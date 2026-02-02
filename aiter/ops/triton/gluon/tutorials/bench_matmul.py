@@ -41,11 +41,11 @@ print(f"gemm_a16w16 with {M=}, {N=}, {K=} bfloat16 tflops")
 print(f"{'torch':50s} {tflops:10.0f}")
 
 
-def print_perf(kind: str, cfg: Optional[str] = None, pingpong: Optional[bool] = False):
+def print_perf(kind: str, cfg: Optional[str] = None, pingpong: Optional[bool] = False, scheduling: Optional[bool] = False):
     if kind == "triton":
         running_lib = "matmul_triton"
     elif kind == "gluon":
-        running_lib = "matmul_gluon_gfx950_" + cfg + ("_pingpong" if pingpong else "")
+        running_lib = "matmul_gluon_gfx950_" + cfg + ("_pingpong" if pingpong else "") + ("_scheduling" if scheduling else "")
     else :
         assert(0)
     module = importlib.import_module(running_lib)
@@ -85,6 +85,8 @@ import os
 os.environ["WYSIWYG"] = "1"
 print_perf("gluon", "256x256x64_2stage", pingpong=True)
 print_perf("gluon", "256x256x32_3stage", pingpong=True)
+print_perf("gluon", "256x256x64_2stage", scheduling=True)
+print_perf("gluon", "256x256x32_3stage", scheduling=True)
 
 
 
