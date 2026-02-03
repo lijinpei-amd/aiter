@@ -126,13 +126,14 @@ def matmul_kernel(
     for k in range(0,num_k_iter-2):
         cur_a = a_bufs.index(buf_idx).load(layout=dot_a_layout)
         cur_b = b_bufs.index(buf_idx).load(layout=dot_b_layout)
+        gl.amd.cdna3.sched_barrier(0x0)
+        accumulator = gl.amd.cdna4.mfma(cur_a, cur_b, accumulator)
         async_idx = (buf_idx + 2) % 3
 
-        gl.amd.cdna3.sched_barrier(0x0)
         gl.amd.cdna4.async_copy.buffer_load_to_shared(a_bufs.index(async_idx), a_ptr, a_offs)
         gl.amd.cdna4.async_copy.buffer_load_to_shared(b_bufs.index(async_idx), b_ptr, b_offs)
         gl.amd.cdna4.async_copy.commit_group()
-        accumulator = gl.amd.cdna4.mfma(cur_a, cur_b, accumulator)
+
 
         #DS_READ
         gl.amd.cdna3.sched_group_barrier(0x100, 4, 0)

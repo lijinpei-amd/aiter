@@ -38,7 +38,7 @@ The first parameter is a mask that determines the types of instructions that you
 ```python
 gl.amd.cdna3.sched_barrier(0x0)
 gl.amd.cdna4.mfma
-...
+
 #DS_READ
 gl.amd.cdna3.sched_group_barrier(0x100, 4, 0)
 #MFMA

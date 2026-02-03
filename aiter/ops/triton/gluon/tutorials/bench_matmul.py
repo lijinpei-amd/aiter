@@ -81,12 +81,12 @@ print_perf("triton", "256x256x64_2stage")
 print_perf("triton", "256x256x32_3stage")
 print_perf("gluon", "256x256x64_2stage")
 print_perf("gluon", "256x256x32_3stage")
+print_perf("gluon", "256x256x64_2stage", scheduling=True)
+print_perf("gluon", "256x256x32_3stage", scheduling=True)
 import os
 os.environ["WYSIWYG"] = "1"
 print_perf("gluon", "256x256x64_2stage", pingpong=True)
 print_perf("gluon", "256x256x32_3stage", pingpong=True)
-print_perf("gluon", "256x256x64_2stage", scheduling=True)
-print_perf("gluon", "256x256x32_3stage", scheduling=True)
 
 
 
@@ -97,6 +97,8 @@ K=4096
 #matmul_triton_256x256x32_3stage                           844
 #matmul_gluon_gfx950_256x256x64_2stage                    1052
 #matmul_gluon_gfx950_256x256x32_3stage                     876
+#matmul_gluon_gfx950_256x256x64_2stage_scheduling         1016
+#matmul_gluon_gfx950_256x256x32_3stage_scheduling          993
 #matmul_gluon_gfx950_256x256x64_2stage_pingpong            896
 #matmul_gluon_gfx950_256x256x32_3stage_pingpong            868
 
@@ -107,6 +109,8 @@ K=8192
 #matmul_triton_256x256x32_3stage                           954
 #matmul_gluon_gfx950_256x256x64_2stage                     879
 #matmul_gluon_gfx950_256x256x32_3stage                     748
+#matmul_gluon_gfx950_256x256x64_2stage_scheduling          970
+#matmul_gluon_gfx950_256x256x32_3stage_scheduling          842
 #matmul_gluon_gfx950_256x256x64_2stage_pingpong            994
 #matmul_gluon_gfx950_256x256x32_3stage_pingpong           1018
 
@@ -117,5 +121,7 @@ K=16384
 #matmul_triton_256x256x32_3stage                           959
 #matmul_gluon_gfx950_256x256x64_2stage                     851
 #matmul_gluon_gfx950_256x256x32_3stage                     652
+#matmul_gluon_gfx950_256x256x64_2stage_scheduling          978
+#matmul_gluon_gfx950_256x256x32_3stage_scheduling          786
 #matmul_gluon_gfx950_256x256x64_2stage_pingpong           1011
 #matmul_gluon_gfx950_256x256x32_3stage_pingpong            954
