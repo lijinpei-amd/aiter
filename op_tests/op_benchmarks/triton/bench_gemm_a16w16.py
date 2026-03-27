@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 import triton
 import math
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
@@ -19,6 +20,11 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
 )
 from typing import Optional
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16 import (
+    _gemm_a16_w16_kernel,
+    _gemm_a16w16_reduce_kernel,
+    _get_config,
+)
 
 
 def bench_gemm_fn(
@@ -29,8 +35,11 @@ def bench_gemm_fn(
     layout: str,
     atomic: bool = False,
     activation: Optional[str] = None,
+    check_correctness: bool = False,
     **kwargs,
 ):
+    _gemm_a16_w16_kernel.fn.device_caches.clear()
+    #print("clear-cache", M, N, K)
     # NOTE: Assume bias and output has the same dtype
     c_dtype = torch.bfloat16
     x, w, bias, out_dtype, y = generate_gemm_a16w16_inputs(
@@ -63,6 +72,9 @@ def bench_gemm_fn(
             rep=100,  # noqa: E731
         )
 
+    if check_correctness:
+        correctness_check(x, w, bias, y, atomic=atomic, activation=activation)
+
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
         return ms
@@ -74,6 +86,39 @@ def bench_gemm_fn(
         return bandwidth
     else:
         raise ValueError("Unknown metric: " + metric)
+
+
+def correctness_check(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    bias: torch.Tensor | None,
+    triton_out: torch.Tensor,
+    atomic: bool = False,
+    activation: str | None = None,
+    atol: float = 1e-1,
+    rtol: float = 1e-1,
+):
+    """Compare Triton GEMM output against torch.nn.functional.linear reference."""
+    M, K = x.shape
+    N = w.shape[0]
+
+    # Reference: torch computes y = x @ w^T + bias
+    torch_out = F.linear(x, w, bias=bias)
+
+    if activation is not None:
+        if activation == "gelu":
+            torch_out = F.gelu(torch_out)
+        elif activation == "gelu_tanh":
+            torch_out = F.gelu(torch_out, approximate="tanh")
+        elif activation in ("silu", "silu_exp2"):
+            torch_out = F.silu(torch_out)
+        elif activation == "relu":
+            torch_out = F.relu(torch_out)
+
+    out = triton_out.to(torch_out.dtype) if atomic else triton_out
+    torch.testing.assert_close(out, torch_out, atol=atol, rtol=rtol)
+    print(f"  PASSED correctness: M={M}, N={N}, K={K}, "
+          f"atomic={atomic}, activation={activation}")
 
 
 def run_model_benchmark(args):
@@ -109,7 +154,8 @@ def run_model_benchmark(args):
         # print(f"Layer: {layer}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
         return bench_gemm_fn(
-            M, N, K, metric, args.layout, atomic=args.atomic, activation=args.activation
+            M, N, K, metric, args.layout, atomic=args.atomic,
+            activation=args.activation, check_correctness=args.correctness,
         )
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
@@ -125,7 +171,10 @@ def run_shape_benchmark(args):
     def bench_gemm_a16w16(M, N, K, metric, **kwargs):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
-        return bench_gemm_fn(M, N, K, metric, args.layout, atomic=args.atomic)
+        return bench_gemm_fn(
+            M, N, K, metric, args.layout, atomic=args.atomic,
+            check_correctness=args.correctness,
+        )
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
 
@@ -170,6 +219,12 @@ def parse_args(args: list[str] | None = None):
         type=str,
         default=None,
         help="Activation function to apply to the output. One of ('gelu', 'gelu_tanh', 'silu', 'silu_exp2', 'relu').",
+    )
+    parser.add_argument(
+        "--correctness",
+        action="store_true",
+        default=False,
+        help="Also run correctness tests (compare Triton output against torch reference) for each benchmarked shape.",
     )
     return get_ff_args(parser, args=args)
 

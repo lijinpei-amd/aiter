@@ -78,6 +78,8 @@ def gemm_a16w16(
             )
         else:
             y_pp = None
+        config["num_warps"]=4
+        config["waves_per_eu"]=1
 
         grid = lambda META: (  # noqa: E731
             (
@@ -86,6 +88,7 @@ def gemm_a16w16(
                 * triton.cdiv(N, META["BLOCK_SIZE_N"])
             ),
         )
+        # print(f"{config =}")
         _gemm_a16_w16_kernel[grid](
             x,
             w,
