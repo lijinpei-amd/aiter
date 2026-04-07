@@ -2,6 +2,8 @@ import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
+from triton.experimental.gluon.language.amd.cdna4 import async_copy as cdna4_async_copy
+import triton.language as tl
 
 
 @triton.heuristics(
@@ -46,17 +48,21 @@ def matmul_kernel(
 
     # Add user set layout
     blocked_a: gl.constexpr = gl.DistributedLinearLayout(
-        reg_bases=((0,1),(0,2), (0,4),(8,0), (128, 0)),
+            #reg_bases=((0,1),(0,2), (4, 0), (8,0), (128, 0)),
+        reg_bases=((0,1),(0,2), (0,4),(4, 0), (8,0), (128, 0)),
         lane_bases=((0, 8), (0, 16), (0, 32), (16, 0), (32, 0), (64, 0)),
-        warp_bases=((1, 0), (2, 0), (4, 0)),
+        #warp_bases=((1, 0), (2, 0), (4, 0)),
+        warp_bases=((1, 0), (2, 0)),
         block_bases=[],
         shape=[256, 64],
     )
 
     blocked_b: gl.constexpr = gl.DistributedLinearLayout(
-        reg_bases=((1,0),(2,0),(4,0),(0,8), (0, 128)),
+            #reg_bases=((1,0),(2,0), (0, 4), (0,8), (0, 128)),
+        reg_bases=((1,0),(2,0),(4,0),(0, 4), (0,8), (0, 128)),
         lane_bases=((8, 0), (16, 0), (32, 0), (0, 16), (0, 32), (0, 64)),
-        warp_bases=((0, 1), (0, 2), (0, 4)),
+        #warp_bases=((0, 1), (0, 2), (0, 4)),
+        warp_bases=((0, 1), (0, 2)),
         block_bases=[],
         shape=[64, 256],
     )
@@ -65,7 +71,8 @@ def matmul_kernel(
         version=4,
         instr_shape=[16, 16, 32],
         transposed=True,
-        warps_per_cta=[2, 4],
+        #warps_per_cta=[2, 4],
+        warps_per_cta=[2, 2],
     )
     dot_a_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=mfma_layout, k_width=8
@@ -77,13 +84,13 @@ def matmul_kernel(
     shared_a: gl.constexpr = gl.PaddedSharedLayout(
         interval_padding_pairs = [[512,16]],
         offset_bases = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [16,0], [32,0], [64,0], [1,0], [2,0], [4,0], [8,0], [128,0]],
-        block_bases = [],
+        cga_layout = [],
         shape = [256, 64]
     )
     shared_b: gl.constexpr = gl.PaddedSharedLayout(
         interval_padding_pairs = [[512,16]],
         offset_bases = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [0, 16], [0, 32], [0, 64], [0, 1], [0, 2], [0, 4], [0, 8], [0, 128]],
-        block_bases = [],
+        cga_layout = [],
         shape = [64, 256]
     )
 
@@ -105,7 +112,7 @@ def matmul_kernel(
     accumulator = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=gl.float32, layout=mfma_layout)
 
     num_k_iter = gl.cdiv(K, BLOCK_SIZE_K)
-    gl.assume(num_k_iter > 2)
+    gl.assume(num_k_iter > 3)
 
 
     # prologue
@@ -114,39 +121,44 @@ def matmul_kernel(
     gl.amd.cdna4.async_copy.commit_group()
     a_offs += BLOCK_SIZE_K * stride_ak
     b_offs += BLOCK_SIZE_K * stride_bk
-
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(a_bufs.index(1), a_ptr, a_offs)
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(b_bufs.index(1), b_ptr, b_offs)
+    gl.amd.cdna4.async_copy.commit_group()
+    a_offs += BLOCK_SIZE_K * stride_ak
+    b_offs += BLOCK_SIZE_K * stride_bk
+    gl.amd.cdna4.async_copy.wait_group(1)
+    # cur_a = a_bufs.index(0).load(layout=dot_a_layout)
+    # cur_b = b_bufs.index(0).load(layout=dot_b_layout)
+    cur_a = cdna4_async_copy.load_shared_relaxed(a_bufs.index(0), dot_a_layout)
+    cur_b = cdna4_async_copy.load_shared_relaxed(b_bufs.index(0), dot_b_layout)
     buf_idx = 0
     # mainloop
-    for k in range(0,num_k_iter-1):
-        gl.amd.cdna4.async_copy.wait_group(0)
-        async_idx = (buf_idx + 1) % 2
-        cur_a = a_bufs.index(buf_idx).load(layout=dot_a_layout)
-        cur_b = b_bufs.index(buf_idx).load(layout=dot_b_layout)
-
-        gl.amd.cdna3.sched_barrier(0x0)
+    tl.debug_barrier()
+    for k in range(0,num_k_iter-2):
+        # tl.debug_barrier()
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(a_bufs.index(buf_idx), a_ptr, a_offs)
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(b_bufs.index(buf_idx), b_ptr, b_offs)
         accumulator = gl.amd.cdna4.mfma(cur_a, cur_b, accumulator)
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(a_bufs.index(async_idx), a_ptr, a_offs)
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(b_bufs.index(async_idx), b_ptr, b_offs)
-
-        #DS_READ
-        gl.amd.cdna3.sched_group_barrier(0x100, 4, 0)
-        #MFMA
-        gl.amd.cdna3.sched_group_barrier(0x008, 1, 0)
-        #DS_WRITE
-        gl.amd.cdna3.sched_group_barrier(0x200, 1, 0)
-        #VMEM
-        gl.amd.cdna3.sched_group_barrier(0x020, 4, 0)
-        #MFMA
-        gl.amd.cdna3.sched_group_barrier(0x008, 1, 0)
-        gl.amd.cdna3.sched_barrier(0x0)
-
+        next_buf_idx = (buf_idx + 1) % 2
+        next_a = cdna4_async_copy.load_shared_relaxed(a_bufs.index(next_buf_idx), dot_a_layout)
+        next_b = cdna4_async_copy.load_shared_relaxed(b_bufs.index(next_buf_idx), dot_b_layout)
+        gl.amd.cdna4.async_copy.commit_group()
+        gl.amd.cdna4.async_copy.wait_group(0)
+        cur_a = next_a
+        cur_b = next_b
         a_offs += BLOCK_SIZE_K * stride_ak
         b_offs += BLOCK_SIZE_K * stride_bk
-        buf_idx = (buf_idx + 1) % 2
-    # epilogue
+        buf_idx = next_buf_idx
+        # cur_a = a_bufs.index(buf_idx).load(layout=dot_a_layout)
+        # cur_b = b_bufs.index(buf_idx).load(layout=dot_b_layout)
+
+    accumulator = gl.amd.cdna4.mfma(cur_a, cur_b, accumulator)
     gl.amd.cdna4.async_copy.wait_group(0)
-    cur_a = a_bufs.index(buf_idx).load(layout=dot_a_layout)
-    cur_b = b_bufs.index(buf_idx).load(layout=dot_b_layout)
+    buf_idx = (buf_idx + 1) % 2
+    # cur_a = a_bufs.index(buf_idx).load(layout=dot_a_layout)
+    # cur_b = b_bufs.index(buf_idx).load(layout=dot_b_layout)
+    cur_a = cdna4_async_copy.load_shared_relaxed(a_bufs.index(buf_idx), dot_a_layout)
+    cur_b = cdna4_async_copy.load_shared_relaxed(b_bufs.index(buf_idx), dot_b_layout)
     accumulator = gl.amd.cdna4.mfma(cur_a, cur_b, accumulator)
 
     # store c

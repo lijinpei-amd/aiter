@@ -8,7 +8,7 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
 
-def matmul(a, b, config, matmul_kernel, torch_output):
+def matmul(a, b, config, matmul_kernel, torch_output, check=False):
     M, K = a.shape
     K, N = b.shape
     c = torch.empty((M, N), device=DEVICE, dtype=torch.bfloat16)
@@ -21,8 +21,8 @@ def matmul(a, b, config, matmul_kernel, torch_output):
         c.stride(0), c.stride(1),  #
         **config,
     )
-    # comment out when profiling
-    # torch.testing.assert_close(c, torch_output, atol=1e-4, rtol=1e-2)
+    if check:
+        torch.testing.assert_close(c, torch_output, atol=1e-2, rtol=1e-2)
     return c
 
 
@@ -48,6 +48,8 @@ def print_perf(kind: str, cfg: Optional[str] = None, pingpong: Optional[bool] = 
         running_lib = "matmul_gluon_gfx950_" + cfg + ("_pingpong" if pingpong else "") + ("_scheduling" if scheduling else "")
     else :
         assert(0)
+
+    print(f"{running_lib = }")
     module = importlib.import_module(running_lib)
     matmul_kernel = getattr(module, "matmul_kernel")
     if kind == "triton":
@@ -64,6 +66,8 @@ def print_perf(kind: str, cfg: Optional[str] = None, pingpong: Optional[bool] = 
         config["BLOCK_SIZE_K"] = 64
         config["GROUP_SIZE_M"] = 4
         config["num_stages"] = 2
+        config["num_warps"] = 4
+        config["waves_per_eu"] = 1
     elif cfg == "256x256x32_3stage":
         config["BLOCK_SIZE_M"] = 256
         config["BLOCK_SIZE_N"] = 256
@@ -77,20 +81,25 @@ def print_perf(kind: str, cfg: Optional[str] = None, pingpong: Optional[bool] = 
     tflops = (2.0 * M * N * K) / ms * 1e-9
     print(f"{running_lib:50s} {tflops:10.0f}")
 
-print_perf("triton", "256x256x64_2stage")
-print_perf("triton", "256x256x32_3stage")
-print_perf("gluon", "256x256x64_2stage")
-print_perf("gluon", "256x256x32_3stage")
+    # correctness check before benchmarking
+    matmul(a, b, config, matmul_kernel, torch_output, check=True)
+    print(f"{running_lib:50s} correctness check passed")
+
+
+# print_perf("triton", "256x256x64_2stage")
+# print_perf("triton", "256x256x32_3stage")
+# print_perf("gluon", "256x256x64_2stage")
+# print_perf("gluon", "256x256x32_3stage")
 print_perf("gluon", "256x256x64_2stage", scheduling=True)
-print_perf("gluon", "256x256x32_3stage", scheduling=True)
-import os
-os.environ["WYSIWYG"] = "1"
-print_perf("gluon", "256x256x64_2stage", pingpong=True)
-print_perf("gluon", "256x256x32_3stage", pingpong=True)
-
-
-
-K=4096
+# print_perf("gluon", "256x256x32_3stage", scheduling=True)
+# import os
+# os.environ["WYSIWYG"] = "1"
+# print_perf("gluon", "256x256x64_2stage", pingpong=True)
+# print_perf("gluon", "256x256x32_3stage", pingpong=True)
+# 
+# 
+# 
+# K=4096
 #gemm_a16w16 with M=4096, N=4096, K=4096 bfloat16 tflops
 #torch                                                    1133
 #matmul_triton_256x256x64_2stage                          1070

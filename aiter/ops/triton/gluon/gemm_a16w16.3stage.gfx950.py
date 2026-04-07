@@ -124,13 +124,13 @@ def _gemm_a16_w16_kernel(
     shared_a: gl.constexpr = gl.PaddedSharedLayout(
         interval_padding_pairs = [[512,16]],
         offset_bases = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [16,0], [32,0], [64,0], [128,0], [1,0], [2,0], [4,0], [8,0]],
-        block_bases = [],
+        cga_layout = [],
         shape = [256, 32]
     )
     shared_b: gl.constexpr = gl.PaddedSharedLayout(
         interval_padding_pairs = [[512,16]],
         offset_bases = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 16], [0, 32], [0, 64], [0, 128], [0, 1], [0, 2], [0, 4], [0, 8]],
-        block_bases = [],
+        cga_layout = [],
         shape = [32, 256]
     )
 
