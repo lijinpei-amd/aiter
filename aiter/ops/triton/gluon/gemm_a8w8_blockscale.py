@@ -61,16 +61,22 @@ def _gemm_a8w8_blockscale_kernel(
     GROUP_SIZE_M: gl.constexpr,
     NUM_KSPLIT: gl.constexpr,
     SPLITK_BLOCK_SIZE: gl.constexpr,
+    NUM_STAGES: gl.constexpr,
     EVEN_K: gl.constexpr,
     GRID_MN: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     cache_modifier: gl.constexpr,
 ):
     """
-    Note: this is Triton jited function and not meant to be called direcgly. Call gemm_a8w8_blockscale function
-    below
+    Note: this is a Gluon jited function and not meant to be called directly.
+    Call gemm_a8w8_blockscale below.
 
-    Computes the 8 bit matmul C = A x B using the block-scale quantization approach.
+    Computes the 8 bit matmul C = A x B using the block-scale quantization
+    approach. A and B tiles are streamed via direct global→LDS buffer loads
+    (`async_copy.buffer_load_to_shared`) with NUM_STAGES-deep multi-buffering
+    so that loads of the next K tile overlap with the MFMA on the current
+    tile. Per-tile scales are loaded directly into MFMA-slice VGPRs (the
+    tensors are tiny, so an LDS round-trip would only add latency).
 
     Key parameters:
     - A: Matrix A with shape (M, K).
@@ -94,26 +100,25 @@ def _gemm_a8w8_blockscale_kernel(
 
     if NUM_KSPLIT == 1:
         remap_xcd(pid, GRID_MN)
-
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
         pid_m = pid // num_pid_n
         pid_n = pid % num_pid_n
 
-    threads_per_elem_mk: gl.constexpr = triton.cdiv(
-        BLOCK_SIZE_M * BLOCK_SIZE_K // (NUM_WARPS * 64), 16
-    )
-    threads_per_elem_kn: gl.constexpr = triton.cdiv(
-        BLOCK_SIZE_K * BLOCK_SIZE_N // (NUM_WARPS * 64), 16
-    )
+    # Layouts tuned for `async_copy.buffer_load_to_shared` on CDNA4: each
+    # thread emits a 128-bit (16 fp8) load along the K-contiguous axis, and
+    # all six lane bases continue linearly in the destination shared memory
+    # so the coalesced-write check in canLoadDirectToLDS passes. The slow
+    # axis (M for A, N for B) is covered via register replication, which is
+    # supported because it sits past the coalesced prefix.
     blocked_mk: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[threads_per_elem_mk, 16],
+        size_per_thread=[1, 16],
         threads_per_warp=[8, 8],
         warps_per_cta=[NUM_WARPS, 1],
         order=[1, 0],
     )
     blocked_kn: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[16, threads_per_elem_kn],
+        size_per_thread=[16, 1],
         threads_per_warp=[8, 8],
         warps_per_cta=[1, NUM_WARPS],
         order=[0, 1],
@@ -126,16 +131,10 @@ def _gemm_a8w8_blockscale_kernel(
     )
 
     shared_a: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=16, per_phase=2, max_phase=8, order=[1, 0]
+        vec=16, per_phase=1, max_phase=1, order=[1, 0]
     )
     shared_b: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=16, per_phase=2, max_phase=8, order=[0, 1]
-    )
-    shared_a_scale: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=16, per_phase=2, max_phase=8, order=[0]
-    )
-    shared_b_scale: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=16, per_phase=2, max_phase=8, order=[0]
+        vec=16, per_phase=1, max_phase=1, order=[0, 1]
     )
     dot_a_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=mfma_layout, k_width=16
@@ -143,33 +142,28 @@ def _gemm_a8w8_blockscale_kernel(
     dot_b_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=1, parent=mfma_layout, k_width=16
     )
+    a_scale_layout: gl.constexpr = gl.SliceLayout(1, mfma_layout)
+    b_scale_layout: gl.constexpr = gl.SliceLayout(0, mfma_layout)
 
     if (pid_k * SPLITK_BLOCK_SIZE) < K:
         # SPLITK_BLOCK_SIZE = gl.cdiv(K, NUM_KSPLIT)
         num_k_iter = gl.cdiv(SPLITK_BLOCK_SIZE, BLOCK_SIZE_K)
 
-        smem_a = gl.allocate_shared_memory(
-            a_ptr.type.element_ty, [BLOCK_SIZE_M, BLOCK_SIZE_K], layout=shared_a
+        # Multi-buffered LDS for A and B; the prefetch for stage k+1 lands in
+        # bufs_*.index((k + 1) % NUM_STAGES) while the MFMA consumes stage k.
+        bufs_a = gl.allocate_shared_memory(
+            a_ptr.type.element_ty,
+            [NUM_STAGES, BLOCK_SIZE_M, BLOCK_SIZE_K],
+            layout=shared_a,
+        )
+        bufs_b = gl.allocate_shared_memory(
+            b_ptr.type.element_ty,
+            [NUM_STAGES, BLOCK_SIZE_K, BLOCK_SIZE_N],
+            layout=shared_b,
         )
 
-        smem_b = gl.allocate_shared_memory(
-            b_ptr.type.element_ty, [BLOCK_SIZE_K, BLOCK_SIZE_N], layout=shared_b
-        )
-
-        # Create pointers for first block of A and B input matrices
         offs_ak = gl.arange(0, BLOCK_SIZE_K, layout=gl.SliceLayout(0, blocked_mk))
-        offs_ak_split = pid_k * SPLITK_BLOCK_SIZE + offs_ak
         offs_bk = gl.arange(0, BLOCK_SIZE_K, layout=gl.SliceLayout(1, blocked_kn))
-        offs_bk_split = pid_k * SPLITK_BLOCK_SIZE + offs_bk
-
-        smem_scale_a = gl.allocate_shared_memory(
-            a_scale_ptr.type.element_ty, [BLOCK_SIZE_M], layout=shared_a_scale
-        )
-
-        smem_scale_b = gl.allocate_shared_memory(
-            b_scale_ptr.type.element_ty, [BLOCK_SIZE_N], layout=shared_b_scale
-        )
-
         offs_am = pid_m * BLOCK_SIZE_M + gl.arange(
             0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, blocked_mk)
         )
@@ -177,59 +171,66 @@ def _gemm_a8w8_blockscale_kernel(
             0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, blocked_kn)
         )
 
-        offs_a = offs_am[:, None] * stride_am + offs_ak_split[None, :] * stride_ak
+        offs_a = offs_am[:, None] * stride_am + (
+            pid_k * SPLITK_BLOCK_SIZE + offs_ak[None, :]
+        ) * stride_ak
+        offs_b = (pid_k * SPLITK_BLOCK_SIZE + offs_bk[:, None]) * stride_bk + offs_bn[
+            None, :
+        ] * stride_bn
 
-        # Create pointers for the scales
+        # Scales are tiny (BLOCK_SIZE_M / BLOCK_SIZE_N elements per K tile);
+        # load them directly into MFMA-slice VGPRs to skip the LDS round-trip
+        # used in the previous version.
+        offs_am_scale = pid_m * BLOCK_SIZE_M + gl.arange(
+            0, BLOCK_SIZE_M, layout=a_scale_layout
+        )
+        offs_bn_scale_n = (
+            pid_n * BLOCK_SIZE_N
+            + gl.arange(0, BLOCK_SIZE_N, layout=b_scale_layout)
+        ) // GROUP_N
+
         offs_k_scale = (pid_k * SPLITK_BLOCK_SIZE) // GROUP_K
-        offs_a_scale = offs_am * stride_ascale_m + offs_k_scale * stride_ascale_k
+        offs_a_scale = (
+            offs_am_scale * stride_ascale_m + offs_k_scale * stride_ascale_k
+        )
+        offs_b_scale = (
+            offs_k_scale * stride_bscale_k + offs_bn_scale_n * stride_bscale_n
+        )
+        offs_ks_step: gl.constexpr = BLOCK_SIZE_K // GROUP_K
 
+        # Prologue: kick off the first global→LDS load and commit it as a
+        # pipeline stage. The mask formulation matches the previous kernel so
+        # that K-axis tail handling is unchanged.
         if EVEN_K:
-            a = gl.amd.cdna4.buffer_load(
-                ptr=a_ptr,
-                offsets=offs_a,
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                bufs_a.index(0),
+                a_ptr,
+                offs_a,
                 mask=offs_am[:, None] < M,
-                cache=cache_modifier,
             )
-        else:
-            a = gl.amd.cdna4.buffer_load(
-                ptr=a_ptr,
-                offsets=offs_a,
-                mask=(offs_ak[None, :] < K - (pid_k * num_k_iter * BLOCK_SIZE_K))
-                & (offs_am[:, None] < M),
-                cache=cache_modifier,
-            )
-        a_scale = gl.amd.cdna4.buffer_load(
-            ptr=a_scale_ptr,
-            offsets=offs_a_scale,
-            cache=cache_modifier,
-        )
-
-        offs_b = offs_bk_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
-        offs_b_scale_n = offs_bn // GROUP_N
-        offs_b_scale = offs_k_scale * stride_bscale_k + offs_b_scale_n * stride_bscale_n
-
-        if EVEN_K:
-            b = gl.amd.cdna4.buffer_load(
-                ptr=b_ptr,
-                offsets=offs_b,
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                bufs_b.index(0),
+                b_ptr,
+                offs_b,
                 mask=offs_bn[None, :] < N,
-                cache=cache_modifier,
             )
         else:
-            b = gl.amd.cdna4.buffer_load(
-                ptr=b_ptr,
-                offsets=offs_b,
-                mask=(offs_bk[:, None] < K - (pid_k * num_k_iter * BLOCK_SIZE_K))
-                & (offs_bn[None, :] < N),
-                cache=cache_modifier,
+            k_split_remaining = K - pid_k * num_k_iter * BLOCK_SIZE_K
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                bufs_a.index(0),
+                a_ptr,
+                offs_a,
+                mask=(offs_ak[None, :] < k_split_remaining)
+                & (offs_am[:, None] < M),
             )
-        b_scale = gl.amd.cdna4.buffer_load(
-            ptr=b_scale_ptr,
-            offsets=offs_b_scale,
-            cache=cache_modifier,
-        )
-        smem_scale_a.store(a_scale)
-        smem_a.store(a)
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                bufs_b.index(0),
+                b_ptr,
+                offs_b,
+                mask=(offs_bk[:, None] < k_split_remaining)
+                & (offs_bn[None, :] < N),
+            )
+        gl.amd.cdna4.async_copy.commit_group()
 
         acc_dtype = gl.float32 if c_ptr.type.element_ty != gl.int8 else gl.int32
         acc = gl.zeros(
@@ -239,84 +240,104 @@ def _gemm_a8w8_blockscale_kernel(
             (BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=mfma_layout
         )
 
-        offs_ks_step = BLOCK_SIZE_K // GROUP_K  # could be replaced by a constant 1
-
-        for k in range(pid_k * num_k_iter, ((pid_k + 1) * num_k_iter) - 1):
-            # Advance the ptrs to the next K block.
+        # Main loop: each iteration prefetches stage k+1, waits for stage k,
+        # then issues the MFMA for stage k. With NUM_STAGES=2 the in-flight
+        # depth never exceeds 2 commits.
+        for k in range(num_k_iter - 1):
             offs_a += BLOCK_SIZE_K * stride_ak
             offs_b += BLOCK_SIZE_K * stride_bk
-            a_scale_ptr += offs_ks_step * stride_ascale_k
-            b_scale_ptr += offs_ks_step * stride_bscale_k
 
-            # Load the next block of A and B, generate a mask by checking the K dimension.
-            # If it is out of bounds, set it to 0.
+            buf_idx_next = (k + 1) % NUM_STAGES
             if EVEN_K:
-                a = gl.amd.cdna4.buffer_load(
-                    ptr=a_ptr,
-                    offsets=offs_a,
+                gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                    bufs_a.index(buf_idx_next),
+                    a_ptr,
+                    offs_a,
                     mask=offs_am[:, None] < M,
-                    cache=cache_modifier,
+                )
+                gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                    bufs_b.index(buf_idx_next),
+                    b_ptr,
+                    offs_b,
+                    mask=offs_bn[None, :] < N,
                 )
             else:
-                a = gl.amd.cdna4.buffer_load(
-                    ptr=a_ptr,
-                    offsets=offs_a,
-                    mask=(offs_ak[None, :] < K - (k + 1) * BLOCK_SIZE_K)
+                k_remaining = K - (pid_k * num_k_iter + k + 1) * BLOCK_SIZE_K
+                gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                    bufs_a.index(buf_idx_next),
+                    a_ptr,
+                    offs_a,
+                    mask=(offs_ak[None, :] < k_remaining)
                     & (offs_am[:, None] < M),
-                    cache=cache_modifier,
                 )
-            smem_b.store(b)
-            smem_scale_b.store(b_scale)
-            cur_a = smem_a.load(layout=dot_a_layout)
-            cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, mfma_layout))
-            a_scale = gl.amd.cdna4.buffer_load(
+                gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                    bufs_b.index(buf_idx_next),
+                    b_ptr,
+                    offs_b,
+                    mask=(offs_bk[:, None] < k_remaining)
+                    & (offs_bn[None, :] < N),
+                )
+            gl.amd.cdna4.async_copy.commit_group()
+
+            # Wait until at most NUM_STAGES-1 commits remain pending so the
+            # buffer for stage k is guaranteed populated.
+            gl.amd.cdna4.async_copy.wait_group(NUM_STAGES - 1)
+
+            buf_idx_cur = k % NUM_STAGES
+
+            cur_a_scale = gl.amd.cdna4.buffer_load(
                 ptr=a_scale_ptr,
                 offsets=offs_a_scale,
                 cache=cache_modifier,
             )
-            cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, mfma_layout))
-            if EVEN_K:
-                b = gl.amd.cdna4.buffer_load(
-                    ptr=b_ptr,
-                    offsets=offs_b,
-                    mask=offs_bn[None, :] < N,
-                    cache=cache_modifier,
-                )
-            else:
-                b = gl.amd.cdna4.buffer_load(
-                    ptr=b_ptr,
-                    offsets=offs_b,
-                    mask=(offs_bk[:, None] < K - (k + 1) * BLOCK_SIZE_K)
-                    & (offs_bn[None, :] < N),
-                    cache=cache_modifier,
-                )
-            b_scale = gl.amd.cdna4.buffer_load(
+            cur_b_scale = gl.amd.cdna4.buffer_load(
                 ptr=b_scale_ptr,
                 offsets=offs_b_scale,
                 cache=cache_modifier,
             )
-            cur_b = smem_b.load(layout=dot_b_layout)
+
+            cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                bufs_a.index(buf_idx_cur), dot_a_layout
+            )
+            cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                bufs_b.index(buf_idx_cur), dot_b_layout
+            )
 
             mfma_out = gl.amd.cdna4.mfma(cur_a, cur_b, zeros)
             acc += mfma_out * cur_a_scale[:, None] * cur_b_scale[None, :]
 
-            smem_a.store(a)
-            smem_scale_a.store(a_scale)
+            offs_a_scale += offs_ks_step * stride_ascale_k
+            offs_b_scale += offs_ks_step * stride_bscale_k
 
-        # ======= Epilogue ========
-        smem_b.store(b)
-        smem_scale_b.store(b_scale)
-        cur_a = smem_a.load(layout=dot_a_layout)
-        cur_b = smem_b.load(layout=dot_b_layout)
-        cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, mfma_layout))
-        cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, mfma_layout))
+        # Epilogue: drain the final outstanding commit and consume the last
+        # tile.
+        gl.amd.cdna4.async_copy.wait_group(0)
 
-        zeros = gl.amd.cdna4.mfma(cur_a, cur_b, zeros)
-        acc += zeros * cur_a_scale[:, None] * cur_b_scale[None, :]
+        buf_idx_last = (num_k_iter - 1) % NUM_STAGES
+
+        cur_a_scale = gl.amd.cdna4.buffer_load(
+            ptr=a_scale_ptr,
+            offsets=offs_a_scale,
+            cache=cache_modifier,
+        )
+        cur_b_scale = gl.amd.cdna4.buffer_load(
+            ptr=b_scale_ptr,
+            offsets=offs_b_scale,
+            cache=cache_modifier,
+        )
+        cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            bufs_a.index(buf_idx_last), dot_a_layout
+        )
+        cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            bufs_b.index(buf_idx_last), dot_b_layout
+        )
+
+        mfma_out = gl.amd.cdna4.mfma(cur_a, cur_b, zeros)
+        acc += mfma_out * cur_a_scale[:, None] * cur_b_scale[None, :]
 
         c = acc.to(c_ptr.type.element_ty)
 
-        # # Write back the block of the output matrix C with masks.
+        # Write back the block of the output matrix C with masks.
         offs_cm = pid_m * BLOCK_SIZE_M + gl.arange(
             0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, mfma_layout)
         )
@@ -540,6 +561,12 @@ def gemm_a8w8_blockscale(
     else:
         y_pp = None
 
+    # NUM_STAGES drives the depth of the LDS multi-buffer used by
+    # async_copy.buffer_load_to_shared. The pipeline issues one prefetch ahead
+    # of the consuming MFMA, so 2 is the minimum value that overlaps anything.
+    num_stages = config.get("num_stages", 2)
+    num_stages = max(num_stages, 2)
+
     # grid = (config["NUM_KSPLIT"], triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
     grid = lambda META: (  # noqa: E731
         (
@@ -569,6 +596,7 @@ def gemm_a8w8_blockscale(
         w_scale.stride(0),
         w_scale.stride(1),
         NUM_WARPS=config["num_warps"],
+        NUM_STAGES=num_stages,
         **config,
     )
 
