@@ -7,6 +7,7 @@ from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
 from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
 )
+import aiter.ops.triton.utils._triton.arch_info as arch_info
 from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
     generate_gemm_a8w8_blockscale_inputs,
 )
@@ -82,11 +83,11 @@ def bench_gemm_fn(
         raise ValueError("Unknown metric: " + metric)
 
 
-def run_model_benchmark(args, impl):
+def run_model_benchmark(args, impl, plot_name, shuffle):
     """
     Runs benchmark given a --model argument.
     """
-    benchmark = get_model_benchmark_object(get_caller_name_no_ext(), args)
+    benchmark = get_model_benchmark_object(plot_name, args)
 
     @triton.testing.perf_report([benchmark])
     def bench_gemm_a8w8_blockscale(
@@ -116,57 +117,68 @@ def run_model_benchmark(args, impl):
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(
-            M, N, K, metric, args.layout, impl, shuffle=args.preshuffle
-        )
+        return bench_gemm_fn(M, N, K, metric, args.layout, impl, shuffle=shuffle)
 
     bench_gemm_a8w8_blockscale.run(save_path="." if args.o else None, print_data=True)
 
 
-def run_shape_benchmark(args, impl):
-    benchmark = get_shape_benchmark_object(get_caller_name_no_ext(), args)
+def run_shape_benchmark(args, impl, plot_name, shuffle):
+    benchmark = get_shape_benchmark_object(plot_name, args)
 
     @triton.testing.perf_report([benchmark])
     def bench_gemm_a8w8_blockscale(M, N, K, metric, model_name=None, **kwargs):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
-        return bench_gemm_fn(
-            M, N, K, metric, args.layout, impl, shuffle=args.preshuffle
-        )
+        return bench_gemm_fn(M, N, K, metric, args.layout, impl, shuffle=shuffle)
 
     bench_gemm_a8w8_blockscale.run(save_path="." if args.o else None, print_data=True)
+
+
+def _select_impls(args):
+    # Each flag activates its own impl; the basic triton impl is the fallback
+    # when none was requested. `-gluon -preshuffle` runs both, for comparison.
+    impls = []
+    if args.preshuffle:
+        impls.append(
+            ("triton_preshuffle", triton_gemm_a8w8_blockscale_preshuffle, True)
+        )
+    if args.gluon:
+        if not arch_info.is_gluon_avail():
+            raise RuntimeError(
+                f"-gluon is not available on arch {arch_info.get_arch()!r}."
+            )
+        impls.append(("gluon", gluon_gemm_a8w8_blockscale, False))
+    if not impls:
+        impls.append(("triton", triton_gemm_a8w8_blockscale, False))
+    return impls
 
 
 def run_benchmark(args, defaults):
     assert not (args.shape and args.model) or not (
         args.shape and args.M
     ), "User can specify --shape or --model MODEL -M VAL exclusively"
-    if args.gluon:
-        impl = gluon_gemm_a8w8_blockscale
-    elif args.preshuffle:
-        impl = triton_gemm_a8w8_blockscale_preshuffle
-    else:
-        impl = triton_gemm_a8w8_blockscale
+
+    impls = _select_impls(args)
+    base_plot_name = get_caller_name_no_ext()
+    multiple_impls = len(impls) > 1
+
     if args.model:
         unsupported_args = []
-        for arg in unsupported_args:
-            if getattr(args, arg, None) != getattr(defaults, arg, None):
-                raise Exception(
-                    f"Argument '{arg}' is not supported for benchmarking with the --model flag."
-                )
-        run_model_benchmark(args, impl)
+        runner = run_model_benchmark
     else:
-        unsupported_args = [
-            "fc1",
-            "fc2",
-            "no_glu",
-        ]
-        for arg in unsupported_args:
-            if getattr(args, arg, None) != getattr(defaults, arg, None):
-                raise Exception(
-                    f"Argument '{arg}' is not supported for benchmarking without the --model flag."
-                )
-        run_shape_benchmark(args, impl)
+        unsupported_args = ["fc1", "fc2", "no_glu"]
+        runner = run_shape_benchmark
+    flag_word = "with" if args.model else "without"
+    for arg in unsupported_args:
+        if getattr(args, arg, None) != getattr(defaults, arg, None):
+            raise Exception(
+                f"Argument '{arg}' is not supported for benchmarking {flag_word} the --model flag."
+            )
+    for name, impl, shuffle in impls:
+        plot_name = f"{base_plot_name}_{name}" if multiple_impls else base_plot_name
+        if multiple_impls:
+            print(f"\n=== Benchmarking impl: {name} ===")
+        runner(args, impl, plot_name, shuffle)
 
 
 def parse_args(args: list[str] | None = None):
@@ -175,7 +187,9 @@ def parse_args(args: list[str] | None = None):
     parser.add_argument(
         "-gluon",
         action="store_true",
-        help="Use Gluon implementation (experimental, requires latest Triton from main)",
+        help="Benchmark the Gluon implementation instead of the default triton impl. "
+        "Combine with -preshuffle to run both gluon and preshuffle. "
+        "(experimental, requires gfx950 and latest Triton from main).",
     )
     parser.add_argument(
         "-preshuffle",
