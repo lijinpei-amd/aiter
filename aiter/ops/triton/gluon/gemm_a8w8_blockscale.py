@@ -105,36 +105,74 @@ def _gemm_a8w8_blockscale_kernel(
         pid_m = pid // num_pid_n
         pid_n = pid % num_pid_n
 
-    # Layouts tuned for `async_copy.buffer_load_to_shared` on CDNA4: each
-    # thread emits a 128-bit (16 fp8) load along the K-contiguous axis, and
-    # all six lane bases continue linearly in the destination shared memory
-    # so the coalesced-write check in canLoadDirectToLDS passes. The slow
-    # axis (M for A, N for B) is covered via register replication, which is
-    # supported because it sits past the coalesced prefix.
-    blocked_mk: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 16],
-        threads_per_warp=[8, 8],
-        warps_per_cta=[NUM_WARPS, 1],
-        order=[1, 0],
+    # Distributed offset layouts copied verbatim from the Triton-compiled
+    # ttgir for this kernel (cache key 6OS5LQDK4...): `#linear` for A and
+    # `#linear1` for B. Each lane's per-register stride sequence is chosen so
+    # the resulting per-thread write into `shared_a`/`shared_b` lands on
+    # consecutive bank lanes -- this is the pairing the AMD lowering for
+    # `amdg.buffer_load_to_local` into a `padded_shared` destination requires
+    # (a plain BlockedLayout source leaves `unrealized_conversion_cast`s the
+    # LLVM translator can't resolve). The bases are baked for BLOCK_M=128 /
+    # BLOCK_N=256 / BLOCK_K=128 / NUM_WARPS=4 -- same contract as the
+    # padded_shared layouts below.
+    linear_a: gl.constexpr = gl.DistributedLinearLayout(
+        reg_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [4, 0], [8, 0]],
+        lane_bases=[[0, 16], [0, 32], [0, 64], [16, 0], [32, 0], [64, 0]],
+        warp_bases=[[1, 0], [2, 0]],
+        block_bases=[],
+        shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
     )
-    blocked_kn: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[16, 1],
-        threads_per_warp=[8, 8],
-        warps_per_cta=[1, NUM_WARPS],
-        order=[0, 1],
+    linear_b: gl.constexpr = gl.DistributedLinearLayout(
+        reg_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 4], [0, 8], [0, 128]],
+        lane_bases=[[16, 0], [32, 0], [64, 0], [0, 16], [0, 32], [0, 64]],
+        warp_bases=[[0, 1], [0, 2]],
+        block_bases=[],
+        shape=[BLOCK_SIZE_K, BLOCK_SIZE_N],
     )
+    # warpsPerCTA = [1, NUM_WARPS] — all warps tile N. This matches the
+    # `#mma = #ttg.amd_mfma<{warpsPerCTA = [1, 4], ...}>` pattern that the
+    # downstream tt.dot_scaled wants to land on. With BLOCK_M=128,
+    # BLOCK_N=256, NUM_WARPS=4, each warp owns a (128, 64) output tile and
+    # issues 8x4 = 32 MFMA[16,16,128] instructions — same MFMA count as the
+    # prior [2, 2] split, just retiled.
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
-        instr_shape=[16, 16, 32],  # V_MFMA_F32_16X16X32_FP8_FP8 instruction
+        instr_shape=[16, 16, 128],
         transposed=True,
-        warps_per_cta=[NUM_WARPS // 2, 2],
+        warps_per_cta=[1, NUM_WARPS],
     )
 
-    shared_a: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=16, per_phase=1, max_phase=1, order=[1, 0]
+    # Padded LDS layout copied verbatim from the Triton-compiled ttgir for
+    # this kernel (cache key 6OS5LQDK4...): a 1024-element interval with 32
+    # bytes of padding plus a permuted offset_bases swizzle that the bank
+    # arbiter favors on CDNA4. Unlike a SwizzledSharedLayout, the K-fast bits
+    # come first in identity, then the slow-axis bits are reordered so each
+    # 1024-fp8 LDS line spans 8 rows/cols stride-16 — which lines up with the
+    # 32-bank read pattern that v_mfma_scaled_* issues. The offset_bases are
+    # hard-coded for BLOCK_M=128 / BLOCK_N=256 / BLOCK_K=128 (the only config
+    # this kernel ships with); a static_assert below pins that contract.
+    gl.static_assert(
+        BLOCK_SIZE_M == 128 and BLOCK_SIZE_K == 128 and BLOCK_SIZE_N == 256,
+        "shared_a/shared_b padded layouts are baked for "
+        "BLOCK_M=128, BLOCK_K=128, BLOCK_N=256",
     )
-    shared_b: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=16, per_phase=1, max_phase=1, order=[0, 1]
+    shared_a: gl.constexpr = gl.PaddedSharedLayout(
+        interval_padding_pairs=[[1024, 32]],
+        offset_bases=[
+            [0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64],
+            [16, 0], [32, 0], [64, 0], [1, 0], [2, 0], [4, 0], [8, 0],
+        ],
+        cga_layout=[],
+        shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
+    )
+    shared_b: gl.constexpr = gl.PaddedSharedLayout(
+        interval_padding_pairs=[[1024, 32]],
+        offset_bases=[
+            [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0],
+            [0, 16], [0, 32], [0, 64], [0, 1], [0, 2], [0, 4], [0, 8], [0, 128],
+        ],
+        cga_layout=[],
+        shape=[BLOCK_SIZE_K, BLOCK_SIZE_N],
     )
     # 1D layout for the scale prefetch. Each lane writes one fp32 (32-bit
     # direct-to-LDS path on CDNA4); the 4-warp / 64-lane CTA covers 256
@@ -190,13 +228,13 @@ def _gemm_a8w8_blockscale_kernel(
             layout=shared_scale,
         )
 
-        offs_ak = gl.arange(0, BLOCK_SIZE_K, layout=gl.SliceLayout(0, blocked_mk))
-        offs_bk = gl.arange(0, BLOCK_SIZE_K, layout=gl.SliceLayout(1, blocked_kn))
+        offs_ak = gl.arange(0, BLOCK_SIZE_K, layout=gl.SliceLayout(0, linear_a))
+        offs_bk = gl.arange(0, BLOCK_SIZE_K, layout=gl.SliceLayout(1, linear_b))
         offs_am = pid_m * BLOCK_SIZE_M + gl.arange(
-            0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, blocked_mk)
+            0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, linear_a)
         )
         offs_bn = pid_n * BLOCK_SIZE_N + gl.arange(
-            0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, blocked_kn)
+            0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, linear_b)
         )
 
         offs_a = offs_am[:, None] * stride_am + (
@@ -281,6 +319,9 @@ def _gemm_a8w8_blockscale_kernel(
         # k, then issues the MFMA for stage k. With NUM_STAGES=2 the
         # in-flight depth never exceeds 2 commits.
         for k in range(num_k_iter - 1):
+            # Wait until at most NUM_STAGES-1 commits remain pending so the
+            # buffer for stage k is guaranteed populated.
+            gl.amd.cdna4.async_copy.wait_group(0)
             offs_a += BLOCK_SIZE_K * stride_ak
             offs_b += BLOCK_SIZE_K * stride_bk
             offs_a_scale += offs_ks_step * stride_ascale_k
@@ -324,10 +365,6 @@ def _gemm_a8w8_blockscale_kernel(
             )
             gl.amd.cdna4.async_copy.commit_group()
 
-            # Wait until at most NUM_STAGES-1 commits remain pending so the
-            # buffer for stage k is guaranteed populated.
-            gl.amd.cdna4.async_copy.wait_group(NUM_STAGES - 1)
-
             buf_idx_cur = k % NUM_STAGES
 
             cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
@@ -343,8 +380,15 @@ def _gemm_a8w8_blockscale_kernel(
                 bufs_bs.index(buf_idx_cur), b_scale_layout
             )
 
-            mfma_out = gl.amd.cdna4.mfma(cur_a, cur_b, zeros)
-            acc += mfma_out * cur_a_scale[:, None] * cur_b_scale[None, :]
+            # tt.dot_scaled with no explicit scale operands (None, None)
+            # lowers to v_mfma_scaled_* with the unit-MX-scale fast path.
+            # The actual per-tile blockscale (one fp32 per [BLOCK_M,
+            # BLOCK_K] / [BLOCK_K, BLOCK_N] tile) is still applied below;
+            # microscaling at scale_factor=32 is orthogonal.
+            mfma_out = gl.amd.cdna4.mfma_scaled(
+                cur_a, None, "e4m3", cur_b, None, "e4m3", zeros
+            )
+            acc += mfma_out * (cur_a_scale[:, None] * cur_b_scale[None, :])
 
         # Epilogue: drain the final outstanding commit and consume the last
         # tile.
@@ -365,7 +409,9 @@ def _gemm_a8w8_blockscale_kernel(
             bufs_bs.index(buf_idx_last), b_scale_layout
         )
 
-        mfma_out = gl.amd.cdna4.mfma(cur_a, cur_b, zeros)
+        mfma_out = gl.amd.cdna4.mfma_scaled(
+            cur_a, None, "e4m3", cur_b, None, "e4m3", zeros
+        )
         acc += mfma_out * cur_a_scale[:, None] * cur_b_scale[None, :]
 
         c = acc.to(c_ptr.type.element_ty)
