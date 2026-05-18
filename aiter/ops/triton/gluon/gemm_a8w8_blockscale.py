@@ -27,6 +27,11 @@ _SUPPORTED_TILES = ((64, 128), (128, 128), (128, 256))
 
 
 @constexpr_function
+def _is_supported_tile(BM, BN):
+    return (BM, BN) in _SUPPORTED_TILES
+
+
+@constexpr_function
 def _linear_a_reg(BM):
     k_reg = [[0, 1], [0, 2], [0, 4], [0, 8]]
     reg_m = {128: [[4, 0], [8, 0]], 64: [[32, 0]]}[BM]
@@ -181,7 +186,7 @@ def _gemm_a8w8_blockscale_kernel(
         "linear/padded layouts are baked for BLOCK_K=128 and NUM_WARPS=4",
     )
     gl.static_assert(
-        (BLOCK_SIZE_M, BLOCK_SIZE_N) in _SUPPORTED_TILES,
+        _is_supported_tile(BLOCK_SIZE_M, BLOCK_SIZE_N),
         "(BM, BN) must be in _SUPPORTED_TILES",
     )
     linear_a: gl.constexpr = gl.DistributedLinearLayout(
