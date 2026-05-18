@@ -67,7 +67,7 @@ def bench_gemm_fn(
     ms = triton.testing.do_bench(
         lambda: impl(x, bench_weight, bench_x_scale, w_scale, c_dtype, y),  # noqa: E731
         warmup=25,
-        rep=10000,
+        rep=100,
     )
 
     # Return exactly one scalar depending on which metric is active

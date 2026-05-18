@@ -16,6 +16,72 @@ from triton import language as tl
 _LOGGER = AiterTritonLogger()
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+from triton.runtime.jit import constexpr_function
+
+
+# Each (BLOCK_M, BLOCK_N) pair maps to a distinct set of linear/padded-shared
+# layouts that the AMD lowering for `amdg.buffer_load_to_local` accepts on
+# CDNA4. BLOCK_K is fixed at 128 (matching the e4m3 k_width=16 × instr_K=128
+# contract of mfma_scaled) and NUM_WARPS at 4.
+_SUPPORTED_TILES = ((64, 128), (128, 128), (128, 256))
+
+
+@constexpr_function
+def _linear_a_reg(BM):
+    k_reg = [[0, 1], [0, 2], [0, 4], [0, 8]]
+    reg_m = {128: [[4, 0], [8, 0]], 64: [[32, 0]]}[BM]
+    return k_reg + reg_m
+
+
+@constexpr_function
+def _linear_a_lane(BM):
+    k_lane = [[0, 16], [0, 32], [0, 64]]
+    lane_m = {128: [[16, 0], [32, 0], [64, 0]], 64: [[4, 0], [8, 0], [16, 0]]}[BM]
+    return k_lane + lane_m
+
+
+@constexpr_function
+def _linear_a_warp():
+    return [[1, 0], [2, 0]]
+
+
+@constexpr_function
+def _linear_b_reg(BN):
+    k_reg = [[1, 0], [2, 0], [4, 0], [8, 0]]
+    reg_n = {256: [[0, 4], [0, 8], [0, 128]], 128: [[0, 4], [0, 8]]}[BN]
+    return k_reg + reg_n
+
+
+@constexpr_function
+def _linear_b_lane():
+    return [[16, 0], [32, 0], [64, 0], [0, 16], [0, 32], [0, 64]]
+
+
+@constexpr_function
+def _linear_b_warp():
+    return [[0, 1], [0, 2]]
+
+
+@constexpr_function
+def _shared_a_bases(BM):
+    # K low-to-high, then M bits in `lane → warp → reg` order — the swizzle
+    # Triton's lowering picks for conflict-free `ds_read_b128` from these tiles.
+    k_bases = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]]
+    m_bases = {
+        128: [[16, 0], [32, 0], [64, 0], [1, 0], [2, 0], [4, 0], [8, 0]],
+        64: [[4, 0], [8, 0], [16, 0], [1, 0], [2, 0], [32, 0]],
+    }[BM]
+    return k_bases + m_bases
+
+
+@constexpr_function
+def _shared_b_bases(BN):
+    k_bases = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0]]
+    n_bases = {
+        256: [[0, 16], [0, 32], [0, 64], [0, 1], [0, 2], [0, 4], [0, 8], [0, 128]],
+        128: [[0, 16], [0, 32], [0, 64], [0, 1], [0, 2], [0, 4], [0, 8]],
+    }[BN]
+    return k_bases + n_bases
 
 
 @triton.heuristics(
@@ -105,36 +171,35 @@ def _gemm_a8w8_blockscale_kernel(
         pid_m = pid // num_pid_n
         pid_n = pid % num_pid_n
 
-    # Distributed offset layouts copied verbatim from the Triton-compiled
-    # ttgir for this kernel (cache key 6OS5LQDK4...): `#linear` for A and
-    # `#linear1` for B. Each lane's per-register stride sequence is chosen so
-    # the resulting per-thread write into `shared_a`/`shared_b` lands on
-    # consecutive bank lanes -- this is the pairing the AMD lowering for
-    # `amdg.buffer_load_to_local` into a `padded_shared` destination requires
-    # (a plain BlockedLayout source leaves `unrealized_conversion_cast`s the
-    # LLVM translator can't resolve). The bases are baked for BLOCK_M=128 /
-    # BLOCK_N=256 / BLOCK_K=128 / NUM_WARPS=4 -- same contract as the
-    # padded_shared layouts below.
+    # Distributed-linear + padded-shared layouts that mirror what the Triton
+    # compiler picks for the same load. This is the only pairing the AMD
+    # lowering for `amdg.buffer_load_to_local` into a `padded_shared`
+    # destination accepts — a plain BlockedLayout source leaves
+    # `unrealized_conversion_cast`s the LLVM translator can't resolve.
+    gl.static_assert(
+        BLOCK_SIZE_K == 128 and NUM_WARPS == 4,
+        "linear/padded layouts are baked for BLOCK_K=128 and NUM_WARPS=4",
+    )
+    gl.static_assert(
+        (BLOCK_SIZE_M, BLOCK_SIZE_N) in _SUPPORTED_TILES,
+        "(BM, BN) must be in _SUPPORTED_TILES",
+    )
     linear_a: gl.constexpr = gl.DistributedLinearLayout(
-        reg_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [4, 0], [8, 0]],
-        lane_bases=[[0, 16], [0, 32], [0, 64], [16, 0], [32, 0], [64, 0]],
-        warp_bases=[[1, 0], [2, 0]],
+        reg_bases=_linear_a_reg(BLOCK_SIZE_M),
+        lane_bases=_linear_a_lane(BLOCK_SIZE_M),
+        warp_bases=_linear_a_warp(),
         block_bases=[],
         shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
     )
     linear_b: gl.constexpr = gl.DistributedLinearLayout(
-        reg_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 4], [0, 8], [0, 128]],
-        lane_bases=[[16, 0], [32, 0], [64, 0], [0, 16], [0, 32], [0, 64]],
-        warp_bases=[[0, 1], [0, 2]],
+        reg_bases=_linear_b_reg(BLOCK_SIZE_N),
+        lane_bases=_linear_b_lane(),
+        warp_bases=_linear_b_warp(),
         block_bases=[],
         shape=[BLOCK_SIZE_K, BLOCK_SIZE_N],
     )
-    # warpsPerCTA = [1, NUM_WARPS] — all warps tile N. This matches the
-    # `#mma = #ttg.amd_mfma<{warpsPerCTA = [1, 4], ...}>` pattern that the
-    # downstream tt.dot_scaled wants to land on. With BLOCK_M=128,
-    # BLOCK_N=256, NUM_WARPS=4, each warp owns a (128, 64) output tile and
-    # issues 8x4 = 32 MFMA[16,16,128] instructions — same MFMA count as the
-    # prior [2, 2] split, just retiled.
+    # warpsPerCTA = [1, NUM_WARPS] — all warps tile N, matching the warp
+    # split that the downstream `tt.dot_scaled` MFMA layout expects.
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
         instr_shape=[16, 16, 128],
@@ -142,35 +207,19 @@ def _gemm_a8w8_blockscale_kernel(
         warps_per_cta=[1, NUM_WARPS],
     )
 
-    # Padded LDS layout copied verbatim from the Triton-compiled ttgir for
-    # this kernel (cache key 6OS5LQDK4...): a 1024-element interval with 32
-    # bytes of padding plus a permuted offset_bases swizzle that the bank
-    # arbiter favors on CDNA4. Unlike a SwizzledSharedLayout, the K-fast bits
-    # come first in identity, then the slow-axis bits are reordered so each
-    # 1024-fp8 LDS line spans 8 rows/cols stride-16 — which lines up with the
-    # 32-bank read pattern that v_mfma_scaled_* issues. The offset_bases are
-    # hard-coded for BLOCK_M=128 / BLOCK_N=256 / BLOCK_K=128 (the only config
-    # this kernel ships with); a static_assert below pins that contract.
-    gl.static_assert(
-        BLOCK_SIZE_M == 128 and BLOCK_SIZE_K == 128 and BLOCK_SIZE_N == 256,
-        "shared_a/shared_b padded layouts are baked for "
-        "BLOCK_M=128, BLOCK_K=128, BLOCK_N=256",
-    )
+    # Padded LDS layout: 1024-element interval + 32-byte padding plus a
+    # permuted offset_bases swizzle. Each 1024-fp8 LDS line spans 8 rows/cols
+    # stride-16 — lining up with the 32-bank read pattern `v_mfma_scaled_*`
+    # issues; a plain SwizzledSharedLayout misses this.
     shared_a: gl.constexpr = gl.PaddedSharedLayout(
         interval_padding_pairs=[[1024, 32]],
-        offset_bases=[
-            [0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64],
-            [16, 0], [32, 0], [64, 0], [1, 0], [2, 0], [4, 0], [8, 0],
-        ],
+        offset_bases=_shared_a_bases(BLOCK_SIZE_M),
         cga_layout=[],
         shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
     )
     shared_b: gl.constexpr = gl.PaddedSharedLayout(
         interval_padding_pairs=[[1024, 32]],
-        offset_bases=[
-            [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0],
-            [0, 16], [0, 32], [0, 64], [0, 1], [0, 2], [0, 4], [0, 8], [0, 128],
-        ],
+        offset_bases=_shared_b_bases(BLOCK_SIZE_N),
         cga_layout=[],
         shape=[BLOCK_SIZE_K, BLOCK_SIZE_N],
     )
@@ -557,12 +606,18 @@ def _get_config(
         if potential_block_m.isnumeric():
             bounds.append(int(potential_block_m))
 
-    for bound in bounds:
-        if M <= bound and f"M_LEQ_{bound}" in _get_config._config_dict[key]:
-            config = _get_config._config_dict[key][f"M_LEQ_{bound}"]
+    # Walk buckets in ascending-M order; pick the smallest one whose tile
+    # the kernel currently supports. Unsupported buckets are skipped (those
+    # configs become live again once the kernel grows the corresponding
+    # padded-LDS layouts), so we may fall through to "any".
+    config = _get_config._config_dict[key]["any"]
+    for bound in sorted(bounds):
+        if M > bound or f"M_LEQ_{bound}" not in _get_config._config_dict[key]:
+            continue
+        candidate = _get_config._config_dict[key][f"M_LEQ_{bound}"]
+        if (candidate["BLOCK_SIZE_M"], candidate["BLOCK_SIZE_N"]) in _SUPPORTED_TILES:
+            config = candidate
             break
-        else:
-            config = _get_config._config_dict[key]["any"]
 
     config = (
         config.copy()
