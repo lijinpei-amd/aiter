@@ -1,5 +1,7 @@
 import torch
 import triton
+from aiter import dtypes
+from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
     gemm_a8w8_blockscale_preshuffle as triton_gemm_a8w8_blockscale_preshuffle,
@@ -8,8 +10,9 @@ from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
 )
 import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.test_common import checkAllclose
 from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
-    generate_gemm_a8w8_blockscale_inputs,
+    run_torch,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_benchmark_object,
@@ -27,6 +30,68 @@ import math
 block_shape = (128, 128)
 
 
+def _generate_inputs(M, N, K, layout, shuffle):
+    """Generate inputs using the same recipe as op_tests/test_gemm_a8w8_blockscale.py::test_gemm:
+
+      x:       rand fp32 / 10, cast to aiter.dtypes.fp8, shape (M, K)
+      weight:  rand fp32 / 10, cast to aiter.dtypes.fp8, shape (N, K)
+      x_scale: rand fp32, shape (M, scale_k)
+      w_scale: rand fp32, shape (scale_n, scale_k)
+      no fixed seed (the test doesn't set one either)
+
+    The op_test only supports TN; we extend by transposing storage for non-TN
+    layouts (same data, different stride) so the bench's --layout still works.
+
+    The shuffle path uses the *triton* preshuffle convention (16x16 shuffle
+    with a row-flatten reshape, plus transposed x_scale) because the impls
+    being benchmarked are triton/gluon. The CK shuffle from op_tests/test_gemm
+    would produce wrong-shaped tensors for these kernels.
+    """
+    block_shape_n, block_shape_k = block_shape
+    scale_n = (N + block_shape_n - 1) // block_shape_n
+    scale_k = (K + block_shape_k - 1) // block_shape_k
+
+    if layout[0] == "T":
+        x = (torch.rand((M, K), dtype=torch.float32, device="cuda") / 10).to(
+            dtypes.fp8
+        )
+    else:
+        x = (
+            (torch.rand((K, M), dtype=torch.float32, device="cuda") / 10)
+            .to(dtypes.fp8)
+            .T
+        )
+
+    if layout[1] == "N":
+        weight = (torch.rand((N, K), dtype=torch.float32, device="cuda") / 10).to(
+            dtypes.fp8
+        )
+    else:
+        weight = (
+            (torch.rand((K, N), dtype=torch.float32, device="cuda") / 10)
+            .to(dtypes.fp8)
+            .T
+        )
+
+    x_scale = torch.rand([M, scale_k], dtype=torch.float32, device="cuda")
+    w_scale = torch.rand([scale_n, scale_k], dtype=torch.float32, device="cuda")
+
+    if shuffle:
+        weight_shuffle_layout = (16, 16)
+        weight_shuffled = shuffle_weight(weight, weight_shuffle_layout).reshape(
+            weight.shape[0] // weight_shuffle_layout[0],
+            weight.shape[1] * weight_shuffle_layout[0],
+        )
+        x_scale_shuffled = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
+    else:
+        weight_shuffled = weight
+        x_scale_shuffled = x_scale
+
+    y = torch.empty((M, N), dtype=torch.bfloat16, device="cuda")
+
+    return x, weight, weight_shuffled, x_scale, x_scale_shuffled, w_scale, y
+
+
 def bench_gemm_fn(
     M: int,
     N: int,
@@ -35,21 +100,12 @@ def bench_gemm_fn(
     layout: str,
     impl: callable,
     shuffle: bool = False,
+    test: bool = False,
 ):
-    block_shape_n, block_shape_k = block_shape
     c_dtype = torch.bfloat16
 
     x, weight, weight_shuffled, x_scale, x_scale_shuffled, w_scale, y = (
-        generate_gemm_a8w8_blockscale_inputs(
-            M,
-            N,
-            K,
-            block_shape_n,
-            block_shape_k,
-            layout=layout,
-            output=True,
-            shuffle=shuffle,
-        )
+        _generate_inputs(M, N, K, layout, shuffle)
     )
     if shuffle:
         bench_weight = weight_shuffled
@@ -57,6 +113,16 @@ def bench_gemm_fn(
     else:
         bench_weight = weight
         bench_x_scale = x_scale
+
+    if test:
+        # Correctness check, mirrors op_tests/test_gemm_a8w8_blockscale.py:
+        # torch reference runs on un-shuffled inputs, impl runs on whatever
+        # layout it expects. checkAllclose's defaults (rtol=1e-2, atol=1e-2)
+        # are the same tolerances test_gemm uses.
+        ref = run_torch(x, weight, x_scale, w_scale, c_dtype)
+        out = impl(x, bench_weight, bench_x_scale, w_scale, c_dtype, y)
+        checkAllclose(ref, out, msg=f"M={M},N={N},K={K}")
+
     # flops
     flops = 2.0 * M * N * K
     # memory transfer
@@ -117,7 +183,9 @@ def run_model_benchmark(args, impl, plot_name, shuffle):
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(M, N, K, metric, args.layout, impl, shuffle=shuffle)
+        return bench_gemm_fn(
+            M, N, K, metric, args.layout, impl, shuffle=shuffle, test=args.test
+        )
 
     bench_gemm_a8w8_blockscale.run(save_path="." if args.o else None, print_data=True)
 
@@ -129,7 +197,9 @@ def run_shape_benchmark(args, impl, plot_name, shuffle):
     def bench_gemm_a8w8_blockscale(M, N, K, metric, model_name=None, **kwargs):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
-        return bench_gemm_fn(M, N, K, metric, args.layout, impl, shuffle=shuffle)
+        return bench_gemm_fn(
+            M, N, K, metric, args.layout, impl, shuffle=shuffle, test=args.test
+        )
 
     bench_gemm_a8w8_blockscale.run(save_path="." if args.o else None, print_data=True)
 
@@ -195,6 +265,12 @@ def parse_args(args: list[str] | None = None):
         "-preshuffle",
         action="store_true",
         help="Use preshuffle implementation",
+    )
+    parser.add_argument(
+        "-test",
+        action="store_true",
+        help="Run a correctness check for each benchmarked shape against a "
+        "torch reference (mirrors op_tests/test_gemm_a8w8_blockscale.py).",
     )
     return get_ff_args(parser, args=args)
 
