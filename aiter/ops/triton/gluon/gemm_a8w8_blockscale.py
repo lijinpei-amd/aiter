@@ -400,6 +400,11 @@ def _compute_MN_tile(
             BLOCK_SIZE_K, GROUP_K, NUM_STAGES,
         )
 
+        # EVEN_K=True is safe to hard-code here: k_iter + 2 < num_k_aligned
+        # by loop bound, so the prefetched K-tile is fully in-bounds and the
+        # _prefetch_tensors K-mask branch would never fire even with the
+        # runtime EVEN_K. Pinning it constexpr-True lets the compiler drop
+        # the `k_iter == last_k_iter` compare from this hot loop.
         _prefetch_tensors(
             bufs_a, bufs_b,
             k_iter + 2, last_k_iter,
@@ -408,7 +413,7 @@ def _compute_MN_tile(
             offs_ak, offs_bk,
             m_mask, n_mask,
             K, stride_ak, stride_bk,
-            BLOCK_SIZE_K, NUM_STAGES, EVEN_K,
+            BLOCK_SIZE_K, NUM_STAGES, True,
             NEED_M_MASK, NEED_N_MASK,
         )
 
