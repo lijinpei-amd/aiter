@@ -91,18 +91,18 @@ def _prefetch_tensors(
     bufs_a,
     bufs_b,
     k_iter,
+    last_k_iter,
     a_ptr,
     b_ptr,
     offs_a,
     offs_b,
-    offs_am,
-    offs_bn,
     offs_ak,
     offs_bk,
-    M,
-    N,
+    m_mask,
+    n_mask,
     K,
-    k_block_offset,
+    stride_ak,
+    stride_bk,
     BLOCK_SIZE_K: gl.constexpr,
     NUM_STAGES: gl.constexpr,
     EVEN_K: gl.constexpr,
@@ -110,30 +110,35 @@ def _prefetch_tensors(
     NEED_N_MASK: gl.constexpr,
 ):
     buf_idx = k_iter % NUM_STAGES
+    k_off = k_iter * BLOCK_SIZE_K
+    a_ptr_iter = a_ptr + k_off * stride_ak
+    b_ptr_iter = b_ptr + k_off * stride_bk
     if EVEN_K:
         if NEED_M_MASK:
-            mask_a = offs_am[:, None] < M
+            mask_a = m_mask
         else:
             mask_a = None
         if NEED_N_MASK:
-            mask_b = offs_bn[None, :] < N
+            mask_b = n_mask
         else:
             mask_b = None
     else:
-        k_remaining = K - k_block_offset * BLOCK_SIZE_K
+        k_remaining = K - k_off
+        k_mask_a = offs_ak[None, :] < k_remaining
+        k_mask_b = offs_bk[:, None] < k_remaining
         if NEED_M_MASK:
-            mask_a = (offs_ak[None, :] < k_remaining) & (offs_am[:, None] < M)
+            mask_a = m_mask & k_mask_a
         else:
-            mask_a = offs_ak[None, :] < k_remaining
+            mask_a = k_mask_a
         if NEED_N_MASK:
-            mask_b = (offs_bk[:, None] < k_remaining) & (offs_bn[None, :] < N)
+            mask_b = n_mask & k_mask_b
         else:
-            mask_b = offs_bk[:, None] < k_remaining
+            mask_b = k_mask_b
     gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        bufs_a.index(buf_idx), a_ptr, offs_a, mask=mask_a
+        bufs_a.index(buf_idx), a_ptr_iter, offs_a, mask=mask_a
     )
     gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        bufs_b.index(buf_idx), b_ptr, offs_b, mask=mask_b
+        bufs_b.index(buf_idx), b_ptr_iter, offs_b, mask=mask_b
     )
 
 
@@ -161,14 +166,21 @@ def _prefetch_scales(
     b_scale_ptr,
     offs_a_scale,
     offs_b_scale,
+    stride_ascale_k,
+    stride_bscale_k,
+    BLOCK_SIZE_K: gl.constexpr,
+    GROUP_K: gl.constexpr,
     NUM_STAGES: gl.constexpr,
 ):
     buf_idx = k_iter % NUM_STAGES
+    k_scale_off = k_iter * (BLOCK_SIZE_K // GROUP_K)
+    a_scale_ptr_iter = a_scale_ptr + k_scale_off * stride_ascale_k
+    b_scale_ptr_iter = b_scale_ptr + k_scale_off * stride_bscale_k
     gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        bufs_as.index(buf_idx), a_scale_ptr, offs_a_scale
+        bufs_as.index(buf_idx), a_scale_ptr_iter, offs_a_scale
     )
     gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        bufs_bs.index(buf_idx), b_scale_ptr, offs_b_scale
+        bufs_bs.index(buf_idx), b_scale_ptr_iter, offs_b_scale
     )
 
 
@@ -304,7 +316,18 @@ def _compute_MN_tile(
 
     offs_a_scale = offs_am_scale_blk * stride_ascale_m
     offs_b_scale = offs_bn_scale_n_blk * stride_bscale_n
-    offs_ks_step: gl.constexpr = BLOCK_SIZE_K // GROUP_K
+
+    # Pre-compute M / N boundary masks once; the K-mask is built lazily inside
+    # `_prefetch_tensors` only on the last K-iter when EVEN_K is False.
+    if NEED_M_MASK:
+        m_mask = offs_am[:, None] < M
+    else:
+        m_mask = None
+    if NEED_N_MASK:
+        n_mask = offs_bn[None, :] < N
+    else:
+        n_mask = None
+    last_k_iter = num_k_iter - 1
 
     # Prologue: kick off stage 0's global→LDS prefetch (both scales
     # and tensors).
@@ -313,16 +336,17 @@ def _compute_MN_tile(
         0,
         a_scale_ptr, b_scale_ptr,
         offs_a_scale, offs_b_scale,
-        NUM_STAGES,
+        stride_ascale_k, stride_bscale_k,
+        BLOCK_SIZE_K, GROUP_K, NUM_STAGES,
     )
     _prefetch_tensors(
         bufs_a, bufs_b,
-        0,
+        0, last_k_iter,
         a_ptr, b_ptr,
         offs_a, offs_b,
-        offs_am, offs_bn, offs_ak, offs_bk,
-        M, N, K,
-        0,
+        offs_ak, offs_bk,
+        m_mask, n_mask,
+        K, stride_ak, stride_bk,
         BLOCK_SIZE_K, NUM_STAGES, EVEN_K,
         NEED_M_MASK, NEED_N_MASK,
     )
@@ -337,16 +361,14 @@ def _compute_MN_tile(
     )
 
     if num_k_iter > 1:
-        offs_a += BLOCK_SIZE_K * stride_ak
-        offs_b += BLOCK_SIZE_K * stride_bk
         _prefetch_tensors(
             bufs_a, bufs_b,
-            1,
+            1, last_k_iter,
             a_ptr, b_ptr,
             offs_a, offs_b,
-            offs_am, offs_bn, offs_ak, offs_bk,
-            M, N, K,
-            1,
+            offs_ak, offs_bk,
+            m_mask, n_mask,
+            K, stride_ak, stride_bk,
             BLOCK_SIZE_K, NUM_STAGES, EVEN_K,
             NEED_M_MASK, NEED_N_MASK,
         )
@@ -367,26 +389,23 @@ def _compute_MN_tile(
             bufs_bs.index(buf_idx_cur), b_scale_layout
         )
 
-        offs_a_scale += offs_ks_step * stride_ascale_k
-        offs_b_scale += offs_ks_step * stride_bscale_k
         _prefetch_scales(
             bufs_as, bufs_bs,
             k + 1,
             a_scale_ptr, b_scale_ptr,
             offs_a_scale, offs_b_scale,
-            NUM_STAGES,
+            stride_ascale_k, stride_bscale_k,
+            BLOCK_SIZE_K, GROUP_K, NUM_STAGES,
         )
 
-        offs_a += BLOCK_SIZE_K * stride_ak
-        offs_b += BLOCK_SIZE_K * stride_bk
         _prefetch_tensors(
             bufs_a, bufs_b,
-            k + 2,
+            k + 2, last_k_iter,
             a_ptr, b_ptr,
             offs_a, offs_b,
-            offs_am, offs_bn, offs_ak, offs_bk,
-            M, N, K,
-            k + 2,
+            offs_ak, offs_bk,
+            m_mask, n_mask,
+            K, stride_ak, stride_bk,
             BLOCK_SIZE_K, NUM_STAGES, EVEN_K,
             NEED_M_MASK, NEED_N_MASK,
         )
@@ -414,14 +433,13 @@ def _compute_MN_tile(
             bufs_bs.index(buf_idx_cur), b_scale_layout
         )
 
-        offs_a_scale += offs_ks_step * stride_ascale_k
-        offs_b_scale += offs_ks_step * stride_bscale_k
         _prefetch_scales(
             bufs_as, bufs_bs,
             num_k_iter - 1,
             a_scale_ptr, b_scale_ptr,
             offs_a_scale, offs_b_scale,
-            NUM_STAGES,
+            stride_ascale_k, stride_bscale_k,
+            BLOCK_SIZE_K, GROUP_K, NUM_STAGES,
         )
         gl.amd.cdna4.async_copy.commit_group()
 
@@ -592,12 +610,12 @@ def _gemm_a8w8_blockscale_kernel(
     # Non-last splits always see EVEN_K (SPLITK_BLOCK_SIZE is BLOCK_K-aligned
     # by construction); only the last split inherits the original EVEN_K.
     k_split_offset = pid_k * SPLITK_BLOCK_SIZE
-    a_ptr_split = a_ptr + k_split_offset.to(gl.int64) * stride_ak
-    b_ptr_split = b_ptr + k_split_offset.to(gl.int64) * stride_bk
-    c_ptr_split = c_ptr + pid_k.to(gl.int64) * stride_ck
+    a_ptr_split = a_ptr + k_split_offset * stride_ak
+    b_ptr_split = b_ptr + k_split_offset * stride_bk
+    c_ptr_split = c_ptr + pid_k * stride_ck
     k_scale_offset = k_split_offset // GROUP_K
-    a_scale_ptr_split = a_scale_ptr + k_scale_offset.to(gl.int64) * stride_ascale_k
-    b_scale_ptr_split = b_scale_ptr + k_scale_offset.to(gl.int64) * stride_bscale_k
+    a_scale_ptr_split = a_scale_ptr + k_scale_offset * stride_ascale_k
+    b_scale_ptr_split = b_scale_ptr + k_scale_offset * stride_bscale_k
 
     if pid_k == NUM_KSPLIT - 1:
         _compute_MN_tile(
