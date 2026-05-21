@@ -387,10 +387,6 @@ def _compute_MN_tile(
     for k_iter in range(num_k_aligned - 2):
         gl.amd.cdna4.async_copy.wait_group(0)
 
-        cur_a_scale, cur_b_scale = _load_shared(
-            bufs_as, bufs_bs, k_iter, a_scale_layout, b_scale_layout, NUM_STAGES
-        )
-
         _prefetch_scales(
             bufs_as, bufs_bs,
             k_iter + 1,
@@ -417,6 +413,10 @@ def _compute_MN_tile(
             NEED_M_MASK, NEED_N_MASK,
         )
 
+        gl.amd.cdna4.async_copy.commit_group()
+        cur_a_scale, cur_b_scale = _load_shared(
+            bufs_as, bufs_bs, k_iter, a_scale_layout, b_scale_layout, NUM_STAGES
+        )
         mfma_out = gl.amd.cdna4.mfma_scaled(
             prev_a, None, "e4m3", prev_b, None, "e4m3", zeros
         )
@@ -427,7 +427,6 @@ def _compute_MN_tile(
 
         prev_a = cur_a
         prev_b = cur_b
-        gl.amd.cdna4.async_copy.commit_group()
 
     # Wind-down (statically unrolled, gated by constexpr EVEN_K):
     # - EVEN_K=True  : 1 iter (k_iter = num_k_iter - 2), no tensor prefetch.
