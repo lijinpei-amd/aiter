@@ -51,6 +51,10 @@ def get_x_vals():
     x_vals += [(v, 9216, 7168) for v in (128, 192, 4096, 8000)]
     x_vals += [(v, 7168, 4608) for v in (128, 192, 4096, 8000)]
     x_vals += [(v, 8192, 512) for v in (128, 192, 4096, 8000)]
+    # Small-K shapes that exercise the gluon wind-down's num_k_iter guards
+    # (BLOCK_SIZE_K=128; K in {128,192,256,320} -> num_k_iter in {1,2,2,3}).
+    # K<BLOCK_SIZE_K isn't supported by the gluon wrapper (GROUP_K assert).
+    x_vals += [(512, 512, K) for K in (128, 192, 256, 320)]
     return x_vals
 
 
