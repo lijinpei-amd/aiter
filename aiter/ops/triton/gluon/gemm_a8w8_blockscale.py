@@ -143,7 +143,7 @@ def _prefetch_tensors(
 
 
 @gluon.jit
-def _load_ab(
+def _load_shared(
     bufs_a,
     bufs_b,
     k_iter,
@@ -376,22 +376,18 @@ def _compute_MN_tile(
         gl.amd.cdna4.async_copy.wait_group(1)
     else:
         gl.amd.cdna4.async_copy.wait_group(0)
-    prev_a, prev_b = _load_ab(bufs_a, bufs_b, 0, dot_a_layout, dot_b_layout, NUM_STAGES)
+    prev_a, prev_b = _load_shared(bufs_a, bufs_b, 0, dot_a_layout, dot_b_layout, NUM_STAGES)
 
-    for k in range(num_k_iter - 2):
+    for k_iter in range(num_k_iter - 2):
         gl.amd.cdna4.async_copy.wait_group(0)
 
-        buf_idx_cur = k % NUM_STAGES
-        cur_a_scale = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            bufs_as.index(buf_idx_cur), a_scale_layout
-        )
-        cur_b_scale = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            bufs_bs.index(buf_idx_cur), b_scale_layout
+        cur_a_scale, cur_b_scale = _load_shared(
+            bufs_as, bufs_bs, k_iter, a_scale_layout, b_scale_layout, NUM_STAGES
         )
 
         _prefetch_scales(
             bufs_as, bufs_bs,
-            k + 1,
+            k_iter + 1,
             a_scale_ptr, b_scale_ptr,
             offs_a_scale, offs_b_scale,
             stride_ascale_k, stride_bscale_k,
@@ -400,7 +396,7 @@ def _compute_MN_tile(
 
         _prefetch_tensors(
             bufs_a, bufs_b,
-            k + 2, last_k_iter,
+            k_iter + 2, last_k_iter,
             a_ptr, b_ptr,
             offs_a, offs_b,
             offs_ak, offs_bk,
@@ -413,8 +409,8 @@ def _compute_MN_tile(
         mfma_out = gl.amd.cdna4.mfma_scaled(
             prev_a, None, "e4m3", prev_b, None, "e4m3", zeros
         )
-        cur_a, cur_b = _load_ab(
-            bufs_a, bufs_b, k + 1, dot_a_layout, dot_b_layout, NUM_STAGES
+        cur_a, cur_b = _load_shared(
+            bufs_a, bufs_b, k_iter + 1, dot_a_layout, dot_b_layout, NUM_STAGES
         )
         acc += mfma_out * (cur_a_scale[:, None] * cur_b_scale[None, :])
 
@@ -425,12 +421,9 @@ def _compute_MN_tile(
     if num_k_iter > 1:
         gl.amd.cdna4.async_copy.wait_group(0)
 
-        buf_idx_cur = (num_k_iter - 2) % NUM_STAGES
-        cur_a_scale = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            bufs_as.index(buf_idx_cur), a_scale_layout
-        )
-        cur_b_scale = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            bufs_bs.index(buf_idx_cur), b_scale_layout
+        cur_a_scale, cur_b_scale = _load_shared(
+            bufs_as, bufs_bs, num_k_iter - 2,
+            a_scale_layout, b_scale_layout, NUM_STAGES,
         )
 
         _prefetch_scales(
@@ -443,7 +436,7 @@ def _compute_MN_tile(
         )
         gl.amd.cdna4.async_copy.commit_group()
 
-        cur_a, cur_b = _load_ab(
+        cur_a, cur_b = _load_shared(
             bufs_a, bufs_b, num_k_iter - 1, dot_a_layout, dot_b_layout, NUM_STAGES
         )
 
@@ -456,12 +449,9 @@ def _compute_MN_tile(
         prev_b = cur_b
 
     gl.amd.cdna4.async_copy.wait_group(0)
-    buf_idx_last = (num_k_iter - 1) % NUM_STAGES
-    last_a_scale = gl.amd.cdna4.async_copy.load_shared_relaxed(
-        bufs_as.index(buf_idx_last), a_scale_layout
-    )
-    last_b_scale = gl.amd.cdna4.async_copy.load_shared_relaxed(
-        bufs_bs.index(buf_idx_last), b_scale_layout
+    last_a_scale, last_b_scale = _load_shared(
+        bufs_as, bufs_bs, num_k_iter - 1,
+        a_scale_layout, b_scale_layout, NUM_STAGES,
     )
     mfma_out = gl.amd.cdna4.mfma_scaled(
         prev_a, None, "e4m3", prev_b, None, "e4m3", zeros
