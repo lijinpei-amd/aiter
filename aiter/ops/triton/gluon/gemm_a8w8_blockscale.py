@@ -429,48 +429,98 @@ def _compute_MN_tile(
         prev_b = cur_b
         gl.amd.cdna4.async_copy.commit_group()
 
-    # Wind-down: iters [num_k_aligned - 2, num_k_iter - 1). The tensor
-    # prefetch is conditional because k_iter + 2 may overshoot num_k_iter
-    # (e.g. EVEN_K wind-down's 2 iters never prefetch tensors). When the
-    # prefetch does fire and lands on the last K-iter, _prefetch_tensors
-    # applies the K-mask via its `k_iter == last_k_iter` check.
-    for k_iter in range(num_k_aligned - 2, num_k_iter - 1):
+    # Wind-down (statically unrolled, gated by constexpr EVEN_K):
+    # - EVEN_K=True  : 1 iter (k_iter = num_k_iter - 2), no tensor prefetch.
+    # - EVEN_K=False : 2 iters; the first prefetches the K-misaligned last
+    #   tile (the only call site that ever exercises _prefetch_tensors's
+    #   K-mask path), the second prefetches the last scales only.
+    # Unrolling drops the wind-down's `prev_a, prev_b` loop PHI so the
+    # register allocator can keep the main loop's dot operands AGPR-resident.
+    if EVEN_K:
         gl.amd.cdna4.async_copy.wait_group(0)
-
         cur_a_scale, cur_b_scale = _load_shared(
-            bufs_as, bufs_bs, k_iter, a_scale_layout, b_scale_layout, NUM_STAGES
+            bufs_as, bufs_bs, num_k_iter - 2,
+            a_scale_layout, b_scale_layout, NUM_STAGES,
         )
-
         _prefetch_scales(
             bufs_as, bufs_bs,
-            k_iter + 1,
+            num_k_iter - 1,
             a_scale_ptr, b_scale_ptr,
             offs_a_scale, offs_b_scale,
             stride_ascale_k, stride_bscale_k,
             BLOCK_SIZE_K, GROUP_K, NUM_STAGES,
         )
-
-        if k_iter + 2 < num_k_iter:
-            _prefetch_tensors(
-                bufs_a, bufs_b,
-                k_iter + 2, last_k_iter,
-                a_ptr, b_ptr,
-                offs_a, offs_b,
-                offs_ak, offs_bk,
-                m_mask, n_mask,
-                K, stride_ak, stride_bk,
-                BLOCK_SIZE_K, NUM_STAGES, EVEN_K,
-                NEED_M_MASK, NEED_N_MASK,
-            )
-
         mfma_out = gl.amd.cdna4.mfma_scaled(
             prev_a, None, "e4m3", prev_b, None, "e4m3", zeros
         )
         cur_a, cur_b = _load_shared(
-            bufs_a, bufs_b, k_iter + 1, dot_a_layout, dot_b_layout, NUM_STAGES
+            bufs_a, bufs_b, num_k_iter - 1,
+            dot_a_layout, dot_b_layout, NUM_STAGES,
         )
         acc += mfma_out * (cur_a_scale[:, None] * cur_b_scale[None, :])
+        prev_a = cur_a
+        prev_b = cur_b
+        gl.amd.cdna4.async_copy.commit_group()
+    else:
+        # iter A: k_iter = num_k_iter - 3
+        gl.amd.cdna4.async_copy.wait_group(0)
+        cur_a_scale, cur_b_scale = _load_shared(
+            bufs_as, bufs_bs, num_k_iter - 3,
+            a_scale_layout, b_scale_layout, NUM_STAGES,
+        )
+        _prefetch_scales(
+            bufs_as, bufs_bs,
+            num_k_iter - 2,
+            a_scale_ptr, b_scale_ptr,
+            offs_a_scale, offs_b_scale,
+            stride_ascale_k, stride_bscale_k,
+            BLOCK_SIZE_K, GROUP_K, NUM_STAGES,
+        )
+        _prefetch_tensors(
+            bufs_a, bufs_b,
+            num_k_iter - 1, last_k_iter,
+            a_ptr, b_ptr,
+            offs_a, offs_b,
+            offs_ak, offs_bk,
+            m_mask, n_mask,
+            K, stride_ak, stride_bk,
+            BLOCK_SIZE_K, NUM_STAGES, EVEN_K,
+            NEED_M_MASK, NEED_N_MASK,
+        )
+        mfma_out = gl.amd.cdna4.mfma_scaled(
+            prev_a, None, "e4m3", prev_b, None, "e4m3", zeros
+        )
+        cur_a, cur_b = _load_shared(
+            bufs_a, bufs_b, num_k_iter - 2,
+            dot_a_layout, dot_b_layout, NUM_STAGES,
+        )
+        acc += mfma_out * (cur_a_scale[:, None] * cur_b_scale[None, :])
+        prev_a = cur_a
+        prev_b = cur_b
+        gl.amd.cdna4.async_copy.commit_group()
 
+        # iter B: k_iter = num_k_iter - 2
+        gl.amd.cdna4.async_copy.wait_group(0)
+        cur_a_scale, cur_b_scale = _load_shared(
+            bufs_as, bufs_bs, num_k_iter - 2,
+            a_scale_layout, b_scale_layout, NUM_STAGES,
+        )
+        _prefetch_scales(
+            bufs_as, bufs_bs,
+            num_k_iter - 1,
+            a_scale_ptr, b_scale_ptr,
+            offs_a_scale, offs_b_scale,
+            stride_ascale_k, stride_bscale_k,
+            BLOCK_SIZE_K, GROUP_K, NUM_STAGES,
+        )
+        mfma_out = gl.amd.cdna4.mfma_scaled(
+            prev_a, None, "e4m3", prev_b, None, "e4m3", zeros
+        )
+        cur_a, cur_b = _load_shared(
+            bufs_a, bufs_b, num_k_iter - 1,
+            dot_a_layout, dot_b_layout, NUM_STAGES,
+        )
+        acc += mfma_out * (cur_a_scale[:, None] * cur_b_scale[None, :])
         prev_a = cur_a
         prev_b = cur_b
         gl.amd.cdna4.async_copy.commit_group()
