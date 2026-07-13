@@ -138,6 +138,10 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     num_stages = 2
     split_k = 1
     block_k = 512
+    # Stage-2 (software pipeline) depth. Requires BLOCK_K>=256 for correctness and
+    # loses to stage-1 on these shapes (occupancy-bound); see the kernel's STAGE 2
+    # note. Default 2 on this branch to exercise the pipeline.
+    num_buffers = 2
     waves_per_eu = 0
 
     if block_m == 16:
@@ -180,6 +184,7 @@ def get_kernel_config_gluon(m, n, k, routing_data):
         "waves_per_eu": waves_per_eu,
         "matrix_instr_nonkdim": 16,
         "kpack": 1,
+        "num_buffers": num_buffers,
     }
     return ret
 
@@ -386,7 +391,9 @@ def moe_gemm_a16w4(
             config["block_k"],
             config["group_m"],
             XCD_SWIZZLE=config["xcd_swizzle"],
-            NUM_BUFFERS=1,  # pipelining disabled (correctness-first port)
+            # Stage-2 pipeline depth; the pipelined path requires
+            # num_k_iter >= NUM_BUFFERS, so clamp to the K-tile count (min 1).
+            NUM_BUFFERS=max(1, min(config["num_buffers"], triton.cdiv(K, config["block_k"]))),
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
             SPLIT_K=config["split_k"],
             EVEN_K=K % config["block_k"] == 0,

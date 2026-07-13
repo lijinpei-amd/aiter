@@ -117,6 +117,77 @@ def _expand_mx_scale_k(scale, BLOCK_N: gl.constexpr, MX_SCALE_BLOCK_K: gl.conste
     return s.reshape(BLOCK_N, MX_SCALE_BLOCK_K * MX_PACK_DIVISOR)
 
 
+@gluon.jit
+def _tdm_load_tile(
+    x_desc,
+    w_desc,
+    ws_desc,
+    x_slot,
+    w_slot,
+    ws_slot,
+    ki,
+    GatherIndx,
+    offs_x_m,
+    offs_x_m_scalar,
+    off_w_n,
+    off_w_n_scale,
+    BLOCK_K: gl.constexpr,
+    PACKED_BLOCK_K_W: gl.constexpr,
+    PACKED_MX_BLOCK: gl.constexpr,
+):
+    # Issue the 3 TDM async loads (X, packed-fp4 W, e8m0 scale) for K-tile `ki`
+    # into the given LDS slots.
+    if GatherIndx is None:
+        gl.amd.gfx1250.tdm.async_load(x_desc, [offs_x_m_scalar, ki * BLOCK_K], x_slot)
+    else:
+        gl.amd.gfx1250.tdm.async_gather(x_desc, offs_x_m, ki * BLOCK_K, x_slot)
+    gl.amd.gfx1250.tdm.async_load(w_desc, [off_w_n, ki * PACKED_BLOCK_K_W], w_slot)
+    gl.amd.gfx1250.tdm.async_load(ws_desc, [off_w_n_scale, ki * PACKED_MX_BLOCK], ws_slot)
+
+
+@gluon.jit
+def _preload_tile(
+    x_slot,
+    w_slot,
+    ws_slot,
+    DOT_LAYOUT_X: gl.constexpr,
+    L_IN_W: gl.constexpr,
+    L_SCALE_W: gl.constexpr,
+    COMPACT_SCALE_LAYOUT: gl.constexpr,
+    SWIZZLE_MX_SCALE: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    MX_SCALE_BLOCK_K: gl.constexpr,
+    MX_PACK_DIVISOR: gl.constexpr,
+    PRESHUFFLE_FACTOR: gl.constexpr,
+    SCALE_KWIDTH: gl.constexpr,
+):
+    # LDS -> register operands for one K-tile.
+    x_tile = x_slot.load(layout=DOT_LAYOUT_X)
+    w_packed = w_slot.permute([1, 0]).load(layout=L_IN_W)
+    if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
+        ws_buffer_slice = unswizzle_mx_scale_gfx1250(
+            ws_slot,
+            BLOCK_N,
+            MX_SCALE_BLOCK_K,
+            PRESHUFFLE_FACTOR,
+            SCALE_KWIDTH,
+            MX_PACK_DIVISOR,
+        )
+        w_scale = ws_buffer_slice.load(layout=COMPACT_SCALE_LAYOUT)
+        w_scale = _expand_mx_scale_k(w_scale, BLOCK_N, MX_SCALE_BLOCK_K)
+        w_scale = gl.convert_layout(w_scale.trans(1, 0), layout=L_SCALE_W)
+    else:
+        _dummy = gl.full((BLOCK_K, BLOCK_N), 0, gl.uint8, layout=L_SCALE_W)
+        _d3 = _dummy.reshape(MX_SCALE_BLOCK_K, MX_PACK_DIVISOR, BLOCK_N)
+        L_SCALE_3D: gl.constexpr = _d3.type.layout
+        w_scale = ws_slot.permute([1, 0]).load(layout=gl.SliceLayout(1, L_SCALE_3D))
+        w_scale = gl.expand_dims(w_scale, 1)
+        w_scale, _ = gl.broadcast(w_scale, _d3)
+        w_scale = w_scale.reshape(BLOCK_K, BLOCK_N)
+    return x_tile, w_packed, w_scale
+
+
 @gluon.jit(launch_metadata=matmul_launch_metadata)
 def _moe_gemm_a16w4(
     Y,
@@ -265,6 +336,9 @@ def _moe_gemm_a16w4(
         PRESHUFFLE_FACTOR: gl.constexpr = 1
         PACKED_MX_BLOCK: gl.constexpr = MX_SCALE_BLOCK_K
         SCALE_BLOCK_N: gl.constexpr = BLOCK_N
+        # Unused on the compact path (only unswizzle_mx_scale_gfx1250 reads it),
+        # but _preload_tile takes it as an arg unconditionally.
+        SCALE_KWIDTH: gl.constexpr = 8
 
     # Scale tile offsets are in units of the scale descriptor's own blocking
     # (N block = SCALE_BLOCK_N, K block = PACKED_MX_BLOCK) -- NOT the weight's
@@ -378,12 +452,6 @@ def _moe_gemm_a16w4(
     SHARED_LAYOUT_Y: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[OUT_BLOCK_N, 8]], [BLOCK_M, OUT_BLOCK_N], [1, 0]
     )
-    # Stage the upcast bf16 weight (BLOCK_N, BLOCK_K) through LDS and permute-read
-    # it as the (BLOCK_K, BLOCK_N) B operand -- mirrors gemm_a16w16, avoids a
-    # register trans+convert into the dot-operand layout.
-    SHARED_LAYOUT_WB: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[BLOCK_K, 8]], [BLOCK_N, BLOCK_K], [1, 0]
-    )
 
     if GatherIndx is None:
         x_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
@@ -429,66 +497,160 @@ def _moe_gemm_a16w4(
         shape=[NUM_BUFFERS] + ws_desc.block_shape,
         layout=ws_desc.layout,
     )
-    wb_buffer = gl.allocate_shared_memory(
-        gl.bfloat16, shape=[BLOCK_N, BLOCK_K], layout=SHARED_LAYOUT_WB
-    )
 
     num_k_iter = tl.cdiv(K, BLOCK_K)
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
 
-    # Non-pipelined baseline (correctness first): load one K tile, wait for ALL
-    # outstanding TDM ops, then consume. No multi-buffer overlap -> uses buffer 0
-    # only (NUM_BUFFERS=1). Re-add pipelining once numerics are verified.
-    for ki in range(num_k_iter):
-        if GatherIndx is None:
-            gl.amd.gfx1250.tdm.async_load(
-                x_desc, [offs_x_m_scalar, ki * BLOCK_K], x_buffer.index(0)
-            )
-        else:
-            gl.amd.gfx1250.tdm.async_gather(
-                x_desc, offs_x_m, ki * BLOCK_K, x_buffer.index(0)
-            )
-        gl.amd.gfx1250.tdm.async_load(
-            w_desc, [off_w_n, ki * PACKED_BLOCK_K_W], w_buffer.index(0)
-        )
-        gl.amd.gfx1250.tdm.async_load(
-            ws_desc, [off_w_n_scale, ki * PACKED_MX_BLOCK], ws_buffer.index(0)
-        )
-        gl.amd.gfx1250.tdm.async_wait(0)
-
-        x_tile = x_buffer.index(0).load(layout=DOT_LAYOUT_X)
-        # fp4 weight to K-major (K/2, N) in the packed operand-B dot layout.
-        w_packed = w_buffer.index(0).permute([1, 0]).load(layout=L_IN_W)
-        if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
-            ws_buffer_slice = unswizzle_mx_scale_gfx1250(
+    if NUM_BUFFERS == 1:
+        # Non-pipelined baseline: load one K tile, wait for ALL outstanding TDM
+        # ops, consume. Two Membar barriers/iter (RAW after wait + WAR back-edge).
+        for ki in range(num_k_iter):
+            _tdm_load_tile(
+                x_desc,
+                w_desc,
+                ws_desc,
+                x_buffer.index(0),
+                w_buffer.index(0),
                 ws_buffer.index(0),
+                ki,
+                GatherIndx,
+                offs_x_m,
+                offs_x_m_scalar,
+                off_w_n,
+                off_w_n_scale,
+                BLOCK_K,
+                PACKED_BLOCK_K_W,
+                PACKED_MX_BLOCK,
+            )
+            gl.amd.gfx1250.tdm.async_wait(0)
+            x_tile, w_packed, w_scale = _preload_tile(
+                x_buffer.index(0),
+                w_buffer.index(0),
+                ws_buffer.index(0),
+                DOT_LAYOUT_X,
+                L_IN_W,
+                L_SCALE_W,
+                COMPACT_SCALE_LAYOUT,
+                SWIZZLE_MX_SCALE,
                 BLOCK_N,
+                BLOCK_K,
                 MX_SCALE_BLOCK_K,
+                MX_PACK_DIVISOR,
                 PRESHUFFLE_FACTOR,
                 SCALE_KWIDTH,
+            )
+            w_kn = gl.amd.gfx1250.scaled_upcast(w_packed, w_scale, gl.bfloat16, axis=0)
+            acc = gl.amd.gfx1250.wmma(x_tile, w_kn, acc)
+    else:
+        # ============================ STAGE 2 ============================
+        # LDS-prefetch pipeline (NUM_BUFFERS>=2, requires num_k_iter >= NUM_BUFFERS).
+        # Prefetch the tile (NUM_BUFFERS-1) ahead into a *different* LDS slot so its
+        # TDM latency overlaps the current tile's compute. Operands are loaded from
+        # LDS *within* each iteration and consumed immediately by the WMMA -- they
+        # are NOT carried in registers across iterations (the expanded bf16 weight +
+        # scale are large; a register pipeline spills).
+        #
+        # NOTE(perf): this is the tuned stage-2 experiment. It does NOT beat the
+        # stage-1 (NUM_BUFFERS=1) kernel for the minimax-m3 prefill shapes: the X
+        # activation tile is ~78% of the 87 KB LDS footprint, so double-buffering it
+        # at the efficient BLOCK_K=256 collapses occupancy (14.9 ms vs stage-1's
+        # 7.56 ms). Smaller BLOCK_K fits the double-buffer but loses BLOCK_K=256's
+        # efficiency (best pipelined = ~8.96 ms at BLOCK_K=128). Kept for reference.
+        #
+        # NOTE(correctness): verified against the test suite at the default
+        # BLOCK_K=256. The two explicit barriers below guard the cross-wave RAW
+        # (post-wait) and WAR (pre-prefetch) hazards on the shared slots that
+        # Membar does not cover for TDM async ops. A residual failure was observed
+        # at BLOCK_K=128 (short compute-per-tile) -- do not use BLOCK_K<256 here.
+        for j in gl.static_range(NUM_BUFFERS - 1):
+            _tdm_load_tile(
+                x_desc,
+                w_desc,
+                ws_desc,
+                x_buffer.index(j),
+                w_buffer.index(j),
+                ws_buffer.index(j),
+                j,
+                GatherIndx,
+                offs_x_m,
+                offs_x_m_scalar,
+                off_w_n,
+                off_w_n_scale,
+                BLOCK_K,
+                PACKED_BLOCK_K_W,
+                PACKED_MX_BLOCK,
+            )
+
+        main_iters = num_k_iter - (NUM_BUFFERS - 1)
+        for ki in range(main_iters):
+            prefetch_ki = ki + NUM_BUFFERS - 1
+            # WAR guard: the prefetch overwrites the LDS slot a prior iteration read.
+            gl.barrier()
+            _tdm_load_tile(
+                x_desc,
+                w_desc,
+                ws_desc,
+                x_buffer.index(prefetch_ki % NUM_BUFFERS),
+                w_buffer.index(prefetch_ki % NUM_BUFFERS),
+                ws_buffer.index(prefetch_ki % NUM_BUFFERS),
+                prefetch_ki,
+                GatherIndx,
+                offs_x_m,
+                offs_x_m_scalar,
+                off_w_n,
+                off_w_n_scale,
+                BLOCK_K,
+                PACKED_BLOCK_K_W,
+                PACKED_MX_BLOCK,
+            )
+            # Leave the NUM_BUFFERS-1 prefetched-ahead tiles outstanding; tile ki done.
+            gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_TDM_OPS)
+            # RAW guard: TDM writes visible CTA-wide before the LDS read.
+            gl.barrier()
+
+            cur_slot = ki % NUM_BUFFERS
+            x_tile, w_packed, w_scale = _preload_tile(
+                x_buffer.index(cur_slot),
+                w_buffer.index(cur_slot),
+                ws_buffer.index(cur_slot),
+                DOT_LAYOUT_X,
+                L_IN_W,
+                L_SCALE_W,
+                COMPACT_SCALE_LAYOUT,
+                SWIZZLE_MX_SCALE,
+                BLOCK_N,
+                BLOCK_K,
+                MX_SCALE_BLOCK_K,
                 MX_PACK_DIVISOR,
+                PRESHUFFLE_FACTOR,
+                SCALE_KWIDTH,
             )
-            w_scale = ws_buffer_slice.load(layout=COMPACT_SCALE_LAYOUT)
-            w_scale = _expand_mx_scale_k(w_scale, BLOCK_N, MX_SCALE_BLOCK_K)
-            w_scale = gl.convert_layout(w_scale.trans(1, 0), layout=L_SCALE_W)
-        else:
-            # Free scale path: view L_SCALE_W as (K/32, 32, N) and load the compact
-            # scale (permuted K-major from LDS) directly into that view's SliceLayout,
-            # so expand_dims+broadcast is a zero-cost un-slice -> reshape to (K,N)==
-            # L_SCALE_W. No trans, no convert_layout, no ds_store (the transpose is
-            # baked into the permute-load's LDS addressing, like the weight).
-            _dummy = gl.full((BLOCK_K, BLOCK_N), 0, gl.uint8, layout=L_SCALE_W)
-            _d3 = _dummy.reshape(MX_SCALE_BLOCK_K, MX_PACK_DIVISOR, BLOCK_N)
-            L_SCALE_3D: gl.constexpr = _d3.type.layout
-            w_scale = ws_buffer.index(0).permute([1, 0]).load(
-                layout=gl.SliceLayout(1, L_SCALE_3D)
+            w_kn = gl.amd.gfx1250.scaled_upcast(w_packed, w_scale, gl.bfloat16, axis=0)
+            acc = gl.amd.gfx1250.wmma(x_tile, w_kn, acc)
+
+        # Epilogue: drain the last NUM_BUFFERS-1 already-prefetched tiles.
+        for i in gl.static_range(NUM_BUFFERS - 1):
+            gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * NUM_TDM_OPS)
+            gl.barrier()
+            cur_slot = (main_iters + i) % NUM_BUFFERS
+            x_tile, w_packed, w_scale = _preload_tile(
+                x_buffer.index(cur_slot),
+                w_buffer.index(cur_slot),
+                ws_buffer.index(cur_slot),
+                DOT_LAYOUT_X,
+                L_IN_W,
+                L_SCALE_W,
+                COMPACT_SCALE_LAYOUT,
+                SWIZZLE_MX_SCALE,
+                BLOCK_N,
+                BLOCK_K,
+                MX_SCALE_BLOCK_K,
+                MX_PACK_DIVISOR,
+                PRESHUFFLE_FACTOR,
+                SCALE_KWIDTH,
             )
-            w_scale = gl.expand_dims(w_scale, 1)
-            w_scale, _ = gl.broadcast(w_scale, _d3)
-            w_scale = w_scale.reshape(BLOCK_K, BLOCK_N)
-        # output is k_width=8 == DOT_LAYOUT_W already; feed straight to the WMMA.
-        w_kn = gl.amd.gfx1250.scaled_upcast(w_packed, w_scale, gl.bfloat16, axis=0)
-        acc = gl.amd.gfx1250.wmma(x_tile, w_kn, acc)
+            w_kn = gl.amd.gfx1250.scaled_upcast(w_packed, w_scale, gl.bfloat16, axis=0)
+            acc = gl.amd.gfx1250.wmma(x_tile, w_kn, acc)
 
     # bias / activation / write-back
     if B is not None:
