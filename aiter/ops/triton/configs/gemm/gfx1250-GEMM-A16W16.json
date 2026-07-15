@@ -1,10 +1,42 @@
 {
+    "M_LEQ_64": {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 2,
+        "cache_modifier": ".cg",
+        "NUM_KSPLIT": 1
+    },
+    "M_LEQ_128": {
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 2,
+        "cache_modifier": ".cg",
+        "NUM_KSPLIT": 1
+    },
+    "M_LEQ_256": {
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 2,
+        "cache_modifier": ".cg",
+        "NUM_KSPLIT": 1
+    },
     "any": {
-        "BLOCK_M": 32,
-        "BLOCK_N": 64,
-        "BLOCK_K": 64,
-        "NUM_BUFFERS": 5,
-        "num_warps": 2,
-        "kernel_type": "bandwidth_bound"
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 64,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 2,
+        "cache_modifier": ".cg",
+        "NUM_KSPLIT": 1
     }
 }
