@@ -197,13 +197,24 @@ def get_kernel_config_gluon(m, n, k, routing_data):
         # projection-dependent knob: gate/up (deep K=6144) prefers 2, down
         # (K=3072) prefers 8.
         block_n = 256
-        block_k = 512
         num_warps = 4
         num_stages = 2
         waves_per_eu = 0
         group_m = 4
-        num_buffers = 1
         xcd_swizzle = 2 if k >= 4096 else 8
+        # LDS budget. The a16w4 Gluon mainloop keeps `num_buffers` resident
+        # copies of the BLOCK_M x BLOCK_K bf16 activation tile plus the
+        # BLOCK_K x BLOCK_N mxfp4 weight tile (~num_buffers * BLOCK_K *
+        # (BLOCK_M*2 + BLOCK_N*0.5) bytes + a small mxfp4-scale overhead). On
+        # gfx1250 (320 KB LDS) BLOCK_M=128/BLOCK_N=256 with a 512-deep K tile
+        # only fits single-buffered (~207 KB); double-buffering
+        # (AITER_MOE_A16W4_GLUON_NUM_BUFFERS=2) at BLOCK_K=512 needs ~404 KB
+        # and overflows ("out of resource: shared memory"). Halving to a
+        # 256-deep K tile halves the footprint (~217 KB) so the double-buffered
+        # prefill kernel stays resident. Resolve the effective num_buffers
+        # (env override included) first, then size BLOCK_K to the budget.
+        num_buffers = _env_config_int("AITER_MOE_A16W4_GLUON", "NUM_BUFFERS", k, 1)
+        block_k = 256 if num_buffers >= 2 else 512
 
     return {
         "block_m": block_m,

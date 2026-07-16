@@ -584,10 +584,30 @@ def _moe_gemm_a16w4(
             )
 
         main_iters = num_k_iter - (NUM_BUFFERS - 1)
+        gl.barrier()
         for ki in range(main_iters):
             prefetch_ki = ki + NUM_BUFFERS - 1
+
+            cur_slot = ki % NUM_BUFFERS
+            x_tile, w_packed, w_scale = _preload_tile(
+                x_buffer.index(cur_slot),
+                w_buffer.index(cur_slot),
+                ws_buffer.index(cur_slot),
+                DOT_LAYOUT_X,
+                L_IN_W,
+                L_SCALE_W,
+                COMPACT_SCALE_LAYOUT,
+                SWIZZLE_MX_SCALE,
+                BLOCK_N,
+                BLOCK_K,
+                MX_SCALE_BLOCK_K,
+                MX_PACK_DIVISOR,
+                PRESHUFFLE_FACTOR,
+                SCALE_KWIDTH,
+            )
+            w_kn = gl.amd.gfx1250.scaled_upcast(w_packed, w_scale, gl.bfloat16, axis=0)
+            acc = gl.amd.gfx1250.wmma(x_tile, w_kn, acc)
             # WAR guard: the prefetch overwrites the LDS slot a prior iteration read.
-            gl.barrier()
             _tdm_load_tile(
                 x_desc,
                 w_desc,
@@ -609,26 +629,6 @@ def _moe_gemm_a16w4(
             gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_TDM_OPS)
             # RAW guard: TDM writes visible CTA-wide before the LDS read.
             gl.barrier()
-
-            cur_slot = ki % NUM_BUFFERS
-            x_tile, w_packed, w_scale = _preload_tile(
-                x_buffer.index(cur_slot),
-                w_buffer.index(cur_slot),
-                ws_buffer.index(cur_slot),
-                DOT_LAYOUT_X,
-                L_IN_W,
-                L_SCALE_W,
-                COMPACT_SCALE_LAYOUT,
-                SWIZZLE_MX_SCALE,
-                BLOCK_N,
-                BLOCK_K,
-                MX_SCALE_BLOCK_K,
-                MX_PACK_DIVISOR,
-                PRESHUFFLE_FACTOR,
-                SCALE_KWIDTH,
-            )
-            w_kn = gl.amd.gfx1250.scaled_upcast(w_packed, w_scale, gl.bfloat16, axis=0)
-            acc = gl.amd.gfx1250.wmma(x_tile, w_kn, acc)
 
         # Epilogue: drain the last NUM_BUFFERS-1 already-prefetched tiles.
         for i in gl.static_range(NUM_BUFFERS - 1):
@@ -697,6 +697,338 @@ def _moe_gemm_a16w4(
     out = out.to(gl.bfloat16)
 
     # TDM Store: accumulator -> shared memory -> global memory
+    Y += start_m.to(index_type) * stride_y_m
+    y_buffer = gl.allocate_shared_memory(
+        Y.type.element_ty,
+        shape=[BLOCK_M, OUT_BLOCK_N],
+        layout=SHARED_LAYOUT_Y,
+    )
+    y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=Y,
+        shape=(M, yN),
+        strides=(stride_y_m, stride_y_n),
+        block_shape=(BLOCK_M, OUT_BLOCK_N),
+        layout=SHARED_LAYOUT_Y,
+    )
+    y_buffer.store(out)
+    gl.amd.gfx1250.tdm.async_store(
+        y_desc, [block_id * BLOCK_M, pid_n * OUT_BLOCK_N], y_buffer
+    )
+    gl.amd.gfx1250.tdm.async_wait(0)
+
+
+@gluon.jit(launch_metadata=matmul_launch_metadata)
+def _moe_gemm_a16w4_memacc(
+    Y,
+    stride_y_k,
+    stride_y_m,
+    stride_y_n,
+    X,
+    stride_x_m,
+    stride_x_k,
+    W,
+    stride_w_e,
+    stride_w_k,
+    stride_w_n,
+    WMxScale,  # E8M0 compact scale (one byte per 32 values along K)
+    stride_w_mx_e,
+    stride_w_mx_n,
+    stride_w_mx_k,
+    B,
+    stride_b_e,  # Bias
+    Gammas,
+    num_tokens,
+    N,
+    K,  # shapes
+    # expt data
+    GatherIndx,
+    ExptHist,
+    ExptOffs,
+    ExptOffsSum,
+    ExptData,
+    # true grid size
+    grid_m,
+    grid_n,
+    # fused activation function
+    APPLY_SWIGLU: gl.constexpr,
+    alpha,
+    limit,
+    ACTIVATION_REDUCTION_N: gl.constexpr,
+    ADD_RESIDUAL: gl.constexpr,
+    # MoE config
+    N_EXPTS_ACT: gl.constexpr,
+    # optimization config
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    GROUP_M: gl.constexpr,
+    XCD_SWIZZLE: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr,
+    # Must be None: the kernel takes pre-expanded e8m0 scales (one byte per fp4 element).
+    SWIZZLE_MX_SCALE: gl.constexpr,
+    EVEN_K: gl.constexpr,
+    SPLIT_K: gl.constexpr,
+    W_CACHE_MODIFIER: gl.constexpr,
+    num_warps: gl.constexpr,
+    UPCAST_INDICES: gl.constexpr = False,
+):
+    # Memory-access-only twin of `_moe_gemm_a16w4`.
+    #
+    # It reproduces the *exact global-memory access pattern* of the real kernel --
+    # the same PID/expert remapping, the same per-K-tile TDM async loads of X,
+    # packed-fp4 W and the e8m0 W-scale into LDS (single-buffer or NUM_BUFFERS>=2
+    # prefetch pipeline), and the same final TDM store of a (BLOCK_M, OUT_BLOCK_N)
+    # Y tile -- but performs NEITHER the LDS -> register operand loads
+    # (`_preload_tile`) NOR the `scaled_upcast` + `wmma` compute. The accumulator
+    # is a constant zero tile.
+    #
+    # Purpose: isolate the DRAM/L2 bandwidth lower bound of the GEMM from its WMMA
+    # compute. Comparing this kernel's runtime against `_moe_gemm_a16w4` for a
+    # given shape/config tells you how much of the latency is memory-bound vs.
+    # compute-bound. It is NOT numerically meaningful (Y is all zeros).
+    MX_PACK_DIVISOR: gl.constexpr = 32
+    NUM_TDM_OPS: gl.constexpr = 3  # X, W (fp4 packed), W_scale (e8m0 expanded)
+    w_type: gl.constexpr = W.dtype.element_ty
+    gl.static_assert(w_type == gl.uint8, "mx_weight_ptr must be uint8")
+    gl.static_assert(
+        WMxScale.dtype.element_ty == gl.uint8, "mx_scale_ptr must be uint8"
+    )
+    gl.static_assert(
+        BLOCK_K % MX_PACK_DIVISOR == 0, "BLOCK_K must be a multiple of MX_PACK_DIVISOR"
+    )
+    gl.static_assert(num_warps == 4 or num_warps == 8, "num_warps must be 4 or 8")
+
+    OUT_BLOCK_N: gl.constexpr = BLOCK_N // ACTIVATION_REDUCTION_N
+    yN = N // ACTIVATION_REDUCTION_N
+
+    pid = gl.program_id(0)
+
+    index_type: gl.constexpr = gl.int64 if UPCAST_INDICES else gl.int32
+
+    if XCD_SWIZZLE != 1:
+        padding_m = grid_m - gl.load(ExptOffsSum)
+        unpadded_m = grid_m - padding_m
+        total_actual_tiles = unpadded_m * grid_n
+        if padding_m > 0 and pid >= total_actual_tiles:
+            return
+        pid = remap_xcd(pid, total_actual_tiles, XCD_SWIZZLE)
+    else:
+        unpadded_m = grid_m
+
+    pid_m, pid_n = pid_grid(pid, unpadded_m, grid_n, 1)
+
+    # unpack expert data
+    expt_data = gl.load(ExptData + pid_m)
+    if XCD_SWIZZLE == 1 and expt_data == -1:
+        return
+    expt_id = expt_data & 0x0000FFFF
+    block_id = expt_data >> 16
+    M = gl.load(ExptHist + expt_id)
+    start_m = gl.load(ExptOffs + expt_id)
+
+    # X / gather offsets
+    offs_x_m_scalar = BLOCK_M * block_id
+    if GatherIndx is None:
+        X += start_m.to(index_type) * stride_x_m
+        offs_x_m = offs_x_m_scalar  # unused in non-gather path
+    else:
+        if GatherIndx.dtype.element_ty == gl.uint16:
+            IDX_LAYOUT: gl.constexpr = gl.SliceLayout(
+                0, gl.BlockedLayout([1, 16], [32, 1], [1, num_warps], [0, 1])
+            )
+            oob_idx = num_tokens
+        else:
+            gl.static_assert(
+                GatherIndx.dtype.element_ty == gl.int32,
+                "Gather index datatype should be uint16 or int32",
+            )
+            IDX_LAYOUT: gl.constexpr = gl.SliceLayout(
+                0, gl.BlockedLayout([1, 8], [32, 1], [1, num_warps], [0, 1])
+            )
+            oob_idx = num_tokens
+
+        offs_x_m = BLOCK_M * block_id + gl.arange(0, BLOCK_M, layout=IDX_LAYOUT)
+        mask_idx = offs_x_m < M
+        offs_x_m = offs_x_m % M
+        GatherIndx += start_m
+        offs_x_m = gl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
+        offs_x_m = gl.where(mask_idx, offs_x_m, oob_idx)
+
+    W_K_DIVISOR: gl.constexpr = 2  # fp4: two values packed per uint8 along K
+    W_N_DIVISOR: gl.constexpr = 1
+    PACKED_BLOCK_K_W: gl.constexpr = BLOCK_K // W_K_DIVISOR
+    PACKED_BLOCK_N_W: gl.constexpr = BLOCK_N // W_N_DIVISOR
+    MX_SCALE_BLOCK_K: gl.constexpr = BLOCK_K // MX_PACK_DIVISOR
+
+    off_w_n = pid_n * PACKED_BLOCK_N_W
+
+    W += expt_id.to(index_type) * stride_w_e
+    WMxScale += expt_id.to(index_type) * stride_w_mx_e
+    if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
+        gl.static_assert(stride_w_mx_k is not None)
+        gl.static_assert(stride_w_mx_n is not None)
+        PRESHUFFLE_FACTOR: gl.constexpr = 32
+        PACKED_MX_BLOCK: gl.constexpr = MX_SCALE_BLOCK_K * PRESHUFFLE_FACTOR
+        SCALE_BLOCK_N: gl.constexpr = BLOCK_N // PRESHUFFLE_FACTOR
+    else:
+        PRESHUFFLE_FACTOR: gl.constexpr = 1
+        PACKED_MX_BLOCK: gl.constexpr = MX_SCALE_BLOCK_K
+        SCALE_BLOCK_N: gl.constexpr = BLOCK_N
+
+    off_w_n_scale = pid_n * SCALE_BLOCK_N
+
+    SHARED_LAYOUT_X: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[BLOCK_K, 8]], [BLOCK_M, BLOCK_K], [1, 0]
+    )
+    SHARED_LAYOUT_W: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[PACKED_BLOCK_K_W, 16]], [BLOCK_N, PACKED_BLOCK_K_W], [1, 0]
+    )
+    SHARED_LAYOUT_W_SCALES: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[BLOCK_K, 16]],
+        [SCALE_BLOCK_N, PACKED_MX_BLOCK],
+        [1, 0],
+    )
+    SHARED_LAYOUT_Y: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[OUT_BLOCK_N, 8]], [BLOCK_M, OUT_BLOCK_N], [1, 0]
+    )
+    # A plain WMMA layout, used ONLY to materialise the zero output tile in a
+    # layout the Y shared buffer accepts (no dot operands / wmma are issued).
+    if num_warps == 4:
+        WARP_BASES: gl.constexpr = [[0, 1], [1, 0]]
+    else:
+        WARP_BASES: gl.constexpr = [[0, 1], [1, 0], [2, 0]]
+    WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
+        version=3,
+        transposed=True,
+        warp_bases=WARP_BASES,
+        reg_bases=[],
+        instr_shape=[16, 16, 32],
+    )
+
+    if GatherIndx is None:
+        x_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=X,
+            shape=(M, K),
+            strides=(stride_x_m, stride_x_k),
+            block_shape=(BLOCK_M, BLOCK_K),
+            layout=SHARED_LAYOUT_X,
+        )
+    else:
+        x_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=X,
+            shape=(num_tokens, K),
+            strides=(stride_x_m, stride_x_k),
+            block_shape=(BLOCK_M, BLOCK_K),
+            layout=SHARED_LAYOUT_X,
+        )
+
+    w_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=W,
+        shape=(N, K // W_K_DIVISOR),
+        strides=(stride_w_n, stride_w_k),
+        block_shape=(BLOCK_N, PACKED_BLOCK_K_W),
+        layout=SHARED_LAYOUT_W,
+    )
+
+    ws_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=WMxScale,
+        shape=(N // PRESHUFFLE_FACTOR, tl.cdiv(K, MX_PACK_DIVISOR) * PRESHUFFLE_FACTOR),
+        strides=(stride_w_mx_n, stride_w_mx_k),
+        block_shape=(SCALE_BLOCK_N, PACKED_MX_BLOCK),
+        layout=SHARED_LAYOUT_W_SCALES,
+    )
+
+    x_buffer = gl.allocate_shared_memory(
+        x_desc.dtype, shape=[NUM_BUFFERS] + x_desc.block_shape, layout=x_desc.layout
+    )
+    w_buffer = gl.allocate_shared_memory(
+        w_desc.dtype, shape=[NUM_BUFFERS] + w_desc.block_shape, layout=w_desc.layout
+    )
+    ws_buffer = gl.allocate_shared_memory(
+        ws_desc.dtype,
+        shape=[NUM_BUFFERS] + ws_desc.block_shape,
+        layout=ws_desc.layout,
+    )
+
+    num_k_iter = tl.cdiv(K, BLOCK_K)
+
+    if NUM_BUFFERS == 1:
+        # Non-pipelined: load one K tile, wait, (skip consume), repeat.
+        for ki in range(num_k_iter):
+            _tdm_load_tile(
+                x_desc,
+                w_desc,
+                ws_desc,
+                x_buffer.index(0),
+                w_buffer.index(0),
+                ws_buffer.index(0),
+                ki,
+                GatherIndx,
+                offs_x_m,
+                offs_x_m_scalar,
+                off_w_n,
+                off_w_n_scale,
+                BLOCK_K,
+                PACKED_BLOCK_K_W,
+                PACKED_MX_BLOCK,
+            )
+            gl.amd.gfx1250.tdm.async_wait(0)
+            # RAW/consume barrier kept so the LDS writes are ordered CTA-wide and
+            # the async loads cannot be dead-store-eliminated as pure no-ops.
+            gl.barrier()
+    else:
+        # LDS-prefetch pipeline (mirrors the real kernel's load schedule).
+        for j in gl.static_range(NUM_BUFFERS - 1):
+            _tdm_load_tile(
+                x_desc,
+                w_desc,
+                ws_desc,
+                x_buffer.index(j),
+                w_buffer.index(j),
+                ws_buffer.index(j),
+                j,
+                GatherIndx,
+                offs_x_m,
+                offs_x_m_scalar,
+                off_w_n,
+                off_w_n_scale,
+                BLOCK_K,
+                PACKED_BLOCK_K_W,
+                PACKED_MX_BLOCK,
+            )
+
+        main_iters = num_k_iter - (NUM_BUFFERS - 1)
+        gl.barrier()
+        for ki in range(main_iters):
+            prefetch_ki = ki + NUM_BUFFERS - 1
+            _tdm_load_tile(
+                x_desc,
+                w_desc,
+                ws_desc,
+                x_buffer.index(prefetch_ki % NUM_BUFFERS),
+                w_buffer.index(prefetch_ki % NUM_BUFFERS),
+                ws_buffer.index(prefetch_ki % NUM_BUFFERS),
+                prefetch_ki,
+                GatherIndx,
+                offs_x_m,
+                offs_x_m_scalar,
+                off_w_n,
+                off_w_n_scale,
+                BLOCK_K,
+                PACKED_BLOCK_K_W,
+                PACKED_MX_BLOCK,
+            )
+            gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_TDM_OPS)
+            gl.barrier()
+
+        # Epilogue: drain the last NUM_BUFFERS-1 already-prefetched tiles.
+        for i in gl.static_range(NUM_BUFFERS - 1):
+            gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * NUM_TDM_OPS)
+            gl.barrier()
+
+    # Zero write-back preserving the real kernel's Y store access pattern.
+    out = gl.zeros((BLOCK_M, OUT_BLOCK_N), dtype=gl.bfloat16, layout=WMMA_LAYOUT)
+
     Y += start_m.to(index_type) * stride_y_m
     y_buffer = gl.allocate_shared_memory(
         Y.type.element_ty,
