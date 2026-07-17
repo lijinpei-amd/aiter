@@ -140,7 +140,11 @@ def _tdm_load_tile(
     if GatherIndx is None:
         gl.amd.gfx1250.tdm.async_load(x_desc, [offs_x_m_scalar, ki * BLOCK_K], x_slot)
     else:
-        gl.amd.gfx1250.tdm.async_gather(x_desc, offs_x_m, ki * BLOCK_K, x_slot)
+        # gl.amd.gfx1250.tdm.async_gather(x_desc, offs_x_m, ki * BLOCK_K, x_slot)
+        x_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+            x_desc, add_offsets=[0, ki * BLOCK_K], clamp_bounds=True
+        )
+        gl.amd.gfx1250.tdm.async_gather(x_desc, offs_x_m, x_slot)
     gl.amd.gfx1250.tdm.async_load(w_desc, [off_w_n, ki * PACKED_BLOCK_K_W], w_slot)
     gl.amd.gfx1250.tdm.async_load(ws_desc, [off_w_n_scale, ki * PACKED_MX_BLOCK], ws_slot)
 
@@ -189,7 +193,7 @@ def _preload_tile(
 
 
 @gluon.jit(launch_metadata=matmul_launch_metadata)
-def _moe_gemm_a16w4(
+def _moe_gemm_a16w4_gluon(
     Y,
     stride_y_k,
     stride_y_m,
@@ -352,7 +356,24 @@ def _moe_gemm_a16w4(
     # WMMA layout for plain bf16 x bf16: instr_shape [16, 16, 32], k_width=8.
     # (Gluon wmma_scaled has no bf16 lhs, so a16w4 must upcast fp4->bf16 via
     # scaled_upcast and use a plain bf16 x bf16 WMMA.)
-    if num_warps == 4:
+    #
+    # warp_bases entries are in units of the 16x16 WMMA instr tile: [1, 0] steps
+    # one 16-row M-tile, [0, 1] steps one 16-col N-tile.
+    if BLOCK_M == 16:
+        # Decode: BLOCK_M spans a single 16-row WMMA M-tile, so any warp placed
+        # along M ([1, 0]/[2, 0]) would recompute duplicate rows AND redundantly
+        # re-read the same N-slice of the W (B) operand from LDS. Put every warp
+        # along N so each owns a distinct 16-col N-tile. Valid because the decode
+        # config guarantees BLOCK_N >= num_warps * 16 (no N over-span/wrap).
+        gl.static_assert(
+            BLOCK_N >= num_warps * 16,
+            "decode warp-along-N layout requires BLOCK_N >= num_warps * 16",
+        )
+        if num_warps == 4:
+            WARP_BASES: gl.constexpr = [[0, 1], [0, 2]]
+        else:
+            WARP_BASES: gl.constexpr = [[0, 1], [0, 2], [0, 4]]
+    elif num_warps == 4:
         WARP_BASES: gl.constexpr = [[0, 1], [1, 0]]
     else:
         WARP_BASES: gl.constexpr = [[0, 1], [1, 0], [2, 0]]

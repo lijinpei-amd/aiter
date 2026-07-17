@@ -7,10 +7,10 @@ import torch
 import triton
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a16w4 import (
-    _moe_gemm_a16w4 as _moe_gemm_a16w4_triton,
+    _moe_gemm_a16w4_triton,
 )
 from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a16w4 import (
-    _moe_gemm_a16w4 as _moe_gemm_a16w4_gluon,
+    _moe_gemm_a16w4_gluon,
 )
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton.arch_info import get_arch
@@ -183,21 +183,28 @@ def get_kernel_config_gluon(m, n, k, routing_data):
         num_warps = 4
     elif block_m == 32:
         block_n = 128
+        # For block_m > 16 the A tile (block_m x block_k) grows with block_m, so
+        # the wide 512-deep K tile blows past the LDS budget on GPUs with a
+        # 320 KB shared-memory limit. Halve BLOCK_K to 256 to fit.
+        block_k = 256
         num_warps = 4
     else:
         # Large-block prefill (block_m=128) on gfx1250, re-tuned for the
         # MiniMax-M3 A16W4 routed GEMMs (N=6144, K in {6144, 3072}, M = routed
         # prefill tokens in [~6.5k, 131k]) via per-shape CUDA-event sweeps of
-        # each _moe_gemm_a16w4 launch in isolation. A 256-wide N tile with a
-        # 512-deep K tile, 4 warps, 2 pipeline stages and a single buffer beat
-        # every other candidate (incl. the tuned Triton path) consistently
-        # across M -- the grid is >=7968 CTAs so the GPU is saturated and the
-        # optimum is essentially M-independent. ~18% faster per GEMM than tuned
-        # Triton, ~15% end-to-end on the fused path. xcd_swizzle is the only
-        # projection-dependent knob: gate/up (deep K=6144) prefers 2, down
-        # (K=3072) prefers 8.
+        # each _moe_gemm_a16w4 launch in isolation. A 256-wide N tile, 4 warps,
+        # 2 pipeline stages and a single buffer beat every other candidate
+        # (incl. the tuned Triton path) consistently across M -- the grid is
+        # >=7968 CTAs so the GPU is saturated and the optimum is essentially
+        # M-independent. xcd_swizzle is the only projection-dependent knob:
+        # gate/up (deep K=6144) prefers 2, down (K=3072) prefers 8.
+        #
+        # BLOCK_K: the tuned optimum is 512, but with block_m=128 that needs
+        # ~404 KB of LDS -- more than the 320 KB hardware limit here, so the
+        # 512-deep K tile fails to launch (OutOfResources: shared memory).
+        # 256 fits within budget; for block_m > 16 we always cap BLOCK_K at 256.
         block_n = 256
-        block_k = 512
+        block_k = 256
         num_warps = 4
         num_stages = 2
         waves_per_eu = 0
@@ -235,11 +242,12 @@ def get_kernel_config_gluon(m, n, k, routing_data):
 def _selected_backend() -> str:
     backend = os.environ.get("AITER_MOE_A16W4_BACKEND")
     if backend is None:
-        # Default to "auto": gfx1250 large-block (block_m>=64) prefill GEMMs run
-        # on the tuned Gluon path (see get_kernel_config_gluon), while small
-        # block_m decode-style shapes stay on Triton. Set AITER_MOE_A16W4_BACKEND
-        # explicitly to override.
-        backend = "gluon" if os.environ.get("AITER_MOE_A16W4_GLUON") == "1" else "auto"
+        # Default to "gluon": the tuned Gluon path (see get_kernel_config_gluon)
+        # is now the default backend. Set AITER_MOE_A16W4_GLUON=0 to fall back to
+        # the "auto" behavior (gfx1250 large-block block_m>=64 prefill GEMMs on
+        # Gluon, small block_m decode-style shapes on Triton), or set
+        # AITER_MOE_A16W4_BACKEND explicitly to override.
+        backend = "auto" if os.environ.get("AITER_MOE_A16W4_GLUON") == "0" else "gluon"
     backend = backend.lower()
     if backend not in {"triton", "gluon", "auto"}:
         raise ValueError(f"unknown AITER_MOE_A16W4_BACKEND={backend!r}")
