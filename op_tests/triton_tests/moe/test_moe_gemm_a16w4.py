@@ -5,6 +5,9 @@ from dataclasses import dataclass, fields
 import pytest
 import torch
 
+# backend selection for moe_gemm_a16w4 (triton vs gfx1250 gluon)
+from aiter.ops.triton.utils._triton.arch_info import get_arch
+
 # routing utilities
 from aiter.ops.triton.moe.moe_routing.routing import routing
 
@@ -179,6 +182,11 @@ class Case:
             Case(4, 4, 8, 128, 4),
             Case(4, 1024, 3072, 128, 4),
             Case(32, 6144, 3072, 128, 4),
+            # Decode with a deep K (>=4096): block_m=16 (16*4//8=8 -> 16) and
+            # K=6144 exercises the gluon stage-2 (NUM_BUFFERS=2) LDS-prefetch
+            # path for the gate/up projection. E kept at 8 so E*K*N stays under
+            # 2**31 and the bulk upcast_from_mxfp reference does not overflow.
+            Case(16, 6144, 6144, 8, 4),
             Case(16, 1024, 1024, 128, 4),
             Case(16, 256, 256, 128, 4),
             Case(4096, 256, 256, 128, 4),
@@ -211,6 +219,7 @@ class Case:
 )
 @pytest.mark.parametrize("has_y_gammas", [False, True])
 @pytest.mark.parametrize("apply_swiglu", [False, True])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_op(
     m,
     n,
@@ -222,11 +231,27 @@ def test_op(
     n_expts_tot,
     n_expts_act,
     hbm_swizzling,
+    backend,
+    monkeypatch,
     device="cuda",
 ):
 
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
+
+    # Select the moe_gemm_a16w4 backend. The env var is read at call time in
+    # moe_gemm_a16w4._selected_backend(), so monkeypatch (auto-restored) is enough.
+    monkeypatch.setenv("AITER_MOE_A16W4_BACKEND", backend)
+    if backend == "gluon":
+        # The gluon a16w4 kernel only dispatches on gfx1250 (else moe_gemm_a16w4
+        # silently falls back to Triton, making the "gluon" run a duplicate).
+        if get_arch() != "gfx1250":
+            pytest.skip("gluon a16w4 backend is only available on gfx1250")
+        # Gluon supports swizzle_mx_scale in {None, GFX1250_SCALE}; it does not
+        # support CDNA4_SCALE (what hbm_swizzling produces) and has a known
+        # accuracy bug with swizzled scales under swiglu.
+        if hbm_swizzling:
+            pytest.skip("gluon a16w4 backend does not support CDNA4_SCALE swizzling")
 
     if hbm_swizzling:
         if not arch_info.is_mx_scale_preshuffling_avail():

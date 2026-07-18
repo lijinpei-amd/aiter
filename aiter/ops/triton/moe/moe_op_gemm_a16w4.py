@@ -10,7 +10,8 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a16w4 import (
     _moe_gemm_a16w4_triton,
 )
 from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a16w4 import (
-    _moe_gemm_a16w4_gluon,
+    _moe_gemm_a16w4_gluon_stage1,
+    _moe_gemm_a16w4_gluon_stage2,
 )
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton.arch_info import get_arch
@@ -181,6 +182,13 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     if block_m == 16:
         block_n = 128
         num_warps = 4
+        # Decode (block_m=16): the deep-K gate/up projection (K=6144, 12 K-iters
+        # at BLOCK_K=512) hides TDM latency behind compute, so the stage-2
+        # LDS-prefetch pipeline (NUM_BUFFERS=2) beats single-buffer by ~4-14%
+        # across decode M (biggest at M=1). The shallow-K down projection
+        # (K=3072, 6 iters) regresses under stage-2 at M>=16, so it stays
+        # single-buffered. Verified bit-identical to NUM_BUFFERS=1 output.
+        num_buffers = 2 if k >= 4096 else 1
     elif block_m == 32:
         block_n = 128
         # For block_m > 16 the A tile (block_m x block_k) grows with block_m, so
@@ -189,27 +197,30 @@ def get_kernel_config_gluon(m, n, k, routing_data):
         block_k = 256
         num_warps = 4
     else:
-        # Large-block prefill (block_m=128) on gfx1250, re-tuned for the
-        # MiniMax-M3 A16W4 routed GEMMs (N=6144, K in {6144, 3072}, M = routed
-        # prefill tokens in [~6.5k, 131k]) via per-shape CUDA-event sweeps of
-        # each _moe_gemm_a16w4 launch in isolation. A 256-wide N tile, 4 warps,
-        # 2 pipeline stages and a single buffer beat every other candidate
-        # (incl. the tuned Triton path) consistently across M -- the grid is
-        # >=7968 CTAs so the GPU is saturated and the optimum is essentially
-        # M-independent. xcd_swizzle is the only projection-dependent knob:
-        # gate/up (deep K=6144) prefers 2, down (K=3072) prefers 8.
+        # Large-block prefill (block_m>=64) on gfx1250, tuned for the MiniMax-M3
+        # A16W4 routed GEMMs (N=6144, K in {6144, 3072}) via do_bench sweeps of
+        # each _moe_gemm_a16w4 launch at a saturated grid (~13.7k CTAs).
         #
-        # BLOCK_K: the tuned optimum is 512, but with block_m=128 that needs
-        # ~404 KB of LDS -- more than the 320 KB hardware limit here, so the
-        # 512-deep K tile fails to launch (OutOfResources: shared memory).
-        # 256 fits within budget; for block_m > 16 we always cap BLOCK_K at 256.
-        block_n = 256
+        # Winner: a 128-wide N tile with the stage-2 (NUM_BUFFERS=2) LDS-prefetch
+        # pipeline. Halving BLOCK_N (256->128) halves the W + scale LDS footprint,
+        # which lets the double-buffered X/W tiles fit the 320 KB budget while
+        # doubling the grid (grid_n 24->48) to keep the GPU saturated -- ~24%
+        # faster on gate/up (K=6144) and ~25% on down (K=3072) vs the old
+        # single-buffer BLOCK_N=256 config. (An earlier stage-2 attempt at
+        # BLOCK_N=256 regressed -- too wide to double-buffer -- which is why
+        # single-buffer was previously preferred.)
+        #
+        # BLOCK_K stays 256: 512 needs ~404 KB LDS at block_m=128 (> 320 KB, fails
+        # to launch) and stage-2 has a correctness floor of BLOCK_K>=256, so 256
+        # is the only valid choice. xcd_swizzle is projection-dependent: gate/up
+        # (deep K=6144) prefers 2, down (K=3072) prefers 8.
+        block_n = 128
         block_k = 256
         num_warps = 4
         num_stages = 2
         waves_per_eu = 0
         group_m = 4
-        num_buffers = 1
+        num_buffers = 2
         xcd_swizzle = 2 if k >= 4096 else 8
 
     return {
@@ -367,7 +378,18 @@ def moe_gemm_a16w4(
     # launch kernel
     if use_gluon:
         w_scales_kernel = w_scales.transpose(1, 2)
-        _moe_gemm_a16w4_gluon[(grid,)](
+        # stage-1 (single buffer) and stage-2 (LDS-prefetch double buffer) are
+        # separate named kernels; pick by the resolved buffer count so profiles
+        # attribute time to the pipeline that actually ran.
+        num_buffers = max(
+            1, min(config["num_buffers"], triton.cdiv(K, config["block_k"]))
+        )
+        gluon_kernel = (
+            _moe_gemm_a16w4_gluon_stage1
+            if num_buffers == 1
+            else _moe_gemm_a16w4_gluon_stage2
+        )
+        gluon_kernel[(grid,)](
             y,
             y.stride(0),
             y.stride(1),
@@ -407,9 +429,7 @@ def moe_gemm_a16w4(
             config["block_k"],
             config["group_m"],
             XCD_SWIZZLE=config["xcd_swizzle"],
-            NUM_BUFFERS=max(
-                1, min(config["num_buffers"], triton.cdiv(K, config["block_k"]))
-            ),
+            NUM_BUFFERS=num_buffers,
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
             SPLIT_K=config["split_k"],
             EVEN_K=K % config["block_k"] == 0,

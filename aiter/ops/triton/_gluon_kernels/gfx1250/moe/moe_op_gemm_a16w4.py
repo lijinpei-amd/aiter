@@ -192,8 +192,8 @@ def _preload_tile(
     return x_tile, w_packed, w_scale
 
 
-@gluon.jit(launch_metadata=matmul_launch_metadata)
-def _moe_gemm_a16w4_gluon(
+@gluon.jit
+def _moe_gemm_a16w4_gluon_impl(
     Y,
     stride_y_k,
     stride_y_m,
@@ -736,3 +736,216 @@ def _moe_gemm_a16w4_gluon(
         y_desc, [block_id * BLOCK_M, pid_n * OUT_BLOCK_N], y_buffer
     )
     gl.amd.gfx1250.tdm.async_wait(0)
+
+
+@gluon.jit(launch_metadata=matmul_launch_metadata)
+def _moe_gemm_a16w4_gluon_stage1(
+    Y,
+    stride_y_k,
+    stride_y_m,
+    stride_y_n,
+    X,
+    stride_x_m,
+    stride_x_k,
+    W,
+    stride_w_e,
+    stride_w_k,
+    stride_w_n,
+    WMxScale,  # E8M0 compact scale (one byte per 32 values along K)
+    stride_w_mx_e,
+    stride_w_mx_n,
+    stride_w_mx_k,
+    B,
+    stride_b_e,  # Bias
+    Gammas,
+    num_tokens,
+    N,
+    K,  # shapes
+    # expt data
+    GatherIndx,
+    ExptHist,
+    ExptOffs,
+    ExptOffsSum,
+    ExptData,
+    # true grid size
+    grid_m,
+    grid_n,
+    # fused activation function
+    APPLY_SWIGLU: gl.constexpr,
+    alpha,
+    limit,
+    ACTIVATION_REDUCTION_N: gl.constexpr,
+    ADD_RESIDUAL: gl.constexpr,
+    # MoE config
+    N_EXPTS_ACT: gl.constexpr,
+    # optimization config
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    GROUP_M: gl.constexpr,
+    XCD_SWIZZLE: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr,
+    # Must be None: the kernel takes pre-expanded e8m0 scales (one byte per fp4 element).
+    SWIZZLE_MX_SCALE: gl.constexpr,
+    EVEN_K: gl.constexpr,
+    SPLIT_K: gl.constexpr,
+    W_CACHE_MODIFIER: gl.constexpr,
+    num_warps: gl.constexpr,
+    UPCAST_INDICES: gl.constexpr = False,
+):
+    # Single-buffer (stage-1) entry point. Distinct name so profilers and the
+    # dispatcher can tell the two pipelines apart; forces the single-buffer path.
+    _moe_gemm_a16w4_gluon_impl(
+        Y=Y,
+        stride_y_k=stride_y_k,
+        stride_y_m=stride_y_m,
+        stride_y_n=stride_y_n,
+        X=X,
+        stride_x_m=stride_x_m,
+        stride_x_k=stride_x_k,
+        W=W,
+        stride_w_e=stride_w_e,
+        stride_w_k=stride_w_k,
+        stride_w_n=stride_w_n,
+        WMxScale=WMxScale,
+        stride_w_mx_e=stride_w_mx_e,
+        stride_w_mx_n=stride_w_mx_n,
+        stride_w_mx_k=stride_w_mx_k,
+        B=B,
+        stride_b_e=stride_b_e,
+        Gammas=Gammas,
+        num_tokens=num_tokens,
+        N=N,
+        K=K,
+        GatherIndx=GatherIndx,
+        ExptHist=ExptHist,
+        ExptOffs=ExptOffs,
+        ExptOffsSum=ExptOffsSum,
+        ExptData=ExptData,
+        grid_m=grid_m,
+        grid_n=grid_n,
+        APPLY_SWIGLU=APPLY_SWIGLU,
+        alpha=alpha,
+        limit=limit,
+        ACTIVATION_REDUCTION_N=ACTIVATION_REDUCTION_N,
+        ADD_RESIDUAL=ADD_RESIDUAL,
+        N_EXPTS_ACT=N_EXPTS_ACT,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        GROUP_M=GROUP_M,
+        XCD_SWIZZLE=XCD_SWIZZLE,
+        NUM_BUFFERS=1,
+        SWIZZLE_MX_SCALE=SWIZZLE_MX_SCALE,
+        EVEN_K=EVEN_K,
+        SPLIT_K=SPLIT_K,
+        W_CACHE_MODIFIER=W_CACHE_MODIFIER,
+        num_warps=num_warps,
+        UPCAST_INDICES=UPCAST_INDICES,
+    )
+
+
+@gluon.jit(launch_metadata=matmul_launch_metadata)
+def _moe_gemm_a16w4_gluon_stage2(
+    Y,
+    stride_y_k,
+    stride_y_m,
+    stride_y_n,
+    X,
+    stride_x_m,
+    stride_x_k,
+    W,
+    stride_w_e,
+    stride_w_k,
+    stride_w_n,
+    WMxScale,  # E8M0 compact scale (one byte per 32 values along K)
+    stride_w_mx_e,
+    stride_w_mx_n,
+    stride_w_mx_k,
+    B,
+    stride_b_e,  # Bias
+    Gammas,
+    num_tokens,
+    N,
+    K,  # shapes
+    # expt data
+    GatherIndx,
+    ExptHist,
+    ExptOffs,
+    ExptOffsSum,
+    ExptData,
+    # true grid size
+    grid_m,
+    grid_n,
+    # fused activation function
+    APPLY_SWIGLU: gl.constexpr,
+    alpha,
+    limit,
+    ACTIVATION_REDUCTION_N: gl.constexpr,
+    ADD_RESIDUAL: gl.constexpr,
+    # MoE config
+    N_EXPTS_ACT: gl.constexpr,
+    # optimization config
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    GROUP_M: gl.constexpr,
+    XCD_SWIZZLE: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr,
+    # Must be None: the kernel takes pre-expanded e8m0 scales (one byte per fp4 element).
+    SWIZZLE_MX_SCALE: gl.constexpr,
+    EVEN_K: gl.constexpr,
+    SPLIT_K: gl.constexpr,
+    W_CACHE_MODIFIER: gl.constexpr,
+    num_warps: gl.constexpr,
+    UPCAST_INDICES: gl.constexpr = False,
+):
+    # Double-buffer (stage-2) LDS-prefetch entry point.
+    _moe_gemm_a16w4_gluon_impl(
+        Y=Y,
+        stride_y_k=stride_y_k,
+        stride_y_m=stride_y_m,
+        stride_y_n=stride_y_n,
+        X=X,
+        stride_x_m=stride_x_m,
+        stride_x_k=stride_x_k,
+        W=W,
+        stride_w_e=stride_w_e,
+        stride_w_k=stride_w_k,
+        stride_w_n=stride_w_n,
+        WMxScale=WMxScale,
+        stride_w_mx_e=stride_w_mx_e,
+        stride_w_mx_n=stride_w_mx_n,
+        stride_w_mx_k=stride_w_mx_k,
+        B=B,
+        stride_b_e=stride_b_e,
+        Gammas=Gammas,
+        num_tokens=num_tokens,
+        N=N,
+        K=K,
+        GatherIndx=GatherIndx,
+        ExptHist=ExptHist,
+        ExptOffs=ExptOffs,
+        ExptOffsSum=ExptOffsSum,
+        ExptData=ExptData,
+        grid_m=grid_m,
+        grid_n=grid_n,
+        APPLY_SWIGLU=APPLY_SWIGLU,
+        alpha=alpha,
+        limit=limit,
+        ACTIVATION_REDUCTION_N=ACTIVATION_REDUCTION_N,
+        ADD_RESIDUAL=ADD_RESIDUAL,
+        N_EXPTS_ACT=N_EXPTS_ACT,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        GROUP_M=GROUP_M,
+        XCD_SWIZZLE=XCD_SWIZZLE,
+        NUM_BUFFERS=NUM_BUFFERS,
+        SWIZZLE_MX_SCALE=SWIZZLE_MX_SCALE,
+        EVEN_K=EVEN_K,
+        SPLIT_K=SPLIT_K,
+        W_CACHE_MODIFIER=W_CACHE_MODIFIER,
+        num_warps=num_warps,
+        UPCAST_INDICES=UPCAST_INDICES,
+    )

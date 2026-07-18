@@ -3,12 +3,13 @@
 
 from itertools import chain
 from pathlib import Path
+import os
+import statistics
 import triton.profiler as proton
 import torch
 import argparse
 import csv
 from aiter.ops.triton.moe.moe_routing.routing import routing
-from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
     moe_gemm_a16w4,
 )
@@ -89,22 +90,31 @@ def compute_roofline(
         perf = inject_proxy_and_call(val, args, kwargs)
         results.append((val, perf))
 
-        tflops = perf["flops"] / perf["kernel_time_ns"] * 1e-3
-        tbps = perf["bytes"] / perf["kernel_time_ns"] * 1e-3
-        total_latency_us = perf["total_time_ns"] / 1e3 / perf["reps"]
+        kt = perf["kernel_time_ns"] or float("nan")
+        tflops = perf["flops"] / kt * 1e-3
+        tbps = perf["bytes"] / kt * 1e-3
         kernel_latency_us = perf["kernel_time_ns"] / 1e3 / perf["reps"]
+        # events mode carries explicit latency stats; proton mode does not
+        if "avg_ms" in perf:
+            lat = (
+                f"avg: {perf['avg_ms']:.4f} ms | min: {perf['min_ms']:.4f} ms | "
+                f"active experts: {perf.get('active_experts', '-')}"
+            )
+        else:
+            lat = f"Kernel latency (us): {kernel_latency_us:.2f}"
         print(
-            f"{intensity_proxy_name}: {val:5d} | "
-            f"Total latency (us): {total_latency_us:.2f} | "
-            f"Kernel latency (us): {kernel_latency_us:.2f} | "
-            f"TFLOPS: {tflops:#.4g} | "
-            f"TBPS: {tbps:.2f}"
+            f"{intensity_proxy_name}: {val:6d} | {lat} | "
+            f"TFLOPS: {tflops:#.4g} | TBPS: {tbps:.2f}"
         )
 
     # write CSV
     fieldnames = [
         intensity_proxy_name,  # e.g. "batch"
-        "total_latency_us",
+        "avg_ms",
+        "min_ms",
+        "max_ms",
+        "median_ms",
+        "active_experts",
         "kernel_latency_us",
         "tflops",
         "tbps",
@@ -118,13 +128,18 @@ def compute_roofline(
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         for val, perf in results:
+            kt = perf["kernel_time_ns"] or float("nan")
             w.writerow(
                 {
                     intensity_proxy_name: val,
-                    "total_latency_us": perf["total_time_ns"] / 1e3 / perf["reps"],
+                    "avg_ms": perf.get("avg_ms", ""),
+                    "min_ms": perf.get("min_ms", ""),
+                    "max_ms": perf.get("max_ms", ""),
+                    "median_ms": perf.get("median_ms", ""),
+                    "active_experts": perf.get("active_experts", ""),
                     "kernel_latency_us": perf["kernel_time_ns"] / 1e3 / perf["reps"],
-                    "tflops": perf["flops"] / perf["kernel_time_ns"] * 1e-3,
-                    "tbps": perf["bytes"] / perf["kernel_time_ns"] * 1e-3,
+                    "tflops": perf["flops"] / kt * 1e-3,
+                    "tbps": perf["bytes"] / kt * 1e-3,
                     "total_time_ns": perf["total_time_ns"],
                     "kernel_time_ns": perf["kernel_time_ns"],
                     "flops": perf["flops"],
@@ -167,8 +182,77 @@ def quantize(x, dtype):
         return x, scale
 
 
+def make_routing(batch, n_expts_tot, n_expts_act, routing_mode, skew, dev):
+    """Build (routing_data, gather_indx, scatter_indx) for one shape.
+
+    ``uniform``  -> independent random logits, so expert load is ~uniform
+                    (many experts active), matching the old bench behaviour.
+    ``skewed``   -> add a per-expert bias so a subset of experts dominates the
+                    top-k selection, mimicking the concentrated load seen in
+                    real captured routing (far fewer experts active).
+    """
+    logits = torch.randn((batch, n_expts_tot), device=dev)
+    if routing_mode == "skewed":
+        expert_bias = torch.randn((n_expts_tot,), device=dev) * skew
+        logits = logits + expert_bias[None, :]
+    return routing(logits, n_expts_act)
+
+
+def op_bytes_flops(batch, dim1, dim2, n_expts_act, n_active):
+    """Analytic byte / flop model for the two-GEMM MoE layer (mxfp4 weights).
+
+    Weight traffic is scaled by the number of *actually active* experts, so it
+    reflects the real routing distribution (this is what makes uniform vs
+    skewed routing show up in TBPS).
+    """
+    R = batch * n_expts_act
+    half = dim2 // 2
+    # mxfp4 weights: 0.5 B/elem + 1 B e8m0 scale per 32 elems along K
+    w1_bytes = n_active * (dim1 * dim2 * 0.5 + (dim1 // 32) * dim2)
+    w2_bytes = n_active * (half * dim1 * 0.5 + (half // 32) * dim1)
+    # bf16 activations: x in, intermediate (write+read), output
+    act_bytes = batch * dim1 * 2 + R * half * 2 * 2 + batch * dim1 * 2
+    total_bytes = w1_bytes + w2_bytes + act_bytes
+    flops = 2 * R * dim1 * dim2 + 2 * R * half * dim1
+    return int(total_bytes), int(flops)
+
+
+def time_with_events(fn, warmup, iters):
+    """Repeated-run CUDA-event timing (same method as the capture replay).
+
+    Returns a list of per-call latencies in milliseconds.
+    """
+    for _ in range(max(0, warmup)):
+        fn()
+    torch.cuda.synchronize()
+    starts, ends = [], []
+    for _ in range(iters):
+        s = torch.cuda.Event(enable_timing=True)
+        e = torch.cuda.Event(enable_timing=True)
+        s.record()
+        fn()
+        e.record()
+        starts.append(s)
+        ends.append(e)
+    torch.cuda.synchronize()
+    return [s.elapsed_time(e) for s, e in zip(starts, ends)]
+
+
 def bench_mlp_single_weight_init(
-    batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, op_regex
+    batch,
+    dim1,
+    dim2,
+    n_expts_tot,
+    n_expts_act,
+    x_dtype,
+    w_dtype,
+    TP,
+    op_regex,
+    timing="events",
+    routing_mode="uniform",
+    skew=4.0,
+    warmup=5,
+    iters=20,
 ):
     rank = 0
     dev = f"cuda:{rank}"
@@ -177,16 +261,13 @@ def bench_mlp_single_weight_init(
 
     # -- init data --
     # weights
-    wg = torch.randn((dim1, n_expts_tot), device=dev)
     w1 = torch.randn((n_expts_tot, dim1, dim2 // TP), device=dev)
     w2 = torch.randn((n_expts_tot, dim2 // TP // 2, dim1), device=dev)
     # biases
-    bg = torch.randn((n_expts_tot,), device=dev)
     b1 = torch.randn((n_expts_tot, dim2 // TP), device=dev)
     b2 = torch.randn((n_expts_tot, dim1), device=dev)
 
     # -- numerics --
-    wg, _ = quantize(wg, "bf16")
     w1, w1_scale = quantize(w1, w_dtype)
     w2, w2_scale = quantize(w2, w_dtype)
     w1_scale, swizzle_mx_scale1 = check_and_shuffle_scales(w1_scale, dim2 // TP, dim1)
@@ -194,20 +275,20 @@ def bench_mlp_single_weight_init(
         w2_scale, dim1, dim2 // TP // 2
     )
 
-    # -- benchmark --
     x_dtype_torch = torch.bfloat16 if x_dtype == "bf16" else torch.float16
-
-    reps = 100
     x = torch.randn((batch, dim1), dtype=x_dtype_torch, device=dev)
-    xg = x
 
-    # run layer
-    fpath = Path(tempfile.mktemp())
-    proton.start(str(fpath), hook="triton")
-    for _ in range(reps):
-        logits = gemm_a16w16(xg, wg.T, bg)
-        rdata, gather_indx, scatter_indx = routing(logits, n_expts_act)
-        x = moe_gemm_a16w4(
+    # routing computed once and held fixed across timed iters, exactly like the
+    # capture replay (which replays fixed real gather/scatter indices).
+    rdata, gather_indx, scatter_indx = make_routing(
+        batch, n_expts_tot, n_expts_act, routing_mode, skew, dev
+    )
+    gammas = rdata.gate_scal
+    n_active = int((rdata.expt_hist > 0).sum())
+
+    def run_layer():
+        # GEMM1 (gate/up): gather + swiglu -> intermediate (M*topk, dim2/2)
+        interm = moe_gemm_a16w4(
             x,
             w1,
             None,
@@ -221,8 +302,11 @@ def bench_mlp_single_weight_init(
             out_dtype=x_dtype_torch,
             apply_swiglu=True,
         )
-        x = moe_gemm_a16w4(
-            x,
+        # GEMM2 (down): scatter-reduce with router weights, no swiglu -> (M, dim1)
+        # This matches the production fused_experts down-projection that the
+        # capture replay exercises (previously this used gather + swiglu).
+        return moe_gemm_a16w4(
+            interm,
             w2,
             None,
             w2_scale,
@@ -230,16 +314,42 @@ def bench_mlp_single_weight_init(
             None,
             b2,
             rdata,
-            gather_indx=gather_indx,
+            scatter_indx=scatter_indx,
+            gammas=gammas,
             swizzle_mx_scale=swizzle_mx_scale2,
             out_dtype=x_dtype_torch,
-            apply_swiglu=True,
         )
 
-    proton.finalize()
-    return parse_profile(
-        fpath.with_suffix(".hatchet"), useful_op_regex=op_regex, reps=reps
+    total_bytes, flops = op_bytes_flops(
+        batch, dim1, dim2 // TP, n_expts_act, n_active
     )
+
+    if timing == "proton":
+        reps = 100
+        fpath = Path(tempfile.mktemp())
+        proton.start(str(fpath), hook="triton")
+        for _ in range(reps):
+            run_layer()
+        proton.finalize()
+        return parse_profile(
+            fpath.with_suffix(".hatchet"), useful_op_regex=op_regex, reps=reps
+        )
+
+    # events: repeated-run CUDA-event timing, same as the capture replay
+    times_ms = time_with_events(run_layer, warmup, iters)
+    mean_ms = statistics.mean(times_ms)
+    return {
+        "total_time_ns": mean_ms * 1e6,
+        "kernel_time_ns": mean_ms * 1e6,
+        "flops": flops,
+        "bytes": total_bytes,
+        "reps": 1,
+        "avg_ms": mean_ms,
+        "min_ms": min(times_ms),
+        "max_ms": max(times_ms),
+        "median_ms": statistics.median(times_ms),
+        "active_experts": n_active,
+    }
 
 
 def bench_mlp(
@@ -253,11 +363,29 @@ def bench_mlp(
     TP,
     op_regex,
     num_weight_inits=1,
+    timing="events",
+    routing_mode="uniform",
+    skew=4.0,
+    warmup=5,
+    iters=20,
 ):
     all_results = []
     for _ in range(num_weight_inits):
         result = bench_mlp_single_weight_init(
-            batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, op_regex
+            batch,
+            dim1,
+            dim2,
+            n_expts_tot,
+            n_expts_act,
+            x_dtype,
+            w_dtype,
+            TP,
+            op_regex,
+            timing=timing,
+            routing_mode=routing_mode,
+            skew=skew,
+            warmup=warmup,
+            iters=iters,
         )
         all_results.append(result)
 
@@ -269,6 +397,10 @@ def bench_mlp(
         "bytes": sum(r["bytes"] for r in all_results) / num_runs,
         "reps": all_results[0]["reps"],
     }
+    # average the optional (events-mode) latency fields when present
+    for k in ["avg_ms", "min_ms", "max_ms", "median_ms", "active_experts"]:
+        if k in all_results[0]:
+            aggregated[k] = sum(r[k] for r in all_results) / num_runs
 
     return aggregated
 
@@ -285,12 +417,17 @@ def roofline_mlp(
     op_regex,
     name="",
     num_weight_inits=1,
+    timing="events",
+    routing_mode="uniform",
+    skew=4.0,
+    warmup=5,
+    iters=20,
 ):
     # Avoid creating an empty directory named like the output CSV stem.
     out_dir = Path("logs") / name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    out_csv = out_dir / f"{x_dtype}x-{w_dtype}w-TP{TP}.csv"
+    out_csv = out_dir / f"{x_dtype}x-{w_dtype}w-TP{TP}-{routing_mode}.csv"
 
     compute_roofline(
         dim1,
@@ -306,6 +443,11 @@ def roofline_mlp(
         intensity_proxy_name="batch",  # intensity proxy name
         intensity_proxy_values=batch_sizes,  # intensity proxy values to sweep
         out_path=out_csv,
+        timing=timing,
+        routing_mode=routing_mode,
+        skew=skew,
+        warmup=warmup,
+        iters=iters,
     )
 
 
@@ -341,17 +483,66 @@ def parse_args(args: list[str] | None = None):
         help="Regex to find perf for specific operation by its kernel name.",
     )
     parser.add_argument(
+        "--backend",
+        type=str,
+        default="auto",
+        choices=["auto", "triton", "gluon"],
+        help="moe_gemm_a16w4 backend to benchmark. 'gluon' targets the tuned "
+        "gfx1250 gluon kernel; 'auto' (default) lets the op pick per-shape.",
+    )
+    parser.add_argument(
         "--num-weight-inits",
         type=int,
         default=1,
         help="Number of different weight initializations to run for more stable results (default: 1). "
         "Each initialization runs 100 iterations. Use higher values (e.g., 10) for more stable benchmarks.",
     )
+    parser.add_argument(
+        "--timing",
+        type=str,
+        default="events",
+        choices=["events", "proton"],
+        help="Timing method. 'events' (default) uses repeated CUDA-event runs "
+        "like the capture replay and needs no profiler; 'proton' uses the "
+        "triton proton profiler (requires librocprofiler-sdk).",
+    )
+    parser.add_argument(
+        "--routing",
+        type=str,
+        default="uniform",
+        choices=["uniform", "skewed"],
+        help="Synthetic routing distribution. 'uniform' (default) spreads tokens "
+        "over many experts; 'skewed' biases a subset of experts to mimic the "
+        "concentrated load of real captured routing (fewer experts active).",
+    )
+    parser.add_argument(
+        "--skew",
+        type=float,
+        default=4.0,
+        help="Strength of per-expert bias when --routing skewed (larger => more "
+        "concentrated, fewer active experts). Default: 4.0.",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=5,
+        help="Warmup iterations per shape for --timing events (default: 5).",
+    )
+    parser.add_argument(
+        "--iters",
+        type=int,
+        default=20,
+        help="Timed iterations per shape for --timing events (default: 20).",
+    )
     return parser.parse_args(args=args)
 
 
 def main(args: list[str] | None = None) -> None:
     parsed_args = parse_args(args=args)
+
+    # Select the moe_gemm_a16w4 backend; read at call time in _selected_backend().
+    os.environ["AITER_MOE_A16W4_BACKEND"] = parsed_args.backend
+    print(f"moe_gemm_a16w4 backend: {parsed_args.backend}")
 
     dim1, dim2 = parsed_args.shape
     total_experts, active_experts = parsed_args.experts
@@ -381,8 +572,13 @@ def main(args: list[str] | None = None) -> None:
         quantized_dtypes[1],
         TP=1,
         op_regex=parsed_args.op_regex,
-        name="gpt-oss-x2",
+        name=f"gpt-oss-x2-{parsed_args.backend}",
         num_weight_inits=parsed_args.num_weight_inits,
+        timing=parsed_args.timing,
+        routing_mode=parsed_args.routing,
+        skew=parsed_args.skew,
+        warmup=parsed_args.warmup,
+        iters=parsed_args.iters,
     )
 
 
