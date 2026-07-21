@@ -132,7 +132,9 @@ def _tdm_load_tile(
         )
         gl.amd.gfx1250.tdm.async_gather(x_desc, offs_x_m, x_slot)
     gl.amd.gfx1250.tdm.async_load(w_desc, [off_w_n, ki * PACKED_BLOCK_K_W], w_slot)
-    gl.amd.gfx1250.tdm.async_load(ws_desc, [off_w_n_scale, ki * PACKED_MX_BLOCK], ws_slot)
+    gl.amd.gfx1250.tdm.async_load(
+        ws_desc, [off_w_n_scale, ki * PACKED_MX_BLOCK], ws_slot
+    )
 
 
 @gluon.jit
@@ -153,8 +155,7 @@ def _preload_tile(
     SCALE_SEL: gl.constexpr,
 ):
     # LDS -> register bf16 W operand for one K-tile (fp4 unpack + scale applied).
-    # X is loaded by the caller so PROBE_FAKE_A/B can fake each operand
-    # independently.
+    # X is loaded separately by the caller.
     w_packed = w_slot.permute([1, 0]).load(layout=L_IN_W)
     if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
         ws_buffer_slice = unswizzle_mx_scale_gfx1250(
@@ -269,11 +270,6 @@ def _moe_gemm_a16w4_gluon_impl(
     W_CACHE_MODIFIER: gl.constexpr,
     num_warps: gl.constexpr,
     UPCAST_INDICES: gl.constexpr = False,
-    # PERF PROBE (NUMERICALLY INCORRECT): feed the WMMA constant operands instead
-    # of loading them. PROBE_FAKE_A skips the X (activation) LDS load; PROBE_FAKE_B
-    # skips the W load + fp4 scaled_upcast. Default off.
-    PROBE_FAKE_B: gl.constexpr = False,
-    PROBE_FAKE_A: gl.constexpr = False,
 ):
     MX_PACK_DIVISOR: gl.constexpr = 32
     NUM_TDM_OPS: gl.constexpr = 3  # X, W (fp4 packed), W_scale (e8m0 expanded)
@@ -415,7 +411,7 @@ def _moe_gemm_a16w4_gluon_impl(
         instr_shape=[16, 16, INSTR_K],
     )
     K_PER_INSR: gl.constexpr = 16
-    K_WIDTH: gl.constexpr  = min(16, BLOCK_K // INSTR_K * K_PER_INSR)
+    K_WIDTH: gl.constexpr = min(16, BLOCK_K // INSTR_K * K_PER_INSR)
     # scale_upcast (compact-scale path) k_scale = min(K_WIDTH, 32); with K_WIDTH
     # = 16 that is block16, whose raw OPSEL is 4 (bit 2 set, bytes 0/1 -> lane
     # halves 0..15 / 16..31). Replicated bytes make the exact byte immaterial.
@@ -581,33 +577,23 @@ def _moe_gemm_a16w4_gluon_impl(
                 PACKED_MX_BLOCK,
             )
             gl.amd.gfx1250.tdm.async_wait(0)
-            if PROBE_FAKE_A:
-                x_tile = gl.full(
-                    (BLOCK_M, BLOCK_K), 1.0, gl.bfloat16, layout=DOT_LAYOUT_X
-                )
-            else:
-                x_tile = x_buffer.index(0).load(layout=DOT_LAYOUT_X)
-            if PROBE_FAKE_B:
-                w_kn = gl.full(
-                    (BLOCK_K, BLOCK_N), 1.0, gl.bfloat16, layout=DOT_LAYOUT_W
-                )
-            else:
-                w_kn = _preload_tile(
-                    w_buffer.index(0),
-                    ws_buffer.index(0),
-                    L_IN_W,
-                    L_SCALE_W,
-                    COMPACT_SCALE_LAYOUT,
-                    SWIZZLE_MX_SCALE,
-                    BLOCK_N,
-                    BLOCK_K,
-                    MX_SCALE_BLOCK_K,
-                    MX_PACK_DIVISOR,
-                    PRESHUFFLE_FACTOR,
-                    SCALE_KWIDTH,
-                    min(K_WIDTH, MX_PACK_DIVISOR),
-                    SCALE_SEL,
-                )
+            x_tile = x_buffer.index(0).load(layout=DOT_LAYOUT_X)
+            w_kn = _preload_tile(
+                w_buffer.index(0),
+                ws_buffer.index(0),
+                L_IN_W,
+                L_SCALE_W,
+                COMPACT_SCALE_LAYOUT,
+                SWIZZLE_MX_SCALE,
+                BLOCK_N,
+                BLOCK_K,
+                MX_SCALE_BLOCK_K,
+                MX_PACK_DIVISOR,
+                PRESHUFFLE_FACTOR,
+                SCALE_KWIDTH,
+                min(K_WIDTH, MX_PACK_DIVISOR),
+                SCALE_SEL,
+            )
             acc = gl.amd.gfx1250.wmma(x_tile, w_kn, acc)
     else:
         # ============================ STAGE 2 ============================
@@ -672,33 +658,23 @@ def _moe_gemm_a16w4_gluon_impl(
                 PACKED_MX_BLOCK,
             )
             cur_slot = ki % NUM_BUFFERS
-            if PROBE_FAKE_A:
-                x_tile = gl.full(
-                    (BLOCK_M, BLOCK_K), 1.0, gl.bfloat16, layout=DOT_LAYOUT_X
-                )
-            else:
-                x_tile = x_buffer.index(cur_slot).load(layout=DOT_LAYOUT_X)
-            if PROBE_FAKE_B:
-                w_kn = gl.full(
-                    (BLOCK_K, BLOCK_N), 1.0, gl.bfloat16, layout=DOT_LAYOUT_W
-                )
-            else:
-                w_kn = _preload_tile(
-                    w_buffer.index(cur_slot),
-                    ws_buffer.index(cur_slot),
-                    L_IN_W,
-                    L_SCALE_W,
-                    COMPACT_SCALE_LAYOUT,
-                    SWIZZLE_MX_SCALE,
-                    BLOCK_N,
-                    BLOCK_K,
-                    MX_SCALE_BLOCK_K,
-                    MX_PACK_DIVISOR,
-                    PRESHUFFLE_FACTOR,
-                    SCALE_KWIDTH,
-                    min(K_WIDTH, MX_PACK_DIVISOR),
-                    SCALE_SEL,
-                )
+            x_tile = x_buffer.index(cur_slot).load(layout=DOT_LAYOUT_X)
+            w_kn = _preload_tile(
+                w_buffer.index(cur_slot),
+                ws_buffer.index(cur_slot),
+                L_IN_W,
+                L_SCALE_W,
+                COMPACT_SCALE_LAYOUT,
+                SWIZZLE_MX_SCALE,
+                BLOCK_N,
+                BLOCK_K,
+                MX_SCALE_BLOCK_K,
+                MX_PACK_DIVISOR,
+                PRESHUFFLE_FACTOR,
+                SCALE_KWIDTH,
+                min(K_WIDTH, MX_PACK_DIVISOR),
+                SCALE_SEL,
+            )
             acc = gl.amd.gfx1250.wmma(x_tile, w_kn, acc)
 
         # Epilogue: drain the last NUM_BUFFERS-1 already-prefetched tiles.
@@ -706,33 +682,23 @@ def _moe_gemm_a16w4_gluon_impl(
             gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * NUM_TDM_OPS)
             gl.barrier()
             cur_slot = (main_iters + i) % NUM_BUFFERS
-            if PROBE_FAKE_A:
-                x_tile = gl.full(
-                    (BLOCK_M, BLOCK_K), 1.0, gl.bfloat16, layout=DOT_LAYOUT_X
-                )
-            else:
-                x_tile = x_buffer.index(cur_slot).load(layout=DOT_LAYOUT_X)
-            if PROBE_FAKE_B:
-                w_kn = gl.full(
-                    (BLOCK_K, BLOCK_N), 1.0, gl.bfloat16, layout=DOT_LAYOUT_W
-                )
-            else:
-                w_kn = _preload_tile(
-                    w_buffer.index(cur_slot),
-                    ws_buffer.index(cur_slot),
-                    L_IN_W,
-                    L_SCALE_W,
-                    COMPACT_SCALE_LAYOUT,
-                    SWIZZLE_MX_SCALE,
-                    BLOCK_N,
-                    BLOCK_K,
-                    MX_SCALE_BLOCK_K,
-                    MX_PACK_DIVISOR,
-                    PRESHUFFLE_FACTOR,
-                    SCALE_KWIDTH,
-                    min(K_WIDTH, MX_PACK_DIVISOR),
-                    SCALE_SEL,
-                )
+            x_tile = x_buffer.index(cur_slot).load(layout=DOT_LAYOUT_X)
+            w_kn = _preload_tile(
+                w_buffer.index(cur_slot),
+                ws_buffer.index(cur_slot),
+                L_IN_W,
+                L_SCALE_W,
+                COMPACT_SCALE_LAYOUT,
+                SWIZZLE_MX_SCALE,
+                BLOCK_N,
+                BLOCK_K,
+                MX_SCALE_BLOCK_K,
+                MX_PACK_DIVISOR,
+                PRESHUFFLE_FACTOR,
+                SCALE_KWIDTH,
+                min(K_WIDTH, MX_PACK_DIVISOR),
+                SCALE_SEL,
+            )
             acc = gl.amd.gfx1250.wmma(x_tile, w_kn, acc)
 
     # bias / activation / write-back
@@ -860,11 +826,6 @@ def _moe_gemm_a16w4_gluon_stage1(
     W_CACHE_MODIFIER: gl.constexpr,
     num_warps: gl.constexpr,
     UPCAST_INDICES: gl.constexpr = False,
-    # PERF PROBE (NUMERICALLY INCORRECT): feed the WMMA constant operands instead
-    # of loading them. PROBE_FAKE_A skips the X (activation) LDS load; PROBE_FAKE_B
-    # skips the W load + fp4 scaled_upcast. Default off.
-    PROBE_FAKE_B: gl.constexpr = False,
-    PROBE_FAKE_A: gl.constexpr = False,
 ):
     # Single-buffer (stage-1) entry point. Distinct name so profilers and the
     # dispatcher can tell the two pipelines apart; forces the single-buffer path.
@@ -915,8 +876,6 @@ def _moe_gemm_a16w4_gluon_stage1(
         W_CACHE_MODIFIER=W_CACHE_MODIFIER,
         num_warps=num_warps,
         UPCAST_INDICES=UPCAST_INDICES,
-        PROBE_FAKE_B=PROBE_FAKE_B,
-        PROBE_FAKE_A=PROBE_FAKE_A,
     )
 
 
@@ -982,11 +941,6 @@ def _moe_gemm_a16w4_gluon_stage2(
     W_CACHE_MODIFIER: gl.constexpr,
     num_warps: gl.constexpr,
     UPCAST_INDICES: gl.constexpr = False,
-    # PERF PROBE (NUMERICALLY INCORRECT): feed the WMMA constant operands instead
-    # of loading them. PROBE_FAKE_A skips the X (activation) LDS load; PROBE_FAKE_B
-    # skips the W load + fp4 scaled_upcast. Default off.
-    PROBE_FAKE_B: gl.constexpr = False,
-    PROBE_FAKE_A: gl.constexpr = False,
 ):
     # Double-buffer (stage-2) LDS-prefetch entry point.
     _moe_gemm_a16w4_gluon_impl(
@@ -1036,8 +990,6 @@ def _moe_gemm_a16w4_gluon_stage2(
         W_CACHE_MODIFIER=W_CACHE_MODIFIER,
         num_warps=num_warps,
         UPCAST_INDICES=UPCAST_INDICES,
-        PROBE_FAKE_B=PROBE_FAKE_B,
-        PROBE_FAKE_A=PROBE_FAKE_A,
     )
 
 
@@ -1103,11 +1055,6 @@ def _moe_gemm_a16w4_gluon_stage3(
     W_CACHE_MODIFIER: gl.constexpr,
     num_warps: gl.constexpr,
     UPCAST_INDICES: gl.constexpr = False,
-    # PERF PROBE (NUMERICALLY INCORRECT): feed the WMMA constant operands instead
-    # of loading them. PROBE_FAKE_A skips the X (activation) LDS load; PROBE_FAKE_B
-    # skips the W load + fp4 scaled_upcast. Default off.
-    PROBE_FAKE_B: gl.constexpr = False,
-    PROBE_FAKE_A: gl.constexpr = False,
 ):
     # Triple-buffer (stage-3) LDS-prefetch entry point: same rolling-prefetch
     # pipeline as stage-2 but with NUM_BUFFERS=3 (2 tiles prefetched ahead).
@@ -1158,6 +1105,4 @@ def _moe_gemm_a16w4_gluon_stage3(
         W_CACHE_MODIFIER=W_CACHE_MODIFIER,
         num_warps=num_warps,
         UPCAST_INDICES=UPCAST_INDICES,
-        PROBE_FAKE_B=PROBE_FAKE_B,
-        PROBE_FAKE_A=PROBE_FAKE_A,
     )

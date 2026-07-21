@@ -256,14 +256,6 @@ def get_kernel_config_gluon(m, n, k, routing_data):
         "num_buffers": _env_config_int(
             "AITER_MOE_A16W4_GLUON", "NUM_BUFFERS", k, num_buffers
         ),
-        # PERF PROBE (numerically incorrect): feed WMMA constant operands to
-        # isolate load vs compute cost. Off by default.
-        "probe_fake_b": _env_config_int(
-            "AITER_MOE_A16W4_GLUON", "PROBE_FAKE_B", k, 0
-        ),
-        "probe_fake_a": _env_config_int(
-            "AITER_MOE_A16W4_GLUON", "PROBE_FAKE_A", k, 0
-        ),
     }
 
 
@@ -329,14 +321,25 @@ def moe_gemm_a16w4(
 
     # compute optimization flags
     backend = _selected_backend()
-    # "auto" (the default) only routes to the tuned Gluon path where it has been
-    # validated numerically correct: gfx1250 large-block (block_m>=64) prefill
-    # with no MX-scale preshuffling. The Gluon path has a pre-existing accuracy
-    # bug with swizzled scales (produces inf under swiglu), so swizzled shapes
-    # stay on Triton unless Gluon is requested explicitly.
-    use_gluon = get_arch() == "gfx1250" and (
-        backend == "gluon"
-        or (backend == "auto" and block_m >= 64 and swizzle_mx_scale is None)
+    # The Gluon path is only numerically correct for compact (non-swizzled) MX
+    # scales: GFX1250_SCALE hangs the ROCm loader at first launch and CDNA4_SCALE
+    # is unsupported (produces inf under swiglu). So swizzled scales ALWAYS stay
+    # on Triton, regardless of the selected backend -- including the "gluon"
+    # default. An explicit AITER_MOE_A16W4_BACKEND=gluon with swizzled scales
+    # cannot be honored correctly, so fail loudly rather than hang / return inf.
+    # "auto" additionally restricts Gluon to gfx1250 large-block (block_m>=64)
+    # prefill, where it has been validated.
+    if backend == "gluon" and get_arch() == "gfx1250" and swizzle_mx_scale is not None:
+        raise ValueError(
+            "AITER_MOE_A16W4_BACKEND=gluon cannot honor swizzled MX scales "
+            f"(swizzle_mx_scale={swizzle_mx_scale!r}): the Gluon a16w4 kernel "
+            "supports only compact e8m0 scales. Use the Triton backend "
+            "(AITER_MOE_A16W4_BACKEND=triton or =auto) for swizzled scales."
+        )
+    use_gluon = (
+        get_arch() == "gfx1250"
+        and swizzle_mx_scale is None
+        and (backend == "gluon" or (backend == "auto" and block_m >= 64))
     )
     config = (
         get_kernel_config_gluon(M, N, K, routing_data)
@@ -455,8 +458,6 @@ def moe_gemm_a16w4(
             num_warps=config["num_warps"],
             num_stages=config["num_stages"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
-            PROBE_FAKE_B=bool(config["probe_fake_b"]),
-            PROBE_FAKE_A=bool(config["probe_fake_a"]),
             waves_per_eu=config["waves_per_eu"],
             matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
             kpack=config["kpack"],
