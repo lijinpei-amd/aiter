@@ -1,6 +1,7 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/bench/bench_mlp.py
 
+from itertools import product
 from pathlib import Path
 import os
 import statistics
@@ -11,11 +12,13 @@ import csv
 from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
     moe_gemm_a16w4,
+    moe_gemm_torch,
+    _get_config,
 )
 from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 import tempfile
-from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
+from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp, upcast_from_mxfp
 
 # Config dict forwarded to every moe_gemm_a16w4 call (set from --backend /
 # --gluon-stage in main). None -> let the op's `auto` config pick per shape.
@@ -142,8 +145,9 @@ def dump_routing_blocks(batch, routing_data):
         print(f"    {pid:>5} {expt:>7} {blk:>13} {tok:>7}")
 
 
-def op_bytes_flops(batch, dim1, dim2, n_expts_act, n_active):
-    """Analytic byte / flop model for the two-GEMM MoE layer (mxfp4 weights).
+def op_bytes_flops(batch, dim1, dim2, n_expts_act, n_active, gemm="both"):
+    """Analytic byte / flop model for the MoE layer (mxfp4 weights). `gemm` selects
+    GEMM1 (gate/up), GEMM2 (down) or the full two-GEMM layer ("both").
 
     Weight traffic is scaled by the number of *actually active* experts, so it
     reflects the real routing distribution (this is what makes uniform vs
@@ -154,10 +158,18 @@ def op_bytes_flops(batch, dim1, dim2, n_expts_act, n_active):
     # mxfp4 weights: 0.5 B/elem + 1 B e8m0 scale per 32 elems along K
     w1_bytes = n_active * (dim1 * dim2 * 0.5 + (dim1 // 32) * dim2)
     w2_bytes = n_active * (half * dim1 * 0.5 + (half // 32) * dim1)
-    # bf16 activations: x in, intermediate (write+read), output
-    act_bytes = batch * dim1 * 2 + R * half * 2 * 2 + batch * dim1 * 2
-    total_bytes = w1_bytes + w2_bytes + act_bytes
-    flops = 2 * R * dim1 * dim2 + 2 * R * half * dim1
+    # bf16 activations
+    x_bytes = batch * dim1 * 2  # GEMM1 input
+    interm_bytes = R * half * 2  # GEMM1 write / GEMM2 read (one direction)
+    out_bytes = batch * dim1 * 2  # GEMM2 output
+    flops1 = 2 * R * dim1 * dim2
+    flops2 = 2 * R * half * dim1
+    if gemm == "gemm1":
+        return int(w1_bytes + x_bytes + interm_bytes), int(flops1)
+    if gemm == "gemm2":
+        return int(w2_bytes + interm_bytes + out_bytes), int(flops2)
+    total_bytes = w1_bytes + w2_bytes + x_bytes + 2 * interm_bytes + out_bytes
+    flops = flops1 + flops2
     return int(total_bytes), int(flops)
 
 
@@ -180,6 +192,26 @@ def time_with_events(fn, warmup, iters):
         ends.append(e)
     torch.cuda.synchronize()
     return [s.elapsed_time(e) for s, e in zip(starts, ends)]
+
+
+def _measure(fn, timing, warmup, iters):
+    """Latency stats (ms) via repeated CUDA events or triton's do_bench.
+
+    Returns {avg_ms, min_ms, max_ms, median_ms}. do_bench manages its own
+    (time-based) warmup/rep; the events path uses `warmup`/`iters` counts.
+    """
+    if timing == "do_bench":
+        import triton.testing
+
+        med, lo, hi = triton.testing.do_bench(fn, quantiles=[0.5, 0.0, 1.0])
+        return {"avg_ms": med, "min_ms": lo, "max_ms": hi, "median_ms": med}
+    times = time_with_events(fn, warmup, iters)
+    return {
+        "avg_ms": statistics.mean(times),
+        "min_ms": min(times),
+        "max_ms": max(times),
+        "median_ms": statistics.median(times),
+    }
 
 
 # --- launched-grid capture ------------------------------------------------
@@ -242,6 +274,340 @@ def _capture_grids(fn):
     return " ".join(parts) if parts else "-"
 
 
+# --- autotuning -----------------------------------------------------------
+# Search space for --tune: the tuned config is the Cartesian product of these
+# per-parameter value lists. block_m is fixed by routing (not tuned); backend and
+# (optionally) the gluon stage are pinned by --backend / --gluon-stage. Edit these
+# lists to widen/narrow the search (the product can be large -> tuning is slow).
+_TUNE_SPACE = {
+    "block_n": [64, 128, 256],
+    "block_k": [32, 64, 128, 256, 512],
+    "num_warps": [1, 2, 4, 8],
+    "num_stages": [1, 2],
+    "group_m": [1, 4],
+    "xcd_swizzle": [1, 2, 8],
+    "waves_per_eu": [0, 1, 2, 3, 4],
+    "kpack": [1, 2],
+}
+# Extra gluon-only knob (the pipeline stage), swept unless --gluon-stage pins it.
+_TUNE_SPACE_GLUON = {"num_buffers": [1, 2, 3]}
+
+_TUNE_FMT_KEYS = [
+    "backend",
+    "num_buffers",
+    "block_n",
+    "block_k",
+    "num_warps",
+    "num_stages",
+    "group_m",
+    "xcd_swizzle",
+    "waves_per_eu",
+    "kpack",
+]
+
+
+def _fmt_cfg(cfg):
+    return "{" + ", ".join(f"{k}={cfg[k]}" for k in _TUNE_FMT_KEYS if k in cfg) + "}"
+
+
+def _tune_candidates(backend, pinned):
+    """Cartesian product of _TUNE_SPACE (plus the gluon stage unless pinned), each
+    merged with `pinned` (which fixes backend and optionally num_buffers)."""
+    space = dict(_TUNE_SPACE)
+    if backend == "gluon" and "num_buffers" not in pinned:
+        space["num_buffers"] = _TUNE_SPACE_GLUON["num_buffers"]
+    keys = list(space)
+    cands = []
+    for combo in product(*(space[k] for k in keys)):
+        cfg = dict(pinned)
+        cfg.update(dict(zip(keys, combo)))
+        cands.append(cfg)
+    return cands
+
+
+def _load_assert_close():
+    """Reuse assert_close from the unit test (op_tests/.../test_moe_gemm_a16w4.py)
+    for the tuned-config correctness check."""
+    import importlib.util
+
+    path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..",
+        "..",
+        "triton_tests",
+        "moe",
+        "test_moe_gemm_a16w4.py",
+    )
+    spec = importlib.util.spec_from_file_location("_moe_a16w4_unittest", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.assert_close
+
+
+def _make_is_close(ref):
+    """Build a predicate that checks a kernel output against `ref` using the unit
+    test's assert_close tolerances (maxtol=4e-1, rmstol=4e-2). assert_close dumps
+    the mismatch list on failure, so its stdout is suppressed here."""
+    import contextlib
+    import io
+
+    assert_close = _load_assert_close()
+
+    def is_close(out):
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                assert_close(ref, out, maxtol=4e-1, rmstol=4e-2, verbose=False)
+            return True
+        except AssertionError:
+            return False
+
+    return is_close
+
+
+def _perf_str(ms, flops, byts):
+    """TFLOPS/TBPS string in the same format as the benchmark output."""
+    if not ms:
+        return ""
+    tflops = flops / (ms * 1e6) * 1e-3
+    tbps = byts / (ms * 1e6) * 1e-3
+    return f"TFLOPS: {tflops:#.4g} | TBPS: {tbps:.2f}"
+
+
+def _eval_config(make_fn, cfg, is_close, timing, warmup, iters):
+    """Evaluate one config. Returns (min_ms, status) where status is:
+    'ok' (correct), 'wrong' (ran but numerically incorrect vs the reference) or
+    'fail' (did not compile/launch, e.g. an LDS-over-budget tile)."""
+    try:
+        out = make_fn(cfg)()
+    except Exception:
+        return None, "fail"
+    if is_close is not None and not is_close(out):
+        return None, "wrong"
+    try:
+        return _measure(make_fn(cfg), timing, warmup, iters)["min_ms"], "ok"
+    except Exception:
+        return None, "fail"
+
+
+def _tune_one(
+    label,
+    make_fn,
+    backend,
+    pinned,
+    current_cfg,
+    is_close,
+    flops,
+    byts,
+    timing,
+    warmup,
+    iters,
+    gap,
+    cand,
+):
+    cands = _tune_candidates(backend, pinned)
+    print(f"\n[tune] {label}: sweeping {len(cands)} configs (pinned {pinned}) ...")
+    scored = []
+    n_wrong = n_fail = 0
+    for c in cands:
+        t, st = _eval_config(make_fn, c, is_close, timing, warmup, iters)
+        if st == "ok":
+            scored.append((t, c))
+        elif st == "wrong":
+            n_wrong += 1
+        else:
+            n_fail += 1
+
+    cur_t, cur_st = _eval_config(make_fn, current_cfg, is_close, timing, warmup, iters)
+    cur_s = f"{cur_t:.4f} ms" if cur_t is not None else "n/a"
+    print(
+        f"[tune] {label}: current config -> {cur_s} [{cur_st}] "
+        f"{_perf_str(cur_t, flops, byts)}  {_fmt_cfg(current_cfg)}"
+    )
+    print(
+        f"[tune] {label}: {len(scored)} correct, {n_wrong} wrong, {n_fail} failed "
+        f"(of {len(cands)})"
+    )
+    if not scored:
+        print(f"[tune] {label}: no correct config found")
+        return
+    scored.sort(key=lambda x: x[0])
+    best = scored[0][0]
+    picked = [(t, c) for (t, c) in scored if t <= best * (1 + gap / 100.0)][:cand]
+    print(
+        f"[tune] {label}: top {len(picked)} verified-correct configs within "
+        f"{gap:g}% of best, fastest first:"
+    )
+    for t, c in picked:
+        print(
+            f"       {t:.4f} ms  ({t / best - 1:+.1%})  "
+            f"{_perf_str(t, flops, byts)}  {_fmt_cfg(c)}"
+        )
+
+
+def tune_shape(
+    batch,
+    dim1,
+    dim2,
+    n_expts_tot,
+    n_expts_act,
+    x_dtype,
+    w_dtype,
+    TP,
+    routing_mode,
+    skew,
+    seed,
+    gluon_stage,
+    gap,
+    cand,
+    warmup,
+    iters,
+    gemm="both",
+    timing="events",
+):
+    """Autotune GEMM1 (gate/up) and/or GEMM2 (down) separately for one MLP shape.
+    `gemm` selects which to tune ("both", "gemm1" or "gemm2")."""
+    dev = "cuda:0"
+    if seed is not None:
+        torch.manual_seed(int(seed))
+    w1 = torch.randn((n_expts_tot, dim1, dim2 // TP), device=dev)
+    w2 = torch.randn((n_expts_tot, dim2 // TP // 2, dim1), device=dev)
+    b1 = torch.randn((n_expts_tot, dim2 // TP), device=dev)
+    b2 = torch.randn((n_expts_tot, dim1), device=dev)
+    w1, w1_scale = quantize(w1, w_dtype)
+    w2, w2_scale = quantize(w2, w_dtype)
+    # Tune against compact (non-swizzled) scales: the tile config is what's being
+    # tuned, and compact scales are the common denominator both backends accept
+    # (gluon rejects swizzled scales).
+    sw1 = sw2 = None
+    xdt = torch.bfloat16 if x_dtype == "bf16" else torch.float16
+    x = torch.randn((batch, dim1), dtype=xdt, device=dev)
+    rdata, gidx, sidx = make_routing(
+        batch, n_expts_tot, n_expts_act, routing_mode, skew, dev, seed=seed
+    )
+    gammas = rdata.gate_scal
+    n_active = int((rdata.expt_hist > 0).sum())
+    bytes1, flops1 = op_bytes_flops(
+        batch, dim1, dim2 // TP, n_expts_act, n_active, gemm="gemm1"
+    )
+    bytes2, flops2 = op_bytes_flops(
+        batch, dim1, dim2 // TP, n_expts_act, n_active, gemm="gemm2"
+    )
+    print(
+        f"\n===== tune shape: M={batch} dim1={dim1} dim2={dim2} "
+        f"E={n_expts_tot}/{n_expts_act} block_m={rdata.block_m} ====="
+    )
+
+    def _pin(backend):
+        p = {"backend": backend}
+        if gluon_stage is not None and backend == "gluon":
+            p["num_buffers"] = gluon_stage
+        return p
+
+    # GEMM1: gate/up (gather + swiglu). N=dim2/TP, K=dim1.
+    def make_gemm1(cfg):
+        return lambda: moe_gemm_a16w4(
+            x,
+            w1,
+            None,
+            w1_scale,
+            None,
+            None,
+            b1,
+            rdata,
+            gather_indx=gidx,
+            swizzle_mx_scale=sw1,
+            out_dtype=xdt,
+            apply_swiglu=True,
+            config=cfg,
+        )
+
+    cur1, _ = _get_config(
+        rdata, gidx.shape[0], dim2 // TP, dim1, config=_MOE_CONFIG, swizzle_mx_scale=sw1
+    )
+    if gemm in ("both", "gemm1"):
+        # Reference for correctness: bf16 dequantized weights through moe_gemm_torch
+        # (per-expert upcast avoids the int32 overflow of a bulk upcast on big shapes).
+        w1_ref = torch.stack(
+            [
+                upcast_from_mxfp(w1[e], w1_scale[e], torch.bfloat16, axis=0)
+                for e in range(n_expts_tot)
+            ]
+        )
+        ref1 = moe_gemm_torch(x, w1_ref, b1, rdata, gidx, None, None, apply_swiglu=True)
+        _tune_one(
+            f"M={batch} GEMM1 gate/up (N={dim2 // TP} K={dim1})",
+            make_gemm1,
+            cur1["backend"],
+            _pin(cur1["backend"]),
+            cur1,
+            _make_is_close(ref1),
+            flops1,
+            bytes1,
+            timing,
+            warmup,
+            iters,
+            gap,
+            cand,
+        )
+
+    if gemm not in ("both", "gemm2"):
+        return
+
+    # GEMM2: down (scatter). N=dim1, K=dim2/TP/2. Input is GEMM1's output.
+    interm = make_gemm1(cur1)()
+
+    def make_gemm2(cfg):
+        return lambda: moe_gemm_a16w4(
+            interm,
+            w2,
+            None,
+            w2_scale,
+            None,
+            None,
+            b2,
+            rdata,
+            scatter_indx=sidx,
+            gammas=gammas,
+            swizzle_mx_scale=sw2,
+            out_dtype=xdt,
+            config=cfg,
+        )
+
+    # Reference for GEMM2: down-project the SAME interm the kernel consumes.
+    w2_ref = torch.stack(
+        [
+            upcast_from_mxfp(w2[e], w2_scale[e], torch.bfloat16, axis=0)
+            for e in range(n_expts_tot)
+        ]
+    )
+    ref2 = moe_gemm_torch(
+        interm, w2_ref, b2, rdata, None, sidx, gammas, apply_swiglu=False
+    )
+    cur2, _ = _get_config(
+        rdata,
+        interm.shape[0],
+        dim1,
+        dim2 // TP // 2,
+        config=_MOE_CONFIG,
+        swizzle_mx_scale=sw2,
+    )
+    _tune_one(
+        f"M={batch} GEMM2 down (N={dim1} K={dim2 // TP // 2})",
+        make_gemm2,
+        cur2["backend"],
+        _pin(cur2["backend"]),
+        cur2,
+        _make_is_close(ref2),
+        flops2,
+        bytes2,
+        timing,
+        warmup,
+        iters,
+        gap,
+        cand,
+    )
+
+
 def bench_mlp_single_weight_init(
     batch,
     dim1,
@@ -259,6 +625,7 @@ def bench_mlp_single_weight_init(
     iters=20,
     dump_blocks=False,
     seed=None,
+    gemm="both",
 ):
     rank = 0
     dev = f"cuda:{rank}"
@@ -300,9 +667,12 @@ def bench_mlp_single_weight_init(
     if dump_blocks:
         dump_routing_blocks(batch, rdata)
 
-    def run_layer():
-        # GEMM1 (gate/up): gather + swiglu -> intermediate (M*topk, dim2/2)
-        interm = moe_gemm_a16w4(
+    # GEMM1 (gate/up): gather + swiglu -> intermediate (M*topk, dim2/2). Its output
+    # is stashed so GEMM2 can be benchmarked on the real intermediate.
+    interm_holder = {}
+
+    def run_gemm1():
+        out = moe_gemm_a16w4(
             x,
             w1,
             None,
@@ -317,11 +687,14 @@ def bench_mlp_single_weight_init(
             apply_swiglu=True,
             config=_MOE_CONFIG,
         )
-        # GEMM2 (down): scatter-reduce with router weights, no swiglu -> (M, dim1)
-        # This matches the production fused_experts down-projection that the
-        # capture replay exercises (previously this used gather + swiglu).
+        interm_holder["interm"] = out
+        return out
+
+    # GEMM2 (down): scatter-reduce with router weights, no swiglu -> (M, dim1). This
+    # matches the production fused_experts down-projection the capture replay uses.
+    def run_gemm2():
         return moe_gemm_a16w4(
-            interm,
+            interm_holder["interm"],
             w2,
             None,
             w2_scale,
@@ -336,17 +709,33 @@ def bench_mlp_single_weight_init(
             config=_MOE_CONFIG,
         )
 
-    total_bytes, flops = op_bytes_flops(batch, dim1, dim2 // TP, n_expts_act, n_active)
+    def run_layer():
+        run_gemm1()
+        return run_gemm2()
 
-    # capture the actual launched grid(s) once (GEMM1, GEMM2, reduce)
-    launched_grid = _capture_grids(run_layer)
+    # Select what to time: GEMM1 alone, GEMM2 alone (on the real intermediate) or
+    # the full layer.
+    if gemm == "gemm1":
+        run_fn = run_gemm1
+    elif gemm == "gemm2":
+        run_gemm1()  # populate the intermediate once (not timed)
+        run_fn = run_gemm2
+    else:
+        run_fn = run_layer
+
+    total_bytes, flops = op_bytes_flops(
+        batch, dim1, dim2 // TP, n_expts_act, n_active, gemm=gemm
+    )
+
+    # capture the actual launched grid(s) once
+    launched_grid = _capture_grids(run_fn)
 
     if timing == "proton":
         reps = 100
         fpath = Path(tempfile.mktemp())
         proton.start(str(fpath), hook="triton")
         for _ in range(reps):
-            run_layer()
+            run_fn()
         proton.finalize()
         perf = parse_profile(
             fpath.with_suffix(".hatchet"), useful_op_regex=op_regex, reps=reps
@@ -354,19 +743,16 @@ def bench_mlp_single_weight_init(
         perf["launched_grid"] = launched_grid
         return perf
 
-    # events: repeated-run CUDA-event timing, same as the capture replay
-    times_ms = time_with_events(run_layer, warmup, iters)
-    mean_ms = statistics.mean(times_ms)
+    # events / do_bench timing
+    stats = _measure(run_fn, timing, warmup, iters)
+    mean_ms = stats["avg_ms"]
     return {
         "total_time_ns": mean_ms * 1e6,
         "kernel_time_ns": mean_ms * 1e6,
         "flops": flops,
         "bytes": total_bytes,
         "reps": 1,
-        "avg_ms": mean_ms,
-        "min_ms": min(times_ms),
-        "max_ms": max(times_ms),
-        "median_ms": statistics.median(times_ms),
+        **stats,
         "active_experts": n_active,
         "launched_grid": launched_grid,
     }
@@ -390,6 +776,7 @@ def bench_mlp(
     iters=20,
     dump_blocks=False,
     seed=None,
+    gemm="both",
 ):
     all_results = []
     for init_idx in range(num_weight_inits):
@@ -413,6 +800,7 @@ def bench_mlp(
             iters=iters,
             dump_blocks=dump_blocks,
             seed=init_seed,
+            gemm=gemm,
         )
         all_results.append(result)
 
@@ -454,16 +842,18 @@ def roofline_mlp(
     iters=20,
     dump_blocks=False,
     seed=None,
+    gemm="both",
 ):
     # Avoid creating an empty directory named like the output CSV stem.
     out_dir = Path("logs") / name
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{x_dtype}x-{w_dtype}w-TP{TP}-{routing_mode}.csv"
+    suffix = "" if gemm == "both" else f"-{gemm}"
+    out_path = out_dir / f"{x_dtype}x-{w_dtype}w-TP{TP}-{routing_mode}{suffix}.csv"
 
     # Sweep batch sizes, benchmark each, print a summary line and write a CSV.
     results: list[tuple[int, dict[str, int | float]]] = []
     print("=========================================")
-    print(f"{out_path}...")
+    print(f"{out_path}  (gemm={gemm})...")
     print("=========================================")
 
     for batch in batch_sizes:
@@ -485,6 +875,7 @@ def roofline_mlp(
             iters=iters,
             dump_blocks=dump_blocks,
             seed=seed,
+            gemm=gemm,
         )
         results.append((batch, perf))
 
@@ -600,10 +991,12 @@ def parse_args(args: list[str] | None = None):
         "--timing",
         type=str,
         default="events",
-        choices=["events", "proton"],
+        choices=["events", "proton", "do_bench"],
         help="Timing method. 'events' (default) uses repeated CUDA-event runs "
-        "like the capture replay and needs no profiler; 'proton' uses the "
-        "triton proton profiler (requires librocprofiler-sdk).",
+        "like the capture replay and needs no profiler; 'do_bench' uses triton's "
+        "testing.do_bench (L2-flushing, time-based warmup/rep); 'proton' uses the "
+        "triton proton profiler (requires librocprofiler-sdk). Tuning uses "
+        "'do_bench'/'events' (proton falls back to events).",
     )
     parser.add_argument(
         "--routing",
@@ -658,6 +1051,37 @@ def parse_args(args: list[str] | None = None):
         "3 = triple-buffer (stage-3). Default (None) uses the per-shape tuned "
         "value from get_kernel_config_gluon. Capped at cdiv(K, block_k) at launch.",
     )
+    parser.add_argument(
+        "--tune",
+        action="store_true",
+        help="Autotune configs for each shape instead of benchmarking: sweep the "
+        "Cartesian product of the config search space (see _TUNE_SPACE) for GEMM1 "
+        "and GEMM2 of every M, and report the fastest configs. --backend / "
+        "--gluon-stage pin the backend / stage that is tuned.",
+    )
+    parser.add_argument(
+        "--tune-gap-percent",
+        type=float,
+        default=5.0,
+        help="When tuning, only return configs whose kernel time is within this "
+        "percent of the best config (default: 5).",
+    )
+    parser.add_argument(
+        "--tune-cand-number",
+        type=int,
+        default=3,
+        help="When tuning, return at most this many configs per shape, fastest "
+        "first (default: 3).",
+    )
+    parser.add_argument(
+        "--gemm",
+        choices=["both", "gemm1", "gemm2"],
+        default="both",
+        help="Which projection to benchmark/tune: 'gemm1' = gate/up only "
+        "(gather + swiglu), 'gemm2' = down only (scatter, no swiglu), 'both' = the "
+        "full two-GEMM layer (default). 'gemm1'/'gemm2' benchmark and tune the two "
+        "projections separately.",
+    )
     return parser.parse_args(args=args)
 
 
@@ -676,6 +1100,8 @@ def main(args: list[str] | None = None) -> None:
     _MOE_CONFIG = cli_config or None
     print(f"moe_gemm_a16w4 config: {_MOE_CONFIG}")
 
+    gemm_sel = parsed_args.gemm  # "both" | "gemm1" | "gemm2"
+
     dim1, dim2 = parsed_args.shape
     total_experts, active_experts = parsed_args.experts
     if parsed_args.M is None:
@@ -684,6 +1110,30 @@ def main(args: list[str] | None = None) -> None:
         batch_sizes_moe = parsed_args.M
 
     quantized_dtypes = ["bf16", "mx4"]
+
+    if parsed_args.tune:
+        for batch in batch_sizes_moe:
+            tune_shape(
+                batch,
+                dim1,
+                dim2,
+                total_experts,
+                active_experts,
+                quantized_dtypes[0],
+                quantized_dtypes[1],
+                TP=1,
+                routing_mode=parsed_args.routing,
+                skew=parsed_args.skew,
+                seed=parsed_args.seed,
+                gluon_stage=parsed_args.gluon_stage,
+                gap=parsed_args.tune_gap_percent,
+                cand=parsed_args.tune_cand_number,
+                warmup=parsed_args.warmup,
+                iters=parsed_args.iters,
+                gemm=gemm_sel,
+                timing=parsed_args.timing,
+            )
+        return
 
     roofline_mlp(
         batch_sizes_moe,
@@ -704,6 +1154,7 @@ def main(args: list[str] | None = None) -> None:
         iters=parsed_args.iters,
         dump_blocks=parsed_args.dump_blocks,
         seed=parsed_args.seed,
+        gemm=gemm_sel,
     )
 
 

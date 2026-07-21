@@ -1,7 +1,7 @@
 {
     "N_LEQ_6144": {
         "K_LEQ_3072": {
-            "block_n": 128,
+            "block_n": 256,
             "block_k": 256,
             "num_warps": 4,
             "num_stages": 2,
