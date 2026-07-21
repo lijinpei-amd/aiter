@@ -214,7 +214,6 @@ def test_op(
     n_expts_act,
     hbm_swizzling,
     backend,
-    monkeypatch,
     device="cuda",
 ):
 
@@ -227,9 +226,8 @@ def test_op(
     if do_scatter and n < 32:
         pytest.skip(f"scatter-combine (reduce_grouped) requires N >= 32, got N={n}")
 
-    # Select the moe_gemm_a16w4 backend. The env var is read at call time in
-    # moe_gemm_a16w4._selected_backend(), so monkeypatch (auto-restored) is enough.
-    monkeypatch.setenv("AITER_MOE_A16W4_BACKEND", backend)
+    # Pin the backend via the config arg (config-selection env vars were removed).
+    backend_config = {"backend": backend}
     if backend == "gluon":
         # The gluon a16w4 kernel only dispatches on gfx1250 (else moe_gemm_a16w4
         # silently falls back to Triton, making the "gluon" run a duplicate).
@@ -352,6 +350,7 @@ def test_op(
         swizzle_mx_scale,
         out_dtype,
         apply_swiglu,
+        config=backend_config,
     )
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
 

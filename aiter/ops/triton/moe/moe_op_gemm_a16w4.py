@@ -1,8 +1,11 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_details/_matmul.py
 
+import functools
 import itertools
+import json
 import os
+from typing import Optional
 import torch
 import triton
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
@@ -16,6 +19,7 @@ from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a16w4 import (
 )
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 
 # -----------------------------------------------------------------------------
 #                    Matrix Multiplication + Outer Gather/Scatter
@@ -32,13 +36,6 @@ def can_overflow_int32(tensor: torch.Tensor):
 
 def should_upcast_indices(*args):
     return any(tensor is not None and can_overflow_int32(tensor) for tensor in args)
-
-
-def _env_config_int(prefix: str, name: str, k: int, default: int) -> int:
-    value = os.environ.get(f"{prefix}_{name}_K{k}", os.environ.get(f"{prefix}_{name}"))
-    if value is None:
-        return default
-    return int(value)
 
 
 def allocate_output(
@@ -77,201 +74,202 @@ def allocate_output(
     return matmul_output, final_output
 
 
-def get_kernel_config(m, n, k, routing_data):
-    block_m = routing_data.block_m
-    group_m = 4
-    num_xcds = 8
-    xcd_swizzle = num_xcds
-    w_cache_modifier = ".cg" if block_m <= 32 else None
-    num_stages = 1
-    split_k = 1
-    block_k = 256
-    waves_per_eu = 0
-    kpack = 1
-
-    if block_m == 16:
-        block_n = 128
-        num_warps = 4
-        # Decode / tiny-M (block_m=16) on gfx1250, tuned on the MiniMax-M3 A16W4
-        # eager decode capture (M<=16, N=6144, K in {6144,3072}). A 512-deep K
-        # tile beats the flat 256 on the deep gate/up projection (K=6144)
-        # consistently across decode M (~6-15% on that GEMM); the shallow down
-        # projection (K=3072) keeps the 256 tile.
-        block_k = 512 if k >= 4096 else 256
-
-        grid_m = routing_data.n_blocks(m, block_m)
-        grid_n = triton.cdiv(n, block_n)
-        grid = grid_m * grid_n * split_k
-        while block_n >= 64 and grid < 256:
-            block_n = block_n // 2
-            grid_m = routing_data.n_blocks(m, block_m)
-            grid_n = triton.cdiv(n, block_n)
-            grid = grid_m * grid_n * split_k
-
-    elif block_m == 32:
-        if n <= 1024:
-            block_n = 128
-            num_warps = 4
-        elif n <= 4096:
-            block_n = 256
-            num_warps = 8
-        else:
-            block_n = 512
-            num_warps = 8
-
-    else:
-        # Large block_m (dense prefill grouped MoE, e.g. block_m == 128).
-        # Tuned on gfx1250 for the MiniMax-M3 routed GEMMs (N=6144, K in
-        # {6144, 3072}, M ~= routed prefill tokens) via rocprofv3 kernel-trace
-        # DURATION sweeps. BLOCK_N=256 with a K-dependent BLOCK_K beats the old
-        # flat BLOCK_N=512 / BLOCK_K=256 by ~1.4x end-to-end on the fused path.
-        num_warps = 8
-        block_n = 256
-        if k >= 4096:
-            # deep-K projection (gate/up, K == hidden): larger K tile + more
-            # waves hides the extra K iterations.
-            block_k = 512
-            waves_per_eu = 2
-            group_m = 4
-            kpack = 1
-        else:
-            # shallow-K projection (down, K == intermediate): square K tile,
-            # kpack=2 packs two mxfp4 K-slices per MFMA for better throughput.
-            block_k = 256
-            waves_per_eu = 0
-            group_m = 1
-            kpack = 2
-
-    ret = {
-        "block_m": block_m,
-        "block_n": _env_config_int("AITER_MOE_A16W4_TRITON", "BLOCK_N", k, block_n),
-        "block_k": _env_config_int("AITER_MOE_A16W4_TRITON", "BLOCK_K", k, block_k),
-        "num_warps": _env_config_int(
-            "AITER_MOE_A16W4_TRITON", "NUM_WARPS", k, num_warps
-        ),
-        "num_stages": _env_config_int(
-            "AITER_MOE_A16W4_TRITON", "NUM_STAGES", k, num_stages
-        ),
-        "group_m": _env_config_int("AITER_MOE_A16W4_TRITON", "GROUP_M", k, group_m),
-        "xcd_swizzle": _env_config_int(
-            "AITER_MOE_A16W4_TRITON", "XCD_SWIZZLE", k, xcd_swizzle
-        ),
-        "w_cache_modifier": w_cache_modifier,
-        "split_k": split_k,
-        "waves_per_eu": _env_config_int(
-            "AITER_MOE_A16W4_TRITON", "WAVES_PER_EU", k, waves_per_eu
-        ),
-        "matrix_instr_nonkdim": _env_config_int(
-            "AITER_MOE_A16W4_TRITON", "MATRIX_INSTR_NONKDIM", k, 16
-        ),
-        "kpack": _env_config_int("AITER_MOE_A16W4_TRITON", "KPACK", k, kpack),
-    }
-    return ret
-
-
-def get_kernel_config_gluon(m, n, k, routing_data):
-    block_m = routing_data.block_m
-    group_m = 4
-    xcd_swizzle = 1
-    w_cache_modifier = ".cg" if block_m <= 32 else None
-    num_stages = 2
-    split_k = 1
-    block_k = 512
-    num_buffers = 1
-    waves_per_eu = 0
-
-    if block_m == 16:
-        block_n = 128
-        num_warps = 4
-        # Decode (block_m=16): the deep-K gate/up projection (K=6144, 12 K-iters
-        # at BLOCK_K=512) hides TDM latency behind compute, so the stage-2
-        # LDS-prefetch pipeline (NUM_BUFFERS=2) beats single-buffer by ~4-14%
-        # across decode M (biggest at M=1). The shallow-K down projection
-        # (K=3072, 6 iters) regresses under stage-2 at M>=16, so it stays
-        # single-buffered. Verified bit-identical to NUM_BUFFERS=1 output.
-        num_buffers = 2 if k >= 4096 else 1
-    elif block_m == 32:
-        block_n = 128
-        # For block_m > 16 the A tile (block_m x block_k) grows with block_m, so
-        # the wide 512-deep K tile blows past the LDS budget on GPUs with a
-        # 320 KB shared-memory limit. Halve BLOCK_K to 256 to fit.
-        block_k = 256
-        num_warps = 4
-    else:
-        # Large-block prefill (block_m>=64) on gfx1250, tuned for the MiniMax-M3
-        # A16W4 routed GEMMs (N=6144, K in {6144, 3072}) via do_bench sweeps of
-        # each _moe_gemm_a16w4 launch at a saturated grid (~13.7k CTAs).
-        #
-        # Winner: a 128-wide N tile with the stage-2 (NUM_BUFFERS=2) LDS-prefetch
-        # pipeline. Halving BLOCK_N (256->128) halves the W + scale LDS footprint,
-        # which lets the double-buffered X/W tiles fit the 320 KB budget while
-        # doubling the grid (grid_n 24->48) to keep the GPU saturated -- ~24%
-        # faster on gate/up (K=6144) and ~25% on down (K=3072) vs the old
-        # single-buffer BLOCK_N=256 config. (An earlier stage-2 attempt at
-        # BLOCK_N=256 regressed -- too wide to double-buffer -- which is why
-        # single-buffer was previously preferred.)
-        #
-        # BLOCK_K stays 256: 512 needs ~404 KB LDS at block_m=128 (> 320 KB, fails
-        # to launch) and stage-2 has a correctness floor of BLOCK_K>=256, so 256
-        # is the only valid choice. xcd_swizzle is projection-dependent: gate/up
-        # (deep K=6144) prefers 2, down (K=3072) prefers 8.
-        block_n = 128
-        block_k = 256
-        num_warps = 4
-        num_stages = 2
-        waves_per_eu = 0
-        group_m = 4
-        num_buffers = 2
-        xcd_swizzle = 2 if k >= 4096 else 8
-        # block_m==128 (dense prefill): the down projection (K<4096) is faster
-        # single-buffered (stage-1) with xcd_swizzle=2 -- +8-11% end-to-end at
-        # M>=4096 vs the stage-2 / xcd_swizzle=8 default (validated full-layer,
-        # interleaved min-of-min, gfx1250 tune 2026-07). This regresses at
-        # block_m==64, so it is gated on block_m==128 only.
-        if block_m == 128 and k < 4096:
-            num_buffers = 1
-            xcd_swizzle = 2
-
+def get_kernel_config_triton(m, n, k, routing_data):
+    """Functional (non-tuned) default triton config. Used only as a fallback when
+    no tuned JSON entry exists for the shape -- all tuned configs live in
+    configs/moe/{arch}-MOE-GEMM-A16W4-triton-BLOCK_M=*.json. Values are safe for
+    any (block_m, N, K): a 128-wide N tile and 256-deep K tile run correctly for
+    every shape (masked when N/K are smaller)."""
     return {
-        "block_m": block_m,
-        "block_n": _env_config_int("AITER_MOE_A16W4_GLUON", "BLOCK_N", k, block_n),
-        "block_k": _env_config_int("AITER_MOE_A16W4_GLUON", "BLOCK_K", k, block_k),
-        "num_warps": _env_config_int(
-            "AITER_MOE_A16W4_GLUON", "NUM_WARPS", k, num_warps
-        ),
-        "num_stages": _env_config_int(
-            "AITER_MOE_A16W4_GLUON", "NUM_STAGES", k, num_stages
-        ),
-        "group_m": _env_config_int("AITER_MOE_A16W4_GLUON", "GROUP_M", k, group_m),
-        "xcd_swizzle": _env_config_int(
-            "AITER_MOE_A16W4_GLUON", "XCD_SWIZZLE", k, xcd_swizzle
-        ),
-        "w_cache_modifier": w_cache_modifier,
-        "split_k": split_k,
-        "waves_per_eu": _env_config_int(
-            "AITER_MOE_A16W4_GLUON", "WAVES_PER_EU", k, waves_per_eu
-        ),
+        "block_m": routing_data.block_m,
+        "block_n": 128,
+        "block_k": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "group_m": 4,
+        "xcd_swizzle": 8,
+        "w_cache_modifier": None,
+        "split_k": 1,
+        "waves_per_eu": 0,
         "matrix_instr_nonkdim": 16,
         "kpack": 1,
-        "num_buffers": _env_config_int(
-            "AITER_MOE_A16W4_GLUON", "NUM_BUFFERS", k, num_buffers
-        ),
     }
 
 
-def _selected_backend() -> str:
-    backend = os.environ.get("AITER_MOE_A16W4_BACKEND")
-    if backend is None:
-        # Default to "gluon": the tuned Gluon path (see get_kernel_config_gluon)
-        # is now the default backend. Set AITER_MOE_A16W4_GLUON=0 to fall back to
-        # the "auto" behavior (gfx1250 large-block block_m>=64 prefill GEMMs on
-        # Gluon, small block_m decode-style shapes on Triton), or set
-        # AITER_MOE_A16W4_BACKEND explicitly to override.
-        backend = "auto" if os.environ.get("AITER_MOE_A16W4_GLUON") == "0" else "gluon"
-    backend = backend.lower()
-    if backend not in {"triton", "gluon", "auto"}:
-        raise ValueError(f"unknown AITER_MOE_A16W4_BACKEND={backend!r}")
-    return backend
+def get_kernel_config_gluon(m, n, k, routing_data, force_num_buffers=None):
+    """Functional (non-tuned) default gluon config. Used only as a fallback when
+    no tuned JSON entry exists for the shape -- all tuned configs live in
+    configs/moe/{arch}-MOE-GEMM-A16W4-gluon-num-stage-*-BLOCK_M=*.json. Values are
+    safe for any (block_m, N, K): single-buffer (num_buffers=1) with a 128-wide N
+    tile and the 256-deep K tile that satisfies the stage>=2 BLOCK_K floor.
+    ``force_num_buffers`` pins the pipeline stage."""
+    return {
+        "block_m": routing_data.block_m,
+        "block_n": 128,
+        "block_k": 256,
+        "num_warps": 4,
+        "num_stages": 2,
+        "group_m": 4,
+        "xcd_swizzle": 1,
+        "w_cache_modifier": None,
+        "split_k": 1,
+        "waves_per_eu": 0,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "num_buffers": 1 if force_num_buffers is None else force_num_buffers,
+    }
+
+
+_MOE_A16W4_CONFIG_NAME = "MOE-GEMM-A16W4"
+
+
+@functools.lru_cache(maxsize=256)
+def _load_moe_a16w4_json(variant: str, block_m: int):
+    """Load the configs/moe JSON for a (variant, block_m), falling back to the
+    block_m-agnostic variant file. Returns the raw dict, or None if no file exists
+    (JSON is optional). File layout is a two-level N -> K mapping."""
+    arch = get_arch()
+    base = f"{AITER_TRITON_CONFIGS_PATH}/moe"
+    name = f"{arch}-{_MOE_A16W4_CONFIG_NAME}-{variant}"
+    for fname in (f"{name}-BLOCK_M={block_m}.json", f"{name}.json"):
+        fpath = f"{base}/{fname}"
+        if os.path.exists(fpath):
+            with open(fpath, "r") as fh:
+                return json.load(fh)
+    return None
+
+
+def _leq_lookup(mapping: dict, prefix: str, val: int):
+    """Select an entry from `mapping` by `val` using {prefix}_LEQ_x / {prefix}_GEQ_x
+    keys (bounds derived from the keys themselves), falling back to a "default" /
+    "any" catch-all. Returns the matched value, or None."""
+    leq = sorted(
+        int(key.rsplit("_", 1)[1])
+        for key in mapping
+        if key.startswith(prefix + "_LEQ_")
+    )
+    for bound in leq:
+        if val <= bound:
+            return mapping[f"{prefix}_LEQ_{bound}"]
+    geq = sorted(
+        (
+            int(key.rsplit("_", 1)[1])
+            for key in mapping
+            if key.startswith(prefix + "_GEQ_")
+        ),
+        reverse=True,
+    )
+    for bound in geq:
+        if val >= bound:
+            return mapping[f"{prefix}_GEQ_{bound}"]
+    if "default" in mapping:
+        return mapping["default"]
+    if "any" in mapping:
+        return mapping["any"]
+    return None
+
+
+def _moe_a16w4_json_entry(variant: str, block_m: int, n: int, k: int):
+    """Config entry for a (variant, block_m, N, K), or None if no file/entry
+    matches. Files are named by block_m; the entry is selected by a two-level
+    N -> K {prefix}_LEQ_x lookup inside."""
+    cfg = _load_moe_a16w4_json(variant, block_m)
+    if cfg is None:
+        return None
+    sub = _leq_lookup(cfg, "N", n)
+    if not isinstance(sub, dict):
+        return None
+    entry = _leq_lookup(sub, "K", k)
+    return dict(entry) if isinstance(entry, dict) else None
+
+
+def _auto_default(block_m):
+    """Functional default for the `auto` variant (no JSON): gfx1250 runs gluon,
+    single-buffer. Callers force triton for non-gfx1250 / swizzled scales before
+    reaching here."""
+    return {"backend": "gluon", "num_buffers": 1}
+
+
+def _get_config(routing_data, m, n, k, config=None, swizzle_mx_scale=None):
+    """Resolve the full a16w4 MoE launch config (backend + stage + tiling).
+
+    Mirrors gemm_a8w8._get_config but with backend/stage variants:
+      * if `config` pins ``backend`` (and optionally ``num_buffers``) that variant
+        is used directly;
+      * otherwise the ``auto`` variant picks backend+stage for the shape;
+      * tiling comes from the variant JSON if present, else the functional-default
+        config from get_kernel_config_{triton,gluon}; any tiling keys in `config`
+        overlay on top.
+
+    Returns ``(config_dict, is_tuned)``. ``config_dict`` always contains
+    ``"backend"`` and (for gluon) ``"num_buffers"``.
+    """
+    config = dict(config) if config else {}
+    block_m = routing_data.block_m
+    backend = config.get("backend")
+    num_buffers = config.get("num_buffers")
+    pinned_gluon = backend == "gluon"
+
+    arch = get_arch()
+    # Correctness constraints (independent of tuning): the gluon a16w4 kernel is
+    # gfx1250-only and only supports compact (non-swizzled) e8m0 scales.
+    if swizzle_mx_scale is not None:
+        if pinned_gluon and arch == "gfx1250":
+            raise ValueError(
+                "config backend='gluon' cannot honor swizzled MX scales "
+                f"(swizzle_mx_scale={swizzle_mx_scale!r}): the Gluon a16w4 kernel "
+                "supports only compact e8m0 scales. Use backend='triton'."
+            )
+        backend = "triton"
+    if arch != "gfx1250":
+        backend = "triton"
+
+    is_tuned = False
+    # Resolve backend and/or the gluon stage from `auto` whenever the caller left
+    # either unpinned -- so an explicit backend="gluon" (no stage) still gets the
+    # per-shape tuned stage, not the functional default.
+    if backend is None or (backend == "gluon" and num_buffers is None):
+        auto = _moe_a16w4_json_entry("auto", block_m, n, k)
+        if auto is not None:
+            is_tuned = True
+        else:
+            auto = _auto_default(block_m)
+        if backend is None:
+            backend = auto["backend"]
+        if backend == "gluon" and num_buffers is None:
+            num_buffers = auto.get("num_buffers")
+
+    # Resolve tiling for the chosen variant (JSON if present, else functional).
+    if backend == "gluon":
+        if num_buffers is None:
+            num_buffers = 1
+        entry = _moe_a16w4_json_entry(f"gluon-num-stage-{num_buffers}", block_m, n, k)
+        if entry is not None:
+            entry["block_m"] = block_m
+            entry.setdefault("num_buffers", num_buffers)
+            params = entry
+            is_tuned = True
+        else:
+            params = get_kernel_config_gluon(
+                m, n, k, routing_data, force_num_buffers=num_buffers
+            )
+    else:
+        entry = _moe_a16w4_json_entry("triton", block_m, n, k)
+        if entry is not None:
+            entry["block_m"] = block_m
+            params = entry
+            is_tuned = True
+        else:
+            params = get_kernel_config_triton(m, n, k, routing_data)
+
+    params["backend"] = backend
+
+    # Overlay caller-supplied tiling keys (everything except the control key).
+    for key, val in config.items():
+        if key != "backend":
+            params[key] = val
+
+    return params, is_tuned
 
 
 # -----------------------------------------------------------------------------
@@ -299,11 +297,22 @@ def moe_gemm_a16w4(
     swiglu_add_residual=True,
     unpadded_N=None,
     unpadded_K=None,
+    config: Optional[dict] = None,
 ):
     """
     Y[:, :] = 0.
     for e in num_experts:
         Y[idxs_y_m(e), :] += matmul(X[idxs_x_m(e), :], W[e, :, :])
+
+    Args:
+        config (Optional[dict]): Kernel selection + tuning parameters. May pin
+            ``"backend"`` ("triton"/"gluon"), ``"num_buffers"`` (gluon pipeline
+            stage 1/2/3), and any tiling keys (``block_n``, ``block_k``,
+            ``num_warps``, ``num_stages``, ``group_m``, ``xcd_swizzle``,
+            ``waves_per_eu``, ``matrix_instr_nonkdim``, ``kpack``). When a
+            backend/stage is not pinned, the ``auto`` config resolves it per
+            shape. ``block_m`` is always taken from ``routing_data``. See
+            :func:`_get_config`.
     """
     assert w.stride(-2) == 1, "`w` must be column-major when it has data-type mxfp"
     assert x_scales is None, "x_scales must be none"
@@ -319,39 +328,12 @@ def moe_gemm_a16w4(
     if unpadded_K and block_m == 16:
         K = unpadded_K
 
-    # compute optimization flags
-    backend = _selected_backend()
-    # The Gluon path is only numerically correct for compact (non-swizzled) MX
-    # scales: GFX1250_SCALE hangs the ROCm loader at first launch and CDNA4_SCALE
-    # is unsupported (produces inf under swiglu). So swizzled scales ALWAYS stay
-    # on Triton, regardless of the selected backend -- including the "gluon"
-    # default. An explicit AITER_MOE_A16W4_BACKEND=gluon with swizzled scales
-    # cannot be honored correctly, so fail loudly rather than hang / return inf.
-    # "auto" additionally restricts Gluon to gfx1250 large-block (block_m>=64)
-    # prefill, where it has been validated.
-    if backend == "gluon" and get_arch() == "gfx1250" and swizzle_mx_scale is not None:
-        raise ValueError(
-            "AITER_MOE_A16W4_BACKEND=gluon cannot honor swizzled MX scales "
-            f"(swizzle_mx_scale={swizzle_mx_scale!r}): the Gluon a16w4 kernel "
-            "supports only compact e8m0 scales. Use the Triton backend "
-            "(AITER_MOE_A16W4_BACKEND=triton or =auto) for swizzled scales."
-        )
-    use_gluon = (
-        get_arch() == "gfx1250"
-        and swizzle_mx_scale is None
-        and (backend == "gluon" or (backend == "auto" and block_m >= 64))
+    # resolve the launch config (backend + stage + tiling) from `config` / the
+    # tuned JSON variants / the code-default heuristics (see _get_config).
+    config, _is_tuned = _get_config(
+        routing_data, M, N, K, config=config, swizzle_mx_scale=swizzle_mx_scale
     )
-    config = (
-        get_kernel_config_gluon(M, N, K, routing_data)
-        if use_gluon
-        else get_kernel_config(M, N, K, routing_data)
-    )
-    if os.environ.get("AITER_MOE_A16W4_DEBUG_PRINT"):
-        print(
-            f"moe_gemm_a16w4 backend={backend} use_gluon={use_gluon} "
-            f"M={M} N={N} K={K} swiglu={int(bool(apply_swiglu))} config={config}",
-            flush=True,
-        )
+    use_gluon = config["backend"] == "gluon"
     if apply_swiglu and config["split_k"] > 1:
         apply_swiglu_matmul = False
         reduction_n_matmul = 1

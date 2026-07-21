@@ -1,7 +1,6 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/bench/bench_mlp.py
 
-from itertools import chain
 from pathlib import Path
 import os
 import statistics
@@ -17,7 +16,10 @@ from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 import tempfile
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
-import inspect
+
+# Config dict forwarded to every moe_gemm_a16w4 call (set from --backend /
+# --gluon-stage in main). None -> let the op's `auto` config pick per shape.
+_MOE_CONFIG = None
 
 
 def parse_profile(profile_path, useful_op_regex, reps):
@@ -48,108 +50,6 @@ def parse_profile(profile_path, useful_op_regex, reps):
         "bytes": bytes_,
         "reps": reps,
     }
-
-
-def compute_roofline(
-    *args, bench_fn, intensity_proxy_name, intensity_proxy_values, out_path, **kwargs
-):
-    """
-    Sweeps intensity_proxy_values by injecting them into bench_fn, prints summary, and writes a CSV to out_path.
-    """
-    # validate input args
-    if not isinstance(intensity_proxy_name, str):
-        raise TypeError(
-            "intensity_proxy must be a string naming a parameter in target_fn"
-        )
-
-    # determine position of intensity_proxy in target_fn signature
-    sig = inspect.signature(bench_fn)
-    params = list(sig.parameters.values())
-    if intensity_proxy_name not in sig.parameters:
-        raise ValueError(
-            f"Parameter '{intensity_proxy_name}' not found in {bench_fn.__name__} signature"
-        )
-    pos_index = [p.name for p in params].index(intensity_proxy_name)
-
-    # wrapper to inject intensity proxy into target_fn and call it
-    def inject_proxy_and_call(val, args_, kwargs_):
-        args_list = list(args_)
-        args_list.insert(pos_index, val)
-        return bench_fn(*args_list, **kwargs_)
-
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # collect performance data
-    results: list[tuple[str, dict[str, int | float]]] = []
-    print("=========================================")
-    print(f"{out_path}...")
-    print("=========================================")
-
-    for val in intensity_proxy_values:
-        perf = inject_proxy_and_call(val, args, kwargs)
-        results.append((val, perf))
-
-        kt = perf["kernel_time_ns"] or float("nan")
-        tflops = perf["flops"] / kt * 1e-3
-        tbps = perf["bytes"] / kt * 1e-3
-        kernel_latency_us = perf["kernel_time_ns"] / 1e3 / perf["reps"]
-        # events mode carries explicit latency stats; proton mode does not
-        if "avg_ms" in perf:
-            lat = (
-                f"avg: {perf['avg_ms']:.4f} ms | min: {perf['min_ms']:.4f} ms | "
-                f"active experts: {perf.get('active_experts', '-')}"
-            )
-        else:
-            lat = f"Kernel latency (us): {kernel_latency_us:.2f}"
-        print(
-            f"{intensity_proxy_name}: {val:6d} | {lat} | "
-            f"TFLOPS: {tflops:#.4g} | TBPS: {tbps:.2f} | "
-            f"grid[{perf.get('launched_grid', '-')}]"
-        )
-
-    # write CSV
-    fieldnames = [
-        intensity_proxy_name,  # e.g. "batch"
-        "avg_ms",
-        "min_ms",
-        "max_ms",
-        "median_ms",
-        "active_experts",
-        "launched_grid",
-        "kernel_latency_us",
-        "tflops",
-        "tbps",
-        "total_time_ns",
-        "kernel_time_ns",
-        "flops",
-        "bytes",
-        "reps",
-    ]
-    with out_path.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for val, perf in results:
-            kt = perf["kernel_time_ns"] or float("nan")
-            w.writerow(
-                {
-                    intensity_proxy_name: val,
-                    "avg_ms": perf.get("avg_ms", ""),
-                    "min_ms": perf.get("min_ms", ""),
-                    "max_ms": perf.get("max_ms", ""),
-                    "median_ms": perf.get("median_ms", ""),
-                    "active_experts": perf.get("active_experts", ""),
-                    "launched_grid": perf.get("launched_grid", ""),
-                    "kernel_latency_us": perf["kernel_time_ns"] / 1e3 / perf["reps"],
-                    "tflops": perf["flops"] / kt * 1e-3,
-                    "tbps": perf["bytes"] / kt * 1e-3,
-                    "total_time_ns": perf["total_time_ns"],
-                    "kernel_time_ns": perf["kernel_time_ns"],
-                    "flops": perf["flops"],
-                    "bytes": perf["bytes"],
-                    "reps": perf["reps"],
-                }
-            )
 
 
 def check_and_shuffle_scales(scale, N, K):
@@ -333,7 +233,8 @@ def _capture_grids(fn):
         low = name.lower()
         if "gemm" in low:
             parts.append(
-                f"gemm={gm}x{gn}" if gm is not None and gn is not None
+                f"gemm={gm}x{gn}"
+                if gm is not None and gn is not None
                 else f"gemm={total}"
             )
         elif "reduce" in low:
@@ -414,6 +315,7 @@ def bench_mlp_single_weight_init(
             swizzle_mx_scale=swizzle_mx_scale1,
             out_dtype=x_dtype_torch,
             apply_swiglu=True,
+            config=_MOE_CONFIG,
         )
         # GEMM2 (down): scatter-reduce with router weights, no swiglu -> (M, dim1)
         # This matches the production fused_experts down-projection that the
@@ -431,11 +333,10 @@ def bench_mlp_single_weight_init(
             gammas=gammas,
             swizzle_mx_scale=swizzle_mx_scale2,
             out_dtype=x_dtype_torch,
+            config=_MOE_CONFIG,
         )
 
-    total_bytes, flops = op_bytes_flops(
-        batch, dim1, dim2 // TP, n_expts_act, n_active
-    )
+    total_bytes, flops = op_bytes_flops(batch, dim1, dim2 // TP, n_expts_act, n_active)
 
     # capture the actual launched grid(s) once (GEMM1, GEMM2, reduce)
     launched_grid = _capture_grids(run_layer)
@@ -557,31 +458,96 @@ def roofline_mlp(
     # Avoid creating an empty directory named like the output CSV stem.
     out_dir = Path("logs") / name
     out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{x_dtype}x-{w_dtype}w-TP{TP}-{routing_mode}.csv"
 
-    out_csv = out_dir / f"{x_dtype}x-{w_dtype}w-TP{TP}-{routing_mode}.csv"
+    # Sweep batch sizes, benchmark each, print a summary line and write a CSV.
+    results: list[tuple[int, dict[str, int | float]]] = []
+    print("=========================================")
+    print(f"{out_path}...")
+    print("=========================================")
 
-    compute_roofline(
-        dim1,
-        dim2,
-        n_expts_tot,
-        n_expts_act,
-        x_dtype,
-        w_dtype,
-        TP,
-        op_regex,  # fixed args
-        num_weight_inits,
-        bench_fn=bench_mlp,  # function to benchmark
-        intensity_proxy_name="batch",  # intensity proxy name
-        intensity_proxy_values=batch_sizes,  # intensity proxy values to sweep
-        out_path=out_csv,
-        timing=timing,
-        routing_mode=routing_mode,
-        skew=skew,
-        warmup=warmup,
-        iters=iters,
-        dump_blocks=dump_blocks,
-        seed=seed,
-    )
+    for batch in batch_sizes:
+        perf = bench_mlp(
+            batch,
+            dim1,
+            dim2,
+            n_expts_tot,
+            n_expts_act,
+            x_dtype,
+            w_dtype,
+            TP,
+            op_regex,
+            num_weight_inits,
+            timing=timing,
+            routing_mode=routing_mode,
+            skew=skew,
+            warmup=warmup,
+            iters=iters,
+            dump_blocks=dump_blocks,
+            seed=seed,
+        )
+        results.append((batch, perf))
+
+        kt = perf["kernel_time_ns"] or float("nan")
+        tflops = perf["flops"] / kt * 1e-3
+        tbps = perf["bytes"] / kt * 1e-3
+        kernel_latency_us = perf["kernel_time_ns"] / 1e3 / perf["reps"]
+        # events mode carries explicit latency stats; proton mode does not
+        if "avg_ms" in perf:
+            lat = (
+                f"avg: {perf['avg_ms']:.4f} ms | min: {perf['min_ms']:.4f} ms | "
+                f"active experts: {perf.get('active_experts', '-')}"
+            )
+        else:
+            lat = f"Kernel latency (us): {kernel_latency_us:.2f}"
+        print(
+            f"batch: {batch:6d} | {lat} | "
+            f"TFLOPS: {tflops:#.4g} | TBPS: {tbps:.2f} | "
+            f"grid[{perf.get('launched_grid', '-')}]"
+        )
+
+    # write CSV
+    fieldnames = [
+        "batch",
+        "avg_ms",
+        "min_ms",
+        "max_ms",
+        "median_ms",
+        "active_experts",
+        "launched_grid",
+        "kernel_latency_us",
+        "tflops",
+        "tbps",
+        "total_time_ns",
+        "kernel_time_ns",
+        "flops",
+        "bytes",
+        "reps",
+    ]
+    with out_path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for batch, perf in results:
+            kt = perf["kernel_time_ns"] or float("nan")
+            w.writerow(
+                {
+                    "batch": batch,
+                    "avg_ms": perf.get("avg_ms", ""),
+                    "min_ms": perf.get("min_ms", ""),
+                    "max_ms": perf.get("max_ms", ""),
+                    "median_ms": perf.get("median_ms", ""),
+                    "active_experts": perf.get("active_experts", ""),
+                    "launched_grid": perf.get("launched_grid", ""),
+                    "kernel_latency_us": perf["kernel_time_ns"] / 1e3 / perf["reps"],
+                    "tflops": perf["flops"] / kt * 1e-3,
+                    "tbps": perf["bytes"] / kt * 1e-3,
+                    "total_time_ns": perf["total_time_ns"],
+                    "kernel_time_ns": perf["kernel_time_ns"],
+                    "flops": perf["flops"],
+                    "bytes": perf["bytes"],
+                    "reps": perf["reps"],
+                }
+            )
 
 
 def parse_args(args: list[str] | None = None):
@@ -698,29 +664,22 @@ def parse_args(args: list[str] | None = None):
 def main(args: list[str] | None = None) -> None:
     parsed_args = parse_args(args=args)
 
-    # Select the moe_gemm_a16w4 backend; read at call time in _selected_backend().
-    os.environ["AITER_MOE_A16W4_BACKEND"] = parsed_args.backend
-    print(f"moe_gemm_a16w4 backend: {parsed_args.backend}")
-
-    # Optionally force the gluon pipeline stage (NUM_BUFFERS) for all shapes; the
-    # config reads this env var per launch (get_kernel_config_gluon).
+    # Build the config dict forwarded to every moe_gemm_a16w4 call. "auto" leaves
+    # the backend unpinned (the op's `auto` config picks per shape); "triton" /
+    # "gluon" pin the backend, and --gluon-stage pins the gluon pipeline stage.
+    global _MOE_CONFIG
+    cli_config = {}
+    if parsed_args.backend != "auto":
+        cli_config["backend"] = parsed_args.backend
     if parsed_args.gluon_stage is not None:
-        os.environ["AITER_MOE_A16W4_GLUON_NUM_BUFFERS"] = str(parsed_args.gluon_stage)
-        print(f"gluon stage (NUM_BUFFERS) forced to: {parsed_args.gluon_stage}")
+        cli_config["num_buffers"] = parsed_args.gluon_stage
+    _MOE_CONFIG = cli_config or None
+    print(f"moe_gemm_a16w4 config: {_MOE_CONFIG}")
 
     dim1, dim2 = parsed_args.shape
     total_experts, active_experts = parsed_args.experts
     if parsed_args.M is None:
-        batch_ranges_moe = [
-            (1, 2, 1),
-            (2, 5, 2),
-            (8, 18, 8),
-            (32, 65, 32),
-            (128, 257, 128),
-            (1024, 1200, 200),
-            (4096, 8200, 4096),
-        ]
-        batch_sizes_moe = list(chain(*[range(*r) for r in batch_ranges_moe]))
+        batch_sizes_moe = [1, 2, 4, 8, 16, 32, 64, 128, 256, 1024, 4096, 8192]
     else:
         batch_sizes_moe = parsed_args.M
 
