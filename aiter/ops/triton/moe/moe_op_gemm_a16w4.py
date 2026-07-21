@@ -12,6 +12,7 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a16w4 import (
 from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a16w4 import (
     _moe_gemm_a16w4_gluon_stage1,
     _moe_gemm_a16w4_gluon_stage2,
+    _moe_gemm_a16w4_gluon_stage3,
 )
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton.arch_info import get_arch
@@ -222,6 +223,14 @@ def get_kernel_config_gluon(m, n, k, routing_data):
         group_m = 4
         num_buffers = 2
         xcd_swizzle = 2 if k >= 4096 else 8
+        # block_m==128 (dense prefill): the down projection (K<4096) is faster
+        # single-buffered (stage-1) with xcd_swizzle=2 -- +8-11% end-to-end at
+        # M>=4096 vs the stage-2 / xcd_swizzle=8 default (validated full-layer,
+        # interleaved min-of-min, gfx1250 tune 2026-07). This regresses at
+        # block_m==64, so it is gated on block_m==128 only.
+        if block_m == 128 and k < 4096:
+            num_buffers = 1
+            xcd_swizzle = 2
 
     return {
         "block_m": block_m,
@@ -246,6 +255,14 @@ def get_kernel_config_gluon(m, n, k, routing_data):
         "kpack": 1,
         "num_buffers": _env_config_int(
             "AITER_MOE_A16W4_GLUON", "NUM_BUFFERS", k, num_buffers
+        ),
+        # PERF PROBE (numerically incorrect): feed WMMA constant operands to
+        # isolate load vs compute cost. Off by default.
+        "probe_fake_b": _env_config_int(
+            "AITER_MOE_A16W4_GLUON", "PROBE_FAKE_B", k, 0
+        ),
+        "probe_fake_a": _env_config_int(
+            "AITER_MOE_A16W4_GLUON", "PROBE_FAKE_A", k, 0
         ),
     }
 
@@ -384,11 +401,12 @@ def moe_gemm_a16w4(
         num_buffers = max(
             1, min(config["num_buffers"], triton.cdiv(K, config["block_k"]))
         )
-        gluon_kernel = (
-            _moe_gemm_a16w4_gluon_stage1
-            if num_buffers == 1
-            else _moe_gemm_a16w4_gluon_stage2
-        )
+        if num_buffers == 1:
+            gluon_kernel = _moe_gemm_a16w4_gluon_stage1
+        elif num_buffers == 2:
+            gluon_kernel = _moe_gemm_a16w4_gluon_stage2
+        else:
+            gluon_kernel = _moe_gemm_a16w4_gluon_stage3
         gluon_kernel[(grid,)](
             y,
             y.stride(0),
@@ -437,6 +455,8 @@ def moe_gemm_a16w4(
             num_warps=config["num_warps"],
             num_stages=config["num_stages"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
+            PROBE_FAKE_B=bool(config["probe_fake_b"]),
+            PROBE_FAKE_A=bool(config["probe_fake_a"]),
             waves_per_eu=config["waves_per_eu"],
             matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
             kpack=config["kpack"],

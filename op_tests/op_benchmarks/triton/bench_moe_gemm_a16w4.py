@@ -104,7 +104,8 @@ def compute_roofline(
             lat = f"Kernel latency (us): {kernel_latency_us:.2f}"
         print(
             f"{intensity_proxy_name}: {val:6d} | {lat} | "
-            f"TFLOPS: {tflops:#.4g} | TBPS: {tbps:.2f}"
+            f"TFLOPS: {tflops:#.4g} | TBPS: {tbps:.2f} | "
+            f"grid[{perf.get('launched_grid', '-')}]"
         )
 
     # write CSV
@@ -115,6 +116,7 @@ def compute_roofline(
         "max_ms",
         "median_ms",
         "active_experts",
+        "launched_grid",
         "kernel_latency_us",
         "tflops",
         "tbps",
@@ -137,6 +139,7 @@ def compute_roofline(
                     "max_ms": perf.get("max_ms", ""),
                     "median_ms": perf.get("median_ms", ""),
                     "active_experts": perf.get("active_experts", ""),
+                    "launched_grid": perf.get("launched_grid", ""),
                     "kernel_latency_us": perf["kernel_time_ns"] / 1e3 / perf["reps"],
                     "tflops": perf["flops"] / kt * 1e-3,
                     "tbps": perf["bytes"] / kt * 1e-3,
@@ -182,7 +185,7 @@ def quantize(x, dtype):
         return x, scale
 
 
-def make_routing(batch, n_expts_tot, n_expts_act, routing_mode, skew, dev):
+def make_routing(batch, n_expts_tot, n_expts_act, routing_mode, skew, dev, seed=None):
     """Build (routing_data, gather_indx, scatter_indx) for one shape.
 
     ``uniform``  -> independent random logits, so expert load is ~uniform
@@ -190,12 +193,53 @@ def make_routing(batch, n_expts_tot, n_expts_act, routing_mode, skew, dev):
     ``skewed``   -> add a per-expert bias so a subset of experts dominates the
                     top-k selection, mimicking the concentrated load seen in
                     real captured routing (far fewer experts active).
+
+    When ``seed`` is not None the logits are drawn from a dedicated generator
+    keyed on ``(seed, batch)``, so the routing (and thus the active-expert count
+    that drives latency) is identical for a given M across process runs and is
+    independent of any other RNG consumption (e.g. weight init). This is what
+    makes A/B comparisons (e.g. --gluon-stage 1 vs 2) fair. With seed=None the
+    global RNG is used, reproducing the old non-deterministic behaviour.
     """
-    logits = torch.randn((batch, n_expts_tot), device=dev)
+    gen = None
+    if seed is not None:
+        # 100003 is a prime multiplier so distinct M values never collide on the
+        # same sub-seed; the generator lives on the routing device.
+        gen = torch.Generator(device=dev).manual_seed(int(seed) * 100003 + int(batch))
+    logits = torch.randn((batch, n_expts_tot), device=dev, generator=gen)
     if routing_mode == "skewed":
-        expert_bias = torch.randn((n_expts_tot,), device=dev) * skew
+        expert_bias = torch.randn((n_expts_tot,), device=dev, generator=gen) * skew
         logits = logits + expert_bias[None, :]
     return routing(logits, n_expts_act)
+
+
+def dump_routing_blocks(batch, routing_data):
+    """Print, per launched M-block, the expert id and non-padding token count.
+
+    Decodes routing_data.expt_data.block_pid_map exactly as the kernel does:
+    val==-1 is an idle block; else expt_id = val & 0xFFFF, block_id = val >> 16,
+    and tokens = min(block_m, hist[expt_id] - block_id*block_m).
+    """
+    block_m = int(routing_data.block_m)
+    ed = routing_data.expt_data
+    hist = ed.hist.tolist()
+    bpm = ed.block_pid_map.tolist()
+    active = []
+    for pid, val in enumerate(bpm):
+        if val == -1:
+            continue
+        expt = val & 0xFFFF
+        blk = (val >> 16) & 0xFFFF
+        active.append((pid, expt, blk, min(block_m, hist[expt] - blk * block_m)))
+    idle = len(bpm) - len(active)
+    print(
+        f"  [blocks] M={batch} block_m={block_m} grid_m={len(bpm)} "
+        f"active={len(active)} idle={idle} "
+        f"experts_with_work={len({e for _, e, _, _ in active})}"
+    )
+    print(f"    {'pid':>5} {'expert':>7} {'blk_in_expert':>13} {'tokens':>7}")
+    for pid, expt, blk, tok in active:
+        print(f"    {pid:>5} {expt:>7} {blk:>13} {tok:>7}")
 
 
 def op_bytes_flops(batch, dim1, dim2, n_expts_act, n_active):
@@ -238,6 +282,65 @@ def time_with_events(fn, warmup, iters):
     return [s.elapsed_time(e) for s, e in zip(starts, ends)]
 
 
+# --- launched-grid capture ------------------------------------------------
+# Patch KernelInterface.__getitem__ (shared by the triton & gluon kernels) to
+# record each launch's decomposed grid (grid_m x grid_n, from the named kernel
+# args) while capture is on -- so the bench can report the real grid per shape.
+_GRID_CAP = {"on": False, "grids": []}
+
+
+def _install_grid_capture():
+    from triton.runtime.jit import KernelInterface
+
+    if getattr(KernelInterface.__getitem__, "_grid_cap", False):
+        return
+    orig = KernelInterface.__getitem__
+
+    def patched(self, grid):
+        launcher = orig(self, grid)
+        if not _GRID_CAP["on"]:
+            return launcher
+        arg_names = getattr(self, "arg_names", None)
+        name = getattr(self, "__name__", None) or type(self).__name__
+        total = grid[0] if isinstance(grid, (tuple, list)) and grid else grid
+
+        def wrap(*a, **k):
+            gm = gn = None
+            if arg_names:
+                nd = dict(zip(arg_names, a))
+                nd.update(k)
+                gm, gn = nd.get("grid_m"), nd.get("grid_n")
+            _GRID_CAP["grids"].append((name, total, gm, gn))
+            return launcher(*a, **k)
+
+        return wrap
+
+    patched._grid_cap = True
+    KernelInterface.__getitem__ = patched
+
+
+def _capture_grids(fn):
+    """Run fn once with capture on; return 'gemm=64x48 gemm=64x48 reduce=16'."""
+    _install_grid_capture()
+    _GRID_CAP["grids"] = []
+    _GRID_CAP["on"] = True
+    try:
+        fn()
+    finally:
+        _GRID_CAP["on"] = False
+    parts = []
+    for name, total, gm, gn in _GRID_CAP["grids"]:
+        low = name.lower()
+        if "gemm" in low:
+            parts.append(
+                f"gemm={gm}x{gn}" if gm is not None and gn is not None
+                else f"gemm={total}"
+            )
+        elif "reduce" in low:
+            parts.append(f"reduce={total}")
+    return " ".join(parts) if parts else "-"
+
+
 def bench_mlp_single_weight_init(
     batch,
     dim1,
@@ -253,9 +356,16 @@ def bench_mlp_single_weight_init(
     skew=4.0,
     warmup=5,
     iters=20,
+    dump_blocks=False,
+    seed=None,
 ):
     rank = 0
     dev = f"cuda:{rank}"
+
+    # Make weight/activation init reproducible too when a seed is given. Weight
+    # *values* don't affect latency, but this keeps the whole run deterministic.
+    if seed is not None:
+        torch.manual_seed(int(seed))
 
     assert dim2 % TP == 0, f"{dim2=}, {TP=}, dim2 must be divisible by TP"
 
@@ -281,10 +391,13 @@ def bench_mlp_single_weight_init(
     # routing computed once and held fixed across timed iters, exactly like the
     # capture replay (which replays fixed real gather/scatter indices).
     rdata, gather_indx, scatter_indx = make_routing(
-        batch, n_expts_tot, n_expts_act, routing_mode, skew, dev
+        batch, n_expts_tot, n_expts_act, routing_mode, skew, dev, seed=seed
     )
     gammas = rdata.gate_scal
     n_active = int((rdata.expt_hist > 0).sum())
+
+    if dump_blocks:
+        dump_routing_blocks(batch, rdata)
 
     def run_layer():
         # GEMM1 (gate/up): gather + swiglu -> intermediate (M*topk, dim2/2)
@@ -324,6 +437,9 @@ def bench_mlp_single_weight_init(
         batch, dim1, dim2 // TP, n_expts_act, n_active
     )
 
+    # capture the actual launched grid(s) once (GEMM1, GEMM2, reduce)
+    launched_grid = _capture_grids(run_layer)
+
     if timing == "proton":
         reps = 100
         fpath = Path(tempfile.mktemp())
@@ -331,9 +447,11 @@ def bench_mlp_single_weight_init(
         for _ in range(reps):
             run_layer()
         proton.finalize()
-        return parse_profile(
+        perf = parse_profile(
             fpath.with_suffix(".hatchet"), useful_op_regex=op_regex, reps=reps
         )
+        perf["launched_grid"] = launched_grid
+        return perf
 
     # events: repeated-run CUDA-event timing, same as the capture replay
     times_ms = time_with_events(run_layer, warmup, iters)
@@ -349,6 +467,7 @@ def bench_mlp_single_weight_init(
         "max_ms": max(times_ms),
         "median_ms": statistics.median(times_ms),
         "active_experts": n_active,
+        "launched_grid": launched_grid,
     }
 
 
@@ -368,9 +487,14 @@ def bench_mlp(
     skew=4.0,
     warmup=5,
     iters=20,
+    dump_blocks=False,
+    seed=None,
 ):
     all_results = []
-    for _ in range(num_weight_inits):
+    for init_idx in range(num_weight_inits):
+        # Distinct-but-reproducible seed per weight init so multiple inits still
+        # sample different routing while staying stable across process runs.
+        init_seed = None if seed is None else int(seed) + init_idx
         result = bench_mlp_single_weight_init(
             batch,
             dim1,
@@ -386,6 +510,8 @@ def bench_mlp(
             skew=skew,
             warmup=warmup,
             iters=iters,
+            dump_blocks=dump_blocks,
+            seed=init_seed,
         )
         all_results.append(result)
 
@@ -401,6 +527,9 @@ def bench_mlp(
     for k in ["avg_ms", "min_ms", "max_ms", "median_ms", "active_experts"]:
         if k in all_results[0]:
             aggregated[k] = sum(r[k] for r in all_results) / num_runs
+    # launched_grid is a string (same across inits) -- carry the first
+    if "launched_grid" in all_results[0]:
+        aggregated["launched_grid"] = all_results[0]["launched_grid"]
 
     return aggregated
 
@@ -422,6 +551,8 @@ def roofline_mlp(
     skew=4.0,
     warmup=5,
     iters=20,
+    dump_blocks=False,
+    seed=None,
 ):
     # Avoid creating an empty directory named like the output CSV stem.
     out_dir = Path("logs") / name
@@ -448,6 +579,8 @@ def roofline_mlp(
         skew=skew,
         warmup=warmup,
         iters=iters,
+        dump_blocks=dump_blocks,
+        seed=seed,
     )
 
 
@@ -534,6 +667,31 @@ def parse_args(args: list[str] | None = None):
         default=20,
         help="Timed iterations per shape for --timing events (default: 20).",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Fix the routing RNG seed so the active-expert distribution (which "
+        "drives latency) is identical per M across process runs, making A/B "
+        "comparisons (e.g. --gluon-stage 1 vs 2) fair. Routing is keyed on "
+        "(seed, M) via a dedicated generator; weight init uses torch.manual_seed"
+        "(seed). Default (None) reproduces the old non-deterministic behaviour.",
+    )
+    parser.add_argument(
+        "--dump-blocks",
+        action="store_true",
+        help="For each shape, print the per-launched-M-block routing layout "
+        "(expert id + non-padding token count) decoded from block_pid_map.",
+    )
+    parser.add_argument(
+        "--gluon-stage",
+        type=int,
+        default=None,
+        help="Force the gluon pipeline stage (= NUM_BUFFERS) for every shape: "
+        "1 = single-buffer (stage-1), 2 = LDS-prefetch double-buffer (stage-2), "
+        "3 = triple-buffer (stage-3). Default (None) uses the per-shape tuned "
+        "value from get_kernel_config_gluon. Capped at cdiv(K, block_k) at launch.",
+    )
     return parser.parse_args(args=args)
 
 
@@ -543,6 +701,12 @@ def main(args: list[str] | None = None) -> None:
     # Select the moe_gemm_a16w4 backend; read at call time in _selected_backend().
     os.environ["AITER_MOE_A16W4_BACKEND"] = parsed_args.backend
     print(f"moe_gemm_a16w4 backend: {parsed_args.backend}")
+
+    # Optionally force the gluon pipeline stage (NUM_BUFFERS) for all shapes; the
+    # config reads this env var per launch (get_kernel_config_gluon).
+    if parsed_args.gluon_stage is not None:
+        os.environ["AITER_MOE_A16W4_GLUON_NUM_BUFFERS"] = str(parsed_args.gluon_stage)
+        print(f"gluon stage (NUM_BUFFERS) forced to: {parsed_args.gluon_stage}")
 
     dim1, dim2 = parsed_args.shape
     total_experts, active_experts = parsed_args.experts
@@ -579,6 +743,8 @@ def main(args: list[str] | None = None) -> None:
         skew=parsed_args.skew,
         warmup=parsed_args.warmup,
         iters=parsed_args.iters,
+        dump_blocks=parsed_args.dump_blocks,
+        seed=parsed_args.seed,
     )
 
 
