@@ -111,6 +111,7 @@ def get_kernel_config_gluon(m, n, k, routing_data, force_num_buffers=None):
         "waves_per_eu": 0,
         "matrix_instr_nonkdim": 16,
         "num_buffers": 1 if force_num_buffers is None else force_num_buffers,
+        "k_width": 0,  # 0 -> kernel auto-derives from block_k
     }
 
 
@@ -182,6 +183,29 @@ def _auto_default(block_m):
     return {"backend": "gluon", "num_buffers": 1}
 
 
+# Config keys a caller may override (via the `config` arg / bench --config). Any
+# other key is a typo or a stale name and is rejected rather than silently ignored.
+# "backend"/"num_buffers" select the variant; "k_width" is gluon-only (0 = auto).
+KNOWN_CONFIG_KEYS = frozenset(
+    {
+        "backend",
+        "block_m",
+        "block_n",
+        "block_k",
+        "num_warps",
+        "num_stages",
+        "group_m",
+        "xcd_swizzle",
+        "w_cache_modifier",
+        "split_k",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "num_buffers",
+        "k_width",
+    }
+)
+
+
 def _get_config(routing_data, m, n, k, config=None, swizzle_mx_scale=None):
     """Resolve the full a16w4 MoE launch config (backend + stage + tiling).
 
@@ -193,6 +217,12 @@ def _get_config(routing_data, m, n, k, config=None, swizzle_mx_scale=None):
     and (for gluon) ``"num_buffers"``.
     """
     config = dict(config) if config else {}
+    unknown_keys = set(config) - KNOWN_CONFIG_KEYS
+    if unknown_keys:
+        raise ValueError(
+            f"Unknown moe_gemm_a16w4 config key(s): {sorted(unknown_keys)}. "
+            f"Known keys: {sorted(KNOWN_CONFIG_KEYS)}"
+        )
     block_m = routing_data.block_m
     backend = config.get("backend")
     num_buffers = config.get("num_buffers")
@@ -234,6 +264,7 @@ def _get_config(routing_data, m, n, k, config=None, swizzle_mx_scale=None):
         if entry is not None:
             entry["block_m"] = block_m
             entry.setdefault("num_buffers", num_buffers)
+            entry.setdefault("k_width", 0)
             params = entry
             is_tuned = True
         else:
@@ -422,6 +453,7 @@ def moe_gemm_a16w4(
             W_CACHE_MODIFIER=config["w_cache_modifier"],
             num_warps=config["num_warps"],
             num_stages=config["num_stages"],
+            KWIDTH=config.get("k_width", 0),
             UPCAST_INDICES=should_upcast_indices(x, w, y),
             waves_per_eu=config["waves_per_eu"],
             matrix_instr_nonkdim=config["matrix_instr_nonkdim"],

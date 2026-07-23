@@ -67,11 +67,9 @@ def _tdm_load_tile(
     if GatherIndx is None:
         gl.amd.gfx1250.tdm.async_load(x_desc, [offs_x_m_scalar, ki * BLOCK_K], x_slot)
     else:
-        # gl.amd.gfx1250.tdm.async_gather(x_desc, offs_x_m, ki * BLOCK_K, x_slot)
-        x_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-            x_desc, add_offsets=[0, ki * BLOCK_K], clamp_bounds=True
-        )
-        gl.amd.gfx1250.tdm.async_gather(x_desc, offs_x_m, x_slot)
+        # async_gather takes the K-column offset directly (src_col_offset), mirroring
+        # the non-gather async_load above; no descriptor rebump needed.
+        gl.amd.gfx1250.tdm.async_gather(x_desc, offs_x_m, ki * BLOCK_K, x_slot)
     gl.amd.gfx1250.tdm.async_load(w_desc, [off_w_n, ki * PACKED_BLOCK_K_W], w_slot)
     gl.amd.gfx1250.tdm.async_load(
         ws_desc, [off_w_n_scale, ki * PACKED_MX_BLOCK], ws_slot
@@ -92,10 +90,13 @@ def _preload_tile(
     MX_PACK_DIVISOR: gl.constexpr,
     PRESHUFFLE_FACTOR: gl.constexpr,
     SCALE_KWIDTH: gl.constexpr,
+    SCALE_REG_SHARE: gl.constexpr,
+    SCALE_SEL: gl.constexpr,
 ):
     # LDS -> register bf16 W operand for one K-tile (fp4 unpack + scale applied).
-    # `scaled_upcast` (the only upcast primitive; compact hw `scale_upcast` is gone)
-    # wants one e8m0 scale per unpacked element, in the op's output layout.
+    # Flip NO_MUL_UPCAST to route the compact scale through the software
+    # scaled_upcast instead of the hardware v_cvt_scale_pk8 (see the elif below).
+    NO_MUL_UPCAST: gl.constexpr = False
     w_packed = w_slot.permute([1, 0]).load(layout=L_IN_W)
     if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
         ws_buffer_slice = unswizzle_mx_scale_gfx1250(
@@ -111,22 +112,83 @@ def _preload_tile(
         w_scale = gl.convert_layout(w_scale.trans(1, 0), layout=L_SCALE_W)
         # Software fp4->bf16 upcast with per-element expanded scale.
         w_kn = gl.amd.gfx1250.scaled_upcast(w_packed, w_scale, gl.bfloat16, axis=0)
-    else:
-        # Compact e8m0 path (no swizzle): build the (BLOCK_K, BLOCK_N) scale
-        # directly in the scaled_upcast output layout (L_SCALE_W), no trans/
-        # convert_layout. Reshape L_SCALE_W to expose the 32-wide pack axis, load
-        # the compact e8m0 into that slice, then expand_dims + broadcast x32 so
-        # out[g*32 + r, n] == scale[g, n]. Faster than the convert_layout variant
-        # on MiniMax-M3 6144x6144: ~30-37% at decode, ~20% at GEMM1 prefill
-        # (GEMM2 prefill ~wash).
-        _dummy = gl.full((BLOCK_K, BLOCK_N), 0, gl.uint8, layout=L_SCALE_W)
-        _d3 = _dummy.reshape(MX_SCALE_BLOCK_K, MX_PACK_DIVISOR, BLOCK_N)
-        L_SCALE_3D: gl.constexpr = _d3.type.layout
-        w_scale = ws_slot.permute([1, 0]).load(layout=gl.SliceLayout(1, L_SCALE_3D))
-        w_scale = gl.expand_dims(w_scale, 1)
-        w_scale, _ = gl.broadcast(w_scale, _d3)
-        w_scale = w_scale.reshape(BLOCK_K, BLOCK_N)
+    elif NO_MUL_UPCAST:
+        # Reference no-mul path: software scaled_upcast on the COMPACT scale (x32
+        # expand -> per-element scale -> software fp4->bf16). Correct for kWidth 8
+        # and 16, but ~45% slower as a drop-in at the current kWidth=16 config: the
+        # inner-loop x32 expansion + trans/convert_layout below are work the
+        # hardware CvtScalePk path avoids. Disabled (NO_MUL_UPCAST=False); kept for
+        # reference. The tuned kWidth=8 variant that drops the convert_layout lives
+        # in git fa8e11e4b.
+        w_scale = ws_slot.load(layout=COMPACT_SCALE_LAYOUT)
+        w_scale = _expand_mx_scale_k(w_scale, BLOCK_N, MX_SCALE_BLOCK_K)
+        w_scale = gl.convert_layout(w_scale.trans(1, 0), layout=L_SCALE_W)
         w_kn = gl.amd.gfx1250.scaled_upcast(w_packed, w_scale, gl.bfloat16, axis=0)
+    else:
+        # CvtScalePk consumes a compact uint32 scale whose layout, expanded by a
+        # kWidth-wide register identity on K, is exactly L_SCALE_W. The source MX
+        # scale is physically shared by 32 K elements, so duplicate it 4/2/1 times
+        # when the dot operand kWidth is 8/16/32 respectively.
+        DOT_KW: gl.constexpr = SCALE_REG_SHARE
+        gl.static_assert(DOT_KW == 8 or DOT_KW == 16 or DOT_KW == 32)
+        KW: gl.constexpr = DOT_KW
+        DUP: gl.constexpr = MX_PACK_DIVISOR // KW
+        SK: gl.constexpr = BLOCK_K // KW
+
+        # Strip the kWidth register axis from the upcast output layout to obtain
+        # CvtScalePk's compact scale layout, then expose the physical x32 scale
+        # grouping so the LDS load can be broadcast only as far as necessary.
+        _out3 = gl.full((BLOCK_K, BLOCK_N), 0, gl.uint8, layout=L_SCALE_W).reshape(
+            SK, KW, BLOCK_N
+        )
+        COMPACT_CVT_LAYOUT: gl.constexpr = gl.SliceLayout(1, _out3.type.layout)
+        _scale3 = gl.full(
+            (SK, BLOCK_N), 0, gl.uint8, layout=COMPACT_CVT_LAYOUT
+        ).reshape(MX_SCALE_BLOCK_K, DUP, BLOCK_N)
+        if DOT_KW == 32:
+            # In the kWidth=32 dot layout, the lane-half basis owns the low
+            # scale-K bit and the instruction consumes bytes 0/1 for the even/odd
+            # lane halves. Pack each adjacent pair of physical E8M0 scales into
+            # those bytes and replicate the pair in the upper half as well.
+            if MX_SCALE_BLOCK_K == 1:
+                e8m0 = ws_slot.permute([1, 0]).load(layout=COMPACT_CVT_LAYOUT)
+                w_scale = e8m0.to(gl.uint32) * 0x01010101
+            else:
+                gl.static_assert(MX_SCALE_BLOCK_K % 2 == 0)
+                PAIR_SCALE_LAYOUT: gl.constexpr = gl.BlockedLayout(
+                    [1, 2], [8, 4], [gl.num_warps(), 1], [1, 0]
+                )
+                e8m0 = ws_slot.load(layout=PAIR_SCALE_LAYOUT).reshape(
+                    BLOCK_N, MX_SCALE_BLOCK_K // 2, 2
+                )
+                e8m0_even, e8m0_odd = gl.split(e8m0)
+                scale_pair = (
+                    e8m0_even.to(gl.uint32) * 0x00010001
+                    + e8m0_odd.to(gl.uint32) * 0x01000100
+                )
+                w_scale = gl.join(scale_pair, scale_pair).reshape(
+                    BLOCK_N, MX_SCALE_BLOCK_K
+                )
+                w_scale = gl.convert_layout(
+                    w_scale.trans(1, 0), layout=COMPACT_CVT_LAYOUT
+                )
+        else:
+            e8m0 = ws_slot.permute([1, 0]).load(
+                layout=gl.SliceLayout(1, _scale3.type.layout)
+            )
+            e8m0 = gl.expand_dims(e8m0, 1)
+            e8m0, _ = gl.broadcast(e8m0, _scale3)
+            e8m0 = e8m0.reshape(SK, BLOCK_N)
+            # Replicate the raw E8M0 byte into every uint32 byte. This makes
+            # OPSEL's lane-half byte routing immaterial for kWidth 8/16.
+            w_scale = e8m0.to(gl.uint32) * 0x01010101
+        w_kn = gl.amd.gfx1250.cvt_scale_pk(
+            w_packed,
+            w_scale,
+            axis=0,
+            scale_sel=SCALE_SEL,
+            elem_type=gl.bfloat16,
+        )
     return w_kn
 
 
@@ -184,6 +246,8 @@ def _moe_gemm_a16w4_gluon_impl(
     SPLIT_K: gl.constexpr,
     W_CACHE_MODIFIER: gl.constexpr,
     num_warps: gl.constexpr,
+    # fp4 dot-operand k_width; 0 -> auto-derive from BLOCK_K. Tunable via config.
+    KWIDTH: gl.constexpr = 0,
     UPCAST_INDICES: gl.constexpr = False,
 ):
     MX_PACK_DIVISOR: gl.constexpr = 32
@@ -314,11 +378,20 @@ def _moe_gemm_a16w4_gluon_impl(
         instr_shape=[16, 16, INSTR_K],
     )
     K_PER_INSR: gl.constexpr = 16
-    K_WIDTH: gl.constexpr = min(16, BLOCK_K // INSTR_K * K_PER_INSR)
+    # KWIDTH from config overrides; 0 falls back to the BLOCK_K-derived default.
+    K_WIDTH_AUTO: gl.constexpr = min(16, BLOCK_K // INSTR_K * K_PER_INSR)
+    K_WIDTH: gl.constexpr = KWIDTH if KWIDTH != 0 else K_WIDTH_AUTO
+    gl.static_assert(
+        K_WIDTH == 8 or K_WIDTH == 16 or K_WIDTH == 32,
+        "k_width must be 8, 16, or 32",
+    )
+    # CvtScalePk uses block16 OPSEL for kWidth=16 and block32 for kWidth=32.
+    # kWidth=8 is a short, padded pk8 group and leaves the block bit clear.
+    SCALE_SEL: gl.constexpr = 4 if min(K_WIDTH, MX_PACK_DIVISOR) == 16 else 0
     DOT_LAYOUT_X: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=WMMA_LAYOUT, k_width=K_WIDTH
     )
-    # scaled_upcast operand-aligned layouts: fp4 input k_width=K_WIDTH//2, scale
+    # CvtScalePk operand-aligned layouts: fp4 input k_width=K_WIDTH//2, output
     # k_width=K_WIDTH. k_width doubles on unpack so the bf16 output matches the
     # WMMA B dot-operand layout directly -> WMMA B operand needs NO convert_layout
     # (saves 128 cross-lane v_permlanes/tile). Scale sits on the lanes the HW
@@ -436,6 +509,8 @@ def _moe_gemm_a16w4_gluon_impl(
                 MX_PACK_DIVISOR,
                 PRESHUFFLE_FACTOR,
                 SCALE_KWIDTH,
+                min(K_WIDTH, MX_PACK_DIVISOR),
+                SCALE_SEL,
             )
             acc = gl.amd.gfx1250.wmma(x_tile, w_kn, acc)
     else:
@@ -508,6 +583,8 @@ def _moe_gemm_a16w4_gluon_impl(
                 MX_PACK_DIVISOR,
                 PRESHUFFLE_FACTOR,
                 SCALE_KWIDTH,
+                min(K_WIDTH, MX_PACK_DIVISOR),
+                SCALE_SEL,
             )
             acc = gl.amd.gfx1250.wmma(x_tile, w_kn, acc)
 
@@ -530,6 +607,8 @@ def _moe_gemm_a16w4_gluon_impl(
                 MX_PACK_DIVISOR,
                 PRESHUFFLE_FACTOR,
                 SCALE_KWIDTH,
+                min(K_WIDTH, MX_PACK_DIVISOR),
+                SCALE_SEL,
             )
             acc = gl.amd.gfx1250.wmma(x_tile, w_kn, acc)
 
@@ -650,6 +729,8 @@ def _moe_gemm_a16w4_gluon_stage1(
     SPLIT_K: gl.constexpr,
     W_CACHE_MODIFIER: gl.constexpr,
     num_warps: gl.constexpr,
+    # fp4 dot-operand k_width; 0 -> auto-derive from BLOCK_K. Tunable via config.
+    KWIDTH: gl.constexpr = 0,
     UPCAST_INDICES: gl.constexpr = False,
 ):
     # Single-buffer (stage-1) entry point; distinct name for profiling/dispatch.
@@ -699,6 +780,7 @@ def _moe_gemm_a16w4_gluon_stage1(
         SPLIT_K=SPLIT_K,
         W_CACHE_MODIFIER=W_CACHE_MODIFIER,
         num_warps=num_warps,
+        KWIDTH=KWIDTH,
         UPCAST_INDICES=UPCAST_INDICES,
     )
 
@@ -757,6 +839,8 @@ def _moe_gemm_a16w4_gluon_stage2(
     SPLIT_K: gl.constexpr,
     W_CACHE_MODIFIER: gl.constexpr,
     num_warps: gl.constexpr,
+    # fp4 dot-operand k_width; 0 -> auto-derive from BLOCK_K. Tunable via config.
+    KWIDTH: gl.constexpr = 0,
     UPCAST_INDICES: gl.constexpr = False,
 ):
     # Double-buffer (stage-2) LDS-prefetch entry point.
@@ -806,6 +890,7 @@ def _moe_gemm_a16w4_gluon_stage2(
         SPLIT_K=SPLIT_K,
         W_CACHE_MODIFIER=W_CACHE_MODIFIER,
         num_warps=num_warps,
+        KWIDTH=KWIDTH,
         UPCAST_INDICES=UPCAST_INDICES,
     )
 
@@ -864,6 +949,8 @@ def _moe_gemm_a16w4_gluon_stage3(
     SPLIT_K: gl.constexpr,
     W_CACHE_MODIFIER: gl.constexpr,
     num_warps: gl.constexpr,
+    # fp4 dot-operand k_width; 0 -> auto-derive from BLOCK_K. Tunable via config.
+    KWIDTH: gl.constexpr = 0,
     UPCAST_INDICES: gl.constexpr = False,
 ):
     # Triple-buffer (stage-3) entry point: stage-2 pipeline with NUM_BUFFERS=3.
@@ -913,5 +1000,6 @@ def _moe_gemm_a16w4_gluon_stage3(
         SPLIT_K=SPLIT_K,
         W_CACHE_MODIFIER=W_CACHE_MODIFIER,
         num_warps=num_warps,
+        KWIDTH=KWIDTH,
         UPCAST_INDICES=UPCAST_INDICES,
     )

@@ -15,6 +15,7 @@ from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
     moe_gemm_a16w4,
     moe_gemm_torch,
     _get_config,
+    KNOWN_CONFIG_KEYS,
 )
 from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 from aiter.ops.triton.utils._triton.arch_info import get_arch
@@ -309,12 +310,14 @@ _TUNE_SPACE = {
     "xcd_swizzle": [1, 2, 8],
     "waves_per_eu": [0, 1, 2, 3, 4],
 }
-# Extra gluon-only knob (the pipeline stage), swept unless --gluon-stage pins it.
-_TUNE_SPACE_GLUON = {"num_buffers": [1, 2, 3]}
+# Extra gluon-only knobs, swept when backend is gluon (num_buffers unless
+# --gluon-stage pins it; k_width is the fp4 dot-operand width).
+_TUNE_SPACE_GLUON = {"num_buffers": [1, 2, 3], "k_width": [8, 16]}
 
 _TUNE_FMT_KEYS = [
     "backend",
     "num_buffers",
+    "k_width",
     "block_n",
     "block_k",
     "num_warps",
@@ -329,12 +332,63 @@ def _fmt_cfg(cfg):
     return "{" + ", ".join(f"{k}={cfg[k]}" for k in _TUNE_FMT_KEYS if k in cfg) + "}"
 
 
+# Full resolved-config display order for reporting the config actually in use
+# (superset of _TUNE_FMT_KEYS: adds block_m/split_k/etc that the tuner holds fixed).
+_CONFIG_PRINT_KEYS = [
+    "backend",
+    "block_m",
+    "block_n",
+    "block_k",
+    "num_warps",
+    "num_stages",
+    "num_buffers",
+    "k_width",
+    "group_m",
+    "xcd_swizzle",
+    "waves_per_eu",
+    "split_k",
+    "matrix_instr_nonkdim",
+    "w_cache_modifier",
+]
+
+
+def _fmt_full_cfg(cfg):
+    """Format a fully-resolved launch config for the 'config in use' report,
+    keys in a stable order; trailing unknown keys appended so nothing is hidden."""
+    keys = [k for k in _CONFIG_PRINT_KEYS if k in cfg]
+    keys += [k for k in cfg if k not in _CONFIG_PRINT_KEYS]
+    return "{" + ", ".join(f"{k}={cfg[k]}" for k in keys) + "}"
+
+
+def _resolve_configs(rdata, M, dim1, dim2, TP, sw1, sw2, gemm):
+    """Resolve the full launch config(s) moe_gemm_a16w4 will actually use for the
+    selected GEMM(s), for reporting. Mirrors the m/n/k the op derives: GEMM1
+    (gate/up) N=dim2/TP K=dim1; GEMM2 (down) N=dim1 K=dim2/TP/2; both use
+    M = number of gathered rows. Overlays _MOE_CONFIG exactly like the real call,
+    so the printed config reflects --backend / --gluon-stage / --config too.
+    Returns "gemm1={...} gemm2={...}" (only the selected GEMM(s))."""
+    parts = []
+    if gemm in ("both", "gemm1"):
+        c1, _ = _get_config(
+            rdata, M, dim2 // TP, dim1, config=_MOE_CONFIG, swizzle_mx_scale=sw1
+        )
+        parts.append(f"gemm1={_fmt_full_cfg(c1)}")
+    if gemm in ("both", "gemm2"):
+        c2, _ = _get_config(
+            rdata, M, dim1, dim2 // TP // 2, config=_MOE_CONFIG, swizzle_mx_scale=sw2
+        )
+        parts.append(f"gemm2={_fmt_full_cfg(c2)}")
+    return " ".join(parts)
+
+
 def _tune_candidates(backend, pinned):
     """Cartesian product of _TUNE_SPACE (plus the gluon stage unless pinned), each
     merged with `pinned` (which fixes backend and optionally num_buffers)."""
     space = dict(_TUNE_SPACE)
-    if backend == "gluon" and "num_buffers" not in pinned:
-        space["num_buffers"] = _TUNE_SPACE_GLUON["num_buffers"]
+    if backend == "gluon":
+        for key, vals in _TUNE_SPACE_GLUON.items():
+            if key not in pinned:
+                space[key] = vals
     keys = list(space)
     cands = []
     for combo in product(*(space[k] for k in keys)):
@@ -772,6 +826,20 @@ def bench_mlp_single_weight_init(
     if dump_blocks:
         dump_routing_blocks(batch, rdata)
 
+    # Resolve the config moe_gemm_a16w4 will actually launch with (backend +
+    # stage + tiling, after overlaying _MOE_CONFIG), so the bench can report the
+    # config in use per shape. M = number of gathered rows (same for both GEMMs).
+    config_str = _resolve_configs(
+        rdata,
+        gather_indx.shape[0],
+        dim1,
+        dim2,
+        TP,
+        swizzle_mx_scale1,
+        swizzle_mx_scale2,
+        gemm,
+    )
+
     # GEMM1 (gate/up): gather + swiglu -> intermediate (M*topk, dim2/2). Output is
     # stashed so GEMM2 can run on the real intermediate.
     interm_holder = {}
@@ -846,6 +914,7 @@ def bench_mlp_single_weight_init(
             fpath.with_suffix(".hatchet"), useful_op_regex=op_regex, reps=reps
         )
         perf["launched_grid"] = launched_grid
+        perf["config_str"] = config_str
         return perf
 
     # events / do_bench timing
@@ -860,6 +929,7 @@ def bench_mlp_single_weight_init(
         **stats,
         "active_experts": n_active,
         "launched_grid": launched_grid,
+        "config_str": config_str,
     }
 
 
@@ -923,9 +993,11 @@ def bench_mlp(
     for k in ["avg_ms", "min_ms", "max_ms", "median_ms", "active_experts"]:
         if k in all_results[0]:
             aggregated[k] = sum(r[k] for r in all_results) / num_runs
-    # launched_grid is a string (same across inits) -- carry the first
+    # launched_grid / config_str are strings (same across inits) -- carry the first
     if "launched_grid" in all_results[0]:
         aggregated["launched_grid"] = all_results[0]["launched_grid"]
+    if "config_str" in all_results[0]:
+        aggregated["config_str"] = all_results[0]["config_str"]
 
     return aggregated
 
@@ -1005,6 +1077,8 @@ def roofline_mlp(
             f"TFLOPS: {tflops:#.4g} | TBPS: {tbps:.2f} | "
             f"grid[{perf.get('launched_grid', '-')}]"
         )
+        if perf.get("config_str"):
+            print(f"         config in use: {perf['config_str']}")
 
     # write CSV
     fieldnames = [
@@ -1015,6 +1089,7 @@ def roofline_mlp(
         "median_ms",
         "active_experts",
         "launched_grid",
+        "config",
         "kernel_latency_us",
         "tflops",
         "tbps",
@@ -1038,6 +1113,7 @@ def roofline_mlp(
                     "median_ms": perf.get("median_ms", ""),
                     "active_experts": perf.get("active_experts", ""),
                     "launched_grid": perf.get("launched_grid", ""),
+                    "config": perf.get("config_str", ""),
                     "kernel_latency_us": perf["kernel_time_ns"] / 1e3 / perf["reps"],
                     "tflops": perf["flops"] / kt * 1e-3,
                     "tbps": perf["bytes"] / kt * 1e-3,
@@ -1048,6 +1124,58 @@ def roofline_mlp(
                     "reps": perf["reps"],
                 }
             )
+
+
+# Keys that _get_config resolves from routing and moe_gemm_a16w4 asserts against;
+# overriding them from the CLI would break the block_m==config["block_m"] check.
+_CONFIG_LOCKED_KEYS = {"block_m"}
+
+
+def _coerce_config_value(key, val):
+    """Coerce a CLI config value string to the type the kernel config expects:
+    'backend' stays a string; 'none'/'null' -> None; otherwise int if it parses,
+    else the raw string (e.g. a w_cache_modifier)."""
+    if key == "backend":
+        return val
+    if val.lower() in ("none", "null"):
+        return None
+    try:
+        return int(val)
+    except ValueError:
+        return val
+
+
+def _parse_cli_config(spec):
+    """Parse a --config string into a config dict overlaid on every kernel call.
+
+    Accepts the exact `key=value` format the tuner prints (e.g.
+    '{backend=gluon, num_buffers=1, block_n=128, block_k=64}'): surrounding
+    braces and whitespace are optional, pairs are comma-separated. Values are
+    coerced via _coerce_config_value. block_m may not be set (it is fixed by
+    routing). Returns {} for an empty spec."""
+    cfg = {}
+    spec = spec.strip().strip("{}").strip()
+    if not spec:
+        return cfg
+    for pair in spec.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        if "=" not in pair:
+            raise ValueError(
+                f"--config entry {pair!r} is not 'key=value' (full spec: {spec!r})"
+            )
+        key, val = pair.split("=", 1)
+        key, val = key.strip(), val.strip()
+        if key in _CONFIG_LOCKED_KEYS:
+            raise ValueError(f"--config may not set {key!r} (it is fixed by routing)")
+        if key not in KNOWN_CONFIG_KEYS:
+            raise ValueError(
+                f"--config has unknown key {key!r} (full spec: {spec!r}). "
+                f"Known keys: {sorted(KNOWN_CONFIG_KEYS)}"
+            )
+        cfg[key] = _coerce_config_value(key, val)
+    return cfg
 
 
 def parse_args(args: list[str] | None = None):
@@ -1160,6 +1288,19 @@ def parse_args(args: list[str] | None = None):
         "value from get_kernel_config_gluon. Capped at cdiv(K, block_k) at launch.",
     )
     parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Pin extra kernel-config tiling keys, forwarded to every "
+        "moe_gemm_a16w4 call (overlaid on the resolved per-shape config). Uses the "
+        "same 'key=value' format the tuner prints, e.g. "
+        "--config 'block_n=128, block_k=64, num_warps=4, num_stages=1, group_m=1, "
+        "xcd_swizzle=2, waves_per_eu=0, k_width=8' (optional surrounding braces; "
+        "'none' -> None). Overrides --backend / --gluon-stage on key conflicts. "
+        "Unknown keys are rejected; block_m is fixed by routing and may not be set. "
+        "k_width is a gluon-only knob (0 auto-derives from block_k).",
+    )
+    parser.add_argument(
         "--tune",
         action="store_true",
         help="Autotune instead of benchmarking: sweep the config search space "
@@ -1229,8 +1370,13 @@ def main(args: list[str] | None = None) -> None:
         cli_config["backend"] = parsed_args.backend
     if parsed_args.gluon_stage is not None:
         cli_config["num_buffers"] = parsed_args.gluon_stage
+    # --config tiling keys overlay last, so they win over --backend/--gluon-stage.
+    if parsed_args.config is not None:
+        cli_config.update(_parse_cli_config(parsed_args.config))
     _MOE_CONFIG = cli_config or None
-    print(f"moe_gemm_a16w4 config: {_MOE_CONFIG}")
+    # This is the pinned CLI overlay (backend/stage/--config); the fully-resolved
+    # per-shape config actually launched is printed per batch in roofline_mlp.
+    print(f"moe_gemm_a16w4 pinned config overlay: {_MOE_CONFIG}")
 
     gemm_sel = parsed_args.gemm  # "both" | "gemm1" | "gemm2"
 
