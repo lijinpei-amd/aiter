@@ -388,9 +388,15 @@ def _moe_gemm_a16w4_gluon_impl(
         K_WIDTH == 8 or K_WIDTH == 16 or K_WIDTH == 32,
         "k_width must be 8, 16, or 32",
     )
-    # CvtScalePk uses block16 OPSEL for kWidth=16 and block32 for kWidth=32.
-    # kWidth=8 is a short, padded pk8 group and leaves the block bit clear.
-    SCALE_SEL: gl.constexpr = 4 if min(K_WIDTH, MX_PACK_DIVISOR) == 16 else 0
+    # CvtScalePk scale selection is (scale_lane, scale_bytes). For packed fp4,
+    # b0b2/b1b3 encode block16 and b0b1/b2b3 encode block32; the E8M0 byte is
+    # replicated across the uint32 (0x01010101), so the exact byte is immaterial
+    # and only the block mode matters. kWidth=16 -> block16; kWidth=8 (short,
+    # padded pk8 group, block bit clear) and kWidth=32 -> block32. Source lane
+    # h0 (lanes 0..15) carries the scale the HW broadcast reads.
+    SCALE_SEL: gl.constexpr = (
+        ("h0", "b0b2") if min(K_WIDTH, MX_PACK_DIVISOR) == 16 else ("h0", "b0b1")
+    )
     DOT_LAYOUT_X: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=WMMA_LAYOUT, k_width=K_WIDTH
     )
