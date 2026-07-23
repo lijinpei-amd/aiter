@@ -67,9 +67,12 @@ def _tdm_load_tile(
     if GatherIndx is None:
         gl.amd.gfx1250.tdm.async_load(x_desc, [offs_x_m_scalar, ki * BLOCK_K], x_slot)
     else:
-        # async_gather takes the K-column offset directly (src_col_offset), mirroring
-        # the non-gather async_load above; no descriptor rebump needed.
-        gl.amd.gfx1250.tdm.async_gather(x_desc, offs_x_m, ki * BLOCK_K, x_slot)
+        # async_gather carries the K-column offset on the descriptor (no
+        # src_col_offset arg): position it to K-tile `ki`, then gather the rows.
+        x_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+            x_desc, add_offsets=[0, ki * BLOCK_K], clamp_bounds=True
+        )
+        gl.amd.gfx1250.tdm.async_gather(x_desc, offs_x_m, x_slot)
     gl.amd.gfx1250.tdm.async_load(w_desc, [off_w_n, ki * PACKED_BLOCK_K_W], w_slot)
     gl.amd.gfx1250.tdm.async_load(
         ws_desc, [off_w_n_scale, ki * PACKED_MX_BLOCK], ws_slot
