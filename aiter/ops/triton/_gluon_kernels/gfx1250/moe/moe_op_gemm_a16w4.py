@@ -10,7 +10,7 @@ from aiter.ops.triton._triton_kernels.moe.launch_metadata import (
 
 @gluon.jit
 def unswizzle_mx_scale_gfx1250(
-    scale, BLOCK_N, MX_SCALE_BLOCK_K, PRESHUFFLE_FACTOR, SCALE_KWIDTH, MX_PACK_DIVISOR
+    scale, BLOCK_N, MX_SCALE_BLOCK_K, PRESHUFFLE_FACTOR, SCALE_KWIDTH
 ):
     # Invert the host-side preshuffle: the loaded tile packs (k0, n1, k1) along the
     # contiguous dim; reshape + permute reassembles the logical compact scale
@@ -29,20 +29,6 @@ def unswizzle_mx_scale_gfx1250(
     )
 
     return scale
-
-
-@gluon.jit
-def _expand_mx_scale_k(scale, BLOCK_N: gl.constexpr, MX_SCALE_BLOCK_K: gl.constexpr):
-    # scaled_upcast wants one e8m0 scale per unpacked element (BLOCK_N, BLOCK_K), not
-    # the compact per-32-group scale. Broadcast each group scale MX_PACK_DIVISOR (=32)
-    # times along K (stride-0) so out[n, g*32 + r] == scale[n, g].
-    MX_PACK_DIVISOR: gl.constexpr = 32
-    s = scale.reshape(BLOCK_N, MX_SCALE_BLOCK_K, 1)
-    tgt = gl.full(
-        (BLOCK_N, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR), 0, gl.uint8, layout=s.type.layout
-    )
-    s, _ = gl.broadcast(s, tgt)
-    return s.reshape(BLOCK_N, MX_SCALE_BLOCK_K * MX_PACK_DIVISOR)
 
 
 @gluon.jit
@@ -80,119 +66,358 @@ def _tdm_load_tile(
 
 
 @gluon.jit
+def _compact_mx_scale_slot(
+    ws_slot,
+    SWIZZLE_MX_SCALE: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    MX_SCALE_BLOCK_K: gl.constexpr,
+    PRESHUFFLE_FACTOR: gl.constexpr,
+    SCALE_KWIDTH: gl.constexpr,
+):
+    # Shared-memory view of the logical compact E8M0 tile
+    # (BLOCK_N, MX_SCALE_BLOCK_K), one byte per 32-element group along K.
+    if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
+        slot = unswizzle_mx_scale_gfx1250(
+            ws_slot, BLOCK_N, MX_SCALE_BLOCK_K, PRESHUFFLE_FACTOR, SCALE_KWIDTH
+        )
+    else:
+        slot = ws_slot
+    return slot
+
+
+# cvt_scale_pk contract (gfx1250):
+#   * scale_factor = out.shape[axis] // scale.shape[axis]; output element k uses
+#     scale entry k // scale_factor.
+#   * the hardware sources one scale register per pk8 group from a single lane
+#     half and routes one byte of it to destination lanes 0..15 and another to
+#     lanes 16..31, so scale entry k // scale_factor must be owned by the
+#     destination lane itself or by its half-warp peer (lane ^ 16), selected by
+#     "h0"/"h1".
+#   * the scale_sel entry used by a pk8 group is scale_sel[coord // k_width % len],
+#     where coord is the group's K coordinate at lane 0 with the lane bases
+#     dropped and k_width defaults to the output's contiguous-per-thread run on
+#     K (== the dot-operand kWidth, == K_SCALE here). The lane-16 basis owns a K
+#     bit strictly below k_width * 2, so coord // k_width is always even and the
+#     odd scale_sel slots are unreachable filler.
+
+
+@gluon.jit
+def _cvt_scale_pk_block_operand(
+    ws_slot,
+    L_SCALE_W: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    MX_SCALE_BLOCK_K: gl.constexpr,
+    K_SCALE: gl.constexpr,
+):
+    # Scale operand for K_SCALE 8/16, i.e. one scale entry per MX block
+    # (scale_factor 32). Both destination lane halves of a pk8 group sit inside
+    # one 32-element block (K_SCALE <= 16), so they need the *same* entry: the
+    # entry must be broadcast over the lane-16 basis and both routed bytes must
+    # carry the same payload.
+    #
+    # Stripping the whole MX block off L_SCALE_W leaves exactly that layout --
+    # lanes 0..15 hold every block along K in consecutive registers and lanes
+    # 16..31 duplicate them -- which is also the widest possible ds_read.
+    #
+    # A pk8 group at block b reads bytes 0/1 for even b and bytes 2/3 for odd b
+    # (scale_sel period 4, even slots only), so one uint32 carries BYTES = 4/DUP
+    # blocks, each replicated DUP = 32/K_SCALE times:
+    #   K_SCALE  DUP  BYTES  bytes of the uint32
+    #      8      4     1    [P, P, P, P]   (one block, both byte pairs equal)
+    #     16      2     2    [P, P, Q, Q]   (blocks 2j and 2j+1)
+    # and entry b is handed the uint32 covering it, so entries 2j / 2j+1 are two
+    # registers holding the same bits with different byte pairs selected.
+    MX_PACK_DIVISOR: gl.constexpr = 32
+    gl.static_assert(K_SCALE == 8 or K_SCALE == 16)
+    DUP: gl.constexpr = MX_PACK_DIVISOR // K_SCALE  # copies of each E8M0 byte
+    BYTES: gl.constexpr = min(4 // DUP, MX_SCALE_BLOCK_K)  # blocks per uint32
+    NDW: gl.constexpr = MX_SCALE_BLOCK_K // BYTES  # uint32s along K
+    # DUP copies of one payload, in the low DUP bytes: 0x0101 / 0x01010101.
+    DUP_MASK: gl.constexpr = 0x01010101 >> (8 * (4 - DUP))
+
+    _phys3 = gl.full((BLOCK_K, BLOCK_N), 0, gl.uint8, layout=L_SCALE_W).reshape(
+        MX_SCALE_BLOCK_K, MX_PACK_DIVISOR, BLOCK_N
+    )
+    PHYS_LAYOUT: gl.constexpr = gl.SliceLayout(1, _phys3.type.layout)
+    e8m0 = ws_slot.permute([1, 0]).load(layout=PHYS_LAYOUT)
+
+    # Concatenate BYTES payloads into each uint32. Block bit 0 lives in the
+    # register domain here, so the shifts are per-register constants and the
+    # reduction is lane-local.
+    kb = gl.expand_dims(
+        gl.arange(0, MX_SCALE_BLOCK_K, layout=gl.SliceLayout(1, PHYS_LAYOUT)), 1
+    )
+    kb, _ = gl.broadcast(
+        kb, gl.full((MX_SCALE_BLOCK_K, BLOCK_N), 0, gl.int32, layout=PHYS_LAYOUT)
+    )
+    packed = (e8m0.to(gl.uint32) * DUP_MASK) << (kb % BYTES).to(gl.uint32) * (8 * DUP)
+    dwords = gl.sum(packed.reshape(NDW, BYTES, BLOCK_N), axis=1)
+
+    # Hand the same uint32 to all BYTES entries it covers. Free: the broadcast
+    # axis is the register axis the reduction just collapsed.
+    _grp3 = gl.full(
+        (MX_SCALE_BLOCK_K, BLOCK_N), 0, gl.uint32, layout=PHYS_LAYOUT
+    ).reshape(NDW, BYTES, BLOCK_N)
+    w_scale, _ = gl.broadcast(gl.expand_dims(dwords, 1), _grp3)
+    return w_scale.reshape(MX_SCALE_BLOCK_K, BLOCK_N)
+
+
+@gluon.jit
+def _cvt_scale_pk_word_operand(
+    ws_slot,
+    L_SCALE_W_LOAD: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    MX_SCALE_BLOCK_K: gl.constexpr,
+    SCALE_WORD_BLOCKS: gl.constexpr,
+):
+    # Scale operand for K_SCALE 32: one uint32 per SCALE_WORD_BLOCKS (<= 4) MX
+    # blocks, i.e. scale_factor = 32 * SCALE_WORD_BLOCKS (128 once BLOCK_K >=
+    # 128). At K_SCALE 32 the two destination lane halves of a pk8 group are a
+    # full MX block apart, so -- unlike the 8/16 path -- they need *different*
+    # blocks; only a scale entry spanning both (>= 64 elements) can serve them
+    # from one register, which is what makes scale_factor 128 the natural choice.
+    #
+    # The SCALE_WORD_BLOCKS bytes of an entry are contiguous in LDS, so instead
+    # of loading them as bytes and packing with shift/or, view the tile as
+    # SCALE_WORD_BLOCKS-wide words and load one word per entry directly. A
+    # padded layout may be reinterpreted at a different element width as long as
+    # the *byte* hole pattern is unchanged (MemDescReinterpretOp::verify compares
+    # interval * elemSize), i.e. divide both interval and padding by the width.
+    #
+    # L_SCALE_W_LOAD is a dot-operand layout whose kWidth is a whole number of
+    # entries, so after stripping the elements an entry covers, what is left on
+    # the word index are one lane basis (the lane-16 one) plus however many
+    # register bases. Which bit the lane-16 basis lands on is the call site's
+    # choice of kWidth, and it decides the load:
+    #
+    #   kWidth = 32*SCALE_WORD_BLOCKS    lane-16 owns word bit 0 -> a lane holds
+    #                                    words w, w+2: ds_read2_b32
+    #   kWidth = 64*SCALE_WORD_BLOCKS    lane-16 owns word bit 1 -> a lane holds
+    #                                    words 2h, 2h+1, adjacent in LDS since
+    #                                    the word axis is the fastest one after
+    #                                    the permute: one ds_read_b64
+    #
+    # Either way a word lives in only one lane half, so scale_sel picks the half
+    # ("h0"/"h1") that owns the word each pk8 group needs -- but *which* half
+    # differs between the two, so the two orderings are not interchangeable.
+    MX_PACK_DIVISOR: gl.constexpr = 32
+    NDW: gl.constexpr = MX_SCALE_BLOCK_K // SCALE_WORD_BLOCKS  # scale entries along K
+    ELEMS_PER_WORD: gl.constexpr = MX_PACK_DIVISOR * SCALE_WORD_BLOCKS
+
+    gl.static_assert(ws_slot.shape[0] == BLOCK_N)
+    gl.static_assert(ws_slot.shape[1] == MX_SCALE_BLOCK_K)
+    if SCALE_WORD_BLOCKS == 4:
+        WORD_TYPE: gl.constexpr = gl.uint32
+    else:
+        # fp4 needs a scale at least 16 bits wide, so BLOCK_K < 128 is the floor.
+        gl.static_assert(SCALE_WORD_BLOCKS == 2)
+        WORD_TYPE: gl.constexpr = gl.uint16
+        # A 16-bit scale operand rejects the "b2b3" scale_sel slots outright,
+        # even though nothing selects them when a row holds a single word, so
+        # the loaded halfword is zero-extended back to 32 bits below.
+    INTERVAL: gl.constexpr = ws_slot.layout.interval_padding_pairs[0][0]
+    PADDING: gl.constexpr = ws_slot.layout.interval_padding_pairs[0][1]
+    WORD_SHARED: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[INTERVAL // SCALE_WORD_BLOCKS, PADDING // SCALE_WORD_BLOCKS]],
+        [BLOCK_N, NDW],
+        [1, 0],
+    )
+    ws_words = ws_slot._reinterpret(WORD_TYPE, [BLOCK_N, NDW], WORD_SHARED)
+
+    _phys3 = gl.full((BLOCK_K, BLOCK_N), 0, gl.uint8, layout=L_SCALE_W_LOAD).reshape(
+        NDW, ELEMS_PER_WORD, BLOCK_N
+    )
+    WORD_LAYOUT: gl.constexpr = gl.SliceLayout(1, _phys3.type.layout)
+    return ws_words.permute([1, 0]).load(layout=WORD_LAYOUT).to(gl.uint32)
+
+
+@gluon.jit
 def _preload_tile(
     w_slot,
     ws_slot,
-    L_IN_W: gl.constexpr,
-    L_SCALE_W: gl.constexpr,
-    COMPACT_SCALE_LAYOUT: gl.constexpr,
+    WMMA_LAYOUT: gl.constexpr,
+    K_WIDTH: gl.constexpr,
     SWIZZLE_MX_SCALE: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
     MX_SCALE_BLOCK_K: gl.constexpr,
-    MX_PACK_DIVISOR: gl.constexpr,
     PRESHUFFLE_FACTOR: gl.constexpr,
     SCALE_KWIDTH: gl.constexpr,
-    SCALE_REG_SHARE: gl.constexpr,
-    SCALE_SEL: gl.constexpr,
 ):
-    # LDS -> register bf16 W operand for one K-tile (fp4 unpack + scale applied).
-    # Flip NO_MUL_UPCAST to route the compact scale through the software
-    # scaled_upcast instead of the hardware v_cvt_scale_pk8 (see the elif below).
-    NO_MUL_UPCAST: gl.constexpr = False
-    w_packed = w_slot.permute([1, 0]).load(layout=L_IN_W)
-    if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
-        ws_buffer_slice = unswizzle_mx_scale_gfx1250(
-            ws_slot,
-            BLOCK_N,
-            MX_SCALE_BLOCK_K,
-            PRESHUFFLE_FACTOR,
-            SCALE_KWIDTH,
-            MX_PACK_DIVISOR,
+    # LDS -> register bf16 W operand for one K-tile: a single v_cvt_scale_pk8
+    # per 8 values unpacks fp4 and applies the compact E8M0 scale, straight into
+    # the WMMA B dot-operand layout.
+    #
+    # NOTE(perf): handing cvt_scale_pk whole i32 payloads (below) is what makes
+    # this path competitive. While the val operand was packed fp4 in i8, the
+    # lowering rebuilt every pk8 source nibble by nibble -- 7 v_and_b16 + 5
+    # v_lshrrev_b16 + 3 v_or3_b32 per pk8 plus the spills that came with the
+    # pressure -- and cost ~2.6x vs the gfx1250.scaled_upcast path this replaced.
+    # Same 64 v_cvt_scale_pk8 and 32 wmma either way, but 3893 -> 1272
+    # instructions at BLOCK_N=256/BLOCK_K=512 with all 384 scratch ops gone, and
+    # MiniMax-M3 6144x6144 (128 experts, top-4) prefill 9.28 -> 3.58 ms (200 ->
+    # 519 TFLOPS), i.e. level with scaled_upcast.
+    #
+    # Decode is unmoved (0.92 TBPS, M=1) and still well short of scaled_upcast's
+    # 5.21 TBPS -- that gap is not the val repack and needs its own look.
+    MX_PACK_DIVISOR: gl.constexpr = 32
+    # K elements each lane holds contiguously = the run cvt_scale_pk indexes its
+    # scale_sel with, capped at the MX block size.
+    K_SCALE: gl.constexpr = min(K_WIDTH, MX_PACK_DIVISOR)
+    # A pk8 source is 8 packed fp4 values = one uint32, and the tile already has
+    # them contiguous along K, so view the fp4 bytes as words and hand the whole
+    # payload over instead of two bytes at a time. cvt_scale_pk expands the
+    # storage layout by 4 bits / element (x8 here) along the pack axis, so the
+    # element layout -- and with it the bf16 result -- is still k_width K_WIDTH:
+    # it matches the WMMA B dot-operand layout and needs NO convert_layout
+    # (saves 128 cross-lane v_permlanes per tile).
+    #
+    # NOTE(correctness): do not pin BLOCK_K=512 at BLOCK_M=128/BLOCK_N=256/nw=4
+    # with K_WIDTH 16 (what k_width=0 auto-derives there). That tiling already
+    # sits at the 1024-VGPR cap and spills; the wide val load shifts the pressure
+    # enough that a few thousand outputs come out wrong, varying run to run. The
+    # corruption arrives through the scale registers -- replacing the scale LDS
+    # read with a constant makes it bit-deterministic again -- and no barrier,
+    # scale_sel grouping or narrower (i16) word fixes it, so it reads as a
+    # register-allocation miscompile, not a layout bug. K_WIDTH 8/32 are fine at
+    # that tiling, as is K_WIDTH 16 at BLOCK_M<=32, BLOCK_N<=128 or nw=8, and the
+    # tuner never pairs BLOCK_K=512 with BLOCK_M=128.
+    W_WORD_BYTES: gl.constexpr = 4
+    W_BLOCK_K_WORDS: gl.constexpr = BLOCK_K // (2 * W_WORD_BYTES)
+    gl.static_assert(w_slot.shape[1] == W_BLOCK_K_WORDS * W_WORD_BYTES)
+    W_INTERVAL: gl.constexpr = w_slot.layout.interval_padding_pairs[0][0]
+    W_PADDING: gl.constexpr = w_slot.layout.interval_padding_pairs[0][1]
+    W_WORD_SHARED: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[W_INTERVAL // W_WORD_BYTES, W_PADDING // W_WORD_BYTES]],
+        [BLOCK_N, W_BLOCK_K_WORDS],
+        [1, 0],
+    )
+    w_words = w_slot._reinterpret(gl.uint32, [BLOCK_N, W_BLOCK_K_WORDS], W_WORD_SHARED)
+    L_IN_W: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=WMMA_LAYOUT, k_width=K_WIDTH // 8
+    )
+    w_packed = w_words.permute([1, 0]).load(layout=L_IN_W)
+    ws_slot = _compact_mx_scale_slot(
+        ws_slot,
+        SWIZZLE_MX_SCALE,
+        BLOCK_N,
+        MX_SCALE_BLOCK_K,
+        PRESHUFFLE_FACTOR,
+        SCALE_KWIDTH,
+    )
+    if K_SCALE == 32:
+        # MX blocks per uint32 scale entry, i.e. scale_factor = 32 *
+        # SCALE_WORD_BLOCKS (128 once BLOCK_K >= 128).
+        SCALE_WORD_BLOCKS: gl.constexpr = min(4, MX_SCALE_BLOCK_K)
+        SCALE_WORDS: gl.constexpr = MX_SCALE_BLOCK_K // SCALE_WORD_BLOCKS
+        # The word operand reinterprets the scale tile in place, so it needs the
+        # plain compact buffer -- the GFX1250_SCALE unswizzle above leaves a
+        # layout subview behind, which cannot be reinterpreted.
+        gl.static_assert(
+            SWIZZLE_MX_SCALE != "GFX1250_SCALE",
+            "K_SCALE 32 scales require the compact (unswizzled) layout",
         )
-        w_scale = ws_buffer_slice.load(layout=COMPACT_SCALE_LAYOUT)
-        w_scale = _expand_mx_scale_k(w_scale, BLOCK_N, MX_SCALE_BLOCK_K)
-        w_scale = gl.convert_layout(w_scale.trans(1, 0), layout=L_SCALE_W)
-        # Software fp4->bf16 upcast with per-element expanded scale.
-        w_kn = gl.amd.gfx1250.scaled_upcast(w_packed, w_scale, gl.bfloat16, axis=0)
-    elif NO_MUL_UPCAST:
-        # Reference no-mul path: software scaled_upcast on the COMPACT scale (x32
-        # expand -> per-element scale -> software fp4->bf16). Correct for kWidth 8
-        # and 16, but ~45% slower as a drop-in at the current kWidth=16 config: the
-        # inner-loop x32 expansion + trans/convert_layout below are work the
-        # hardware CvtScalePk path avoids. Disabled (NO_MUL_UPCAST=False); kept for
-        # reference. The tuned kWidth=8 variant that drops the convert_layout lives
-        # in git fa8e11e4b.
-        w_scale = ws_slot.load(layout=COMPACT_SCALE_LAYOUT)
-        w_scale = _expand_mx_scale_k(w_scale, BLOCK_N, MX_SCALE_BLOCK_K)
-        w_scale = gl.convert_layout(w_scale.trans(1, 0), layout=L_SCALE_W)
-        w_kn = gl.amd.gfx1250.scaled_upcast(w_packed, w_scale, gl.bfloat16, axis=0)
-    else:
-        # CvtScalePk consumes a compact uint32 scale whose layout, expanded by a
-        # kWidth-wide register identity on K, is exactly L_SCALE_W. The source MX
-        # scale is physically shared by 32 K elements, so duplicate it 4/2/1 times
-        # when the dot operand kWidth is 8/16/32 respectively.
-        DOT_KW: gl.constexpr = SCALE_REG_SHARE
-        gl.static_assert(DOT_KW == 8 or DOT_KW == 16 or DOT_KW == 32)
-        KW: gl.constexpr = DOT_KW
-        DUP: gl.constexpr = MX_PACK_DIVISOR // KW
-        SK: gl.constexpr = BLOCK_K // KW
-
-        # Strip the kWidth register axis from the upcast output layout to obtain
-        # CvtScalePk's compact scale layout, then expose the physical x32 scale
-        # grouping so the LDS load can be broadcast only as far as necessary.
-        _out3 = gl.full((BLOCK_K, BLOCK_N), 0, gl.uint8, layout=L_SCALE_W).reshape(
-            SK, KW, BLOCK_N
-        )
-        COMPACT_CVT_LAYOUT: gl.constexpr = gl.SliceLayout(1, _out3.type.layout)
-        _scale3 = gl.full(
-            (SK, BLOCK_N), 0, gl.uint8, layout=COMPACT_CVT_LAYOUT
-        ).reshape(MX_SCALE_BLOCK_K, DUP, BLOCK_N)
-        if DOT_KW == 32:
-            # In the kWidth=32 dot layout, the lane-half basis owns the low
-            # scale-K bit and the instruction consumes bytes 0/1 for the even/odd
-            # lane halves. Pack each adjacent pair of physical E8M0 scales into
-            # those bytes and replicate the pair in the upper half as well.
-            if MX_SCALE_BLOCK_K == 1:
-                e8m0 = ws_slot.permute([1, 0]).load(layout=COMPACT_CVT_LAYOUT)
-                w_scale = e8m0.to(gl.uint32) * 0x01010101
-            else:
-                gl.static_assert(MX_SCALE_BLOCK_K % 2 == 0)
-                PAIR_SCALE_LAYOUT: gl.constexpr = gl.BlockedLayout(
-                    [1, 2], [8, 4], [gl.num_warps(), 1], [1, 0]
-                )
-                e8m0 = ws_slot.load(layout=PAIR_SCALE_LAYOUT).reshape(
-                    BLOCK_N, MX_SCALE_BLOCK_K // 2, 2
-                )
-                e8m0_even, e8m0_odd = gl.split(e8m0)
-                scale_pair = (
-                    e8m0_even.to(gl.uint32) * 0x00010001
-                    + e8m0_odd.to(gl.uint32) * 0x01000100
-                )
-                w_scale = gl.join(scale_pair, scale_pair).reshape(
-                    BLOCK_N, MX_SCALE_BLOCK_K
-                )
-                w_scale = gl.convert_layout(
-                    w_scale.trans(1, 0), layout=COMPACT_CVT_LAYOUT
-                )
+        # Give each lane two adjacent words (one ds_read_b64) whenever there are
+        # enough of them; below 4 words the far half would have nothing to hold,
+        # so keep one word per lane there.
+        if SCALE_WORDS >= 4:
+            SCALE_WORDS_PER_LANE: gl.constexpr = 2
         else:
-            e8m0 = ws_slot.permute([1, 0]).load(
-                layout=gl.SliceLayout(1, _scale3.type.layout)
+            SCALE_WORDS_PER_LANE: gl.constexpr = 1
+        L_SCALE_W_LOAD: gl.constexpr = gl.DotOperandLayout(
+            operand_index=1,
+            parent=WMMA_LAYOUT,
+            k_width=MX_PACK_DIVISOR * SCALE_WORD_BLOCKS * SCALE_WORDS_PER_LANE,
+        )
+        w_scale = _cvt_scale_pk_word_operand(
+            ws_slot,
+            L_SCALE_W_LOAD,
+            BLOCK_N,
+            BLOCK_K,
+            MX_SCALE_BLOCK_K,
+            SCALE_WORD_BLOCKS,
+        )
+        # (source lane half, byte routing) for pk8 group c, consumed as
+        # scale_sel[2c] -- one uint32 covers 4 MX blocks = 2 groups, so group c
+        # wants blocks 2c (dest lanes 0..15) and 2c+1 (dest lanes 16..31), both
+        # in word c // 2 at byte pair c % 2. Only the half that owns that word
+        # differs between the two layouts; odd slots are unreachable filler.
+        if SCALE_WORDS_PER_LANE == 2:
+            # Lane half h holds words 2h and 2h+1, so word c // 2 is owned by
+            # half (c // 4) % 2 -- the half flips every four groups, and the
+            # pattern needs 8 groups (16 slots) to repeat.
+            w = gl.amd.gfx1250.cvt_scale_pk(
+                w_packed,
+                w_scale,
+                axis=0,
+                scale_sel=(
+                    ("h0", "b0b1"),
+                    ("h0", "b0b1"),
+                    ("h0", "b2b3"),
+                    ("h0", "b2b3"),
+                    ("h0", "b0b1"),
+                    ("h0", "b0b1"),
+                    ("h0", "b2b3"),
+                    ("h0", "b2b3"),
+                    ("h1", "b0b1"),
+                    ("h1", "b0b1"),
+                    ("h1", "b2b3"),
+                    ("h1", "b2b3"),
+                    ("h1", "b0b1"),
+                    ("h1", "b0b1"),
+                    ("h1", "b2b3"),
+                    ("h1", "b2b3"),
+                ),
+                elem_type=gl.bfloat16,
             )
-            e8m0 = gl.expand_dims(e8m0, 1)
-            e8m0, _ = gl.broadcast(e8m0, _scale3)
-            e8m0 = e8m0.reshape(SK, BLOCK_N)
-            # Replicate the raw E8M0 byte into every uint32 byte. This makes
-            # OPSEL's lane-half byte routing immaterial for kWidth 8/16.
-            w_scale = e8m0.to(gl.uint32) * 0x01010101
-        w_kn = gl.amd.gfx1250.cvt_scale_pk(
+        else:
+            # Lane half h holds the words of parity h, so word c // 2 is owned
+            # by half (c // 2) % 2 and the pattern repeats every 4 groups.
+            w = gl.amd.gfx1250.cvt_scale_pk(
+                w_packed,
+                w_scale,
+                axis=0,
+                scale_sel=(
+                    ("h0", "b0b1"),
+                    ("h0", "b0b1"),
+                    ("h0", "b2b3"),
+                    ("h0", "b2b3"),
+                    ("h1", "b0b1"),
+                    ("h1", "b0b1"),
+                    ("h1", "b2b3"),
+                    ("h1", "b2b3"),
+                ),
+                elem_type=gl.bfloat16,
+            )
+    else:
+        # scale_factor 32: the operand is this layout with the MX block
+        # stripped off, which is what makes it lane-16 broadcast.
+        L_SCALE_W: gl.constexpr = gl.DotOperandLayout(
+            operand_index=1, parent=WMMA_LAYOUT, k_width=K_WIDTH
+        )
+        w_scale = _cvt_scale_pk_block_operand(
+            ws_slot, L_SCALE_W, BLOCK_N, BLOCK_K, MX_SCALE_BLOCK_K, K_SCALE
+        )
+        # One entry per MX block, all in lanes 0..15 ("h0"): block b reads bytes
+        # 0/1 for even b and 2/3 for odd b (only even scale_sel slots reach the
+        # hardware), so one uint32 serves the blocks it packs. The first byte of
+        # the pair goes to destination lanes 0..15, the second to lanes 16..31 --
+        # here both hold the same payload.
+        w = gl.amd.gfx1250.cvt_scale_pk(
             w_packed,
             w_scale,
             axis=0,
-            scale_sel=SCALE_SEL,
+            scale_sel=(
+                ("h0", "b0b1"),
+                ("h0", "b0b1"),
+                ("h0", "b2b3"),
+                ("h0", "b2b3"),
+            ),
             elem_type=gl.bfloat16,
         )
-    return w_kn
+    return w
 
 
 @gluon.jit
@@ -388,37 +613,19 @@ def _moe_gemm_a16w4_gluon_impl(
         K_WIDTH == 8 or K_WIDTH == 16 or K_WIDTH == 32,
         "k_width must be 8, 16, or 32",
     )
-    # CvtScalePk scale selection is (scale_lane, scale_bytes). For packed fp4,
-    # b0b2/b1b3 encode block16 and b0b1/b2b3 encode block32; the E8M0 byte is
-    # replicated across the uint32 (0x01010101), so the exact byte is immaterial
-    # and only the block mode matters. kWidth=16 -> block16; kWidth=8 (short,
-    # padded pk8 group, block bit clear) and kWidth=32 -> block32. Source lane
-    # h0 (lanes 0..15) carries the scale the HW broadcast reads.
-    SCALE_SEL: gl.constexpr = (
-        ("h0", "b0b2") if min(K_WIDTH, MX_PACK_DIVISOR) == 16 else ("h0", "b0b1")
-    )
+    # NOTE(correctness): k_width=8 is wrong at BLOCK_N=128, BLOCK_K=512,
+    # num_warps=4 -- output columns [96, 128) of the N tile are garbage, values
+    # vary run to run, and a fresh process only misses once another launch has
+    # dirtied LDS. Independent of the scale (all-127 scales fail the same way)
+    # and of the W/scale shared-tile padding, so it is in the packed-fp4
+    # LDS->register read at dot k_width=4, not in the scale path. k_width=16/32
+    # and every other BLOCK_N/BLOCK_K are clean. Don't tune k_width=8 onto that
+    # tiling until this is root-caused.
     DOT_LAYOUT_X: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=WMMA_LAYOUT, k_width=K_WIDTH
     )
-    # CvtScalePk operand-aligned layouts: fp4 input k_width=K_WIDTH//2, output
-    # k_width=K_WIDTH. k_width doubles on unpack so the bf16 output matches the
-    # WMMA B dot-operand layout directly -> WMMA B operand needs NO convert_layout
-    # (saves 128 cross-lane v_permlanes/tile). Scale sits on the lanes the HW
-    # broadcast reads.
-    L_IN_W: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=WMMA_LAYOUT, k_width=K_WIDTH // 2
-    )
-    L_SCALE_W: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=WMMA_LAYOUT, k_width=K_WIDTH
-    )
-
-    # Parametric blocked layout for the compact (BLOCK_N, MX_SCALE_BLOCK_K) scale
-    # tile (shape-agnostic, so BLOCK_K is tunable). _expand_mx_scale_k operates
-    # on the logical values and the result is convert_layout'd to the upcast
-    # output layout, so the exact blocked layout here only needs to tile the shape.
-    COMPACT_SCALE_LAYOUT: gl.constexpr = gl.BlockedLayout(
-        [1, 1], [8, 4], [num_warps, 1], [1, 0]
-    )
+    # The W operand layouts are derived from (WMMA_LAYOUT, K_WIDTH) inside
+    # _preload_tile, which is the only consumer.
 
     SHARED_LAYOUT_X: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_K, 8]], [BLOCK_M, BLOCK_K], [1, 0]
@@ -508,18 +715,14 @@ def _moe_gemm_a16w4_gluon_impl(
             w_kn = _preload_tile(
                 w_buffer.index(0),
                 ws_buffer.index(0),
-                L_IN_W,
-                L_SCALE_W,
-                COMPACT_SCALE_LAYOUT,
+                WMMA_LAYOUT,
+                K_WIDTH,
                 SWIZZLE_MX_SCALE,
                 BLOCK_N,
                 BLOCK_K,
                 MX_SCALE_BLOCK_K,
-                MX_PACK_DIVISOR,
                 PRESHUFFLE_FACTOR,
                 SCALE_KWIDTH,
-                min(K_WIDTH, MX_PACK_DIVISOR),
-                SCALE_SEL,
             )
             acc = gl.amd.gfx1250.wmma(x_tile, w_kn, acc)
     else:
@@ -582,18 +785,14 @@ def _moe_gemm_a16w4_gluon_impl(
             w_kn = _preload_tile(
                 w_buffer.index(cur_slot),
                 ws_buffer.index(cur_slot),
-                L_IN_W,
-                L_SCALE_W,
-                COMPACT_SCALE_LAYOUT,
+                WMMA_LAYOUT,
+                K_WIDTH,
                 SWIZZLE_MX_SCALE,
                 BLOCK_N,
                 BLOCK_K,
                 MX_SCALE_BLOCK_K,
-                MX_PACK_DIVISOR,
                 PRESHUFFLE_FACTOR,
                 SCALE_KWIDTH,
-                min(K_WIDTH, MX_PACK_DIVISOR),
-                SCALE_SEL,
             )
             acc = gl.amd.gfx1250.wmma(x_tile, w_kn, acc)
 
@@ -606,18 +805,14 @@ def _moe_gemm_a16w4_gluon_impl(
             w_kn = _preload_tile(
                 w_buffer.index(cur_slot),
                 ws_buffer.index(cur_slot),
-                L_IN_W,
-                L_SCALE_W,
-                COMPACT_SCALE_LAYOUT,
+                WMMA_LAYOUT,
+                K_WIDTH,
                 SWIZZLE_MX_SCALE,
                 BLOCK_N,
                 BLOCK_K,
                 MX_SCALE_BLOCK_K,
-                MX_PACK_DIVISOR,
                 PRESHUFFLE_FACTOR,
                 SCALE_KWIDTH,
-                min(K_WIDTH, MX_PACK_DIVISOR),
-                SCALE_SEL,
             )
             acc = gl.amd.gfx1250.wmma(x_tile, w_kn, acc)
 
