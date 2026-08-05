@@ -1603,9 +1603,22 @@ def _mla_decode_fwd_kernel(
 
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ
-    tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+    # Partition over the causal prefix this q block actually scans (the tile loop
+    # clamps to max_seq_prefix_len below), not over the whole sequence. When a
+    # decode group straddles a KV-block edge -- seq_len % TILE_SIZE <
+    # num_tokens_per_seq -- the two differ, and the seq_len-based split handed
+    # some q blocks a segment whose tile range is empty after clamping while the
+    # reduce still folded that segment in, corrupting 20-40% of the output for
+    # decode_qlen > 1. _mla_decode_fwd_reduce_kernel computes the same quantity.
+    q_prefix_len = (
+        seq_len
+        - num_tokens_per_seq
+        + (token_q_block_local_idx + 1) * BLOCK_Q
+    )
+    q_prefix_len = gl.minimum(q_prefix_len, seq_len)
+    tiles_per_segment = cdiv_fn(q_prefix_len, num_segments * TILE_SIZE)
 
-    if segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:
+    if segm_idx * tiles_per_segment * TILE_SIZE >= q_prefix_len:
         return
 
     qk_factor: gl.float32 = cfg.QK_SCALE
@@ -2576,9 +2589,22 @@ def _mla_decode_fwd_kernel_non_pipelined(
 
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ
-    tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+    # Partition over the causal prefix this q block actually scans (the tile loop
+    # clamps to max_seq_prefix_len below), not over the whole sequence. When a
+    # decode group straddles a KV-block edge -- seq_len % TILE_SIZE <
+    # num_tokens_per_seq -- the two differ, and the seq_len-based split handed
+    # some q blocks a segment whose tile range is empty after clamping while the
+    # reduce still folded that segment in, corrupting 20-40% of the output for
+    # decode_qlen > 1. _mla_decode_fwd_reduce_kernel computes the same quantity.
+    q_prefix_len = (
+        seq_len
+        - num_tokens_per_seq
+        + (token_q_block_local_idx + 1) * BLOCK_Q
+    )
+    q_prefix_len = gl.minimum(q_prefix_len, seq_len)
+    tiles_per_segment = cdiv_fn(q_prefix_len, num_segments * TILE_SIZE)
 
-    if segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:
+    if segm_idx * tiles_per_segment * TILE_SIZE >= q_prefix_len:
         return
 
     q_lora_shared = gl.allocate_shared_memory(
@@ -2990,9 +3016,20 @@ def _mla_decode_fwd_reduce_kernel(
         out_scale = 1 / gl.load(out_scale_ptr)
 
     num_segments = NUM_SEGMENTS_PER_SEQ
-    tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+    # Mirror the attention kernel: it partitions over the causal prefix of the
+    # q block this token belongs to, so the segment count here has to be derived
+    # from the same length or empty segments get folded into the reduction.
+    if ALL_DECODE:
+        tok_in_seq = 0
+    else:
+        tok_in_seq = query_token_idx - seq_idx * num_tokens_per_seq
+    q_prefix_len = (
+        seq_len - num_tokens_per_seq + (tok_in_seq // BLOCK_Q + 1) * BLOCK_Q
+    )
+    q_prefix_len = gl.minimum(q_prefix_len, seq_len)
+    tiles_per_segment = cdiv_fn(q_prefix_len, num_segments * TILE_SIZE)
 
-    act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
+    act_num_segments = cdiv_fn(q_prefix_len, tiles_per_segment * TILE_SIZE)
     offs_segm = gl.arange(0, NUM_SEGMENTS_PER_SEQ, layout=SEGM_LAYOUT)
     segm_mask = offs_segm < gl.full(
         [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=gl.int32, layout=SEGM_LAYOUT
