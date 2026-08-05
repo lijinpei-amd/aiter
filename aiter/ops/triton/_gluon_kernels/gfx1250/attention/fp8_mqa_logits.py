@@ -617,7 +617,13 @@ def _gluon_fp8_mqa_logits_kernel(
         warp_bases: gl.constexpr = [[0, 1], [0, 2]]
     else:
         warp_bases: gl.constexpr = [[0, 1], [0, 2], [0, 4]]
-    FP8_K_DIM: gl.constexpr = 128 if HEAD_SIZE > 64 else 64
+    # HEAD_SIZE > 64 used to select a 16x16x128 fp8 WMMA here, which produced
+    # garbage (calc_diff 1.0, then NaN) for every head_dim=128 case -- the exact
+    # shape DeepSeek-V3.2 / GLM-5.2 use (index_head_dim=128). Neither k_width=16
+    # nor 32 makes that instruction agree with the reference. The 16x16x64 WMMA
+    # is correct (diff ~3e-4, matching head_dim=64); for HEAD_SIZE=128 the
+    # compiler simply issues two of them.
+    FP8_K_DIM: gl.constexpr = 64
     mfma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
         version=3,
         transposed=False,
