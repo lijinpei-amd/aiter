@@ -190,6 +190,13 @@ def is_skinny_default_shape(
     if isinstance(dtype, str):
         dtype = eval(dtype)
     cu_num = get_cu_num() if cu_num is None else cu_num
+    # The skinny solutions are HIP kernels in module_custom (wvSpltK / LLMM1 /
+    # wv_splitk_small_fp16_bf16). No aiter C++ module builds for gfx1250 -- every
+    # one of them transitively includes ck_tile/core.hpp, whose arch static_assert
+    # has no gfx1250 entry -- so selecting them here is an unconditional failure.
+    # Fall through to the torch/hipblaslt solution instead.
+    if get_gfx() == "gfx1250":
+        return False
     return (
         dtype in [dtypes.fp16, dtypes.bf16]
         and K % 8 == 0
