@@ -36,11 +36,17 @@ def _apply_score_mode(x, SCORE_MODE: tl.constexpr):
       - "sqrtsoftplus": x → sqrt(softplus(x)) using numerically stable
         softplus(x) = max(x, 0) + log(1 + exp(-|x|)). Matches
         torch.nn.functional.softplus for the DeepSeek-V4 sqrtsoftplus router.
+      - "sigmoid": x → 1 / (1 + exp(-x)). GLM-5.2 / DeepSeek-V3 sigmoid
+        router (config scoring_func="sigmoid").
     """
     if SCORE_MODE == "sqrtsoftplus":
         x_f = x.to(tl.float32)
         softplus_x = tl.maximum(x_f, 0.0) + tl.log(1.0 + tl.exp(-tl.abs(x_f)))
         return tl.sqrt(softplus_x).to(x.dtype)
+    if SCORE_MODE == "sigmoid":
+        # DeepSeek/GLM noaux_tc router: scores = sigmoid(logits). Same
+        # semantics as the sigmoid branch of _grouped_topk.
+        return (1.0 / (1.0 + tl.exp(-x.to(tl.float32)))).to(x.dtype)
     # "softmax" (and default): identity
     return x
 
@@ -234,7 +240,7 @@ def _topk(
     # streaming_topk are biased scores (sqrt(softplus(x)) + bias) — used for
     # selection. We want the unbiased sqrt(softplus(x)) values as the gathered
     # weights (the "noaux_tc" pattern from V4). Subtract bias[y_indices].
-    if SCORE_MODE == "sqrtsoftplus" and HAS_BIAS:
+    if (SCORE_MODE == "sqrtsoftplus" or SCORE_MODE == "sigmoid") and HAS_BIAS:
         safe_idx = tl.where(real_mask, y_indices, 0).to(tl.int32)
         b_at_idx = tl.load(Bias + safe_idx)
         y_unbiased = y_values.to(tl.float32) - b_at_idx
