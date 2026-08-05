@@ -260,10 +260,11 @@ def fused_qk_rope_cat_and_cache_mla(
     grid = (n_pid, 1, 1)
     if DEVICE_ARCH == "gfx1250":
         _kernel = gluon_fused_qk_rope_cat_and_cache_mla_kernel
-        # The gfx1250 gluon kernel keeps an extra (unused) MAX_EMBD_POS positional
-        # arg for a uniform launch interface with the BLOCK kernel. Pass the
-        # cos/sin cache length to satisfy its signature.
-        _extra_uniform_args = (cos.shape[0],)
+        # NOTE: _fused_qk_rope_cat_and_cache_mla_kernel has no MAX_EMBD_POS
+        # parameter -- its positional list matches the BLOCK kernel's exactly.
+        # Passing an extra arg here shifted every stride by one and collided
+        # with k_scale_ptr ("got multiple values for argument 'k_scale_ptr'").
+        _extra_uniform_args = ()
     else:
         _kernel = triton_fused_qk_rope_cat_and_cache_mla_kernel
         _extra_uniform_args = ()
