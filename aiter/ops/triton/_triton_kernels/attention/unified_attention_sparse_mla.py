@@ -257,7 +257,12 @@ def _kernel_unified_attention_sparse_mla_2d(
         acc = tl.dot(P.to(V_lora.dtype), V_lora, acc=acc)
 
     # epilogue
-    one_over_L = 1.0 / L[:, None]
+    # A row whose top-k list is entirely -1 never accumulates anything: every
+    # tile masks S to -inf, m_j is then clamped to 0.0 by the guard above, so
+    # alpha = exp(-inf - 0.0) = 0 and L is driven to exactly 0. Dividing by it
+    # gives +inf, and inf * acc's zeros is NaN -- so an empty row poisoned its
+    # whole output instead of returning zeros. Leave such rows at 0.
+    one_over_L = 1.0 / tl.where(L > 0.0, L, 1.0)[:, None]
     acc = acc * one_over_L * kv_s
 
     output_offs_lora = (
