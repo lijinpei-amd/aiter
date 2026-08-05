@@ -1,3 +1,6 @@
+import torch
+import triton
+
 from aiter.ops.triton._triton_kernels.attention.unified_attention_sparse_mla import (
     _kernel_unified_attention_sparse_mla_2d,
 )
@@ -15,6 +18,7 @@ def unified_attention_sparse_mla(
     topk_indices,
     block_table,
     kv_lora_rank,
+    kv_scale=None,
 ):
     """
     This function computes the sparse attention.
@@ -49,7 +53,18 @@ def unified_attention_sparse_mla(
 
     BLOCK_M = 16
 
-    total_num_q_blocks = q.shape[0] * (num_query_heads // BLOCK_M)
+    # cdiv, not floor-div: with fewer than BLOCK_M heads per rank (8 at TP=8 for
+    # a 64-head model) the floor gave a zero-sized grid, so `out` was never
+    # written and the caller silently consumed uninitialised memory.
+    num_head_blocks = triton.cdiv(num_query_heads, BLOCK_M)
+    total_num_q_blocks = q.shape[0] * num_head_blocks
+
+    use_fp8 = kv.dtype not in (torch.bfloat16, torch.float16)
+    assert (
+        not use_fp8 or kv_scale is not None
+    ), "an fp8 KV cache requires kv_scale (per-tensor fp32 descale)"
+    assert q.dtype in (torch.bfloat16, torch.float16), f"q must be bf16/fp16, got {q.dtype}"
+
     ALL_DECODE = max_seqlen_q == 1
 
     ROPE_RANK = head_size - kv_lora_rank
@@ -85,11 +100,14 @@ def unified_attention_sparse_mla(
         topk_count=topk_count,
         query_start_len_ptr=cu_seqlens_q,
         num_seqs=num_seqs,
+        kv_scale_ptr=kv_scale,
         BLOCK_M=BLOCK_M,
         ROPE_RANK=ROPE_RANK,
         KV_LORA_RANK=KV_LORA_RANK,
         TILE_SIZE=TILE_SIZE,
         ALL_DECODE=ALL_DECODE,
+        USE_FP8=use_fp8,
+        NUM_HEAD_BLOCKS=num_head_blocks,
         num_warps=num_warps,
         num_stages=num_stages_2d,
     )

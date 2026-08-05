@@ -67,11 +67,14 @@ def _kernel_unified_attention_sparse_mla_2d(
     topk_count: tl.constexpr,
     query_start_len_ptr,  # [num_seqs+1]
     num_seqs: tl.int32,
+    kv_scale_ptr,  # [1] fp32, only read when USE_FP8
     BLOCK_M: tl.constexpr,  # int
     ROPE_RANK: tl.constexpr,
     KV_LORA_RANK: tl.constexpr,
     TILE_SIZE: tl.constexpr,
     ALL_DECODE: tl.constexpr = False,
+    USE_FP8: tl.constexpr = False,
+    NUM_HEAD_BLOCKS: tl.constexpr = 1,
 ):
     """
     TODO:
@@ -84,8 +87,11 @@ def _kernel_unified_attention_sparse_mla_2d(
     kv_head_idx = 0  # assume there is single kv head
 
     q_block_global_idx = tl.program_id(0)
-    q_ind = q_block_global_idx // (num_query_heads // BLOCK_M)
-    head_ind = q_block_global_idx % (num_query_heads // BLOCK_M)
+    # NUM_HEAD_BLOCKS = cdiv(num_query_heads, BLOCK_M). The old
+    # `num_query_heads // BLOCK_M` divisor is 0 once a rank has fewer than
+    # BLOCK_M heads (8 heads at TP=8), which hangs the kernel on a div-by-zero.
+    q_ind = q_block_global_idx // NUM_HEAD_BLOCKS
+    head_ind = q_block_global_idx % NUM_HEAD_BLOCKS
     seq_idx = find_seq_idx(query_start_len_ptr, q_ind, num_seqs, BLOCK_Q, False)
     q_block_start_idx = tl.load(query_start_len_ptr + seq_idx)
 
@@ -103,10 +109,15 @@ def _kernel_unified_attention_sparse_mla_2d(
     offs_lora = tl.arange(0, KV_LORA_RANK)
     offs_rope = tl.arange(KV_LORA_RANK, KV_LORA_RANK + ROPE_RANK)
 
-    query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
+    # BLOCK_Q == 1, so every row of the tile is a head of the SAME query token.
+    # The MHA-style `offs_m // num_queries_per_kv` rolled rows past
+    # num_query_heads into the *next* token while still using this token's top-k
+    # list, which is silently wrong whenever BLOCK_M > num_query_heads -- e.g. 8
+    # heads per rank at TP=8. Index heads directly and mask the tail instead.
+    query_pos = q_block_local_idx * BLOCK_Q + tl.zeros([BLOCK_M], dtype=tl.int32)
 
     query_offset_0 = cur_batch_in_all_start_index + query_pos
-    query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
+    query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m
 
     query_mask_0 = query_pos < cur_batch_query_len
     query_mask_1 = query_offset_1 < num_query_heads
@@ -142,6 +153,14 @@ def _kernel_unified_attention_sparse_mla_2d(
         other=0.0,
         cache_modifier=Q_cache_modifier,
     )
+
+    # Per-tensor fp8 descale: fold it into the QK scale, and apply it to the PV
+    # accumulator in the epilogue (acc = sum P*V_fp8, true acc = kv_s * acc).
+    if USE_FP8:
+        kv_s = tl.load(kv_scale_ptr)
+    else:
+        kv_s = 1.0
+    qk_scale = scale * kv_s
 
     M = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
@@ -185,7 +204,7 @@ def _kernel_unified_attention_sparse_mla_2d(
             other=0.0,
             cache_modifier=KV_cache_modifier,
         )
-        S += scale * tl.dot(Q_rope, K_rope)
+        S += qk_scale * tl.dot(Q_rope, K_rope.to(Q_rope.dtype))
         # K_lora: (KV_LORA_RANK, TILE_SIZE)
         k_lora_ptrs = (
             key_cache_ptr
@@ -201,7 +220,7 @@ def _kernel_unified_attention_sparse_mla_2d(
             cache_modifier=KV_cache_modifier,
         )
 
-        S += scale * tl.dot(Q_lora, K_lora)
+        S += qk_scale * tl.dot(Q_lora, K_lora.to(Q_lora.dtype))
 
         S = tl.where(
             query_mask_1[:, None] & query_mask_0[:, None] & valid_t[None, :],
@@ -234,11 +253,12 @@ def _kernel_unified_attention_sparse_mla_2d(
             cache_modifier=KV_cache_modifier,
         )
 
+        V_lora = V_lora.to(Q_lora.dtype)
         acc = tl.dot(P.to(V_lora.dtype), V_lora, acc=acc)
 
     # epilogue
     one_over_L = 1.0 / L[:, None]
-    acc = acc * one_over_L
+    acc = acc * one_over_L * kv_s
 
     output_offs_lora = (
         query_offset_0[:, None] * output_stride_0
