@@ -27,21 +27,22 @@ async-copy and layout idioms rather than inventing new ones.
 | Milestone | Content |
 |---|---|
 | **M1** | A4W4 MXFP4 (E2M1 packed 2/byte, group 32 along K, uint8 E8M0 scales), fp32 accumulate, both stages, fused MXFP4 output quant on gemm1, bias + gammas, non-persistent, prefill shapes. Gated on `test_model_shapes`. |
-| **M2** | Decode path: `TILE_SCHED`, small-`BLOCK_M` tuning, `SPLIT_K` if needed. |
+| **M2** | Decode path: `TILE_SCHED`, small-`BLOCK_M` tuning, N-tile fusion for L2 reuse. |
 | **M3** | BF16 × BF16, then MXFP8 (E4M3 + E8M0/32). |
 | **M4** | DeepSeek-V4 native A8W4 (fp8 activations block-128 × fp4 weights group-32). Needs
 `gl.amd.cdna4.scaled_upcast` + plain `mfma`; **it is not expressible with `mfma_scaled`**, whose
 CDNA4 implementation asserts `scale_factor == 32` and E8M0 scales. |
 
 Out of scope: NVFP4 (group 16, E4M3 scales — **no hardware path on CDNA4**), hash routing for
-DeepSeek-V4 layers 0–2, the router GEMM, the dense (non-MoE) layers 0–2 of GLM-5.2 / MiniMax-M3.
+DeepSeek-V4 layers 0–2, the router GEMM, the dense (non-MoE) layers 0–2 of GLM-5.2 / MiniMax-M3,
+`SPLIT_K`, and the **shared expert**.
 
-**Shared expert — decide before M1.** Every one of the four models has exactly one shared expert at
-full `I`, all three AMD repacks quantize it to MXFP4, and on MiniMax-M3 it is 1 of 5 activated
-experts (~20% of MoE FLOPs). aiter already supports folding it in as an always-selected expert
-(`aiter/ops/triton/moe/moe_routing_sigmoid_top1_fused.py:47`, topk+1). Either it rides the same
-grouped GEMM as expert index `E` or it is a separate dense launch — this changes the expert-count
-and metadata contract, so it is not a one-line exclusion.
+The shared expert is left alone: it stays on whatever path serves it today and does *not* ride this
+grouped GEMM as an always-on expert `E`. Recorded here because it is not free — every one of the
+four models has exactly one shared expert at full `I`, all three AMD repacks quantize it to MXFP4,
+and on MiniMax-M3 it is 1 of 5 activated experts (~20% of MoE FLOPs). So the perf numbers this
+kernel reports cover the routed experts only, and the end-to-end MoE layer time will not move by the
+same factor.
 
 ## Key kernel design points
 
@@ -83,7 +84,7 @@ the standalone quant launch. Consequences, all of which are requirements:
   no direct-from-LDS global store (`async_copy.shared_to_global` exists on CDNA5/GFX1250, not CDNA4).
 - `BLOCK_N % 64 == 0` in **raw, pre-halving** terms (32 emitted columns = 64 raw columns after the
   interleaved gate/up halving), so the MX group is always tile-local.
-- `SPLIT_K == 1` on this path.
+- `SPLIT_K == 1`, which is unconditional here anyway (see "No split-K").
 
 #### Entry-point contract
 
@@ -106,9 +107,9 @@ class RoutingMeta(NamedTuple):
 ```
 
 Grid: `grid_m = routing_data.n_blocks(M, block_m)` (host-side; **not** `cdiv`), `grid_n =
-tuning_cfg.grid_N(N)`, `grid = grid_m * grid_n * SPLIT_K`. Both kernels must publish a verbatim
-Python signature next to their `@gluon.jit` definition, including every stride and the `bias` /
-`gammas` pointers.
+tuning_cfg.grid_N(N)`, `grid = grid_m * grid_n`. There is no split-K (see "No split-K"). Both
+kernels must publish a verbatim Python signature next to their `@gluon.jit` definition, including
+every stride and the `bias` / `gammas` pointers.
 
 ### Tensor dtype and quant method
 
@@ -283,7 +284,9 @@ class KernelTuningConfig:
     BLOCK_M: gl.constexpr
     BLOCK_N: gl.constexpr
     BLOCK_K: gl.constexpr
-    SPLIT_K: gl.constexpr
+    # K % BLOCK_K == 0. True for every in-scope shape at BLOCK_K in {128, 256, 512};
+    # when True the masked tail body and its peeled fill are compiled out entirely.
+    EVEN_K: gl.constexpr
     # unroll factor of the OUTER (inter-BLOCK_K) k-loop; see "The K loop"
     K_UNROLL: gl.constexpr
     # Within BLOCK_K, run an unrolled loop, each iter of which issues MINI_BLOCK_K amount of
@@ -322,7 +325,8 @@ class KernelTuningConfig:
 
     @gluon.constexpr_function
     def grid_N(self, N):
-        # host-side: compute grid-N. grid-M is determined by the routing metadata.
+        # Callable from BOTH host and device (verified on gfx950). Host: for the grid tuple,
+        # take .value off the returned constexpr. grid-M comes from the routing metadata.
         ...
 
     @gluon.constexpr_function
@@ -390,7 +394,8 @@ for k in range(..., ..., K_UNROLL):     # steady state, body unrolled K_UNROLL t
     ...
 for k in range(..., ..., 1):            # remainder, no K mask
     ...
-last loop body with K mask              # the K % BLOCK_K tail
+if not EVEN_K:                          # compiled out entirely when K % BLOCK_K == 0
+    last loop body with K mask          # the K % BLOCK_K tail; its fill is peeled (see below)
 ```
 
 - **No divisibility requirement** between `cdiv(K, BLOCK_K)` and `K_UNROLL` — the step-1 loop
@@ -412,6 +417,25 @@ last loop body with K mask              # the K % BLOCK_K tail
   is the I-cache and live-range pressure knob — budget it against the VGPR target below.
 - The M-axis mask is a separate matter: the ragged last block of each expert needs operand-A masking
   in **every** body, unrolled or not.
+
+**`EVEN_K` and the peeled tail fill.** `EVEN_K: gl.constexpr == (K % BLOCK_K == 0)`. Two things
+follow.
+
+Under an `NUM_LDS_BUFFER`-deep pipeline the *fill* for a K-tile is issued `NUM_LDS_BUFFER-1`
+iterations before it is *consumed*, so a naive structure would issue the masked tail's fill from
+inside a body that is supposed to be mask-free. **Peel it**: the last `NUM_LDS_BUFFER-1` fills are
+hoisted out of the two pipelined loops into an explicit prologue-to-the-tail, which carries the K
+mask; the loops themselves then only ever fill full tiles and stay mask-free. Do not rely on the
+buffer descriptor's hardware OOB for this — it is correct for the payload, but it makes the loop
+bound and the fill bound differ silently, which is exactly the kind of thing that survives all 16
+correctness cases and shows up as a wrong `wait_group` count under a different `NUM_LDS_BUFFER`.
+
+Branch on `EVEN_K` as a constexpr, so when it holds the peeled fill, the masked tail body and every
+K-mask computation are compiled out and the kernel is loop-uniform. It holds for **every in-scope
+shape**: stage-1 `K = H ∈ {4096, 6144, 7168}` and stage-2 `K = I ∈ {2048, 3072}` are all multiples
+of 1024, so any `BLOCK_K ∈ {128, 256, 512}` divides them. The `not EVEN_K` path exists for
+generality and will not be exercised by the gating tests — cover it with a dedicated
+non-multiple-of-`BLOCK_K` case or it is untested code.
 
 Divisibility lattice for the rest: `BLOCK_K % MINI_BLOCK_K == 0`; `MINI_BLOCK_K % mfma_k == 0`
 (`mfma_k` = 64 or 128 for the CDNA4 scaled f8f6f4 pipes, 16/32 for bf16);
@@ -624,10 +648,13 @@ The load/store methods take coordinates but no masks; the boundary rules must be
 - **Empty experts / padded pids**: `expt_block_pid_map == -1` signals no work
   (`_gluon_kernels/gfx1250/moe/moe_op_gemm_a8w4.py:295-297`). The early return must not leave
   uncommitted async groups outstanding.
-- **N tails**: decide between masked store into an exactly-N buffer (what the Triton a4w4 kernel
-  does) and unmasked full-`BLOCK_N` store into a padded-N buffer (what the gfx1250 gluon a8w4 kernel
-  does, `moe_op_gemm_a8w4.py:370-374`). Pick one and say which; it changes who allocates and how big.
-- **K tails**: only the final body is masked (see "The K loop").
+- **N tails: none.** Assert `N % BLOCK_N == 0` on the host and assume it in the kernel — the store
+  is an unmasked full-`BLOCK_N` store into an exactly-N buffer, and no N-mask is ever computed. The
+  assert is satisfiable for every in-scope shape: stage-1 `N = 2I ∈ {4096, 6144}` and stage-2
+  `N = H ∈ {4096, 6144, 7168}` are all multiples of 1024, so any `BLOCK_N ∈ {128 … 1024}` divides
+  them. The wrapper must refuse (fall back to Triton) rather than silently mis-store if a future
+  shape violates it.
+- **K tails**: only the final body is masked, and only when `not EVEN_K` (see "The K loop").
 - **Index dtype**: `gather_indx` is uint16 when `n_gates <= 65535`, else int32
   (`moe_routing/routing.py:98-101`), and is divided by `n_expts_act`.
 - **2 GB buffer window**: per-expert re-basing, or the `USE_BUFFER_LOAD` / 64-bit fallback.
@@ -647,20 +674,39 @@ The load/store methods take coordinates but no masks; the boundary rules must be
 
 ### Performance targets
 
-`op_tests/op_benchmarks/triton/bench_moe_gemm_a4w4.py` already takes `--model`, fills shapes from
-`moe_model_recipes.py`, and computes a Proton-based roofline. Required in the PR description:
+**The target is to beat the tuned FlyDSL / HIP MoE implementation.** Not a %-of-peak number: the
+bar is an existing, tuned kernel on the same shapes, which is a harder and less gameable target.
 
-- decode T ∈ {1, 8, 32} and prefill T ∈ {1k, 4k, 16k}, all four models, both stages.
-- baseline: the current Triton a4w4 kernel on the same 16 shapes.
-- pass marks: prefill ≥ X% of MI355 MXFP4 MFMA peak **and** ≥ 1.Y× the Triton kernel; decode ≥ Z% of
-  HBM peak. Fill in X/Y/Z before starting — a target named after the fact is not a target.
+The FlyDSL path is the right comparison because it has the same decomposition — two stages,
+separately compiled and separately tuned: `compile_flydsl_moe_stage1` / `compile_flydsl_moe_stage2`
+(`aiter/ops/flydsl/moe_kernels.py:547,663`), with the mxfp4 stage-2 gfx950 optimization from commit
+`a43fe2589` and tuned configs under `aiter/configs/model_configs/*_a4w4_tuned_fmoe.csv`. The HIP
+comparison is `fused_moe` (`aiter/fused_moe.py`).
+
+Measurement:
+
+- `op_tests/op_benchmarks/triton/bench_moe_gemm_a4w4.py --model {dsv4-flash,dsv4-pro,glm52-base,
+  minimax-m3}` already fills shapes from `moe_model_recipes.py` and computes a Proton roofline.
+- decode T ∈ {1, 8, 32} and prefill T ∈ {1k, 4k, 16k}, all four models, **both stages reported
+  separately** — stage 1 and stage 2 have different bottlenecks and FlyDSL tunes them separately.
+- report the current Triton a4w4 kernel alongside, so the regression risk on the fallback path is
+  visible.
+
+Two things to settle before the numbers mean anything:
+
+- The tuned fmoe CSVs in-tree cover **Kimi-K2**, not these four models
+  (`aiter/configs/model_configs/kimik3_a4w4_tuned_fmoe.csv` is the only a4w4 tuned fmoe file). Either
+  tune FlyDSL for the four target shapes first, or state explicitly that the baseline is running
+  untuned/interpolated — beating an untuned baseline proves nothing.
+- The shared expert is out of scope here (see Scope) but is inside some end-to-end FlyDSL paths.
+  Compare routed-expert GEMM time against routed-expert GEMM time, not against a fused MoE layer.
 
 ### Decode vs prefill
 
 The two stated objectives are decode bandwidth and prefill MFMA utilization, but the only
 decomposition given is by MoE stage. State whether one kernel serves both regimes (an
-`IS_DECODE: gl.constexpr`) or two exist, and enumerate what differs: `SPLIT_K`, N-tile fusion for
-L2 reuse, `NUM_LDS_BUFFER`, `K_UNROLL`, MFMA instruction shape.
+`IS_DECODE: gl.constexpr`) or two exist, and enumerate what differs: N-tile fusion for L2 reuse,
+`NUM_LDS_BUFFER`, `K_UNROLL`, MFMA instruction shape.
 
 The decode regime is qualitatively different and the doc should say so. `BLOCK_M` is pinned at 16 by
 the router, and `grid_m = routing_data.n_blocks(M, block_m)` **returns `M` whenever
@@ -668,7 +714,26 @@ the router, and `grid_m = routing_data.n_blocks(M, block_m)` **returns `M` whene
 gate rows against 384 experts → 96 blocks of `BLOCK_M=16` holding 96 rows in total, i.e. **~6%
 M-occupancy**. The pathology is intra-block M padding, not empty blocks, and there is no
 MFMA-utilization story at all: it is a weight-streaming, bandwidth-bound skinny GEMM over K=7168
-whose levers are split-K, N-tile fusion, and minimizing per-tile scalar metadata loads.
+whose levers — split-K being off the table — are N-tile fusion and minimizing per-tile scalar
+metadata loads.
+
+### No split-K
+
+`SPLIT_K` is not a knob and does not appear in `KernelTuningConfig`; the kernel is always
+`split_k == 1`. `moe_op_gemm_a4w4.py:79` already hardcodes it today, so nothing is lost.
+
+Two consequences to keep in mind rather than rediscover:
+
+- The fused activation depends on it. When `split_k > 1` the existing wrapper moves the swiglu out of
+  the GEMM and into `reduce_grouped` (`moe_op_gemm_a4w4.py:225-229`), because partial sums cannot be
+  activated. Fusing the activation into gemm1's epilogue therefore forecloses ever turning split-K
+  back on for this path — that is an accepted trade, not an oversight. Fused output quant has the
+  same dependency, and more strongly: it needs the final value to compute the group amax.
+- The output-buffer contract still carries the leading axis. `matmul_shape = (split_k, M,
+  N // reduction_n_matmul)` (`moe_op_gemm_a4w4.py:61`) and `reduce_grouped` indexes accordingly, so
+  gemm1/gemm2 must still write into a `(1, M, N)` buffer — do not silently drop the axis.
+
+The wrapper must fall back to the Triton kernel if a caller ever asks for `split_k > 1`.
 
 ### Wiring
 
@@ -681,7 +746,8 @@ between two gluon kernels. Specify:
 - the arch gate — three incompatible idioms exist in-tree: unconditional import plus
   `use_gluon = get_arch() == "gfx950"` (`moe_op_gemm_a8w4.py:10-18,349`), lazy import, and the
   defensive `try/except ImportError -> None` of `moe/reduce.py:7-16`. Pick one;
-- an explicit `_gluon_supported(dtypes, apply_swiglu, split_k, out_quant, swizzle)` predicate, with
+- an explicit `_gluon_supported(dtypes, apply_swiglu, split_k, out_quant, swizzle, N % BLOCK_N)`
+  predicate — it must refuse `split_k > 1` and `N % BLOCK_N != 0` — with
   the existing Triton kernel as the fallback for every unsupported combination, so no existing
   caller silently changes behaviour. Do not repeat the a8w4 precedent of a hard assert
   (`moe_op_gemm_a8w4.py:351-353`).
@@ -695,8 +761,19 @@ the nested resolver hardcoded to the `gemm/` subtree (`utils/gemm_config_utils.p
 
 - where tuned configs live (extend the nested resolver to `{arch}/gluon/moe/{dtype}/`, or start with
   an explicit Python ladder);
-- the host→device handoff: the config **class** is passed as a `gl.constexpr` and instantiated
-  in-kernel from scalar constexprs, because an aggregate cannot be a kernel argument;
+- the host→device handoff, which is **verified on gfx950**, not assumed (probe run on an MI350X
+  against this Triton):
+  - host-constructing an all-constexpr aggregate works, and the *same*
+    `@gluon.constexpr_function` method runs there — `TuningCfg(128, 3).grid_N(6144)` returns
+    `constexpr[48]`. Take `.value` before putting it in a grid tuple.
+  - passing that instance as a kernel argument is rejected:
+    `TypeError: failed to specialize argument of type: TuningCfg`.
+  - passing the **class** as a `gl.constexpr` and instantiating in-kernel works, and `grid_N` called
+    on device returns the same 48.
+
+  So one method definition serves both sides and the config is simply **constructed twice**: once on
+  the host for the grid tuple, once in-kernel from the same scalar constexprs. No plain-Python
+  mirror of the grid math is needed — keep the arithmetic in the aggregate so the two cannot drift.
 - `NUM_WARPS` / `WAVES_PER_EU` are launch options and must also be passed as launch kwargs;
 - `do_not_specialize` for `num_token` and every other dynamic scalar — this is the house pattern
   (`gfx1250/moe/moe_op_gemm_a8w4.py:100-103`) and the fix in commit `760a07977`
@@ -709,25 +786,3 @@ Copy from the sibling `gfx950/attention` kernels: SPDX header, module docstring,
 `__init__.py` in the new package, and `@aggregate` + `@strip_annotate` on every aggregate
 (`from triton.language.core import _aggregate as aggregate`;
 `from aiter.ops.triton.utils.common_utils import strip_annotate`).
-
-## Open questions
-
-1. **`grid_N` on the host.** An all-constexpr aggregate should be constructible host-side and its
-   `@gluon.constexpr_function` methods callable there — but that instance still cannot be passed to
-   the kernel, so the config is constructed twice (once host-side for the grid, once in-kernel).
-   This could not be verified in this checkout (the Triton dev tree has no built backends). If host
-   construction turns out to need `_semantic`, mirror the grid math in a plain Python dataclass and
-   keep the aggregate device-only.
-2. **Masking the tail's fill.** Under an `NUM_LDS_BUFFER`-deep pipeline the *fill* for the masked
-   tail K-tile is issued `NUM_LDS_BUFFER-1` iterations before it is *consumed* — i.e. from inside a
-   "no K mask" loop. Either peel that fill out of the pipelined loops, or delegate K masking to the
-   buffer descriptor's hardware OOB (`buffer_load_to_shared` returns 0 past `num_records`, harmless
-   for both the fp4 payload and the E8M0 scale, since a zero payload contributes nothing). Decide
-   which — it determines whether "no K mask" means "no mask tensor computed" or "no mask needed".
-3. **Shared expert**: fused as always-on expert `E`, or a separate dense launch? (see Scope)
-4. **N-tail policy**: masked store into an exact-N buffer, or unmasked store into a padded-N buffer?
-5. **Perf pass marks**: fill in X / Y / Z in "Performance targets".
-6. **`SPLIT_K`**: `moe_op_gemm_a4w4.py:79` hardcodes `split_k=1` today. Declaring it a v1 invariant
-   is fine, but say so — a hard-fused activation forecloses ever enabling it, since the swiglu has
-   to move to `reduce_grouped` when `split_k > 1` (`moe_op_gemm_a4w4.py:225-229`), and the
-   `(split_k, M, N // reduction_n)` output-buffer contract must be honoured even at `split_k == 1`.
