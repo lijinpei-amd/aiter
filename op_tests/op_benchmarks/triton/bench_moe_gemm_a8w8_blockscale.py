@@ -425,6 +425,33 @@ def roofline_mlp(
     )
 
 
+def _resolve_model_shape(model_name):
+    """(dim1, dim2, n_expts_tot, n_expts_act) for a shared MoE model recipe.
+
+    ``dim1`` is the hidden size and ``dim2`` the fused gate+up width (2*I), matching
+    what ``bench_mlp`` builds: ``w1[E, dim1, dim2]`` and ``w2[E, dim2//2, dim1]``.
+
+    The recipe module is imported lazily behind a sys.path bootstrap so this
+    benchmark keeps working when invoked directly as a script (op_tests/op_benchmarks
+    has no __init__.py, so the package is only importable from the repo root).
+    """
+    import sys
+    from pathlib import Path
+
+    root = str(Path(__file__).resolve().parents[3])
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from op_tests.triton_tests.moe.moe_model_recipes import get_recipe
+
+    recipe = get_recipe(model_name)
+    return (
+        recipe.hidden_size,
+        recipe.fused_intermediate_size,
+        recipe.n_routed_experts,
+        recipe.topk,
+    )
+
+
 def parse_args(args: list[str] | None = None):
     parser = argparse.ArgumentParser(prog="Benchmark MoE")
 
@@ -481,14 +508,32 @@ def parse_args(args: list[str] | None = None):
         help="Number of different weight initializations to run for more stable results (default: 1). "
         "Each initialization runs 100 iterations. Use higher values (e.g., 10) for more stable benchmarks.",
     )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="MoE model recipe name (dsv4-flash, dsv4-pro, glm52-base, minimax-m3). "
+        "Fills in --shape/--experts from op_tests/triton_tests/moe/moe_model_recipes.py; "
+        "mutually exclusive with passing them explicitly.",
+    )
+
     return parser.parse_args(args=args)
 
 
 def main(args: list[str] | None = None) -> None:
     parsed_args = parse_args(args=args)
 
-    dim1, dim2 = parsed_args.shape
-    total_experts, active_experts = parsed_args.experts
+    if parsed_args.model is not None:
+        if parsed_args.shape is not None or parsed_args.experts is not None:
+            raise SystemExit("--model is mutually exclusive with --shape/--experts")
+        dim1, dim2, total_experts, active_experts = _resolve_model_shape(
+            parsed_args.model
+        )
+    else:
+        if parsed_args.shape is None or parsed_args.experts is None:
+            raise SystemExit("pass either --model, or both --shape and --experts")
+        dim1, dim2 = parsed_args.shape
+        total_experts, active_experts = parsed_args.experts
     if parsed_args.M is None:
         batch_ranges_moe = [
             (1, 2, 1),
