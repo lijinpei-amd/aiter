@@ -49,6 +49,21 @@ def preshuffle_moe_wscale(s: torch.Tensor) -> torch.Tensor:
     return moe_shuffle_scale(s.transpose(-1, -2)).transpose(-1, -2)
 
 
+from op_tests.triton_tests.moe.moe_model_recipes import (
+    HARNESS_WEIGHT_COPIES,
+    get_recipe,
+    skip_if_insufficient_hbm,
+)
+
+# model shape/activation recipes shared with the benchmarks
+from op_tests.triton_tests.moe.moe_model_recipes import (
+    gemm_shapes as model_gemm_shapes,
+)
+
+_HARNESS = "a4w4"
+
+_MODEL_SHAPES = model_gemm_shapes()
+
 # ---------------
 # initialize data
 # ---------------
@@ -187,6 +202,45 @@ def test_op(
     backend,
     device="cuda",
 ):
+    _run_case(
+        m,
+        n,
+        k,
+        do_gather,
+        do_scatter,
+        has_y_gammas,
+        apply_swiglu,
+        n_expts_tot,
+        n_expts_act,
+        hbm_swizzling,
+        preshuffle_weights,
+        backend,
+        device=device,
+    )
+
+
+def _run_case(
+    m,
+    n,
+    k,
+    do_gather,
+    do_scatter,
+    has_y_gammas,
+    apply_swiglu,
+    n_expts_tot,
+    n_expts_act,
+    hbm_swizzling,
+    preshuffle_weights,
+    backend,
+    act=None,
+    device="cuda",
+):
+    """Shared body for :func:`test_op` and :func:`test_model_shapes`.
+
+    ``act`` is an optional SwigluRecipe. When None the legacy behaviour is kept
+    (``apply_swiglu`` honoured, wrapper defaults alpha=1.0/limit=1.0/residual=True).
+    When given, its knobs are threaded into both the op and the torch reference.
+    """
     if get_arch() != "gfx950" and get_arch() != "gfx1250":
         pytest.skip("Kernel not supported on this GPU.")
     if not is_fp4_avail():
@@ -269,8 +323,14 @@ def test_op(
     maxtol = None
     rmstol = None
 
+    ref_act = {"apply_swiglu": apply_swiglu}
+    op_act = {"apply_swiglu": apply_swiglu}
+    if act is not None and apply_swiglu:
+        ref_act = act.torch_kwargs()
+        op_act = act.op_kwargs()
+
     ref_y = moe_gemm_torch(
-        x_ref, w_ref, bias_ref, rdata, gindx, sindx, gammas, apply_swiglu
+        x_ref, w_ref, bias_ref, rdata, gindx, sindx, gammas, **ref_act
     )
 
     # run kernel
@@ -287,7 +347,38 @@ def test_op(
         swizzle_mx_scale,
         preshuffle_weights,
         out_dtype,
-        apply_swiglu,
+        **op_act,
         backend=backend,
     )
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
+
+
+# ---------------------------------------------------------------------------
+# Model coverage: DeepSeek-V4-{Flash,Pro}, GLM-5.2, MiniMax-M3
+# ---------------------------------------------------------------------------
+# MXFP4 A4W4 -- the format all three AMD Quark repacks ship in.
+# Each model contributes its two grouped-GEMM stages with its OWN activation
+# recipe, so this is a lookup rather than a cross-product and stays cheap.
+@pytest.mark.parametrize("shape", _MODEL_SHAPES, ids=[s.id for s in _MODEL_SHAPES])
+def test_model_shapes(shape, device="cuda"):
+    recipe = get_recipe(shape.model)
+    skip_if_insufficient_hbm(shape, copies=HARNESS_WEIGHT_COPIES[_HARNESS])
+    # The swiglu epilogue belongs to the fused gate/up GEMM only; stage 2 is a plain
+    # down-projection, so applying it there would test an activation no model uses.
+    is_stage1 = shape.stage == 1
+    _run_case(
+        shape.m,
+        shape.n,
+        shape.k,
+        do_gather=True,
+        do_scatter=True,
+        has_y_gammas=True,
+        apply_swiglu=is_stage1,
+        n_expts_tot=shape.n_expts_tot,
+        n_expts_act=shape.n_expts_act,
+        hbm_swizzling=False,
+        preshuffle_weights=False,
+        backend="triton",
+        act=recipe.swiglu if is_stage1 else None,
+        device=device,
+    )
