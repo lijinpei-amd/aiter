@@ -16,7 +16,11 @@ from op_tests.triton_tests.moe.test_moe_align_block_size import input_helper
 
 def model_benchmark_configs(args):
     config_file = args.model_configs
-    configs = get_model_configs(config_path=config_file, models="mixtral")
+    # Honour --model. This used to be hardcoded to "mixtral", which made the --model
+    # flag dead and silently benchmarked the wrong model.
+    configs = get_model_configs(
+        config_path=config_file, models="mixtral" if args.model is None else args.model
+    )
     moe_configs = []
     M = args.M if args.M else 4096  # check size
     # M, K, N, E, top_k
@@ -28,8 +32,10 @@ def model_benchmark_configs(args):
         N2 = config["hidden_size"]
         K2 = config["intermediate_size"] // 2
 
-        E = 8
-        top_k = 2
+        # Take the expert count from the config; these were hardcoded to mixtral's
+        # 8/2, which is the one thing this benchmark is actually sensitive to.
+        E = config["num_expert"]
+        top_k = config["top_k"]
 
         moe_configs.append((model_name, M, N1, K1, E, top_k))
         moe_configs.append((model_name, M, N2, K2, E, top_k))

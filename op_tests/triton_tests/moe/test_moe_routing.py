@@ -11,6 +11,7 @@ from aiter.ops.triton.moe.moe_routing.routing import (
     routing_torch,
 )
 from aiter.ops.triton.moe.moe_routing.topk import grouped_topk
+from aiter.ops.triton.moe.moe_routing.topk import topk as flat_topk
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 
@@ -915,3 +916,82 @@ def bench_routing():
 
 if __name__ == "__main__":
     bench_routing()
+
+
+# ---------------------------------------------------------------------------
+# Model routing coverage: DeepSeek-V4-{Flash,Pro}, GLM-5.2, MiniMax-M3
+# ---------------------------------------------------------------------------
+# One case per model, driven by the shared recipes. Models whose routing the Triton
+# kernels cannot express yet are skipped with the exact assert that blocks them, so
+# this doubles as the living record of the routing gap.
+from op_tests.triton_tests.moe.moe_model_recipes import (
+    all_recipes,
+    skip_reason,
+)
+
+_ROUTING_RECIPES = all_recipes()
+
+
+@pytest.mark.parametrize("n_tokens", [8, 1024])
+@pytest.mark.parametrize(
+    "recipe", _ROUTING_RECIPES, ids=[r.name for r in _ROUTING_RECIPES]
+)
+def test_model_routing(recipe, n_tokens):
+    _maybe_skip()
+    reason = skip_reason(recipe.name, "routing")
+    if reason:
+        pytest.skip(reason)
+
+    device = "cuda"
+    torch.manual_seed(2)
+    logits = init_data(
+        n_tokens, recipe.n_routed_experts, device=device, dtype=torch.float32
+    )
+    bias = (
+        torch.randn(recipe.n_routed_experts, dtype=torch.float32, device=device) * 0.05
+        if recipe.use_score_bias
+        else None
+    )
+    scale = recipe.routed_scaling_factors[0]
+
+    if recipe.use_grouped_topk:
+        y_vals, y_indx, _ = grouped_topk(
+            logits,
+            recipe.topk,
+            recipe.num_expert_group,
+            recipe.topk_group,
+            score_mode=recipe.score_mode,
+            bias=bias,
+            renorm=recipe.renorm,
+            routed_scaling_factor=scale,
+        )
+    else:
+        # DeepSeek-V4: noaux_tc with no expert groups is a flat top-k. The flat path
+        # accepts sqrtsoftplus + fp32 bias at any E < 32768 (topk.py:204, :207-220),
+        # so it also covers dsv4-pro's E=384, which grouped_topk cannot (topk.py:41).
+        y_vals, y_indx, _ = flat_topk(
+            logits,
+            recipe.topk,
+            score_mode=recipe.score_mode,
+            apply_softmax=False,  # only valid with score_mode="softmax"
+            bias=bias,
+            renorm=recipe.renorm,
+            routed_scaling_factor=scale,
+            return_bitmatrix=True,
+        )
+
+    assert y_vals.shape == (n_tokens, recipe.topk)
+    assert y_indx.shape == (n_tokens, recipe.topk)
+    # every selected expert is in range and distinct per token
+    assert int(y_indx.min()) >= 0
+    assert int(y_indx.max()) < recipe.n_routed_experts
+    for row in y_indx.tolist():
+        assert len(set(row)) == len(row), f"duplicate expert in {row}"
+    # renorm + routed_scaling_factor => weights sum to the scale factor
+    if recipe.renorm:
+        torch.testing.assert_close(
+            y_vals.float().sum(dim=-1),
+            torch.full((n_tokens,), scale, device=device),
+            atol=2e-3,
+            rtol=2e-3,
+        )
