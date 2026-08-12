@@ -284,9 +284,6 @@ class KernelTuningConfig:
     BLOCK_M: gl.constexpr
     BLOCK_N: gl.constexpr
     BLOCK_K: gl.constexpr
-    # K % BLOCK_K == 0. True for every in-scope shape at BLOCK_K in {128, 256, 512};
-    # when True the masked tail body and its peeled fill are compiled out entirely.
-    EVEN_K: gl.constexpr
     # unroll factor of the OUTER (inter-BLOCK_K) k-loop; see "The K loop"
     K_UNROLL: gl.constexpr
     # Within BLOCK_K, run an unrolled loop, each iter of which issues MINI_BLOCK_K amount of
@@ -390,12 +387,11 @@ class in the repo to copy. Constraints:
 
 ```python
 prologue                                # pipeline fill: NUM_LDS_BUFFER-1 stages, no mma
-for k in range(..., ..., K_UNROLL):     # steady state, body unrolled K_UNROLL times, no K mask
+for k in range(..., ..., K_UNROLL):     # steady state, body unrolled K_UNROLL times
     ...
-for k in range(..., ..., 1):            # remainder, no K mask
+for k in range(..., ..., 1):            # remainder (0 .. K_UNROLL-1 iterations)
     ...
-if not EVEN_K:                          # compiled out entirely when K % BLOCK_K == 0
-    last loop body with K mask          # the K % BLOCK_K tail; its fill is peeled (see below)
+epilogue                                # NUM_LDS_BUFFER-1 mma-only iterations, no fill
 ```
 
 - **No divisibility requirement** between `cdiv(K, BLOCK_K)` and `K_UNROLL` — the step-1 loop
@@ -408,8 +404,8 @@ if not EVEN_K:                          # compiled out entirely when K % BLOCK_K
   NUM_LDS_BUFFER`), turning the descriptor index into a static offset and constant-folding the
   `wait_group` counts and the address arithmetic. Enforce it as a constexpr assert, not a
   convention — without it the unroll buys nothing but code size.
-- The step-1 loop and the masked tail run at an arbitrary buffer phase and therefore use a dynamic
-  `.index()`. That is fine; they are off the critical path, and the alternative
+- The step-1 remainder loop and the drain epilogue run at an arbitrary buffer phase and therefore
+  use a dynamic `.index()`. That is fine; they are off the critical path, and the alternative
   (`gl.static_range(K_UNROLL)` with an exit predicate) is pure code bloat.
 - `MINI_PREFETCH_K > 0` needs the *next* stage's buffer index statically, so it implies
   `K_UNROLL >= 2`.
@@ -418,24 +414,23 @@ if not EVEN_K:                          # compiled out entirely when K % BLOCK_K
 - The M-axis mask is a separate matter: the ragged last block of each expert needs operand-A masking
   in **every** body, unrolled or not.
 
-**`EVEN_K` and the peeled tail fill.** `EVEN_K: gl.constexpr == (K % BLOCK_K == 0)`. Two things
-follow.
+**K divisibility is a host precondition, not a kernel branch.** Assert `K % BLOCK_K == 0` on the
+host and assume it in the kernel: **only the even-K case is implemented**. There is no masked tail
+body, no `EVEN_K` constexpr, and no K-mask computed anywhere — the same treatment `N % BLOCK_N == 0`
+gets (see "Edge cases"). The wrapper must fall back to the Triton kernel rather than mis-compute if
+a caller ever presents a non-divisible K.
 
-Under an `NUM_LDS_BUFFER`-deep pipeline the *fill* for a K-tile is issued `NUM_LDS_BUFFER-1`
-iterations before it is *consumed*, so a naive structure would issue the masked tail's fill from
-inside a body that is supposed to be mask-free. **Peel it**: the last `NUM_LDS_BUFFER-1` fills are
-hoisted out of the two pipelined loops into an explicit prologue-to-the-tail, which carries the K
-mask; the loops themselves then only ever fill full tiles and stay mask-free. Do not rely on the
-buffer descriptor's hardware OOB for this — it is correct for the payload, but it makes the loop
-bound and the fill bound differ silently, which is exactly the kind of thing that survives all 16
-correctness cases and shows up as a wrong `wait_group` count under a different `NUM_LDS_BUFFER`.
+The assert is satisfiable for every in-scope shape: stage-1 `K = H ∈ {4096, 6144, 7168}` and stage-2
+`K = I ∈ {2048, 3072}` are all multiples of 1024, so any `BLOCK_K ∈ {128, 256, 512}` divides them —
+and `CDNA4_SCALE` already forces `BLOCK_K >= 256`.
 
-Branch on `EVEN_K` as a constexpr, so when it holds the peeled fill, the masked tail body and every
-K-mask computation are compiled out and the kernel is loop-uniform. It holds for **every in-scope
-shape**: stage-1 `K = H ∈ {4096, 6144, 7168}` and stage-2 `K = I ∈ {2048, 3072}` are all multiples
-of 1024, so any `BLOCK_K ∈ {128, 256, 512}` divides them. The `not EVEN_K` path exists for
-generality and will not be exercised by the gating tests — cover it with a dedicated
-non-multiple-of-`BLOCK_K` case or it is untested code.
+This removes the fill/consume masking hazard rather than solving it, but the **drain still has to
+exist**. Under an `NUM_LDS_BUFFER`-deep pipeline the fill for a K-tile is issued `NUM_LDS_BUFFER-1`
+iterations before it is consumed, so the last `NUM_LDS_BUFFER-1` stages are consumed by an
+mma-only epilogue that issues **no fill at all** — that, not masking, is what keeps the loads inside
+`K`. Getting this wrong reads past the end of the K strip while every correctness case still passes,
+because the over-read lands in the next expert's weights and is multiplied by an accumulator that is
+never stored. Assert the fill count equals `cdiv(K, BLOCK_K)` in the constexpr layer.
 
 Divisibility lattice for the rest: `BLOCK_K % MINI_BLOCK_K == 0`; `MINI_BLOCK_K % mfma_k == 0`
 (`mfma_k` = 64 or 128 for the CDNA4 scaled f8f6f4 pipes, 16/32 for bf16);
@@ -654,7 +649,8 @@ The load/store methods take coordinates but no masks; the boundary rules must be
   `N = H ∈ {4096, 6144, 7168}` are all multiples of 1024, so any `BLOCK_N ∈ {128 … 1024}` divides
   them. The wrapper must refuse (fall back to Triton) rather than silently mis-store if a future
   shape violates it.
-- **K tails**: only the final body is masked, and only when `not EVEN_K` (see "The K loop").
+- **K tails: none.** Assert `K % BLOCK_K == 0` on the host, same as N. Only the even-K case is
+  implemented; the pipeline drain, not a mask, is what keeps loads inside `K` (see "The K loop").
 - **Index dtype**: `gather_indx` is uint16 when `n_gates <= 65535`, else int32
   (`moe_routing/routing.py:98-101`), and is divided by `n_expts_act`.
 - **2 GB buffer window**: per-expert re-basing, or the `USE_BUFFER_LOAD` / 64-bit fallback.
@@ -746,8 +742,8 @@ between two gluon kernels. Specify:
 - the arch gate — three incompatible idioms exist in-tree: unconditional import plus
   `use_gluon = get_arch() == "gfx950"` (`moe_op_gemm_a8w4.py:10-18,349`), lazy import, and the
   defensive `try/except ImportError -> None` of `moe/reduce.py:7-16`. Pick one;
-- an explicit `_gluon_supported(dtypes, apply_swiglu, split_k, out_quant, swizzle, N % BLOCK_N)`
-  predicate — it must refuse `split_k > 1` and `N % BLOCK_N != 0` — with
+- an explicit `_gluon_supported(dtypes, apply_swiglu, split_k, out_quant, swizzle, N, K)`
+  predicate — it must refuse `split_k > 1`, `N % BLOCK_N != 0` and `K % BLOCK_K != 0` — with
   the existing Triton kernel as the fallback for every unsupported combination, so no existing
   caller silently changes behaviour. Do not repeat the a8w4 precedent of a hard assert
   (`moe_op_gemm_a8w4.py:351-353`).
