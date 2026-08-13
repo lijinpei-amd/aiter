@@ -26,6 +26,7 @@ from aiter.ops.triton.moe.quant_moe import (
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 from op_tests.triton_tests.moe.moe_model_recipes import (
+    ACT_RECIPES,
     HARNESS_WEIGHT_COPIES,
     get_recipe,
     skip_if_insufficient_hbm,
@@ -386,4 +387,121 @@ def test_model_shapes(shape, device="cuda"):
         hbm_swizzling=False,
         act=recipe.swiglu if is_stage1 else None,
         device=device,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fused MXFP4 output quant (gfx950 Gluon gemm1)
+# ---------------------------------------------------------------------------
+# gemm1's epilogue emits gemm2's operand-A format directly, which is what lets the
+# wrapper drop the standalone `mxfp4_quant` launch (today: bf16 write + bf16 read +
+# fp4 write + fp4 read, ~2.5x the necessary intermediate traffic). The contract is
+# bit-for-bit equality with that launch, so this compares payload and E8M0 scale
+# exactly rather than with a tolerance -- a tolerance test would not notice a
+# half-ULP difference that makes gemm2 read a different tensor.
+@pytest.mark.parametrize(
+    "m, n, k, n_expts_tot, n_expts_act",
+    [
+        (1024, 4096, 4096, 128, 4),
+        (1024, 6144, 7168, 256, 8),
+        (16, 4096, 4096, 128, 4),
+    ],
+)
+@pytest.mark.parametrize("act", ACT_RECIPES, ids=[a.name for a in ACT_RECIPES])
+def test_gemm1_fused_mxfp4_out(m, n, k, n_expts_tot, n_expts_act, act, device="cuda"):
+    if get_arch() != "gfx950":
+        pytest.skip("Gluon MoE kernels are gfx950 only.")
+    from aiter.ops.triton.moe.moe_op_gemm_a4w4_gluon import (
+        gluon_supported,
+        moe_gemm1_a4w4_mxfp4_out,
+        moe_gemm_a4w4_gluon,
+    )
+
+    torch.manual_seed(0)
+    m, rdata, gindx, _ = init_routing_data(
+        m, n_expts_tot, n_expts_act, do_gather=True, do_scatter=False, device=device
+    )
+    x_tri, w_tri, bias_tri, gammas = init_compute_data(
+        m,
+        n,
+        k,
+        gindx,
+        None,
+        n_expts_tot,
+        n_expts_act,
+        torch.bfloat16,
+        torch.bfloat16,
+        True,
+        device=device,
+    )
+    w_tri, w_scale_tri = downcast_to_mxfp(w_tri, torch.uint8, axis=1)
+    x_tri, x_mx_scales_tri = mxfp4_quant(x_tri)
+
+    M = gindx.shape[0]
+    ok, why = gluon_supported(
+        x=x_tri,
+        w=w_tri,
+        x_scales=x_mx_scales_tri,
+        w_scales=w_scale_tri,
+        y=torch.empty((1, M, n // 2), dtype=torch.bfloat16, device=device),
+        bias=bias_tri,
+        routing_data=rdata,
+        swizzle_mx_scale=None,
+        split_k=1,
+        x_static_scale=None,
+        quant_static_scale=None,
+        out_quant=None,
+        N=n,
+        K=k,
+    )
+    if not ok:
+        pytest.skip(f"shape not on the Gluon path: {why}")
+
+    kw = {
+        "alpha": act.alpha,
+        "limit": act.limit,
+        "swiglu_add_residual": act.add_residual,
+    }
+    # reference: the same Gluon gemm1 emitting bf16, then the standalone quant launch
+    y_bf16 = torch.empty((1, M, n // 2), dtype=torch.bfloat16, device=device)
+    moe_gemm_a4w4_gluon(
+        y_bf16,
+        x_tri,
+        w_tri,
+        x_mx_scales_tri,
+        w_scale_tri,
+        bias_tri,
+        gammas,
+        rdata,
+        gindx,
+        None,
+        n,
+        k,
+        True,
+        act.alpha,
+        act.limit,
+        act.add_residual,
+    )
+    ref_fp4, ref_scale = mxfp4_quant(y_bf16[0])
+
+    got_fp4, got_scale = moe_gemm1_a4w4_mxfp4_out(
+        x_tri,
+        w_tri,
+        x_mx_scales_tri,
+        w_scale_tri,
+        bias_tri,
+        rdata,
+        gindx,
+        gammas,
+        **kw,
+    )
+
+    # Rows past each expert's histogram are padding in both tensors; only compare the
+    # rows the routing actually wrote.
+    assert torch.equal(
+        got_fp4, ref_fp4
+    ), f"payload differs in {(got_fp4 != ref_fp4).sum().item()} / {ref_fp4.numel()} bytes"
+    assert torch.equal(got_scale, ref_scale), (
+        f"E8M0 scale differs in {(got_scale != ref_scale).sum().item()} "
+        f"/ {ref_scale.numel()} bytes"
     )
