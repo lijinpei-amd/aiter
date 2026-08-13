@@ -634,6 +634,19 @@ class KernelTuningConfig:
             assert (
                 _v(self.K_UNROLL) >= 2
             ), "MINI_PREFETCH_K needs the next stage's index"
+        if _v(self.MINI_BLOCK_K) < BK:
+            # The LDS scale path slices per mini-tile; the register fallback advances a
+            # flat offset by MINI_BLOCK_K/32 and hands mfma_scaled a fragment still
+            # shaped for the whole BLOCK_K. The two disagree, and the only symptom is
+            # the backend's "Operands must have the same scale factor" at lowering
+            # time, which names neither knob. Refuse the pair here instead.
+            for idx in (0, 1):
+                assert not self.func_cfg.has_scale(idx) or self.scale_via_lds(idx), (
+                    f"MINI_BLOCK_K ({_v(self.MINI_BLOCK_K)}) < BLOCK_K ({BK}) needs "
+                    f"operand {idx}'s scale on the LDS path, but its tile is too small "
+                    "for a coalesced direct-to-LDS copy; raise BLOCK_K or set "
+                    "MINI_BLOCK_K == BLOCK_K"
+                )
 
         # -- the constexpr rotating buffer index only folds if this holds --
         assert (
