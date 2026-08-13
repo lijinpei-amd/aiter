@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Host side of the gfx950 Gluon MoE A4W4 grouped GEMM.
+"""Host side of the gfx950 Gluon MoE grouped GEMMs.
 
-``aiter/ops/triton/moe/__init__.py`` is empty and there is no per-stage op --
-``moe_gemm_a4w4`` serves both stages, distinguished only by its arguments -- so the
-two-kernel split is expressed as *one* wrapper choosing between two Gluon entry points.
+One launcher for every ``moe_gemm_*`` op. ``aiter/ops/triton/moe/__init__.py`` is empty
+and there is no per-stage op -- each ``moe_gemm_*`` serves both MoE stages, distinguished
+only by its arguments -- so the two-kernel split is expressed as *one* wrapper choosing
+between two Gluon entry points, and the operand dtypes are inferred from the tensors
+rather than encoded in a separate entry point per op.
+
+Wired into ``moe_op_gemm_a4w4.py``, ``moe_op_gemm_a8w8.py`` and ``moe_op_gemm_a8w4.py``
+through :func:`try_gluon_grouped_gemm`.
 
 The arch gate is the ``moe_op_gemm_a8w4.py`` idiom (unconditional import plus an
 ``get_arch() == "gfx950"`` check), but **not** its hard assert: every combination the
@@ -22,6 +27,7 @@ from functools import cache
 import torch
 
 from aiter.ops.triton._gluon_kernels.gfx950.moe._config import (
+    LDS_USABLE_BYTES,
     KernelFuncConfig,
     KernelTuningConfig,
 )
@@ -48,7 +54,8 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
-MXFP4_QUANT_BLOCK_SIZE = 32
+#: MX group size. Fixed by the OCP microscaling spec for both E2M1 and E4M3; not a knob.
+MX_GROUP_SIZE = 32
 _SUPPORTED_BLOCK_M = (16, 32, 64, 128)
 
 
@@ -66,23 +73,91 @@ def _can_overflow_int32(t: torch.Tensor | None, drop_leading: int = 0) -> bool:
 
 
 # --------------------------------------------------------------------------------
+# dtype inference
+# --------------------------------------------------------------------------------
+_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2)
+_BF16_DTYPES = (torch.bfloat16, torch.float16)
+
+
+def infer_dtype_quant(t: torch.Tensor, scales: torch.Tensor | None):
+    """Map a stored tensor plus its optional scale tensor onto a :class:`DtypeQuant`.
+
+    The four in-tree MoE ops all describe their operands this way and nothing else
+    distinguishes them: MXFP4 is the only one stored as ``uint8`` (two E2M1 per byte),
+    fp8 with an E8M0 group-32 scale is MXFP8, fp8 without one is FP8_E4M3 (unit scales,
+    which still has to go through ``mfma_scaled`` to reach the double-rate pipe).
+
+    Returns ``None`` for anything outside the supported set, which the caller turns into
+    a fallback rather than a failure.
+    """
+    if t.dtype == torch.uint8:
+        return DtypeQuant.MXFP4 if scales is not None else None
+    if t.dtype in _FP8_DTYPES:
+        return DtypeQuant.MXFP8 if scales is not None else DtypeQuant.FP8_E4M3
+    if t.dtype in _BF16_DTYPES:
+        return DtypeQuant.BF16 if scales is None else None
+    return None
+
+
+def _mfma_instr(dq_a, dq_b, nonk: int):
+    """MFMA instruction shape for an operand pair.
+
+    A bf16 pair is the only one that does *not* land on the f8f6f4 pipe, and that pipe's
+    K is a quarter of the scaled one's; getting this wrong does not fail, it silently
+    halves throughput.
+    """
+    both_bf16 = dq_a == DtypeQuant.BF16 and dq_b == DtypeQuant.BF16
+    if both_bf16:
+        return (32, 32, 16) if nonk == 32 else (16, 16, 32)
+    return (32, 32, 64) if nonk == 32 else (16, 16, 128)
+
+
+def _probe_lds_bytes(cfg: dict, dq_a, dq_b) -> int:
+    """LDS footprint of a candidate config, computed by the *aggregate* rather than by a
+    second copy of the arithmetic -- the host and the device must not be able to
+    disagree about whether a config fits."""
+    from triton.experimental.gluon import language as gl
+
+    func = KernelFuncConfig(
+        int(dq_a),
+        int(dq_b),
+        int(dq_a),
+        int(dq_b),
+        gl.float32,
+        None,
+        None,
+        False,
+        False,
+        False,
+        False,
+    )
+    return KernelTuningConfig(func, *_tuning_args(cfg)).lds_bytes()
+
+
+# --------------------------------------------------------------------------------
 # tuning
 # --------------------------------------------------------------------------------
 @cache
-def _get_gluon_config_cached(block_m: int, N: int, K: int, small_grid: bool) -> tuple:
-    return tuple(sorted(get_gluon_config_uncached(block_m, N, K, small_grid).items()))
+def _get_gluon_config_cached(
+    block_m: int, N: int, K: int, dq_a, dq_b, small_grid: bool
+) -> tuple:
+    return tuple(
+        sorted(get_gluon_config_uncached(block_m, N, K, dq_a, dq_b, small_grid).items())
+    )
 
 
-def get_gluon_config(block_m: int, N: int, K: int, small_grid: bool = False) -> dict:
+def get_gluon_config(
+    block_m: int, N: int, K: int, dq_a, dq_b, small_grid: bool = False
+) -> dict:
     """Cached view of :func:`get_gluon_config_uncached`. The decode path issues one of
     these per launch and the launch path *is* the critical path there."""
-    return dict(_get_gluon_config_cached(block_m, N, K, bool(small_grid)))
+    return dict(_get_gluon_config_cached(block_m, N, K, dq_a, dq_b, bool(small_grid)))
 
 
 def get_gluon_config_uncached(
-    block_m: int, N: int, K: int, small_grid: bool = False
+    block_m: int, N: int, K: int, dq_a, dq_b, small_grid: bool = False
 ) -> dict:
-    """Explicit Python ladder keyed on ``(block_m, N, K, small_grid)``.
+    """Explicit Python ladder keyed on ``(block_m, N, K, dtypes, small_grid)``.
 
     ``aiter/ops/triton/configs/gfx950/gluon/moe/`` is empty and the three in-tree config
     mechanisms are mutually incompatible, so this starts as a ladder; a JSON resolver
@@ -102,64 +177,94 @@ def get_gluon_config_uncached(
       removes the register-path scale load from the K loop -- and register-path global
       accesses in the loop make every ``wait_group`` conservative, because on CDNA4
       direct-to-LDS completes *in order* with ordinary loads.
-    * ``block_m in (64, 128)`` -- prefill. MFMA bound, so the 32x32x64 pipe with a wide
-      N tile and warps spread over both axes.
+    * ``block_m in (64, 128)`` -- prefill. MFMA bound, so the wide N tile and warps
+      spread over both axes.
+
+    The tile is then shrunk until it fits LDS. That step is not cosmetic: the base
+    numbers are tuned for MXFP4, and an MXFP8 or bf16 operand is two or four times
+    wider per element, so the same ``(BLOCK_N, BLOCK_K)`` would overflow the 160 KiB
+    cap outright.
     """
     if block_m == 16:
         block_n, block_k, warps, nb = 128, 512, (1, 4), 3
-        instr = (16, 16, 128)
+        nonk = 16
         if small_grid:
             # A narrow N tile is the only way to keep every XCD busy when the router
             # hands out only a few M blocks.
             block_n = 64
     elif block_m == 32:
         block_n, block_k, warps, nb = 256, 512, (1, 4), 2
-        instr = (16, 16, 128)
+        nonk = 16
     elif block_m == 64:
         block_n, block_k, warps, nb = 256, 256, (2, 4), 2
-        instr = (32, 32, 64)
+        nonk = 32
     else:  # 128
         block_n, block_k, warps, nb = 256, 256, (4, 2), 2
-        instr = (32, 32, 64)
+        nonk = 32
+    instr = _mfma_instr(dq_a, dq_b, nonk)
 
     # shrink the N tile until it divides N (the kernel has no N tail by construction)
     gran_n = instr[1] * warps[1]
     while block_n > gran_n and N % block_n != 0:
         block_n //= 2
-    while block_k > 128 and (K % block_k != 0 or K // block_k < nb):
+    min_k = max(128, instr[2])
+    while block_k > min_k and (K % block_k != 0 or K // block_k < nb):
         block_k //= 2
-    mini_n = min(block_n, gran_n * 2)
-    while mini_n % gran_n:
-        mini_n += gran_n
 
-    return {
-        "BLOCK_M": block_m,
-        "BLOCK_N": block_n,
-        "BLOCK_K": block_k,
-        "K_UNROLL": nb,
-        "MINI_BLOCK_K": block_k,
-        "MINI_PREFETCH_K": 0,
-        "MINI_BLOCK_M": block_m,
-        "MINI_BLOCK_N": mini_n,
-        "MINI_PRESTORE_MN": 1,
-        "NUM_LDS_BUFFER": nb,
-        "mfma_instr_shape": instr,
-        "warps_per_cta": warps,
-        "tiles_per_warp": (1, 1),
-        "k_width": 16,
-        "transposed": True,
-        "WAVES_PER_EU": 0,
-        "TILE_SCHED": int(TileSched.XCD_GROUP_M),
-        "GROUP_M": 4,
-        "NUM_XCDS": 8,
-        "token_mod": "",
-        "token_scale_mod": "",
-        "expert_mod": ".cg" if block_m <= 32 else "",
-        "expert_scale_mod": ".cg" if block_m <= 32 else "",
-        "result_mod": "",
-        "result_scale_mod": "",
-        "WARP_PIPELINE": False,
-    }
+    def _build(bn, bk, n_buf):
+        mini_n = min(bn, gran_n * 2)
+        while mini_n % gran_n:
+            mini_n += gran_n
+        return {
+            "BLOCK_M": block_m,
+            "BLOCK_N": bn,
+            "BLOCK_K": bk,
+            "K_UNROLL": n_buf,
+            "MINI_BLOCK_K": bk,
+            "MINI_PREFETCH_K": 0,
+            "MINI_BLOCK_M": block_m,
+            "MINI_BLOCK_N": mini_n,
+            "MINI_PRESTORE_MN": 1,
+            "NUM_LDS_BUFFER": n_buf,
+            "mfma_instr_shape": instr,
+            "warps_per_cta": warps,
+            "tiles_per_warp": (1, 1),
+            # None means "derive from the instruction shape and the operand packing".
+            # A literal here would silently pick a different MFMA variant.
+            "k_width": None,
+            "transposed": True,
+            "WAVES_PER_EU": 0,
+            "TILE_SCHED": int(TileSched.XCD_GROUP_M),
+            "GROUP_M": 4,
+            "NUM_XCDS": 8,
+            "token_mod": "",
+            "token_scale_mod": "",
+            "expert_mod": ".cg" if block_m <= 32 else "",
+            "expert_scale_mod": ".cg" if block_m <= 32 else "",
+            "result_mod": "",
+            "result_scale_mod": "",
+            "WARP_PIPELINE": False,
+        }
+
+    cfg = _build(block_n, block_k, nb)
+    while _probe_lds_bytes(cfg, dq_a, dq_b) > LDS_USABLE_BYTES:
+        # Order matters. Narrowing N costs arithmetic intensity; shortening K costs the
+        # pipeline *and*, below BLOCK_K=256, drops the E8M0 scale tiles under the width
+        # a coalesced direct-to-LDS write needs, which puts a register-path global load
+        # back inside the K loop and makes every wait_group conservative. Measured at
+        # 0.6x on MXFP8 prefill. So: N first, then pipeline depth, then K.
+        if block_n > gran_n and N % (block_n // 2) == 0:
+            block_n //= 2
+        elif nb > 2:
+            nb -= 1
+        elif block_k > min_k and K % (block_k // 2) == 0:
+            block_k //= 2
+        else:
+            break  # gluon_supported's validate() will reject it
+        if K // block_k < nb:
+            nb = max(2, K // block_k)
+        cfg = _build(block_n, block_k, nb)
+    return cfg
 
 
 def _small_grid(routing_data, M, N) -> bool:
@@ -193,10 +298,14 @@ def gluon_supported(
         return False, "arch is not gfx950"
     if split_k != 1:
         return False, "split_k > 1 has no Gluon path (the fused epilogue forecloses it)"
-    if x_scales is None or w_scales is None:
-        return False, "Gluon A4W4 needs microscaled activations and weights"
-    if x_static_scale is not None or quant_static_scale is not None:
-        return False, "static fp8 scales are not implemented on the Gluon path"
+    dq_a = infer_dtype_quant(x, x_scales)
+    dq_b = infer_dtype_quant(w, w_scales)
+    if dq_a is None or dq_b is None:
+        return False, f"unsupported operand dtypes ({x.dtype} / {w.dtype})"
+    if quant_static_scale is not None:
+        return False, "fused fp8 output quant is not implemented on the Gluon path"
+    if x_static_scale is not None and dq_a != DtypeQuant.FP8_E4M3:
+        return False, "a static activation scale only applies to unscaled fp8 operands"
     if out_quant not in (None, DtypeQuant.MXFP4):
         return False, f"output_quant {out_quant} is not implemented"
     if swizzle_mx_scale is not None:
@@ -205,28 +314,36 @@ def gluon_supported(
         return False, f"scale swizzle {swizzle_mx_scale} is not implemented"
     if routing_data is None or routing_data.expt_data is None:
         return False, "Gluon path needs the Family-A routing metadata"
-    if x.dtype != torch.uint8 or w.dtype != torch.uint8:
-        return False, "expected packed E2M1 payloads in uint8"
     if x.stride(-1) != 1:
         return False, "x must be row-major"
     if w.stride(-2) != 1:
-        return False, "w must be K-contiguous ((E, K/2, N) with stride(-2) == 1)"
+        return False, "w must be K-contiguous ((E, K/pack, N) with stride(-2) == 1)"
     if bias is not None and bias.dtype != torch.float32:
         return False, "bias must be fp32"
+    # bf16 x microscaled needs scaled_upcast + plain mfma; see moe_gemm._load_operands.
+    mixed_bf16 = (dq_a == DtypeQuant.BF16) != (dq_b == DtypeQuant.BF16)
+    if mixed_bf16:
+        return False, "bf16 x microscaled (scaled_upcast path) is not implemented"
 
     block_m = routing_data.block_m
     if block_m not in _SUPPORTED_BLOCK_M:
         return False, f"block_m {block_m} outside {_SUPPORTED_BLOCK_M}"
 
-    cfg = get_gluon_config(block_m, N, K, _small_grid(routing_data, y.shape[1], N))
+    cfg = get_gluon_config(
+        block_m, N, K, dq_a, dq_b, _small_grid(routing_data, y.shape[1], N)
+    )
     if N % cfg["BLOCK_N"] != 0:
         return False, f"N {N} % BLOCK_N {cfg['BLOCK_N']} != 0"
     if K % cfg["BLOCK_K"] != 0:
         return False, f"K {K} % BLOCK_K {cfg['BLOCK_K']} != 0"
     if K // cfg["BLOCK_K"] < cfg["NUM_LDS_BUFFER"]:
         return False, "K strip shorter than the pipeline depth"
-    if K % (2 * MXFP4_QUANT_BLOCK_SIZE) != 0:
+    if _probe_lds_bytes(cfg, dq_a, dq_b) > LDS_USABLE_BYTES:
+        return False, "no tile of this shape fits the LDS budget"
+    if (dq_a == DtypeQuant.MXFP4 or dq_b == DtypeQuant.MXFP4) and K % 64 != 0:
         return False, "K must be a multiple of 64 for packed E2M1 + group-32 scales"
+    if K % MX_GROUP_SIZE != 0:
+        return False, "K must be a multiple of the 32-element MX group"
 
     # 2 GB buffer window. The expert stride is folded into the 64-bit scalar base, so
     # only the per-expert slice has to fit; everything else is checked whole.
@@ -248,10 +365,13 @@ def _launch_spec(
     block_m,
     N,
     K,
+    dq_a,
+    dq_b,
     small_grid,
     has_bias,
     has_gammas,
     has_gather,
+    has_x_static_scale,
     act,
     out_quant,
     config_items,
@@ -267,19 +387,20 @@ def _launch_spec(
     c = (
         dict(config_items)
         if config_items
-        else get_gluon_config(block_m, N, K, small_grid)
+        else get_gluon_config(block_m, N, K, dq_a, dq_b, small_grid)
     )
     func_spec = FuncSpec(
-        int(DtypeQuant.MXFP4),
-        int(DtypeQuant.MXFP4),
-        int(DtypeQuant.MXFP4),
-        int(DtypeQuant.MXFP4),
+        int(dq_a),
+        int(dq_b),
+        int(dq_a),
+        int(dq_b),
         gl.float32,
         act,
         out_quant,
         has_bias,
         has_gammas,
         has_gather,
+        has_x_static_scale,
     )
     tuning_spec = TuningSpec(*(_hashable(c[k]) for k in _TUNING_KEYS))
     # Construct the tuning config on the host off exactly the numbers the kernel will
@@ -302,7 +423,7 @@ def _hashable(v):
     return tuple(v) if isinstance(v, list) else v
 
 
-def moe_gemm_a4w4_gluon(
+def moe_gemm_gluon(
     y: torch.Tensor,
     x: torch.Tensor,
     w: torch.Tensor,
@@ -319,10 +440,16 @@ def moe_gemm_a4w4_gluon(
     alpha: float,
     limit: float | None,
     swiglu_add_residual: bool,
+    x_static_scale: torch.Tensor | None = None,
     y_scales: torch.Tensor | None = None,
     config: dict | None = None,
 ):
     """Launch the Gluon grouped GEMM into ``y`` (shape ``(1, M, N // ARN)``).
+
+    Operand dtypes are inferred from the tensors -- ``uint8`` + scales is MXFP4, fp8 +
+    scales is MXFP8, fp8 alone is FP8_E4M3 (unit scales, still on the scaled pipe),
+    bf16 alone is BF16 -- so every ``moe_gemm_*`` op calls this one function.
+    :func:`gluon_supported` must have said yes for these tensors first.
 
     ``y_scales`` non-None selects the fused MXFP4 output quant: ``y`` then holds the
     E2M1 payload (``N // ARN // 2`` uint8 columns) and ``y_scales`` the E8M0 exponents,
@@ -334,6 +461,8 @@ def moe_gemm_a4w4_gluon(
     block_m = routing_data.block_m
     expt_data = routing_data.expt_data
     grid_m = routing_data.n_blocks(y.shape[1], block_m)
+    dq_a = infer_dtype_quant(x, x_scales)
+    dq_b = infer_dtype_quant(w, w_scales)
 
     if apply_swiglu:
         act = ActivationSpec(
@@ -350,37 +479,43 @@ def moe_gemm_a4w4_gluon(
         block_m,
         N,
         K,
+        dq_a,
+        dq_b,
         _small_grid(routing_data, y.shape[1], N),
         bias is not None,
         gammas is not None,
         gather_indx is not None,
+        x_static_scale is not None,
         act,
         out_quant,
         tuple(sorted((k, _hashable(v)) for k, v in config.items())) if config else None,
     )
 
+    # The Quant* tuples carry the scale pointer and strides unconditionally; when the
+    # operand has no scale the kernel never reads them, so a null pointer and zero
+    # strides keep one tuple type for every dtype instead of four launch sites.
     a = QuantTokenTensor.make(
-        DtypeQuant.MXFP4,
+        dq_a,
         x,
         x_scales,
         x.shape[0],
         x.stride(0),
-        x_scales.stride(0),
-        x_scales.stride(1),
+        0 if x_scales is None else x_scales.stride(0),
+        0 if x_scales is None else x_scales.stride(1),
         K,
         routing_data.n_expts_act,
         ScaleSwizzle.NONE,
     )
     b = QuantExpertTensor.make(
-        DtypeQuant.MXFP4,
+        dq_b,
         w,
         w_scales,
         w.stride(0),
         w.stride(1),
         w.stride(2),
-        w_scales.stride(0),
-        w_scales.stride(2),
-        w_scales.stride(1),
+        0 if w_scales is None else w_scales.stride(0),
+        0 if w_scales is None else w_scales.stride(2),
+        0 if w_scales is None else w_scales.stride(1),
         w.shape[0],
         K,
         N,
@@ -415,6 +550,7 @@ def moe_gemm_a4w4_gluon(
         rt,
         bias,
         0 if bias is None else bias.stride(0),
+        x_static_scale,
         grid_m,
         grid_n,
         kcfg,
@@ -423,6 +559,78 @@ def moe_gemm_a4w4_gluon(
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
     )
+
+
+def try_gluon_grouped_gemm(
+    *,
+    op_name: str,
+    y: torch.Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    x_scales: torch.Tensor | None,
+    w_scales: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    gammas: torch.Tensor | None,
+    routing_data,
+    gather_indx: torch.Tensor | None,
+    scatter_indx: torch.Tensor | None,
+    N: int,
+    K: int,
+    apply_swiglu: bool,
+    alpha: float,
+    limit: float | None,
+    swiglu_add_residual: bool,
+    split_k: int,
+    x_static_scale=None,
+    quant_static_scale=None,
+    swizzle_mx_scale=None,
+) -> bool:
+    """The one hook every ``moe_gemm_*`` wrapper calls.
+
+    Returns True when the Gluon kernel has written ``y``, False when the caller must
+    fall through to its own Triton kernel. Capability-gated and never asserted: an
+    unsupported combination is a fallback, not a failure, so no existing caller silently
+    changes behaviour.
+    """
+    ok, why = gluon_supported(
+        x=x,
+        w=w,
+        x_scales=x_scales,
+        w_scales=w_scales,
+        y=y,
+        bias=bias,
+        routing_data=routing_data,
+        swizzle_mx_scale=swizzle_mx_scale,
+        split_k=split_k,
+        x_static_scale=x_static_scale,
+        quant_static_scale=quant_static_scale,
+        out_quant=None,
+        N=N,
+        K=K,
+    )
+    if not ok:
+        _LOGGER.debug(f"{op_name}: falling back to the Triton kernel: {why}")
+        return False
+    moe_gemm_gluon(
+        y,
+        x,
+        w,
+        x_scales,
+        w_scales,
+        bias,
+        gammas,
+        routing_data,
+        gather_indx,
+        scatter_indx,
+        N,
+        K,
+        apply_swiglu,
+        alpha,
+        limit,
+        swiglu_add_residual,
+        x_static_scale=x_static_scale,
+    )
+    return True
 
 
 def moe_gemm1_a4w4_mxfp4_out(
@@ -458,7 +666,7 @@ def moe_gemm1_a4w4_mxfp4_out(
 
     y = torch.empty((1, M, out_n // 2), dtype=torch.uint8, device=x.device)
     y_scales = torch.empty(
-        (M, out_n // MXFP4_QUANT_BLOCK_SIZE), dtype=torch.uint8, device=x.device
+        (M, out_n // MX_GROUP_SIZE), dtype=torch.uint8, device=x.device
     )
     ok, why = gluon_supported(
         x=x,
@@ -479,7 +687,7 @@ def moe_gemm1_a4w4_mxfp4_out(
     if not ok:
         raise NotImplementedError(f"fused MXFP4 gemm1 not available: {why}")
 
-    moe_gemm_a4w4_gluon(
+    moe_gemm_gluon(
         y,
         x,
         w,

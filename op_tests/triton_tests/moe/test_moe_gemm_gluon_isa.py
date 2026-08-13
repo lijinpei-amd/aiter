@@ -17,31 +17,39 @@ import re
 import pytest
 import torch
 
-from aiter.ops.triton.moe.moe_op_gemm_a4w4 import mxfp4_quant
-from aiter.ops.triton.moe.moe_op_gemm_a4w4_gluon import moe_gemm_a4w4_gluon
+from aiter.ops.triton.moe.moe_op_gemm_gluon import moe_gemm_gluon
 from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
+_TORCH_DTYPE = {"mxfp4": torch.uint8, "mxfp8": torch.float8_e4m3fn}
+
 _CASES = [
-    # (m, n, k, n_expts_tot, n_expts_act, apply_swiglu) -- one per BLOCK_M regime
-    pytest.param(16, 4096, 4096, 256, 8, False, id="bm16-decode"),
-    pytest.param(1024, 4096, 4096, 128, 4, False, id="bm32"),
-    pytest.param(4096, 6144, 4096, 128, 4, True, id="bm128-swiglu"),
+    # (m, n, k, n_expts_tot, n_expts_act, swiglu, x dtype, w dtype)
+    # one per BLOCK_M regime, then one per operand-dtype pair -- the copy width, the
+    # LDS layout and the k_width are all per dtype, so a4w4 passing says nothing about
+    # the others.
+    pytest.param(16, 4096, 4096, 256, 8, False, "mxfp4", "mxfp4", id="bm16-decode"),
+    pytest.param(1024, 4096, 4096, 128, 4, False, "mxfp4", "mxfp4", id="bm32"),
+    pytest.param(4096, 6144, 4096, 128, 4, True, "mxfp4", "mxfp4", id="bm128-swiglu"),
+    pytest.param(1024, 4096, 4096, 128, 4, False, "mxfp8", "mxfp8", id="mxfp8xmxfp8"),
+    pytest.param(1024, 4096, 4096, 128, 4, False, "mxfp8", "mxfp4", id="mxfp8xmxfp4"),
 ]
 
 
-def _build(m, n, k, n_expts_tot, n_expts_act, device="cuda"):
+def _build(m, n, k, n_expts_tot, n_expts_act, x_tag, w_tag, device="cuda"):
     torch.manual_seed(0)
     logits = torch.randn((m, n_expts_tot), dtype=torch.float16, device=device)
     rdata, gindx, _ = routing(logits, n_expts_act)
     rdata.gate_scal = None
     x = torch.randn((m, k), device=device, dtype=torch.bfloat16)
-    w = torch.randn((n_expts_tot, k, n), device=device, dtype=torch.bfloat16)
+    w = torch.randn((n_expts_tot, n, k), device=device, dtype=torch.bfloat16).transpose(
+        1, 2
+    )
     bias = torch.randn((n_expts_tot, n), device=device, dtype=torch.float32)
     gammas = torch.rand((gindx.shape[0],), device=device, dtype=torch.float32)
-    w, w_scale = downcast_to_mxfp(w, torch.uint8, axis=1)
-    x, x_scale = mxfp4_quant(x)
+    w, w_scale = downcast_to_mxfp(w, _TORCH_DTYPE[w_tag], axis=1)
+    x, x_scale = downcast_to_mxfp(x, _TORCH_DTYPE[x_tag], axis=-1)
     return rdata, gindx, x, x_scale, w, w_scale, bias, gammas
 
 
@@ -58,17 +66,21 @@ def _isa_blocks_with(asm: str, mnemonic: str):
     return [b for b in blocks if mnemonic in b]
 
 
-@pytest.mark.parametrize("m, n, k, n_expts_tot, n_expts_act, swiglu", _CASES)
-def test_gluon_moe_isa(m, n, k, n_expts_tot, n_expts_act, swiglu, device="cuda"):
+@pytest.mark.parametrize(
+    "m, n, k, n_expts_tot, n_expts_act, swiglu, x_tag, w_tag", _CASES
+)
+def test_gluon_moe_isa(
+    m, n, k, n_expts_tot, n_expts_act, swiglu, x_tag, w_tag, device="cuda"
+):
     if get_arch() != "gfx950":
         pytest.skip("Gluon MoE kernels are gfx950 only.")
     rdata, gindx, x, x_scale, w, w_scale, bias, gammas = _build(
-        m, n, k, n_expts_tot, n_expts_act, device
+        m, n, k, n_expts_tot, n_expts_act, x_tag, w_tag, device
     )
     M = gindx.shape[0]
     out_n = n // 2 if swiglu else n
     y = torch.empty((1, M, out_n), dtype=torch.bfloat16, device=device)
-    pgm = moe_gemm_a4w4_gluon(
+    pgm = moe_gemm_gluon(
         y,
         x,
         w,

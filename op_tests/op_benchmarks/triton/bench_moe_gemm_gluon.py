@@ -12,8 +12,8 @@ Baseline is the in-tree Triton ``_moe_gemm_a4w4`` on the identical inputs, selec
 ``AITER_TRITON_MOE_DISABLE_GLUON=1``, so the regression risk on the fallback path is
 visible in the same table.
 
-    python op_tests/op_benchmarks/triton/bench_moe_gemm_a4w4_gluon.py
-    python op_tests/op_benchmarks/triton/bench_moe_gemm_a4w4_gluon.py --model glm52-base
+    python op_tests/op_benchmarks/triton/bench_moe_gemm_gluon.py
+    python op_tests/op_benchmarks/triton/bench_moe_gemm_gluon.py --model glm52-base
 """
 
 import argparse
@@ -22,8 +22,10 @@ import sys
 
 import torch
 
-from aiter.ops.triton.moe.moe_op_gemm_a4w4 import moe_gemm_a4w4, mxfp4_quant
-from aiter.ops.triton.moe.moe_op_gemm_a4w4_gluon import gluon_supported
+from aiter.ops.triton.moe.moe_op_gemm_a4w4 import moe_gemm_a4w4
+from aiter.ops.triton.moe.moe_op_gemm_a8w4 import moe_gemm_a8w4
+from aiter.ops.triton.moe.moe_op_gemm_a8w8 import moe_gemm_a8w8
+from aiter.ops.triton.moe.moe_op_gemm_gluon import gluon_supported
 from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 from aiter.ops.triton.utils._triton.arch_info import get_arch
@@ -31,6 +33,15 @@ from op_tests.triton_tests.moe.moe_model_recipes import MODEL_RECIPES, get_recip
 
 DECODE_T = (1, 8, 32)
 PREFILL_T = (1024, 4096, 16384)
+
+#: op name -> (wrapper, x storage dtype, w storage dtype). The Gluon launcher infers the
+#: operand dtypes from the tensors, so the only thing that changes per op is how the
+#: inputs are quantised and which Triton kernel is the fallback baseline.
+_OPS = {
+    "a4w4": (moe_gemm_a4w4, torch.uint8, torch.uint8),
+    "a8w8": (moe_gemm_a8w8, torch.float8_e4m3fn, torch.float8_e4m3fn),
+    "a8w4": (moe_gemm_a8w4, torch.float8_e4m3fn, torch.uint8),
+}
 
 
 def _time(fn, warmup=5, reps=20):
@@ -47,7 +58,7 @@ def _time(fn, warmup=5, reps=20):
     return start.elapsed_time(end) / reps * 1e3  # us
 
 
-def _build(t, n, k, n_expts_tot, n_expts_act, device):
+def _build(t, n, k, n_expts_tot, n_expts_act, device, x_dtype, w_dtype):
     # The bf16 staging weights for dsv4-pro at E=384 are ~17 GB; without releasing the
     # previous case's arena first, the allocator falls back to fragmented reuse and the
     # timings for the largest shapes become meaningless (observed 3.5x noise).
@@ -60,16 +71,19 @@ def _build(t, n, k, n_expts_tot, n_expts_act, device):
     w = torch.randn((n_expts_tot, k, n), device=device, dtype=torch.bfloat16)
     bias = torch.randn((n_expts_tot, n), device=device, dtype=torch.float32)
     gammas = torch.rand((gindx.shape[0],), device=device, dtype=torch.float32)
-    w, w_scale = downcast_to_mxfp(w, torch.uint8, axis=1)
-    x, x_scale = mxfp4_quant(x)
+    w, w_scale = downcast_to_mxfp(w, w_dtype, axis=1)
+    x, x_scale = downcast_to_mxfp(x, x_dtype, axis=-1)
     return rdata, gindx, sindx, x, x_scale, w, w_scale, bias, gammas
 
 
-def _run_one(recipe, stage, t, device="cuda"):
+def _run_one(recipe, stage, t, op, device="cuda"):
+    wrapper, x_dtype, w_dtype = _OPS[op]
     shape = recipe.gemm_shape(stage, t)
     n, k = shape.n, shape.k
     try:
-        built = _build(t, n, k, shape.n_expts_tot, shape.n_expts_act, device)
+        built = _build(
+            t, n, k, shape.n_expts_tot, shape.n_expts_act, device, x_dtype, w_dtype
+        )
     except torch.OutOfMemoryError:
         return None
     rdata, gindx, sindx, x, xs, w, ws, bias, gammas = built
@@ -97,20 +111,19 @@ def _run_one(recipe, stage, t, device="cuda"):
     )
 
     def call():
-        return moe_gemm_a4w4(
+        # keyword args past w_scales: moe_gemm_a8w8 has an extra `w_static_scale`
+        # parameter, so the positional orders of the three ops do not line up.
+        return wrapper(
             x,
             w,
             xs,
             ws,
-            None,
-            None,
-            bias,
-            rdata,
-            gindx,
-            sindx,
-            gammas,
-            None,
-            torch.bfloat16,
+            bias=bias,
+            routing_data=rdata,
+            gather_indx=gindx,
+            scatter_indx=sindx,
+            gammas=gammas,
+            out_dtype=torch.bfloat16,
             apply_swiglu=swiglu,
             alpha=act.alpha,
             limit=act.limit,
@@ -142,14 +155,16 @@ def _run_one(recipe, stage, t, device="cuda"):
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(prog="bench_moe_gemm_a4w4_gluon")
+    p = argparse.ArgumentParser(prog="bench_moe_gemm_gluon")
     p.add_argument("--model", choices=sorted(MODEL_RECIPES), action="append")
     p.add_argument("--regime", choices=("decode", "prefill", "both"), default="both")
+    p.add_argument("--op", choices=sorted(_OPS), action="append")
     args = p.parse_args(argv)
     if get_arch() != "gfx950":
         print(f"gfx950 required, got {get_arch()}", file=sys.stderr)
         return 1
     models = args.model or sorted(MODEL_RECIPES)
+    ops = args.op or ["a4w4"]
     ts = ()
     if args.regime in ("decode", "both"):
         ts += DECODE_T
@@ -157,27 +172,33 @@ def main(argv=None):
         ts += PREFILL_T
 
     hdr = (
-        f"| {'model':<12} | {'st':<2} | {'T':>6} | {'N':>5} | {'K':>5} "
+        f"| {'op':<5} | {'model':<12} | {'st':<2} | {'T':>6} | {'N':>5} | {'K':>5} "
         f"| {'gluon us':>9} | {'triton us':>10} | {'speedup':>7} "
         f"| {'gluon TF/s':>10} | {'gluon GB/s':>10} |"
     )
     print(hdr)
     print("|" + "-" * (len(hdr) - 2) + "|")
-    for name in models:
-        recipe = get_recipe(name)
-        for t in ts:
-            for stage in (1, 2):
-                r = _run_one(recipe, stage, t)
-                if r is None:
-                    print(f"| {name:<12} | {stage:<2} | {t:>6} | OOM")
-                    continue
-                sp = r["t_triton"] / r["t_gluon"] if r["t_gluon"] == r["t_gluon"] else 0
-                note = f"  ({r['why']})" if r["why"] else ""
-                print(
-                    f"| {name:<12} | {stage:<2} | {t:>6} | {r['n']:>5} | {r['k']:>5} "
-                    f"| {r['t_gluon']:>9.1f} | {r['t_triton']:>10.1f} | {sp:>6.2f}x "
-                    f"| {r['tflops_gluon']:>10.1f} | {r['gbps_gluon']:>10.1f} |{note}"
-                )
+    for op in ops:
+        for name in models:
+            recipe = get_recipe(name)
+            for t in ts:
+                for stage in (1, 2):
+                    r = _run_one(recipe, stage, t, op)
+                    if r is None:
+                        print(f"| {op:<5} | {name:<12} | {stage:<2} | {t:>6} | OOM")
+                        continue
+                    sp = (
+                        r["t_triton"] / r["t_gluon"]
+                        if r["t_gluon"] == r["t_gluon"]
+                        else 0
+                    )
+                    note = f"  ({r['why']})" if r["why"] else ""
+                    print(
+                        f"| {op:<5} | {name:<12} | {stage:<2} | {t:>6} | {r['n']:>5} "
+                        f"| {r['k']:>5} "
+                        f"| {r['t_gluon']:>9.1f} | {r['t_triton']:>10.1f} | {sp:>6.2f}x "
+                        f"| {r['tflops_gluon']:>10.1f} | {r['gbps_gluon']:>10.1f} |{note}"
+                    )
     return 0
 
 

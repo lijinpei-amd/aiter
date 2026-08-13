@@ -13,10 +13,9 @@ from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a4w4 import (
     get_moe_a4w4_layouts_prefill,
 )
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a4w4 import _moe_gemm_a4w4
-from aiter.ops.triton.moe.moe_op_gemm_a4w4_gluon import (
-    gluon_supported as _gluon_supported,
+from aiter.ops.triton.moe.moe_op_gemm_gluon import (
+    try_gluon_grouped_gemm as _try_gluon,
 )
-from aiter.ops.triton.moe.moe_op_gemm_a4w4_gluon import moe_gemm_a4w4_gluon
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import (
     EpCombineScatter,
@@ -55,10 +54,6 @@ def _workgroups_per_wgp(lds_bytes):
     cap = arch_info._LDS_CAP_BYTES[get_arch()]
     return max(1, cap // max(1, lds_bytes))
 
-
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-
-_LOGGER = AiterTritonLogger()
 
 # -----------------------------------------------------------------------------
 #                    Matrix Multiplication + Outer Gather/Scatter
@@ -485,55 +480,38 @@ def moe_gemm_a4w4(
     expt_hist_sum = None if expt_data is None else expt_data.token_offs_pad[-1]
     expt_token_offs_raw = None if expt_data is None else expt_data.token_offs_raw
     expt_block_pid_map = None if expt_data is None else expt_data.block_pid_map
-    # gfx950 Gluon path. Capability-gated, never asserted: anything it does not serve
-    # falls through to the Triton kernel below, so no existing caller changes behaviour.
     # `use_gluon` is the *gfx1250* kernel; the gfx950 one reads the plain (E, K/2, N)
     # weight layout and returns through reduce_grouped, so the gfx1250-only contracts
     # (preshuffled weights, MXFP4 emit, EP scatter) stay on their own paths.
-    gluon_ok, gluon_why = (
-        (
-            False,
-            "gfx1250 gluon backend, preshuffled weights, out_mx_quant or ep_scatter",
-        )
-        if use_gluon or preshuffle_weights or out_mx_quant or ep_scatter is not None
-        else _gluon_supported(
+    if (
+        not use_gluon
+        and not preshuffle_weights
+        and not out_mx_quant
+        and ep_scatter is None
+        and _try_gluon(
+            op_name="MOE_GEMM_A4W4",
+            y=y,
             x=x,
             w=w,
             x_scales=x_scales,
             w_scales=w_scales,
-            y=y,
             bias=bias,
+            gammas=gammas,
             routing_data=routing_data,
-            swizzle_mx_scale=swizzle_mx_scale,
+            gather_indx=gather_indx,
+            scatter_indx=scatter_indx,
+            N=N,
+            K=K,
+            apply_swiglu=apply_swiglu_matmul,
+            alpha=alpha,
+            limit=limit,
+            swiglu_add_residual=swiglu_add_residual,
             split_k=split_k,
             x_static_scale=None,
             quant_static_scale=None,
-            out_quant=None,
-            N=N,
-            K=K,
+            swizzle_mx_scale=swizzle_mx_scale,
         )
-    )
-    if not gluon_ok:
-        _LOGGER.debug(f"MOE_GEMM_A4W4: falling back to the Triton kernel: {gluon_why}")
-    if gluon_ok:
-        moe_gemm_a4w4_gluon(
-            y,
-            x,
-            w,
-            x_scales,
-            w_scales,
-            bias,
-            gammas,
-            routing_data,
-            gather_indx,
-            scatter_indx,
-            N,
-            K,
-            apply_swiglu_matmul,
-            alpha,
-            limit,
-            swiglu_add_residual,
-        )
+    ):
         group_indx = (
             None
             if scatter_indx is None

@@ -14,11 +14,31 @@ Two entry points over **one** ``@gluon.jit`` body:
 They differ only in the ``KernelFuncConfig`` instantiated in-kernel. The reduce/combine
 step stays in the existing ``moe/reduce.py::reduce_grouped``.
 
-Memory layout contract (the wrapper hard-asserts it):
+Operand dtypes are independent -- everything derived from one (LDS element type, tile
+shape, copy width, ``k_width``, the MFMA shape) is per operand, because the mixed pairs
+are real:
 
-* activations  ``(M, K/2)`` row-major, ``stride(-1) == 1``
-* weights      ``(E, K/2, N)`` with ``stride(-2) == 1``  (K contiguous)
-* w scales     ``(E, K/32, N)`` strided view, K contiguous, strides carried explicitly
+===============  =============  ==================================================
+ A                B              dot
+===============  =============  ==================================================
+ MXFP4            MXFP4          mfma_scaled e2m1 x e2m1        (a4w4)
+ MXFP8            MXFP8          mfma_scaled e4m3 x e4m3        (a8w8)
+ MXFP8 / FP8      MXFP4          mfma_scaled e4m3 x e2m1        (a8w4)
+ BF16             BF16           mfma
+ BF16             MXFP4          scaled_upcast + mfma -- refused, see gluon_supported
+===============  =============  ==================================================
+
+FP8 without a scale still goes through ``mfma_scaled`` with ``a_scale=None``: the
+backend folds the synthesized unit scales back into ``V_MFMA_*_F8F6F4`` and only that
+path reaches the double-rate K=64/128 pipes. Its per-tensor scale is applied to the raw
+accumulator in the epilogue instead.
+
+Memory layout contract (the wrapper hard-asserts it), with ``pack`` = 2 for MXFP4 and
+1 otherwise:
+
+* activations  ``(M, K/pack)`` row-major, ``stride(-1) == 1``
+* weights      ``(E, K/pack, N)`` with ``stride(-2) == 1``  (K contiguous)
+* scales       ``(E, K/32, N)`` strided view, K contiguous, strides carried explicitly
 * stage 1: ``N = 2*I``, ``K = H``; stage 2: ``N = H``, ``K = I``
 * stage 1 gate/up arrive pre-fused and column-interleaved (even = gate, odd = up)
 
@@ -46,7 +66,7 @@ from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
 from ._lds import LDSManager
 from ._quant import mxfp4_quant_gluon
-from ._types import DtypeQuant, TileSched
+from ._types import DotKind, DtypeQuant, TileSched
 
 #: @gluon.jit code may only read constexpr globals; plain ints and enum members are
 #: rejected, so every scalar the kernel body compares against is pre-wrapped here.
@@ -54,6 +74,9 @@ MX_GROUP: gl.constexpr = gl.constexpr(32)
 _DQ_MXFP4: gl.constexpr = gl.constexpr(int(DtypeQuant.MXFP4))
 _TS_XCD_GROUP_M: gl.constexpr = gl.constexpr(int(TileSched.XCD_GROUP_M))
 _TS_GROUP_M: gl.constexpr = gl.constexpr(int(TileSched.GROUP_M))
+_DK_MFMA: gl.constexpr = gl.constexpr(int(DotKind.MFMA))
+_DK_MFMA_SCALED: gl.constexpr = gl.constexpr(int(DotKind.MFMA_SCALED))
+_DK_UPCAST_MFMA: gl.constexpr = gl.constexpr(int(DotKind.UPCAST_MFMA))
 
 __all__ = [
     "MoeKernelConfig",
@@ -148,6 +171,7 @@ def _build_configs(cfg, FuncCfgT: gl.constexpr, TuningCfgT: gl.constexpr):
         _at(f, 7),
         _at(f, 8),
         _at(f, 9),
+        _at(f, 10),
     )
     tuning_cfg = TuningCfgT(
         func_cfg,
@@ -210,24 +234,48 @@ def _gather_rows(
 
 @gluon.jit
 def _dot(a, a_scale, b, b_scale, acc, func_cfg):
-    # A single trailing `return` after a constexpr-true `if` is not enough: the Gluon
-    # code generator keeps visiting the statements that follow the inlined branch, so
-    # every static dispatch here is written as an explicit if/else.
-    if func_cfg.uses_mfma_scaled():
-        # FP8 x FP8 also comes here with both scales None: the backend folds the
-        # synthesized unit scales back into V_MFMA_*_F8F6F4, and only that path reaches
-        # the double-rate K=64/128 pipes. Plain mfma would select CDNA3-class K=16/32.
+    """The one matrix instruction, dispatched on the operand pair.
+
+    A single trailing ``return`` after a constexpr-true ``if`` is not enough: the Gluon
+    code generator keeps visiting the statements that follow the inlined branch, so
+    every static dispatch here is written as an explicit if/else.
+    """
+    kind: gl.constexpr = func_cfg.dot_kind()
+    if kind == _DK_MFMA_SCALED:
+        # Every fp4/fp8 pair, mixed or not. FP8 x FP8 arrives with both scales None:
+        # the backend folds the synthesized unit scales back into V_MFMA_*_F8F6F4, and
+        # only that path reaches the double-rate K=64/128 pipes -- plain mfma would
+        # select the CDNA3-class K=16/32 one.
         out = gl.amd.cdna4.mfma_scaled(
             a=a,
             a_scale=a_scale,
-            a_format=func_cfg.a_format(),
+            a_format=func_cfg.mx_format(0),
             b=b,
             b_scale=b_scale,
-            b_format=func_cfg.b_format(),
+            b_format=func_cfg.mx_format(1),
             acc=acc,
         )
-    else:
+    elif kind == _DK_MFMA:
         out = gl.amd.cdna4.mfma(a, b, acc)
+    else:
+        # UPCAST_MFMA: mfma_scaled cannot mix a bf16 operand with a microscaled one, so
+        # the low-precision side has already been expanded to bf16 by the loader and
+        # this is a plain bf16 x bf16 mfma.
+        out = gl.amd.cdna4.mfma(a, b, acc)
+    return out
+
+
+@gluon.jit
+def _mini_scale_off(base, step, HAS_SCALE: gl.constexpr):
+    """Advance a register-path scale offset, or pass the None sentinel through.
+
+    An operand without a scale carries ``None`` here (bf16, or fp8 with a per-tensor
+    static scale), and ``None + int`` is a trace-time error rather than a no-op.
+    """
+    if HAS_SCALE:
+        out = base + step
+    else:
+        out = base
     return out
 
 
@@ -251,29 +299,51 @@ def _mma_stage(
     if PF == 0:
         for i in gl.static_range(NUM_MINI):
             a, a_s = lds.load_a_frag(
-                buf_idx, i, a_scale_ptr, a_scale_offs + i * SK_MINI
+                buf_idx,
+                i,
+                a_scale_ptr,
+                _mini_scale_off(a_scale_offs, i * SK_MINI, func_cfg.has_scale(0)),
             )
             b, b_s = lds.load_b_frag(
-                buf_idx, i, b_scale_ptr, b_scale_offs + i * SK_MINI
+                buf_idx,
+                i,
+                b_scale_ptr,
+                _mini_scale_off(b_scale_offs, i * SK_MINI, func_cfg.has_scale(1)),
             )
             acc = _dot(a, a_s, b, b_s, acc, func_cfg)
     else:
         frags = ()
         for i in gl.static_range(PF):
             a, a_s = lds.load_a_frag(
-                buf_idx, i, a_scale_ptr, a_scale_offs + i * SK_MINI
+                buf_idx,
+                i,
+                a_scale_ptr,
+                _mini_scale_off(a_scale_offs, i * SK_MINI, func_cfg.has_scale(0)),
             )
             b, b_s = lds.load_b_frag(
-                buf_idx, i, b_scale_ptr, b_scale_offs + i * SK_MINI
+                buf_idx,
+                i,
+                b_scale_ptr,
+                _mini_scale_off(b_scale_offs, i * SK_MINI, func_cfg.has_scale(1)),
             )
             frags = frags + ((a, a_s, b, b_s),)
         for i in gl.static_range(NUM_MINI):
             if i + PF < NUM_MINI:
                 a, a_s = lds.load_a_frag(
-                    buf_idx, i + PF, a_scale_ptr, a_scale_offs + (i + PF) * SK_MINI
+                    buf_idx,
+                    i + PF,
+                    a_scale_ptr,
+                    _mini_scale_off(
+                        a_scale_offs, (i + PF) * SK_MINI, func_cfg.has_scale(0)
+                    ),
                 )
                 b, b_s = lds.load_b_frag(
-                    buf_idx, i + PF, b_scale_ptr, b_scale_offs + (i + PF) * SK_MINI
+                    buf_idx,
+                    i + PF,
+                    b_scale_ptr,
+                    _mini_scale_off(
+                        b_scale_offs, (i + PF) * SK_MINI, func_cfg.has_scale(1)
+                    ),
                 )
                 frags = frags + ((a, a_s, b, b_s),)
             cur = frags[0]
@@ -296,6 +366,7 @@ def _epilogue_store(
     pid_n,
     M_e,
     gammas_base,
+    x_static_scale,
     func_cfg,
     tuning_cfg,
 ):
@@ -324,6 +395,12 @@ def _epilogue_store(
     for mi in gl.static_range(BM // MBM):
         for ni in gl.static_range(BN // MBN):
             sub = gl.amd.slice(acc, [MBM, MBN], [mi * MBM, ni * MBN])
+
+            if func_cfg.has_x_static_scale:
+                # Per-tensor fp8 activation scale. FP8_E4M3 operands go through the
+                # MMA with unit scales, so the tensor scale comes back here -- before
+                # bias, matching the Triton kernels exactly.
+                sub = sub * x_static_scale
 
             raw_n0 = pid_n * BN + ni * MBN
             if func_cfg.has_bias:
@@ -405,6 +482,7 @@ def _moe_gemm_body(
     rt,  # RoutingMeta
     bias_ptr,
     stride_bias_e,
+    x_static_scale_ptr,
     grid_m,
     grid_n,
     cfg,  # MoeKernelConfig
@@ -550,7 +628,13 @@ def _moe_gemm_body(
         if func_cfg.b_has_scale():
             bs_fill = bs_fill + s_step * b.scale_stride_k
 
+    # Read-side scale offsets. These exist separately from the fill-side pointers
+    # because the register fallback (scale tile too small for a coalesced
+    # direct-to-LDS write) reads the scale at *consume* time, one BLOCK_K behind the
+    # fill; advancing only one of the two silently re-reads the first K tile's scales
+    # for the whole loop, which no compile-time check catches.
     a_scale_read = a_scale_offs
+    b_scale_read = b_scale_offs
     MAIN: gl.constexpr = NUM_K - NB
     UNROLLED: gl.constexpr = (MAIN // tuning_cfg.K_UNROLL) * tuning_cfg.K_UNROLL
 
@@ -568,7 +652,7 @@ def _moe_gemm_body(
                 as_ptr,
                 a_scale_read,
                 ws_ptr,
-                b_scale_offs,
+                b_scale_read,
                 func_cfg,
                 tuning_cfg,
             )
@@ -582,6 +666,7 @@ def _moe_gemm_body(
                 a_scale_read = a_scale_read + s_step * a.scale_stride_k
             if func_cfg.b_has_scale():
                 bs_fill = bs_fill + s_step * b.scale_stride_k
+                b_scale_read = b_scale_read + s_step * b.scale_stride_k
 
     # remainder (0 .. K_UNROLL-1 iterations); NUM_K is constexpr so this stays static
     for j in gl.static_range(UNROLLED, MAIN):
@@ -594,7 +679,7 @@ def _moe_gemm_body(
             as_ptr,
             a_scale_read,
             ws_ptr,
-            b_scale_offs,
+            b_scale_read,
             func_cfg,
             tuning_cfg,
         )
@@ -608,6 +693,7 @@ def _moe_gemm_body(
             a_scale_read = a_scale_read + s_step * a.scale_stride_k
         if func_cfg.b_has_scale():
             bs_fill = bs_fill + s_step * b.scale_stride_k
+            b_scale_read = b_scale_read + s_step * b.scale_stride_k
 
     # drain: the last NUM_LDS_BUFFER stages are consumed with NO fill at all. This, not
     # masking, is what keeps every load inside K -- getting it wrong reads into the next
@@ -622,14 +708,21 @@ def _moe_gemm_body(
             as_ptr,
             a_scale_read,
             ws_ptr,
-            b_scale_offs,
+            b_scale_read,
             func_cfg,
             tuning_cfg,
         )
         if func_cfg.a_has_scale():
             a_scale_read = a_scale_read + s_step * a.scale_stride_k
+        if func_cfg.b_has_scale():
+            b_scale_read = b_scale_read + s_step * b.scale_stride_k
 
     # ---------------------------------------------------------------- epilogue
+    # Hoisted out of the mini-tile loop: one scalar load, not one per tile.
+    if func_cfg.has_x_static_scale:
+        x_static_scale = gl.load(x_static_scale_ptr)
+    else:
+        x_static_scale: gl.constexpr = None
     _epilogue_store(
         acc,
         y_ptr,
@@ -643,6 +736,7 @@ def _moe_gemm_body(
         pid_n,
         M_e,
         gammas_base,
+        x_static_scale,
         func_cfg,
         tuning_cfg,
     )
@@ -667,6 +761,7 @@ def _moe_gluon_gemm1(
     rt,  # RoutingMeta
     bias_ptr,  # fp32 (E, N) or None
     stride_bias_e,
+    x_static_scale_ptr,  # fp32 scalar or None
     grid_m,  # routing_data.n_blocks(M, block_m) -- NOT cdiv
     grid_n,  # tuning_cfg.grid_N(N)
     cfg,  # MoeKernelConfig
@@ -677,7 +772,8 @@ def _moe_gluon_gemm1(
 
     Signature, verbatim, for the launch site:
         _moe_gluon_gemm1[(grid_m * grid_n,)](
-            a, b, res, rt, bias_ptr, stride_bias_e, grid_m, grid_n, cfg,
+            a, b, res, rt, bias_ptr, stride_bias_e, x_static_scale_ptr, grid_m,
+            grid_n, cfg,
             KernelFuncConfig, KernelTuningConfig,
             num_warps=..., waves_per_eu=...)
     where the NamedTuples flatten to
@@ -698,6 +794,7 @@ def _moe_gluon_gemm1(
         rt,
         bias_ptr,
         stride_bias_e,
+        x_static_scale_ptr,
         grid_m,
         grid_n,
         cfg,
@@ -718,6 +815,7 @@ def _moe_gluon_gemm2(
     rt,
     bias_ptr,
     stride_bias_e,
+    x_static_scale_ptr,
     grid_m,
     grid_n,
     cfg,
@@ -736,6 +834,7 @@ def _moe_gluon_gemm2(
         rt,
         bias_ptr,
         stride_bias_e,
+        x_static_scale_ptr,
         grid_m,
         grid_n,
         cfg,

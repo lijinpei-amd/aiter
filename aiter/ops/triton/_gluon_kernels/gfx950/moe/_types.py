@@ -26,6 +26,7 @@ from triton.experimental.gluon import language as gl
 __all__ = [
     "ActKind",
     "ActivationSpec",
+    "DotKind",
     "DtypeQuant",
     "FuncSpec",
     "NonQuantExpertTensor",
@@ -66,6 +67,14 @@ class ActKind(IntEnum):
     SWIGLU_OAI = 1  # alpha != 1.0
 
 
+class DotKind(IntEnum):
+    """Which CDNA4 matrix instruction an operand pair maps onto."""
+
+    MFMA = 0  # bf16 x bf16
+    MFMA_SCALED = 1  # any fp4/fp8 pair, incl. FP8 x FP8 with unit scales
+    UPCAST_MFMA = 2  # bf16 x microscaled: scaled_upcast, then plain mfma
+
+
 class TileSched(IntEnum):
     LINEAR = 0  # plain row-major (pid_m, pid_n), no swizzle
     GROUP_M = 1  # pid_grid GROUP_M blocking, for L2 reuse of the token tile
@@ -87,6 +96,7 @@ class FuncSpec(NamedTuple):
     has_bias: bool
     has_gammas: bool
     has_gather: bool
+    has_x_static_scale: bool
 
 
 class TuningSpec(NamedTuple):

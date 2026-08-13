@@ -38,6 +38,14 @@ MX_GROUP: gl.constexpr = gl.constexpr(32)
 __all__ = ["LDSManager"]
 
 
+@gluon.constexpr_function
+def _opt(buf):
+    """Wrap an optional shared buffer so an absent one is a constexpr, not raw None."""
+    if buf is None or (isinstance(buf, gl.constexpr) and buf.value is None):
+        return gl.constexpr(None)
+    return buf
+
+
 @gluon.jit
 def _shared_load(smem, layout: gl.constexpr, RELAXED: gl.constexpr = False):
     """LDS -> register.
@@ -78,9 +86,13 @@ class LDSManager:
     func_cfg: KernelFuncConfig
     tuning_cfg: KernelTuningConfig
     token_buf: gl.shared_memory_descriptor
-    token_scale_buf: gl.shared_memory_descriptor
+    # The union is load-bearing, not documentation: the aggregate's __setattr__ does an
+    # isinstance check against the annotation, so an operand without a scale (bf16, or
+    # fp8 with a per-tensor static scale) has to store gl.constexpr(None) here and the
+    # annotation has to admit it.
+    token_scale_buf: gl.shared_memory_descriptor | gl.constexpr
     weight_buf: gl.shared_memory_descriptor
-    weight_scale_buf: gl.shared_memory_descriptor
+    weight_scale_buf: gl.shared_memory_descriptor | gl.constexpr
 
     @gluon.constexpr_function
     def __init__(
@@ -95,31 +107,39 @@ class LDSManager:
         self.func_cfg = func_cfg
         self.tuning_cfg = tuning_cfg
         self.token_buf = token_buf
-        self.token_scale_buf = token_scale_buf
+        # An absent scale buffer has to be stored as gl.constexpr(None), not raw None:
+        # the aggregate isinstance-checks the annotation, and only a constexpr field is
+        # skipped when the aggregate is flattened into IR. The wrapping happens here
+        # because a `x: gl.constexpr = gl.constexpr(None)` local inside @gluon.jit is
+        # unwrapped back to raw None by the frontend before it reaches the constructor.
+        self.token_scale_buf = _opt(token_scale_buf)
         self.weight_buf = weight_buf
-        self.weight_scale_buf = weight_scale_buf
+        self.weight_scale_buf = _opt(weight_scale_buf)
 
     # ------------------------------------------------------------------ allocation
     @gluon.jit
     def alloc(func_cfg, tuning_cfg):
         """Static factory -- invoked as ``LDSManager.alloc(...)``, no ``self``."""
         NB: gl.constexpr = tuning_cfg.NUM_LDS_BUFFER
-        elem_ty: gl.constexpr = func_cfg.operand_elem_ty()
-        a_shape: gl.constexpr = tuning_cfg.a_lds_shape()
-        b_shape: gl.constexpr = tuning_cfg.b_lds_shape()
+        # Per operand: the two sides differ in every mixed configuration (bf16 x fp4,
+        # fp8 x fp4), so element type and tile shape are never shared.
+        a_ty: gl.constexpr = func_cfg.operand_elem_ty(0)
+        b_ty: gl.constexpr = func_cfg.operand_elem_ty(1)
+        a_shape: gl.constexpr = tuning_cfg.lds_shape(0)
+        b_shape: gl.constexpr = tuning_cfg.lds_shape(1)
 
         token_buf = gl.allocate_shared_memory(
-            elem_ty,
+            a_ty,
             [NB, a_shape[0], a_shape[1]],
             layout=tuning_cfg.dot_operand_lds_layout(0),
         )
         weight_buf = gl.allocate_shared_memory(
-            elem_ty,
+            b_ty,
             [NB, b_shape[0], b_shape[1]],
             layout=tuning_cfg.dot_operand_lds_layout(1),
         )
-        if func_cfg.a_has_scale():
-            as_shape: gl.constexpr = tuning_cfg.a_scale_shape()
+        if func_cfg.has_scale(0):
+            as_shape: gl.constexpr = tuning_cfg.scale_shape(0)
             token_scale_buf = gl.allocate_shared_memory(
                 gl.uint8,
                 [NB, as_shape[0], as_shape[1]],
@@ -127,8 +147,8 @@ class LDSManager:
             )
         else:
             token_scale_buf: gl.constexpr = None
-        if func_cfg.b_has_scale():
-            bs_shape: gl.constexpr = tuning_cfg.b_scale_shape()
+        if func_cfg.has_scale(1):
+            bs_shape: gl.constexpr = tuning_cfg.scale_shape(1)
             weight_scale_buf = gl.allocate_shared_memory(
                 gl.uint8,
                 [NB, bs_shape[0], bs_shape[1]],
@@ -163,7 +183,7 @@ class LDSManager:
             cfg.payload_via_lds(0),
             cfg.token_mod,
         )
-        if self.func_cfg.a_has_scale() and cfg.scale_via_lds(0):
+        if self.func_cfg.has_scale(0) and cfg.scale_via_lds(0):
             _async_or_reg_fill(
                 self.token_scale_buf.index(idx),
                 a_scale_ptr,
@@ -182,7 +202,7 @@ class LDSManager:
             cfg.payload_via_lds(1),
             cfg.expert_mod,
         )
-        if self.func_cfg.b_has_scale() and cfg.scale_via_lds(1):
+        if self.func_cfg.has_scale(1) and cfg.scale_via_lds(1):
             _async_or_reg_fill(
                 self.weight_scale_buf.index(idx),
                 b_scale_ptr,
@@ -236,11 +256,11 @@ class LDSManager:
         cfg: gl.constexpr = self.tuning_cfg
         a_val = _shared_load(
             self._payload_slice(
-                self.token_buf, idx, mini_idx, 1, self.func_cfg.a_pack_divisor()
+                self.token_buf, idx, mini_idx, 1, self.func_cfg.pack_divisor(0)
             ),
             cfg.dot_operand_fragment_layout(0),
         )
-        if self.func_cfg.a_has_scale():
+        if self.func_cfg.has_scale(0):
             if cfg.scale_via_lds(0):
                 a_scale_val = _shared_load(
                     self._scale_slice(self.token_scale_buf, idx, mini_idx),
@@ -261,11 +281,11 @@ class LDSManager:
         cfg: gl.constexpr = self.tuning_cfg
         b_val = _shared_load(
             self._payload_slice(
-                self.weight_buf, idx, mini_idx, 0, self.func_cfg.b_pack_divisor()
+                self.weight_buf, idx, mini_idx, 0, self.func_cfg.pack_divisor(1)
             ),
             cfg.dot_operand_fragment_layout(1),
         )
-        if self.func_cfg.b_has_scale():
+        if self.func_cfg.has_scale(1):
             if cfg.scale_via_lds(1):
                 b_scale_val = _shared_load(
                     self._scale_slice(self.weight_scale_buf, idx, mini_idx),
