@@ -311,8 +311,18 @@ def get_gluon_config_uncached(
             "NUM_XCDS": 8,
             "token_mod": "",
             "token_scale_mod": "",
+            # .cg (non-temporal) on the weight payload: at decode every line is read
+            # once, so streaming it keeps it from evicting anything that is reused.
+            # Dropping it costs 10% more HBM traffic.
             "expert_mod": ".cg" if block_m <= 32 else "",
-            "expert_scale_mod": ".cg" if block_m <= 32 else "",
+            # ...but NOT on the weight scales. The scale tensor is (E, K/32, N) with K
+            # contiguous, so one 128 B line holds 128 consecutive K-scales for a single
+            # n, while a BLOCK_K stage consumes only BLOCK_K/32 of them -- 16 bytes at
+            # BLOCK_K=512. That line is needed by 8 consecutive K iterations and has to
+            # survive in L2; marking it non-temporal turns all 8 touches into separate
+            # HBM fetches. Measured on H7168-I2048-E33-k8 T=32 stage 1: 651 -> 517 MB of
+            # HBM reads, L2 hit 16% -> 33%, 122.6 -> 96.9 us.
+            "expert_scale_mod": "",
             "result_mod": "",
             "result_scale_mod": "",
             "WARP_PIPELINE": False,
