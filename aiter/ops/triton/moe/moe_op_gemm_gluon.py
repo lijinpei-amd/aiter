@@ -75,6 +75,10 @@ def _can_overflow_int32(t: torch.Tensor | None, drop_leading: int = 0) -> bool:
 # --------------------------------------------------------------------------------
 # dtype inference
 # --------------------------------------------------------------------------------
+def _hashable(v):
+    return tuple(v) if isinstance(v, list) else v
+
+
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2)
 #: operand dtypes that carry an E8M0 group-32 scale tile alongside the payload
 _SCALED = (DtypeQuant.MXFP4, DtypeQuant.MXFP8)
@@ -114,7 +118,21 @@ def _mfma_instr(dq_a, dq_b, nonk: int):
     return (32, 32, 64) if nonk == 32 else (16, 16, 128)
 
 
+@cache
+def _probe_lds_bytes_cached(cfg_items: tuple, dq_a, dq_b) -> int:
+    return _probe_lds_bytes_uncached(dict(cfg_items), dq_a, dq_b)
+
+
 def _probe_lds_bytes(cfg: dict, dq_a, dq_b) -> int:
+    """Memoised. Constructing the two aggregates costs ~55 us of Python, and this runs
+    inside ``gluon_supported`` on *every* launch -- at decode that is the critical path
+    and it doubled the host issue time before it was cached."""
+    return _probe_lds_bytes_cached(
+        tuple(sorted((k, _hashable(v)) for k, v in cfg.items())), dq_a, dq_b
+    )
+
+
+def _probe_lds_bytes_uncached(cfg: dict, dq_a, dq_b) -> int:
     """LDS footprint of a candidate config, computed by the *aggregate* rather than by a
     second copy of the arithmetic -- the host and the device must not be able to
     disagree about whether a config fits."""
@@ -436,10 +454,6 @@ def _launch_spec(
     )
     num_warps = c["warps_per_cta"][0] * c["warps_per_cta"][1]
     return grid_n, kcfg, num_warps, c["WAVES_PER_EU"], c
-
-
-def _hashable(v):
-    return tuple(v) if isinstance(v, list) else v
 
 
 def moe_gemm_gluon(

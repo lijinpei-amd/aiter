@@ -137,9 +137,20 @@ def _run_one(recipe, stage, t, op, device="cuda"):
 
     n_tokens = float(rdata.expt_hist.sum().item())
     flops = 2.0 * n_tokens * n * k
+
+    # Bytes actually moved, the same accounting the Triton kernels' launch_metadata
+    # uses: every *activated* expert's weights (plus their scales) read once, the
+    # gathered activation rows read once, the result written once. Counting weights
+    # alone -- which is all that matters at decode -- understates prefill by a lot,
+    # and reporting a bandwidth that ignores the intermediate is how a bandwidth-bound
+    # regression hides.
     n_active = int((rdata.expt_hist > 0).sum().item())
-    w_bytes = w.numel() * w.element_size() / w.shape[0] * n_active
-    w_bytes += ws.numel() * ws.element_size() / ws.shape[0] * n_active
+    w_bytes = (w.numel() * w.element_size() / w.shape[0]) * n_active
+    w_bytes += (ws.numel() * ws.element_size() / ws.shape[0]) * n_active
+    x_bytes = n_tokens * x.shape[-1] * x.element_size()
+    x_bytes += n_tokens * xs.shape[-1] * xs.element_size()
+    y_bytes = n_tokens * (n // (2 if swiglu else 1)) * 2  # bf16 out
+    total_bytes = w_bytes + x_bytes + y_bytes
     # the locals die with the frame; _build() releases the arena on the way in
     return {
         "n": n,
@@ -148,8 +159,8 @@ def _run_one(recipe, stage, t, op, device="cuda"):
         "t_gluon": t_gluon,
         "tflops_gluon": flops / (t_gluon * 1e-6) / 1e12 if ok else float("nan"),
         "tflops_triton": flops / (t_triton * 1e-6) / 1e12,
-        "gbps_gluon": w_bytes / (t_gluon * 1e-6) / 1e9 if ok else float("nan"),
-        "gbps_triton": w_bytes / (t_triton * 1e-6) / 1e9,
+        "gbps_gluon": total_bytes / (t_gluon * 1e-6) / 1e9 if ok else float("nan"),
+        "gbps_triton": total_bytes / (t_triton * 1e-6) / 1e9,
         "why": "" if ok else why,
     }
 
@@ -173,8 +184,8 @@ def main(argv=None):
 
     hdr = (
         f"| {'op':<5} | {'model':<12} | {'st':<2} | {'T':>6} | {'N':>5} | {'K':>5} "
-        f"| {'gluon us':>9} | {'triton us':>10} | {'speedup':>7} "
-        f"| {'gluon TF/s':>10} | {'gluon GB/s':>10} |"
+        f"| {'gluon us':>9} | {'triton us':>10} | {'spdup':>6} "
+        f"| {'gl TF/s':>8} | {'tr TF/s':>8} | {'gl GB/s':>8} | {'tr GB/s':>8} |"
     )
     print(hdr)
     print("|" + "-" * (len(hdr) - 2) + "|")
@@ -196,8 +207,10 @@ def main(argv=None):
                     print(
                         f"| {op:<5} | {name:<12} | {stage:<2} | {t:>6} | {r['n']:>5} "
                         f"| {r['k']:>5} "
-                        f"| {r['t_gluon']:>9.1f} | {r['t_triton']:>10.1f} | {sp:>6.2f}x "
-                        f"| {r['tflops_gluon']:>10.1f} | {r['gbps_gluon']:>10.1f} |{note}"
+                        f"| {r['t_gluon']:>9.1f} | {r['t_triton']:>10.1f} | {sp:>5.2f}x "
+                        f"| {r['tflops_gluon']:>8.1f} | {r['tflops_triton']:>8.1f} "
+                        f"| {r['gbps_gluon']:>8.1f} | {r['gbps_triton']:>8.1f} |{note}",
+                        flush=True,
                     )
     return 0
 
