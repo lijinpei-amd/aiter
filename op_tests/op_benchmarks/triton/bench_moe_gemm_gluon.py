@@ -165,17 +165,43 @@ def _run_one(recipe, stage, t, op, device="cuda"):
     }
 
 
+def _explicit_recipe(hidden: int, inter: int, n_expts: int, topk: int):
+    """A one-off MoeRecipe for a shape that is not one of the four model recipes."""
+    from dataclasses import replace
+
+    base = get_recipe("glm52-base")
+    return replace(
+        base,
+        name=f"H{hidden}-I{inter}-E{n_expts}-k{topk}",
+        hidden_size=hidden,
+        intermediate_size=inter,
+        n_routed_experts=n_expts,
+        topk=topk,
+    )
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="bench_moe_gemm_gluon")
     p.add_argument("--model", choices=sorted(MODEL_RECIPES), action="append")
     p.add_argument("--regime", choices=("decode", "prefill", "both"), default="both")
     p.add_argument("--op", choices=sorted(_OPS), action="append")
+    p.add_argument(
+        "--shape",
+        help="explicit H,I,E,topk instead of a model recipe -- for comparing against "
+        "the tuned fused_moe path, whose CSVs cover different shapes than the four "
+        "model recipes do",
+    )
     args = p.parse_args(argv)
     if get_arch() != "gfx950":
         print(f"gfx950 required, got {get_arch()}", file=sys.stderr)
         return 1
     models = args.model or sorted(MODEL_RECIPES)
     ops = args.op or ["a4w4"]
+    explicit = None
+    if args.shape:
+        h, i, e, tk = (int(v) for v in args.shape.split(","))
+        explicit = _explicit_recipe(h, i, e, tk)
+        models = [explicit.name]
     ts = ()
     if args.regime in ("decode", "both"):
         ts += DECODE_T
@@ -191,7 +217,7 @@ def main(argv=None):
     print("|" + "-" * (len(hdr) - 2) + "|")
     for op in ops:
         for name in models:
-            recipe = get_recipe(name)
+            recipe = explicit if explicit is not None else get_recipe(name)
             for t in ts:
                 for stage in (1, 2):
                     r = _run_one(recipe, stage, t, op)

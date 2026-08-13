@@ -326,6 +326,7 @@ def gluon_supported(
     out_quant,
     N: int,
     K: int,
+    w_static_scale=None,
 ) -> tuple[bool, str]:
     """The capability predicate. Returns ``(ok, reason)``; ``reason`` is logged when
     the call falls back to the Triton kernel."""
@@ -341,6 +342,11 @@ def gluon_supported(
         return False, f"unsupported operand dtypes ({x.dtype} / {w.dtype})"
     if quant_static_scale is not None:
         return False, "fused fp8 output quant is not implemented on the Gluon path"
+    if w_static_scale is not None:
+        # moe_gemm_a8w8 accepts one and the Triton kernel folds it into the
+        # accumulator; the Gluon epilogue has no equivalent, so taking this path would
+        # drop a scalar factor and return a quietly wrong answer.
+        return False, "a per-tensor weight scale is not implemented on the Gluon path"
     if x_static_scale is not None and dq_a != DtypeQuant.FP8_E4M3:
         return False, "a static activation scale only applies to unscaled fp8 operands"
     if out_quant not in (None, DtypeQuant.MXFP4):
@@ -617,6 +623,7 @@ def try_gluon_grouped_gemm(
     x_static_scale=None,
     quant_static_scale=None,
     swizzle_mx_scale=None,
+    w_static_scale=None,
 ) -> bool:
     """The one hook every ``moe_gemm_*`` wrapper calls.
 
@@ -640,6 +647,7 @@ def try_gluon_grouped_gemm(
         out_quant=None,
         N=N,
         K=K,
+        w_static_scale=w_static_scale,
     )
     if not ok:
         _LOGGER.debug(f"{op_name}: falling back to the Triton kernel: {why}")
