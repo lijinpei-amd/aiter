@@ -12,13 +12,27 @@ Baseline is the in-tree Triton ``_moe_gemm_a4w4`` on the identical inputs, selec
 ``AITER_TRITON_MOE_DISABLE_GLUON=1``, so the regression risk on the fallback path is
 visible in the same table.
 
-    python op_tests/op_benchmarks/triton/bench_moe_gemm_gluon.py
-    python op_tests/op_benchmarks/triton/bench_moe_gemm_gluon.py --model glm52-base
+    python op_tests/op_benchmarks/triton/bench_moe_gemm_gluon.py --op a4w4 --model glm52-base
+    python op_tests/op_benchmarks/triton/bench_moe_gemm_gluon.py --op a4w4 --shape 7168,2048,32,8
+
+If `import triton` fails with "module 'triton' has no attribute 'language'", the venv has
+a stale site-packages/triton/ shadowing an editable Triton build; prepend the real one:
+
+    PYTHONPATH=<triton>/python python op_tests/op_benchmarks/triton/bench_moe_gemm_gluon.py ...
 """
 
 import argparse
 import os
 import sys
+
+# Run directly (`python op_tests/op_benchmarks/triton/bench_moe_gemm_gluon.py`) and
+# sys.path[0] is *this* directory, not the repo root -- so an editable `aiter` install
+# pointing at a different checkout wins the import and you silently benchmark the wrong
+# tree. Put the repo root first. (The stale site-packages/triton shadow is a separate,
+# environment-level problem; see the module docstring.)
+sys.path.insert(
+    0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+)
 
 import torch
 
@@ -184,6 +198,14 @@ def main(argv=None):
     p = argparse.ArgumentParser(prog="bench_moe_gemm_gluon")
     p.add_argument("--model", choices=sorted(MODEL_RECIPES), action="append")
     p.add_argument("--regime", choices=("decode", "prefill", "both"), default="both")
+    p.add_argument(
+        "--tokens",
+        type=int,
+        nargs="+",
+        help="explicit token counts, overriding --regime; mirrors the -t flag of "
+        "op_tests/test_moe_2stage.py so the two harnesses can be pointed at the "
+        "same single point",
+    )
     p.add_argument("--op", choices=sorted(_OPS), action="append")
     p.add_argument(
         "--shape",
@@ -202,11 +224,14 @@ def main(argv=None):
         h, i, e, tk = (int(v) for v in args.shape.split(","))
         explicit = _explicit_recipe(h, i, e, tk)
         models = [explicit.name]
-    ts = ()
-    if args.regime in ("decode", "both"):
-        ts += DECODE_T
-    if args.regime in ("prefill", "both"):
-        ts += PREFILL_T
+    if args.tokens:
+        ts = tuple(args.tokens)
+    else:
+        ts = ()
+        if args.regime in ("decode", "both"):
+            ts += DECODE_T
+        if args.regime in ("prefill", "both"):
+            ts += PREFILL_T
 
     hdr = (
         f"| {'op':<5} | {'model':<12} | {'st':<2} | {'T':>6} | {'N':>5} | {'K':>5} "

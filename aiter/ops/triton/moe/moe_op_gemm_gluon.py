@@ -21,6 +21,7 @@ decides.
 
 from __future__ import annotations
 
+import math
 import os
 from functools import cache
 
@@ -123,6 +124,43 @@ def _probe_lds_bytes_cached(cfg_items: tuple, dq_a, dq_b) -> int:
     return _probe_lds_bytes_uncached(dict(cfg_items), dq_a, dq_b)
 
 
+def _pick_warps(block_m: int, block_n: int, num_warps: int, instr) -> tuple:
+    """Split ``num_warps`` over (M, N) so each warp's tile is as square as possible.
+
+    This is the single biggest tuning lever and it is not obvious from the tile sizes.
+    A warp's operand traffic is ``m_tiles * k + n_tiles * k`` LDS reads for
+    ``m_tiles * n_tiles * k`` MFMAs, so the MFMA-per-read ratio is maximised when the
+    warp tile is square and falls off linearly with the aspect ratio. At BLOCK_M=128,
+    BLOCK_N=256 the old fixed ``(4, 2)`` gave every warp a 32x128 slab -- 16 MFMAs
+    against 20 LDS reads. ``(2, 4)`` makes it 64x64: same 16 MFMAs, 16 reads. Measured
+    424.6 -> 362.9 us on H7168-I2048-E32-k8 stage 1, and 355.4 us for the best
+    tiles_per_warp variant.
+
+    Splitting N is what the caller's ``gran_n`` is derived from, so a split whose N
+    granularity does not divide ``block_n`` is not merely suboptimal -- it makes the
+    caller's ``mini_n`` alignment walk step past ``block_n`` forever. The N constraint
+    is therefore mandatory and the M constraint is only a preference. ``(num_warps, 1)``
+    is the guaranteed-safe floor: ``block_n`` is always a multiple of ``instr[1]``.
+    """
+    best = None
+    fallback = None
+    wm = 1
+    while wm <= num_warps:
+        wn = num_warps // wm
+        if wm * wn == num_warps and block_n % (instr[1] * wn) == 0:
+            # squareness of the per-warp tile, in log space
+            skew = abs(math.log2((block_m / wm) / (block_n / wn)))
+            if block_m % (instr[0] * wm) == 0:
+                if best is None or skew < best[0]:
+                    best = (skew, (wm, wn))
+            elif fallback is None or skew < fallback[0]:
+                fallback = (skew, (wm, wn))
+        wm *= 2
+    if best is not None:
+        return best[1]
+    return fallback[1] if fallback is not None else (num_warps, 1)
+
+
 def _probe_lds_bytes(cfg: dict, dq_a, dq_b) -> int:
     """Memoised. Constructing the two aggregates costs ~55 us of Python, and this runs
     inside ``gluon_supported`` on *every* launch -- at decode that is the critical path
@@ -206,25 +244,34 @@ def get_gluon_config_uncached(
     cap outright.
     """
     if block_m == 16:
-        block_n, block_k, warps, nb = 128, 512, (1, 4), 3
+        # BLOCK_K=512 is not a depth choice, it is forced: the A-scale tile is
+        # block_m * BLOCK_K/32 bytes, and direct-to-LDS needs a warp to write one
+        # contiguous 64-lane x 4 B run. At BLOCK_K=256 that tile is 128 B, the backend
+        # refuses to lower the copy, and the scale falls back to a register load inside
+        # the K loop -- measured at +17 us on H=7168 I=2048 E=32 topk=8 T=32, which no
+        # amount of the occupancy it buys back (4 CTAs/CU vs 2) makes up for.
+        # Two buffers, not three: measured 112 us vs 118 at half the LDS.
+        block_n, block_k, num_warps, nb = 128, 512, 4, 2
         nonk = 16
         if small_grid:
             # A narrow N tile is the only way to keep every XCD busy when the router
             # hands out only a few M blocks.
             block_n = 64
     elif block_m == 32:
-        block_n, block_k, warps, nb = 256, 512, (1, 4), 2
+        block_n, block_k, num_warps, nb = 256, 512, 4, 2
         nonk = 16
     elif block_m == 64:
-        block_n, block_k, warps, nb = 256, 256, (2, 4), 2
+        block_n, block_k, num_warps, nb = 256, 256, 8, 2
         nonk = 32
     else:  # 128
-        block_n, block_k, warps, nb = 256, 256, (4, 2), 2
+        block_n, block_k, num_warps, nb = 256, 256, 8, 2
         nonk = 32
     instr = _mfma_instr(dq_a, dq_b, nonk)
 
-    # shrink the N tile until it divides N (the kernel has no N tail by construction)
-    gran_n = instr[1] * warps[1]
+    # shrink the N tile until it divides N (the kernel has no N tail by construction).
+    # The warp split is derived per candidate BLOCK_N inside _build, so use the
+    # coarsest granularity any split could need for the divisibility walk.
+    gran_n = instr[1]
     while block_n > gran_n and N % block_n != 0:
         block_n //= 2
     min_k = max(128, instr[2])
@@ -232,6 +279,11 @@ def get_gluon_config_uncached(
         block_k //= 2
 
     def _build(bn, bk, n_buf):
+        warps = _pick_warps(block_m, bn, num_warps, instr)
+        gran_n = instr[1] * warps[1]
+        # Not defensive: if this ever fails the loop below never terminates, and the
+        # symptom is a test run that spins at 200% CPU for an hour with no output.
+        assert bn % gran_n == 0, f"BLOCK_N {bn} not a multiple of warp N-granularity {gran_n}"
         mini_n = min(bn, gran_n * 2)
         while mini_n % gran_n:
             mini_n += gran_n
