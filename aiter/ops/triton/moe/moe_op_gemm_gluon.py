@@ -76,6 +76,8 @@ def _can_overflow_int32(t: torch.Tensor | None, drop_leading: int = 0) -> bool:
 # dtype inference
 # --------------------------------------------------------------------------------
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2)
+#: operand dtypes that carry an E8M0 group-32 scale tile alongside the payload
+_SCALED = (DtypeQuant.MXFP4, DtypeQuant.MXFP8)
 _BF16_DTYPES = (torch.bfloat16, torch.float16)
 
 
@@ -246,19 +248,36 @@ def get_gluon_config_uncached(
             "WARP_PIPELINE": False,
         }
 
+    # Which axis to give up first when the tile does not fit.
+    #
+    # With microscaled operands, keep BLOCK_K >= 256: below that the E8M0 scale tiles
+    # drop under the width a coalesced direct-to-LDS write needs, which puts a
+    # register-path global load back inside the K loop and makes every wait_group
+    # conservative (measured 0.6x of the Triton kernel on MXFP8 prefill). So narrow N
+    # first and accept the loss of arithmetic intensity.
+    #
+    # With no scales at all (bf16 x bf16) that argument does not exist, and narrowing N
+    # is pure loss -- it was picking BLOCK_N=64 where BLOCK_N=128 with a shorter K fits
+    # just as well. Shorten K first.
+    shrink_n_first = dq_a in _SCALED or dq_b in _SCALED
+
     cfg = _build(block_n, block_k, nb)
     while _probe_lds_bytes(cfg, dq_a, dq_b) > LDS_USABLE_BYTES:
-        # Order matters. Narrowing N costs arithmetic intensity; shortening K costs the
-        # pipeline *and*, below BLOCK_K=256, drops the E8M0 scale tiles under the width
-        # a coalesced direct-to-LDS write needs, which puts a register-path global load
-        # back inside the K loop and makes every wait_group conservative. Measured at
-        # 0.6x on MXFP8 prefill. So: N first, then pipeline depth, then K.
-        if block_n > gran_n and N % (block_n // 2) == 0:
-            block_n //= 2
+        can_n = block_n > gran_n and N % (block_n // 2) == 0
+        can_k = block_k > min_k and K % (block_k // 2) == 0
+        first, second = (can_n, can_k) if shrink_n_first else (can_k, can_n)
+        if first:
+            if shrink_n_first:
+                block_n //= 2
+            else:
+                block_k //= 2
         elif nb > 2:
             nb -= 1
-        elif block_k > min_k and K % (block_k // 2) == 0:
-            block_k //= 2
+        elif second:
+            if shrink_n_first:
+                block_k //= 2
+            else:
+                block_n //= 2
         else:
             break  # gluon_supported's validate() will reject it
         if K // block_k < nb:
