@@ -238,6 +238,7 @@ def moe_gemm_a8w8(
         x_static_scale=x_static_scale,
         quant_static_scale=quant_static_scale,
         swizzle_mx_scale=swizzle_mx_scale,
+        w_static_scale=w_static_scale,
     ):
         group_indx = (
             None

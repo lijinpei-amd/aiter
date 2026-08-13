@@ -597,7 +597,11 @@ class KernelTuningConfig:
             shape = self.lds_shape(idx)
             width = fc.operand_elem_ty(idx).primitive_bitwidth // 8
             per_stage += shape[0] * shape[1] * width
-            if fc.has_scale(idx) and self.scale_via_lds(idx):
+            # LDSManager.alloc() allocates the scale buffer whenever the operand has
+            # a scale, not only when it is filled by a direct-to-LDS copy, so the
+            # budget has to count it the same way -- otherwise the host shrink loop
+            # accepts a config whose real footprint is larger than it believes.
+            if fc.has_scale(idx):
                 s = self.scale_shape(idx)
                 per_stage += s[0] * s[1]
         return per_stage * _v(self.NUM_LDS_BUFFER)
