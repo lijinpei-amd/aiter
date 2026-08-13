@@ -9,6 +9,9 @@ import triton
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w8 import (
     _moe_gemm_a8w8,
 )
+from aiter.ops.triton.moe.moe_op_gemm_gluon import (
+    try_gluon_grouped_gemm as _try_gluon,
+)
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton.arch_info import get_arch
@@ -213,6 +216,46 @@ def moe_gemm_a8w8(
     expt_hist_sum = None if expt_data is None else expt_data.token_offs_pad[-1]
     expt_token_offs_raw = None if expt_data is None else expt_data.token_offs_raw
     expt_block_pid_map = None if expt_data is None else expt_data.block_pid_map
+    if _try_gluon(
+        op_name="MOE_GEMM_A8W8",
+        y=y,
+        x=x,
+        w=w,
+        x_scales=x_scales,
+        w_scales=w_scales,
+        bias=bias,
+        gammas=gammas,
+        routing_data=routing_data,
+        gather_indx=gather_indx,
+        scatter_indx=scatter_indx,
+        N=N,
+        K=K,
+        apply_swiglu=apply_swiglu_matmul,
+        alpha=alpha,
+        limit=limit,
+        swiglu_add_residual=swiglu_add_residual,
+        split_k=config["split_k"],
+        x_static_scale=x_static_scale,
+        quant_static_scale=quant_static_scale,
+        swizzle_mx_scale=swizzle_mx_scale,
+    ):
+        group_indx = (
+            None
+            if scatter_indx is None
+            else scatter_indx.view(-1, routing_data.n_expts_act)
+        )
+        return reduce_grouped(
+            y,
+            group_indx,
+            y_final,
+            apply_swiglu_reduction,
+            alpha,
+            limit,
+            reduction_n_reduction,
+            out_dtype=out_dtype,
+            swiglu_add_residual=swiglu_add_residual,
+        )
+
     # spmd grid
     grid_m = routing_data.n_blocks(M, config["block_m"])
     grid_n = triton.cdiv(N, config["block_n"])

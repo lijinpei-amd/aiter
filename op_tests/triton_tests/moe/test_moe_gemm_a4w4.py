@@ -411,10 +411,10 @@ def test_model_shapes(shape, device="cuda"):
 def test_gemm1_fused_mxfp4_out(m, n, k, n_expts_tot, n_expts_act, act, device="cuda"):
     if get_arch() != "gfx950":
         pytest.skip("Gluon MoE kernels are gfx950 only.")
-    from aiter.ops.triton.moe.moe_op_gemm_a4w4_gluon import (
+    from aiter.ops.triton.moe.moe_op_gemm_gluon import (
         gluon_supported,
         moe_gemm1_a4w4_mxfp4_out,
-        moe_gemm_a4w4_gluon,
+        moe_gemm_gluon,
     )
 
     torch.manual_seed(0)
@@ -464,7 +464,7 @@ def test_gemm1_fused_mxfp4_out(m, n, k, n_expts_tot, n_expts_act, act, device="c
     }
     # reference: the same Gluon gemm1 emitting bf16, then the standalone quant launch
     y_bf16 = torch.empty((1, M, n // 2), dtype=torch.bfloat16, device=device)
-    moe_gemm_a4w4_gluon(
+    moe_gemm_gluon(
         y_bf16,
         x_tri,
         w_tri,

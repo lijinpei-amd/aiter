@@ -19,6 +19,9 @@ from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a8w4 import (
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w4 import (
     _moe_gemm_a8w4 as _moe_gemm_a8w4_triton,
 )
+from aiter.ops.triton.moe.moe_op_gemm_gluon import (
+    try_gluon_grouped_gemm as _try_gluon,
+)
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton.arch_info import get_arch
@@ -457,6 +460,56 @@ def moe_gemm_a8w4(
         stride_y_mx_n = 0
     stride_bias = None if bias is None else bias.stride(0)
     # moe metadata
+    # gfx950 Gluon path. `use_gluon` above is the *gfx1250* kernel; this one is CDNA4
+    # and reads the same (E, K/2, N) weight layout the Triton path wants, so it is
+    # offered only when the gfx1250 transpose above did not happen.
+    # `out_mx_quant` returns (fp8 values, ue8m0 scales) instead of going through
+    # reduce_grouped, so it is a different contract and stays on the Triton path.
+    if (
+        not use_gluon
+        and not out_mx_quant
+        and _try_gluon(
+            op_name="MOE_GEMM_A8W4",
+            y=y,
+            x=x,
+            w=w,
+            x_scales=x_scales,
+            w_scales=w_scales,
+            bias=bias,
+            gammas=gammas,
+            routing_data=routing_data,
+            gather_indx=gather_indx,
+            scatter_indx=scatter_indx,
+            N=N,
+            K=K,
+            apply_swiglu=apply_swiglu_matmul,
+            alpha=alpha,
+            limit=limit,
+            swiglu_add_residual=swiglu_add_residual,
+            split_k=config["split_k"],
+            x_static_scale=x_static_scale,
+            quant_static_scale=quant_static_scale,
+            swizzle_mx_scale=swizzle_mx_scale,
+        )
+    ):
+        group_indx = (
+            None
+            if scatter_indx is None
+            else scatter_indx.view(-1, routing_data.n_expts_act)
+        )
+        return reduce_grouped(
+            y,
+            group_indx,
+            y_final,
+            apply_swiglu_reduction,
+            alpha,
+            limit,
+            reduction_n_reduction,
+            out_dtype=out_dtype,
+            swiglu_add_residual=swiglu_add_residual,
+            residual=residual,
+        )
+
     expt_data = routing_data.expt_data
     expt_hist = None if expt_data is None else expt_data.hist
     expt_hist_sum = None if expt_data is None else expt_data.token_offs_pad[-1]
