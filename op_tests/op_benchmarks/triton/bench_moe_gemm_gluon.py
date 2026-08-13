@@ -72,13 +72,41 @@ def _time(fn, warmup=5, reps=20):
     return start.elapsed_time(end) / reps * 1e3  # us
 
 
-def _build(t, n, k, n_expts_tot, n_expts_act, device, x_dtype, w_dtype):
+def _balanced_logits(t, n_expts_tot, n_expts_act, n_active, device):
+    """``op_tests/test_moe_2stage.py``'s ``AITER_MOE_NUM_EXPERT_ACTIVATED`` score.
+
+    Random logits activate a number of experts that depends on the seed, and the weight
+    traffic of a MoE GEMM is set almost entirely by *how many* experts are active -- so
+    two harnesses that seed independently are not measuring the same workload. At T=8 on
+    H7168-I2048-E33-k8 that difference alone was 17% of stage-1 HBM traffic, larger than
+    any kernel effect being compared. This reproduces the other harness's forced-activation
+    score so both read the same weights: -inf everywhere, 1.0 at round-robin slots over
+    the active set, giving exactly ``n_active`` experts with balanced load.
+
+    Which experts are chosen does not matter, only the count and the balance, so this
+    takes the first ``n_active`` rather than replicating the other harness's ``randperm``
+    (that would require matching its whole RNG call sequence).
+    """
+    lo, hi = n_expts_act, min(n_expts_tot, t * n_expts_act)
+    if not lo <= n_active <= hi:
+        raise ValueError(f"--n-active {n_active} outside [{lo}, {hi}] for T={t}")
+    score = torch.full((t, n_expts_tot), float("-inf"), dtype=torch.float16)
+    slot = torch.arange(t * n_expts_act) % n_active
+    rows = torch.arange(t).repeat_interleave(n_expts_act)
+    score[rows, torch.arange(n_active)[slot]] = 1.0
+    return score.to(device)
+
+
+def _build(t, n, k, n_expts_tot, n_expts_act, device, x_dtype, w_dtype, n_active=None):
     # The bf16 staging weights for dsv4-pro at E=384 are ~17 GB; without releasing the
     # previous case's arena first, the allocator falls back to fragmented reuse and the
     # timings for the largest shapes become meaningless (observed 3.5x noise).
     torch.cuda.empty_cache()
     torch.manual_seed(0)
-    logits = torch.randn((t, n_expts_tot), dtype=torch.float16, device=device)
+    if n_active is None:
+        logits = torch.randn((t, n_expts_tot), dtype=torch.float16, device=device)
+    else:
+        logits = _balanced_logits(t, n_expts_tot, n_expts_act, n_active, device)
     rdata, gindx, sindx = routing(logits, n_expts_act)
     rdata.gate_scal = None
     x = torch.randn((t, k), device=device, dtype=torch.bfloat16)
@@ -90,13 +118,21 @@ def _build(t, n, k, n_expts_tot, n_expts_act, device, x_dtype, w_dtype):
     return rdata, gindx, sindx, x, x_scale, w, w_scale, bias, gammas
 
 
-def _run_one(recipe, stage, t, op, device="cuda"):
+def _run_one(recipe, stage, t, op, device="cuda", n_active=None):
     wrapper, x_dtype, w_dtype = _OPS[op]
     shape = recipe.gemm_shape(stage, t)
     n, k = shape.n, shape.k
     try:
         built = _build(
-            t, n, k, shape.n_expts_tot, shape.n_expts_act, device, x_dtype, w_dtype
+            t,
+            n,
+            k,
+            shape.n_expts_tot,
+            shape.n_expts_act,
+            device,
+            x_dtype,
+            w_dtype,
+            n_active,
         )
     except torch.OutOfMemoryError:
         return None
@@ -208,6 +244,15 @@ def main(argv=None):
     )
     p.add_argument("--op", choices=sorted(_OPS), action="append")
     p.add_argument(
+        "--n-active",
+        type=int,
+        help="force exactly this many active experts with a balanced round-robin "
+        "assignment, mirroring op_tests/test_moe_2stage.py's "
+        "AITER_MOE_NUM_EXPERT_ACTIVATED. Use it when comparing against that harness: "
+        "random routing activates a seed-dependent number of experts, and MoE GEMM "
+        "traffic is set by that count, so unaligned runs do not measure the same work.",
+    )
+    p.add_argument(
         "--shape",
         help="explicit H,I,E,topk instead of a model recipe -- for comparing against "
         "the tuned fused_moe path, whose CSVs cover different shapes than the four "
@@ -245,7 +290,7 @@ def main(argv=None):
             recipe = explicit if explicit is not None else get_recipe(name)
             for t in ts:
                 for stage in (1, 2):
-                    r = _run_one(recipe, stage, t, op)
+                    r = _run_one(recipe, stage, t, op, n_active=args.n_active)
                     if r is None:
                         print(f"| {op:<5} | {name:<12} | {stage:<2} | {t:>6} | OOM")
                         continue
