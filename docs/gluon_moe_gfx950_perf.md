@@ -59,65 +59,95 @@ FlyDSL candidate -- so there is no tuned FlyDSL entry to report at that point.
 
 **Stage 1** (N=4096, K=7168)
 
-| T | impl | kernel µs | TFLOP/s | HBM GB/s | HBM MB |
-|---:|---|---:|---:|---:|---:|
-| 1 | Gluon | 27.3 | 17 | 4,579 | 125.0 |
-| 1 | Triton | 32.0 | 15 | 3,906 | 125.0 |
-| 1 | Tuned FlyDSL | 32.2 | 15 | 3,916 | 126.1 |
-| 1 | Tuned FlyDSL+CK | 32.2 | 15 | 3,916 | 126.1 |
-| 8 | Gluon | 99.0 | 38 | 5,209 | 515.7 |
-| 8 | Triton | 113.0 | 33 | 4,611 | 521.0 |
-| 8 | Tuned FlyDSL | 109.5 | 34 | 4,743 | 519.4 |
-| 8 | Tuned FlyDSL+CK | 109.5 | 34 | 4,743 | 519.4 |
-| 32 | Gluon | 100.9 | 149 | 5,122 | 516.8 |
-| 32 | Triton | 124.0 | 121 | 4,206 | 521.5 |
-| 32 | Tuned FlyDSL | 98.5 | 153 | 5,278 | 519.9 |
-| 32 | Tuned FlyDSL+CK | 98.5 | 153 | 5,278 | 519.9 |
+| T | impl | kernel / tile | µs | TFLOP/s | HBM GB/s | HBM MB |
+|---:|---|---|---:|---:|---:|---:|
+| 1 | Gluon | `BM16xBN64xBK512, 2 buf, 4 warps` | 27.3 | 17 | 4,579 | 125.0 |
+| 1 | Triton | `BM16xBN128xBK256` | 32.0 | 15 | 3,906 | 125.0 |
+| 1 | Tuned FlyDSL | `flydsl moe1 t64x128x256_w4_fp4` | 32.2 | 15 | 3,916 | 126.1 |
+| 1 | Tuned FlyDSL+CK | `flydsl moe1 t64x128x256_w4_fp4` | 32.2 | 15 | 3,916 | 126.1 |
+| 8 | Gluon | `BM16xBN128xBK512, 2 buf, 4 warps` | 99.0 | 38 | 5,209 | 515.7 |
+| 8 | Triton | `BM16xBN128xBK256` | 113.0 | 33 | 4,611 | 521.0 |
+| 8 | Tuned FlyDSL | `flydsl moe1 t64x128x256_w3_fp4` | 109.5 | 34 | 4,743 | 519.4 |
+| 8 | Tuned FlyDSL+CK | `flydsl moe1 t64x128x256_w3_fp4` | 109.5 | 34 | 4,743 | 519.4 |
+| 32 | Gluon | `BM16xBN128xBK512, 2 buf, 4 warps` | 100.9 | 149 | 5,122 | 516.8 |
+| 32 | Triton | `BM16xBN128xBK256` | 124.0 | 121 | 4,206 | 521.5 |
+| 32 | Tuned FlyDSL | `flydsl moe1 t32x32x256_w3 (bf16 out)` | 98.5 | 153 | 5,278 | 519.9 |
+| 32 | Tuned FlyDSL+CK | `flydsl moe1 t32x32x256_w3 (bf16 out)` | 98.5 | 153 | 5,278 | 519.9 |
 
 **Stage 2** (N=7168, K=2048)
 
-| T | impl | kernel µs | TFLOP/s | HBM GB/s | HBM MB |
-|---:|---|---:|---:|---:|---:|
-| 1 | Gluon | 16.0 | 15 | 3,925 | 62.8 |
-| 1 | Triton | 16.0 | 15 | 3,925 | 62.8 |
-| 1 | Tuned FlyDSL | — | — | — | — |
-| 1 | Tuned FlyDSL+CK | 19.3 | 12 | 3,280 | 63.3 |
-| 8 | Gluon | 52.1 | 36 | 4,979 | 259.4 |
-| 8 | Triton | 50.7 | 37 | 5,116 | 259.4 |
-| 8 | Tuned FlyDSL | 57.9 | 32 | 4,501 | 260.6 |
-| 8 | Tuned FlyDSL+CK | 57.9 | 32 | 4,501 | 260.6 |
-| 32 | Gluon | 52.7 | 143 | 4,981 | 262.5 |
-| 32 | Triton | 55.5 | 135 | 4,730 | 262.5 |
-| 32 | Tuned FlyDSL | 58.0 | 130 | 4,616 | 267.7 |
-| 32 | Tuned FlyDSL+CK | 58.0 | 130 | 4,616 | 267.7 |
+| T | impl | kernel / tile | µs | TFLOP/s | HBM GB/s | HBM MB |
+|---:|---|---|---:|---:|---:|---:|
+| 1 | Gluon | `BM16xBN64xBK512, 2 buf, 4 warps` | 16.0 | 15 | 3,925 | 62.8 |
+| 1 | Triton | `BM16xBN128xBK256` | 16.0 | 15 | 3,925 | 62.8 |
+| 1 | Tuned FlyDSL | *not selected — the joint search picked CK here* | — | — | — | — |
+| 1 | Tuned FlyDSL+CK | `CK moe_ck2stages_gemm2 256x64x128x128` | 19.3 | 12 | 3,280 | 63.3 |
+| 8 | Gluon | `BM16xBN128xBK512, 2 buf, 4 warps` | 52.1 | 36 | 4,979 | 259.4 |
+| 8 | Triton | `BM16xBN128xBK256` | 50.7 | 37 | 5,116 | 259.4 |
+| 8 | Tuned FlyDSL | `flydsl moe2 t32x128x256_atomic_bnt2_sbm64` | 57.9 | 32 | 4,501 | 260.6 |
+| 8 | Tuned FlyDSL+CK | `flydsl moe2 t32x128x256_atomic_bnt2_sbm64` | 57.9 | 32 | 4,501 | 260.6 |
+| 32 | Gluon | `BM16xBN128xBK512, 2 buf, 4 warps` | 52.7 | 143 | 4,981 | 262.5 |
+| 32 | Triton | `BM16xBN128xBK256` | 55.5 | 135 | 4,730 | 262.5 |
+| 32 | Tuned FlyDSL | `flydsl moe2 t32x128x256_atomic_bnt2` | 58.0 | 130 | 4,616 | 267.7 |
+| 32 | Tuned FlyDSL+CK | `flydsl moe2 t32x128x256_atomic_bnt2` | 58.0 | 130 | 4,616 | 267.7 |
 
 ### Prefill
 
 **Stage 1** (N=4096, K=7168)
 
-| T | impl | kernel µs | TFLOP/s | HBM GB/s | HBM MB |
-|---:|---|---:|---:|---:|---:|
-| 1024 | Gluon | 291.2 | 1,652 | 2,087 | 607.8 |
-| 1024 | Triton | 412.5 | 1,166 | 1,503 | 620.1 |
-| 1024 | Tuned FlyDSL | 223.4 | 2,153 | 3,183 | 711.0 |
-| 1024 | Tuned FlyDSL+CK | 223.4 | 2,153 | 3,183 | 711.0 |
-| 4096 | Gluon | 942.3 | 2,042 | 1,610 | 1516.8 |
-| 4096 | Triton | 1107.6 | 1,737 | 1,332 | 1475.1 |
-| 4096 | Tuned FlyDSL | 651.4 | 2,954 | 2,423 | 1578.5 |
-| 4096 | Tuned FlyDSL+CK | 651.4 | 2,954 | 2,423 | 1578.5 |
+| T | impl | kernel / tile | µs | TFLOP/s | HBM GB/s | HBM MB |
+|---:|---|---|---:|---:|---:|---:|
+| 1024 | Gluon | `BM128xBN256xBK256, 2 buf, 8 warps` | 291.2 | 1,652 | 2,087 | 607.8 |
+| 1024 | Triton | `BM128xBN512xBK256` | 412.5 | 1,166 | 1,503 | 620.1 |
+| 1024 | Tuned FlyDSL | `flydsl moe1 t64x128x256_w2_bnt0_fp4` | 223.4 | 2,153 | 3,183 | 711.0 |
+| 1024 | Tuned FlyDSL+CK | `flydsl moe1 t64x128x256_w2_bnt0_fp4` | 223.4 | 2,153 | 3,183 | 711.0 |
+| 4096 | Gluon | `BM128xBN256xBK256, 2 buf, 8 warps` | 942.3 | 2,042 | 1,610 | 1516.8 |
+| 4096 | Triton | `BM128xBN512xBK256` | 1107.6 | 1,737 | 1,332 | 1475.1 |
+| 4096 | Tuned FlyDSL | `flydsl moe1 t64x128x256_w4_bnt0_fp4` | 651.4 | 2,954 | 2,423 | 1578.5 |
+| 4096 | Tuned FlyDSL+CK | `flydsl moe1 t64x128x256_w4_bnt0_fp4` | 651.4 | 2,954 | 2,423 | 1578.5 |
 
 **Stage 2** (N=7168, K=2048)
 
-| T | impl | kernel µs | TFLOP/s | HBM GB/s | HBM MB |
-|---:|---|---:|---:|---:|---:|
-| 1024 | Gluon | 157.2 | 1,530 | 2,665 | 418.9 |
-| 1024 | Triton | 189.4 | 1,270 | 2,228 | 422.0 |
-| 1024 | Tuned FlyDSL | 180.9 | 1,330 | 4,916 | 889.3 |
-| 1024 | Tuned FlyDSL+CK | 180.9 | 1,330 | 4,916 | 889.3 |
-| 4096 | Gluon | 523.9 | 1,836 | 2,067 | 1082.8 |
-| 4096 | Triton | 643.5 | 1,495 | 1,809 | 1164.1 |
-| 4096 | Tuned FlyDSL | 526.1 | 1,829 | 2,880 | 1515.4 |
-| 4096 | Tuned FlyDSL+CK | 526.1 | 1,829 | 2,880 | 1515.4 |
+| T | impl | kernel / tile | µs | TFLOP/s | HBM GB/s | HBM MB |
+|---:|---|---|---:|---:|---:|---:|
+| 1024 | Gluon | `BM128xBN256xBK256, 2 buf, 8 warps` | 157.2 | 1,530 | 2,665 | 418.9 |
+| 1024 | Triton | `BM128xBN512xBK256` | 189.4 | 1,270 | 2,228 | 422.0 |
+| 1024 | Tuned FlyDSL | `flydsl moe2 t64x256x256_atomic` | 180.9 | 1,330 | 4,916 | 889.3 |
+| 1024 | Tuned FlyDSL+CK | `flydsl moe2 t64x256x256_atomic` | 180.9 | 1,330 | 4,916 | 889.3 |
+| 4096 | Gluon | `BM128xBN256xBK256, 2 buf, 8 warps` | 523.9 | 1,836 | 2,067 | 1082.8 |
+| 4096 | Triton | `BM128xBN512xBK256` | 643.5 | 1,495 | 1,809 | 1164.1 |
+| 4096 | Tuned FlyDSL | `flydsl moe2 t64x128x256_atomic_bnt2` | 526.1 | 1,829 | 2,880 | 1515.4 |
+| 4096 | Tuned FlyDSL+CK | `flydsl moe2 t64x128x256_atomic_bnt2` | 526.1 | 1,829 | 2,880 | 1515.4 |
+
+## Which kernel the tuner selected
+
+`kernelName1`/`kernelName2` from `aiter/configs/tuned_fmoe.csv` for this shape, with the
+tuner's own recorded time next to the time measured here. Every selection was confirmed
+against the symbol that actually dispatched, so the "Tuned" rows above are the tuned
+kernel, not a fallback.
+
+| T | stage | tuner's `kernelName` | tuner's µs | measured µs | dispatched symbol |
+|---:|---:|---|---:|---:|---|
+| 1 | 1 | `flydsl_moe1_afp4_wfp4_bf16_t64x128x256_w4_fp4` | 29.2 | 32.2 | `mfma_moe1_silu_mul_afp4_wfp4_fp4_t64x128x256_pm1_fp4q` |
+| 1 | 2 | `moe_ck2stages_gemm2_256x64x128x128_1x4_...FP4X2_FP4X2_B16` | 20.1 | 19.3 | `kernel_moe_mxgemm_2lds` |
+| 8 | 1 | `flydsl_moe1_afp4_wfp4_bf16_t64x128x256_w3_fp4` | 74.0 | 109.5 † | `mfma_moe1_silu_mul_afp4_wfp4_fp4_t64x128x256_pm1_fp4q` |
+| 8 | 2 | `flydsl_moe2_afp4_wfp4_bf16_t32x128x256_atomic_bnt2_sbm64` | 47.1 | 57.9 † | `mfma_moe2_afp4_wfp4_bf16_cshuffle_t32x128x256_vscale` |
+| 32 | 1 | `flydsl_moe1_afp4_wfp4_bf16_t32x32x256_w3` | 90.3 | 98.5 | `mfma_moe1_silu_mul_afp4_wfp4_bf16_t32x32x256_pm1_async` |
+| 32 | 2 | `flydsl_moe2_afp4_wfp4_bf16_t32x128x256_atomic_bnt2` | 50.8 | 58.0 | `mfma_moe2_afp4_wfp4_bf16_cshuffle_t32x128x256_vscale` |
+| 1024 | 1 | `flydsl_moe1_afp4_wfp4_bf16_t64x128x256_w2_bnt0_fp4` | 208.6 | 223.4 | `mfma_moe1_silu_mul_afp4_wfp4_fp4_t64x128x256_pm1` |
+| 1024 | 2 | `flydsl_moe2_afp4_wfp4_bf16_t64x256x256_atomic` | 163.3 | 180.9 | `mfma_moe2_afp4_wfp4_bf16_cshuffle_t64x256x256_vscale` |
+| 4096 | 1 | `flydsl_moe1_afp4_wfp4_bf16_t64x128x256_w4_bnt0_fp4` | 619.1 | 651.4 | `mfma_moe1_silu_mul_afp4_wfp4_fp4_t64x128x256_pm1` |
+| 4096 | 2 | `flydsl_moe2_afp4_wfp4_bf16_t64x128x256_atomic_bnt2` | 542.6 | 526.1 | `mfma_moe2_afp4_wfp4_bf16_cshuffle_t64x128x256_vscale` |
+
+Measured times run 8-10% above the tuner's own, consistent with counter collection
+serializing dispatches. † T=8 is the exception and the gap is deliberate: the tuner
+recorded natural routing, while these runs force all 33 experts active to match the Gluon
+harness. Unforced, T=8 stage 1 measures 76.0 us against the tuner's 74.0.
+
+The tuner searches roughly 800 FlyDSL candidates per dtype pair (272 stage-1 for
+a4w4->bf16, 272 for a4w4->fp4, 257 stage-2) alongside CK codegen instances, hand-written
+ASM kernels and Opus instances, and picks per stage -- which is why the tile changes at
+almost every token count, and why stage 2 at T=1 is CK while stage 1 is FlyDSL.
 
 ## Reading the table
 
@@ -128,6 +158,13 @@ here only after a fix: it had been marking the weight *scale* loads non-temporal
 which cost 25% extra traffic, because the scale tensor is `(E, K/32, N)` with K contiguous
 -- one 128 B line holds 128 consecutive K-scales, a `BLOCK_K=512` stage consumes 16 of
 them, and that line has to survive in L2 across 8 K-iterations.
+
+Worth noting for anyone reading the two kernels side by side: Triton passes the *same*
+`.cg` to its weight-scale loads (`_triton_kernels/moe/moe_op_gemm_a4w4.py`, the
+`W_CACHE_MODIFIER` on both the payload and the `WMxScale` load) and still reaches the
+compulsory floor. So the modifier is evidently honoured differently on Gluon's
+`buffer_load_to_shared` (direct-to-LDS) path than on a register `tl.load` -- the Triton
+config was not a template to copy here, and the A/B was needed to find it.
 
 **Prefill is compute-bound** and the ordering changes: FlyDSL's stage 1 is 30% (T=1024)
 to 45% (T=4096) ahead of Gluon while moving *more* bytes, so its advantage there is
