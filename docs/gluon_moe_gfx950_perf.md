@@ -149,6 +149,91 @@ a4w4->bf16, 272 for a4w4->fp4, 257 stage-2) alongside CK codegen instances, hand
 ASM kernels and Opus instances, and picks per stage -- which is why the tile changes at
 almost every token count, and why stage 2 at T=1 is CK while stage 1 is FlyDSL.
 
+
+## Like-for-like: fp4 intermediate
+
+The tuned FlyDSL stage-1 kernel fuses the MXFP4 quant of the intermediate into its
+epilogue (`_fp4q`) at every token count except T=32, so the tables above compare it
+against a bf16-emitting Gluon and Triton. Gluon has the same fused path
+(`moe_gemm1_a4w4_mxfp4_out`); the Triton a4w4 kernel has none -- only a8w4 has
+`out_mx_quant`, and that emits fp8 -- so its equivalent is gemm1(bf16) followed by the
+standalone `mxfp4_quant` launch, and both kernels are charged to it.
+
+| T | Gluon fused | Gluon bf16 | Triton gemm1 + quant | Tuned FlyDSL fused |
+|---:|---:|---:|---:|---:|
+| 1 | **26.7** | 27.3 | 32.0 + 3.3 = 35.3 | 32.2 |
+| 8 | **103.8** | 99.0 | 117.4 + 3.1 = 120.5 | 109.5 |
+| 32 | **104.7** | 100.9 | 126.8 + 3.1 = 129.9 | (emits bf16) |
+| 1024 | 320.7 | 291.2 | 410.4 + 18.9 = 429.3 | **223.4** |
+| 4096 | 1051.3 | 942.3 | 1120.6 + 74.3 = 1194.9 | **651.4** |
+
+HBM moved, same runs:
+
+| T | Gluon fused | Gluon bf16 | Triton gemm1 + quant |
+|---:|---:|---:|---:|
+| 1024 | 584.8 MB | 607.8 MB | 696.8 MB |
+| 4096 | 1420.8 MB | 1516.8 MB | 1783.3 MB |
+
+Two things fall out.
+
+**Against Triton the fused path wins everywhere** -- 1.34x at T=1024, 1.14x at T=4096 --
+and moves 16-20% less memory, which is the case the fused epilogue was written for.
+
+**Against FlyDSL it does not close the prefill gap; it widens it** (1.30x -> 1.44x at
+T=1024, 1.45x -> 1.61x at T=4096). Gluon's fused quant is *slower than emitting bf16* at
+every T >= 8 despite moving less traffic -- 320.7 vs 291.2 us at T=1024 -- so the epilogue
+quant costs more than the write traffic it saves. That is a defect in our epilogue, not a
+property of fusing, and it is the first thing to look at before reading anything else into
+the prefill numbers.
+
+## Why prefill is slower than FlyDSL
+
+Three plausible explanations were measured and ruled out.
+
+**Not occupancy.** Gluon uses 105,952 B of LDS at prefill -- 1 workgroup/CU, 8 waves --
+against Triton's 65,536 (2/CU) and FlyDSL's 55,424 (2/CU, also 8 waves). But raising
+occupancy makes it worse, because the only way to free that much LDS is a shorter
+`BLOCK_K`, and that multiplies per-stage barrier and wait overhead:
+
+| config | LDS | CTA/CU | T=1024 us | T=4096 us |
+|---|---:|---:|---:|---:|
+| BN256 BK256 nb2 (shipping) | 104,448 | 1 | 281.0 | 1034.1 |
+| BN128 BK256 nb2 | 69,632 | 2 | **273.6** | 1013.0 |
+| BN256 BK128 nb2 | 52,224 | 3 | 622.2 | 1986.0 |
+| BN128 BK128 nb2 | 34,816 | 4 | 701.8 | 2357.6 |
+| BN128 BK256 nb3 | 104,448 | 1 | 331.3 | 1193.9 |
+| BN256 BK256 nb2, tiles/warp (1,2) | 104,448 | 1 | 282.1 | **982.6** |
+
+Best available is 2-5%, not 30-60%.
+
+**Not M-padding.** `block_m` is 128 at prefill while experts hold ~248 tokens, which looks
+like 1.5x wasted work from `RoutingData.n_blocks`. It is not: that function returns a
+worst-case grid bound, and the surplus blocks are marked -1 in `block_pid_map` and exit
+immediately. Only 66 of 96 blocks execute at T=1024 and 264 of 288 at T=4096 -- **1.031x**
+padded work, and FlyDSL at `tile_m=64` pays exactly the same 1.031x.
+
+**Not the output format**, as the section above shows.
+
+**It is data-wait stalls.** The prefill stall profile is the mirror image of decode, where
+Gluon was issue-bound:
+
+| | issue | wait-data | wait-issue | `SQ_WAIT_ANY` |
+|---|---:|---:|---:|---:|
+| FlyDSL T=1024 | 18.5% | 30.2% | 51.3% | 57,886,326 |
+| Gluon T=1024 | 15.7% | **37.8%** | 46.5% | **90,181,943** |
+| FlyDSL T=4096 | **25.9%** | 28.6% | 45.5% | 157,322,620 |
+| Gluon T=4096 | 17.5% | **36.2%** | 46.3% | **310,240,888** |
+
+Gluon's waves wait on data 1.56x (T=1024) and 1.97x (T=4096) as many cycles as FlyDSL's,
+and issue an instruction on only 15.7-17.5% of cycles against FlyDSL's 18.5-25.9%. Both
+run 8 waves/CU at T=1024, so this is not a wave-count difference -- it is that 8 waves with
+two `BLOCK_K=256` stages in flight (512 K-elements) cannot cover the latency, and at
+`BLOCK_N=256` there is no LDS left to go deeper. FlyDSL reaches the same wave count as
+2-3 workgroups of 4 waves with its own prefetch, and at T=4096 gets to 3 CTAs/CU.
+
+Closing this needs more K in flight per byte of LDS -- the same restructuring the decode
+investigation pointed at -- not another tile from the existing ladder.
+
 ## Reading the table
 
 **Decode is bandwidth-bound, and traffic is the whole story.** Every implementation sits
@@ -184,12 +269,11 @@ stage-1 lead at prefill (see caveat 1 -- that comparison is not like-for-like).
 
 ## Caveats
 
-1. **FlyDSL stage 1 emits fp4 at T=1, 8, 1024 and 4096** (`_fp4q` kernels: it fuses the
-   MXFP4 quant of the intermediate into its epilogue) while Gluon and Triton emit bf16.
-   That is less output traffic and a different amount of work, so the prefill stage-1
-   comparison is not like-for-like. Gluon has the same fused-quant path
-   (`moe_gemm1_a4w4_mxfp4_out`) but it is not exercised here. At T=32 FlyDSL emits bf16
-   and that row is directly comparable.
+1. **FlyDSL stage 1 emits fp4 at T=1, 8, 1024 and 4096** (`_fp4q`) while the Gluon and
+   Triton rows in the tables above emit bf16, so those rows are not like-for-like. The
+   "Like-for-like fp4 intermediate" section measures the fair version: it does not favour
+   Gluon, it widens the gap. At T=32 FlyDSL emits bf16 and that row is directly
+   comparable as printed.
 2. Tuned FlyDSL/CK numbers come from the **aiter-02** checkout, because
    `test_moe_2stage.py` has no repo-root `sys.path` bootstrap and resolves `aiter` there.
 3. The active expert *ids* differ between harnesses (`arange(n)` vs `randperm(n)`); only
