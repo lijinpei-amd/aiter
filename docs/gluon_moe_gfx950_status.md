@@ -9,19 +9,41 @@ routing aligned across harnesses. Full tables, methodology and caveats:
 
 ## Status
 
-Gluon µs against the best of {Triton, tuned FlyDSL/CK} at each point. **Bold** = Gluon
-leads.
+Gluon against the best of {Triton, tuned FlyDSL/CK} at each point. **Bold** = faster.
+TFLOP/s counts *useful* FLOPs (`2 * T*topk * N * K`), not the padded MFMA work; GB/s is
+measured HBM traffic (`TCC_MISS_sum * 128 B`), against ~8 TB/s of peak.
 
-| | T=1 | T=8 | T=32 | T=1024 | T=4096 |
-|---|---|---|---|---|---|
-| stage 1 | **27.3** vs 32.0 | **99.0** vs 109.5 | 100.9 vs 98.5 | 291.2 vs 223.4 | 942.3 vs 651.4 |
-| stage 2 | 16.0 vs 16.0 (tie) | 52.1 vs 50.7 | **52.7** vs 55.5 | **157.2** vs 180.9 | **523.9** vs 526.1 |
+**Decode**
 
-- **Decode**: competitive. Ahead at 3 of 6 points, tied at 1, behind by 2.4-2.8% at the
-  other 2. HBM traffic is within 1% of compulsory everywhere, matching Triton and FlyDSL.
-- **Prefill stage 2**: ahead at both points.
-- **Prefill stage 1**: behind FlyDSL by 1.30x (T=1024) and 1.45x (T=4096). This is the one
-  real deficit. Ahead of Triton everywhere at prefill (1.18-1.42x).
+| T | stage | Gluon µs | TFLOP/s | GB/s | best other | µs | TFLOP/s | GB/s |
+|---:|---:|---:|---:|---:|---|---:|---:|---:|
+| 1 | 1 | **27.3** | 17 | 4,579 | Triton | 32.0 | 15 | 3,906 |
+| 1 | 2 | 16.0 | 15 | 3,925 | Triton *(tie)* | 16.0 | 15 | 3,925 |
+| 8 | 1 | **99.0** | 38 | 5,209 | FlyDSL | 109.5 | 34 | 4,743 |
+| 8 | 2 | 52.1 | 36 | 4,979 | Triton | **50.7** | 37 | 5,116 |
+| 32 | 1 | 100.9 | 149 | 5,122 | FlyDSL | **98.5** | 153 | 5,278 |
+| 32 | 2 | **52.7** | 143 | 4,981 | Triton | 55.5 | 135 | 4,730 |
+
+**Prefill**
+
+| T | stage | Gluon µs | TFLOP/s | GB/s | best other | µs | TFLOP/s | GB/s |
+|---:|---:|---:|---:|---:|---|---:|---:|---:|
+| 1024 | 1 | 291.2 | 1,652 | 2,087 | FlyDSL | **223.4** | 2,153 | 3,183 |
+| 1024 | 2 | **157.2** | 1,530 | 2,665 | FlyDSL | 180.9 | 1,330 | 4,916 |
+| 4096 | 1 | 942.3 | 2,042 | 1,610 | FlyDSL | **651.4** | 2,954 | 2,423 |
+| 4096 | 2 | **523.9** | 1,836 | 2,067 | FlyDSL | 526.1 | 1,829 | 2,880 |
+
+- **Decode is bandwidth-bound** -- everything runs at 3.9-5.3 TB/s and 15-153 TFLOP/s, so
+  the ranking tracks HBM traffic and little else. Gluon is ahead at 3 of 6 points, tied at
+  1, behind by 2.4-2.8% at the other 2, and its traffic is within 1% of compulsory
+  everywhere, matching Triton and FlyDSL.
+- **Prefill is compute-bound** -- 1,530-2,954 TFLOP/s at only 1.6-4.9 TB/s. Gluon leads
+  stage 2 at both points and trails FlyDSL on stage 1 by 1.30x (T=1024) and 1.45x (T=4096).
+  That stage-1 deficit is the one real gap; against Triton, Gluon leads everywhere at
+  prefill by 1.18-1.42x.
+- FlyDSL's higher GB/s at prefill is not an advantage -- it moves *more* bytes for the same
+  math (711 vs 608 MB at T=1024 stage 1) and is still faster, which is what makes prefill a
+  scheduling problem rather than a memory one.
 
 ## Fixed this round
 
