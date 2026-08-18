@@ -16,6 +16,8 @@ from triton.language.core import _aggregate as aggregate
 
 from aiter.ops.triton.utils.common_utils import strip_annotate
 
+from ._lang import MX_GROUP, WARP_SIZE
+from ._lang import unwrap as _v
 from ._types import (
     ActivationSpec,
     DotKind,
@@ -27,10 +29,8 @@ from ._types import (
     dq_uses_mfma_scaled,
 )
 
-__all__ = ["MX_GROUP", "WARP_SIZE", "KernelFuncConfig", "KernelTuningConfig"]
+__all__ = ["KernelFuncConfig", "KernelTuningConfig"]
 
-MX_GROUP = 32
-WARP_SIZE = 64
 #: gfx950 LDS capacity, mirrors utils/_triton/arch_info.py::_LDS_CAP_BYTES["gfx950"].
 LDS_CAP_BYTES = 163840
 #: Headroom the operand buffers must leave for LDS the *compiler* allocates on top of
@@ -41,15 +41,6 @@ LDS_CAP_BYTES = 163840
 LDS_EPILOGUE_RESERVE_BYTES = 4096
 #: What the operand buffers may actually use.
 LDS_USABLE_BYTES = LDS_CAP_BYTES - LDS_EPILOGUE_RESERVE_BYTES
-
-
-@gluon.constexpr_function
-def _v(x):
-    """Unwrap a ``gl.constexpr``. Must be a ``constexpr_function``, not a plain one:
-    Triton's aggregate hash walker rejects any bare callable an aggregate method
-    references ("Unsupported function referenced"). Called from Python it returns the
-    raw value, so ``list()``/indexing on the result still work."""
-    return x.value if isinstance(x, gl.constexpr) else x
 
 
 @gluon.constexpr_function
@@ -356,7 +347,6 @@ class KernelTuningConfig:
         self.result_scale_mod = gl.constexpr(_v(result_scale_mod))
         self.WARP_PIPELINE = gl.constexpr(_v(WARP_PIPELINE))
 
-    # ---------------------------------------------------------------- derived sizes
     @gluon.constexpr_function
     def num_warps(self):
         w = _v(self.warps_per_cta)
@@ -381,6 +371,11 @@ class KernelTuningConfig:
         BK = _v(self.BLOCK_K)
         assert K % BK == 0, f"K ({K}) must be a multiple of BLOCK_K ({BK})"
         return K // BK
+
+    @gluon.constexpr_function
+    def num_mini_k(self):
+        """Mini-K steps per BLOCK_K stage."""
+        return _v(self.BLOCK_K) // _v(self.MINI_BLOCK_K)
 
     @gluon.constexpr_function
     def lds_shape(self, idx):
@@ -469,7 +464,6 @@ class KernelTuningConfig:
         vec = self.copy_contiguity(idx)
         return shape[0] * shape[1] >= WARP_SIZE * vec
 
-    # ---------------------------------------------------------------- layouts
     @gluon.constexpr_function
     def dot_result_fragment_layout(self):
         """AMDMFMALayout for dot / scaled-dot results in register.
@@ -588,7 +582,6 @@ class KernelTuningConfig:
             order=[1, 0],
         )
 
-    # ---------------------------------------------------------------- budgets
     @gluon.constexpr_function
     def lds_bytes(self):
         fc = self.func_cfg

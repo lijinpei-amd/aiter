@@ -11,6 +11,9 @@ from typing import NamedTuple
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from ._lang import const as _c
+from ._lang import unwrap as _unwrap
+
 __all__ = [
     "ActKind",
     "ActivationSpec",
@@ -133,16 +136,6 @@ class ActivationSpec(NamedTuple):
 
 
 @gluon.constexpr_function
-def _unwrap(x):
-    """Accept either a raw Python value or a ``gl.constexpr`` wrapping one.
-
-    A ``constexpr_function`` rather than a plain one because Triton's aggregate hash
-    walker rejects bare callables referenced from aggregate methods.
-    """
-    return x.value if isinstance(x, gl.constexpr) else x
-
-
-@gluon.constexpr_function
 def dq_has_scale(dq):
     return _unwrap(dq) in (int(DtypeQuant.MXFP4), int(DtypeQuant.MXFP8))
 
@@ -175,14 +168,6 @@ def dq_uses_mfma_scaled(dq_a, dq_b):
     )
 
 
-def _c(v):
-    """Wrap a host value so it lands as a compile-time NamedTuple field."""
-    return gl.constexpr(v)
-
-
-# --------------------------------------------------------------------------------
-# host -> device tensor descriptors
-# --------------------------------------------------------------------------------
 class NonQuantTokenTensor(NamedTuple):
     """bf16 activations. ``stride_k`` is pinned to 1 by the layout contract."""
 

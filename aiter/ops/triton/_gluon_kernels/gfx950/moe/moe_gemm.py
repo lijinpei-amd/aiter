@@ -64,13 +64,16 @@ from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
+from ._lang import MX_GROUP_CE as MX_GROUP
+from ._lang import field_at as _at
+from ._lang import require_constexpr
+from ._lang import unwrap_attr as _cv
 from ._lds import LDSManager
 from ._quant import mxfp4_quant_gluon
 from ._types import DotKind, DtypeQuant, TileSched
 
 #: @gluon.jit code may only read constexpr globals; plain ints and enum members are
 #: rejected, so every scalar the kernel body compares against is pre-wrapped here.
-MX_GROUP: gl.constexpr = gl.constexpr(32)
 _DQ_MXFP4: gl.constexpr = gl.constexpr(int(DtypeQuant.MXFP4))
 _TS_XCD_GROUP_M: gl.constexpr = gl.constexpr(int(TileSched.XCD_GROUP_M))
 _TS_GROUP_M: gl.constexpr = gl.constexpr(int(TileSched.GROUP_M))
@@ -107,13 +110,6 @@ class MoeKernelConfig(NamedTuple):
     K: gl.constexpr
 
 
-# --------------------------------------------------------------------------------
-# launch metadata / repr
-# --------------------------------------------------------------------------------
-def _cv(x):
-    return x.value if hasattr(x, "value") else x
-
-
 def moe_gemm_launch_metadata(grid, kernel, args):
     ret = {}
     cfg = args["cfg"]
@@ -144,16 +140,6 @@ def moe_gemm_launch_metadata(grid, kernel, args):
 # `specialization.constants` under a usable key; the two entry-point names already
 # distinguish the stages in a profile.
 _moe_gemm_repr_fields = []
-
-
-# --------------------------------------------------------------------------------
-# helpers
-# --------------------------------------------------------------------------------
-@gluon.constexpr_function
-def _at(spec, i):
-    """Index one field out of a plain-Python NamedTuple carried inside a constexpr."""
-    spec = spec.value if isinstance(spec, gl.constexpr) else spec
-    return spec[i]
 
 
 @gluon.jit
@@ -223,7 +209,7 @@ def _gather_rows(
     """
     offs = BLOCK_M * block_id + gl.arange(0, BLOCK_M, layout=layout)
     offs = offs % M_e
-    if HAS_GATHER:
+    if require_constexpr(HAS_GATHER):
         # gather_indx is uint16 when n_gates <= 65535, else int32; it indexes gates, so
         # divide by n_expts_act to get the token row.
         rows = gl.load(rt.gather_indx + start_m + offs) // rt.n_expts_act
@@ -241,7 +227,7 @@ def _dot(a, a_scale, b, b_scale, acc, func_cfg):
     every static dispatch here is written as an explicit if/else.
     """
     kind: gl.constexpr = func_cfg.dot_kind()
-    if kind == _DK_MFMA_SCALED:
+    if require_constexpr(kind == _DK_MFMA_SCALED):
         # Every fp4/fp8 pair, mixed or not. FP8 x FP8 arrives with both scales None:
         # the backend folds the synthesized unit scales back into V_MFMA_*_F8F6F4, and
         # only that path reaches the double-rate K=64/128 pipes -- plain mfma would
@@ -255,7 +241,7 @@ def _dot(a, a_scale, b, b_scale, acc, func_cfg):
             b_format=func_cfg.mx_format(1),
             acc=acc,
         )
-    elif kind == _DK_MFMA:
+    elif require_constexpr(kind == _DK_MFMA):
         out = gl.amd.cdna4.mfma(a, b, acc)
     else:
         # UPCAST_MFMA: mfma_scaled cannot mix a bf16 operand with a microscaled one, so
@@ -272,7 +258,7 @@ def _mini_scale_off(base, step, HAS_SCALE: gl.constexpr):
     An operand without a scale carries ``None`` here (bf16, or fp8 with a per-tensor
     static scale), and ``None + int`` is a trace-time error rather than a no-op.
     """
-    if HAS_SCALE:
+    if require_constexpr(HAS_SCALE):
         out = base + step
     else:
         out = base
@@ -296,7 +282,7 @@ def _mma_stage(
     PF: gl.constexpr = tuning_cfg.MINI_PREFETCH_K
     SK_MINI: gl.constexpr = tuning_cfg.MINI_BLOCK_K // MX_GROUP
 
-    if PF == 0:
+    if require_constexpr(PF == 0):
         for i in gl.static_range(NUM_MINI):
             a, a_s = lds.load_a_frag(
                 buf_idx,
@@ -328,7 +314,7 @@ def _mma_stage(
             )
             frags = frags + ((a, a_s, b, b_s),)
         for i in gl.static_range(NUM_MINI):
-            if i + PF < NUM_MINI:
+            if require_constexpr(i + PF < NUM_MINI):
                 a, a_s = lds.load_a_frag(
                     buf_idx,
                     i + PF,
@@ -396,19 +382,19 @@ def _epilogue_store(
         for ni in gl.static_range(BN // MBN):
             sub = gl.amd.slice(acc, [MBM, MBN], [mi * MBM, ni * MBN])
 
-            if func_cfg.has_x_static_scale:
+            if require_constexpr(func_cfg.has_x_static_scale):
                 # Per-tensor fp8 activation scale. FP8_E4M3 operands go through the
                 # MMA with unit scales, so the tensor scale comes back here -- before
                 # bias, matching the Triton kernels exactly.
                 sub = sub * x_static_scale
 
             raw_n0 = pid_n * BN + ni * MBN
-            if func_cfg.has_bias:
+            if require_constexpr(func_cfg.has_bias):
                 # fp32, expert indexed, over the RAW N axis (before the halving)
                 bias = gl.load(bias_ptr + raw_n0 + gl.arange(0, MBN))
                 sub = sub + bias[None, :]
 
-            if func_cfg.has_activation():
+            if require_constexpr(func_cfg.has_activation()):
                 out = _swiglu(sub, act.alpha, act.limit, ADD_RESIDUAL=act.add_residual)
                 gl.static_assert(out.shape[1] == OUT_MBN)
             else:
@@ -417,12 +403,12 @@ def _epilogue_store(
 
             offs_m = BM * block_id + mi * MBM + gl.arange(0, MBM)
             mask_m = offs_m < M_e
-            if func_cfg.has_gammas:
+            if require_constexpr(func_cfg.has_gammas):
                 g = gl.load(gammas_base + offs_m, mask=mask_m, other=0.0)
                 out = out * g[:, None]
 
             out_n0 = raw_n0 // ARN
-            if func_cfg.output_quant is None:
+            if require_constexpr(func_cfg.output_quant is None):
                 val = gl.convert_layout(
                     out.to(out_ty), store_layout, assert_trivial=False
                 )
@@ -471,9 +457,6 @@ def _epilogue_store(
                 )
 
 
-# --------------------------------------------------------------------------------
-# the shared body
-# --------------------------------------------------------------------------------
 @gluon.jit
 def _moe_gemm_body(
     a,  # QuantTokenTensor | NonQuantTokenTensor
@@ -501,9 +484,8 @@ def _moe_gemm_body(
     SK: gl.constexpr = BK // MX_GROUP
     NUM_K: gl.constexpr = tuning_cfg.num_k_tiles(cfg.K)
 
-    # ---------------------------------------------------------------- tile schedule
     pid = gl.program_id(0)
-    if tuning_cfg.TILE_SCHED == _TS_XCD_GROUP_M:
+    if require_constexpr(tuning_cfg.TILE_SCHED == _TS_XCD_GROUP_M):
         # Drop the padded tiles first so the swizzle is a bijection over real work; a
         # grid-persistent mode would forfeit this early return, which is why it is out
         # of scope here.
@@ -512,7 +494,7 @@ def _moe_gemm_body(
             return
         pid = remap_xcd(pid, unpadded_m * grid_n, tuning_cfg.NUM_XCDS)
         pid_m, pid_n = pid_grid(pid, unpadded_m, grid_n, tuning_cfg.GROUP_M)
-    elif tuning_cfg.TILE_SCHED == _TS_GROUP_M:
+    elif require_constexpr(tuning_cfg.TILE_SCHED == _TS_GROUP_M):
         pid_m, pid_n = pid_grid(pid, grid_m, grid_n, tuning_cfg.GROUP_M)
     else:
         pid_m = pid // grid_n
@@ -527,30 +509,28 @@ def _moe_gemm_body(
     M_e = gl.load(rt.expt_hist + expt_id)
     start_m = gl.load(rt.expt_offs_raw + expt_id)
 
-    # ---------------------------------------------------------------- rebase per expert
     # Buffer ops carry a 32-bit offset (2 GB window) and V4-Pro's stacked gemm1 weight is
     # ~8.5 GB, so the expert stride is folded into the scalar base in 64-bit; a single
     # expert is ~22 MB and fits comfortably.
     w_ptr = b.ptr + expt_id.to(gl.int64) * b.stride_e
-    if func_cfg.b_has_scale():
+    if require_constexpr(func_cfg.b_has_scale()):
         ws_ptr = b.scale_ptr + expt_id.to(gl.int64) * b.scale_stride_e
     else:
         ws_ptr: gl.constexpr = None
     y_ptr = res.ptr + start_m.to(gl.int64) * res.stride_m
-    if func_cfg.output_quant is not None:
+    if require_constexpr(func_cfg.output_quant is not None):
         ys_ptr = res.scale_ptr + start_m.to(gl.int64) * res.scale_stride_m
     else:
         ys_ptr: gl.constexpr = None
-    if func_cfg.has_bias:
+    if require_constexpr(func_cfg.has_bias):
         bias_base = bias_ptr + expt_id.to(gl.int64) * stride_bias_e
     else:
         bias_base: gl.constexpr = None
-    if func_cfg.has_gammas:
+    if require_constexpr(func_cfg.has_gammas):
         gammas_base = rt.gammas + start_m
     else:
         gammas_base: gl.constexpr = None
 
-    # ---------------------------------------------------------------- tile offsets
     cl_a: gl.constexpr = tuning_cfg.dot_operand_copy_layout(0)
     cl_b: gl.constexpr = tuning_cfg.dot_operand_copy_layout(1)
 
@@ -567,8 +547,8 @@ def _moe_gemm_body(
         * b.stride_n
     )
 
-    if func_cfg.a_has_scale():
-        if tuning_cfg.scale_via_lds(0):
+    if require_constexpr(func_cfg.a_has_scale()):
+        if require_constexpr(tuning_cfg.scale_via_lds(0)):
             asl: gl.constexpr = tuning_cfg.dot_operand_scale_copy_layout(0)
         else:
             asl: gl.constexpr = tuning_cfg.dot_operand_scale_fragment_layout(0)
@@ -585,8 +565,8 @@ def _moe_gemm_body(
         a_scale_offs: gl.constexpr = None
         as_ptr: gl.constexpr = None
 
-    if func_cfg.b_has_scale():
-        if tuning_cfg.scale_via_lds(1):
+    if require_constexpr(func_cfg.b_has_scale()):
+        if require_constexpr(tuning_cfg.scale_via_lds(1)):
             bsl: gl.constexpr = tuning_cfg.dot_operand_scale_copy_layout(1)
         else:
             bsl: gl.constexpr = tuning_cfg.dot_operand_scale_fragment_layout(1)
@@ -598,7 +578,6 @@ def _moe_gemm_body(
     else:
         b_scale_offs: gl.constexpr = None
 
-    # ---------------------------------------------------------------- K loop
     lds = LDSManager.alloc(func_cfg, tuning_cfg)
     acc = gl.zeros(
         [BM, BN],
@@ -623,9 +602,9 @@ def _moe_gemm_body(
         lds.commit_fill_lds()
         a_fill = a_fill + a_step
         b_fill = b_fill + b_step
-        if func_cfg.a_has_scale():
+        if require_constexpr(func_cfg.a_has_scale()):
             as_fill = as_fill + s_step * a.scale_stride_k
-        if func_cfg.b_has_scale():
+        if require_constexpr(func_cfg.b_has_scale()):
             bs_fill = bs_fill + s_step * b.scale_stride_k
 
     # Read-side scale offsets. These exist separately from the fill-side pointers
@@ -661,10 +640,10 @@ def _moe_gemm_body(
             lds.commit_fill_lds()
             a_fill = a_fill + a_step
             b_fill = b_fill + b_step
-            if func_cfg.a_has_scale():
+            if require_constexpr(func_cfg.a_has_scale()):
                 as_fill = as_fill + s_step * a.scale_stride_k
                 a_scale_read = a_scale_read + s_step * a.scale_stride_k
-            if func_cfg.b_has_scale():
+            if require_constexpr(func_cfg.b_has_scale()):
                 bs_fill = bs_fill + s_step * b.scale_stride_k
                 b_scale_read = b_scale_read + s_step * b.scale_stride_k
 
@@ -688,10 +667,10 @@ def _moe_gemm_body(
         lds.commit_fill_lds()
         a_fill = a_fill + a_step
         b_fill = b_fill + b_step
-        if func_cfg.a_has_scale():
+        if require_constexpr(func_cfg.a_has_scale()):
             as_fill = as_fill + s_step * a.scale_stride_k
             a_scale_read = a_scale_read + s_step * a.scale_stride_k
-        if func_cfg.b_has_scale():
+        if require_constexpr(func_cfg.b_has_scale()):
             bs_fill = bs_fill + s_step * b.scale_stride_k
             b_scale_read = b_scale_read + s_step * b.scale_stride_k
 
@@ -712,14 +691,13 @@ def _moe_gemm_body(
             func_cfg,
             tuning_cfg,
         )
-        if func_cfg.a_has_scale():
+        if require_constexpr(func_cfg.a_has_scale()):
             a_scale_read = a_scale_read + s_step * a.scale_stride_k
-        if func_cfg.b_has_scale():
+        if require_constexpr(func_cfg.b_has_scale()):
             b_scale_read = b_scale_read + s_step * b.scale_stride_k
 
-    # ---------------------------------------------------------------- epilogue
     # Hoisted out of the mini-tile loop: one scalar load, not one per tile.
-    if func_cfg.has_x_static_scale:
+    if require_constexpr(func_cfg.has_x_static_scale):
         x_static_scale = gl.load(x_static_scale_ptr)
     else:
         x_static_scale: gl.constexpr = None
@@ -742,9 +720,6 @@ def _moe_gemm_body(
     )
 
 
-# --------------------------------------------------------------------------------
-# entry points
-# --------------------------------------------------------------------------------
 _gemm1_repr = make_kernel_repr("_moe_gluon_gemm1", _moe_gemm_repr_fields)
 _gemm2_repr = make_kernel_repr("_moe_gluon_gemm2", _moe_gemm_repr_fields)
 
