@@ -1,9 +1,11 @@
-# gfx950 MoE A4W4 grouped GEMM: Gluon vs Triton vs tuned CK/FlyDSL
+# gfx950 MoE A4W4 grouped GEMM: Gluon vs Triton vs tuned FlyDSL
 
-Kernel-level comparison of the four a4w4 MoE grouped-GEMM implementations in this tree,
-on one shape, measured with `rocprofv3`. Wall-clock is deliberately **not** reported: at
-decode the Gluon launch path costs ~90 us of host time against a ~27 us kernel, which
-swamps the kernel differences this table is about.
+Kernel-level comparison of the a4w4 MoE grouped-GEMM implementations in this tree, on one
+shape, measured with `rocprofv3`. Wall-clock is deliberately **not** reported: at decode
+the Gluon launch path costs ~90 us of host time against a ~25 us kernel, which swamps the
+kernel differences this table is about. (For scale: the harness reports 110 us wall for a
+25.4 us T=1 stage-1 kernel, and every decode point sits on the same ~100-120 us floor
+regardless of shape.)
 
 ## Setup
 
@@ -16,9 +18,10 @@ swamps the kernel differences this table is about.
 | dtype | MXFP4 x MXFP4 (E2M1 payload + E8M0 group-32 scales) |
 | tool | `rocprofv3 --pmc TCC_HIT_sum TCC_MISS_sum`, per-dispatch average |
 
-`E=33` is not arbitrary: it is the shape the tuned table covers for a4w4 FlyDSL
-(the count includes the shared expert). At `E=32` there is no tuned FlyDSL row and
-the dispatcher falls back to CK, so that shape cannot compare against tuned FlyDSL.
+`E=33` is 32 routed experts plus the shared expert. Note that **no** tuned row shipped for
+this shape in any `*_tuned_fmoe.csv`; the tuned column here comes from a tuning run done
+for this document (see "Which kernel the tuner selected"), and E=33 also had to be added
+to the mxfp4 aux codegen table before it would run at all.
 
 ### Routing is aligned across harnesses
 
@@ -29,9 +32,11 @@ at T=8 that alone was a 17% difference, larger than any kernel effect. Both side
 are pinned with `AITER_MOE_NUM_EXPERT_ACTIVATED=n` (n=8 at T=1, n=33 elsewhere), which
 forces exactly n active experts with a round-robin, perfectly balanced token assignment.
 
-After alignment, Triton and FlyDSL agree on stage-1 HBM traffic to within 0.4% at every
-token count -- two independent implementations landing on the same number, which is the
-check that makes the rest of the table meaningful.
+After alignment, Gluon, Triton and FlyDSL agree on stage-1 HBM traffic to within 1% at
+every decode point (516-521 MB at T=8 and T=32) -- three independent implementations
+landing on the same number, which is the check that makes the rest of the table
+meaningful. At prefill they diverge by up to 9% because the tuned kernels choose different
+tiling and split-K strategies; there the traffic column is a result, not a control.
 
 ### How the columns are defined
 
@@ -39,12 +44,15 @@ check that makes the rest of the table meaningful.
 |---|---|
 | **Gluon** | `_moe_gluon_gemm1/2`, this branch |
 | **Triton** | in-tree `_moe_gemm_a4w4` |
-| **Tuned FlyDSL** | the FlyDSL kernel selected by the tuner for this (shape, token, stage) |
-| **Tuned FlyDSL+CK** | what the joint dispatcher actually runs -- the tuner searches CK codegen instances, the FlyDSL registry, hand-written ASM kernels and Opus instances together, and picks a winner **per stage** |
+| **Tuned FlyDSL** | the FlyDSL kernel selected by `gemm_moe_tune.py --mxfp4-flydsl` for this (shape, token), re-tuned for this document |
 
-The two tuned columns coincide everywhere here except T=1 stage 2, where the joint search
-picks a CK kernel (`moe_ck2stages_gemm2_...`, symbol `kernel_moe_mxgemm_2lds`) over any
-FlyDSL candidate -- so there is no tuned FlyDSL entry to report at that point.
+**The tuned column is a FlyDSL-only search.** `--mxfp4-flydsl` tunes stage 1 and stage 2 as
+a coupled `(g1, g2)` unit over the FlyDSL mxfp4 registry; it does not consider CK codegen
+instances, hand-written ASM or Opus. An earlier revision of this document reported a
+*joint* FlyDSL+CK search, which at T=1 stage 2 preferred a CK kernel
+(`moe_ck2stages_gemm2_...`, symbol `kernel_moe_mxgemm_2lds`). That joint search has not
+been re-run here, so the tuned rows below are a lower bound on what the full dispatcher
+could pick, not the dispatcher's own answer.
 
 ### How the derived columns are computed
 
@@ -61,35 +69,29 @@ FlyDSL candidate -- so there is no tuned FlyDSL entry to report at that point.
 
 | T | impl | kernel / tile | µs | TFLOP/s | HBM GB/s | HBM MB |
 |---:|---|---|---:|---:|---:|---:|
-| 1 | Gluon | `BM16xBN64xBK512, 2 buf, 4 warps` | 27.3 | 17 | 4,579 | 125.0 |
-| 1 | Triton | `BM16xBN128xBK256` | 32.0 | 15 | 3,906 | 125.0 |
-| 1 | Tuned FlyDSL | `flydsl moe1 t64x128x256_w4_fp4` | 32.2 | 15 | 3,916 | 126.1 |
-| 1 | Tuned FlyDSL+CK | `flydsl moe1 t64x128x256_w4_fp4` | 32.2 | 15 | 3,916 | 126.1 |
-| 8 | Gluon | `BM16xBN128xBK512, 2 buf, 4 warps` | 99.0 | 38 | 5,209 | 515.7 |
-| 8 | Triton | `BM16xBN128xBK256` | 113.0 | 33 | 4,611 | 521.0 |
-| 8 | Tuned FlyDSL | `flydsl moe1 t64x128x256_w3_fp4` | 109.5 | 34 | 4,743 | 519.4 |
-| 8 | Tuned FlyDSL+CK | `flydsl moe1 t64x128x256_w3_fp4` | 109.5 | 34 | 4,743 | 519.4 |
-| 32 | Gluon | `BM16xBN128xBK512, 2 buf, 4 warps` | 100.9 | 149 | 5,122 | 516.8 |
-| 32 | Triton | `BM16xBN128xBK256` | 124.0 | 121 | 4,206 | 521.5 |
-| 32 | Tuned FlyDSL | `flydsl moe1 t32x32x256_w3 (bf16 out)` | 98.5 | 153 | 5,278 | 519.9 |
-| 32 | Tuned FlyDSL+CK | `flydsl moe1 t32x32x256_w3 (bf16 out)` | 98.5 | 153 | 5,278 | 519.9 |
+| 1 | Gluon | `BM16xBN64xBK512, 2 buf, 4 warps` | 25.4 | 18.5 | 4,927 | 125.0 |
+| 1 | Triton | `BM16xBN128xBK256` | 31.7 | 14.8 | 3,950 | 125.0 |
+| 1 | Tuned FlyDSL | `g1_a4w4_16x256x256_f16in_nt` | 27.2 | 17.3 | 4,611 | 125.4 |
+| 8 | Gluon | `BM16xBN128xBK512, 2 buf, 4 warps` | 95.6 | 39.3 | 5,395 | 515.7 |
+| 8 | Triton | `BM16xBN128xBK256` | 107.4 | 35.0 | 4,852 | 520.9 |
+| 8 | Tuned FlyDSL | `g1_a4w4_16x256x256_f16in_nt` | 109.4 | 34.4 | 4,727 | 517.1 |
+| 32 | Gluon | `BM16xBN128xBK512, 2 buf, 4 warps` | 96.5 | 155.8 | 5,357 | 516.8 |
+| 32 | Triton | `BM16xBN128xBK256` | 119.3 | 126.0 | 4,372 | 521.4 |
+| 32 | Tuned FlyDSL | `g1_a4w4_16x256x256_f16in_nt` | 108.8 | 138.2 | 4,780 | 520.0 |
 
 **Stage 2** (N=7168, K=2048)
 
 | T | impl | kernel / tile | µs | TFLOP/s | HBM GB/s | HBM MB |
 |---:|---|---|---:|---:|---:|---:|
-| 1 | Gluon | `BM16xBN64xBK512, 2 buf, 4 warps` | 16.0 | 15 | 3,925 | 62.8 |
-| 1 | Triton | `BM16xBN128xBK256` | 16.0 | 15 | 3,925 | 62.8 |
-| 1 | Tuned FlyDSL | *not selected — the joint search picked CK here* | — | — | — | — |
-| 1 | Tuned FlyDSL+CK | `CK moe_ck2stages_gemm2 256x64x128x128` | 19.3 | 12 | 3,280 | 63.3 |
-| 8 | Gluon | `BM16xBN128xBK512, 2 buf, 4 warps` | 52.1 | 36 | 4,979 | 259.4 |
-| 8 | Triton | `BM16xBN128xBK256` | 50.7 | 37 | 5,116 | 259.4 |
-| 8 | Tuned FlyDSL | `flydsl moe2 t32x128x256_atomic_bnt2_sbm64` | 57.9 | 32 | 4,501 | 260.6 |
-| 8 | Tuned FlyDSL+CK | `flydsl moe2 t32x128x256_atomic_bnt2_sbm64` | 57.9 | 32 | 4,501 | 260.6 |
-| 32 | Gluon | `BM16xBN128xBK512, 2 buf, 4 warps` | 52.7 | 143 | 4,981 | 262.5 |
-| 32 | Triton | `BM16xBN128xBK256` | 55.5 | 135 | 4,730 | 262.5 |
-| 32 | Tuned FlyDSL | `flydsl moe2 t32x128x256_atomic_bnt2` | 58.0 | 130 | 4,616 | 267.7 |
-| 32 | Tuned FlyDSL+CK | `flydsl moe2 t32x128x256_atomic_bnt2` | 58.0 | 130 | 4,616 | 267.7 |
+| 1 | Gluon | `BM16xBN64xBK512, 2 buf, 4 warps` | 16.4 | 14.3 | 3,829 | 62.8 |
+| 1 | Triton | `BM16xBN128xBK256` | 16.5 | 14.2 | 3,799 | 62.8 |
+| 1 | Tuned FlyDSL | `t16x256x256_atomic_nt_sbm16` | 13.8 | 17.0 | 4,550 | 62.8 |
+| 8 | Gluon | `BM16xBN128xBK512, 2 buf, 4 warps` | 49.2 | 38.2 | 5,267 | 259.3 |
+| 8 | Triton | `BM16xBN128xBK256` | 51.6 | 36.4 | 5,025 | 259.3 |
+| 8 | Tuned FlyDSL | `t16x128x256_atomic_sbm16` | 46.5 | 40.4 | 5,590 | 260.1 |
+| 32 | Gluon | `BM16xBN128xBK512, 2 buf, 4 warps` | 51.4 | 146.1 | 5,097 | 262.2 |
+| 32 | Triton | `BM16xBN128xBK256` | 57.6 | 130.4 | 4,550 | 262.2 |
+| 32 | Tuned FlyDSL | `t16x256x128_atomic_persist_nt_sbm16` | 49.8 | 151.0 | 5,416 | 269.6 |
 
 ### Prefill
 
@@ -97,60 +99,89 @@ FlyDSL candidate -- so there is no tuned FlyDSL entry to report at that point.
 
 | T | impl | kernel / tile | µs | TFLOP/s | HBM GB/s | HBM MB |
 |---:|---|---|---:|---:|---:|---:|
-| 1024 | Gluon | `BM128xBN256xBK256, 2 buf, 8 warps` | 291.2 | 1,652 | 2,087 | 607.8 |
-| 1024 | Triton | `BM128xBN512xBK256` | 412.5 | 1,166 | 1,503 | 620.1 |
-| 1024 | Tuned FlyDSL | `flydsl moe1 t64x128x256_w2_bnt0_fp4` | 223.4 | 2,153 | 3,183 | 711.0 |
-| 1024 | Tuned FlyDSL+CK | `flydsl moe1 t64x128x256_w2_bnt0_fp4` | 223.4 | 2,153 | 3,183 | 711.0 |
-| 4096 | Gluon | `BM128xBN256xBK256, 2 buf, 8 warps` | 942.3 | 2,042 | 1,610 | 1516.8 |
-| 4096 | Triton | `BM128xBN512xBK256` | 1107.6 | 1,737 | 1,332 | 1475.1 |
-| 4096 | Tuned FlyDSL | `flydsl moe1 t64x128x256_w4_bnt0_fp4` | 651.4 | 2,954 | 2,423 | 1578.5 |
-| 4096 | Tuned FlyDSL+CK | `flydsl moe1 t64x128x256_w4_bnt0_fp4` | 651.4 | 2,954 | 2,423 | 1578.5 |
+| 1024 | Gluon | `BM128xBN256xBK256, 2 buf, 8 warps` | 281.8 | 1,707 | 2,157 | 607.9 |
+| 1024 | Triton | `BM128xBN512xBK256` | 394.8 | 1,218 | 1,572 | 620.6 |
+| 1024 | Tuned FlyDSL | `g1_a4w4_128x256x256` | 218.3 | 2,204 | 3,027 | 660.8 |
+| 4096 | Gluon | `BM128xBN256xBK256, 2 buf, 8 warps` | 936.3 | 2,055 | 1,621 | 1517.6 |
+| 4096 | Triton | `BM128xBN512xBK256` | 1068.1 | 1,802 | 1,380 | 1473.9 |
+| 4096 | Tuned FlyDSL | `g1_a4w4_128x256x256` | 574.6 | 3,349 | 2,562 | 1472.3 |
+| 16384 | Gluon | `BM128xBN256xBK256, 2 buf, 8 warps` | 3488.8 | 2,206 | 1,660 | 5791.7 |
+| 16384 | Triton | `BM128xBN512xBK256` | 3790.0 | 2,031 | 1,429 | 5415.6 |
+| 16384 | Tuned FlyDSL | `g1_a4w4_128x256x256` | 2159.5 | 3,564 | 2,468 | 5328.6 |
 
 **Stage 2** (N=7168, K=2048)
 
 | T | impl | kernel / tile | µs | TFLOP/s | HBM GB/s | HBM MB |
 |---:|---|---|---:|---:|---:|---:|
-| 1024 | Gluon | `BM128xBN256xBK256, 2 buf, 8 warps` | 157.2 | 1,530 | 2,665 | 418.9 |
-| 1024 | Triton | `BM128xBN512xBK256` | 189.4 | 1,270 | 2,228 | 422.0 |
-| 1024 | Tuned FlyDSL | `flydsl moe2 t64x256x256_atomic` | 180.9 | 1,330 | 4,916 | 889.3 |
-| 1024 | Tuned FlyDSL+CK | `flydsl moe2 t64x256x256_atomic` | 180.9 | 1,330 | 4,916 | 889.3 |
-| 4096 | Gluon | `BM128xBN256xBK256, 2 buf, 8 warps` | 523.9 | 1,836 | 2,067 | 1082.8 |
-| 4096 | Triton | `BM128xBN512xBK256` | 643.5 | 1,495 | 1,809 | 1164.1 |
-| 4096 | Tuned FlyDSL | `flydsl moe2 t64x128x256_atomic_bnt2` | 526.1 | 1,829 | 2,880 | 1515.4 |
-| 4096 | Tuned FlyDSL+CK | `flydsl moe2 t64x128x256_atomic_bnt2` | 526.1 | 1,829 | 2,880 | 1515.4 |
+| 1024 | Gluon | `BM128xBN256xBK256, 2 buf, 8 warps` | 153.9 | 1,563 | 2,584 | 397.6 |
+| 1024 | Triton | `BM128xBN512xBK256` | 183.7 | 1,310 | 2,228 | 409.2 |
+| 1024 | Tuned FlyDSL | `t128x128x256_atomic_sbm128` | 157.1 | 1,531 | 4,846 | 761.5 |
+| 4096 | Gluon | `BM128xBN256xBK256, 2 buf, 8 warps` | 530.9 | 1,812 | 2,057 | 1091.9 |
+| 4096 | Triton | `BM128xBN512xBK256` | 634.8 | 1,516 | 1,830 | 1161.9 |
+| 4096 | Tuned FlyDSL | `t128x256x128_reduce_sbm128` (split-K 8) | 393.8 | 2,443 | 6,111 | 2406.8 |
+| 16384 | Gluon | `BM128xBN256xBK256, 2 buf, 8 warps` | 1981.3 | 1,942 | 2,202 | 4362.8 |
+| 16384 | Triton | `BM128xBN512xBK256` | 2257.5 | 1,705 | 2,021 | 4563.1 |
+| 16384 | Tuned FlyDSL | `t128x256x128_reduce_sbm128` (split-K 8) | 1568.7 | 2,453 | 6,386 | 10018.1 |
+
+**Two-stage totals**
+
+| T | Gluon µs | Triton µs | Tuned FlyDSL µs | tuned vs Gluon |
+|---:|---:|---:|---:|---:|
+| 1 | 41.8 | 48.2 | 41.0 | 1.02x |
+| 8 | 144.8 | 159.0 | 155.9 | 0.93x |
+| 32 | 147.9 | 176.9 | 158.6 | 0.93x |
+| 1024 | 435.7 | 578.5 | 375.4 | 1.16x |
+| 4096 | 1467.2 | 1702.9 | 968.4 | **1.52x** |
+| 16384 | 5470.1 | 6047.5 | 3728.2 | **1.47x** |
 
 ## Which kernel the tuner selected
 
-`kernelName1`/`kernelName2` from `aiter/configs/tuned_fmoe.csv` for this shape, with the
-tuner's own recorded time next to the time measured here. Every selection was confirmed
-against the symbol that actually dispatched, so the "Tuned" rows above are the tuned
-kernel, not a fallback.
+There is **no tuned row for this shape** in `aiter/configs/tuned_fmoe.csv` or any
+`model_configs/*_tuned_fmoe.csv`. Left alone, the dispatcher takes the untuned fallback,
+so the tuned column above required running the tuner first:
 
-| T | stage | tuner's `kernelName` | tuner's µs | measured µs | dispatched symbol |
-|---:|---:|---|---:|---:|---|
-| 1 | 1 | `flydsl_moe1_afp4_wfp4_bf16_t64x128x256_w4_fp4` | 29.2 | 32.2 | `mfma_moe1_silu_mul_afp4_wfp4_fp4_t64x128x256_pm1_fp4q` |
-| 1 | 2 | `moe_ck2stages_gemm2_256x64x128x128_1x4_...FP4X2_FP4X2_B16` | 20.1 | 19.3 | `kernel_moe_mxgemm_2lds` |
-| 8 | 1 | `flydsl_moe1_afp4_wfp4_bf16_t64x128x256_w3_fp4` | 74.0 | 109.5 † | `mfma_moe1_silu_mul_afp4_wfp4_fp4_t64x128x256_pm1_fp4q` |
-| 8 | 2 | `flydsl_moe2_afp4_wfp4_bf16_t32x128x256_atomic_bnt2_sbm64` | 47.1 | 57.9 † | `mfma_moe2_afp4_wfp4_bf16_cshuffle_t32x128x256_vscale` |
-| 32 | 1 | `flydsl_moe1_afp4_wfp4_bf16_t32x32x256_w3` | 90.3 | 98.5 | `mfma_moe1_silu_mul_afp4_wfp4_bf16_t32x32x256_pm1_async` |
-| 32 | 2 | `flydsl_moe2_afp4_wfp4_bf16_t32x128x256_atomic_bnt2` | 50.8 | 58.0 | `mfma_moe2_afp4_wfp4_bf16_cshuffle_t32x128x256_vscale` |
-| 1024 | 1 | `flydsl_moe1_afp4_wfp4_bf16_t64x128x256_w2_bnt0_fp4` | 208.6 | 223.4 | `mfma_moe1_silu_mul_afp4_wfp4_fp4_t64x128x256_pm1` |
-| 1024 | 2 | `flydsl_moe2_afp4_wfp4_bf16_t64x256x256_atomic` | 163.3 | 180.9 | `mfma_moe2_afp4_wfp4_bf16_cshuffle_t64x256x256_vscale` |
-| 4096 | 1 | `flydsl_moe1_afp4_wfp4_bf16_t64x128x256_w4_bnt0_fp4` | 619.1 | 651.4 | `mfma_moe1_silu_mul_afp4_wfp4_fp4_t64x128x256_pm1` |
-| 4096 | 2 | `flydsl_moe2_afp4_wfp4_bf16_t64x128x256_atomic_bnt2` | 542.6 | 526.1 | `mfma_moe2_afp4_wfp4_bf16_cshuffle_t64x128x256_vscale` |
+```bash
+python csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py --mxfp4-flydsl \
+  -i untuned.csv -o tuned.csv --mp 8 --shape_grouped --all
+```
 
-Measured times run 8-10% above the tuner's own, consistent with counter collection
-serializing dispatches. † T=8 is the exception and the gap is deliberate: the tuner
-recorded natural routing, while these runs force all 33 experts active to match the Gluon
-harness. Unforced, T=8 stage 1 measures 76.0 us against the tuner's 74.0.
+`--mxfp4-flydsl` searches `(g1, g2)` as a coupled unit, so it reports one combined `us`
+per shape and leaves `us2`/`tflops`/`bw` zero. Winners, with the coupled time the tuner
+recorded and the per-stage times measured here:
 
-The tuner searches roughly 800 FlyDSL candidates per dtype pair (272 stage-1 for
-a4w4->bf16, 272 for a4w4->fp4, 257 stage-2) alongside CK codegen instances, hand-written
-ASM kernels and Opus instances, and picks per stage -- which is why the tile changes at
-almost every token count, and why stage 2 at T=1 is CK while stage 1 is FlyDSL.
+| T | winning g1 | winning g2 | tuner µs (g1+g2) | measured µs (g1+g2) |
+|---:|---|---|---:|---:|
+| 1 | `g1_a4w4_16x256x256_f16in_nt` | `t16x256x256_atomic_nt_sbm16` | 42.0 | 41.0 |
+| 8 | `g1_a4w4_16x256x256_f16in_nt` | `t16x128x256_atomic_sbm16` | 127.6 | 155.9 |
+| 32 | `g1_a4w4_16x256x256_f16in_nt` | `t16x256x128_atomic_persist_nt_sbm16` | 160.3 | 158.6 |
+| 1024 | `g1_a4w4_128x256x256` | `t128x128x256_atomic_sbm128` | 394.8 | 375.4 |
+| 4096 | `g1_a4w4_128x256x256` | `t128x256x128_reduce_sbm128` | 1187.8 | 968.4 |
+| 16384 | `g1_a4w4_128x256x256` | `t128x256x128_reduce_sbm128` | 4542.9 | 3728.2 |
+
+The tile choice splits cleanly at the decode/prefill boundary: `16x256x256` wins all three
+decode points, `128x256x256` all three prefill points. Selections were confirmed against
+the symbols that actually dispatched (`gemm1_a4w4_port_h7168_i2048_ne33_bm16_iq_sep` /
+`..._bm128_cached_sep`), so the tuned rows are the tuned kernel, not a fallback.
+
+The tuner's coupled time and the sum of the two measured kernel times are not the same
+quantity -- the tuner times the whole fused call including the sorting and quant aux
+kernels, while the measured column sums only the two GEMM dispatches. The tuner's figure
+is higher at T=8/32 (aux dominates at decode) and lower at prefill (counter collection is
+not serializing its dispatches). Do not read the difference as run-to-run noise.
+
+Errors were 0.0118-0.0128 cosine diff at every point, well inside the tuner's 0.1 gate.
+21 of the searched candidates were rejected, all of them CUDA OOM on the `32x256x256` g1
+variant at T=16384 -- no correctness rejections.
 
 
 ## Like-for-like: fp4 intermediate
+
+> **Stale for the tuned column.** This section was measured against the *previous* tuned
+> selection, whose stage-1 kernels carried an explicit `_fp4q` marker. The re-tuned
+> winners above (`gemm1_a4w4_port_..._sep`) carry no such marker and their stage-2
+> partners are all `..._bf16_...`, but the intermediate dtype has **not** been confirmed
+> at the IR level. Until it is, treat the tuned prefill stage-1 numbers as possibly not
+> like-for-like against bf16-emitting Gluon. The Gluon and Triton columns below stand.
 
 The tuned FlyDSL stage-1 kernel fuses the MXFP4 quant of the intermediate into its
 epilogue (`_fp4q`) at every token count except T=32, so the tables above compare it
@@ -231,6 +262,34 @@ two `BLOCK_K=256` stages in flight (512 K-elements) cannot cover the latency, an
 `BLOCK_N=256` there is no LDS left to go deeper. FlyDSL reaches the same wave count as
 2-3 workgroups of 4 waves with its own prefetch, and at T=4096 gets to 3 CTAs/CU.
 
+**Advanced Thread Trace confirms it, and names the instruction.** ATT captures
+(`rocprofv3 --att --att-target-cu 1 --kernel-iteration-range 1-1`) attribute stall cycles
+per instruction on one CU for one dispatch. Share of that CU's total stall cycles:
+
+| | `s_barrier` | `s_waitcnt` | `ds_read` | stall/latency |
+|---|---:|---:|---:|---:|
+| Gluon T=1024 s1 | 26-33% | -- | 10-14% | 83.2% |
+| FlyDSL T=1024 s1 | 8-11% | 22-46% | ~1% | 83.7% |
+| Gluon T=4096 s1 | 26-33% | -- | 10-14% | 81.7% |
+| FlyDSL T=4096 s1 | 8-11% | 22-46% | ~1% | 78.1% |
+
+Both are ~80% stalled; they stall on different things. Gluon waits at barriers and on LDS
+reads, FlyDSL waits on memory counters -- which is what you want, because `s_waitcnt` on a
+prefetched load can overlap with another workgroup's compute while `s_barrier` cannot.
+The wall-clock cycle span on the traced CU follows: 1,596,480 vs 1,174,420 clocks for
+stage 1 at T=4096 (gfx clock 1.90-2.12 GHz, read from the trace's own
+`realtime.json` gfx/realtime clock pairs).
+
+The mechanism is the LDS budget already noted above. Gluon's 105,952 B and 512-thread
+workgroup mean **one CTA per CU**, so every one of its 9 `s_barrier`s stalls all 8 resident
+waves simultaneously with nothing else to run. The tuned kernels are 256-thread workgroups
+at 55,424 B, giving two CTAs per CU (three for stage 2 at T=4096), so one workgroup's
+barrier is covered by the other's work.
+
+*(The ATT captures were taken against the previous tuned selection, not the re-tuned
+kernels in the tables above. The Gluon side -- which is what the argument rests on -- is
+unaffected.)*
+
 Closing this needs more K in flight per byte of LDS -- the same restructuring the decode
 investigation pointed at -- not another tile from the existing ladder.
 
@@ -251,54 +310,98 @@ compulsory floor. So the modifier is evidently honoured differently on Gluon's
 `buffer_load_to_shared` (direct-to-LDS) path than on a register `tl.load` -- the Triton
 config was not a template to copy here, and the A/B was needed to find it.
 
-**Prefill is compute-bound** and the ordering changes: FlyDSL's stage 1 is 30% (T=1024)
-to 45% (T=4096) ahead of Gluon while moving *more* bytes, so its advantage there is
-scheduling -- a persistent grid with no tail -- not memory.
+**Prefill is compute-bound** and the ordering inverts: tuned FlyDSL stage 1 is 29%
+(T=1024), 63% (T=4096) and 62% (T=16384) ahead of Gluon in TFLOP/s. At T=4096 it does this
+on *less* HBM traffic than Gluon (1472 vs 1518 MB), so it is a straight arithmetic-
+throughput win, not a memory one -- consistent with the barrier-stall finding below.
+
+**The tuned stage-2 prefill win is bought with bandwidth, not saved bytes.** At T=4096
+the `reduce_sbm128` winner moves 2407 MB against Gluon's 1092 -- 2.2x the traffic, 2.3x at
+T=16384 -- and is still 26% faster because it sustains 6.1-6.4 TB/s where Gluon sustains
+2.1. That is a split-K-8 kernel trading footprint for parallelism, and it runs close to
+HBM peak. On a bandwidth-contended system, or co-resident with other work, that extra
+traffic is a real cost this isolated benchmark does not charge it for.
 
 **Where each implementation wins**
 
-| | decode (T=1, 8, 32) | prefill (T=1024, 4096) |
+| | decode (T=1, 8, 32) | prefill (T=1024, 4096, 16384) |
 |---|---|---|
-| Gluon | fastest at 3 of 6 points (T=1 s1, T=8 s1, T=32 s2), tied at T=1 s2 | fastest **stage 2** at both points |
-| Triton | fastest at T=8 s2 (by 2.8%) | slowest at every point |
-| Tuned FlyDSL | fastest at T=32 s1 (by 2.4%) | fastest **stage 1** at both points |
+| Gluon | fastest at 3 of 6 points (all three stage 1) | fastest **stage 2** at T=1024 only |
+| Triton | never fastest | slowest at every point |
+| Tuned FlyDSL | fastest at all three stage-2 points | fastest **stage 1** at all three; fastest stage 2 at T=4096, 16384 |
 
-No implementation dominates. Gluon and the tuned kernels are within a few percent of each
-other across decode; the clear separations are Triton trailing at prefill, and FlyDSL's
-stage-1 lead at prefill (see caveat 1 -- that comparison is not like-for-like).
+The split is clean and it is the opposite of what the previous revision of this document
+reported. **Gluon owns decode** by ~7% on the two-stage total (its stage-1 lead of 13-14%
+outweighs a 3-5% stage-2 deficit); **tuned FlyDSL owns prefill** by 1.16x at T=1024 rising
+to 1.52x at T=4096 and 1.47x at T=16384. Triton trails everywhere.
 
 ## Caveats
 
-1. **FlyDSL stage 1 emits fp4 at T=1, 8, 1024 and 4096** (`_fp4q`) while the Gluon and
-   Triton rows in the tables above emit bf16, so those rows are not like-for-like. The
-   "Like-for-like fp4 intermediate" section measures the fair version: it does not favour
-   Gluon, it widens the gap. At T=32 FlyDSL emits bf16 and that row is directly
-   comparable as printed.
-2. Tuned FlyDSL/CK numbers come from the **aiter-02** checkout, because
-   `test_moe_2stage.py` has no repo-root `sys.path` bootstrap and resolves `aiter` there.
+1. **The tuned stage-1 intermediate dtype is unverified.** See the banner on the
+   "Like-for-like" section. If the re-tuned `..._sep` kernels still emit fp4, the tuned
+   prefill stage-1 rows are not like-for-like against bf16-emitting Gluon.
+2. **The tuned column is a FlyDSL-only search**, not the joint FlyDSL+CK+ASM+Opus search
+   the dispatcher would run. See "How the columns are defined".
 3. The active expert *ids* differ between harnesses (`arange(n)` vs `randperm(n)`); only
    the count and the balance affect traffic, both of which are pinned.
-4. Counter collection serializes dispatches, which costs a few percent. The tuner's own
-   recorded times for this shape (`us1` = 29.2 / 90.3 at T=1 / T=32) sit 9-10% below the
-   times measured here, consistent with that overhead.
-5. Single shape, single GPU, per-dispatch average over 5 (Gluon/Triton) or 8 (FlyDSL/CK)
-   dispatches. No error bars; run-to-run variance on repeated sweeps was 1-2%.
+4. Counter collection serializes dispatches, which costs a few percent.
+5. Single shape, single GPU, per-dispatch average over 20 dispatches (25 recorded, first
+   fifth dropped as warmup). No error bars; repeated sweeps of the same configuration
+   varied 2-4% -- e.g. Gluon T=4096 stage 1 measured 903.6, 936.3 and 942.3 us across
+   three runs, so differences below ~5% in these tables should not be ranked.
+6. All numbers in this document were measured in **this** checkout on one machine, unlike
+   an earlier revision whose tuned column was borrowed from a separate `aiter-02` tree.
 
 ## Reproducing
 
 ```bash
 # Gluon / Triton, aligned routing. --n-active mirrors the other harness's
 # AITER_MOE_NUM_EXPERT_ACTIVATED; it must be <= min(E, T*topk), so T=1 needs 8.
+# PYTHONPATH points at the rocprof shim; see below for why.
+PYTHONPATH=op_tests/op_benchmarks/triton/rocprof_shim \
 rocprofv3 --pmc TCC_HIT_sum TCC_MISS_sum --truncate-kernels -d out \
   -- python op_tests/op_benchmarks/triton/bench_moe_gemm_gluon.py \
      --op a4w4 --shape 7168,2048,33,8 --tokens 8 32 1024 4096 --n-active 33
 
-# Tuned FlyDSL / CK (from the aiter-02 checkout)
-AITER_MOE_NUM_EXPERT_ACTIVATED=33 \
+# Tuned FlyDSL. AITER_CONFIG_FMOE points the dispatcher at the tuned CSV; without it
+# this shape has no tuned row and silently takes the untuned fallback.
+AITER_MOE_NUM_EXPERT_ACTIVATED=33 AITER_CONFIG_FMOE=tuned.csv \
+PYTHONPATH=op_tests/op_benchmarks/triton/rocprof_shim \
 rocprofv3 --pmc TCC_HIT_sum TCC_MISS_sum --truncate-kernels -d out \
   -- python op_tests/test_moe_2stage.py -q 4 -dim 7168,2048 -e 33 -k 8 -t 32 \
-     --csv-filter __none__
+     --csv-filter __none__ --kernel
 ```
+
+### Environment prerequisites for the FlyDSL side
+
+Three traps, all of which fail far from their cause. Set these before any run that
+JIT-compiles a FlyDSL kernel:
+
+```bash
+export PATH="$ROCM_SDK/lib/llvm/bin:$ROCM_SDK/bin:$PATH"
+export FLYDSL_GPU_ARCH=gfx950
+```
+
+1. **`rocm_agent_enumerator` must be on PATH.** `flydsl/runtime/device.py::_arch_from_hardware`
+   shells out to it, swallows every exception, and returns a hard-coded `"gfx942"` on
+   failure. These kernels emit a 16-byte `rocdl.raw.ptr.buffer.load.lds`; gfx942 has no
+   128-bit LDS DMA, and LLVM does not diagnose it -- the DAG legalizer hits
+   `ExpandIntegerOperand` on the `ptr addrspace(8)` rsrc and dies with
+   `LLVM ERROR: Do not know how to expand this operator's operand!`, naming neither the
+   target nor the intrinsic. `FLYDSL_GPU_ARCH=gfx950` pins it regardless. To confirm a
+   suspected case: `FLYDSL_DUMP_IR=1 FLYDSL_DUMP_DIR=d` then `grep 'chip =' d/*/00_origin.mlir`.
+2. **The toolchain's `ld.lld` must come first on PATH.** A distro `/usr/bin/ld.lld` from a
+   different LLVM major (22 vs the toolchain's 23) makes MLIR's `gpu-module-to-binary`
+   fail with `lld invocation failed` and nothing else.
+3. **The shape needs an mxfp4 aux instance.** `SHAPES` in
+   `csrc/kernels/mxfp4_moe/moe_aux/codegen/gen_instances.py` is a hard-coded list; a shape
+   missing from it fails at runtime with
+   `no codegen'd instance for shape key 'aux_sortzi_NE33_TOPK8_MB16_H7168'`. E=33 was added
+   there for this document. After editing it, delete `aiter/jit/build/module_moe_mxfp4_aux`
+   and the `.so` to force a real regeneration -- the JIT will otherwise relink stale blobs.
+
+Under `rocprofv3`, a FlyDSL compile abort additionally deadlocks in the profiler's chained
+signal handler rather than exiting, so the run hangs until its timeout instead of failing.
 
 The benchmark's own wall-clock columns are not what this document reports -- take the
 kernel times from the trace (`rocpd_kernel_dispatch`), for the reason given at the top.
@@ -309,3 +412,13 @@ some rows have no AOT cache entry.
 
 If `rocprofv3` fails with error 16, `torch/lib/librocprofiler-sdk.so` is a second copy of
 the SDK; move it aside for the duration of the run.
+
+If instead it dies with a SIGSEGV in `llvm::DenseMapBase<>::LookupBucketFor<>()` before
+any kernel runs, the crash is in `import triton`, not in anything being measured: the
+profiler `LD_PRELOAD`s a rocprofiler-sdk that drags in `libLLVM.so.23`, whose global LLVM
+symbols the statically-LLVM-linked `libtriton.so` then binds to in its own static
+initialisers (`_GLOBAL__sub_I_PassBuilder.cpp`, `llvm::DebugCounter`). The shim in
+`op_tests/op_benchmarks/triton/rocprof_shim/` pre-imports Triton with `RTLD_DEEPBIND`
+when -- and only when -- a rocprofiler library is preloaded, which is why the command
+above sets `PYTHONPATH`. Prepend the same `PYTHONPATH=...` to any other profiled run that
+imports `aiter` or `triton`.
