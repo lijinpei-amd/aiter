@@ -3,18 +3,6 @@
 
 """Dtype / quant-scheme enums and the host->device NamedTuples of the gfx950 Gluon MoE
 grouped GEMMs.
-
-A ``@gluon.aggregate`` cannot cross the launch boundary, so everything that has to be
-passed in from the host is a ``NamedTuple``: Triton flattens its leaves positionally
-into the real signature. Two rules that are easy to get wrong and are the reason for
-the ``_c()`` helper below:
-
-* a NamedTuple field only becomes compile-time if the *value* is a ``gl.constexpr``
-  instance -- the ``: gl.constexpr`` annotation on the class is documentation, the
-  specializer never reads ``__annotations__``;
-* anything the specializer does not know how to type (``str``, enum members, plain
-  Python objects) must be wrapped in ``gl.constexpr`` too, otherwise the launch fails
-  with ``failed to specialize argument of type: ...``.
 """
 
 from enum import IntEnum
@@ -45,9 +33,6 @@ __all__ = [
 ]
 
 
-# --------------------------------------------------------------------------------
-# enums -- carried as int-valued gl.constexpr
-# --------------------------------------------------------------------------------
 class DtypeQuant(IntEnum):
     """Tensor payload dtype together with its quantisation scheme."""
 
@@ -59,6 +44,7 @@ class DtypeQuant(IntEnum):
 
 class ScaleSwizzle(IntEnum):
     NONE = 0
+    # TODO name what the swizzle does, not the arch
     CDNA4_SCALE = 1  # utils/shuffle.py:_shuffle_scale_tile_gfx950 preshuffle
 
 
@@ -100,7 +86,10 @@ class FuncSpec(NamedTuple):
 
 
 class TuningSpec(NamedTuple):
-    """Same, for :class:`KernelTuningConfig` (minus its leading ``func_cfg`` field)."""
+    """Plain-Python mirror of :class:`KernelTuningConfig`'s fields, carried as a single
+    ``gl.constexpr`` leaf so the launch-time argument specializer walks one item instead
+    of twenty-six. Field order must match the aggregate's constructor, skipping its
+    leading ``func_cfg`` field -- that one is rebuilt from :class:`FuncSpec`."""
 
     BLOCK_M: int
     BLOCK_N: int
@@ -143,9 +132,6 @@ class ActivationSpec(NamedTuple):
     add_residual: bool  # False | False | True
 
 
-# --------------------------------------------------------------------------------
-# constexpr helpers over DtypeQuant
-# --------------------------------------------------------------------------------
 @gluon.constexpr_function
 def _unwrap(x):
     """Accept either a raw Python value or a ``gl.constexpr`` wrapping one.
