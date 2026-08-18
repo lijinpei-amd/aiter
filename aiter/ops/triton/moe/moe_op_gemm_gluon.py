@@ -73,9 +73,6 @@ def _can_overflow_int32(t: torch.Tensor | None, drop_leading: int = 0) -> bool:
     return offset > max_int32
 
 
-# --------------------------------------------------------------------------------
-# dtype inference
-# --------------------------------------------------------------------------------
 def _hashable(v):
     return tuple(v) if isinstance(v, list) else v
 
@@ -192,9 +189,6 @@ def _probe_lds_bytes_uncached(cfg: dict, dq_a, dq_b) -> int:
     return KernelTuningConfig(func, *_tuning_args(cfg)).lds_bytes()
 
 
-# --------------------------------------------------------------------------------
-# tuning
-# --------------------------------------------------------------------------------
 @cache
 def _get_gluon_config_cached(
     block_m: int, N: int, K: int, dq_a, dq_b, small_grid: bool
@@ -462,9 +456,6 @@ def gluon_supported(
     return True, ""
 
 
-# --------------------------------------------------------------------------------
-# launch
-# --------------------------------------------------------------------------------
 @cache
 def _launch_spec(
     block_m,
