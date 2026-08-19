@@ -266,10 +266,8 @@ class KernelTuningConfig:
     BLOCK_K: gl.constexpr
     K_UNROLL: gl.constexpr
     MINI_BLOCK_K: gl.constexpr
-    MINI_PREFETCH_K: gl.constexpr
     MINI_BLOCK_M: gl.constexpr
     MINI_BLOCK_N: gl.constexpr
-    MINI_PRESTORE_MN: gl.constexpr
     NUM_LDS_BUFFER: gl.constexpr
     mfma_instr_shape: gl.constexpr
     warps_per_cta: gl.constexpr
@@ -287,6 +285,7 @@ class KernelTuningConfig:
     result_mod: gl.constexpr
     result_scale_mod: gl.constexpr
     WARP_PIPELINE: gl.constexpr
+    VGPR_PREFETCH_K: gl.constexpr
 
     @gluon.constexpr_function
     def __init__(
@@ -297,10 +296,8 @@ class KernelTuningConfig:
         BLOCK_K,
         K_UNROLL,
         MINI_BLOCK_K,
-        MINI_PREFETCH_K,
         MINI_BLOCK_M,
         MINI_BLOCK_N,
-        MINI_PRESTORE_MN,
         NUM_LDS_BUFFER,
         mfma_instr_shape,
         warps_per_cta,
@@ -318,6 +315,7 @@ class KernelTuningConfig:
         result_mod,
         result_scale_mod,
         WARP_PIPELINE,
+        VGPR_PREFETCH_K,
     ):
         self.func_cfg = func_cfg
         self.BLOCK_M = gl.constexpr(_v(BLOCK_M))
@@ -325,10 +323,8 @@ class KernelTuningConfig:
         self.BLOCK_K = gl.constexpr(_v(BLOCK_K))
         self.K_UNROLL = gl.constexpr(_v(K_UNROLL))
         self.MINI_BLOCK_K = gl.constexpr(_v(MINI_BLOCK_K))
-        self.MINI_PREFETCH_K = gl.constexpr(_v(MINI_PREFETCH_K))
         self.MINI_BLOCK_M = gl.constexpr(_v(MINI_BLOCK_M))
         self.MINI_BLOCK_N = gl.constexpr(_v(MINI_BLOCK_N))
-        self.MINI_PRESTORE_MN = gl.constexpr(_v(MINI_PRESTORE_MN))
         self.NUM_LDS_BUFFER = gl.constexpr(_v(NUM_LDS_BUFFER))
         self.mfma_instr_shape = gl.constexpr(list(_v(mfma_instr_shape)))
         self.warps_per_cta = gl.constexpr(list(_v(warps_per_cta)))
@@ -346,6 +342,7 @@ class KernelTuningConfig:
         self.result_mod = gl.constexpr(_v(result_mod))
         self.result_scale_mod = gl.constexpr(_v(result_scale_mod))
         self.WARP_PIPELINE = gl.constexpr(_v(WARP_PIPELINE))
+        self.VGPR_PREFETCH_K = gl.constexpr(int(_v(VGPR_PREFETCH_K)))
 
     @gluon.constexpr_function
     def num_warps(self):
@@ -376,6 +373,15 @@ class KernelTuningConfig:
     def num_mini_k(self):
         """Mini-K steps per BLOCK_K stage."""
         return _v(self.BLOCK_K) // _v(self.MINI_BLOCK_K)
+
+    @gluon.constexpr_function
+    def num_prefetch_mini(self):
+        """Mini-K steps held in registers across a pipeline step.
+
+        ``num_mini_k()`` means the whole stage is carried (the MFMAs never touch a tile
+        read in their own step); 0 means none is. Anything between splits the stage.
+        """
+        return _v(self.VGPR_PREFETCH_K) // _v(self.MINI_BLOCK_K)
 
     @gluon.constexpr_function
     def lds_shape(self, idx):
@@ -621,12 +627,7 @@ class KernelTuningConfig:
         # -- divisibility lattice --
         assert BK % _v(self.MINI_BLOCK_K) == 0
         assert _v(self.MINI_BLOCK_K) % instr[2] == 0
-        assert _v(self.MINI_PREFETCH_K) < BK // _v(self.MINI_BLOCK_K)
         assert BK % MX_GROUP == 0
-        if _v(self.MINI_PREFETCH_K) > 0:
-            assert (
-                _v(self.K_UNROLL) >= 2
-            ), "MINI_PREFETCH_K needs the next stage's index"
         if _v(self.MINI_BLOCK_K) < BK:
             # The LDS scale path slices per mini-tile; the register fallback advances a
             # flat offset by MINI_BLOCK_K/32 and hands mfma_scaled a fragment still
@@ -667,16 +668,6 @@ class KernelTuningConfig:
             f"MINI_BLOCK_N {_v(self.MINI_BLOCK_N)} must be a multiple of "
             f"instr[1]*warps[1]*tiles[1] = {instr[1] * warps[1] * tiles[1]}"
         )
-        assert _v(self.MINI_PRESTORE_MN) <= (BM // _v(self.MINI_BLOCK_M)) * (
-            BN // _v(self.MINI_BLOCK_N)
-        )
-        assert _v(self.MINI_PRESTORE_MN) == 1, (
-            "MINI_PRESTORE_MN only means something when results are staged through LDS. "
-            "This epilogue does the MX group amax in registers -- the transposed MFMA "
-            "accumulator already gives each lane 4 consecutive N, so the reduction over "
-            "the remaining lanes is a reshape, not an LDS round trip -- and stores each "
-            "mini tile straight to HBM, so there is nothing to pre-stage."
-        )
 
         # -- MFMA shape must fit the tile --
         assert BM % (instr[0] * warps[0] * tiles[0]) == 0
@@ -707,6 +698,34 @@ class KernelTuningConfig:
             "WARP_PIPELINE is not usable with a consume-then-refill pipeline: the "
             "wait_group and the LDS reads cannot both live inside a stage region"
         )
+
+        # -- pipeline wait depth --
+        # The loop is wait-first / commit-last and always copies into a buffer no live
+        # stage occupies, so on every step one buffer is being filled by buffer_load and
+        # one is being consumed by ds_read: the wait is NUM_LDS_BUFFER-2, and two
+        # buffers leave nothing to overlap with (the wait folds to wait_group(0) and
+        # drains every copy on every stage -- measured 1217 us against 1028 us).
+        assert _v(self.NUM_LDS_BUFFER) >= 3, (
+            f"NUM_LDS_BUFFER {_v(self.NUM_LDS_BUFFER)} < 3: one buffer is being filled "
+            "and one consumed on every step, leaving nothing to overlap a copy with"
+        )
+
+        # -- register prefetch depth --
+        # VGPR_PREFETCH_K is how much of a BLOCK_K stage is read into registers one step
+        # before its MFMAs consume it. BLOCK_K carries the whole stage, 0 carries none,
+        # and the ds_read still moves a full stage either way -- only the register
+        # handoff changes, which is why the buffer arithmetic above does not mention it.
+        pk = _v(self.VGPR_PREFETCH_K)
+        if pk:
+            assert pk <= BK, f"VGPR_PREFETCH_K {pk} > BLOCK_K {BK}"
+            assert pk >= _v(self.MINI_BLOCK_K), (
+                f"VGPR_PREFETCH_K {pk} < MINI_BLOCK_K {_v(self.MINI_BLOCK_K)}: the "
+                "handoff is a whole number of mini-K steps"
+            )
+            assert BK % pk == 0, f"BLOCK_K {BK} % VGPR_PREFETCH_K {pk} != 0"
+            assert (
+                pk % _v(self.MINI_BLOCK_K) == 0
+            ), f"VGPR_PREFETCH_K {pk} % MINI_BLOCK_K {_v(self.MINI_BLOCK_K)} != 0"
 
         # -- resource budgets --
         lds = self.lds_bytes()
