@@ -99,10 +99,8 @@ class TuningSpec(NamedTuple):
     BLOCK_K: int
     K_UNROLL: int
     MINI_BLOCK_K: int
-    MINI_PREFETCH_K: int
     MINI_BLOCK_M: int
     MINI_BLOCK_N: int
-    MINI_PRESTORE_MN: int
     NUM_LDS_BUFFER: int
     mfma_instr_shape: tuple
     warps_per_cta: tuple
@@ -120,6 +118,7 @@ class TuningSpec(NamedTuple):
     result_mod: str
     result_scale_mod: str
     WARP_PIPELINE: bool
+    VGPR_PREFETCH_K: int
 
 
 class ActivationSpec(NamedTuple):

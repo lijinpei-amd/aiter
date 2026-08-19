@@ -116,6 +116,11 @@ def _mfma_instr(dq_a, dq_b, nonk: int):
     return (32, 32, 64) if nonk == 32 else (16, 16, 128)
 
 
+def _env_int(name: str, default: int) -> int:
+    v = os.environ.get(name)
+    return default if v is None else int(v)
+
+
 @cache
 def _probe_lds_bytes_cached(cfg_items: tuple, dq_a, dq_b) -> int:
     return _probe_lds_bytes_uncached(dict(cfg_items), dq_a, dq_b)
@@ -245,21 +250,22 @@ def get_gluon_config_uncached(
         # the K loop -- measured at +17 us on H=7168 I=2048 E=32 topk=8 T=32, which no
         # amount of the occupancy it buys back (4 CTAs/CU vs 2) makes up for.
         # Two buffers, not three: measured 112 us vs 118 at half the LDS.
-        block_n, block_k, num_warps, nb = 128, 512, 4, 2
+        block_n, block_k, num_warps, nb = 128, 512, 4, 3
         nonk = 16
         if small_grid:
             # A narrow N tile is the only way to keep every XCD busy when the router
             # hands out only a few M blocks.
             block_n = 64
     elif block_m == 32:
-        block_n, block_k, num_warps, nb = 256, 512, 4, 2
+        block_n, block_k, num_warps, nb = 256, 512, 4, 3
         nonk = 16
     elif block_m == 64:
-        block_n, block_k, num_warps, nb = 256, 256, 8, 2
+        block_n, block_k, num_warps, nb = 256, 256, 8, 3
         nonk = 32
     else:  # 128
-        block_n, block_k, num_warps, nb = 256, 256, 8, 2
+        block_n, block_k, num_warps, nb = 256, 256, 8, 3
         nonk = 32
+    nb = _env_int("AITER_TRITON_MOE_GLUON_NB", nb)
     instr = _mfma_instr(dq_a, dq_b, nonk)
 
     # shrink the N tile until it divides N (the kernel has no N tail by construction).
@@ -277,7 +283,9 @@ def get_gluon_config_uncached(
         gran_n = instr[1] * warps[1]
         # Not defensive: if this ever fails the loop below never terminates, and the
         # symptom is a test run that spins at 200% CPU for an hour with no output.
-        assert bn % gran_n == 0, f"BLOCK_N {bn} not a multiple of warp N-granularity {gran_n}"
+        assert (
+            bn % gran_n == 0
+        ), f"BLOCK_N {bn} not a multiple of warp N-granularity {gran_n}"
         mini_n = min(bn, gran_n * 2)
         while mini_n % gran_n:
             mini_n += gran_n
@@ -287,10 +295,8 @@ def get_gluon_config_uncached(
             "BLOCK_K": bk,
             "K_UNROLL": n_buf,
             "MINI_BLOCK_K": bk,
-            "MINI_PREFETCH_K": 0,
             "MINI_BLOCK_M": block_m,
             "MINI_BLOCK_N": mini_n,
-            "MINI_PRESTORE_MN": 1,
             "NUM_LDS_BUFFER": n_buf,
             "mfma_instr_shape": instr,
             "warps_per_cta": warps,
@@ -320,6 +326,21 @@ def get_gluon_config_uncached(
             "result_mod": "",
             "result_scale_mod": "",
             "WARP_PIPELINE": False,
+            # Read stage N's fragments one stage before their MFMA consumes them. Costs
+            # one BLOCK_K tile of live registers and one stage of global prefetch depth
+            # (the fill is waited on at stage s+NB-1 rather than s+NB), so it wants
+            # NUM_LDS_BUFFER >= 3 to break even on the global side. 0 is off; a nonzero
+            # m turns it on and sets the wait to wait_group(NB - m), so 1 is the minimal
+            # wait and higher m over-waits. Over-waiting only loses: at NB=3 with relaxed
+            # loads, T=4096 stage 1 measured 1005.6 us at m=2 (vmcnt(8), one stage
+            # outstanding) against 1090.9 us at m=3, where the wait folds to vmcnt(0) and
+            # drains every global load three times per loop body.
+            # How much of a BLOCK_K stage is read into registers one step before
+            # its MFMAs consume it. BLOCK_K (the default) carries the whole stage
+            # so a ds_read and its MFMA sit a stage apart and never meet lgkmcnt;
+            # 0 reads and consumes in the same step. Intermediate values only
+            # become reachable once MINI_BLOCK_K < BLOCK_K.
+            "VGPR_PREFETCH_K": _env_int("AITER_TRITON_MOE_GLUON_VGPR_PREFETCH_K", bk),
         }
 
     # Which axis to give up first when the tile does not fit.
@@ -345,7 +366,7 @@ def get_gluon_config_uncached(
                 block_n //= 2
             else:
                 block_k //= 2
-        elif nb > 2:
+        elif nb > 3:
             nb -= 1
         elif second:
             if shrink_n_first:
@@ -355,7 +376,7 @@ def get_gluon_config_uncached(
         else:
             break  # gluon_supported's validate() will reject it
         if K // block_k < nb:
-            nb = max(2, K // block_k)
+            nb = max(3, K // block_k)
         cfg = _build(block_n, block_k, nb)
     return cfg
 
@@ -810,10 +831,8 @@ _TUNING_KEYS = (
     "BLOCK_K",
     "K_UNROLL",
     "MINI_BLOCK_K",
-    "MINI_PREFETCH_K",
     "MINI_BLOCK_M",
     "MINI_BLOCK_N",
-    "MINI_PRESTORE_MN",
     "NUM_LDS_BUFFER",
     "mfma_instr_shape",
     "warps_per_cta",
@@ -831,6 +850,7 @@ _TUNING_KEYS = (
     "result_mod",
     "result_scale_mod",
     "WARP_PIPELINE",
+    "VGPR_PREFETCH_K",
 )
 
 
