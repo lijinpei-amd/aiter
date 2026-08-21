@@ -384,11 +384,40 @@ class KernelTuningConfig:
         return _v(self.VGPR_PREFETCH_K) // _v(self.MINI_BLOCK_K)
 
     @gluon.constexpr_function
+    def num_mini_m(self):
+        """Mini-M row blocks per CTA tile. Operand A and the accumulator split by this."""
+        return _v(self.BLOCK_M) // _v(self.MINI_BLOCK_M)
+
+    @gluon.constexpr_function
+    def num_mini_n(self):
+        """Mini-N column blocks per CTA tile. Operand B and the accumulator split."""
+        return _v(self.BLOCK_N) // _v(self.MINI_BLOCK_N)
+
+    @gluon.constexpr_function
+    def num_lds_tiles(self, idx):
+        """How many independently copied/read tiles one operand's stage is split into."""
+        return self.num_mini_m() if _v(idx) == 0 else self.num_mini_n()
+
+    @gluon.constexpr_function
     def lds_shape(self, idx):
-        """Shared tile shape of one payload operand, in stored (packed) elements."""
+        """Shared tile shape of one payload operand, in stored (packed) elements.
+
+        This is a *mini* block, not the whole CTA tile: A is split along M into
+        ``num_mini_m()`` tiles of ``MINI_BLOCK_M`` rows, B along N into ``num_mini_n()``
+        tiles of ``MINI_BLOCK_N`` columns. Each tile is allocated, copied and read as an
+        independent unit, so each gets its own efficient padded layout and its own fully
+        coalesced direct-to-LDS copy -- slicing one big tile would instead hand the copy
+        a strided view of a permuted layout.
+        """
         if _v(idx) == 0:
-            return [_v(self.BLOCK_M), _v(self.BLOCK_K) // self.func_cfg.pack_divisor(0)]
-        return [_v(self.BLOCK_K) // self.func_cfg.pack_divisor(1), _v(self.BLOCK_N)]
+            return [
+                _v(self.MINI_BLOCK_M),
+                _v(self.BLOCK_K) // self.func_cfg.pack_divisor(0),
+            ]
+        return [
+            _v(self.BLOCK_K) // self.func_cfg.pack_divisor(1),
+            _v(self.MINI_BLOCK_N),
+        ]
 
     @gluon.constexpr_function
     def a_lds_shape(self):
@@ -400,8 +429,8 @@ class KernelTuningConfig:
 
     @gluon.constexpr_function
     def scale_shape(self, idx):
-        """E8M0 scale tile of one operand, always [non-K extent, BLOCK_K/32]."""
-        non_k = _v(self.BLOCK_M) if _v(idx) == 0 else _v(self.BLOCK_N)
+        """E8M0 scale tile of one operand, [mini non-K extent, BLOCK_K/32]."""
+        non_k = _v(self.MINI_BLOCK_M) if _v(idx) == 0 else _v(self.MINI_BLOCK_N)
         return [non_k, _v(self.BLOCK_K) // MX_GROUP]
 
     @gluon.constexpr_function
@@ -595,14 +624,16 @@ class KernelTuningConfig:
         for idx in (0, 1):
             shape = self.lds_shape(idx)
             width = fc.operand_elem_ty(idx).primitive_bitwidth // 8
-            per_stage += shape[0] * shape[1] * width
+            # lds_shape() is one mini block; a stage holds num_lds_tiles() of them
+            n_tiles = self.num_lds_tiles(idx)
+            per_stage += n_tiles * shape[0] * shape[1] * width
             # LDSManager.alloc() allocates the scale buffer whenever the operand has
             # a scale, not only when it is filled by a direct-to-LDS copy, so the
             # budget has to count it the same way -- otherwise the host shrink loop
             # accepts a config whose real footprint is larger than it believes.
             if fc.has_scale(idx):
                 s = self.scale_shape(idx)
-                per_stage += s[0] * s[1]
+                per_stage += n_tiles * s[0] * s[1]
         return per_stage * _v(self.NUM_LDS_BUFFER)
 
     @gluon.constexpr_function
@@ -656,8 +687,9 @@ class KernelTuningConfig:
         n_fill = _v(self.NUM_LDS_BUFFER) + (n_k - _v(self.NUM_LDS_BUFFER))
         assert n_fill == n_k, "fill count must equal cdiv(K, BLOCK_K)"
 
-        # -- gl.amd.slice is register-only and layout-preserving, so the mini tile must
-        #    align to the CTA tiling; non-divisible values are illegal, not wasteful --
+        # -- the mini block is the unit of LDS allocation, of the global->LDS copy, of
+        #    the MFMA and of the accumulator, so it must align to the CTA tiling;
+        #    non-divisible values are illegal, not merely wasteful --
         assert BM % _v(self.MINI_BLOCK_M) == 0
         assert BN % _v(self.MINI_BLOCK_N) == 0
         assert _v(self.MINI_BLOCK_M) % (instr[0] * warps[0] * tiles[0]) == 0, (
@@ -668,6 +700,22 @@ class KernelTuningConfig:
             f"MINI_BLOCK_N {_v(self.MINI_BLOCK_N)} must be a multiple of "
             f"instr[1]*warps[1]*tiles[1] = {instr[1] * warps[1] * tiles[1]}"
         )
+
+        # -- a mini block is also the granule of the global->LDS copy, so once an operand
+        #    is actually split it must still give every warp a full 128-bit access.
+        #    Below that, _bases_to_distributed runs out of bases for the warp dimension
+        #    and pads it with zeros, which makes the surplus warps re-fetch and re-write
+        #    a tile another warp already owns: correct, but pure wasted HBM traffic. --
+        for idx in (0, 1):
+            if self.num_lds_tiles(idx) > 1 and self.payload_via_lds(idx):
+                tile = self.lds_shape(idx)
+                vec = self.copy_contiguity(idx)
+                need = WARP_SIZE * vec * self.num_warps()
+                assert tile[0] * tile[1] >= need, (
+                    f"operand {idx}'s mini tile {tile} holds {tile[0] * tile[1]} "
+                    f"elements, below the {need} one 128-bit access per warp needs; "
+                    f"raise MINI_BLOCK_{'M' if idx == 0 else 'N'} or BLOCK_K"
+                )
 
         # -- MFMA shape must fit the tile --
         assert BM % (instr[0] * warps[0] * tiles[0]) == 0
@@ -686,18 +734,20 @@ class KernelTuningConfig:
             )
             assert _v(self.MINI_BLOCK_N) % (MX_GROUP * arn) == 0
 
-        # -- warp pipelining --
-        # `with gl.amd.warp_pipeline_stage(label, priority)` is the right mechanism, but
-        # TritonAMDGPUWarpPipeline rejects any barrier or wait inside a stage region and
-        # a non-relaxed `smem.load` emits one. `load_shared_relaxed` would remove it, but
-        # it is unsafe here: this pipeline refills the very buffer it has just consumed,
-        # and suppressing the wait in front of the LDS read corrupts the result (measured
-        # as a 10% RMS error). So the knob stays, and stays off, until the pipeline is
-        # restructured to write into a buffer no MFMA is still reading.
-        assert not _v(self.WARP_PIPELINE), (
-            "WARP_PIPELINE is not usable with a consume-then-refill pipeline: the "
-            "wait_group and the LDS reads cannot both live inside a stage region"
-        )
+        # -- warp pipelining (the inter-wave ping-pong) --
+        # A slot's MFMAs are handed to TritonAMDGPUWarpPipeline as the `mfma` stage and
+        # its ds_reads plus global->LDS copies as the `mem` stage. That is only a legal
+        # split when the MFMAs read nothing the same slot loads, i.e. when the whole
+        # BLOCK_K window is carried in registers from the previous stage. The pass also
+        # rejects a wait inside a stage region, which is why the per-slot wait_group is
+        # emitted before the `mfma` region rather than inside the `mem` one.
+        if _v(self.WARP_PIPELINE):
+            assert self.num_prefetch_mini() == self.num_mini_k(), (
+                f"WARP_PIPELINE needs VGPR_PREFETCH_K == BLOCK_K (got "
+                f"{_v(self.VGPR_PREFETCH_K)} vs {BK}): with a partial window the slot's "
+                "MFMAs depend on the slot's own ds_read and there is no mem stage to "
+                "hide behind them"
+            )
 
         # -- pipeline wait depth --
         # The loop is wait-first / commit-last and always copies into a buffer no live

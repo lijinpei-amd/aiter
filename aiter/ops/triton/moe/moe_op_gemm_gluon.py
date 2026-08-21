@@ -121,6 +121,11 @@ def _env_int(name: str, default: int) -> int:
     return default if v is None else int(v)
 
 
+def _env_mod(name: str, default: str) -> str:
+    """Cache-modifier override, for A/B-testing L1/L2 policy without editing source."""
+    return os.environ.get("AITER_TRITON_MOE_GLUON_" + name, default)
+
+
 @cache
 def _probe_lds_bytes_cached(cfg_items: tuple, dq_a, dq_b) -> int:
     return _probe_lds_bytes_uncached(dict(cfg_items), dq_a, dq_b)
@@ -289,13 +294,26 @@ def get_gluon_config_uncached(
         mini_n = min(bn, gran_n * 2)
         while mini_n % gran_n:
             mini_n += gran_n
+        # MINI_BLOCK_M/N now also split the LDS staging area, the global->LDS copy and
+        # the accumulator, so a sweep over them is a real pipeline experiment, not just
+        # an epilogue one. The override is only honoured when it divides the CTA tile
+        # and is a whole number of warp tiles -- validate() would reject anything else.
+        gran_m = instr[0] * warps[0]
+        mini_m = _env_int("AITER_TRITON_MOE_GLUON_MINI_BLOCK_M", block_m)
+        if not (
+            0 < mini_m <= block_m and block_m % mini_m == 0 and mini_m % gran_m == 0
+        ):
+            mini_m = block_m
+        mini_n_env = _env_int("AITER_TRITON_MOE_GLUON_MINI_BLOCK_N", mini_n)
+        if 0 < mini_n_env <= bn and bn % mini_n_env == 0 and mini_n_env % gran_n == 0:
+            mini_n = mini_n_env
         return {
             "BLOCK_M": block_m,
             "BLOCK_N": bn,
             "BLOCK_K": bk,
             "K_UNROLL": n_buf,
             "MINI_BLOCK_K": bk,
-            "MINI_BLOCK_M": block_m,
+            "MINI_BLOCK_M": mini_m,
             "MINI_BLOCK_N": mini_n,
             "NUM_LDS_BUFFER": n_buf,
             "mfma_instr_shape": instr,
@@ -306,15 +324,18 @@ def get_gluon_config_uncached(
             "k_width": None,
             "transposed": True,
             "WAVES_PER_EU": 0,
-            "TILE_SCHED": int(TileSched.XCD_GROUP_M),
-            "GROUP_M": 4,
-            "NUM_XCDS": 8,
-            "token_mod": "",
-            "token_scale_mod": "",
+            # Tile-schedule overrides, for sweeping L2 locality without editing source.
+            "TILE_SCHED": _env_int(
+                "AITER_TRITON_MOE_GLUON_TILE_SCHED", int(TileSched.XCD_GROUP_M)
+            ),
+            "GROUP_M": _env_int("AITER_TRITON_MOE_GLUON_GROUP_M", 4),
+            "NUM_XCDS": _env_int("AITER_TRITON_MOE_GLUON_NUM_XCDS", 8),
+            "token_mod": _env_mod("TOKEN_MOD", ""),
+            "token_scale_mod": _env_mod("TOKEN_SCALE_MOD", ""),
             # .cg (non-temporal) on the weight payload: at decode every line is read
             # once, so streaming it keeps it from evicting anything that is reused.
             # Dropping it costs 10% more HBM traffic.
-            "expert_mod": ".cg" if block_m <= 32 else "",
+            "expert_mod": _env_mod("EXPERT_MOD", ".cg" if block_m <= 32 else ""),
             # ...but NOT on the weight scales. The scale tensor is (E, K/32, N) with K
             # contiguous, so one 128 B line holds 128 consecutive K-scales for a single
             # n, while a BLOCK_K stage consumes only BLOCK_K/32 of them -- 16 bytes at
@@ -322,10 +343,13 @@ def get_gluon_config_uncached(
             # survive in L2; marking it non-temporal turns all 8 touches into separate
             # HBM fetches. Measured on H7168-I2048-E33-k8 T=32 stage 1: 651 -> 517 MB of
             # HBM reads, L2 hit 16% -> 33%, 122.6 -> 96.9 us.
-            "expert_scale_mod": "",
-            "result_mod": "",
-            "result_scale_mod": "",
-            "WARP_PIPELINE": False,
+            "expert_scale_mod": _env_mod("EXPERT_SCALE_MOD", ""),
+            "result_mod": _env_mod("RESULT_MOD", ""),
+            "result_scale_mod": _env_mod("RESULT_SCALE_MOD", ""),
+            # Hand each slot's MFMAs and its ds_read/copy shadow to
+            # TritonAMDGPUWarpPipeline as an mfma/mem stage pair, so the waves ping-pong
+            # between the two. Needs VGPR_PREFETCH_K == BLOCK_K; off by default.
+            "WARP_PIPELINE": bool(_env_int("AITER_TRITON_MOE_GLUON_WARP_PIPELINE", 0)),
             # Read stage N's fragments one stage before their MFMA consumes them. Costs
             # one BLOCK_K tile of live registers and one stage of global prefetch depth
             # (the fill is waited on at stage s+NB-1 rather than s+NB), so it wants
