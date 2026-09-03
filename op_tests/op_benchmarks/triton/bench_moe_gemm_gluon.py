@@ -72,6 +72,9 @@ def _time(fn, warmup=5, reps=20):
     return start.elapsed_time(end) / reps * 1e3  # us
 
 
+EXPERT_SEL_SEED = 0  # must match op_tests/test_moe_2stage.py
+
+
 def _balanced_logits(t, n_expts_tot, n_expts_act, n_active, device):
     """``op_tests/test_moe_2stage.py``'s ``AITER_MOE_NUM_EXPERT_ACTIVATED`` score.
 
@@ -83,9 +86,9 @@ def _balanced_logits(t, n_expts_tot, n_expts_act, n_active, device):
     score so both read the same weights: -inf everywhere, 1.0 at round-robin slots over
     the active set, giving exactly ``n_active`` experts with balanced load.
 
-    Which experts are chosen does not matter, only the count and the balance, so this
-    takes the first ``n_active`` rather than replicating the other harness's ``randperm``
-    (that would require matching its whole RNG call sequence).
+    The active set is drawn with the same seeded ``randperm`` the other harness uses
+    (``EXPERT_SEL_SEED``), so the two benchmarks route identical tokens to identical
+    expert *ids*, not merely to equal-sized groups.
     """
     lo, hi = n_expts_act, min(n_expts_tot, t * n_expts_act)
     if not lo <= n_active <= hi:
@@ -93,7 +96,9 @@ def _balanced_logits(t, n_expts_tot, n_expts_act, n_active, device):
     score = torch.full((t, n_expts_tot), float("-inf"), dtype=torch.float16)
     slot = torch.arange(t * n_expts_act) % n_active
     rows = torch.arange(t).repeat_interleave(n_expts_act)
-    score[rows, torch.arange(n_active)[slot]] = 1.0
+    gen = torch.Generator().manual_seed(EXPERT_SEL_SEED)
+    sel = torch.randperm(n_expts_tot, generator=gen)[:n_active]
+    score[rows, sel[slot]] = 1.0
     return score.to(device)
 
 

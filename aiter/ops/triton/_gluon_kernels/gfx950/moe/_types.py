@@ -29,6 +29,8 @@ __all__ = [
     "ScaleSwizzle",
     "TileSched",
     "TuningSpec",
+    "WaitCommitScheme",
+    "WarpPipeline",
     "dq_has_scale",
     "dq_mx_format",
     "dq_pack_divisor",
@@ -49,6 +51,13 @@ class ScaleSwizzle(IntEnum):
     NONE = 0
     # TODO name what the swizzle does, not the arch
     CDNA4_SCALE = 1  # utils/shuffle.py:_shuffle_scale_tile_gfx950 preshuffle
+    # csrc/kernels/mxfp4_moe/moe_aux/moe_sort_scales.cuh, run per call rather than
+    # offline: the token scales are gathered into routing order *and* permuted into the
+    # MFMA scale-fragment order, so a stage's scales are a contiguous slice instead of
+    # BLOCK_M rows of 8 bytes at a K/32 stride. Only meaningful for operand A, and only
+    # for the layout the shuffle was written against -- see
+    # KernelTuningConfig.sorted_shuffled_ok().
+    SORTED_SHUFFLED = 2
 
 
 class ActKind(IntEnum):
@@ -68,6 +77,66 @@ class TileSched(IntEnum):
     LINEAR = 0  # plain row-major (pid_m, pid_n), no swizzle
     GROUP_M = 1  # pid_grid GROUP_M blocking, for L2 reuse of the token tile
     XCD_GROUP_M = 2  # remap_xcd first, then GROUP_M blocking
+
+
+class WarpPipeline(IntEnum):
+    """Which inter-wave ping-pong the K-loop step is built for.
+
+    All three run the *same* ``_pipeline_step_impl`` body: a slot always emits its MFMAs,
+    then its ``ds_read``s, then its global->LDS fills, and the mode only decides whether
+    stage borders are laid down between those groups (see
+    ``_lang.pick_warp_pipeline_stage``). Nothing about the schedule is duplicated per
+    mode, so a change to the fill placement or the wait arithmetic cannot land in one
+    mode and miss another.
+
+    * ``NONE`` -- no borders. One wave group, the MFMAs and the memory work overlapped
+      only by the machine scheduler.
+    * ``COMPILER`` -- hand the ``mfma``/``mem`` halves to ``TritonAMDGPUWarpPipeline``,
+      which turns the interleave into a two-wave-group ping-pong. Needs
+      ``VGPR_PREFETCH_K == BLOCK_K`` (the slot's MFMAs must not read what the slot loads)
+      and only applies inside the ``tl.range`` body -- a border opened in the peeled step
+      or the drain would still be open when the loop starts, and the pass rejects a loop,
+      and every wait, caught inside a stage.
+    * ``MANUAL`` -- the hand-emitted rendezvous (``cond_barrier`` / ``setprio`` /
+      ``bare_barrier``) instead of the pass. Currently implemented only by
+      ``_pipeline_step_frozen``, so it needs ``FROZEN_STEP=1``; the live step asserts
+      rather than quietly running unpipelined.
+    """
+
+    NONE = 0
+    COMPILER = 1
+    MANUAL = 2
+
+
+class WaitCommitScheme(IntEnum):
+    """Granularity of the global->LDS commit groups, and where their wait goes.
+
+    One knob for both halves on purpose: ``wait_group(n)`` counts *groups*, so the
+    emission granularity and the wait arithmetic are the same decision seen from two
+    sides. Splitting them is what used to make the coarser levels look broken -- the
+    commits moved and the model counting them did not.
+
+    Per slot ``(mi, ni)`` of the ``num_mini_m() x num_mini_n()`` walk, one K stage
+    emits:
+
+    * ``PER_FILL`` -- one group per copy: the A payload, the B payload and any scale
+      that a different slot owns. ``num_mini_m() + num_mini_n()`` payload groups per
+      stage, 6 marks at 2x2 with the scales displaced.
+    * ``PER_SLOT`` -- one group per mini block, ``num_mini_m() * num_mini_n()``.
+    * ``PER_STAGE`` -- one group for the whole stage, committed at its last slot.
+
+    The wait placement follows from that. Under ``PER_FILL`` the groups a slot reads
+    are named individually, so every slot of a stage computes a wait and the *strongest*
+    of them, emitted once at the stage head, covers all of them -- one ``wait_group``
+    per stage rather than ``num_mini_m() * num_mini_n()`` of them, each of which
+    Membar follows with a barrier. The coarser levels bunch several tiles behind one
+    group, so a slot's wait is no longer implied by an earlier slot's and each is
+    emitted where it is needed, at the head of its own slot.
+    """
+
+    PER_FILL = 1
+    PER_SLOT = 2
+    PER_STAGE = 3
 
 
 class FuncSpec(NamedTuple):
@@ -117,8 +186,33 @@ class TuningSpec(NamedTuple):
     expert_scale_mod: str
     result_mod: str
     result_scale_mod: str
-    WARP_PIPELINE: bool
+    #: :class:`WarpPipeline` -- which ping-pong the K-loop step is built for. Was a
+    #: bool; ``True``/``1`` is still ``COMPILER``, so old configs keep their meaning.
+    WARP_PIPELINE: int
     VGPR_PREFETCH_K: int
+    #: read operand A's scales from the moe_sort_scales pre-pass output (already in
+    #: routing order and MFMA fragment order) rather than the raw (M, K/32) tensor
+    A_SCALE_SORTED_SHUFFLED: bool = False
+    #: read operand B's scales from a CDNA4_SCALE-preshuffled tensor. The weights are
+    #: static, so unlike the A-side shuffle this costs nothing at run time.
+    B_SCALE_SHUFFLED: bool = False
+    #: load operand B straight from global into the MFMA fragment registers, never
+    #: staging it in LDS. What FlyDSL does (BufferCopy128b), and the reason its
+    #: ds_read_b128 count is half ours.
+    B_IN_REG: bool = False
+    #: read operand B from a 16-column-blocked weight tensor -- aiter's
+    #: utils/shuffle.py::shuffle_weight(w, (16, 16)). Independent of B_IN_REG: with it
+    #: the fragment-layout global load coalesces, and without it the LDS tile takes the
+    #: matching permutation, which drops the staging unit from 32 rows to 16 and removes
+    #: its padding. Changes the operand contract, so the caller has to supply the
+    #: permuted tensor.
+    B_PRESHUFFLED: bool = False
+    #: use the hardware reciprocal in the fused SwiGLU instead of an IEEE divide,
+    #: as the FlyDSL port does. ~1 ulp, well inside the bf16 the result is stored as.
+    ACT_FAST_RCP: bool = False
+    #: :class:`WaitCommitScheme` -- how coarsely the global->LDS copies are committed,
+    #: and hence how many groups a ``wait_group`` count has to walk past.
+    WAIT_COMMIT_SCHEME: int = int(WaitCommitScheme.PER_FILL)
 
 
 class ActivationSpec(NamedTuple):
@@ -193,7 +287,7 @@ class QuantTokenTensor(NamedTuple):
     num_token: gl.tensor
     stride_m: gl.tensor  # payload elements, i.e. hidden_dim // 2 for MXFP4
     scale_stride_m: gl.tensor
-    scale_stride_k: gl.tensor
+    scale_stride_k: gl.constexpr  # constexpr: folds the stage bump into the address
     hidden_dim: gl.constexpr  # logical extent; packed extent from dtype_quant
     topk: gl.constexpr
     scale_swizzle: gl.constexpr
@@ -268,7 +362,7 @@ class QuantExpertTensor(NamedTuple):
     stride_n: gl.tensor
     scale_stride_e: gl.tensor
     scale_stride_n: gl.tensor
-    scale_stride_k: gl.tensor
+    scale_stride_k: gl.constexpr  # constexpr: folds the stage bump into the address
     num_expert: gl.tensor
     hidden_dim: gl.constexpr
     fused_intermediate_dim: gl.constexpr
