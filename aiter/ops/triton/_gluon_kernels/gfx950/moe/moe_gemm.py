@@ -40,7 +40,16 @@ Memory layout contract (the wrapper hard-asserts it), with ``pack`` = 2 for MXFP
 * weights      ``(E, K/pack, N)`` with ``stride(-2) == 1``  (K contiguous)
 * scales       ``(E, K/32, N)`` strided view, K contiguous, strides carried explicitly
 * stage 1: ``N = 2*I``, ``K = H``; stage 2: ``N = H``, ``K = I``
-* stage 1 gate/up arrive pre-fused and column-interleaved (even = gate, odd = up)
+* stage 1 gate/up arrive pre-fused, in one of two packings along N, selected by
+  ``KernelFuncConfig.gate_up_split``:
+
+  - ``False`` (default) -- column-interleaved, even = gate, odd = up
+  - ``True``  -- whole halves, gate in ``[0, I)`` and up in ``[I, 2I)``. A mini-N block
+    is then one entire operand side, so the activation pairs two accumulator *tiles*
+    with identical layouts instead of two registers within a lane's quad, and a warp's
+    32 emitted channels are exactly one MX group. See ``_n_start``. The caller permutes
+    weights, weight scales and bias with ``activations.py::gate_up_split_perm``; the
+    emitted output is bit-identical either way.
 
 ``N`` and ``K`` are compile-time: it is what makes the pipeline drain, the mini-tile
 decomposition and the rotating buffer index fully static. The in-scope models present
@@ -62,7 +71,12 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.language.core import _aggregate as aggregate
 
-from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
+from aiter.ops.triton._triton_kernels.moe.activations import (
+    _swiglu,
+    _swiglu_combine,
+    _swiglu_gate,
+    _swiglu_pair,
+)
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.common_utils import strip_annotate
 
@@ -139,6 +153,27 @@ _EPI_ROTATE: gl.constexpr = gl.constexpr(
 #:   the kernel computes the activation on the wrong operands.
 _ACT_GROUP: gl.constexpr = gl.constexpr(
     int(os.environ.get("AITER_TRITON_MOE_GLUON_ACT_GROUP", "1"))
+)
+
+#: Fold the gate half's activation into the LAST K iteration, under ``gate_up_split``.
+#:
+#: :func:`_slot_index` is N-outer, so on the final drain step every gate-side
+#: accumulator retires before the first linear-side MFMA is issued. Peeling that step
+#: out of the drain loop lets the silu for mini-M block ``mi`` be emitted between the
+#: ``(mi, 0)`` and ``(mi, 1)`` MFMA clusters, where its 64 exp2 and 64 rcp retire under
+#: MFMAs instead of after the K loop with nothing left to hide behind. The recorded
+#: ``activation cost, frozen`` is +12.5 us, which bounds what this can buy.
+#:
+#: Register pressure should be a wash: the activated tile overwrites the accumulator it
+#: came from, and all NM*NN of them were live into the epilogue regardless. It is close
+#: to the margin though (388 VGPR / 132 AGPR / 0 spills), so the register count is part
+#: of the gate, not a footnote.
+#:
+#: Only the epilogue-operand retire moves: the peeled step has ``DO_DS_READ=False`` and
+#: therefore issues no ``wait_group`` at all, so draining the bias/gammas commit group
+#: ahead of it leaves every other step's wait accounting untouched.
+_FUSE_ACT_MFMA: gl.constexpr = gl.constexpr(
+    int(os.environ.get("AITER_TRITON_MOE_GLUON_FUSE_ACT_MFMA", "0"))
 )
 
 #: EXPERIMENT, NOT CORRECT -- drop the lgkmcnt wait in front of the epilogue's staged
@@ -377,6 +412,7 @@ def _build_configs(cfg):
         _at(f, 8),
         _at(f, 9),
         _at(f, 10),
+        _at(f, 11),
     )
     tuning_cfg = KernelTuningConfig(
         func_cfg,
@@ -533,6 +569,45 @@ def _mini_scale_off(base, step, HAS_SCALE: gl.constexpr):
 
 
 @gluon.jit
+def _n_start(pid_n, ni: gl.constexpr, N, func_cfg, tuning_cfg):
+    """Raw-N index where mini-N block ``ni`` of CTA column ``pid_n`` begins.
+
+    The one place the gate/up packing is expressed. Interleaved, the CTA tile is a
+    contiguous ``BLOCK_N`` run and mini blocks slice it. Split, a CTA owns
+    ``MINI_BLOCK_N`` *emitted* channels and reads each side from its own half of N, so
+    the two mini blocks are ``N/2`` apart -- their tiles land at the same emitted
+    channels, which is what lets the epilogue pair them elementwise.
+
+    Everything downstream of this addresses a plain global ``n``: the 16-column
+    preshuffle in :func:`_blocked_b_offsets`, both scale shuffles and every LDS tile are
+    unchanged by the choice.
+    """
+    BN: gl.constexpr = tuning_cfg.BLOCK_N
+    MBN: gl.constexpr = tuning_cfg.MINI_BLOCK_N
+    if require_constexpr(func_cfg.gu_split()):
+        out = pid_n * MBN + ni * (N // 2)
+    else:
+        out = pid_n * BN + ni * MBN
+    return out
+
+
+@gluon.jit
+def _n_split_offs(pid_n, i, N, func_cfg, tuning_cfg):
+    """:func:`_n_start` for a whole-BLOCK_N index tensor ``i`` in ``[0, BLOCK_N)``.
+
+    Same mapping, expressed elementwise, for the two consumers that address the CTA
+    tile as one run rather than per mini block: the ``B_IN_REG`` scale fetch and the
+    bias staging copy. Uniform arithmetic on a loop-invariant tensor, so it is hoisted.
+    """
+    MBN: gl.constexpr = tuning_cfg.MINI_BLOCK_N
+    if require_constexpr(func_cfg.gu_split()):
+        out = pid_n * MBN + (i // MBN) * (N // 2) + i % MBN
+    else:
+        out = pid_n * tuning_cfg.BLOCK_N + i
+    return out
+
+
+@gluon.jit
 def _blocked_b_offsets(
     layout: gl.constexpr,
     PK_B: gl.constexpr,
@@ -639,7 +714,7 @@ def _a_scale_offsets(a, rt, block_id, M_e, start_m, pid_m, K, func_cfg, tuning_c
 
 
 @gluon.jit
-def _b_scale_offsets(b, pid_n, K, func_cfg, tuning_cfg):
+def _b_scale_offsets(b, pid_n, N, K, func_cfg, tuning_cfg):
     """Byte offsets of the B scale tiles, one per mini-N block (``None`` if unscaled).
 
     Three shapes: the CDNA4_SCALE preshuffle read element-wise into the fragment
@@ -665,7 +740,13 @@ def _b_scale_offsets(b, pid_n, K, func_cfg, tuning_cfg):
     if require_constexpr(tuning_cfg.B_SCALE_SHUFFLED and tuning_cfg.B_IN_REG):
         # Straight into the scale fragment registers, addressed element-wise so it
         # rides the same two-stage pipeline as B's payload.
-        ns = (pid_n * BN + gl.arange(0, BN, layout=gl.SliceLayout(1, bsl)))[:, None]
+        ns = _n_split_offs(
+            pid_n,
+            gl.arange(0, BN, layout=gl.SliceLayout(1, bsl)),
+            N,
+            func_cfg,
+            tuning_cfg,
+        )[:, None]
         ks = gl.arange(0, SK, layout=gl.SliceLayout(0, bsl))[None, :]
         b_scale_offs = (
             (ns // 32) * K
@@ -688,15 +769,14 @@ def _b_scale_offsets(b, pid_n, K, func_cfg, tuning_cfg):
         b_scale_offs = ()
         for ni in gl.static_range(NN):
             b_scale_offs = b_scale_offs + (
-                ((pid_n * BN + ni * MBN) // 32 + sb) * K + jb,
+                (_n_start(pid_n, ni, N, func_cfg, tuning_cfg) // 32 + sb) * K + jb,
             )
     else:
         b_scale_offs = ()
         for ni in gl.static_range(NN):
             b_scale_offs = b_scale_offs + (
                 (
-                    pid_n * BN
-                    + ni * MBN
+                    _n_start(pid_n, ni, N, func_cfg, tuning_cfg)
                     + gl.arange(0, MBN, layout=gl.SliceLayout(1, bsl))
                 )[:, None]
                 * b.scale_stride_n
@@ -1811,7 +1891,59 @@ def _pipeline_step_impl(
 
 
 @gluon.jit
-def _epi_bias_tiles(bias_smem, bias_ptr, pid_n, func_cfg, tuning_cfg):
+def _drain_last_fused(pc, st, bias_tiles, x_static_scale, func_cfg, tuning_cfg):
+    """The final drain step, with the gate half's activation folded into it.
+
+    That step reads nothing, fills nothing and waits on nothing -- it only retires the
+    MFMAs whose operands are already in registers -- so every other branch of
+    :func:`_pipeline_step_impl` would be dead here and the walk collapses to
+    :func:`_maybe_block_dot`. The preconditions are asserted rather than assumed.
+
+    :func:`_slot_index` is N outer, so the visit order is ``(0,0), (1,0), (0,1), (1,1)``
+    and every gate-side accumulator is final before the first linear-side MFMA issues.
+    The silu for mini-M block ``mi`` therefore lands *between* MFMA clusters and its
+    exp2/rcp retire under them. See :data:`_FUSE_ACT_MFMA`.
+
+    Returns the accumulator tuple with each ``ni == 0`` slot replaced by
+    ``silu(bias + acc)`` -- the same value :func:`_epilogue_one_tile` would have
+    computed, which is why it takes ``GATE_PRE`` to skip recomputing it.
+    """
+    tc: gl.constexpr = pc.tuning_cfg
+    NM: gl.constexpr = tc.num_mini_m()
+    NN: gl.constexpr = tc.num_mini_n()
+    PF_MINI: gl.constexpr = tc.num_prefetch_mini()
+    act: gl.constexpr = func_cfg.act()
+    gl.static_assert(func_cfg.gu_split() and NN == 2)
+
+    acc = ()
+    for ni in gl.static_range(NN):
+        for mi in gl.static_range(NM):
+            slot_acc = _maybe_block_dot(
+                _take_pairs(st.a_frags, mi * PF_MINI, PF_MINI),
+                _take_pairs(st.b_frags, ni * PF_MINI, PF_MINI),
+                st.acc[_slot_index(mi, ni, NM, NN)],
+                PF_MINI,
+                func_cfg,
+                tc,
+                True,
+            )
+            if require_constexpr(ni == 0):
+                # Gate side: everything up to and including the reciprocal, issued here
+                # so it overlaps the ni == 1 clusters still to come.
+                if require_constexpr(func_cfg.has_x_static_scale):
+                    slot_acc = slot_acc * x_static_scale
+                if require_constexpr(func_cfg.has_bias and _NO_EPI < 2):
+                    slot_acc = slot_acc + bias_tiles[0][None, :]
+                if require_constexpr(not _NO_EPI):
+                    slot_acc = _swiglu_gate(
+                        slot_acc, act.alpha, act.limit, tc.ACT_FAST_RCP
+                    )
+            acc = acc + (slot_acc,)
+    return acc
+
+
+@gluon.jit
+def _epi_bias_tiles(bias_smem, bias_ptr, pid_n, N, func_cfg, tuning_cfg):
     """Block-level bias, one tensor per mini-N block.
 
     Invariant in mi, so NN of them cover the block where the per-tile form issued
@@ -1832,7 +1964,11 @@ def _epi_bias_tiles(bias_smem, bias_ptr, pid_n, func_cfg, tuning_cfg):
                 )
             else:
                 out = out + (
-                    gl.load(bias_ptr + pid_n * BN + hn * MBN + gl.arange(0, MBN)),
+                    gl.load(
+                        bias_ptr
+                        + _n_start(pid_n, hn, N, func_cfg, tuning_cfg)
+                        + gl.arange(0, MBN)
+                    ),
                 )
     return out
 
@@ -1859,7 +1995,7 @@ def _epi_gamma_tiles(gamma_smem, gammas_base, block_id, M_e, func_cfg, tuning_cf
 
 
 @gluon.constexpr_function
-def _amax_lane_elems(MBM, OUT_MBN, tuning_cfg):
+def _amax_lane_elems(MBM, OUT_MBN, func_cfg, tuning_cfg):
     """Inner width of the split MXFP4 amax reduction.
 
     The amax runs as an fp32 reduce over the inner axis followed by an integer reduce
@@ -1880,7 +2016,18 @@ def _amax_lane_elems(MBM, OUT_MBN, tuning_cfg):
     worse, 2756 / 2782 instructions against 2492); too fine and the integer tree loses
     the 3-input v_max3 fusion and pays for explicit copies around the destructive
     permlane swaps (2 removes every canonicalisation yet costs 112 extra v_mov, 2576).
+
+    Under ``gate_up_split`` the layout IS readable, so this stops guessing: the tile is
+    one accumulator wide, so along the emitted axis a lane owns exactly the transposed
+    MFMA quad -- ``instr_m * instr_n / WARP_SIZE`` consecutive columns, 4 at 16x16 --
+    before the first lane base. Splitting there puts the whole cross-lane part of the
+    tree in the integer half, which is what this function wants and what the
+    interleaved packing cannot give it (its quad holds two gate and two linear values,
+    so only 2 of the 4 survive the reduction).
     """
+    if _v(func_cfg.gu_split()):
+        instr = _v(tuning_cfg.mfma_instr_shape)
+        return max(1, min(_v(MX_GROUP), (instr[0] * instr[1]) // _v(WARP_SIZE)))
     per_lane = (_v(MBM) * _v(OUT_MBN)) // (
         _v(tuning_cfg.num_warps()) * _v(WARP_SIZE)
     )
@@ -1941,6 +2088,62 @@ def _epi_stage_flush(
 
 
 @gluon.jit
+def _epi_block_flush(
+    qp_smem,
+    qs_smem,
+    y_ptr,
+    y_stride_m,
+    y_stride_n,
+    ys_ptr,
+    ys_stride_m,
+    ys_stride_n,
+    block_id,
+    pid_n,
+    M_e,
+    func_cfg,
+    tuning_cfg,
+):
+    """Read the WHOLE staged MXFP4 block back out of LDS and store it.
+
+    The gate/up-split twin of :func:`_epi_stage_flush`. Split collapses the two mini-N
+    blocks into one output tile, so a mini tile already spans the CTA's full emitted
+    width and the only axis left to walk is M -- which means every tile can stage into
+    its own rows of one block-height buffer and the drain needs a single barrier and a
+    single pair of stores rather than one per tile.
+    """
+    BM: gl.constexpr = tuning_cfg.BLOCK_M
+    BN: gl.constexpr = tuning_cfg.BLOCK_N
+    MBN: gl.constexpr = tuning_cfg.MINI_BLOCK_N
+    ARN: gl.constexpr = func_cfg.activation_reduction_n()
+    OUT_MBN: gl.constexpr = MBN // func_cfg.mini_n_reduction()
+    PL: gl.constexpr = tuning_cfg.result_store_layout(BM, OUT_MBN // 2, 8)
+    SL: gl.constexpr = tuning_cfg.result_store_layout(BM, OUT_MBN // MX_GROUP, 8)
+    n0 = pid_n * (BN // ARN)
+    # The staging writes are spread over every warp and each warp reads rows it did not
+    # write, so this fence is load-bearing. Only one is needed: nothing reuses the
+    # buffer afterwards.
+    gl.barrier()
+    pv = qp_smem.load(PL)
+    sv = qs_smem.load(SL)
+    pm = BM * block_id + gl.arange(0, BM, layout=gl.SliceLayout(1, PL))
+    pn = gl.arange(0, OUT_MBN // 2, layout=gl.SliceLayout(0, PL))
+    gl.amd.cdna4.buffer_store(
+        pv,
+        y_ptr,
+        pm[:, None] * y_stride_m + (n0 // 2 + pn)[None, :] * y_stride_n,
+        mask=(pm < M_e)[:, None],
+    )
+    sm = BM * block_id + gl.arange(0, BM, layout=gl.SliceLayout(1, SL))
+    sn = gl.arange(0, OUT_MBN // MX_GROUP, layout=gl.SliceLayout(0, SL))
+    gl.amd.cdna4.buffer_store(
+        sv,
+        ys_ptr,
+        sm[:, None] * ys_stride_m + (n0 // MX_GROUP + sn)[None, :] * ys_stride_n,
+        mask=(sm < M_e)[:, None],
+    )
+
+
+@gluon.jit
 def _epilogue_one_tile(
     sub,
     mi: gl.constexpr,
@@ -1965,38 +2168,73 @@ def _epilogue_one_tile(
     qp_smem=None,
     qs_smem=None,
     STAGE_ONLY: gl.constexpr = False,
+    lin=None,
+    STAGE_ROW: gl.constexpr = 0,
+    GATE_PRE: gl.constexpr = False,
 ):
     """bias -> activation -> gammas -> output_quant -> store, for ONE mini tile.
 
     Lifted verbatim out of :func:`_epilogue_store` so the fused drain step can call it
     per slot the moment that slot's last MFMA retires. ``sub`` is the finished
     accumulator for tile ``(mi, ni)``.
+
+    Under ``gate_up_split`` a "tile" is a *pair*: ``sub`` is the gate side (mini-N block
+    ``ni``) and ``lin`` the linear side (block ``ni + 1``), covering the same emitted
+    channels. The activation is then a plain elementwise op between two tensors of
+    identical layout -- no reshape, no split, and none of the ``v_mov_b32`` gathers the
+    interleaved packing needs -- and the tile is ``MBN`` emitted channels wide rather
+    than ``MBN // 2``. ``STAGE_ROW`` is the row this tile occupies in a block-height LDS
+    staging buffer, which is what lets the caller flush all of them in one store.
     """
     BM: gl.constexpr = tuning_cfg.BLOCK_M
-    BN: gl.constexpr = tuning_cfg.BLOCK_N
     MBM: gl.constexpr = tuning_cfg.MINI_BLOCK_M
     MBN: gl.constexpr = tuning_cfg.MINI_BLOCK_N
     ARN: gl.constexpr = func_cfg.activation_reduction_n()
-    OUT_MBN: gl.constexpr = MBN // ARN
+    OUT_MBN: gl.constexpr = MBN // func_cfg.mini_n_reduction()
     act: gl.constexpr = func_cfg.act()
     out_ty: gl.constexpr = y_ptr.dtype.element_ty
     store_layout: gl.constexpr = tuning_cfg.result_store_layout(
         MBM, OUT_MBN, out_ty.primitive_bitwidth
     )
 
+    # GATE_PRE: the peeled last K step already applied the static scale, the bias and
+    # the silu to `sub`, so those are skipped for the gate side only -- `lin` still
+    # needs both, and the result is the same expression either way.
     if require_constexpr(func_cfg.has_x_static_scale):
         # Per-tensor fp8 activation scale. FP8_E4M3 operands go through the
         # MMA with unit scales, so the tensor scale comes back here -- before
         # bias, matching the Triton kernels exactly.
-        sub = sub * x_static_scale
+        if require_constexpr(not GATE_PRE):
+            sub = sub * x_static_scale
+        if require_constexpr(func_cfg.gu_split()):
+            lin = lin * x_static_scale
 
-    raw_n0 = pid_n * BN + ni * MBN
     if require_constexpr(func_cfg.has_bias and _NO_EPI < 2):
-        # fp32, expert indexed, over the RAW N axis (before the halving)
-        bias = bias_tiles[ni]
-        sub = sub + bias[None, :]
+        # fp32, expert indexed, over the RAW N axis (before the halving). Split: one
+        # tile per side, so each accumulator takes its own.
+        if require_constexpr(not GATE_PRE):
+            sub = sub + bias_tiles[ni][None, :]
+        if require_constexpr(func_cfg.gu_split()):
+            lin = lin + bias_tiles[ni + 1][None, :]
 
-    if require_constexpr(func_cfg.has_activation() and _NO_EPI):
+    if require_constexpr(func_cfg.gu_split() and _NO_EPI):
+        # Ablation: the same [MBM, MBN] x 2 -> [MBM, MBN] reduction, minus exp2/rcp.
+        out = sub * lin
+        gl.static_assert(out.shape[1] == OUT_MBN)
+    elif require_constexpr(GATE_PRE):
+        out = _swiglu_combine(sub, lin, act.limit, ADD_RESIDUAL=act.add_residual)
+        gl.static_assert(out.shape[1] == OUT_MBN)
+    elif require_constexpr(func_cfg.gu_split()):
+        out = _swiglu_pair(
+            sub,
+            lin,
+            act.alpha,
+            act.limit,
+            ADD_RESIDUAL=act.add_residual,
+            FAST_RCP=tuning_cfg.ACT_FAST_RCP,
+        )
+        gl.static_assert(out.shape[1] == OUT_MBN)
+    elif require_constexpr(func_cfg.has_activation() and _NO_EPI):
         # Ablation: the same reshape/split reduction _swiglu does, minus exp2/rcp/clip.
         gelu, linear = tl.split(
             tl.reshape(sub, (sub.shape[0], sub.shape[1] // 2, 2))
@@ -2031,7 +2269,10 @@ def _epilogue_one_tile(
             g = gamma_tiles[mi]
         out = out * g[:, None]
 
-    out_n0 = raw_n0 // ARN
+    # Emitted-channel base. The CTA tile is BLOCK_N // ARN emitted channels wide in both
+    # packings -- what differs is only how many mini blocks that is (2 interleaved, 1
+    # split, where ni is always the gate block and OUT_MBN is the whole width).
+    out_n0 = pid_n * (tuning_cfg.BLOCK_N // ARN) + ni * OUT_MBN
     if require_constexpr(func_cfg.output_quant is None):
         val = gl.convert_layout(
             out.to(out_ty), store_layout, assert_trivial=False
@@ -2062,13 +2303,19 @@ def _epilogue_one_tile(
         # consecutive N, and the reduction over the remaining 8 lanes is what the
         # reshape below expresses.
         #
+        # Interleaved, a warp owns only 16 of those columns (its 32 raw ones halve), so
+        # the group spans two warps and the outer reduction crosses the warp boundary.
+        # Split, a warp owns 32 emitted columns -- exactly one group -- and validate()
+        # enforces it, so the whole reduction stays inside the wave.
         gl.static_assert(func_cfg.output_quant == _DQ_MXFP4)
         gl.static_assert(OUT_MBN % MX_GROUP == 0)
         # LANE_ELEMS splits the amax: how many of the tile's elements one lane owns,
         # so the inner reduction is in-lane fp32 (free |v| modifiers) and only the
         # outer one goes cross-lane. Getting it wrong is not incorrect, just slower --
         # a mismatched split adds permlane steps instead of removing them.
-        LANE_ELEMS: gl.constexpr = _amax_lane_elems(MBM, OUT_MBN, tuning_cfg)
+        LANE_ELEMS: gl.constexpr = _amax_lane_elems(
+            MBM, OUT_MBN, func_cfg, tuning_cfg
+        )
         payload, scale = mxfp4_quant_gluon(
             out, OUT_MBN, MBM, MX_GROUP, LANE_ELEMS
         )
@@ -2102,47 +2349,60 @@ def _epilogue_one_tile(
             SL: gl.constexpr = tuning_cfg.result_store_layout(
                 MBM, OUT_MBN // MX_GROUP, 8
             )
-            if require_constexpr(STAGE_ONLY):
-                # _EPI_ROTATE: stage and return; the caller flushes this buffer one
+            # if/elif/else, not early returns: a `return` from inside a nested
+            # `if require_constexpr(...)` here does NOT stop the trace, so the code
+            # below it still ran and stored the mini tile to the *unsliced* buffer --
+            # which only surfaced as a shape mismatch because the split buffer is
+            # block-height. Keep exactly one store path reachable per configuration.
+            if require_constexpr(func_cfg.gu_split()):
+                # Block-height staging: every mi writes its own MBM rows of one buffer,
+                # so the caller flushes all NM tiles with a single barrier and a single
+                # store instead of a barrier pair per tile. Split halves the tile count
+                # too (each covers both sides), so the drain goes from NM*NN staging
+                # round-trips to one.
+                qp_smem.slice(STAGE_ROW, MBM).store(payload)
+                qs_smem.slice(STAGE_ROW, MBM).store(scale)
+            elif require_constexpr(STAGE_ONLY):
+                # _EPI_ROTATE: stage and leave it; the caller flushes this buffer one
                 # iteration later, after its own barrier.
                 qp_smem.store(payload)
                 qs_smem.store(scale)
-                return
-            gl.barrier()
-            qp_smem.store(payload)
-            qs_smem.store(scale)
-            gl.barrier()
-            if require_constexpr(_EPI_RELAXED_LDS):
-                payload_v = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                    qp_smem, PL
-                )
-                scale_v = gl.amd.cdna4.async_copy.load_shared_relaxed(qs_smem, SL)
             else:
-                payload_v = qp_smem.load(PL)
-                scale_v = qs_smem.load(SL)
+                gl.barrier()
+                qp_smem.store(payload)
+                qs_smem.store(scale)
+                gl.barrier()
+                if require_constexpr(_EPI_RELAXED_LDS):
+                    payload_v = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                        qp_smem, PL
+                    )
+                    scale_v = gl.amd.cdna4.async_copy.load_shared_relaxed(qs_smem, SL)
+                else:
+                    payload_v = qp_smem.load(PL)
+                    scale_v = qs_smem.load(SL)
 
-            pm = BM * block_id + mi * MBM + gl.arange(
-                0, MBM, layout=gl.SliceLayout(1, PL)
-            )
-            pn = gl.arange(0, OUT_MBN // 2, layout=gl.SliceLayout(0, PL))
-            gl.amd.cdna4.buffer_store(
-                payload_v,
-                y_ptr,
-                pm[:, None] * y_stride_m
-                + (out_n0 // 2 + pn)[None, :] * y_stride_n,
-                mask=(pm < M_e)[:, None],
-            )
-            sm = BM * block_id + mi * MBM + gl.arange(
-                0, MBM, layout=gl.SliceLayout(1, SL)
-            )
-            sn = gl.arange(0, OUT_MBN // MX_GROUP, layout=gl.SliceLayout(0, SL))
-            gl.amd.cdna4.buffer_store(
-                scale_v,
-                ys_ptr,
-                sm[:, None] * ys_stride_m
-                + (out_n0 // MX_GROUP + sn)[None, :] * ys_stride_n,
-                mask=(sm < M_e)[:, None],
-            )
+                pm = BM * block_id + mi * MBM + gl.arange(
+                    0, MBM, layout=gl.SliceLayout(1, PL)
+                )
+                pn = gl.arange(0, OUT_MBN // 2, layout=gl.SliceLayout(0, PL))
+                gl.amd.cdna4.buffer_store(
+                    payload_v,
+                    y_ptr,
+                    pm[:, None] * y_stride_m
+                    + (out_n0 // 2 + pn)[None, :] * y_stride_n,
+                    mask=(pm < M_e)[:, None],
+                )
+                sm = BM * block_id + mi * MBM + gl.arange(
+                    0, MBM, layout=gl.SliceLayout(1, SL)
+                )
+                sn = gl.arange(0, OUT_MBN // MX_GROUP, layout=gl.SliceLayout(0, SL))
+                gl.amd.cdna4.buffer_store(
+                    scale_v,
+                    ys_ptr,
+                    sm[:, None] * ys_stride_m
+                    + (out_n0 // MX_GROUP + sn)[None, :] * ys_stride_n,
+                    mask=(sm < M_e)[:, None],
+                )
         else:
             pm = BM * block_id + mi * MBM + gl.arange(0, MBM)
             gl.store(
@@ -2175,6 +2435,7 @@ def _epilogue_store(
     bias_ptr,
     block_id,
     pid_n,
+    N,
     M_e,
     gammas_base,
     gamma_smem,
@@ -2182,6 +2443,7 @@ def _epilogue_store(
     x_static_scale,
     func_cfg,
     tuning_cfg,
+    GATE_PRE: gl.constexpr = False,
 ):
     """bias -> activation -> gammas -> output_quant -> store, per mini (M, N) tile.
 
@@ -2196,7 +2458,7 @@ def _epilogue_store(
     MBM: gl.constexpr = tuning_cfg.MINI_BLOCK_M
     MBN: gl.constexpr = tuning_cfg.MINI_BLOCK_N
     ARN: gl.constexpr = func_cfg.activation_reduction_n()
-    OUT_MBN: gl.constexpr = MBN // ARN
+    OUT_MBN: gl.constexpr = MBN // func_cfg.mini_n_reduction()
     act: gl.constexpr = func_cfg.act()
     # Hoisted: a `x: gl.constexpr = ...` inside a static_range would be a reassignment
     # on the second unrolled iteration, which Gluon rejects outright.
@@ -2215,7 +2477,9 @@ def _epilogue_store(
     # Both are staged in LDS (filled before the K loop, see _moe_gemm_body);
     # the read then carries the accumulator's own M/N slice layout, so nothing downstream
     # changes. Otherwise the block-level load still comes from global.
-    bias_tiles = _epi_bias_tiles(bias_smem, bias_ptr, pid_n, func_cfg, tuning_cfg)
+    bias_tiles = _epi_bias_tiles(
+        bias_smem, bias_ptr, pid_n, N, func_cfg, tuning_cfg
+    )
     gamma_tiles = _epi_gamma_tiles(
         gamma_smem, gammas_base, block_id, M_e, func_cfg, tuning_cfg
     )
@@ -2232,10 +2496,25 @@ def _epilogue_store(
         vec=1, per_phase=1, max_phase=1, order=[1, 0]
     )
     ROT: gl.constexpr = _EPI_ROTATE != 0 and func_cfg.output_quant is not None
+    gl.static_assert(
+        not (func_cfg.gu_split() and _ACT_GROUP != 1),
+        "gate_up_split and ACT_GROUP=2 are alternative repackings of the same operand "
+        "pair and the caller can only have permuted its weights for one of them",
+    )
+    gl.static_assert(
+        not (ROT and func_cfg.gu_split()),
+        "_EPI_ROTATE is inapplicable under gate_up_split: the split walk already "
+        "stages every tile before any flush, so there is no per-tile barrier to hide",
+    )
+    # Split stages the whole block, not one mini tile: NM tiles into one buffer, flushed
+    # once at the end of the walk. Costs NM x the LDS (still a few KB, overlaid on the
+    # dead pipeline buffers) and buys NM-1 barrier pairs and one wide store instead of
+    # NM narrow ones.
+    QROWS: gl.constexpr = BM if func_cfg.gu_split() else MBM
     if require_constexpr(func_cfg.output_quant is not None):
-        qp_smem = gl.allocate_shared_memory(gl.uint8, [MBM, OUT_MBN // 2], layout=QSH)
+        qp_smem = gl.allocate_shared_memory(gl.uint8, [QROWS, OUT_MBN // 2], layout=QSH)
         qs_smem = gl.allocate_shared_memory(
-            gl.uint8, [MBM, OUT_MBN // MX_GROUP], layout=QSH
+            gl.uint8, [QROWS, OUT_MBN // MX_GROUP], layout=QSH
         )
     else:
         qp_smem: gl.constexpr = None
@@ -2251,7 +2530,48 @@ def _epilogue_store(
         qp_smem2: gl.constexpr = None
         qs_smem2: gl.constexpr = None
 
-    if require_constexpr(ROT):
+    if require_constexpr(func_cfg.gu_split()):
+        # One pass over mi, pairing the two mini-N blocks: block 0 is the gate side and
+        # block 1 the linear side of the *same* emitted channels, so the activation is
+        # elementwise between two identically laid out accumulators. Every tile stages
+        # into its own MBM rows of the block-height buffer, then one barrier pair and
+        # one store flushes the lot.
+        for mi in gl.static_range(NM):
+            _epilogue_one_tile(
+                acc[_slot_index(mi, 0, NM, NN)],
+                mi,
+                0,
+                bias_tiles,
+                gamma_tiles,
+                gamma_smem,
+                bias_ptr,
+                gammas_base,
+                y_ptr,
+                y_stride_m,
+                y_stride_n,
+                ys_ptr,
+                ys_stride_m,
+                ys_stride_n,
+                block_id,
+                pid_n,
+                M_e,
+                x_static_scale,
+                func_cfg,
+                tuning_cfg,
+                qp_smem,
+                qs_smem,
+                lin=acc[_slot_index(mi, 1, NM, NN)],
+                STAGE_ROW=mi * MBM,
+                GATE_PRE=GATE_PRE,
+            )
+        if require_constexpr(func_cfg.output_quant is not None):
+            _epi_block_flush(
+                qp_smem, qs_smem,
+                y_ptr, y_stride_m, y_stride_n,
+                ys_ptr, ys_stride_m, ys_stride_n,
+                block_id, pid_n, M_e, func_cfg, tuning_cfg,
+            )
+    elif require_constexpr(ROT):
         # Software-pipelined staging: flush the PREVIOUS tile, then stage this one,
         # then one barrier. The read therefore consumes data written a full iteration
         # ago with a barrier already between them, and the two banks alternate so the
@@ -2429,7 +2749,7 @@ def _moe_gemm_body(
                 _blocked_b_offsets(
                     cl_b,
                     PK_B,
-                    pid_n * BN + ni * MBN,
+                    _n_start(pid_n, ni, cfg.N, func_cfg, tuning_cfg),
                     MBN,
                     KB,
                 ),
@@ -2438,8 +2758,7 @@ def _moe_gemm_body(
             b_offs = b_offs + (
                 gl.arange(0, PK_B, layout=gl.SliceLayout(1, cl_b))[:, None] * b.stride_k
                 + (
-                    pid_n * BN
-                    + ni * MBN
+                    _n_start(pid_n, ni, cfg.N, func_cfg, tuning_cfg)
                     + gl.arange(0, MBN, layout=gl.SliceLayout(0, cl_b))
                 )[None, :]
                 * b.stride_n,
@@ -2459,7 +2778,7 @@ def _moe_gemm_body(
                 _blocked_b_offsets(
                     fl_b,
                     PK_B,
-                    pid_n * BN + ni * MBN,
+                    _n_start(pid_n, ni, cfg.N, func_cfg, tuning_cfg),
                     MBN,
                     KB,
                 ),
@@ -2473,8 +2792,7 @@ def _moe_gemm_body(
             b_frag_offs = b_frag_offs + (
                 gl.arange(0, PK_B, layout=gl.SliceLayout(1, fl_b))[:, None] * b.stride_k
                 + (
-                    pid_n * BN
-                    + ni * MBN
+                    _n_start(pid_n, ni, cfg.N, func_cfg, tuning_cfg)
                     + gl.arange(0, MBN, layout=gl.SliceLayout(0, fl_b))
                 )[None, :]
                 * b.stride_n,
@@ -2485,7 +2803,7 @@ def _moe_gemm_body(
     a_scale_offs = _a_scale_offsets(
         a, rt, block_id, M_e, start_m, pid_m, cfg.K, func_cfg, tuning_cfg
     )
-    b_scale_offs = _b_scale_offsets(b, pid_n, cfg.K, func_cfg, tuning_cfg)
+    b_scale_offs = _b_scale_offsets(b, pid_n, cfg.N, cfg.K, func_cfg, tuning_cfg)
 
     lds = LDSManager.alloc(func_cfg, tuning_cfg)
 
@@ -2755,7 +3073,13 @@ def _moe_gemm_body(
                 gamma_smem, gammas_base, g_offs, mask=g_offs < M_e, other=0.0
             )
         if require_constexpr(func_cfg.has_bias):
-            epi_b_offs = pid_n * BN + gl.arange(0, BN, layout=EPI_BC)
+            epi_b_offs = _n_split_offs(
+                pid_n,
+                gl.arange(0, BN, layout=EPI_BC),
+                cfg.N,
+                func_cfg,
+                tuning_cfg,
+            )
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
                 bias_smem, bias_base, epi_b_offs
             )
@@ -2769,7 +3093,21 @@ def _moe_gemm_body(
     # what keeps every load inside K -- getting it wrong reads into the next expert's
     # weights while every correctness case still passes. The final step reads nothing and
     # just consumes the fragments still in registers.
-    for i in gl.static_range(NB):
+    # FUSE: the last step is peeled so the gate half's activation can be interleaved
+    # with its MFMAs. Legal without touching any wait count because that step alone has
+    # DO_DS_READ == False and therefore issues no wait_group -- see _FUSE_ACT_MFMA.
+    # Not with FROZEN_STEP: the snapshot is the pinned reference schedule and owns the
+    # manual ping-pong's cross-wave rendezvous, so replacing its last step with a
+    # hand-rolled walk would both break the "identical assembly" property the snapshot
+    # exists for and risk a barrier-count mismatch between wave groups.
+    FUSE: gl.constexpr = (
+        _FUSE_ACT_MFMA
+        and not _FROZEN_STEP
+        and func_cfg.gu_split()
+        and tuning_cfg.num_mini_n() == 2
+    )
+    DRAIN: gl.constexpr = NB - 1 if FUSE else NB
+    for i in gl.static_range(DRAIN):
         st = _pipeline_step(
             pc,
             st,
@@ -2780,8 +3118,6 @@ def _moe_gemm_body(
             i + 1 < NB,
             WAIT_SLACK=EPI_GROUPS,
         )
-
-    acc = st.acc
 
     # Hoisted out of the mini-tile loop: one scalar load, not one per tile.
     if require_constexpr(func_cfg.has_x_static_scale):
@@ -2795,8 +3131,25 @@ def _moe_gemm_body(
         # this retires them (and nothing else -- every pipeline group is older). The fill
         # is spread over every warp and each warp reads a whole mini block out of it, so
         # the barrier is load-bearing.
+        #
+        # Under FUSE this sits one step earlier, before the peeled step rather than after
+        # it, because that step now consumes the bias. Every step it still follows was
+        # handed WAIT_SLACK=EPI_GROUPS while the group was outstanding, and the peeled
+        # step issues no wait, so no count changes.
         gl.amd.cdna4.async_copy.wait_group(0)
         gl.barrier()
+
+    if require_constexpr(FUSE):
+        acc = _drain_last_fused(
+            pc,
+            st,
+            _epi_bias_tiles(bias_smem, bias_base, pid_n, cfg.N, func_cfg, tuning_cfg),
+            x_static_scale,
+            func_cfg,
+            tuning_cfg,
+        )
+    else:
+        acc = st.acc
 
     y_ptr = res.ptr + start_m.to(gl.int64) * res.stride_m
     if require_constexpr(func_cfg.output_quant is not None):
@@ -2814,6 +3167,7 @@ def _moe_gemm_body(
         bias_base,
         block_id,
         pid_n,
+        cfg.N,
         M_e,
         gammas_base,
         gamma_smem,
@@ -2821,6 +3175,7 @@ def _moe_gemm_body(
         x_static_scale,
         func_cfg,
         tuning_cfg,
+        GATE_PRE=FUSE,
     )
 
 

@@ -155,6 +155,9 @@ class FuncSpec(NamedTuple):
     has_gammas: bool
     has_gather: bool
     has_x_static_scale: bool
+    # Trailing, with a default: every construction site is positional, so a new field
+    # anywhere else would silently reinterpret the existing ones.
+    gate_up_split: bool = False
 
 
 class TuningSpec(NamedTuple):

@@ -208,6 +208,25 @@ def run_workload(tokens, reps, warmup):
         wd,
         n_active=N_EXPERTS,
     )
+    if os.environ.get("AITER_TRITON_MOE_GLUON_GU_SPLIT", "0") != "0":
+        # The split packing reads gate from [0, N/2) and up from [N/2, N), so the arm is
+        # only meaningful on permuted weights. Done once, outside the timed loop, exactly
+        # as a real caller would store them -- see activations.py::gate_up_split_perm.
+        from aiter.ops.triton._triton_kernels.moe.activations import (
+            gate_up_split_perm,
+        )
+
+        perm = gate_up_split_perm(n).to(w.device)
+
+        def _n_perm(t):
+            # Keep the K-contiguous (stride(-2) == 1) layout the wrapper requires; a
+            # plain .contiguous() after the gather would make N contiguous instead.
+            return t[..., perm].transpose(-1, -2).contiguous().transpose(-1, -2)
+
+        w, ws = _n_perm(w), _n_perm(ws)
+        if bias is not None:
+            bias = bias[..., perm].contiguous()
+
     y = torch.empty((1, gindx.shape[0], n // 2), dtype=torch.bfloat16, device="cuda")
 
     def call():

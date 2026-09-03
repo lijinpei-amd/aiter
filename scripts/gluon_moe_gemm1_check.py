@@ -57,7 +57,11 @@ TEST_FILE = "op_tests/triton_tests/moe/test_moe_gemm_a4w4.py"
 #: fall off the Gluon path and the test declines to run -- which is exactly the kind of
 #: silent coverage loss a "473 passed" string match would have reported as a hard FAIL
 #: while telling you nothing.
-SUITE_TOTAL = 473
+#:
+#: 2026-09-03 (later): 482, up from 473, when
+#: test_gemm1_gate_up_split_matches_interleaved added 9 cases -- the gate/up-split
+#: layout against the interleaved one, byte for byte.
+SUITE_TOTAL = 482
 SUITE_SKIPPED = 9
 
 #: Out-of-tree llc flags. See gluon_moe_gemm1_run_best.py for what each buys.
@@ -90,6 +94,15 @@ ARMS = [
     ("frozen no-act", "g4q", {"AITER_TRITON_MOE_GLUON_FROZEN_STEP": "1",
                               "AITER_TRITON_MOE_GLUON_NO_EPI": "1"}),
     ("impl act",      "g4q", {}),
+    # Gate/up as N halves instead of column-interleaved. Compare against `impl act`,
+    # not against frozen: it changes the epilogue, which frozen shares, so the pair
+    # (impl act, impl split) is the only clean A/B. cold_bench permutes the weights
+    # when it sees GU_SPLIT, so the two arms compute the same thing bit for bit.
+    ("impl split",    "g4q", {"AITER_TRITON_MOE_GLUON_GU_SPLIT": "1"}),
+    # ... plus the last K step peeled so the gate half's silu overlaps the linear
+    # half's MFMAs. Needs FROZEN_STEP off, which `impl` already is.
+    ("impl split fuse", "g4q", {"AITER_TRITON_MOE_GLUON_GU_SPLIT": "1",
+                                "AITER_TRITON_MOE_GLUON_FUSE_ACT_MFMA": "1"}),
     ("flydsl act",    "fly", {}),
     ("flydsl no-act", "fly", {"AITER_FLYDSL_NO_ACT": "1"}),
 ]
@@ -123,6 +136,10 @@ BASELINE_ABS = {
 #: The first two are the contract. "impl - frozen" is progress, not a gate: it is
 #: expected to shrink toward 0 as the refactor restores the manual schedule.
 BASELINE_PAIRED = [
+    # Not a gate yet -- no recorded baseline; reported so the layout A/B is visible in
+    # the same paired, drift-robust form as everything else.
+    ("gate/up split - interleaved", "impl split", "impl act",       None, None),
+    ("act/mfma fuse - split",       "impl split fuse", "impl split", None, None),
     ("activation cost, frozen",  "frozen act",    "frozen no-act",  +12.5, (+3.9, +22.4)),
     ("activation cost, flydsl",  "flydsl act",    "flydsl no-act",   -1.2, (-8.3, +8.1)),
     ("frozen - flydsl, act",     "frozen act",    "flydsl act",     +10.0, (-0.3, +18.0)),
@@ -216,10 +233,13 @@ def run_perf(rounds, gpu, job):
         v = got[name]
         if not v:
             continue
-        base = BASELINE_ABS[name]
+        base = BASELINE_ABS.get(name)
+        # A new arm has no recorded baseline yet; print it rather than crashing the
+        # whole run after the measurements are already in hand.
+        vs_base = f"baseline {base:6.1f}  ({s.median(v) - base:+5.1f})" if base else (
+            "baseline    n/a          ")
         print(f"  {name:14s} median {s.median(v):6.1f}  mean {s.mean(v):6.1f}  "
-              f"sd {s.pstdev(v):4.1f}   baseline {base:6.1f}  "
-              f"({s.median(v) - base:+5.1f})   {[round(x, 1) for x in v]}")
+              f"sd {s.pstdev(v):4.1f}   {vs_base}   {[round(x, 1) for x in v]}")
 
     print()
     print("paired deltas -- these are the verdict")
@@ -235,6 +255,11 @@ def run_perf(rounds, gpu, job):
         # One round gives a point estimate with no interval; treat it as maximally
         # uncertain rather than pretending the CI is zero-width.
         ci = 1.96 * s.stdev(d) / len(d) ** 0.5 if len(d) > 1 else float("inf")
+        if base_d is None:
+            # Informational arm: report the interval, gate on nothing.
+            print(f"    {label:26s} {m:+6.1f}  95% CI [{m - ci:+6.1f}, {m + ci:+6.1f}]"
+                  f"   (informational, no recorded baseline)")
+            continue
         moved = m - base_d
         # Flag only when the new interval clears the recorded one -- this kernel's
         # deltas have a ~4 us half-width, so anything inside that is not a signal.

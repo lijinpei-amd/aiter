@@ -518,3 +518,106 @@ def test_gemm1_fused_mxfp4_out(m, n, k, n_expts_tot, n_expts_act, act, device="c
         f"/ {ref_scale.numel()} bytes"
     )
 
+
+# The gate/up-split weight packing is an exact permutation of the interleaved one, so
+# the two must agree BYTE for byte -- not approximately, not within a ULP. That makes
+# this the whole correctness gate for the layout: any address, any pairing and any
+# reduction-axis mistake shows up here immediately, and nothing else about the kernel
+# changes. Run against the fused MXFP4 output specifically, because that is where the
+# split earns its keep (a warp's 32 emitted channels become exactly one MX group).
+# (E, topk) = (33, 8) on purpose: that is what makes the routing pick BLOCK_M 128, and
+# the split layout needs both mini-block axes split (validate() rejects NN != 2). The
+# 128-expert shapes the neighbouring tests use land on BLOCK_M 32, where there is only
+# one mini-N block and the whole Gluon path is off anyway.
+@pytest.mark.parametrize(
+    "m, n, k, n_expts_tot, n_expts_act",
+    [
+        (512, 4096, 4096, 33, 8),
+        (512, 6144, 7168, 33, 8),
+        (1024, 4096, 4096, 33, 8),
+    ],
+)
+@pytest.mark.parametrize("act", ACT_RECIPES, ids=[a.name for a in ACT_RECIPES])
+def test_gemm1_gate_up_split_matches_interleaved(
+    m, n, k, n_expts_tot, n_expts_act, act, device="cuda"
+):
+    if get_arch() != "gfx950":
+        pytest.skip("Gluon MoE kernels are gfx950 only.")
+    from aiter.ops.triton._triton_kernels.moe.activations import gate_up_split_perm
+    from aiter.ops.triton.moe.moe_op_gemm_gluon import (
+        gluon_supported,
+        moe_gemm1_a4w4_mxfp4_out,
+    )
+
+    torch.manual_seed(0)
+    m, rdata, gindx, _ = init_routing_data(
+        m, n_expts_tot, n_expts_act, do_gather=True, do_scatter=False, device=device
+    )
+    x_tri, w_tri, bias_tri, gammas = init_compute_data(
+        m, n, k, gindx, None, n_expts_tot, n_expts_act,
+        torch.bfloat16, torch.bfloat16, True, device=device,
+    )
+    w_tri, w_scale_tri = downcast_to_mxfp(w_tri, torch.uint8, axis=1)
+    x_tri, x_mx_scales_tri = mxfp4_quant(x_tri)
+
+    M = gindx.shape[0]
+    ok, why = gluon_supported(
+        x=x_tri,
+        w=w_tri,
+        x_scales=x_mx_scales_tri,
+        w_scales=w_scale_tri,
+        y=torch.empty((1, M, n // 2), dtype=torch.bfloat16, device=device),
+        bias=bias_tri,
+        routing_data=rdata,
+        swizzle_mx_scale=None,
+        split_k=1,
+        x_static_scale=None,
+        quant_static_scale=None,
+        out_quant=None,
+        N=n,
+        K=k,
+    )
+    if not ok:
+        pytest.skip(f"shape not on the Gluon path: {why}")
+
+    kw = {
+        "alpha": act.alpha,
+        "limit": act.limit,
+        "swiglu_add_residual": act.add_residual,
+    }
+    args = (x_tri, w_tri, x_mx_scales_tri, w_scale_tri, bias_tri, rdata, gindx, gammas)
+    ref_fp4, ref_scale = moe_gemm1_a4w4_mxfp4_out(*args, gate_up_split=False, **kw)
+
+    # Permute every N-indexed operand into [gate | up] halves. Done here rather than in
+    # the wrapper because a real caller stores the weights this way once; permuting an
+    # ~8.5 GB stacked weight per launch would dwarf the kernel.
+    perm = gate_up_split_perm(n).to(device)
+
+    def n_perm(t):
+        # The gather has to keep the K-contiguous ((E, K/pack, N) with stride(-2) == 1)
+        # layout the wrapper insists on; a plain .contiguous() would make N contiguous
+        # instead and gluon_supported rejects it.
+        return t[..., perm].transpose(-1, -2).contiguous().transpose(-1, -2)
+
+    split_args = (
+        x_tri,
+        n_perm(w_tri),
+        x_mx_scales_tri,
+        n_perm(w_scale_tri),
+        None if bias_tri is None else bias_tri[..., perm].contiguous(),
+        rdata,
+        gindx,
+        gammas,
+    )
+    got_fp4, got_scale = moe_gemm1_a4w4_mxfp4_out(
+        *split_args, gate_up_split=True, **kw
+    )
+
+    assert torch.equal(got_fp4, ref_fp4), (
+        f"payload differs in {(got_fp4 != ref_fp4).sum().item()} / "
+        f"{ref_fp4.numel()} bytes"
+    )
+    assert torch.equal(got_scale, ref_scale), (
+        f"E8M0 scale differs in {(got_scale != ref_scale).sum().item()} "
+        f"/ {ref_scale.numel()} bytes"
+    )
