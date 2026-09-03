@@ -649,6 +649,7 @@ def _launch_spec(
     act,
     out_quant,
     config_items,
+    gate_up_split=False,
 ):
     """Host-side constexpr work, memoised.
 
@@ -675,6 +676,7 @@ def _launch_spec(
         has_gammas,
         has_gather,
         has_x_static_scale,
+        gate_up_split,
     )
     tuning_spec = TuningSpec(*(_hashable(c[k]) for k in _TUNING_KEYS))
     # Construct the tuning config on the host off exactly the numbers the kernel will
@@ -1059,6 +1061,7 @@ def moe_gemm_gluon(
     x_static_scale: torch.Tensor | None = None,
     y_scales: torch.Tensor | None = None,
     config: dict | None = None,
+    gate_up_split: bool | None = None,
 ):
     """Launch the Gluon grouped GEMM into ``y`` (shape ``(1, M, N // ARN)``).
 
@@ -1071,9 +1074,19 @@ def moe_gemm_gluon(
     E2M1 payload (``N // ARN // 2`` uint8 columns) and ``y_scales`` the E8M0 exponents,
     bit-identical to what the standalone ``mxfp4_quant`` launch produces.
 
+    ``gate_up_split`` selects the gated activation's operand packing along N: the
+    default ``False`` is the interleaved (g,l,g,l) form every caller uses today, and
+    ``True`` expects gate in ``w[..., :N//2]`` and up in ``w[..., N//2:]`` -- see
+    ``activations.py::gate_up_split_perm``, which builds the permutation, and the
+    ``moe_gemm.py`` module docstring for why the split form is faster. ``None`` takes
+    the ``AITER_TRITON_MOE_GLUON_GU_SPLIT`` default. Inert without ``apply_swiglu``.
+
     Returns the compiled kernel handle so callers (the ISA-assertion test) can inspect
     ``.asm``; the result itself is written into ``y`` / ``y_scales``.
     """
+    if gate_up_split is None:
+        gate_up_split = bool(_env_int("AITER_TRITON_MOE_GLUON_GU_SPLIT", 0))
+    gate_up_split = bool(gate_up_split) and apply_swiglu
     block_m = routing_data.block_m
     expt_data = routing_data.expt_data
     grid_m = routing_data.n_blocks(y.shape[1], block_m)
@@ -1091,20 +1104,30 @@ def moe_gemm_gluon(
         act = None
     out_quant = int(DtypeQuant.MXFP4) if y_scales is not None else None
 
-    grid_n, kcfg, num_warps, waves_per_eu, _cfg, _tc = _launch_spec(
-        block_m,
-        N,
-        K,
-        dq_a,
-        dq_b,
-        _small_grid(routing_data, y.shape[1], N),
-        bias is not None,
-        gammas is not None,
-        gather_indx is not None,
-        x_static_scale is not None,
-        act,
-        out_quant,
-        tuple(sorted((k, _hashable(v)) for k, v in config.items())) if config else None,
+    # Every argument but the config tuple is fixed for this launch, so bind them once.
+    # Three of the shuffle branches below rebuild the spec against an amended config,
+    # and spelling the full argument list four times is how a new field silently
+    # reaches one call site and not the others.
+    def _spec(cfg_items):
+        return _launch_spec(
+            block_m,
+            N,
+            K,
+            dq_a,
+            dq_b,
+            _small_grid(routing_data, y.shape[1], N),
+            bias is not None,
+            gammas is not None,
+            gather_indx is not None,
+            x_static_scale is not None,
+            act,
+            out_quant,
+            cfg_items,
+            gate_up_split,
+        )
+
+    grid_n, kcfg, num_warps, waves_per_eu, _cfg, _tc = _spec(
+        tuple(sorted((k, _hashable(v)) for k, v in config.items())) if config else None
     )
 
     # Optional token-scale pre-pass. Only rebuilds the launch spec when the shuffle
@@ -1123,12 +1146,8 @@ def moe_gemm_gluon(
             # BLOCK_K/32 == 8) times scale_stride_k. 8 * 32 == the 256 B a stage spans.
             a_scale_stride_m, a_scale_stride_k = 0, 32
             _cfg = dict(_cfg, A_SCALE_SORTED_SHUFFLED=True)
-            grid_n, kcfg, num_warps, waves_per_eu, _cfg, _tc = _launch_spec(
-                block_m, N, K, dq_a, dq_b,
-                _small_grid(routing_data, y.shape[1], N),
-                bias is not None, gammas is not None, gather_indx is not None,
-                x_static_scale is not None, act, out_quant,
-                tuple(sorted((k, _hashable(v)) for k, v in _cfg.items())),
+            grid_n, kcfg, num_warps, waves_per_eu, _cfg, _tc = _spec(
+                tuple(sorted((k, _hashable(v)) for k, v in _cfg.items()))
             )
 
     # The Quant* tuples carry the scale pointer and strides unconditionally; when the
@@ -1154,12 +1173,8 @@ def moe_gemm_gluon(
             b_scales, b_swizzle = shuf_w, ScaleSwizzle.CDNA4_SCALE
             b_scale_stride_k = 32
             _cfg = dict(_cfg, B_SCALE_SHUFFLED=True)
-            grid_n, kcfg, num_warps, waves_per_eu, _cfg, _tc = _launch_spec(
-                block_m, N, K, dq_a, dq_b,
-                _small_grid(routing_data, y.shape[1], N),
-                bias is not None, gammas is not None, gather_indx is not None,
-                x_static_scale is not None, act, out_quant,
-                tuple(sorted((k, _hashable(v)) for k, v in _cfg.items())),
+            grid_n, kcfg, num_warps, waves_per_eu, _cfg, _tc = _spec(
+                tuple(sorted((k, _hashable(v)) for k, v in _cfg.items()))
             )
 
     w_payload = w
@@ -1168,12 +1183,8 @@ def moe_gemm_gluon(
         if shuf_b is not None:
             w_payload = shuf_b
             _cfg = dict(_cfg, B_PRESHUFFLED=True)
-            grid_n, kcfg, num_warps, waves_per_eu, _cfg, _tc = _launch_spec(
-                block_m, N, K, dq_a, dq_b,
-                _small_grid(routing_data, y.shape[1], N),
-                bias is not None, gammas is not None, gather_indx is not None,
-                x_static_scale is not None, act, out_quant,
-                tuple(sorted((k, _hashable(v)) for k, v in _cfg.items())),
+            grid_n, kcfg, num_warps, waves_per_eu, _cfg, _tc = _spec(
+                tuple(sorted((k, _hashable(v)) for k, v in _cfg.items()))
             )
 
     b = QuantExpertTensor.make(
@@ -1393,6 +1404,7 @@ def moe_gemm1_a4w4_mxfp4_out(
     limit: float | None = None,
     swiglu_add_residual: bool = False,
     config: dict | None = None,
+    gate_up_split: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """gemm1 with the activation **and** the MXFP4 output quant fused into the epilogue.
 
@@ -1401,6 +1413,11 @@ def moe_gemm1_a4w4_mxfp4_out(
     the whole point of the two-kernel split -- today's flow writes bf16, reads it back
     and runs a third full pass (``mxfp4_quant``, which even upcasts to fp32 first),
     roughly 2.5x the necessary intermediate traffic.
+
+    ``gate_up_split=True`` expects ``w`` (and ``w_scales`` and ``bias``) permuted so
+    gate occupies ``[0, N/2)`` and up ``[N/2, N)`` along N; see
+    :func:`gate_up_split_perm`. The returned payload and scales are bit-identical to
+    the interleaved form, so the two are a drop-in A/B.
 
     Raises if the shape is outside the Gluon path; there is no silent fallback here
     because the caller is asking for the fused format specifically.
@@ -1452,6 +1469,7 @@ def moe_gemm1_a4w4_mxfp4_out(
         swiglu_add_residual,
         y_scales=y_scales,
         config=config,
+        gate_up_split=gate_up_split,
     )
     return y[0], y_scales
 

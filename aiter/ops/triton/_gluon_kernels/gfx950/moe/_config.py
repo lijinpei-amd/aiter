@@ -201,6 +201,13 @@ class KernelFuncConfig:
     # the FP8_E4M3 operand carries unit scales through the MMA, so the whole tensor
     # scale has to come back somewhere and the Triton kernels put it exactly here.
     has_x_static_scale: gl.constexpr
+    # Gated-activation operand layout along N. False: interleaved (g,l,g,l), the
+    # packing every caller uses today. True: the two sides are whole halves of the raw
+    # N axis, gate in [0, N/2) and linear in [N/2, N) -- so a mini-N block is one whole
+    # side and the pair for an emitted channel is two *tiles*, not two registers. The
+    # caller's weights, weight scales and bias must be permuted to match; see
+    # ``activations.py::gate_up_split_perm``.
+    gate_up_split: gl.constexpr
 
     @gluon.constexpr_function
     def __init__(
@@ -216,6 +223,7 @@ class KernelFuncConfig:
         has_gammas,
         has_gather,
         has_x_static_scale,
+        gate_up_split=False,
     ):
         self.token_dtype_quant = gl.constexpr(_v(token_dtype_quant))
         self.expert_dtype_quant = gl.constexpr(_v(expert_dtype_quant))
@@ -228,6 +236,7 @@ class KernelFuncConfig:
         self.has_gammas = gl.constexpr(_v(has_gammas))
         self.has_gather = gl.constexpr(_v(has_gather))
         self.has_x_static_scale = gl.constexpr(_v(has_x_static_scale))
+        self.gate_up_split = gl.constexpr(bool(_v(gate_up_split)))
 
     # -- activation accessors (the spec's `activation` is a NamedTuple in a constexpr,
     #    so unwrap it here rather than at every use site) --
@@ -243,6 +252,26 @@ class KernelFuncConfig:
     def activation_reduction_n(self):
         """Emitted columns per raw column. 2 for a gated activation, 1 otherwise."""
         return 2 if _v(self.activation) is not None else 1
+
+    @gluon.constexpr_function
+    def gu_split(self):
+        """Is the gated pair laid out as two N halves rather than interleaved?
+
+        Only meaningful with a gated activation -- the flag is inert otherwise, so it
+        is folded in here instead of at every use site.
+        """
+        return bool(_v(self.gate_up_split)) and _v(self.activation) is not None
+
+    @gluon.constexpr_function
+    def mini_n_reduction(self):
+        """Emitted columns per raw column *within one mini-N block*.
+
+        The block-level ratio is always :meth:`activation_reduction_n`, but under
+        ``gu_split`` the halving happens *across* two mini blocks rather than inside
+        each one -- a mini block is a whole operand side, so its width maps 1:1 onto
+        emitted channels and two of them collapse into one output tile.
+        """
+        return 1 if self.gu_split() else self.activation_reduction_n()
 
     # -- dtype accessors --
     #
@@ -1252,9 +1281,34 @@ class KernelTuningConfig:
         # -- scale swizzle --
         # (checked by the caller against the tensor's scale_swizzle field)
 
+        # -- gate/up split: a mini-N block must be exactly one operand side --
+        if fc.gu_split():
+            MBN = _v(self.MINI_BLOCK_N)
+            assert self.num_mini_n() == 2 and MBN * 2 == BN, (
+                f"gate_up_split needs exactly two mini-N blocks, one per side: got "
+                f"BLOCK_N {BN} / MINI_BLOCK_N {MBN} = {self.num_mini_n()}"
+            )
+            assert N % 2 == 0 and (N // 2) % MBN == 0, (
+                f"gate_up_split needs each half of N ({N}) to be a whole number of "
+                f"MINI_BLOCK_N ({MBN}) tiles"
+            )
+            # The whole point of the layout: a warp's emitted N extent has to contain a
+            # whole MX group, or the fused quant's amax crosses the warp boundary. That
+            # extent is instr_n * tiles_per_warp_n -- warps tile *above* it, so the
+            # warp count is irrelevant here.
+            if fc.output_quant is not None:
+                warp_n = instr[1] * tiles[1]
+                assert warp_n % MX_GROUP == 0, (
+                    f"gate_up_split with a fused MX output quant needs a warp's "
+                    f"emitted N extent (instr_n {instr[1]} * tiles_per_warp_n "
+                    f"{tiles[1]} = {warp_n}) to be a multiple of {MX_GROUP}, else the "
+                    "amax reduction still crosses warps"
+                )
+                assert MBN % MX_GROUP == 0
+
         # -- the fused MX output quant groups 32 *emitted* columns, so the raw tile has
         #    to carry 32 * activation_reduction_n of them --
-        if fc.output_quant is not None:
+        elif fc.output_quant is not None:
             arn = fc.activation_reduction_n()
             assert BN % (MX_GROUP * arn) == 0, (
                 f"BLOCK_N {BN} must be a multiple of {MX_GROUP * arn} in raw "
