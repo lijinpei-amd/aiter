@@ -25,6 +25,11 @@ SHAPES = [
     (385, 7168, 256, 9),  # Kimi-K2.5 D_INTER=256 (kimik2_b)
     (32, 7168, 2048, 8),  # dsv3_a
     (33, 7168, 2048, 8),  # dsv3_a + 1 shared expert
+    # K-sweep shapes: dsv3_a+shared with H scaled 0.5x / 2x / 4x, for measuring
+    # how gemm1 scales with K. Benchmark-only; remove if the list is trimmed.
+    (33, 3584, 2048, 8),
+    (33, 14336, 2048, 8),
+    (33, 28672, 2048, 8),
     (256, 3072, 1536, 8),  # minimax_a (H=3072)
     (256, 3072, 768, 8),  # minimax_b (H=3072)
     (512, 4096, 256, 10),  # qwen35_397b (H=4096, TOPK=10)

@@ -10,6 +10,8 @@ argument, only its class can. Keeping the arithmetic in the aggregate is what st
 host grid math and the device tile math from drifting.
 """
 
+import os
+
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.language.core import _aggregate as aggregate
@@ -18,11 +20,20 @@ from aiter.ops.triton.utils.common_utils import strip_annotate
 
 from ._lang import MX_GROUP, WARP_SIZE
 from ._lang import unwrap as _v
+
+#: Non-K extent of one A-scale fill tile, when it should differ from MINI_BLOCK_M.
+#: 0 = follow MINI_BLOCK_M. Read here rather than inside the constexpr_function: those
+#: bodies are traced by the Gluon compiler, which rejects os.environ.get.
+_SCALE_MINI_M_ENV = int(
+    os.environ.get("AITER_TRITON_MOE_GLUON_SCALE_MINI_BLOCK_M", "0")
+)
 from ._types import (
     ActivationSpec,
     DotKind,
     DtypeQuant,
     ScaleSwizzle,
+    WaitCommitScheme,
+    WarpPipeline,
     dq_has_scale,
     dq_mx_format,
     dq_pack_divisor,
@@ -73,6 +84,95 @@ def _bases_to_distributed(offset_bases, contiguity, num_warps, warp_size, shape)
         warp_bases=[list(b) for b in warp],
         block_bases=[],
         shape=list(shape),
+    )
+
+
+#: K extent of one LDS unit, in bytes. Fixed, for every dtype: the operand shape in
+#: scope is 16x16x128 B, which is 16x16x128 for fp8 and 16x16x256 for packed fp4 (one
+#: unit then spans two MFMA K-steps, and the layout is unaffected).
+LDS_UNIT_K_BYTES = 128
+#: The 16 B a lane moves per access -- the granule the preshuffled HBM order blocks by.
+LDS_LANE_BYTES = 16
+#: Padding of a non-preshuffled unit: 32 B every 1024 B.
+LDS_PAD_INTERVAL_BYTES = 1024
+LDS_PAD_BYTES = 32
+
+
+@gluon.constexpr_function
+def _pow2_bases(dim, rank, values):
+    """``[[v, 0], ...]`` (or ``[[0, v], ...]``) for each stride in ``values``."""
+    return [[v if i == dim else 0 for i in range(rank)] for v in values]
+
+
+@gluon.constexpr_function
+def _ramp(lo, hi):
+    """Powers of two ``lo, 2*lo, ... hi/2``; empty when ``hi <= lo``."""
+    out = []
+    v = lo
+    while v < hi:
+        out.append(v)
+        v *= 2
+    return out
+
+
+@gluon.constexpr_function
+def byte_unit_lds_layout(shape, nk_dim, elem_bits, unit_rows, preshuffled):
+    """LDS layout of a payload operand, tiled by a fixed (rows x 128 B) unit.
+
+    The tile is read as ``(non-K units, K units, unit_rows, 128 B)`` with the rightmost
+    axis contiguous, so the unit -- not the CTA tile -- is what fixes the layout. That
+    is the difference from ``compute_efficient_padded_shared_layout``, which sizes its
+    non-K unit from the whole tile and therefore hands a 128-row tile a different
+    permutation than a 32-row one.
+
+    Two orders, selected by whether the operand is already preshuffled in HBM:
+
+    * not preshuffled -- 32 rows, the measured row permutation ``1, 4, 16, 2, 8``, and
+      32 B of padding every 1024 B. A warp's 64 lanes cover exactly one 1024 B run, so
+      the padding never splits a direct-to-LDS write.
+    * preshuffled -- 16 rows in the byte order ``utils/shuffle.py::shuffle_weight(w,
+      (16, 16))`` already writes, i.e. ``(n//16)*(KB*16) + (k//16)*256 + (n%16)*16 +
+      k%16``. The copy is then a straight linear run and no padding is needed, because
+      the 64 lanes of a fetch already land on 64 consecutive 16 B slots.
+
+    ``shape`` and the returned bases are in *stored* elements; with the 8-bit storage
+    both fp8 and packed fp4 use, one element is one byte.
+    """
+    shape = [int(x) for x in _v(shape)]
+    nk_dim = _v(nk_dim)
+    elem_bits = _v(elem_bits)
+    unit_rows = _v(unit_rows)
+    rank = len(shape)
+    kd = 1 - nk_dim
+    els = lambda nbytes: nbytes * 8 // elem_bits  # noqa: E731
+
+    U = els(LDS_UNIT_K_BYTES)  # elements per 128 B K unit
+    V = els(LDS_LANE_BYTES)  # elements per 16 B lane access
+    rows, kelems = shape[nk_dim], shape[kd]
+
+    K = lambda vs: _pow2_bases(kd, rank, vs)  # noqa: E731
+    NK = lambda vs: _pow2_bases(nk_dim, rank, vs)  # noqa: E731
+
+    if preshuffled:
+        # 16 B of K, then the 16 rows, then the rest of the 128 B unit.
+        bases = K(_ramp(1, V)) + NK(_ramp(1, unit_rows)) + K(_ramp(V, U))
+    else:
+        assert unit_rows == 32, "the 1, 4, 16, 2, 8 permutation is a 32-row order"
+        bases = K(_ramp(1, U)) + NK([1, 4, 16, 2, 8])
+    bases = bases + K(_ramp(U, kelems)) + NK(_ramp(unit_rows, rows))
+
+    if preshuffled:
+        # PaddedSharedLayout insists on at least one interval/padding pair, so name an
+        # interval wider than the tile: no pad can land inside it. 16 rather than 1 so
+        # that even if the allocator rounds the tile up, it stays ds_read_b128 aligned.
+        pairs = [[1 << (rows * kelems).bit_length(), 16]]
+    else:
+        pairs = [[els(LDS_PAD_INTERVAL_BYTES), els(LDS_PAD_BYTES)]]
+    return gl.PaddedSharedLayout(
+        interval_padding_pairs=pairs,
+        offset_bases=bases,
+        cga_layout=[],
+        shape=shape,
     )
 
 
@@ -286,6 +386,12 @@ class KernelTuningConfig:
     result_scale_mod: gl.constexpr
     WARP_PIPELINE: gl.constexpr
     VGPR_PREFETCH_K: gl.constexpr
+    A_SCALE_SORTED_SHUFFLED: gl.constexpr
+    B_SCALE_SHUFFLED: gl.constexpr
+    B_IN_REG: gl.constexpr
+    B_PRESHUFFLED: gl.constexpr
+    ACT_FAST_RCP: gl.constexpr
+    WAIT_COMMIT_SCHEME: gl.constexpr
 
     @gluon.constexpr_function
     def __init__(
@@ -316,6 +422,12 @@ class KernelTuningConfig:
         result_scale_mod,
         WARP_PIPELINE,
         VGPR_PREFETCH_K,
+        A_SCALE_SORTED_SHUFFLED=False,
+        B_SCALE_SHUFFLED=False,
+        B_IN_REG=False,
+        B_PRESHUFFLED=False,
+        ACT_FAST_RCP=False,
+        WAIT_COMMIT_SCHEME=int(WaitCommitScheme.PER_FILL),
     ):
         self.func_cfg = func_cfg
         self.BLOCK_M = gl.constexpr(_v(BLOCK_M))
@@ -341,8 +453,15 @@ class KernelTuningConfig:
         self.expert_scale_mod = gl.constexpr(_v(expert_scale_mod))
         self.result_mod = gl.constexpr(_v(result_mod))
         self.result_scale_mod = gl.constexpr(_v(result_scale_mod))
-        self.WARP_PIPELINE = gl.constexpr(_v(WARP_PIPELINE))
+        # int, not bool: WarpPipeline has three values and True still lands on COMPILER.
+        self.WARP_PIPELINE = gl.constexpr(int(_v(WARP_PIPELINE)))
         self.VGPR_PREFETCH_K = gl.constexpr(int(_v(VGPR_PREFETCH_K)))
+        self.A_SCALE_SORTED_SHUFFLED = gl.constexpr(bool(_v(A_SCALE_SORTED_SHUFFLED)))
+        self.B_SCALE_SHUFFLED = gl.constexpr(bool(_v(B_SCALE_SHUFFLED)))
+        self.B_IN_REG = gl.constexpr(bool(_v(B_IN_REG)))
+        self.B_PRESHUFFLED = gl.constexpr(bool(_v(B_PRESHUFFLED)))
+        self.ACT_FAST_RCP = gl.constexpr(bool(_v(ACT_FAST_RCP)))
+        self.WAIT_COMMIT_SCHEME = gl.constexpr(int(_v(WAIT_COMMIT_SCHEME)))
 
     @gluon.constexpr_function
     def num_warps(self):
@@ -392,6 +511,75 @@ class KernelTuningConfig:
     def num_mini_n(self):
         """Mini-N column blocks per CTA tile. Operand B and the accumulator split."""
         return _v(self.BLOCK_N) // _v(self.MINI_BLOCK_N)
+
+    # -- inter-wave ping-pong (WarpPipeline) ----------------------------------------
+    # The three modes share one step body; these only say which stage borders it lays
+    # down. See _lang.pick_warp_pipeline_stage.
+
+    @gluon.constexpr_function
+    def warp_pipeline_enabled(self):
+        """Any ping-pong at all -- what the VGPR_PREFETCH_K precondition keys on."""
+        return _v(self.WARP_PIPELINE) != int(WarpPipeline.NONE)
+
+    @gluon.constexpr_function
+    def warp_pipeline_compiler(self):
+        """Hand the mfma/mem halves to TritonAMDGPUWarpPipeline."""
+        return _v(self.WARP_PIPELINE) == int(WarpPipeline.COMPILER)
+
+    @gluon.constexpr_function
+    def warp_pipeline_manual(self):
+        """The hand-emitted rendezvous -- ``_pipeline_step_frozen`` only, for now."""
+        return _v(self.WARP_PIPELINE) == int(WarpPipeline.MANUAL)
+
+    # -- commit-group granularity (WaitCommitScheme) --------------------------------
+    # The emission level and the wait arithmetic are one decision: wait_group(n) counts
+    # groups, so a commit moved without the count that walks past it is a wrong wait,
+    # not a slower one. Both sides read these two methods and nothing else.
+
+    @gluon.constexpr_function
+    def commit_per_fill(self):
+        return _v(self.WAIT_COMMIT_SCHEME) == int(WaitCommitScheme.PER_FILL)
+
+    @gluon.constexpr_function
+    def commit_per_slot(self):
+        return _v(self.WAIT_COMMIT_SCHEME) == int(WaitCommitScheme.PER_SLOT)
+
+    @gluon.constexpr_function
+    def commit_per_stage(self):
+        return _v(self.WAIT_COMMIT_SCHEME) == int(WaitCommitScheme.PER_STAGE)
+
+    @gluon.constexpr_function
+    def commit_groups_per_stage(self):
+        """Commit groups one ``BLOCK_K`` stage emits under the selected scheme.
+
+        ``PER_FILL`` is the payload count, ``num_mini_m() + num_mini_n()``: a scale that
+        sits on another slot commits a group of its own on top, so the model is
+        *conservative* there -- it counts fewer groups per stage than are emitted, and a
+        wait derived from it therefore retires more than it has to. The other two levels
+        are exact.
+        """
+        if self.commit_per_slot():
+            return self.num_mini_m() * self.num_mini_n()
+        if self.commit_per_stage():
+            return 1
+        return self.num_mini_m() + self.num_mini_n()
+
+    @gluon.constexpr_function
+    def wait_at_stage_head(self):
+        """Emit one ``wait_group`` per stage (at its first slot) rather than one per slot.
+
+        Only under ``PER_FILL``: every group a slot reads is then named individually, so
+        the strongest slot wait of the stage implies all the others and the remaining
+        ``num_mini_m() * num_mini_n() - 1`` waits are redundant. They are not free --
+        Membar inserts a barrier after *every* ``ttg.async_wait`` unconditionally
+        (Membar.cpp, the MemWaitOp path, which returns before the conflict analysis is
+        consulted), and each such ``ttg.barrier`` is a workgroup release fence and hence
+        an ``s_waitcnt lgkmcnt(0)``. Strongest = smallest count, since ``wait_group(n)``
+        leaves at most ``n`` groups outstanding. Under the coarser
+        levels one group covers several tiles, so a slot's wait is not implied by an
+        earlier slot's and each is emitted at the head of its own slot.
+        """
+        return self.commit_per_fill()
 
     @gluon.constexpr_function
     def num_lds_tiles(self, idx):
@@ -488,6 +676,17 @@ class KernelTuningConfig:
         that keeps this True.
         """
         shape = self.scale_shape(idx)
+        if _v(idx) == 1 and _v(self.B_IN_REG):
+            # B's payload is carried in registers two K-stages deep; its scales have to
+            # ride the same pipeline or the MFMA would pair stage k's payload with a
+            # different stage's scale. Only safe because a wave-private B (warps (1, 4))
+            # is not re-fetched per warp -- under warps (n, 1) it would be.
+            return False
+        if self.scale_shuffled(idx):
+            # Fragment-ordered in HBM, so the copy is linear and the LDS tile keeps the
+            # same permutation; the read is then a 32-bit ds_read. Staying on LDS also
+            # keeps the warp-broadcast B tile a single fetch rather than one per warp.
+            return True
         return (
             shape[0] * shape[1] >= WARP_SIZE * 4 and shape[1] % 4 == 0 and shape[1] >= 8
         )
@@ -507,9 +706,9 @@ class KernelTuningConfig:
         16 B contiguous store, and a lane-local even/odd gate-up pair for the fused
         activation) instead of 4 strided M rows.
         """
-        assert _v(
-            self.transposed
-        ), "transposed=True is pinned, see the module docstring"
+        assert _v(self.transposed), (
+            "transposed=True is pinned, see the module docstring"
+        )
         return gl.amd.AMDMFMALayout(
             version=4,
             instr_shape=_v(self.mfma_instr_shape),
@@ -527,6 +726,55 @@ class KernelTuningConfig:
         )
 
     @gluon.constexpr_function
+    def operand_preshuffled(self, idx):
+        """Is this operand's payload already blocked 16-column in HBM?
+
+        Never for A: the token rows are gathered per launch from the routing order, so
+        there is no static permutation to bake in. For B it is the ``B_PRESHUFFLED``
+        knob, which the caller honours by handing over the permuted weight tensor.
+        """
+        return _v(idx) == 1 and _v(self.B_PRESHUFFLED)
+
+    @gluon.constexpr_function
+    def lds_unit_rows(self, idx):
+        """Non-K extent of one LDS unit.
+
+        A preshuffled operand is blocked 16 rows at a time in HBM and the copy has to
+        stay linear, so the unit is that block. A plain one is read two MFMA tiles at a
+        time (hence the ``tiles_per_warp >= 2`` that :meth:`validate` insists on), so
+        the unit is 32 and the row permutation has a 5th base to work with.
+        """
+        return 16 if self.operand_preshuffled(idx) else 32
+
+    @gluon.constexpr_function
+    def byte_unit_lds_ok(self, idx):
+        """Does :func:`byte_unit_lds_layout` apply to this operand?
+
+        Only the 16x16x128 B operand shape is in scope -- that is 16x16x128 for fp8 and
+        16x16x256 for packed fp4, both stored 8-bit. The 32x32x64 prefill configs, the
+        bf16 ones (16x16x32 / 32x32x16) and any tile too short for a whole unit keep
+        ``compute_efficient_padded_shared_layout``.
+
+        A non-preshuffled 32-row unit additionally needs the warp to own both of its
+        16-row MFMA tiles, i.e. ``tiles_per_warp >= 2`` on that axis. That is not always
+        reachable -- at ``BLOCK_N`` 64 with warps (1, 4) the CTA's whole N tile is four
+        16-column tiles, so no warp can have two -- hence a gate rather than an assert.
+        """
+        idx = _v(idx)
+        if list(_v(self.mfma_instr_shape)) != [16, 16, 128]:
+            return False
+        elem_bits = self.func_cfg.operand_elem_ty(idx).primitive_bitwidth
+        if elem_bits != 8:
+            return False
+        if not self.operand_preshuffled(idx) and _v(self.tiles_per_warp)[idx] < 2:
+            return False
+        shape = self.lds_shape(idx)
+        rows, kelems = shape[idx], shape[1 - idx]
+        unit_rows = self.lds_unit_rows(idx)
+        unit_k = LDS_UNIT_K_BYTES * 8 // elem_bits
+        return rows % unit_rows == 0 and kelems % unit_k == 0
+
+    @gluon.constexpr_function
     def dot_operand_lds_layout(self, idx):
         """Padded shared layout for a payload operand.
 
@@ -537,6 +785,14 @@ class KernelTuningConfig:
         """
         idx = _v(idx)
         shape = self.lds_shape(idx)
+        if self.byte_unit_lds_ok(idx):
+            return byte_unit_lds_layout(
+                shape,
+                idx,
+                self.func_cfg.operand_elem_ty(idx).primitive_bitwidth,
+                self.lds_unit_rows(idx),
+                self.operand_preshuffled(idx),
+            )
         layout = gl.amd.cdna4.compute_efficient_padded_shared_layout(
             self.dot_operand_fragment_layout(idx),
             shape,
@@ -577,6 +833,217 @@ class KernelTuningConfig:
             self.dot_operand_fragment_layout(idx), shape, MX_GROUP
         )
 
+    # -- ScaleSwizzle.SORTED_SHUFFLED --------------------------------------------
+    # moe_sort_scales.cuh writes one dword per (chunk, mi, ku, k_lane, n_lane) with
+    #     row = chunk*BM + (mi*MN_PACK + im_a)*16 + n_lane
+    #     k   = ku*K_PACK*4 + ikxdl*4 + k_lane
+    #     byte within the dword = ikxdl*MN_PACK + im_a
+    # so n_lane/k_lane index the 64 lanes of a wavefront, im_a/ikxdl the 4 bytes a lane
+    # holds, and mi the wave. That is exactly get_mfma_scale_layout's decomposition for
+    # a 16x16x128 dot operand with warps_per_cta = (num_warps, 1) and
+    # tiles_per_warp = (2, 1) -- verified base-for-base -- so the shuffled buffer is
+    # read with a plain contiguous load and no cross-lane movement.
+
+    @gluon.constexpr_function
+    def sorted_shuffled_ok(self):
+        """Does this config produce the layout the C++ shuffle was written against?"""
+        # The permutation lives in the LDS tile's SharedLinearLayout, which is a
+        # property of the byte order the shuffle writes -- not of how warps are split.
+        # So the warp arrangement is free here; what the shuffle does require is the
+        # 16x16x128 operand, BLOCK_K 256 (K_PACK == 2, else it zero-pads half the
+        # bytes) and one A tile per stage.
+        return (
+            list(_v(self.mfma_instr_shape)) == [16, 16, 128]
+            and _v(self.BLOCK_K) == 256
+            and _v(self.BLOCK_M) % 32 == 0
+            # A mini block only has to be a whole number of 32-row stripes: the shuffle
+            # writes one 256 B run per stripe, so a mini block is a contiguous slice.
+            and _v(self.MINI_BLOCK_M) % 32 == 0
+        )
+
+    @gluon.constexpr_function
+    def scale_shuffled(self, idx):
+        """Is this operand's scale tile already in MFMA fragment order in memory?"""
+        if _v(idx) == 0:
+            return _v(self.A_SCALE_SORTED_SHUFFLED)
+        return _v(self.B_SCALE_SHUFFLED)
+
+    @gluon.constexpr_function
+    def shuffled_scale_mem_layout(self, idx):
+        """The scale fragment layout, reordered so registers ascend with the address.
+
+        ``get_mfma_scale_layout`` puts the K-group bit before the non-K bit in
+        ``reg_bases``, so a lane's four bytes land in registers in address order
+        0, +2, +1, +3. A widened (contiguity 4) load fills registers ascending, so it
+        has to be issued at this permutation and converted afterwards -- a within-lane
+        register renumber, no cross-lane traffic, because the lane and warp bases are
+        untouched.
+        """
+        frag = self.dot_operand_scale_fragment_layout(idx)
+        lead = [[16, 0], [0, 4]]
+        rest = [list(b) for b in frag.reg_bases if list(b) not in lead]
+        return gl.DistributedLinearLayout(
+            reg_bases=lead + rest,
+            lane_bases=[list(b) for b in frag.lane_bases],
+            warp_bases=[list(b) for b in frag.warp_bases],
+            block_bases=[],
+            shape=list(frag.shape),
+        )
+
+    @gluon.constexpr_function
+    def scale_mini_m(self):
+        """Non-K extent of one A-scale *fill* tile -- decoupled from MINI_BLOCK_M.
+
+        The payload wants a small mini block (it is what the mfma cluster consumes), but
+        the scale copy wants a tile at least as tall as the copy layout is wide: that
+        layout is warps_per_cta=[num_warps, 1] over an axis whose extent is
+        ``nonk // 32`` stripes, so a tile of fewer stripes than warps is *replicated*
+        across the surplus warps -- a half-empty buffer_load_dword at MINI_BLOCK_M=64
+        with 4 waves, quarter-empty with 8. Sizing the scale tile independently lets the
+        stripe count match the warp count while the payload keeps its own split.
+        """
+        env = _SCALE_MINI_M_ENV
+        m = _v(self.MINI_BLOCK_M)
+        if env and env % m == 0 and _v(self.BLOCK_M) % env == 0:
+            return env
+        return m
+
+    @gluon.constexpr_function
+    def num_scale_tiles_a(self):
+        """A-scale fill tiles per stage (<= num_mini_m())."""
+        return _v(self.BLOCK_M) // self.scale_mini_m()
+
+    @gluon.constexpr_function
+    def scale_tile_ratio_a(self):
+        """Mini-M payload blocks sharing one A-scale tile."""
+        return self.scale_mini_m() // _v(self.MINI_BLOCK_M)
+
+    @gluon.constexpr_function
+    def scale_nonk(self, idx):
+        """Non-K extent of one shuffled scale tile.
+
+        The A-side shuffle (SORTED_SHUFFLED) and CDNA4_SCALE both lay the tile out as
+        one 256 B run per 32-row stripe, so a mini block that is a whole number of
+        stripes is a contiguous slice of it and the tile can be the *mini* extent.
+        """
+        if _v(idx) == 0:
+            return _v(self.MINI_BLOCK_M)
+        return _v(self.MINI_BLOCK_N)
+
+    @gluon.constexpr_function
+    def scale_flat_shape(self, idx):
+        """LDS staging shape of a shuffled scale tile: one 256 B run per 32-row stripe.
+
+        The tile is staged in HBM byte order rather than fragment order because
+        direct-to-LDS on gfx9 cannot scatter -- each warp must write coalesced, which a
+        fragment-ordered SharedLinearLayout does not (canLoadDirectToLDS rejects it, see
+        TritonAMDGPUToLLVM/Utility.cpp). The bytes therefore sit in (non-K 16, K 4) order
+        while the u8 fragment numbers its registers (K 4, non-K 16); reconciling the two
+        used to cost a v_perm per dword, which is what ``scale_packed_ok`` avoids by
+        handing the dword to the MFMA whole and naming the byte order in a selector list.
+        """
+        nonk = self.scale_mini_m() if _v(idx) == 0 else self.scale_nonk(idx)
+        return [nonk // 32, 256]
+
+    @gluon.constexpr_function
+    def shuffled_scale_read_layout(self, idx):
+        """The [non-K, K] view of the flat LDS run, in fragment order."""
+        nonk = self.scale_nonk(idx)
+        bases = [[16, 0], [0, 4], [1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]]
+        stripe = 32
+        while stripe < nonk:
+            bases = bases + [[stripe, 0]]
+            stripe = stripe * 2
+        return gl.SharedLinearLayout(offset_bases=bases)
+
+    # -- packed (i32) scale operands ------------------------------------------------
+    # Every shuffle here puts four scales in a dword, and the matrix instruction can
+    # pick one of them with op_sel. So a lane loads the dword whole and hands it to
+    # mfma_scaled_packed as an i32, with the byte order named in a selector list --
+    # no reinterpret to u8, no register renumbering, no v_perm.
+    #
+    # CDNA4_SCALE / SORTED_SHUFFLED put non-K +16 and K +4 inside the dword, at byte
+    # (nonK) + 2*(K). That fixed pair only works when the fragment happens to hold both
+    # steps in registers, so ``scale_packed_ok`` checks it rather than assuming it.
+
+    @gluon.constexpr_function
+    def scale_dword_delta(self, delta):
+        """Where a (non-K, K) step lands, as a coordinate of the i32 tile.
+
+        The tile is [non-K, BLOCK_K/128] and its row-major linearisation *is* the dword
+        index, so a step worth ``d`` dwords is the coordinate ``(d // 2, d % 2)``.
+        """
+        b = [int(x) for x in _v(delta)]
+        if b == [0, 0]:
+            return [0, 0]
+        # CDNA4_SCALE writes byte (n//32)*256 + (k%4)*64 + (n%16)*4 + (k//4)*2 +
+        # (n%32)//16; dropping the two within-dword terms and dividing by four
+        # leaves the dword index below.
+        d = (b[0] // 32) * 64 + (b[1] % 4) * 16 + (b[0] % 16)
+        return [d // 2, d % 2]
+
+    @gluon.constexpr_function
+    def scale_packed_sel(self, idx):
+        """Byte of the dword that matrix instruction ``i`` reads, for ``i % 4``.
+
+        The instruction index counts non-K major and K minor, so its low two bits are
+        the fragment's first two register bases in that order. CDNA4_SCALE numbers the
+        dword's bytes the other way round, hence the transposition.
+        """
+        if not self.scale_packed_ok(idx):
+            return None
+        return [0, 2, 1, 3]
+
+    @gluon.constexpr_function
+    def scale_packed_ok(self, idx):
+        """Can this operand's scale fragment be fed as one dword per lane?
+
+        The two within-dword steps have to be the fragment's *first two* register bases:
+        register-private, so every lane owns all four bytes, and first, so the selector
+        list can address them as the low two bits of the instruction index.
+        """
+        if not self.scale_shuffled(idx):
+            return False
+        regs = [list(b) for b in self.dot_operand_scale_fragment_layout(idx).reg_bases]
+        if len(regs) < 2:
+            return False
+        return regs[0] == [0, 4] and regs[1] == [16, 0]
+
+    @gluon.constexpr_function
+    def packed_scale_shape(self, idx):
+        nonk = self.scale_nonk(idx)
+        return [nonk, _v(self.BLOCK_K) // 128]
+
+    @gluon.constexpr_function
+    def packed_scale_frag_layout(self, idx):
+        """The i32 scale fragment: the u8 one with its two within-dword bases folded in."""
+        frag = self.dot_operand_scale_fragment_layout(idx)
+        return gl.DistributedLinearLayout(
+            reg_bases=[self.scale_dword_delta(b) for b in frag.reg_bases[2:]],
+            lane_bases=[self.scale_dword_delta(b) for b in frag.lane_bases],
+            warp_bases=[self.scale_dword_delta(b) for b in frag.warp_bases],
+            block_bases=[],
+            shape=self.packed_scale_shape(idx),
+        )
+
+    @gluon.constexpr_function
+    def packed_scale_read_layout(self, idx):
+        """The i32 view of the flat LDS run: one offset bit per dword-address bit."""
+        bases = list(self.shuffled_scale_read_layout(idx).offset_bases)[2:]
+        return gl.SharedLinearLayout(
+            offset_bases=[self.scale_dword_delta(b) for b in bases]
+        )
+
+    @gluon.constexpr_function
+    def sorted_shuffled_c_k1(self, K):
+        """Number of BLOCK_K stages the shuffle lays out per 128-row chunk."""
+        return (_v(K) // MX_GROUP) // (4 * (_v(self.BLOCK_K) // 128))
+
+    @gluon.constexpr_function
+    def sorted_shuffled_chunk_dwords(self, K):
+        """Dwords per 128-row chunk; the stride from one chunk to the next."""
+        return (_v(self.BLOCK_M) // 32) * self.sorted_shuffled_c_k1(K) * 4 * 16
+
     @gluon.constexpr_function
     def dot_operand_scale_lds_layout(self, idx):
         """Identity (K-contiguous) shared tile for the raw E8M0 scales.
@@ -586,6 +1053,7 @@ class KernelTuningConfig:
         the read is ``ds_read_u8`` regardless. An identity tile is what keeps the
         *write* side (direct-to-LDS) coalesced, which is the side that matters.
         """
+        # Flat staging tile -- plain identity; fragment order returns on the read.
         return gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
 
     @gluon.constexpr_function
@@ -593,6 +1061,14 @@ class KernelTuningConfig:
         """32-bit-per-lane blocked layout for the scale direct-to-LDS write."""
         idx = _v(idx)
         shape = self.a_scale_shape() if idx == 0 else self.b_scale_shape()
+        if self.scale_shuffled(idx):
+            # Flat run, 4 contiguous bytes per lane.
+            return gl.BlockedLayout(
+                size_per_thread=[1, 4],
+                threads_per_warp=[1, WARP_SIZE],
+                warps_per_cta=[self.num_warps(), 1],
+                order=[1, 0],
+            )
         sk = shape[1]
         lanes_k = sk // 4
         return gl.BlockedLayout(
@@ -604,8 +1080,22 @@ class KernelTuningConfig:
 
     @gluon.constexpr_function
     def result_store_layout(self, block_m, block_n, elem_bits):
-        """Blocked layout for the (masked) global store of one mini result tile."""
-        vec = max(1, min(128 // _v(elem_bits), _v(block_n)))
+        """Blocked layout for the (masked) global store of one mini result tile.
+
+        ``vec`` is capped by the elements each thread actually owns, not just by the
+        128-bit access width. Without that cap a narrow tile is *over-covered*: the
+        MXFP4 payload tile is [64, 32] uint8 = 2048 elements, but 256 threads x 16
+        would be 4096, so the layout spanned 64x64 and the surplus warp column held a
+        replica -- every payload store issued twice, writing the same bytes. With the
+        cap it tiles exactly at both 4 and 8 waves.
+
+        Covering *less* than the tile is fine and common (the bf16 path does): the
+        layout simply repeats, one register set per repetition. Only over-coverage
+        costs anything. It remains unavoidable for the E8M0 scale tile ([64, 2] is 128
+        elements against 256 threads), which is why that one is still 2x over.
+        """
+        ept = max(1, (_v(block_m) * _v(block_n)) // (self.num_warps() * WARP_SIZE))
+        vec = max(1, min(128 // _v(elem_bits), _v(block_n), ept))
         lanes_n = max(1, min(WARP_SIZE, _v(block_n) // vec))
         lanes_m = max(1, WARP_SIZE // lanes_n)
         warps_m = max(1, min(self.num_warps(), _v(block_m) // lanes_m))
@@ -622,6 +1112,8 @@ class KernelTuningConfig:
         fc = self.func_cfg
         per_stage = 0
         for idx in (0, 1):
+            if idx == 1 and _v(self.B_IN_REG):
+                continue
             shape = self.lds_shape(idx)
             width = fc.operand_elem_ty(idx).primitive_bitwidth // 8
             # lds_shape() is one mini block; a stage holds num_lds_tiles() of them
@@ -674,9 +1166,7 @@ class KernelTuningConfig:
                 )
 
         # -- the constexpr rotating buffer index only folds if this holds --
-        assert (
-            _v(self.K_UNROLL) % _v(self.NUM_LDS_BUFFER) == 0
-        ), "K_UNROLL must be a multiple of NUM_LDS_BUFFER or the unroll buys nothing"
+        assert _v(self.K_UNROLL) >= 1, "K_UNROLL must be at least 1"
 
         # -- the pipeline must issue exactly one fill per K tile --
         n_k = K // BK
@@ -692,6 +1182,18 @@ class KernelTuningConfig:
         #    non-divisible values are illegal, not merely wasteful --
         assert BM % _v(self.MINI_BLOCK_M) == 0
         assert BN % _v(self.MINI_BLOCK_N) == 0
+        # The fill schedule gives each slot of the NM x NN walk one mini-block copy, so
+        # a stage needs at least as many slots as it has copies: NM * NN >= NM + NN,
+        # which for integers means both axes split. The unsplit fallback that used to
+        # cover NM == 1 / NN == 1 (fill A(mi) at ni == 0, B(ni) at mi == 0) is gone.
+        # gluon_supported() checks this first so such a tile falls back gracefully;
+        # reaching here means it was constructed some other way.
+        assert self.num_mini_m() > 1 and self.num_mini_n() > 1, (
+            f"the fill schedule needs both axes split (got num_mini_m "
+            f"{self.num_mini_m()}, num_mini_n {self.num_mini_n()}): lower "
+            f"MINI_BLOCK_M ({_v(self.MINI_BLOCK_M)} vs BLOCK_M {BM}) and MINI_BLOCK_N "
+            f"({_v(self.MINI_BLOCK_N)} vs BLOCK_N {BN})"
+        )
         assert _v(self.MINI_BLOCK_M) % (instr[0] * warps[0] * tiles[0]) == 0, (
             f"MINI_BLOCK_M {_v(self.MINI_BLOCK_M)} must be a multiple of "
             f"instr[0]*warps[0]*tiles[0] = {instr[0] * warps[0] * tiles[0]}"
@@ -721,6 +1223,32 @@ class KernelTuningConfig:
         assert BM % (instr[0] * warps[0] * tiles[0]) == 0
         assert BN % (instr[1] * warps[1] * tiles[1]) == 0
 
+        # -- the LDS unit the byte-tiled layout is built from --
+        # A non-preshuffled unit is 32 rows because a warp reads two 16-row MFMA tiles
+        # from it; at tiles_per_warp 1 the second half of every unit belongs to another
+        # warp, so the 1, 4, 16, 2, 8 permutation would spread one warp's rows over two
+        # padding intervals instead of one. byte_unit_lds_ok() gates on exactly this, so
+        # the assert can only fire if that gate is ever loosened without this being
+        # revisited -- which is the point of stating it here.
+        for idx in (0, 1):
+            if self.byte_unit_lds_ok(idx) and not self.operand_preshuffled(idx):
+                assert tiles[idx] >= 2, (
+                    f"operand {idx} is not preshuffled, so its LDS unit is 32 rows and "
+                    f"tiles_per_warp[{idx}] must be >= 2 (got {tiles[idx]})"
+                )
+        if self.operand_preshuffled(1):
+            # The 16-column-blocked global offsets only stay inside the mini tile while
+            # every extent is a whole number of 16-column, 16-byte blocks.
+            pk_b = BK // fc.b_pack_divisor()
+            assert BN % 16 == 0 and _v(self.MINI_BLOCK_N) % 16 == 0, (
+                f"B_PRESHUFFLED needs BLOCK_N ({BN}) and MINI_BLOCK_N "
+                f"({_v(self.MINI_BLOCK_N)}) to be multiples of the 16-column block"
+            )
+            assert pk_b % 16 == 0, (
+                f"B_PRESHUFFLED needs BLOCK_K/pack ({pk_b}) to be a multiple of the "
+                "16-byte block"
+            )
+
         # -- scale swizzle --
         # (checked by the caller against the tensor's scale_swizzle field)
 
@@ -741,7 +1269,16 @@ class KernelTuningConfig:
         # BLOCK_K window is carried in registers from the previous stage. The pass also
         # rejects a wait inside a stage region, which is why the per-slot wait_group is
         # emitted before the `mfma` region rather than inside the `mem` one.
-        if _v(self.WARP_PIPELINE):
+        assert _v(self.WARP_PIPELINE) in (
+            int(WarpPipeline.NONE),
+            int(WarpPipeline.COMPILER),
+            int(WarpPipeline.MANUAL),
+        ), (
+            f"WARP_PIPELINE {_v(self.WARP_PIPELINE)} is not a WarpPipeline: "
+            f"NONE {int(WarpPipeline.NONE)}, COMPILER {int(WarpPipeline.COMPILER)}, "
+            f"MANUAL {int(WarpPipeline.MANUAL)}"
+        )
+        if self.warp_pipeline_enabled():
             assert self.num_prefetch_mini() == self.num_mini_k(), (
                 f"WARP_PIPELINE needs VGPR_PREFETCH_K == BLOCK_K (got "
                 f"{_v(self.VGPR_PREFETCH_K)} vs {BK}): with a partial window the slot's "
@@ -773,9 +1310,24 @@ class KernelTuningConfig:
                 "handoff is a whole number of mini-K steps"
             )
             assert BK % pk == 0, f"BLOCK_K {BK} % VGPR_PREFETCH_K {pk} != 0"
-            assert (
-                pk % _v(self.MINI_BLOCK_K) == 0
-            ), f"VGPR_PREFETCH_K {pk} % MINI_BLOCK_K {_v(self.MINI_BLOCK_K)} != 0"
+            assert pk % _v(self.MINI_BLOCK_K) == 0, (
+                f"VGPR_PREFETCH_K {pk} % MINI_BLOCK_K {_v(self.MINI_BLOCK_K)} != 0"
+            )
+
+        # -- commit-group granularity --
+        # An out-of-range value would fall through commit_groups_per_stage()'s tail and
+        # silently run the PER_FILL model against a different emission, which is a wrong
+        # wait rather than a rejected config.
+        assert _v(self.WAIT_COMMIT_SCHEME) in (
+            int(WaitCommitScheme.PER_FILL),
+            int(WaitCommitScheme.PER_SLOT),
+            int(WaitCommitScheme.PER_STAGE),
+        ), (
+            f"WAIT_COMMIT_SCHEME {_v(self.WAIT_COMMIT_SCHEME)} is not a WaitCommitScheme: "
+            f"PER_FILL {int(WaitCommitScheme.PER_FILL)}, "
+            f"PER_SLOT {int(WaitCommitScheme.PER_SLOT)}, "
+            f"PER_STAGE {int(WaitCommitScheme.PER_STAGE)}"
+        )
 
         # -- resource budgets --
         lds = self.lds_bytes()
@@ -796,7 +1348,7 @@ class KernelTuningConfig:
 def make_scale_swizzle_check(scale_swizzle, BLOCK_K):
     """``CDNA4_SCALE`` keeps the direct-to-LDS write coalesced but costs BLOCK_K>=256."""
     if _v(scale_swizzle) == int(ScaleSwizzle.CDNA4_SCALE):
-        assert (
-            _v(BLOCK_K) >= 256
-        ), "CDNA4_SCALE preshuffle needs MX_SCALE_BLOCK_K >= 8, i.e. BLOCK_K >= 256"
+        assert _v(BLOCK_K) >= 256, (
+            "CDNA4_SCALE preshuffle needs MX_SCALE_BLOCK_K >= 8, i.e. BLOCK_K >= 256"
+        )
     return True

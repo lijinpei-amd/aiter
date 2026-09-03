@@ -1,5 +1,20 @@
 import triton
 import triton.language as tl
+from triton.language.extra.hip import libdevice as hip_libdevice
+
+
+def swiglu_group2_perm(n: int):
+    """Column permutation that turns the (g,l,g,l) packing into (g,g,l,l).
+
+    ``new[c] = old[perm[c]]`` over the N axis. Within each group of four the middle
+    two swap: gate_2i, gate_2i+1, up_2i, up_2i+1 comes from old 4i, 4i+2, 4i+1, 4i+3.
+    Apply to every N-indexed operand (weights, weight scales, bias) and pass
+    ``GROUP=2`` to :func:`_swiglu`; the emitted output order is unchanged.
+    """
+    import torch
+
+    base = torch.arange(n).view(-1, 4)
+    return base[:, [0, 2, 1, 3]].reshape(-1)
 
 
 @triton.jit
@@ -11,21 +26,55 @@ def clip(x, limit, clip_lower: tl.constexpr):
 
 
 @triton.jit
-def _swiglu(input, alpha, limit, ADD_RESIDUAL: tl.constexpr):
+def _swiglu(input, alpha, limit, ADD_RESIDUAL: tl.constexpr, FAST_RCP: tl.constexpr = False,
+            GROUP: tl.constexpr = 1):
     """
     SwiGLU activation
 
     s = silu(gelu), then returns s * (linear + 1) if ADD_RESIDUAL else s * linear.
     if alpha=1.0, then this is the same as the SiLU activation.
+
+    ``FAST_RCP`` swaps the IEEE divide for the hardware reciprocal; see the comment at
+    the use site. Off by default so no existing caller's numerics move.
     """
-    gelu, linear = tl.split(tl.reshape(input, (input.shape[0], input.shape[1] // 2, 2)))
+    if GROUP == 2:
+        # Gate/linear interleaved in PAIRS along N (g,g,l,l) instead of singly
+        # (g,l,g,l). The caller's weights must be packed to match -- see
+        # ``swiglu_group2_perm``. The point is register placement: with the singly
+        # interleaved form a lane's accumulator quad holds g,l,g,l, so the gate values
+        # sit at stride 2 and every v_pk_* needs two v_mov_b32 to gather them into an
+        # aligned pair. Grouped by 2 the split falls on a register-pair boundary.
+        #
+        # Index arithmetic for the 4-D view (i, h, e) -> 4i + 2h + e:
+        #   split on e  -> a = 4i+2h,      b = 4i+2h+1
+        #   split each on h -> gate = 4i, 4i+1   linear = 4i+2, 4i+3
+        n4: tl.constexpr = input.shape[1] // 4
+        a, b = tl.split(tl.reshape(input, (input.shape[0], n4, 2, 2)))
+        g0, l0 = tl.split(a)
+        g1, l1 = tl.split(b)
+        gelu = tl.reshape(tl.join(g0, g1), (input.shape[0], input.shape[1] // 2))
+        linear = tl.reshape(tl.join(l0, l1), (input.shape[0], input.shape[1] // 2))
+    else:
+        gelu, linear = tl.split(
+            tl.reshape(input, (input.shape[0], input.shape[1] // 2, 2))
+        )
     gelu = gelu.to(tl.float32)
     if limit is not None:
         gelu = clip(gelu, limit, clip_lower=False)
     linear = linear.to(tl.float32)
     if limit is not None:
         linear = clip(linear, limit, clip_lower=True)
-    s = gelu / (1 + tl.exp2(-1.44269504089 * alpha * gelu))
+    denom = 1 + tl.exp2(-1.44269504089 * alpha * gelu)
+    if FAST_RCP:
+        # Hardware v_rcp_f32 instead of the IEEE divide. A true `/` lowers to
+        # v_div_scale_f32 plus a Newton refinement (v_fma / v_div_fmas / v_div_fixup);
+        # this leaves just v_rcp_f32 + v_mul_f32. ~1 ulp, well inside the bf16 the
+        # result is stored as, and what the FlyDSL port does (rocdl.rcp).
+        # tl.fdiv(ieee_rounding=False) does NOT do this -- on the AMD backend it lowers
+        # identically to the IEEE form, so the libdevice call is the only route.
+        s = hip_libdevice.fast_dividef(gelu, denom)
+    else:
+        s = gelu / denom
     if ADD_RESIDUAL:
         return tl.fma(s, linear, s)  # s * (linear + 1)
     else:

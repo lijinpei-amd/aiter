@@ -44,6 +44,9 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     ScaleSwizzle,
     TileSched,
     TuningSpec,
+    WaitCommitScheme,
+    WarpPipeline,
+    dq_pack_divisor,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_gemm import (
     MoeKernelConfig,
@@ -52,6 +55,10 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_gemm import (
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+#: Raw current-stream handle. torch.cuda.current_stream().cuda_stream builds a Stream
+#: object first and costs ~3 us, which is a third of the fast launch path.
+_current_raw_stream = torch._C._cuda_getCurrentRawStream
 
 _LOGGER = AiterTritonLogger()
 
@@ -75,6 +82,11 @@ def _can_overflow_int32(t: torch.Tensor | None, drop_leading: int = 0) -> bool:
 
 def _hashable(v):
     return tuple(v) if isinstance(v, list) else v
+
+
+def _cval(v):
+    """Take the value out of a ``gl.constexpr`` a config method handed back."""
+    return v.value if hasattr(v, "value") else v
 
 
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2)
@@ -307,23 +319,107 @@ def get_gluon_config_uncached(
         mini_n_env = _env_int("AITER_TRITON_MOE_GLUON_MINI_BLOCK_N", mini_n)
         if 0 < mini_n_env <= bn and bn % mini_n_env == 0 and mini_n_env % gran_n == 0:
             mini_n = mini_n_env
+        out_instr, out_warps, out_tiles = instr, warps, (1, 1)
+        out_bk, out_mini_m, out_mini_n = bk, mini_m, mini_n
+        if _env_int("AITER_TRITON_MOE_GLUON_FLY", 0) and block_m == 128:
+            # The operand shape moe_sort_scales was written against, and the one the
+            # FlyDSL port runs: 4 waves each owning 32 contiguous M rows (two 16-row
+            # MFMA tiles). Selecting it here rather than in the tuner keeps the shuffle
+            # on/off A/B on one config, which is the only way to price the scale path.
+            out_instr = (16, 16, 128)
+            # (1, 4) is FlyDSL's split: every wave spans all BM rows (so A is broadcast
+            # and belongs in LDS) and owns BN/4 columns (so B is wave-private and
+            # belongs in registers). (4, 1) inverts that and makes B the broadcast
+            # operand, which is why register-resident B costs 4x the global traffic
+            # there. Selectable so the two can be compared on one config.
+            wn_sel = _env_int("AITER_TRITON_MOE_GLUON_FLY_WARPS_N", 0)
+            if wn_sel == 2:
+                # 8 waves, so 2 land on each SIMD -- the only arrangement in which the
+                # warp pipeliner's ping-pong can actually alternate two waves on one
+                # SIMD. (1, 4) and (4, 1) put one wave per SIMD at occupancy 1, where
+                # the pipeliner pays its barriers for nothing.
+                out_warps = (2, 4)
+                # tiles_per_warp[0] >= 2 keeps the M warp stride at 32, which leaves the
+                # scale fragment's non-K +16 step in the *registers* rather than across
+                # warps -- that is what lets operand A pack four E8M0 bytes into one i32
+                # (scale_packed_ok). At tiles (1, n) the M split is 16 and A falls back
+                # to eight ds_read_u8 plus a v_perm per dword.
+                out_tiles = (_env_int("AITER_TRITON_MOE_GLUON_FLY_TILES_M", 1),
+                             _env_int("AITER_TRITON_MOE_GLUON_FLY_TILES_N", 1))
+                if block_m % (out_instr[0] * out_warps[0] * out_tiles[0]) != 0:
+                    out_tiles = (1, out_tiles[1])
+                if bn % (out_instr[1] * out_warps[1] * out_tiles[1]) != 0:
+                    out_tiles = (out_tiles[0], 1)
+            elif wn_sel:
+                # tiles_per_warp is what decides whether a wave's N columns are
+                # contiguous. At (1, 1) the four waves interleave every 16 columns, so
+                # the scale dword's non-K +16 step crosses waves and CDNA4_SCALE cannot
+                # be read one dword per lane. FlyDSL instead gives each wave two
+                # adjacent 32-column stripes -- tiles_per_warp (1, 4) here -- which puts
+                # +16 back inside a wave's registers.
+                tn = _env_int("AITER_TRITON_MOE_GLUON_FLY_TILES_N", 1)
+                if tn > 1 and bn % (out_instr[1] * 4 * tn) != 0:
+                    tn = 1
+                out_warps, out_tiles = (1, 4), (1, tn)
+            else:
+                out_warps, out_tiles = (4, 1), (2, 1)
+            out_bk = 256
+            # Whole-block mini tiles by default: the preshuffled scale tiles are
+            # read whole, so sorted_shuffled_ok()/_shuffled_b_scales() reject a
+            # subdivided config and both shuffles silently switch off. An explicit
+            # override is still honoured -- that is the only way to price warp
+            # pipelining, which needs NM/NN > 1 to have anything to overlap.
+            out_mini_m = _env_int("AITER_TRITON_MOE_GLUON_MINI_BLOCK_M", block_m)
+            out_mini_n = _env_int("AITER_TRITON_MOE_GLUON_MINI_BLOCK_N", bn)
+            gm = out_instr[0] * out_warps[0]
+            gn = out_instr[1] * out_warps[1] * out_tiles[1]
+            if not (0 < out_mini_m <= block_m and block_m % out_mini_m == 0
+                    and out_mini_m % gm == 0):
+                out_mini_m = block_m
+            if not (0 < out_mini_n <= bn and bn % out_mini_n == 0
+                    and out_mini_n % gn == 0):
+                out_mini_n = bn
+
+        # A 16x16x128 operand that is not preshuffled is staged in LDS as 32-row units
+        # (_config.py::byte_unit_lds_layout), which only describes what a warp reads
+        # while the warp owns both 16-row MFMA tiles of the unit -- so validate()
+        # requires tiles_per_warp >= 2 on that axis. Raise it here wherever the tile
+        # divides; where it does not (BLOCK_M = 16), byte_unit_lds_ok() is False anyway
+        # and the operand keeps compute_efficient_padded_shared_layout.
+        if tuple(out_instr) == (16, 16, 128):
+            tm, tn = out_tiles
+            gm2 = out_instr[0] * out_warps[0] * 2
+            gn2 = out_instr[1] * out_warps[1] * 2
+            if tm < 2 and block_m % gm2 == 0 and out_mini_m % gm2 == 0:
+                tm = 2
+            if tn < 2 and bn % gn2 == 0 and out_mini_n % gn2 == 0:
+                tn = 2
+            out_tiles = (tm, tn)
         return {
             "BLOCK_M": block_m,
             "BLOCK_N": bn,
-            "BLOCK_K": bk,
-            "K_UNROLL": n_buf,
-            "MINI_BLOCK_K": bk,
-            "MINI_BLOCK_M": mini_m,
-            "MINI_BLOCK_N": mini_n,
+            "BLOCK_K": out_bk,
+            # Independent of NUM_LDS_BUFFER: the rotating LDS index is a runtime
+            # value in the unrolled body, so the trip no longer has to land back
+            # on the same buffer phase. Defaults to n_buf, which is what it was
+            # pinned to when the two were coupled.
+            "K_UNROLL": _env_int("AITER_TRITON_MOE_GLUON_K_UNROLL", n_buf),
+            "MINI_BLOCK_K": out_bk,
+            "MINI_BLOCK_M": out_mini_m,
+            "MINI_BLOCK_N": out_mini_n,
             "NUM_LDS_BUFFER": n_buf,
-            "mfma_instr_shape": instr,
-            "warps_per_cta": warps,
-            "tiles_per_warp": (1, 1),
+            "mfma_instr_shape": out_instr,
+            "warps_per_cta": out_warps,
+            "tiles_per_warp": out_tiles,
             # None means "derive from the instruction shape and the operand packing".
             # A literal here would silently pick a different MFMA variant.
             "k_width": None,
             "transposed": True,
-            "WAVES_PER_EU": 0,
+            # 0 lets the backend pick. Worth setting: Triton allocates LDS
+            # dynamically, so LLVM sees group_segment_fixed_size 0 and models an
+            # occupancy the launch cannot reach -- it then derives VGPRCriticalLimit
+            # from that and rejects LDS reads on pressure the hardware does not have.
+            "WAVES_PER_EU": _env_int("AITER_TRITON_MOE_GLUON_WAVES_PER_EU", 0),
             # Tile-schedule overrides, for sweeping L2 locality without editing source.
             "TILE_SCHED": _env_int(
                 "AITER_TRITON_MOE_GLUON_TILE_SCHED", int(TileSched.XCD_GROUP_M)
@@ -346,10 +442,34 @@ def get_gluon_config_uncached(
             "expert_scale_mod": _env_mod("EXPERT_SCALE_MOD", ""),
             "result_mod": _env_mod("RESULT_MOD", ""),
             "result_scale_mod": _env_mod("RESULT_SCALE_MOD", ""),
-            # Hand each slot's MFMAs and its ds_read/copy shadow to
-            # TritonAMDGPUWarpPipeline as an mfma/mem stage pair, so the waves ping-pong
-            # between the two. Needs VGPR_PREFETCH_K == BLOCK_K; off by default.
-            "WARP_PIPELINE": bool(_env_int("AITER_TRITON_MOE_GLUON_WARP_PIPELINE", 0)),
+            # Which inter-wave ping-pong the K-loop step lays borders down for, a
+            # WarpPipeline: 0 none, 1 hand each slot's MFMAs and its ds_read/copy shadow
+            # to TritonAMDGPUWarpPipeline as an mfma/mem stage pair, 2 the hand-emitted
+            # rendezvous (FROZEN_STEP=1 only). 1 and 2 need VGPR_PREFETCH_K == BLOCK_K.
+            # Off by default. Was a bool, and 1 still means what True did.
+            "WARP_PIPELINE": _env_int(
+                "AITER_TRITON_MOE_GLUON_WARP_PIPELINE", int(WarpPipeline.NONE)
+            ),
+            # Read the token scales from the moe_sort_scales pre-pass output instead of
+            # the raw (M, K/32) tensor. Host-gated: _sorted_shuffle_a_scales() only
+            # returns a buffer when the layout matches, so this stays False otherwise.
+            "A_SCALE_SORTED_SHUFFLED": False,
+            "B_SCALE_SHUFFLED": False,
+            "B_PRESHUFFLED": False,
+            "B_IN_REG": bool(_env_int("AITER_TRITON_MOE_GLUON_B_IN_REG", 0)),
+            "ACT_FAST_RCP": bool(
+                _env_int("AITER_TRITON_MOE_GLUON_ACT_FAST_RCP", 0)
+            ),
+            # How coarsely the global->LDS copies of a K stage are committed, and hence
+            # where the wait that retires them goes: PER_FILL (1) marks every copy and
+            # hoists one wait to the stage head, PER_SLOT (2) and PER_STAGE (3) mark
+            # once per mini block / per stage and wait at the head of each slot. One
+            # knob for both halves because wait_group counts groups -- see
+            # WaitCommitScheme.
+            "WAIT_COMMIT_SCHEME": _env_int(
+                "AITER_TRITON_MOE_GLUON_WAIT_COMMIT_SCHEME",
+                int(WaitCommitScheme.PER_FILL),
+            ),
             # Read stage N's fragments one stage before their MFMA consumes them. Costs
             # one BLOCK_K tile of live registers and one stage of global prefetch depth
             # (the fill is waited on at stage s+NB-1 rather than s+NB), so it wants
@@ -482,6 +602,19 @@ def gluon_supported(
         return False, f"K {K} % BLOCK_K {cfg['BLOCK_K']} != 0"
     if K // cfg["BLOCK_K"] < cfg["NUM_LDS_BUFFER"]:
         return False, "K strip shorter than the pipeline depth"
+    # The fill schedule hands each slot of the NM x NN walk one mini-block copy, so it
+    # needs at least as many slots as copies -- both axes split. Refused here rather
+    # than in validate() so a tile that cannot split falls back instead of failing the
+    # compile; validate() asserts the same thing as the in-kernel backstop.
+    if (
+        cfg["BLOCK_M"] // cfg["MINI_BLOCK_M"] < 2
+        or cfg["BLOCK_N"] // cfg["MINI_BLOCK_N"] < 2
+    ):
+        return False, (
+            f"the fill schedule needs both axes split: BLOCK_M {cfg['BLOCK_M']} / "
+            f"MINI_BLOCK_M {cfg['MINI_BLOCK_M']} and BLOCK_N {cfg['BLOCK_N']} / "
+            f"MINI_BLOCK_N {cfg['MINI_BLOCK_N']} must each give at least 2 mini blocks"
+        )
     if _probe_lds_bytes(cfg, dq_a, dq_b) > LDS_USABLE_BYTES:
         return False, "no tile of this shape fits the LDS budget"
     if (dq_a == DtypeQuant.MXFP4 or dq_b == DtypeQuant.MXFP4) and K % 64 != 0:
@@ -557,7 +690,353 @@ def _launch_spec(
         gl.constexpr(K),
     )
     num_warps = c["warps_per_cta"][0] * c["warps_per_cta"][1]
-    return grid_n, kcfg, num_warps, c["WAVES_PER_EU"], c
+    return grid_n, kcfg, num_warps, c["WAVES_PER_EU"], c, tuning_cfg_host
+
+
+#: Attribute the padded-row token map is memoised under, on the ``ExptData`` instance.
+#: Every routing call builds a fresh ``ExptData``, so an entry's lifetime is exactly one
+#: routing: the two GEMMs of a layer share one build and a new routing cannot see a
+#: stale map. Hanging it off the object rather than a global dict is what ties the two
+#: lifetimes together -- a dict keyed by id() would hand a recycled address the previous
+#: routing's permutation.
+_A_SORT_MAP_ATTR = "_aiter_gluon_sorted_token_ids"
+
+
+def _sorted_token_id_map(expt_data, gather_indx, n_expts_act, block_m, n_blocks, n_tok):
+    """Padded-row ``(sorted_token_ids, cumsum)``, built without reading the device.
+
+    The C++ shuffle wants each expert's rows to start at ``token_offs_pad[e] *
+    block_m``, but ``gather_indx`` is packed at the raw offsets, so the rows have to be
+    scattered into padded position. Three steps of that scatter used to need a value
+    that only exists on the GPU, and each one drained the queue:
+
+    * the padded block count was ``int(token_offs_pad[-1])``; it is now the caller's
+      ``n_blocks``, the same closed-form bound ``RoutingData.n_blocks`` already gives
+      the kernel grid;
+    * the row count was ``int(token_offs_raw[-1])``; it is now ``gather_indx.shape[0]``,
+      which is that same total by construction (one gate per routed row);
+    * the row -> expert map was ``repeat_interleave`` over the device histogram, whose
+      output length is a device-side sum; it is now a ``searchsorted`` over the offsets,
+      whose output is shaped by the host-side row count.
+
+    The bound is only an upper bound -- up to ~2x the exact block count when experts are
+    unevenly loaded -- but the exact length still reaches the kernel, as a device value
+    in ``cumsum``. ``sort_scales_kernel_impl`` reads that as ``actual_sorted`` and
+    zero-fills every chunk past it, so the slack costs stores, not gathers.
+    """
+    key = (block_m, n_expts_act, n_blocks, n_tok)
+    cached = getattr(expt_data, _A_SORT_MAP_ATTR, None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+
+    offs_pad = expt_data.token_offs_pad
+    if isinstance(offs_pad, dict):
+        offs_pad = (
+            offs_pad[block_m] if block_m in offs_pad else next(iter(offs_pad.values()))
+        )
+    offs_raw = expt_data.token_offs_raw
+    dev = offs_raw.device
+    n_rows = int(gather_indx.shape[0])
+    max_sorted = n_blocks * block_m
+
+    rows = torch.arange(n_rows, device=dev, dtype=offs_raw.dtype)
+    # right=True counts offsets <= row, which is what makes an expert with no tokens
+    # fall out: its zero-width span shows up as a repeated boundary and the search steps
+    # past both copies, so no row is ever assigned to it.
+    e_of_row = torch.searchsorted(offs_raw[1:].contiguous(), rows, right=True)
+    dst = offs_pad[e_of_row].to(torch.int32) * block_m + (
+        rows.to(torch.int32) - offs_raw[e_of_row].to(torch.int32)
+    )
+    # The gaps between experts keep a sentinel the C++ side maps to row 0 (it tests
+    # `sti_val < M`); the epilogue masks those rows out of the result anyway. One slot
+    # past the buffer absorbs any row the block bound did not anticipate, so a routing
+    # that leaves gates unassigned degrades to a dropped row rather than an OOB scatter.
+    sorted_token_ids = torch.full(
+        (max_sorted + 1,), n_tok, dtype=torch.int32, device=dev
+    )
+    sorted_token_ids[dst.clamp_(max=max_sorted).long()] = (
+        gather_indx.to(torch.int32) // n_expts_act
+    )
+    built = (sorted_token_ids[:max_sorted], offs_pad[-1:].to(torch.int32) * block_m)
+    try:
+        setattr(expt_data, _A_SORT_MAP_ATTR, (key, built))
+    except AttributeError:
+        pass  # not memoisable; correctness is unaffected
+    return built
+
+
+def _sorted_shuffle_a_scales(x_scales, routing_data, gather_indx, K, cfg):
+    """Run the C++ pre-pass that sorts + fragment-permutes the token scales.
+
+    Reuses ``csrc/kernels/mxfp4_moe/moe_aux/moe_sort_scales.cuh`` rather than doing the
+    permute in Triton: it is ~19 us at T=4096 and the layout it writes is exactly the
+    one ``get_mfma_scale_layout`` wants for a 16x16x128 / (num_warps, 1) /
+    tiles_per_warp (2, 1) dot operand, so the GEMM reads it with a contiguous load
+    instead of BLOCK_M strided ``ds_read_u8``.
+
+    Returns ``None`` when the config is not one the shuffle was written against, so the
+    caller falls back to the raw K-contiguous path.
+    """
+    if x_scales is None or gather_indx is None:
+        return None
+    block_m = int(cfg["BLOCK_M"])
+    # Mirrors KernelTuningConfig.sorted_shuffled_ok(): the permutation is carried by the
+    # LDS tile's layout, so the warp split is free -- only the operand shape, BLOCK_K
+    # and one-A-tile-per-stage matter.
+    if (
+        list(cfg["mfma_instr_shape"]) != [16, 16, 128]
+        or int(cfg["BLOCK_K"]) != 256
+        or block_m % 32 != 0
+        # The buffer is one 256 B run per 32-row stripe, so a mini block that is a
+        # whole number of stripes is a contiguous slice of it; the kernel indexes the
+        # slice with a stripe offset. It does not have to be the whole block.
+        or int(cfg["MINI_BLOCK_M"]) % 32 != 0
+        or K % 256 != 0
+    ):
+        return None
+
+    from aiter.ops.moe_mxfp4_aux import mxfp4_moe_sort_scales
+
+    dev = x_scales.device
+    expt_data = routing_data.expt_data
+    n_expts_act = routing_data.n_expts_act
+    # Derive the block bound from this config's BLOCK_M rather than taking the launch
+    # grid's: a tuner-supplied config may override BLOCK_M, and the buffer has to be
+    # sized in the same block space the kernel will index it in.
+    n_blocks = routing_data.n_blocks(int(gather_indx.shape[0]), block_m)
+    max_sorted = n_blocks * block_m
+    sorted_token_ids, cumsum = _sorted_token_id_map(
+        expt_data, gather_indx, n_expts_act, block_m, n_blocks, int(x_scales.shape[0])
+    )
+
+    k_pack = 256 // 128
+    c_m1, c_k1 = block_m // 32, (K // 32) // (4 * k_pack)
+    out = torch.empty(n_blocks * c_m1 * c_k1 * 4 * 16 * 4, dtype=torch.uint8, device=dev)
+    try:
+        mxfp4_moe_sort_scales(
+            x_scales,
+            sorted_token_ids,
+            cumsum,
+            out,
+            int(expt_data.hist.numel()),
+            int(n_expts_act),
+            int(K),  # D_HIDDEN
+            int(block_m),  # MB
+            max_sorted,
+        )
+    except RuntimeError as e:
+        # The C++ side is a codegen'd template keyed on (BM, NE, D_HIDDEN); a shape
+        # outside csrc/.../codegen/gen_instances.py::SHAPES has no instance. Fall back
+        # to the raw scale path rather than failing the launch.
+        _LOGGER.info(f"sorted-shuffled A scales unavailable, using raw scales: {e}")
+        return None
+    return out
+
+
+#: Attribute the shuffled copy is memoised under, on the source tensor itself. The
+#: weights are static, so in production the shuffle belongs in the checkpoint-load path;
+#: memoising keeps the benchmark honest (paid once, not per call) without changing every
+#: caller. It hangs off the tensor rather than a dict keyed by data_ptr because a freed
+#: tensor's address is reused, and a stale entry then silently pairs one expert's scales
+#: with another's weights -- which is exactly what it did before this was fixed.
+_B_SCALE_SHUFFLE_ATTR = "_aiter_gluon_cdna4_scale_shuffled"
+#: Memoised 16-column-blocked copy of the weight payload, on the source tensor.
+_B_PRESHUFFLE_ATTR = "_aiter_gluon_b_preshuffled"
+
+
+def _preshuffled_b(w, cfg, N, K, dq_b):
+    """Weights permuted 16-column blocked, or None if the config cannot read them.
+
+    Byte ``(n, k)`` of an expert moves to
+        ``(n//16)*(KB*16) + (k//16)*256 + (n%16)*16 + k%16``
+    where ``KB = K // pack_divisor`` is the stored K extent, so a wave's 64 lanes --
+    lane L wanting bytes ``[16L, 16L+16)`` of a 16-column, 128-byte tile -- cover one
+    contiguous 1024 B run. Read through the operand-B fragment layout, the plain
+    ``(E, KB, N)`` tensor instead puts consecutive lanes ``stride(-2)`` apart: same L2
+    and HBM traffic, 2.8x the L1 accesses, 42% slower. This is the same permute
+    ``utils/shuffle.py::shuffle_weight(w, (16, 16))`` applies, and the same one FlyDSL's
+    port requires of its caller.
+
+    Used by both B paths. With ``B_IN_REG`` the fragment load reads it straight out of
+    global; through LDS, ``byte_unit_lds_layout`` gives the shared tile the matching
+    permutation, so the direct-to-LDS copy stays one linear run and the unit drops from
+    32 rows to 16 and loses its padding.
+    """
+    if w is None or w.ndim != 3:
+        return None
+    if int(cfg["BLOCK_K"]) % 32 != 0 or N % 16 != 0 or K % 32 != 0:
+        return None
+    KB = K // dq_pack_divisor(dq_b)
+    if KB % 16 != 0:
+        return None
+    hit = getattr(w, _B_PRESHUFFLE_ATTR, None)
+    if hit is not None:
+        return hit
+
+    E = w.shape[0]
+    # (E, KB, N) -> (E, N, KB) -> blocked (E, N/16, KB/16, 16, 16) -> flat
+    out = (
+        w.transpose(-1, -2)
+        .contiguous()
+        .reshape(E, N // 16, 16, KB // 16, 16)
+        .permute(0, 1, 3, 2, 4)
+        .reshape(E, N // 16 * KB * 16)
+        .contiguous()
+    )
+    try:
+        setattr(w, _B_PRESHUFFLE_ATTR, out)
+    except AttributeError:
+        pass
+    return out
+
+
+def _shuffled_b_scales(w_scales, cfg):
+    """CDNA4_SCALE-preshuffled weight scales, or None if the config cannot read them.
+
+    Reuses utils/shuffle.py::shuffle_scale_moe, whose gfx950 permute
+    (preshuffle_factor 32, scale_kwidth 8) lands each element in exactly the slot
+    ``get_mfma_scale_layout`` assigns for a 16x16x128 operand -- verified base for base
+    against the layout, same as the A-side shuffle.
+    """
+    if w_scales is None:
+        return None
+    if (
+        list(cfg["mfma_instr_shape"]) != [16, 16, 128]
+        or int(cfg["BLOCK_K"]) != 256
+        # Stripe-based like the A shuffle: one 256 B run per 32 columns, so a mini
+        # block that is a whole number of stripes is a contiguous slice of the tile.
+        or int(cfg["MINI_BLOCK_N"]) % 32 != 0
+    ):
+        return None
+    hit = getattr(w_scales, _B_SCALE_SHUFFLE_ATTR, None)
+    if hit is None:
+        from aiter.ops.triton.utils.shuffle import _shuffle_scale_tile_gfx950
+
+        # The tile permute itself, not shuffle_scale_moe: that transposes the result
+        # back to (E, K*, N/32) for the Triton kernels, and materialising that view
+        # would undo the very byte order the shuffle exists to produce. What the kernel
+        # reads is the pre-transpose (E, N/32, K) tile, which is already contiguous.
+        hit = _shuffle_scale_tile_gfx950(w_scales.transpose(-1, -2), 32, 8)
+        try:
+            setattr(w_scales, _B_SCALE_SHUFFLE_ATTR, hit)
+        except AttributeError:
+            pass  # not memoisable (e.g. a plain view); correctness is unaffected
+    return hit
+
+
+#: Compiled kernel + launch constants, keyed by everything that can change the
+#: specialization. Bounded by the number of distinct shapes a process sees.
+_FAST_LAUNCH_CACHE: dict = {}
+
+
+def _hooks_empty(hook) -> bool:
+    """True when no launch hook would actually run.
+
+    ``knobs.runtime.launch_{enter,exit}_hook`` default to an empty ``HookChain``, which
+    is a live object and therefore truthy; only ``.calls`` says whether anything is
+    installed. Older Triton exposed a bare ``None`` here, so both shapes are handled.
+    """
+    if hook is None:
+        return True
+    calls = getattr(hook, "calls", None)
+    return calls is not None and len(calls) == 0
+
+
+def _spec_key(vals, out):
+    """Append the parts of ``vals`` that can change a launch's specialization.
+
+    Triton re-derives a full specialization on every launch -- ~16 us of the ~41 us
+    launch here -- but between two launches of one *already compiled* kernel only two
+    things can move: the 16-byte alignment of each pointer (which it bakes in as
+    ``tt.divisibility``) and the runtime scalars. Constexprs cannot move, because they
+    are pinned by the identity of the memoised ``kcfg`` in the cache key.
+
+    Recurses into the aggregates, whose fields are ordinary launch arguments.
+    """
+    for v in vals:
+        if isinstance(v, torch.Tensor):
+            out.append(v.data_ptr() % 16 == 0)
+        elif isinstance(v, tuple):
+            _spec_key(v, out)
+        elif isinstance(v, int):  # bool is an int; both are fine as key material
+            out.append(v)
+    return out
+
+
+def _fast_launch(kernel, grid_x, args, num_warps, waves_per_eu, kcfg):
+    """Dispatch a previously compiled kernel directly, or ``None`` to take the slow path.
+
+    ``JITFunction.run`` spends ~33 of its ~41 us re-deriving state that is identical
+    across launches of one compiled kernel: binding and specializing the arguments
+    (~16 us), re-walking the 26 module globals the kernel closed over to check none was
+    rebound (~12 us), and rebuilding the cache key that then hits (~5 us). With the
+    kernel in hand, dispatch needs only a grid, a stream and the argument list.
+
+    Correctness rests on the key: a miss falls back to the full path, which recompiles
+    or re-specializes as needed and then re-memoises.
+    """
+    if not _env_int("AITER_TRITON_MOE_GLUON_FAST_LAUNCH", 1):
+        return None
+    from triton import knobs
+
+    # Profiling hooks and Triton's debug mode both act inside the slow path; if either
+    # is live, take it so their behaviour is not silently dropped. An installed-but-empty
+    # HookChain is truthy, so emptiness has to be tested through .calls -- the launch
+    # hooks are non-None by default and a bare truth test never takes the fast path.
+    if not _hooks_empty(knobs.runtime.launch_enter_hook):
+        return None
+    if not _hooks_empty(knobs.runtime.launch_exit_hook):
+        return None
+    if knobs.runtime.debug:
+        return None
+
+    key = (id(kernel), id(kcfg), num_warps, waves_per_eu, grid_x)
+    entry = _FAST_LAUNCH_CACHE.get(key)
+    if entry is None:
+        return None
+    compiled, spec, run, fn, packed, _anchor, cpp = entry
+    if _spec_key(args, []) != spec:
+        return None
+
+    stream = _current_raw_stream(torch.cuda.current_device())
+    if cpp is not None:
+        # Generated launcher: METH_FASTCALL, straight-line unpack, THPVariable_Unpack
+        # instead of a data_ptr() method call per tensor. Same top-level arguments.
+        cpp(grid_x, stream, *args)
+        return compiled
+
+    run(grid_x, 1, 1, stream, fn, packed, None, None, None, *args)
+    return compiled
+
+
+def _fast_launch_memoise(kernel, grid_x, args, num_warps, waves_per_eu, kcfg, compiled):
+    """Record a completed slow-path launch so the next identical one can skip it."""
+    if compiled is None or not _env_int("AITER_TRITON_MOE_GLUON_FAST_LAUNCH", 1):
+        return
+    key = (id(kernel), id(kcfg), num_warps, waves_per_eu, grid_x)
+    cpp = None
+    if _env_int("AITER_TRITON_MOE_GLUON_CPP_LAUNCH", 0):
+        # Off by default: the first build of a given signature costs ~12 s of ninja.
+        # It is cached on disk, so later processes only pay the load.
+        try:
+            from aiter.ops.triton.utils._triton.cpp_launcher import build_for
+
+            cpp = build_for(compiled)
+        except Exception as e:  # noqa: BLE001
+            _LOGGER.info(f"C++ launcher unavailable, using triton's: {e}")
+
+    _FAST_LAUNCH_CACHE[key] = (
+        compiled,
+        _spec_key(args, []),
+        compiled.run,
+        compiled.function,
+        compiled.packed_metadata,
+        # The key holds id(kcfg); keep the object alive so that address cannot be
+        # recycled by a later allocation and turn a stale entry into a silent hit.
+        # Same hazard as _B_SCALE_SHUFFLE_ATTR above, same fix.
+        (kernel, kcfg),
+        cpp,
+    )
 
 
 def moe_gemm_gluon(
@@ -612,7 +1091,7 @@ def moe_gemm_gluon(
         act = None
     out_quant = int(DtypeQuant.MXFP4) if y_scales is not None else None
 
-    grid_n, kcfg, num_warps, waves_per_eu, _cfg = _launch_spec(
+    grid_n, kcfg, num_warps, waves_per_eu, _cfg, _tc = _launch_spec(
         block_m,
         N,
         K,
@@ -628,35 +1107,89 @@ def moe_gemm_gluon(
         tuple(sorted((k, _hashable(v)) for k, v in config.items())) if config else None,
     )
 
+    # Optional token-scale pre-pass. Only rebuilds the launch spec when the shuffle
+    # actually applied, so the default path keeps its memoised spec untouched.
+    a_scales, a_swizzle = x_scales, ScaleSwizzle.NONE
+    a_scale_stride_m = 0 if x_scales is None else x_scales.stride(0)
+    a_scale_stride_k = 0 if x_scales is None else x_scales.stride(1)
+    if _env_int("AITER_TRITON_MOE_GLUON_SORTED_SCALES", 0) and apply_swiglu:
+        shuffled = _sorted_shuffle_a_scales(
+            x_scales, routing_data, gather_indx, K, _cfg
+        )
+        if shuffled is not None:
+            a_scales, a_swizzle = shuffled, ScaleSwizzle.SORTED_SHUFFLED
+            # The gather and the row stride are baked into the buffer; all the kernel
+            # still needs is the stage bump, and it computes that as s_step (== SK, so
+            # BLOCK_K/32 == 8) times scale_stride_k. 8 * 32 == the 256 B a stage spans.
+            a_scale_stride_m, a_scale_stride_k = 0, 32
+            _cfg = dict(_cfg, A_SCALE_SORTED_SHUFFLED=True)
+            grid_n, kcfg, num_warps, waves_per_eu, _cfg, _tc = _launch_spec(
+                block_m, N, K, dq_a, dq_b,
+                _small_grid(routing_data, y.shape[1], N),
+                bias is not None, gammas is not None, gather_indx is not None,
+                x_static_scale is not None, act, out_quant,
+                tuple(sorted((k, _hashable(v)) for k, v in _cfg.items())),
+            )
+
     # The Quant* tuples carry the scale pointer and strides unconditionally; when the
     # operand has no scale the kernel never reads them, so a null pointer and zero
     # strides keep one tuple type for every dtype instead of four launch sites.
     a = QuantTokenTensor.make(
         dq_a,
         x,
-        x_scales,
+        a_scales,
         x.shape[0],
         x.stride(0),
-        0 if x_scales is None else x_scales.stride(0),
-        0 if x_scales is None else x_scales.stride(1),
+        a_scale_stride_m,
+        a_scale_stride_k,
         K,
         routing_data.n_expts_act,
-        ScaleSwizzle.NONE,
+        a_swizzle,
     )
+    b_scales, b_swizzle = w_scales, ScaleSwizzle.NONE
+    b_scale_stride_k = 0 if w_scales is None else w_scales.stride(1)
+    if _env_int("AITER_TRITON_MOE_GLUON_SHUFFLED_W_SCALES", 0):
+        shuf_w = _shuffled_b_scales(w_scales, _cfg)
+        if shuf_w is not None:
+            b_scales, b_swizzle = shuf_w, ScaleSwizzle.CDNA4_SCALE
+            b_scale_stride_k = 32
+            _cfg = dict(_cfg, B_SCALE_SHUFFLED=True)
+            grid_n, kcfg, num_warps, waves_per_eu, _cfg, _tc = _launch_spec(
+                block_m, N, K, dq_a, dq_b,
+                _small_grid(routing_data, y.shape[1], N),
+                bias is not None, gammas is not None, gather_indx is not None,
+                x_static_scale is not None, act, out_quant,
+                tuple(sorted((k, _hashable(v)) for k, v in _cfg.items())),
+            )
+
+    w_payload = w
+    if _env_int("AITER_TRITON_MOE_GLUON_B_PRESHUFFLED", 0):
+        shuf_b = _preshuffled_b(w, _cfg, N, K, dq_b)
+        if shuf_b is not None:
+            w_payload = shuf_b
+            _cfg = dict(_cfg, B_PRESHUFFLED=True)
+            grid_n, kcfg, num_warps, waves_per_eu, _cfg, _tc = _launch_spec(
+                block_m, N, K, dq_a, dq_b,
+                _small_grid(routing_data, y.shape[1], N),
+                bias is not None, gammas is not None, gather_indx is not None,
+                x_static_scale is not None, act, out_quant,
+                tuple(sorted((k, _hashable(v)) for k, v in _cfg.items())),
+            )
+
     b = QuantExpertTensor.make(
         dq_b,
-        w,
-        w_scales,
+        w_payload,
+        b_scales,
         w.stride(0),
         w.stride(1),
         w.stride(2),
-        0 if w_scales is None else w_scales.stride(0),
-        0 if w_scales is None else w_scales.stride(2),
-        0 if w_scales is None else w_scales.stride(1),
+        0 if b_scales is None else b_scales.stride(0),
+        0 if b_scales is None else b_scales.stride(b_scales.ndim - 1),
+        b_scale_stride_k,
         w.shape[0],
         K,
         N,
-        ScaleSwizzle.NONE,
+        b_swizzle,
     )
     res = ResultTensor.make(
         out_quant if out_quant is not None else int(DtypeQuant.BF16),
@@ -679,23 +1212,97 @@ def moe_gemm_gluon(
         routing_data.n_expts_act,
     )
 
+    # Every aggregate is spelled out. The kernel signature is flat because
+    # torch.compile / AOTInductor cannot lift the tensors inside a tuple kernel argument
+    # into the FX graph -- see _moe_gluon_gemm1. Field order must track the NamedTuple
+    # definitions in _types.py.
     kernel = _moe_gluon_gemm1 if apply_swiglu else _moe_gluon_gemm2
-    return kernel[(grid_m * grid_n,)](
-        a,
-        b,
-        res,
-        rt,
+    args = (
+        a.ptr,
+        a.scale_ptr,
+        a.num_token,
+        a.stride_m,
+        a.scale_stride_m,
+        b.ptr,
+        b.scale_ptr,
+        b.stride_e,
+        b.stride_n,
+        b.scale_stride_e,
+        b.num_expert,
+        res.ptr,
+        res.scale_ptr,
+        res.stride_m,
+        res.scale_stride_m,
+        res.scale_stride_n,
+        rt.expt_block_pid_map,
+        rt.expt_hist,
+        rt.expt_offs_raw,
+        rt.expt_offs_sum,
+        rt.gather_indx,
+        rt.scatter_indx,
+        rt.gammas,
         bias,
         0 if bias is None else bias.stride(0),
         x_static_scale,
         grid_m,
         grid_n,
-        kcfg,
-        KernelFuncConfig,
-        KernelTuningConfig,
-        num_warps=num_warps,
-        waves_per_eu=waves_per_eu,
+        a.dtype_quant,
+        a.hidden_dim,
+        a.topk,
+        a.scale_stride_k,
+        a.scale_swizzle,
+        b.dtype_quant,
+        b.stride_k,
+        b.scale_stride_n,
+        b.scale_stride_k,
+        b.hidden_dim,
+        b.fused_intermediate_dim,
+        b.scale_swizzle,
+        res.dtype_quant,
+        res.stride_n,
+        res.out_dim,
+        rt.n_expts_act,
+        kcfg.func,
+        kcfg.tuning,
+        kcfg.N,
+        kcfg.K,
     )
+    grid_x = grid_m * grid_n
+    fast = _fast_launch(kernel, grid_x, args, num_warps, waves_per_eu, kcfg)
+    if fast is not None:
+        return fast
+    if _LLVM_FN_ATTRS:
+        compiled = kernel[(grid_x,)](
+            *args,
+            num_warps=num_warps,
+            waves_per_eu=waves_per_eu,
+            llvm_fn_attrs=_LLVM_FN_ATTRS,
+        )
+    else:
+        compiled = kernel[(grid_x,)](
+            *args,
+            num_warps=num_warps,
+            waves_per_eu=waves_per_eu,
+        )
+    _fast_launch_memoise(
+        kernel, grid_x, args, num_warps, waves_per_eu, kcfg, compiled
+    )
+    return compiled
+
+
+#: Extra LLVM function attributes for the Gluon MoE kernels, comma separated, passed
+#: through Triton's ``llvm_fn_attrs`` compile option (no Triton patch needed).
+#:
+#: The motivating one is ``amdgpu-ieee=false``. ``tl.max`` on f32 lowers to
+#: ``llvm.maxnum``, and in IEEE mode the AMDGPU backend has to canonicalise both
+#: operands first, so every cross-lane reduction step carries two redundant
+#: ``v_max_f32 x, x, x``. With IEEE mode off ``v_max_f32`` already returns the non-NaN
+#: operand -- exactly maxnum's semantics -- and the canonicalisation is dropped. It is
+#: opt-in because it changes NaN/denormal behaviour for every float op in the kernel,
+#: not just the reduction.
+#:
+#:     AITER_TRITON_MOE_GLUON_LLVM_FN_ATTRS=amdgpu-ieee=false
+_LLVM_FN_ATTRS = os.environ.get("AITER_TRITON_MOE_GLUON_LLVM_FN_ATTRS", "")
 
 
 def try_gluon_grouped_gemm(
@@ -875,6 +1482,12 @@ _TUNING_KEYS = (
     "result_scale_mod",
     "WARP_PIPELINE",
     "VGPR_PREFETCH_K",
+    "A_SCALE_SORTED_SHUFFLED",
+    "B_SCALE_SHUFFLED",
+    "B_IN_REG",
+    "B_PRESHUFFLED",
+    "ACT_FAST_RCP",
+    "WAIT_COMMIT_SCHEME",
 )
 
 

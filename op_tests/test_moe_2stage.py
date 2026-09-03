@@ -72,6 +72,9 @@ def parse_num_expert_activated():
 
 AITER_MOE_NUM_EXPERT_ACTIVATED = parse_num_expert_activated()
 
+# Shared with bench_moe_gemm_gluon.py's _balanced_logits.
+EXPERT_SEL_SEED = 0
+
 
 @benchmark()
 def test_fmoe(
@@ -139,8 +142,15 @@ def test_fmoe(
                 f"AITER_MOE_NUM_EXPERT_ACTIVATED={n_act} is invalid: must be "
                 f"in [topk={topk}, min(E={E}, token*topk={token * topk})]"
             )
-        sel = torch.randperm(E)[:n_act]  # random active expert ids
+        # Seeded so the Gluon harness's _balanced_logits can reproduce the same
+        # permutation and the two benchmarks route identical tokens to identical
+        # expert ids, not merely to an equal-sized partition.
+        # Drawn on CPU explicitly: torch.Generator() is a CPU generator and this file
+        # runs with a CUDA default device, so letting randperm pick the device raises.
+        gen = torch.Generator(device="cpu").manual_seed(EXPERT_SEL_SEED)
+        sel = torch.randperm(E, generator=gen, device="cpu")[:n_act]
         score = torch.full((token, E), float("-inf"), dtype=dtype)
+        sel = sel.to(score.device)
         slot = torch.arange(token * topk) % n_act  # round-robin over active set
         rows = torch.arange(token).repeat_interleave(topk)
         score[rows, sel[slot]] = 1.0

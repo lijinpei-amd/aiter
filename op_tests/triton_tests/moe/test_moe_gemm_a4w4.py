@@ -395,10 +395,15 @@ def test_model_shapes(shape, device="cuda"):
 # ---------------------------------------------------------------------------
 # gemm1's epilogue emits gemm2's operand-A format directly, which is what lets the
 # wrapper drop the standalone `mxfp4_quant` launch (today: bf16 write + bf16 read +
-# fp4 write + fp4 read, ~2.5x the necessary intermediate traffic). The contract is
-# bit-for-bit equality with that launch, so this compares payload and E8M0 scale
-# exactly rather than with a tolerance -- a tolerance test would not notice a
-# half-ULP difference that makes gemm2 read a different tensor.
+# fp4 write + fp4 read, ~2.5x the necessary intermediate traffic).
+#
+# The contract is bit-for-bit equality with `mxfp4_quant` applied to an **fp32** gemm1
+# result, so this compares payload and E8M0 scale exactly rather than with a tolerance
+# -- a tolerance test would not notice a half-ULP difference that makes gemm2 read a
+# different tensor. It is deliberately not equality with the deployed bf16 flow: the
+# fused epilogue quantizes the live accumulator and keeps all 24 mantissa bits, where
+# the bf16 spill keeps 8, so ~0.6% of payload bytes differ from that flow. gemm2 reads
+# a slightly more accurate tensor, not a differently-shaped one.
 @pytest.mark.parametrize(
     "m, n, k, n_expts_tot, n_expts_act",
     [
@@ -462,10 +467,17 @@ def test_gemm1_fused_mxfp4_out(m, n, k, n_expts_tot, n_expts_act, act, device="c
         "limit": act.limit,
         "swiglu_add_residual": act.add_residual,
     }
-    # reference: the same Gluon gemm1 emitting bf16, then the standalone quant launch
-    y_bf16 = torch.empty((1, M, n // 2), dtype=torch.bfloat16, device=device)
+    # Reference: the same Gluon gemm1 emitting fp32, then the standalone quant launch.
+    #
+    # fp32, not bf16, because the fused epilogue quantizes the live accumulator. The
+    # deployed unfused flow does spill to bf16 in HBM, so the fused kernel is not
+    # bit-identical to it -- it is strictly more accurate, and 0.63% of payload bytes
+    # land on the other side of an E2M1/E8M0 rounding boundary. Quantizing an fp32
+    # gemm1 result is the same arithmetic the fused path performs, so this stays an
+    # exact comparison rather than a tolerance one.
+    y_fp32 = torch.empty((1, M, n // 2), dtype=torch.float32, device=device)
     moe_gemm_gluon(
-        y_bf16,
+        y_fp32,
         x_tri,
         w_tri,
         x_mx_scales_tri,
@@ -482,7 +494,7 @@ def test_gemm1_fused_mxfp4_out(m, n, k, n_expts_tot, n_expts_act, act, device="c
         act.limit,
         act.add_residual,
     )
-    ref_fp4, ref_scale = mxfp4_quant(y_bf16[0])
+    ref_fp4, ref_scale = mxfp4_quant(y_fp32[0])
 
     got_fp4, got_scale = moe_gemm1_a4w4_mxfp4_out(
         x_tri,
@@ -505,3 +517,4 @@ def test_gemm1_fused_mxfp4_out(m, n, k, n_expts_tot, n_expts_act, act, device="c
         f"E8M0 scale differs in {(got_scale != ref_scale).sum().item()} "
         f"/ {ref_scale.numel()} bytes"
     )
+

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
@@ -97,6 +99,11 @@ LOG2E = 1.4426950408889634
 
 
 def _silu_mul_batch(gs, us):
+    # ABLATION, for measuring what the activation costs -- enabled by AITER_FLYDSL_NO_ACT.
+    # Drops only the transcendentals (exp2 + rcp), keeping the same gate*up shape and
+    # element count so nothing downstream is DCE'd.
+    if os.environ.get("AITER_FLYDSL_NO_ACT", "0") != "0":
+        return [gs[i] * us[i] for i in range(len(gs))]
     e = [fx.Float32(rocdl.exp2(T.f32, _raw(g * fx.Float32(-LOG2E)))) for g in gs]
     sig = [fx.Float32(rocdl.rcp(T.f32, _raw(fx.Float32(1.0) + ei))) for ei in e]
     return [gs[i] * sig[i] * us[i] for i in range(len(gs))]

@@ -1,0 +1,165 @@
+// Generated launcher for {{ kernel_name }} -- do not edit.
+//
+// One specialization, one module. Every type decision is made at render time, so the
+// call path below is straight-line: no argument loop, no per-argument type dispatch,
+// no Python-level attribute or method calls.
+//
+// Against triton's own launcher this drops:
+//   * the python HIPLauncher.__call__ wrapper (driver.py) entirely
+//   * PyArg_ParseTuple           -- METH_FASTCALL hands us PyObject *const *
+//   * PyObject_CallMethodNoArgs(obj, "data_ptr") per pointer argument (driver.c:698)
+//     -- THPVariable_Unpack gives the at::Tensor by reference instead
+//   * the generic signature walk that flattens tuples and skips constexprs
+//
+// signature hash {{ sig_hash }}
+#define __HIP_PLATFORM_AMD__ 1
+
+#include <Python.h>
+
+#include <hip/hip_runtime_api.h>
+#include <torch/csrc/autograd/python_variable.h>
+
+namespace {
+
+hipFunction_t g_function = nullptr;
+uint32_t g_shared = 0;
+uint32_t g_block_x = 0;
+
+// Top-level arguments, i.e. exactly what `kernel[grid](...)` is given -- aggregates
+// still packed, constexprs still present. Indexing into the aggregates and dropping the
+// constexprs happens below, in generated straight-line code, so the caller never builds
+// a flattened list in Python.
+constexpr Py_ssize_t kNumTopLevel = {{ n_top_level }};
+// grid_x and stream precede them.
+constexpr Py_ssize_t kNumArgs = kNumTopLevel + 2;
+
+inline bool unpack_ptr(PyObject *obj, void **out) {
+  if (obj == Py_None) {
+    *out = nullptr;
+    return true;
+  }
+  if (THPVariable_CheckExact(obj)) {
+    // Unpack yields the at::Tensor by reference; data_ptr() is a direct field read.
+    *out = THPVariable_Unpack(obj).data_ptr();
+    return true;
+  }
+  if (PyLong_Check(obj)) {  // raw device address
+    *out = PyLong_AsVoidPtr(obj);
+    return !PyErr_Occurred();
+  }
+  PyErr_SetString(PyExc_TypeError,
+                  "expected a tensor, None, or an int device pointer");
+  return false;
+}
+
+PyObject *launch(PyObject * /*self*/, PyObject *const *args, Py_ssize_t nargs) {
+  if (nargs != kNumArgs) {
+    PyErr_Format(PyExc_TypeError, "{{ kernel_name }}: expected %zd arguments, got %zd",
+                 kNumArgs, nargs);
+    return nullptr;
+  }
+
+  const unsigned int grid_x = (unsigned int)PyLong_AsUnsignedLong(args[0]);
+  hipStream_t stream = (hipStream_t)PyLong_AsVoidPtr(args[1]);
+  if (PyErr_Occurred()) {
+    return nullptr;
+  }
+
+{% for a in args %}
+{%- if a.nested %}
+  PyObject *o{{ loop.index0 }};
+  {
+    PyObject *t = args[{{ a.top + 2 }}];
+    if (!PyTuple_Check(t)) {
+      PyErr_SetString(PyExc_TypeError,
+                      "{{ kernel_name }}: argument {{ a.top }} must be a tuple");
+      return nullptr;
+    }
+{%- for idx in a.path %}
+{%- if not loop.first %}
+    if (!PyTuple_Check(t)) {
+      PyErr_SetString(PyExc_TypeError, "{{ kernel_name }}: nested tuple expected");
+      return nullptr;
+    }
+{%- endif %}
+    if (PyTuple_GET_SIZE(t) <= {{ idx }}) {
+      PyErr_SetString(PyExc_TypeError, "{{ kernel_name }}: aggregate too short");
+      return nullptr;
+    }
+    t = PyTuple_GET_ITEM(t, {{ idx }});
+{%- endfor %}
+    o{{ loop.index0 }} = t;
+  }
+{%- else %}
+  PyObject *o{{ loop.index0 }} = args[{{ a.top + 2 }}];
+{%- endif %}
+{%- if a.is_ptr %}
+  void *v{{ loop.index0 }};
+  if (!unpack_ptr(o{{ loop.index0 }}, &v{{ loop.index0 }})) {
+    return nullptr;
+  }
+{%- else %}
+  {{ a.ctype }} v{{ loop.index0 }} = ({{ a.ctype }})PyLong_AsLongLong(o{{ loop.index0 }});
+{%- endif %}
+{%- endfor %}
+
+  if (PyErr_Occurred()) {
+    return nullptr;
+  }
+
+  // HIP always includes both scratch slots in the kernel ABI, appended after the
+  // declared arguments (driver.c:1100-1108 does the same). Omitting them leaves
+  // hipModuleLaunchKernel reading past the end of params -- a host-side segfault, not a
+  // device error. Both sizes are 0 for this kernel, checked at build time.
+  void *global_scratch = nullptr;
+  void *profile_scratch = nullptr;
+
+  void *params[] = {
+{%- for a in args %}
+      &v{{ loop.index0 }},
+{%- endfor %}
+      &global_scratch,
+      &profile_scratch,
+  };
+
+  hipError_t err;
+  Py_BEGIN_ALLOW_THREADS
+  err = hipModuleLaunchKernel(g_function, grid_x, 1, 1, g_block_x, 1, 1, g_shared,
+                              stream, params, nullptr);
+  Py_END_ALLOW_THREADS
+  if (err != hipSuccess) {
+    PyErr_Format(PyExc_RuntimeError, "{{ kernel_name }} launch failed: %s",
+                 hipGetErrorString(err));
+    return nullptr;
+  }
+  Py_RETURN_NONE;
+}
+
+PyObject *init(PyObject * /*self*/, PyObject *args) {
+  unsigned long long function = 0;
+  unsigned int shared = 0, block_x = 0;
+  if (!PyArg_ParseTuple(args, "KII", &function, &shared, &block_x)) {
+    return nullptr;
+  }
+  g_function = (hipFunction_t)function;
+  g_shared = shared;
+  g_block_x = block_x;
+  Py_RETURN_NONE;
+}
+
+PyMethodDef methods[] = {
+    {"launch", (PyCFunction)(void *)launch, METH_FASTCALL, "launch {{ kernel_name }}"},
+    {"init", init, METH_VARARGS, "bind the compiled function handle"},
+    {nullptr, nullptr, 0, nullptr},
+};
+
+PyModuleDef module_def = {
+    PyModuleDef_HEAD_INIT, "{{ module_name }}", nullptr, -1, methods,
+    nullptr, nullptr, nullptr, nullptr,
+};
+
+}  // namespace
+
+extern "C" PyObject *PyInit_{{ module_name }}(void) {
+  return PyModule_Create(&module_def);
+}
