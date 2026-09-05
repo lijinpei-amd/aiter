@@ -3112,13 +3112,22 @@ def _moe_gemm_body(
     # FUSE: the last step is peeled so the gate half's activation can be interleaved
     # with its MFMAs. Legal without touching any wait count because that step alone has
     # DO_DS_READ == False and therefore issues no wait_group -- see _FUSE_ACT_MFMA.
-    # Not with FROZEN_STEP: the snapshot is the pinned reference schedule and owns the
-    # manual ping-pong's cross-wave rendezvous, so replacing its last step with a
-    # hand-rolled walk would both break the "identical assembly" property the snapshot
-    # exists for and risk a barrier-count mismatch between wave groups.
+    # Works with FROZEN_STEP too. The earlier exclusion assumed the snapshot owned a
+    # cross-wave rendezvous that a hand-rolled last step could desynchronise, but two
+    # things make that a non-issue. `_drain_last_fused` calls neither step
+    # implementation -- it is a standalone `_maybe_block_dot` walk -- and the step it
+    # replaces is the one with DO_LDS_LOAD == False, where the frozen copy's
+    # `MPP = DO_LDS_LOAD` is already False and it emits no barrier, no setprio and no
+    # rendezvous at all. There is nothing there to desynchronise. (Measured separately:
+    # neither build has any wave-id-dependent control flow -- zero v_mbcnt, zero
+    # cond_barrier -- and ATT shows all waves in lockstep at 4 and 8 waves, so the
+    # "cross-wave rendezvous" the old comment worried about does not exist.)
+    #
+    # The snapshot's "identical assembly" property is unaffected while FUSE is off,
+    # which is the default; with it on the frozen build changes by construction and its
+    # fingerprint has to be re-recorded.
     FUSE: gl.constexpr = (
         _FUSE_ACT_MFMA
-        and not _FROZEN_STEP
         and func_cfg.gu_split()
         and tuning_cfg.num_mini_n() == 2
     )
