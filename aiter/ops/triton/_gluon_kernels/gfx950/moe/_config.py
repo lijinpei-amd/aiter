@@ -597,18 +597,29 @@ class KernelTuningConfig:
     def wait_at_stage_head(self):
         """Emit one ``wait_group`` per stage (at its first slot) rather than one per slot.
 
-        Only under ``PER_FILL``: every group a slot reads is then named individually, so
-        the strongest slot wait of the stage implies all the others and the remaining
-        ``num_mini_m() * num_mini_n() - 1`` waits are redundant. They are not free --
-        Membar inserts a barrier after *every* ``ttg.async_wait`` unconditionally
-        (Membar.cpp, the MemWaitOp path, which returns before the conflict analysis is
-        consulted), and each such ``ttg.barrier`` is a workgroup release fence and hence
-        an ``s_waitcnt lgkmcnt(0)``. Strongest = smallest count, since ``wait_group(n)``
-        leaves at most ``n`` groups outstanding. Under the coarser
-        levels one group covers several tiles, so a slot's wait is not implied by an
-        earlier slot's and each is emitted at the head of its own slot.
+        True for ``PER_FILL`` and ``PER_STAGE``; only ``PER_SLOT`` needs a wait per slot.
+
+        The waits are not free. Membar inserts a barrier after *every* ``ttg.async_wait``
+        unconditionally (Membar.cpp, the MemWaitOp path, which returns before the
+        conflict analysis is consulted), and each such ``ttg.barrier`` is a workgroup
+        release fence and hence an ``s_waitcnt lgkmcnt(0)``. So one wait hoisted out of
+        N is N-1 barriers and N-1 lgkm drains removed.
+
+        ``PER_FILL``: every group a slot reads is named individually, so the strongest
+        slot wait of the stage implies all the others. Strongest = smallest count, since
+        ``wait_group(n)`` leaves at most ``n`` groups outstanding.
+
+        ``PER_STAGE``: stronger still -- ``_slot_wait`` returns ``STAGES_BETWEEN`` for
+        *every* slot, because the stage's own group is not committed until its last slot
+        and so contributes nothing outstanding. All four counts are equal, so the hoisted
+        ``min()`` is not an approximation of them: it *is* them, and the other three
+        waits are pure duplicates.
+
+        ``PER_SLOT`` is the one level that must stay per-slot: one group covers a whole
+        mini block there, so ``_fills_before`` differs between slots and a slot's wait is
+        genuinely not implied by an earlier slot's.
         """
-        return self.commit_per_fill()
+        return self.commit_per_fill() or self.commit_per_stage()
 
     @gluon.constexpr_function
     def num_lds_tiles(self, idx):

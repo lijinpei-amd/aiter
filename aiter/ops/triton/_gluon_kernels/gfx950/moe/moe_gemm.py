@@ -1397,6 +1397,7 @@ def _slot_fills(
     ADVANCE: gl.constexpr = False,
     KI: gl.constexpr = 0,
     KU: gl.constexpr = 1,
+    STAGE_MARK: gl.constexpr = True,
 ):
     """The global->LDS copies slot ``(mi, ni)`` owns, committed per WAIT_COMMIT_SCHEME.
 
@@ -1508,9 +1509,18 @@ def _slot_fills(
     if require_constexpr(MARK_SLOT):
         # One group for everything this mini block just issued.
         pc.lds.commit_fill_lds()
-    if require_constexpr(MARK_STAGE and _slot_index(mi, ni, NM, NN) == NM * NN - 1):
-        # One group for the whole block: committed at the last slot, so the
-        # stage's fills all retire together.
+    if require_constexpr(MARK_STAGE and STAGE_MARK
+                         and _slot_index(mi, ni, NM, NN) == NM * NN - 1):
+        # One group for the whole block, committed at the last slot.
+        #
+        # ``STAGE_MARK=False`` lets _pipeline_step_impl close the group after its walk
+        # instead, which frees the last slot's loads from being pinned mid-walk. Every
+        # OTHER caller must leave it True: the prologue fills NB-1 stages through its own
+        # slot walk (see _moe_gemm_body), and if the mark is dropped there those stages
+        # are never committed at all. The waits that depend on them then have no group to
+        # count, UpdateAsyncWaitCount lowers them with no vmcnt, and the cooperative-fill
+        # barriers that follow stop meaning anything -- a WAR race that shows up as
+        # nondeterministic output in 7 runs out of 8, with the barrier count unchanged.
         pc.lds.commit_fill_lds()
     if require_constexpr(ADVANCE):
         # KU is 1 unless _SOFF_UNROLL folded the body's steps into soffset, in which
@@ -1833,6 +1843,8 @@ def _pipeline_step_impl(
                         ADVANCE=_slot_advance(mi, ni, NM, NN, KIE, KUE),
                         KI=KIE,
                         KU=KUE,
+                        # the step closes the stage group itself, after the walk
+                        STAGE_MARK=False,
                     )
 
             with STAGE("mfma", priority=0):
@@ -1862,6 +1874,10 @@ def _pipeline_step_impl(
             a_new, b_new = _slot_tails(pc, a_cur, b_cur, mi, ni, DO_DS_READ)
             a_tail = a_tail + a_new
             b_tail = b_tail + b_new
+
+    if require_constexpr(tc.commit_per_stage() and DO_BUFFER_LOAD):
+        # One group for the whole stage, closed after the walk -- see _slot_fills.
+        pc.lds.commit_fill_lds()
 
     if require_constexpr(DO_DS_READ):
         if require_constexpr(A_HAS):
