@@ -9,6 +9,11 @@ import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton._gluon_kernels.gfx950.moe._entry import MoeKernelConfig
+from aiter.ops.triton._gluon_kernels.gfx950.moe._epilogue import (
+    _epi_block_flush,
+    _epi_stage_flush,
+)
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     ActivationSpec,
     ActKind,
@@ -16,12 +21,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     FuncSpec,
     TuningSpec,
 )
-from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_gemm import (
-    MoeKernelConfig,
-    _build_configs,
-    _epi_block_flush,
-    _epi_stage_flush,
-)
+from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_gemm import _build_configs
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 

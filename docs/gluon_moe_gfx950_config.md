@@ -5,6 +5,12 @@
 translates legacy benchmark environment variables, so `~/gluon_cold_bench.sh`
 continues to select the recorded impl and frozen configurations.
 
+The low-level entry points `_moe_gluon_gemm1` and `_moe_gluon_gemm2`, their
+`MoeKernelConfig` argument, and launch metadata live in `_entry.py`. The shared
+GEMM body and pipeline remain in `moe_gemm.py`; `_offsets.py` computes A/B HBM
+offsets and mini-tile indices, and `_epilogue.py` owns output activation,
+quantization, staging, and stores. The host launch API is unchanged.
+
 ## Tuning options
 
 Pass these fields in the launcher's `config` dictionary. They are also trailing
@@ -51,17 +57,24 @@ selects the permuted weight layout staged through LDS.
 Each step takes invariant data in `_PipelineConst` and carries two separate
 aggregates through the K loop:
 
-- `_PipelinePointers` contains the A/B payload and scale fill pointers plus the
-  consume-side scale pointers used by direct register loads.
+- `_PipelinePointers`, named `hbm_ptrs` at call sites, contains the A/B payload
+  and scale HBM pointers plus the direct scale HBM pointers used by register loads.
 - `_PipelineRegFragments` contains separate A/B payload and scale tuples and the
   MFMA accumulators. Operand tuples run by mini block, then mini-K step;
   accumulators follow the N-outer, M-inner slot traversal.
 
-`_slot_fills` only issues copies and commit markers. It has no `ADVANCE` argument
-or pointer return value. Its caller advances fill pointers after the last slot,
-inside the memory region. With `SOFF_UNROLL`, this happens once per unrolled body;
-consume-side scale pointers advance after every stage read. The drain advances
-neither fill pointers nor pointers for a stage it does not read.
+`_PipelineConst.lds_ptrs` holds the `LDSManager` descriptors, named
+`a_payload_lds_ptr`, `a_scale_lds_ptr`, `b_payload_lds_ptr`, and `b_scale_lds_ptr`.
+`BUFFER_LOAD_IDX` selects the LDS destination buffer and `DS_READ_IDX` selects
+the LDS source buffer. Direct scale fallbacks still address HBM.
+
+`_buffer_load` only issues copies and commit markers. It has no `ADVANCE`
+argument or pointer return value. Its caller uses `_advance_hbm_ptrs` after the
+last slot, inside the memory region. With `SOFF_UNROLL`, this happens once per
+unrolled body. `_ds_read` loads the next operands, and
+`_advance_direct_scale_hbm_ptrs` advances direct scale pointers after every stage
+read. The drain advances neither copy pointers nor pointers for a stage it does
+not read.
 
 ## Epilogue function configuration
 
@@ -148,3 +161,28 @@ with an interval of -1.44691 to +3.82966 us. All 48 processes and 4,800 measured
 dispatches passed an independent trace, binary, and launch-metadata audit; every
 process started after two clean GPU-idle readings. Full results are in
 `bench_out/gluon_pipeline_refactor_20260906_215026/cold_final/`.
+
+The buffer-load/DS-read naming and module extraction refactor was checked against
+`0d016f483`. Both impl and frozen retain identical encoded `.text` and launch
+metadata for BF16 and MXFP4 output, with 30 exact replays of each variant.
+Validation also passed 43 CPU cases, 50 GPU pipeline cases, four epilogue staging
+cases, three repeated preshuffled-weight/direct-scale probes, and six GEMM2
+dtype/reference cases. The GEMM2 cases use explicit supported split tiling with
+three LDS buffers; their original inputs and Torch reference assertions remain
+unchanged.
+
+Using the same cold protocol above, 12 interleaved baseline/current rounds gave:
+
+| Kernel | Baseline `0d016f483` | Refactored |
+| --- | ---: | ---: |
+| impl | 615.574 us | 614.38375 us |
+| frozen | 616.624 us | 617.13375 us |
+
+The paired current-minus-baseline mean was -0.750125 us for impl, with a
+Student-t 95% interval of -2.88330 to +1.38305 us; frozen was +0.284958 us,
+with an interval of -1.78503 to +2.35495 us. Neither change is statistically
+significant. All 48 processes, 4,800 samples, unchanged binaries, launch metadata,
+and 49 idle guards passed independent audit. A detected foreign GPU allocation
+was confined to a pause between benchmark processes; no samples were discarded.
+Evidence and source snapshots are retained under
+`bench_out/gluon_module_refactor_20260906_235642/`.
