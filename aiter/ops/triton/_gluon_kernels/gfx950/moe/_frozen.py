@@ -14,6 +14,9 @@ The acceptance test for a re-snapshot is *identical assembly* against ``FROZEN_S
 which is also what proves the ``*_frozen`` helper twins below are still in sync with
 their live counterparts.
 
+The shared pointer and register aggregates are adapted at the step boundary; the
+snapshot's scheduling statements, including its separate prologue fence, stay fixed.
+
 This module is imported from the *bottom* of ``moe_gemm``: the snapshot calls back into
 the shared, non-frozen halves of the kernel (``_slot_a_read``, ``_maybe_block_dot``, the
 placement helpers), so the cycle is only breakable in that direction.
@@ -25,17 +28,27 @@ from triton.experimental.gluon import language as gl
 from ._lang import require_constexpr
 from ._lang import unwrap as _v
 from .moe_gemm import (
-    _PipelineState,
-    _b_rotate,
     _fill_order,
     _fill_tile_of,
+    _make_reg_fragments,
     _maybe_block_dot,
     _opt_at,
+    _PipelinePointers,
     _slot_a_read,
     _slot_b_read,
     _slot_index,
     _take_pairs,
+    _take_reg_pairs,
 )
+
+
+@gluon.jit
+def _frozen_prologue_fence():
+    """Preserve the tuned snapshot's cooperative prologue fence and schedule."""
+    gl.amd.cdna4.sched_barrier(0)
+    gl.barrier()
+    gl.amd.cdna4.sched_barrier(0)
+
 
 # --- frozen placement / wait helpers ------------------------------------------
 # Twins of the constexpr helpers _pipeline_step_frozen reaches, with SCALE_FILL_MID
@@ -299,7 +312,8 @@ def _slot_fills_frozen(
 @gluon.jit
 def _pipeline_step_frozen(
     pc,
-    st,
+    ptrs,
+    regs,
     BUFFER_LOAD_INX,
     DS_READ_INX,
     STAGES_BETWEEN: gl.constexpr,
@@ -345,10 +359,10 @@ def _pipeline_step_frozen(
 
     Along K the ``ds_read`` always pulls a whole stage, mini-K steps ``[0, NUM_MINI)``.
     The MFMAs run one window earlier, over ``[-PF_MINI, NUM_MINI-PF_MINI)``: the negative
-    part is ``st.a_frags``/``st.b_frags``, carried from the previous step, and the tail
-    this step reads is carried to the next. ``PF_MINI == NUM_MINI`` makes the MFMAs
-    consume nothing they read themselves; ``PF_MINI == 0`` makes them consume only what
-    they read.
+    part is the payload/scale fragments in ``regs``, carried from the previous step,
+    and the tail this step reads is carried to the next. ``PF_MINI == NUM_MINI`` makes
+    the MFMAs consume nothing they read themselves; ``PF_MINI == 0`` makes them consume
+    only what they read.
 
     ``PF_MINI == NUM_MINI`` is also what makes the ping-pong legal: the slot's MFMAs then
     depend on nothing the slot reads, so they are emitted *first* and the reads and copies
@@ -405,16 +419,7 @@ def _pipeline_step_frozen(
         "_pipeline_step_frozen is the VGPR_PREFETCH_K == BLOCK_K schedule; "
         "HEAD_MINI != 0 needs _pipeline_step_impl",
     )
-    # B_IN_REG was False for the frozen kernel, so FILLS_FIRST (which reduced to
-    # tc.B_IN_REG once _FILLS_FIRST dropped out) is inlined False and the
-    # register-resident-B paths are gone.
-    gl.static_assert(
-        not tc.B_IN_REG,
-        "_pipeline_step_frozen is the B-through-LDS schedule; "
-        "B_IN_REG needs _pipeline_step_impl",
-    )
-    # Global->LDS fills before the register-path B loads. Only matters when B is
-    # register-resident: the two share vmcnt, and the barrier waits on the fills.
+    # The frozen kernel always stages B through LDS.
     # PIPE (the warp-pipeline *pass*) is dead here: it needs `not _MANUAL_PP` and the
     # frozen flags pin _MANUAL_PP = 1. Both `if PIPE` branches below are gone with it.
     # MPP -- the hand-emitted rendezvous -- reduces to DO_DS_READ once _WP,
@@ -428,12 +433,12 @@ def _pipeline_step_frozen(
     KIE: gl.constexpr = 0
     KUE: gl.constexpr = 1
 
-    a_hbm_ptr = st.a_hbm_ptr
-    b_hbm_ptr = st.b_hbm_ptr
-    a_scale_hbm_ptr = st.a_scale_hbm_ptr
-    b_scale_hbm_ptr = st.b_scale_hbm_ptr
-    a_scale_read_hbm_ptr = st.a_scale_read_hbm_ptr
-    b_scale_read_hbm_ptr = st.b_scale_read_hbm_ptr
+    a_hbm_ptr = ptrs.a_hbm_ptr
+    b_hbm_ptr = ptrs.b_hbm_ptr
+    a_scale_hbm_ptr = ptrs.a_scale_hbm_ptr
+    b_scale_hbm_ptr = ptrs.b_scale_hbm_ptr
+    a_scale_read_hbm_ptr = ptrs.a_scale_read_hbm_ptr
+    b_scale_read_hbm_ptr = ptrs.b_scale_read_hbm_ptr
 
     # Fragments this step reads, appended mini block by mini block. `a_cur` grows once
     # per mi (at ni == 0) and `b_cur` once per ni (at mi == 0), so block `mi` always
@@ -461,10 +466,14 @@ def _pipeline_step_frozen(
                 )
 
             if require_constexpr(DO_MFMA):
-                dot_a = _take_pairs(st.a_frags, mi * PF_MINI, PF_MINI)
-                dot_b = _take_pairs(st.b_frags, ni * PF_MINI, PF_MINI)
+                dot_a = _take_reg_pairs(
+                    regs.a_payload, regs.a_scale, mi * PF_MINI, PF_MINI
+                )
+                dot_b = _take_reg_pairs(
+                    regs.b_payload, regs.b_scale, ni * PF_MINI, PF_MINI
+                )
             else:
-                # Nothing carried in yet; st.a_frags/st.b_frags are empty.
+                # Nothing carried in yet; the register fragment tuples are empty.
                 dot_a = ()
                 dot_b = ()
 
@@ -510,7 +519,7 @@ def _pipeline_step_frozen(
             slot_acc = _maybe_block_dot(
                 dot_a,
                 dot_b,
-                st.acc[_slot_index(mi, ni, NM, NN)],
+                regs.acc[_slot_index(mi, ni, NM, NN)],
                 PF_MINI,
                 func_cfg,
                 tc,
@@ -588,18 +597,14 @@ def _pipeline_step_frozen(
                 b_scale_read_hbm_ptr + pc.s_step * pc.b_scale_stride_k
             )
     else:
-        a_tail = st.a_frags
-        b_tail = st.b_frags
+        a_tail = _take_reg_pairs(regs.a_payload, regs.a_scale, 0, NM * PF_MINI)
+        b_tail = _take_reg_pairs(regs.b_payload, regs.b_scale, 0, NN * PF_MINI)
 
-    return _PipelineState(
+    return _PipelinePointers(
         a_hbm_ptr,
         b_hbm_ptr,
         a_scale_hbm_ptr,
         b_scale_hbm_ptr,
         a_scale_read_hbm_ptr,
         b_scale_read_hbm_ptr,
-        a_tail,
-        _b_rotate(st.b_frags2, b_tail, False),
-        b_tail,
-        acc,
-    )
+    ), _make_reg_fragments(a_tail, b_tail, acc)

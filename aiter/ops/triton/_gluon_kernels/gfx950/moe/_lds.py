@@ -151,21 +151,11 @@ class LDSManager:
             [NB * NMA, a_shape[0], a_shape[1]],
             layout=tuning_cfg.dot_operand_lds_layout(0),
         )
-        if require_constexpr(tuning_cfg.B_IN_REG):
-            # Nothing reads this, but the field is typed and the padded dot-operand
-            # layout only legalises against the real tile shape -- so keep the shape and
-            # drop the buffering, which is where the NUM_LDS_BUFFER-fold saving is.
-            weight_buf = gl.allocate_shared_memory(
-                b_ty,
-                [1, b_shape[0], b_shape[1]],
-                layout=tuning_cfg.dot_operand_lds_layout(1),
-            )
-        else:
-            weight_buf = gl.allocate_shared_memory(
-                b_ty,
-                [NB * NMB, b_shape[0], b_shape[1]],
-                layout=tuning_cfg.dot_operand_lds_layout(1),
-            )
+        weight_buf = gl.allocate_shared_memory(
+            b_ty,
+            [NB * NMB, b_shape[0], b_shape[1]],
+            layout=tuning_cfg.dot_operand_lds_layout(1),
+        )
         if require_constexpr(func_cfg.has_scale(0)):
             as_shape: gl.constexpr = tuning_cfg.scale_shape(0)
             if require_constexpr(tuning_cfg.scale_shuffled(0)):
@@ -264,7 +254,7 @@ class LDSManager:
     def fill_b_payload_lds(self, idx, ni: gl.constexpr, b_ptr, b_offs, SOFF: gl.constexpr = 0):
         """Issue the weight copy for mini-N block ``ni`` of a stage."""
         cfg: gl.constexpr = self.tuning_cfg
-        if require_constexpr(not _NO_FILL and not cfg.B_IN_REG):
+        if require_constexpr(not _NO_FILL):
             _async_or_reg_fill(
                 self.weight_buf.index(idx * cfg.num_lds_tiles(1) + ni),
                 b_ptr,
@@ -472,8 +462,6 @@ class LDSManager:
         mini_idx: gl.constexpr,
         b_scale_ptr,
         b_scale_offs,
-        b_ptr=None,
-        b_frag_offs=None,
         RELAXED: gl.constexpr = False,
         READ_PAYLOAD: gl.constexpr = True,
         READ_SCALE: gl.constexpr = True,
@@ -487,14 +475,6 @@ class LDSManager:
                 1,
                 self.func_cfg.operand_elem_ty(1),
                 layout=cfg.dot_operand_fragment_layout(1),
-            )
-        elif require_constexpr(cfg.B_IN_REG):
-            # Global -> VGPR in one step, no LDS round trip. The operand-B fragment
-            # layout is K-contiguous and K is the fastest axis of the weight tensor, so
-            # each lane's 32 packed elements are 16 contiguous bytes: one
-            # buffer_load_dwordx4, which is what FlyDSL's BufferCopy128b emits.
-            b_val = gl.amd.cdna4.buffer_load(
-                ptr=b_ptr, offsets=b_frag_offs, cache=cfg.expert_mod
             )
         else:
             b_val = _shared_load(

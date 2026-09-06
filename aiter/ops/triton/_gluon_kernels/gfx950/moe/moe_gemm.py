@@ -245,8 +245,6 @@ def _build_configs(cfg):
         _at(t, 32),
         _at(t, 33),
         _at(t, 34),
-        _at(t, 35),
-        _at(t, 36),
     )
     return func_cfg, tuning_cfg
 
@@ -395,9 +393,8 @@ def _n_start(pid_n, ni: gl.constexpr, N, func_cfg, tuning_cfg):
 def _n_split_offs(pid_n, i, N, func_cfg, tuning_cfg):
     """:func:`_n_start` for a whole-BLOCK_N index tensor ``i`` in ``[0, BLOCK_N)``.
 
-    Same mapping, expressed elementwise, for the two consumers that address the CTA
-    tile as one run rather than per mini block: the ``B_IN_REG`` scale fetch and the
-    bias staging copy. Uniform arithmetic on a loop-invariant tensor, so it is hoisted.
+    Same mapping, expressed elementwise, for the bias staging copy that addresses the
+    CTA tile as one run. Uniform arithmetic on a loop-invariant tensor is hoisted.
     """
     MBN: gl.constexpr = tuning_cfg.MINI_BLOCK_N
     if require_constexpr(func_cfg.gu_split()):
@@ -422,9 +419,8 @@ def _blocked_b_offsets(
     (packed) K extent. ``k`` here is the byte *within the stage*, which is what the
     caller's per-stage pointer bump of ``PK_B // 16 * 256`` makes correct.
 
-    Used at two layouts: the copy layout, for the direct-to-LDS staging whose shared
-    tile carries the matching ``byte_unit_lds_layout`` permutation, and the operand-B
-    fragment layout, for the ``B_IN_REG`` path that skips LDS altogether.
+    The copy layout matches the direct-to-LDS tile's ``byte_unit_lds_layout``
+    permutation.
     """
     kk = gl.arange(0, PK_B, layout=gl.SliceLayout(1, layout))[:, None]
     nn = (n0 + gl.arange(0, MBN, layout=gl.SliceLayout(0, layout)))[None, :]
@@ -517,15 +513,12 @@ def _a_scale_offsets(a, rt, block_id, M_e, start_m, pid_m, K, func_cfg, tuning_c
 def _b_scale_offsets(b, pid_n, N, K, func_cfg, tuning_cfg):
     """Byte offsets of the B scale tiles, one per mini-N block (``None`` if unscaled).
 
-    Three shapes: the CDNA4_SCALE preshuffle read element-wise into the fragment
-    registers (``B_IN_REG``), the same preshuffle read as a flat run for staging, and
-    the raw ``(K/32, N)`` grid. The caller only sees a tuple it can index per mini
-    block -- the ``B_IN_REG`` form is one whole-BLOCK_N tile, so that tuple is 1-long.
+    Either a flat CDNA4_SCALE preshuffle run for staging or the raw ``(K/32, N)``
+    grid. The caller receives a tuple indexed by mini block.
     """
     if require_constexpr(not func_cfg.b_has_scale()):
         return _NO_SCALE
 
-    BN: gl.constexpr = tuning_cfg.BLOCK_N
     MBN: gl.constexpr = tuning_cfg.MINI_BLOCK_N
     NN: gl.constexpr = tuning_cfg.num_mini_n()
     SK: gl.constexpr = tuning_cfg.BLOCK_K // MX_GROUP
@@ -537,25 +530,7 @@ def _b_scale_offsets(b, pid_n, N, K, func_cfg, tuning_cfg):
     else:
         bsl: gl.constexpr = tuning_cfg.dot_operand_scale_fragment_layout(1)
 
-    if require_constexpr(tuning_cfg.B_SCALE_SHUFFLED and tuning_cfg.B_IN_REG):
-        # Straight into the scale fragment registers, addressed element-wise so it
-        # rides the same two-stage pipeline as B's payload.
-        ns = _n_split_offs(
-            pid_n,
-            gl.arange(0, BN, layout=gl.SliceLayout(1, bsl)),
-            N,
-            func_cfg,
-            tuning_cfg,
-        )[:, None]
-        ks = gl.arange(0, SK, layout=gl.SliceLayout(0, bsl))[None, :]
-        b_scale_offs = (
-            (ns // 32) * K
-            + (ks % 4) * 64
-            + (ns % 16) * 4
-            + (ks // 4) * 2
-            + (ns % 32) // 16,
-        )
-    elif require_constexpr(tuning_cfg.B_SCALE_SHUFFLED):
+    if require_constexpr(tuning_cfg.B_SCALE_SHUFFLED):
         # utils/shuffle.py::shuffle_scale_moe (CDNA4_SCALE) has already permuted the
         # weight scales into MFMA fragment order: per expert the tile is
         # (N/32, K) bytes, and within a 32-row stripe lane L of a stage reads the
@@ -655,8 +630,6 @@ def _b_block_frags(
     scale_offs,
     func_cfg,
     tc,
-    b_ptr=None,
-    b_frag_offs=None,
     RELAXED: gl.constexpr = False,
     READ_PAYLOAD: gl.constexpr = True,
     READ_SCALE: gl.constexpr = True,
@@ -673,8 +646,6 @@ def _b_block_frags(
             i,
             scale_ptr,
             _mini_scale_off(scale_offs, i * SK_MINI, HAS),
-            b_ptr,
-            b_frag_offs,
             RELAXED,
             READ_PAYLOAD,
             READ_SCALE,
@@ -737,13 +708,11 @@ def _block_dot(a_frags, b_frags, acc, N_MINI: gl.constexpr, func_cfg, tuning_cfg
 @aggregate
 @strip_annotate
 class _PipelineConst:
-    """The loop-*invariant* half of a K-pipeline step.
+    """Loop-invariant data for a K-pipeline step.
 
-    Hoisted once before the loop: the LDS buffers, the HBM scale bases, the tile offsets
-    every stage reuses, and the per-stage pointer increments. Split from
-    :class:`_PipelineState` so the loop-carried set is exactly the values that have to
-    cross the back edge -- anything parked in here by mistake would otherwise be threaded
-    through every iteration for nothing.
+    Hoisted once before the loop: LDS buffers, tile offsets, and per-stage pointer
+    increments. Only :class:`_PipelinePointers` and :class:`_PipelineRegFragments`
+    cross the back edge.
 
     Every offset grid is a *tuple*, one entry per mini block: ``num_mini_m()`` for the A
     side, ``num_mini_n()`` for the B side. Each entry is laid out for its own mini tile's
@@ -752,8 +721,8 @@ class _PipelineConst:
 
     ``a_scale_offs``/``b_scale_offs`` serve *both* sides: the direct-to-LDS copy and, for
     the register fallback, the consume-side load. Both walk K by advancing their scalar
-    base pointer in :class:`_PipelineState` instead of the offset grid, so this tile grid
-    is computed once and never moves.
+    base pointer in :class:`_PipelinePointers` instead of the offset grid, so the tile
+    grid is computed once and never moves.
 
     The two ``*_scale_stride_k`` are lifted out of the operand tuples rather than kept as
     ``a``/``b``: the non-quantised operand types have no such field at all, so it can only
@@ -763,7 +732,6 @@ class _PipelineConst:
     lds: LDSManager
     a_offs: tl.tuple | tuple
     b_offs: tl.tuple | tuple
-    b_frag_offs: tl.tuple | tuple | gl.constexpr
     a_scale_offs: tl.tuple | tuple | gl.constexpr
     b_scale_offs: tl.tuple | tuple | gl.constexpr
     a_scale_stride_k: gl.constexpr
@@ -780,7 +748,6 @@ class _PipelineConst:
         lds,
         a_offs,
         b_offs,
-        b_frag_offs,
         a_scale_offs,
         b_scale_offs,
         a_scale_stride_k,
@@ -794,7 +761,6 @@ class _PipelineConst:
         self.lds = lds
         self.a_offs = a_offs
         self.b_offs = b_offs
-        self.b_frag_offs = _opt(b_frag_offs)
         self.a_scale_offs = _opt(a_scale_offs)
         self.b_scale_offs = _opt(b_scale_offs)
         # re-wrapped: the frontend unwraps a constexpr argument before a
@@ -810,8 +776,8 @@ class _PipelineConst:
 
 @aggregate
 @strip_annotate
-class _PipelineState:
-    """The loop-*variant* half: everything one ``BLOCK_K`` stage hands to the next.
+class _PipelinePointers:
+    """HBM addresses carried between K stages, independent of register fragments.
 
     Every address here is in HBM -- the LDS side of the pipeline is entirely inside
     ``_PipelineConst.lds``. The plain ``*_hbm_ptr`` are the copy *sources*, walked one
@@ -819,17 +785,9 @@ class _PipelineState:
     the register fallback, when a tile is too small to be written to LDS coalesced and
     is loaded straight from HBM at MFMA time instead.
 
-    Bundled rather than passed as a flat tuple because the two advance at *different*
-    points in a step -- the copy side before the fill is issued, the read side one stage
-    later when its fragments are consumed -- and keeping them adjacent is what makes it
-    obvious that advancing only one of the pair is the bug.
-
-    ``a_frags``/``b_frags`` hold the fragments read one stage ahead of the MFMAs that
-    take them, ``num_mini_m()`` (resp. ``num_mini_n()``) blocks of ``num_prefetch_mini()``
-    payload/scale pairs. ``acc`` is one ``MINI_BLOCK_M x MINI_BLOCK_N`` accumulator per
-    mini block, in ``mi * num_mini_n() + ni`` order: a dot writes a whole tensor, so a
-    per-mini-block MFMA needs a per-mini-block accumulator -- there is no way to write
-    back into a slice of a single ``BLOCK_M x BLOCK_N`` one.
+    Fill pointers advance after the stage's last copy. Read pointers advance after
+    its fragments are loaded, independently of the fills running ahead in the LDS
+    ring. Both start at the same base and must walk K at the same rate.
     """
 
     a_hbm_ptr: gl.tensor
@@ -838,10 +796,6 @@ class _PipelineState:
     b_scale_hbm_ptr: gl.tensor | gl.constexpr
     a_scale_read_hbm_ptr: gl.tensor | gl.constexpr
     b_scale_read_hbm_ptr: gl.tensor | gl.constexpr
-    a_frags: tl.tuple | tuple
-    b_frags: tl.tuple | tuple
-    b_frags2: tl.tuple | tuple
-    acc: tl.tuple | tuple
 
     # constexpr_function, not @gluon.jit: Triton's aggregate metaclass calls __init__
     # itself from outside kernel scope, which a JITFunction refuses, and a bare Python
@@ -857,10 +811,6 @@ class _PipelineState:
         b_scale_hbm_ptr,
         a_scale_read_hbm_ptr,
         b_scale_read_hbm_ptr,
-        a_frags,
-        b_frags,
-        b_frags2,
-        acc,
     ):
         self.a_hbm_ptr = a_hbm_ptr
         self.b_hbm_ptr = b_hbm_ptr
@@ -870,10 +820,50 @@ class _PipelineState:
         self.b_scale_hbm_ptr = _opt(b_scale_hbm_ptr)
         self.a_scale_read_hbm_ptr = _opt(a_scale_read_hbm_ptr)
         self.b_scale_read_hbm_ptr = _opt(b_scale_read_hbm_ptr)
-        self.a_frags = a_frags
-        self.b_frags = b_frags
-        self.b_frags2 = b_frags2
+
+
+@aggregate
+@strip_annotate
+class _PipelineRegFragments:
+    """Prefetched A/B payloads and scales, plus one accumulator per (ni, mi) slot.
+
+    Operand tuples are ordered by non-K mini block, then mini-K step. An unscaled
+    operand aliases its payload in the scale tuple; _block_dot ignores that slot.
+    """
+
+    a_payload: tl.tuple | tuple
+    a_scale: tl.tuple | tuple
+    b_payload: tl.tuple | tuple
+    b_scale: tl.tuple | tuple
+    acc: tl.tuple | tuple
+
+    @gluon.constexpr_function
+    def __init__(self, a_payload, a_scale, b_payload, b_scale, acc):
+        self.a_payload = a_payload
+        self.a_scale = a_scale
+        self.b_payload = b_payload
+        self.b_scale = b_scale
         self.acc = acc
+
+
+@gluon.jit
+def _take_reg_pairs(payload, scale, LO: gl.constexpr, N: gl.constexpr):
+    out = ()
+    for i in gl.static_range(N):
+        out = out + (payload[LO + i], scale[LO + i])
+    return out
+
+
+@gluon.jit
+def _make_reg_fragments(a_frags, b_frags, acc):
+    a_payload, a_scale, b_payload, b_scale = (), (), (), ()
+    for i in gl.static_range(len(a_frags) // 2):
+        a_payload = a_payload + (a_frags[2 * i],)
+        a_scale = a_scale + (a_frags[2 * i + 1],)
+    for i in gl.static_range(len(b_frags) // 2):
+        b_payload = b_payload + (b_frags[2 * i],)
+        b_scale = b_scale + (b_frags[2 * i + 1],)
+    return _PipelineRegFragments(a_payload, a_scale, b_payload, b_scale, acc)
 
 
 @gluon.constexpr_function
@@ -1192,16 +1182,11 @@ def _slot_advance(mi, ni, NM, NN, KI, KU):
 @gluon.jit
 def _slot_fills(
     pc,
+    ptrs,
     BUFFER_LOAD_INX,
     mi: gl.constexpr,
     ni: gl.constexpr,
-    a_hbm_ptr,
-    b_hbm_ptr,
-    a_scale_hbm_ptr,
-    b_scale_hbm_ptr,
-    ADVANCE: gl.constexpr = False,
     KI: gl.constexpr = 0,
-    KU: gl.constexpr = 1,
     STAGE_MARK: gl.constexpr = True,
 ):
     """The global->LDS copies slot ``(mi, ni)`` owns, committed per WAIT_COMMIT_SCHEME.
@@ -1212,17 +1197,8 @@ def _slot_fills(
     ``commit_group`` boundaries between them change -- and :func:`_slot_wait` counts
     against exactly those boundaries.
 
-    ``KI``/``KU`` are this step's index within the unrolled body and the unroll factor.
-    With ``SOFF_UNROLL`` they turn the per-step pointer bump into a per-body one: every
-    copy addresses ``base + KI * step`` through ``soffset`` and ``ADVANCE`` then moves the
-    base on by ``KU`` steps at once. With the flag off, ``KU`` is 1 and this is the
-    original one-bump-per-step form.
-
-    ``ADVANCE`` walks the returned HBM pointers on to the next ``BLOCK_K`` stage. It is
-    done here, at the last slot, rather than after the slot loop on purpose: the warp
-    pipeliner only tolerates a ``wait_group`` as the *first* op after a stage border, and
-    a stage-tail ``tt.addptr`` sitting between the last ``mem`` border and the next
-    slot's wait is exactly what breaks that.
+    ``KI`` selects the scalar offset within an unrolled body. The caller advances
+    the pointer bundle after this slot's copies; this helper only fills and commits.
     """
     func_cfg: gl.constexpr = pc.func_cfg
     NM: gl.constexpr = pc.tuning_cfg.num_mini_m()
@@ -1267,7 +1243,7 @@ def _slot_fills(
     )
     if require_constexpr(A_TILE is not None):
         pc.lds.fill_a_payload_lds(
-            BUFFER_LOAD_INX, A_TILE, a_hbm_ptr, pc.a_offs[A_TILE], A_SOFF
+            BUFFER_LOAD_INX, A_TILE, ptrs.a_hbm_ptr, pc.a_offs[A_TILE], A_SOFF
         )
         # Payload and its own scale share one commit group; a scale placed elsewhere
         # gets its own below.
@@ -1275,7 +1251,7 @@ def _slot_fills(
             pc.lds.fill_a_scale_lds(
                 BUFFER_LOAD_INX,
                 A_TILE,
-                a_scale_hbm_ptr,
+                ptrs.a_scale_hbm_ptr,
                 _opt_at(pc.a_scale_offs, A_TILE, func_cfg.a_has_scale()),
                 A_SSOFF,
             )
@@ -1285,7 +1261,7 @@ def _slot_fills(
         pc.lds.fill_a_scale_lds(
             BUFFER_LOAD_INX,
             A_SC,
-            a_scale_hbm_ptr,
+            ptrs.a_scale_hbm_ptr,
             _opt_at(pc.a_scale_offs, A_SC, func_cfg.a_has_scale()),
             A_SSOFF,
         )
@@ -1293,13 +1269,13 @@ def _slot_fills(
             pc.lds.commit_fill_lds()
     if require_constexpr(B_TILE is not None):
         pc.lds.fill_b_payload_lds(
-            BUFFER_LOAD_INX, B_TILE, b_hbm_ptr, pc.b_offs[B_TILE], B_SOFF
+            BUFFER_LOAD_INX, B_TILE, ptrs.b_hbm_ptr, pc.b_offs[B_TILE], B_SOFF
         )
         if require_constexpr(B_SC == B_TILE):
             pc.lds.fill_b_scale_lds(
                 BUFFER_LOAD_INX,
                 B_TILE,
-                b_scale_hbm_ptr,
+                ptrs.b_scale_hbm_ptr,
                 _opt_at(pc.b_scale_offs, B_TILE, func_cfg.b_has_scale()),
                 B_SSOFF,
             )
@@ -1309,7 +1285,7 @@ def _slot_fills(
         pc.lds.fill_b_scale_lds(
             BUFFER_LOAD_INX,
             B_SC,
-            b_scale_hbm_ptr,
+            ptrs.b_scale_hbm_ptr,
             _opt_at(pc.b_scale_offs, B_SC, func_cfg.b_has_scale()),
             B_SSOFF,
         )
@@ -1318,8 +1294,9 @@ def _slot_fills(
     if require_constexpr(MARK_SLOT):
         # One group for everything this mini block just issued.
         pc.lds.commit_fill_lds()
-    if require_constexpr(MARK_STAGE and STAGE_MARK
-                         and _slot_index(mi, ni, NM, NN) == NM * NN - 1):
+    if require_constexpr(
+        MARK_STAGE and STAGE_MARK and _slot_index(mi, ni, NM, NN) == NM * NN - 1
+    ):
         # One group for the whole block, committed at the last slot.
         #
         # ``STAGE_MARK=False`` lets _pipeline_step_impl close the group after its walk
@@ -1331,16 +1308,44 @@ def _slot_fills(
         # barriers that follow stop meaning anything -- a WAR race that shows up as
         # nondeterministic output in 7 runs out of 8, with the barrier count unchanged.
         pc.lds.commit_fill_lds()
-    if require_constexpr(ADVANCE):
-        # KU is 1 unless SOFF_UNROLL folded the body's steps into soffset, in which
-        # case one bump at the last step of the body covers all of them.
-        a_hbm_ptr = a_hbm_ptr + KU * pc.a_step
-        b_hbm_ptr = b_hbm_ptr + KU * pc.b_step
-        if require_constexpr(func_cfg.a_has_scale()):
-            a_scale_hbm_ptr = a_scale_hbm_ptr + KU * pc.s_step * pc.a_scale_stride_k
-        if require_constexpr(func_cfg.b_has_scale()):
-            b_scale_hbm_ptr = b_scale_hbm_ptr + KU * pc.s_step * pc.b_scale_stride_k
-    return a_hbm_ptr, b_hbm_ptr, a_scale_hbm_ptr, b_scale_hbm_ptr
+
+
+@gluon.jit
+def _advance_fill_pointers(pc, ptrs, STEPS: gl.constexpr = 1):
+    a_hbm_ptr = ptrs.a_hbm_ptr + STEPS * pc.a_step
+    b_hbm_ptr = ptrs.b_hbm_ptr + STEPS * pc.b_step
+    a_scale_hbm_ptr = ptrs.a_scale_hbm_ptr
+    b_scale_hbm_ptr = ptrs.b_scale_hbm_ptr
+    if require_constexpr(pc.func_cfg.a_has_scale()):
+        a_scale_hbm_ptr = a_scale_hbm_ptr + STEPS * pc.s_step * pc.a_scale_stride_k
+    if require_constexpr(pc.func_cfg.b_has_scale()):
+        b_scale_hbm_ptr = b_scale_hbm_ptr + STEPS * pc.s_step * pc.b_scale_stride_k
+    return _PipelinePointers(
+        a_hbm_ptr,
+        b_hbm_ptr,
+        a_scale_hbm_ptr,
+        b_scale_hbm_ptr,
+        ptrs.a_scale_read_hbm_ptr,
+        ptrs.b_scale_read_hbm_ptr,
+    )
+
+
+@gluon.jit
+def _advance_read_pointers(pc, ptrs):
+    a_scale_read_hbm_ptr = ptrs.a_scale_read_hbm_ptr
+    b_scale_read_hbm_ptr = ptrs.b_scale_read_hbm_ptr
+    if require_constexpr(pc.func_cfg.a_has_scale()):
+        a_scale_read_hbm_ptr = a_scale_read_hbm_ptr + pc.s_step * pc.a_scale_stride_k
+    if require_constexpr(pc.func_cfg.b_has_scale()):
+        b_scale_read_hbm_ptr = b_scale_read_hbm_ptr + pc.s_step * pc.b_scale_stride_k
+    return _PipelinePointers(
+        ptrs.a_hbm_ptr,
+        ptrs.b_hbm_ptr,
+        ptrs.a_scale_hbm_ptr,
+        ptrs.b_scale_hbm_ptr,
+        a_scale_read_hbm_ptr,
+        b_scale_read_hbm_ptr,
+    )
 
 
 @gluon.jit
@@ -1368,22 +1373,6 @@ def _slot_a_read(
 
 
 @gluon.jit
-def _b_rotate(carried, fresh, TWO_STAGE: gl.constexpr):
-    """The set the *next* step consumes.
-
-    With B in LDS the read is already NUM_LDS_BUFFER stages ahead of its use, so the
-    set read this step is next step's. With B in registers there is no LDS to buffer it,
-    so the distance is carried explicitly: this step's read is parked for one step and
-    the one parked last step is promoted -- two K-stages of cover, matching FlyDSL's
-    kStages = 2. Payload and scale sit in the same tuple and are read together, so they
-    cannot drift apart.
-    """
-    if require_constexpr(TWO_STAGE):
-        return carried
-    return fresh
-
-
-@gluon.jit
 def _slot_b_read(
     pc,
     DS_READ_INX,
@@ -1401,10 +1390,6 @@ def _slot_b_read(
         _opt_at(pc.b_scale_offs, ni, pc.func_cfg.b_has_scale()),
         pc.func_cfg,
         pc.tuning_cfg,
-        # B_IN_REG is unsupported for now (see the static_assert in _moe_gemm_body), so
-        # the register-path base pointer is gone and this stays None.
-        None,
-        _opt_at(pc.b_frag_offs, ni, pc.tuning_cfg.B_IN_REG),
         RELAXED,
         READ_PAYLOAD,
         READ_SCALE,
@@ -1516,7 +1501,8 @@ def _slot_tails(
 @gluon.jit
 def _pipeline_step(
     pc,
-    st,
+    ptrs,
+    regs,
     BUFFER_LOAD_INX,
     DS_READ_INX,
     STAGES_BETWEEN: gl.constexpr,
@@ -1530,14 +1516,15 @@ def _pipeline_step(
 ):
     """Pick the live implementation or the frozen 2026-09-01 snapshot.
 
-    ``_pipeline_step_impl`` is the one to edit; ``_pipeline_step_frozen`` is a verbatim
-    copy of it from the best measured kernel. ``FROZEN_STEP=1`` runs the snapshot, so a
+    ``_pipeline_step_impl`` is the one to edit; ``_pipeline_step_frozen`` preserves
+    the best measured schedule. ``FROZEN_STEP=1`` runs the snapshot, so a
     refactor can be compared against the known-good schedule without a checkout.
     """
     if require_constexpr(pc.tuning_cfg.FROZEN_STEP):
         out = _pipeline_step_frozen(
             pc,
-            st,
+            ptrs,
+            regs,
             BUFFER_LOAD_INX,
             DS_READ_INX,
             STAGES_BETWEEN,
@@ -1552,7 +1539,8 @@ def _pipeline_step(
     else:
         out = _pipeline_step_impl(
             pc,
-            st,
+            ptrs,
+            regs,
             BUFFER_LOAD_INX,
             DS_READ_INX,
             STAGES_BETWEEN,
@@ -1570,7 +1558,8 @@ def _pipeline_step(
 @gluon.jit
 def _pipeline_step_impl(
     pc,
-    st,
+    ptrs,
+    regs,
     BUFFER_LOAD_INX,
     DS_READ_INX,
     STAGES_BETWEEN: gl.constexpr,
@@ -1589,8 +1578,6 @@ def _pipeline_step_impl(
     NUM_MINI: gl.constexpr = tc.num_mini_k()
     PF_MINI: gl.constexpr = tc.num_prefetch_mini()
     HEAD_MINI: gl.constexpr = NUM_MINI - PF_MINI
-    A_HAS: gl.constexpr = func_cfg.a_has_scale()
-    B_HAS: gl.constexpr = func_cfg.b_has_scale()
     gl.static_assert(
         HEAD_MINI == 0,
         "the K-loop step needs VGPR_PREFETCH_K == BLOCK_K (HEAD_MINI == 0): a split "
@@ -1615,13 +1602,6 @@ def _pipeline_step_impl(
 
     KIE: gl.constexpr = KI if tc.SOFF_UNROLL else 0
     KUE: gl.constexpr = KU if tc.SOFF_UNROLL else 1
-
-    a_hbm_ptr = st.a_hbm_ptr
-    b_hbm_ptr = st.b_hbm_ptr
-    a_scale_hbm_ptr = st.a_scale_hbm_ptr
-    b_scale_hbm_ptr = st.b_scale_hbm_ptr
-    a_scale_read_hbm_ptr = st.a_scale_read_hbm_ptr
-    b_scale_read_hbm_ptr = st.b_scale_read_hbm_ptr
 
     a_cur = ()
     b_cur = ()
@@ -1661,9 +1641,21 @@ def _pipeline_step_impl(
                     tc.SCALE_FILL_MID,
                 )
 
+            if require_constexpr(
+                DO_DS_READ and not DO_MFMA and _slot_index(mi, ni, NM, NN) == 0
+            ):
+                # Bound prologue instruction scheduling to avoid spilling its scalar
+                # temporaries across the prefetch. The existing wait and shared-memory
+                # barrier provide synchronization; this adds no hardware rendezvous.
+                gl.amd.cdna4.sched_barrier(0)
+
             if require_constexpr(DO_MFMA):
-                dot_a = _take_pairs(st.a_frags, mi * PF_MINI, PF_MINI)
-                dot_b = _take_pairs(st.b_frags, ni * PF_MINI, PF_MINI)
+                dot_a = _take_reg_pairs(
+                    regs.a_payload, regs.a_scale, mi * PF_MINI, PF_MINI
+                )
+                dot_b = _take_reg_pairs(
+                    regs.b_payload, regs.b_scale, ni * PF_MINI, PF_MINI
+                )
             else:
                 dot_a = ()
                 dot_b = ()
@@ -1674,34 +1666,26 @@ def _pipeline_step_impl(
                     DS_READ_INX,
                     mi,
                     ni,
-                    a_scale_read_hbm_ptr,
-                    b_scale_read_hbm_ptr,
+                    ptrs.a_scale_read_hbm_ptr,
+                    ptrs.b_scale_read_hbm_ptr,
                     DO_DS_READ and not READ_A_IN_MFMA,
                     DO_DS_READ and not READ_B_IN_MFMA,
                     DO_DS_READ and not READ_A_SCALE_IN_MFMA,
                     DO_DS_READ and not READ_B_SCALE_IN_MFMA,
                 )
                 if require_constexpr(DO_BUFFER_LOAD):
-                    (
-                        a_hbm_ptr,
-                        b_hbm_ptr,
-                        a_scale_hbm_ptr,
-                        b_scale_hbm_ptr,
-                    ) = _slot_fills(
+                    _slot_fills(
                         pc,
+                        ptrs,
                         BUFFER_LOAD_INX,
                         mi,
                         ni,
-                        a_hbm_ptr,
-                        b_hbm_ptr,
-                        a_scale_hbm_ptr,
-                        b_scale_hbm_ptr,
-                        ADVANCE=_slot_advance(mi, ni, NM, NN, KIE, KUE),
                         KI=KIE,
-                        KU=KUE,
-                        # the step closes the stage group itself, after the walk
                         STAGE_MARK=False,
                     )
+                    if require_constexpr(_slot_advance(mi, ni, NM, NN, KIE, KUE)):
+                        # Keep pointer updates inside this region, ahead of its border.
+                        ptrs = _advance_fill_pointers(pc, ptrs, KUE)
                     if require_constexpr(
                         PIPE and tc.commit_per_stage() and mi == NM - 1 and ni == NN - 1
                     ):
@@ -1712,7 +1696,7 @@ def _pipeline_step_impl(
                 slot_acc = _maybe_block_dot(
                     dot_a,
                     dot_b,
-                    st.acc[_slot_index(mi, ni, NM, NN)],
+                    regs.acc[_slot_index(mi, ni, NM, NN)],
                     PF_MINI,
                     func_cfg,
                     tc,
@@ -1723,8 +1707,8 @@ def _pipeline_step_impl(
                     DS_READ_INX,
                     mi,
                     ni,
-                    a_scale_read_hbm_ptr,
-                    b_scale_read_hbm_ptr,
+                    ptrs.a_scale_read_hbm_ptr,
+                    ptrs.b_scale_read_hbm_ptr,
                     DO_DS_READ and READ_A_IN_MFMA,
                     DO_DS_READ and READ_B_IN_MFMA,
                     DO_DS_READ and READ_A_SCALE_IN_MFMA,
@@ -1743,34 +1727,16 @@ def _pipeline_step_impl(
         pc.lds.commit_fill_lds()
 
     if require_constexpr(DO_DS_READ):
-        if require_constexpr(A_HAS):
-            a_scale_read_hbm_ptr = (
-                a_scale_read_hbm_ptr + pc.s_step * pc.a_scale_stride_k
-            )
-        if require_constexpr(B_HAS):
-            b_scale_read_hbm_ptr = (
-                b_scale_read_hbm_ptr + pc.s_step * pc.b_scale_stride_k
-            )
+        ptrs = _advance_read_pointers(pc, ptrs)
     else:
-        a_tail = st.a_frags
-        b_tail = st.b_frags
+        a_tail = _take_reg_pairs(regs.a_payload, regs.a_scale, 0, NM * PF_MINI)
+        b_tail = _take_reg_pairs(regs.b_payload, regs.b_scale, 0, NN * PF_MINI)
 
-    return _PipelineState(
-        a_hbm_ptr,
-        b_hbm_ptr,
-        a_scale_hbm_ptr,
-        b_scale_hbm_ptr,
-        a_scale_read_hbm_ptr,
-        b_scale_read_hbm_ptr,
-        a_tail,
-        _b_rotate(st.b_frags2, b_tail, pc.tuning_cfg.B_IN_REG),
-        b_tail,
-        acc,
-    )
+    return ptrs, _make_reg_fragments(a_tail, b_tail, acc)
 
 
 @gluon.jit
-def _drain_last_fused(pc, st, bias_tiles, x_static_scale, func_cfg, tuning_cfg):
+def _drain_last_fused(pc, regs, bias_tiles, x_static_scale, func_cfg, tuning_cfg):
     """The final drain step, with the gate half's activation folded into it.
 
     That step reads nothing, fills nothing and waits on nothing -- it only retires the
@@ -1798,9 +1764,9 @@ def _drain_last_fused(pc, st, bias_tiles, x_static_scale, func_cfg, tuning_cfg):
     for ni in gl.static_range(NN):
         for mi in gl.static_range(NM):
             slot_acc = _maybe_block_dot(
-                _take_pairs(st.a_frags, mi * PF_MINI, PF_MINI),
-                _take_pairs(st.b_frags, ni * PF_MINI, PF_MINI),
-                st.acc[_slot_index(mi, ni, NM, NN)],
+                _take_reg_pairs(regs.a_payload, regs.a_scale, mi * PF_MINI, PF_MINI),
+                _take_reg_pairs(regs.b_payload, regs.b_scale, ni * PF_MINI, PF_MINI),
+                regs.acc[_slot_index(mi, ni, NM, NN)],
                 PF_MINI,
                 func_cfg,
                 tc,
@@ -2599,13 +2565,6 @@ def _moe_gemm_body(
     else:
         ws_ptr: gl.constexpr = None
 
-    # The register-resident-B path was stripped along with b_read_hbm_ptr; it needs
-    # reinstating before B_IN_REG can be used again.
-    gl.static_assert(
-        not tuning_cfg.B_IN_REG,
-        "B_IN_REG is unsupported: the register-path B pointer was removed",
-    )
-
     KB: gl.constexpr = cfg.K // func_cfg.b_pack_divisor()
     b_offs = ()
     for ni in gl.static_range(NN):
@@ -2629,42 +2588,6 @@ def _moe_gemm_body(
                 * b.stride_n,
             )
 
-    if require_constexpr(tuning_cfg.B_IN_REG and tuning_cfg.B_PRESHUFFLED):
-        # Same 16-column-blocked addressing as the copy above, but issued at the MFMA
-        # operand layout: lane L of a wave takes bytes [16L, 16L+16) of a 1024 B run, so
-        # the warp's whole fetch is one contiguous block. On the plain (E, K/2, N)
-        # layout the same fragment layout puts consecutive lanes stride(-2) apart, and
-        # the 64 lanes touch 64 separate lines; measured 2.8x the L1 accesses and 42%
-        # slower.
-        fl_b: gl.constexpr = tuning_cfg.dot_operand_fragment_layout(1)
-        b_frag_offs = ()
-        for ni in gl.static_range(NN):
-            b_frag_offs = b_frag_offs + (
-                _blocked_b_offsets(
-                    fl_b,
-                    PK_B,
-                    _n_start(pid_n, ni, cfg.N, func_cfg, tuning_cfg),
-                    MBN,
-                    KB,
-                ),
-            )
-    elif require_constexpr(tuning_cfg.B_IN_REG):
-        # Same addressing as b_offs, but at the MFMA operand layout instead of the
-        # copy layout: the load lands directly in the registers the dot consumes.
-        fl_b: gl.constexpr = tuning_cfg.dot_operand_fragment_layout(1)
-        b_frag_offs = ()
-        for ni in gl.static_range(NN):
-            b_frag_offs = b_frag_offs + (
-                gl.arange(0, PK_B, layout=gl.SliceLayout(1, fl_b))[:, None] * b.stride_k
-                + (
-                    _n_start(pid_n, ni, cfg.N, func_cfg, tuning_cfg)
-                    + gl.arange(0, MBN, layout=gl.SliceLayout(0, fl_b))
-                )[None, :]
-                * b.stride_n,
-            )
-    else:
-        b_frag_offs: gl.constexpr = None
-
     a_scale_offs = _a_scale_offsets(
         a, rt, block_id, M_e, start_m, pid_m, cfg.K, func_cfg, tuning_cfg
     )
@@ -2679,13 +2602,7 @@ def _moe_gemm_body(
     b_step: gl.constexpr = PK_B // 16 * 256 if tuning_cfg.B_PRESHUFFLED else PK_B
     s_step: gl.constexpr = SK
 
-    a_hbm_ptr = a.ptr
-    b_hbm_ptr = w_ptr
-    a_scale_hbm_ptr = as_ptr
-    b_scale_hbm_ptr = ws_ptr
-
-    A_HAS: gl.constexpr = func_cfg.a_has_scale()
-    B_HAS: gl.constexpr = func_cfg.b_has_scale()
+    ptrs = _PipelinePointers(a.ptr, w_ptr, as_ptr, ws_ptr, as_ptr, ws_ptr)
     # Commit groups per stage, at whatever granularity WAIT_COMMIT_SCHEME emits them.
     # The prologue wait below counts in these, so it has to move with the scheme: with
     # a per-stage commit the stream is one group per buffer, and (NB-2) * (NM+NN) would
@@ -2713,7 +2630,6 @@ def _moe_gemm_body(
         lds,
         a_offs,
         b_offs,
-        b_frag_offs,
         a_scale_offs,
         b_scale_offs,
         a_scale_stride_k,
@@ -2743,55 +2659,39 @@ def _moe_gemm_body(
     for i in gl.static_range(NB - 1):
         for ni in gl.static_range(NN):
             for mi in gl.static_range(NM):
-                a_hbm_ptr, b_hbm_ptr, a_scale_hbm_ptr, b_scale_hbm_ptr = _slot_fills(
+                _slot_fills(
                     pc,
+                    ptrs,
                     i,
                     mi,
                     ni,
-                    a_hbm_ptr,
-                    b_hbm_ptr,
-                    a_scale_hbm_ptr,
-                    b_scale_hbm_ptr,
-                    ADVANCE=(mi == NM - 1) and (ni == NN - 1),
                 )
-
-    # Read-side scale pointers. These exist separately from the fill-side ones because
-    # the register fallback (scale tile too small for a coalesced direct-to-LDS write)
-    # reads the scale at *consume* time, NUM_LDS_BUFFER stages behind the fill;
-    # advancing only one of the two silently re-reads the first K tile's scales for the
-    # whole loop, which no compile-time check catches. Both start at the same base and
-    # walk K at the same rate, just from different points in the pipeline.
-    a_scale_read_hbm_ptr = as_ptr
-    b_scale_read_hbm_ptr = ws_ptr
+                if require_constexpr(mi == NM - 1 and ni == NN - 1):
+                    ptrs = _advance_fill_pointers(pc, ptrs)
 
     # Prologue read: stage 0, whose MFMA window has nothing before it, so only its head
     # is dotted here. Its tail seeds the carried fragments the first loop step consumes.
     # It reads every mini block of buffer 0, so it waits out that buffer's whole group
     # set -- the NB-2 buffers behind it stay in flight, the last one not yet issued.
-    lds.wait_fill_lds_num_group((NB - 2) * G)
-    if require_constexpr(tuning_cfg.MANUAL_PP):
-        gl.amd.cdna4.sched_barrier(0)
-        # The prologue fills are cooperative -- every wave writes a slice and then
-        # reads the whole tile -- so the wait (a per-wave vmcnt retire) is not enough
-        # on its own. Membar used to supply this barrier via its after-async_wait
-        # rule; with the async-wait rule off it is ours to place.
-        gl.barrier()
-        gl.amd.cdna4.sched_barrier(0)
+    if require_constexpr(tuning_cfg.FROZEN_STEP or not tuning_cfg.commit_per_stage()):
+        lds.wait_fill_lds_num_group((NB - 2) * G)
+    if require_constexpr(tuning_cfg.FROZEN_STEP):
+        _frozen_prologue_fence()
+    # PER_STAGE waits for buffer 0 in the first slot below, before any reads or
+    # fills. It needs no duplicate outer wait. Other schemes retain the whole-buffer
+    # prologue wait; only the snapshot retains the earlier explicit fence.
     # The prologue's own step: it fills the buffer held back above and issues the first
     # ds_read, but has nothing carried in to dot yet -- which is exactly a pipeline step
     # with the MFMAs switched off. Reusing _pipeline_step keeps the fill/read/wait
-    # interleave, the commit-group order and the MANUAL_PP fences in one place instead of
+    # interleave and the commit-group order in one place instead of
     # a second hand-rolled copy that has to be kept in step with it.
     #
     # Holding the last fill back is what makes that possible: this step reads one buffer
     # while filling one, with NB-2 whole stages in between -- the same STAGES_BETWEEN the
     # loop runs at, so the slot waits it computes are the steady-state ones.
     #
-    # The split-stage / register-resident-B variant of this prologue was removed; the
-    # single MFMA-less step below is the only form. It needs HEAD_MINI == 0, because a
-    # split stage would have to dot the head of stage 0 here, and it needs B_IN_REG off,
-    # because that wants *two* register stages seeded before the first step consumes one
-    # and a single step produces one. Both are asserted rather than branched on.
+    # This single MFMA-less step seeds the register fragments. A split stage would
+    # need to dot its head here, so HEAD_MINI must be zero.
     gl.static_assert(
         HEAD_MINI == 0,
         "split-stage prologue (VGPR_PREFETCH_K < BLOCK_K) is unsupported",
@@ -2806,20 +2706,10 @@ def _moe_gemm_body(
                     layout=tuning_cfg.dot_result_fragment_layout(),
                 ),
             )
-    st = _pipeline_step(
+    ptrs, regs = _pipeline_step(
         pc,
-        _PipelineState(
-            a_hbm_ptr,
-            b_hbm_ptr,
-            a_scale_hbm_ptr,
-            b_scale_hbm_ptr,
-            a_scale_read_hbm_ptr,
-            b_scale_read_hbm_ptr,
-            (),
-            (),
-            (),
-            acc0,
-        ),
+        ptrs,
+        _PipelineRegFragments((), (), (), (), acc0),
         NB - 1,
         0,
         STAGES_BETWEEN,
@@ -2833,7 +2723,7 @@ def _moe_gemm_body(
         # First step peeled out. Its MFMAs are the ones that consume the accumulator
         # while it is still visibly gl.zeros -- inside the loop that is a phi and the
         # zero is invisible.
-        st = _pipeline_step(pc, st, 0, 1 % NB, STAGES_BETWEEN, True, True)
+        ptrs, regs = _pipeline_step(pc, ptrs, regs, 0, 1 % NB, STAGES_BETWEEN, True, True)
 
         # steady state over the remaining MAIN-1 steps, body unrolled K_UNROLL times.
         #
@@ -2856,9 +2746,10 @@ def _moe_gemm_body(
                 else:
                     buffer_load_step = (_k + i + 1) % NB
                     ds_read_step = (_k + i + 2) % NB
-                st = _pipeline_step(
+                ptrs, regs = _pipeline_step(
                     pc,
-                    st,
+                    ptrs,
+                    regs,
                     buffer_load_step,
                     ds_read_step,
                     STAGES_BETWEEN,
@@ -2871,8 +2762,8 @@ def _moe_gemm_body(
 
         # remainder (0 .. K_UNROLL-1 steps); NUM_K is constexpr so this stays static
         for j in gl.static_range(1 + UNROLLED, MAIN):
-            st = _pipeline_step(
-                pc, st, j % NB, (j + 1) % NB, STAGES_BETWEEN, True, True
+            ptrs, regs = _pipeline_step(
+                pc, ptrs, regs, j % NB, (j + 1) % NB, STAGES_BETWEEN, True, True
             )
 
     if require_constexpr(func_cfg.has_bias):
@@ -2966,9 +2857,10 @@ def _moe_gemm_body(
     )
     DRAIN: gl.constexpr = NB - 1 if FUSE else NB
     for i in gl.static_range(DRAIN):
-        st = _pipeline_step(
+        ptrs, regs = _pipeline_step(
             pc,
-            st,
+            ptrs,
+            regs,
             0,
             (MAIN + i + 1) % NB,
             NB - 2 - i,
@@ -3000,14 +2892,14 @@ def _moe_gemm_body(
     if require_constexpr(FUSE):
         acc = _drain_last_fused(
             pc,
-            st,
+            regs,
             _epi_bias_tiles(bias_smem, bias_base, pid_n, cfg.N, func_cfg, tuning_cfg),
             x_static_scale,
             func_cfg,
             tuning_cfg,
         )
     else:
-        acc = st.acc
+        acc = regs.acc
 
     y_ptr = res.ptr + start_m.to(gl.int64) * res.stride_m
     if require_constexpr(func_cfg.output_quant is not None):
@@ -3265,4 +3157,4 @@ def _moe_gluon_gemm2(
 # step and calls back into the shared halves of the kernel, so it can only be bound once
 # everything it names exists. ``_pipeline_step`` looks the name up at compile time, which
 # is well after this line has run.
-from ._frozen import _pipeline_step_frozen  # noqa: E402
+from ._frozen import _frozen_prologue_fence, _pipeline_step_frozen  # noqa: E402

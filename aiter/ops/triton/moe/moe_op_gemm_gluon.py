@@ -484,7 +484,6 @@ def get_gluon_config_uncached(
             "A_SCALE_SORTED_SHUFFLED": False,
             "B_SCALE_SHUFFLED": False,
             "B_PRESHUFFLED": False,
-            "B_IN_REG": bool(_env_int("AITER_TRITON_MOE_GLUON_B_IN_REG", 0)),
             "ACT_FAST_RCP": bool(
                 _env_int("AITER_TRITON_MOE_GLUON_ACT_FAST_RCP", 0)
             ),
@@ -502,7 +501,6 @@ def get_gluon_config_uncached(
             "SCHED_MODE": _env_int(
                 "AITER_TRITON_MOE_GLUON_SCHED_MODE", int(SchedMode.NONE)
             ),
-            "MANUAL_PP": bool(_env_int("AITER_TRITON_MOE_GLUON_MANUAL_PP", 0)),
             "FROZEN_STEP": bool(_env_int("AITER_TRITON_MOE_GLUON_FROZEN_STEP", 0)),
             "SOFF_UNROLL": bool(_env_int("AITER_TRITON_MOE_GLUON_SOFF_UNROLL", 0)),
             "SCALE_FILL_MID": bool(
@@ -899,10 +897,9 @@ def _preshuffled_b(w, cfg, N, K, dq_b):
     ``utils/shuffle.py::shuffle_weight(w, (16, 16))`` applies, and the same one FlyDSL's
     port requires of its caller.
 
-    Used by both B paths. With ``B_IN_REG`` the fragment load reads it straight out of
-    global; through LDS, ``byte_unit_lds_layout`` gives the shared tile the matching
-    permutation, so the direct-to-LDS copy stays one linear run and the unit drops from
-    32 rows to 16 and loses its padding.
+    ``byte_unit_lds_layout`` gives the shared tile the matching permutation, so the
+    direct-to-LDS copy stays one linear run and the unit drops from 32 rows to 16 and
+    loses its padding.
     """
     if w is None or w.ndim != 3:
         return None
