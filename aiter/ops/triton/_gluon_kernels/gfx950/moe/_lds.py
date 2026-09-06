@@ -368,6 +368,8 @@ class LDSManager:
         a_scale_ptr,
         a_scale_offs,
         RELAXED: gl.constexpr = False,
+        READ_PAYLOAD: gl.constexpr = True,
+        READ_SCALE: gl.constexpr = True,
     ):
         """One operand-A fragment (plus its scale): mini-M block ``mi``, mini-K ``mini_idx``.
 
@@ -377,7 +379,9 @@ class LDSManager:
         at this mini-M block and this mini-K step.
         """
         cfg: gl.constexpr = self.tuning_cfg
-        if require_constexpr(_CONST_AB):
+        if require_constexpr(not READ_PAYLOAD):
+            a_val: gl.constexpr = None
+        elif require_constexpr(_CONST_AB):
             a_val = gl.full(
                 cfg.lds_shape(0),
                 1,
@@ -398,7 +402,7 @@ class LDSManager:
                 cfg.dot_operand_fragment_layout(0),
                 RELAXED,
             )
-        if require_constexpr(self.func_cfg.has_scale(0)):
+        if require_constexpr(READ_SCALE and self.func_cfg.has_scale(0)):
             if require_constexpr(_CONST_SCALE):
                 a_scale_val = gl.full(
                     cfg.scale_shape(0),
@@ -471,9 +475,13 @@ class LDSManager:
         b_ptr=None,
         b_frag_offs=None,
         RELAXED: gl.constexpr = False,
+        READ_PAYLOAD: gl.constexpr = True,
+        READ_SCALE: gl.constexpr = True,
     ):
         cfg: gl.constexpr = self.tuning_cfg
-        if require_constexpr(_CONST_AB):
+        if require_constexpr(not READ_PAYLOAD):
+            b_val: gl.constexpr = None
+        elif require_constexpr(_CONST_AB):
             b_val = gl.full(
                 cfg.lds_shape(1),
                 1,
@@ -502,7 +510,7 @@ class LDSManager:
                 cfg.dot_operand_fragment_layout(1),
                 RELAXED,
             )
-        if require_constexpr(self.func_cfg.has_scale(1)):
+        if require_constexpr(READ_SCALE and self.func_cfg.has_scale(1)):
             if require_constexpr(_CONST_SCALE):
                 b_scale_val = gl.full(
                     cfg.scale_shape(1),

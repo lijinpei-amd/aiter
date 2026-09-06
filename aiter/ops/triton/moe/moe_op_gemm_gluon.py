@@ -35,13 +35,16 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._config import (
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     ActivationSpec,
     ActKind,
+    DSReadOperand,
     DtypeQuant,
+    EpilogueMode,
     FuncSpec,
     QuantExpertTensor,
     QuantTokenTensor,
     ResultTensor,
     RoutingMeta,
     ScaleSwizzle,
+    SchedMode,
     TileSched,
     TuningSpec,
     WaitCommitScheme,
@@ -136,6 +139,31 @@ def _env_int(name: str, default: int) -> int:
 def _env_mod(name: str, default: str) -> str:
     """Cache-modifier override, for A/B-testing L1/L2 policy without editing source."""
     return os.environ.get("AITER_TRITON_MOE_GLUON_" + name, default)
+
+
+def _ds_read_in_mfma_from_env() -> int:
+    """Translate the old whole-operand controls into the component mask.
+
+    An explicit mask takes precedence. Legacy DS_MOVE moved A (payload and scale)
+    at 1, both operands at 2; DS_IN_MFMA moved both regardless of DS_MOVE.
+    """
+    mask = os.environ.get("AITER_TRITON_MOE_GLUON_DS_READ_IN_MFMA")
+    if mask is not None:
+        return int(mask)
+    if _env_int("AITER_TRITON_MOE_GLUON_DS_IN_MFMA", 0):
+        return int(DSReadOperand.ALL)
+    move = _env_int("AITER_TRITON_MOE_GLUON_DS_MOVE", 0)
+    if move >= 2:
+        return int(DSReadOperand.ALL)
+    if move >= 1:
+        return int(DSReadOperand.A | DSReadOperand.A_SCALE)
+    return int(DSReadOperand.NONE)
+
+
+def _resolve_epilogue(epilogue: EpilogueMode | int | None) -> int:
+    if epilogue is None:
+        epilogue = _env_int("AITER_TRITON_MOE_GLUON_NO_EPI", int(EpilogueMode.DEFAULT))
+    return int(EpilogueMode(epilogue))
 
 
 @cache
@@ -470,6 +498,16 @@ def get_gluon_config_uncached(
                 "AITER_TRITON_MOE_GLUON_WAIT_COMMIT_SCHEME",
                 int(WaitCommitScheme.PER_FILL),
             ),
+            "DS_READ_IN_MFMA": _ds_read_in_mfma_from_env(),
+            "SCHED_MODE": _env_int(
+                "AITER_TRITON_MOE_GLUON_SCHED_MODE", int(SchedMode.NONE)
+            ),
+            "MANUAL_PP": bool(_env_int("AITER_TRITON_MOE_GLUON_MANUAL_PP", 0)),
+            "FROZEN_STEP": bool(_env_int("AITER_TRITON_MOE_GLUON_FROZEN_STEP", 0)),
+            "SOFF_UNROLL": bool(_env_int("AITER_TRITON_MOE_GLUON_SOFF_UNROLL", 0)),
+            "SCALE_FILL_MID": bool(
+                _env_int("AITER_TRITON_MOE_GLUON_SCALE_FILL_MID", 0)
+            ),
             # Read stage N's fragments one stage before their MFMA consumes them. Costs
             # one BLOCK_K tile of live registers and one stage of global prefetch depth
             # (the fill is waited on at stage s+NB-1 rather than s+NB), so it wants
@@ -650,6 +688,7 @@ def _launch_spec(
     out_quant,
     config_items,
     gate_up_split=False,
+    epilogue=int(EpilogueMode.DEFAULT),
 ):
     """Host-side constexpr work, memoised.
 
@@ -677,8 +716,9 @@ def _launch_spec(
         has_gather,
         has_x_static_scale,
         gate_up_split,
+        epilogue,
     )
-    tuning_spec = TuningSpec(*(_hashable(c[k]) for k in _TUNING_KEYS))
+    tuning_spec = TuningSpec(*(_hashable(v) for v in _tuning_args(c)))
     # Construct the tuning config on the host off exactly the numbers the kernel will
     # use, so the grid math and the tile math cannot drift.
     func_cfg_host = KernelFuncConfig(*func_spec)
@@ -1062,6 +1102,7 @@ def moe_gemm_gluon(
     y_scales: torch.Tensor | None = None,
     config: dict | None = None,
     gate_up_split: bool | None = None,
+    epilogue: EpilogueMode | int | None = None,
 ):
     """Launch the Gluon grouped GEMM into ``y`` (shape ``(1, M, N // ARN)``).
 
@@ -1081,12 +1122,16 @@ def moe_gemm_gluon(
     ``moe_gemm.py`` module docstring for why the split form is faster. ``None`` takes
     the ``AITER_TRITON_MOE_GLUON_GU_SPLIT`` default. Inert without ``apply_swiglu``.
 
+    ``epilogue`` selects normal arithmetic or the shape-preserving NOP modes in
+    :class:`EpilogueMode`. ``None`` accepts the legacy ``NO_EPI`` environment setting.
+
     Returns the compiled kernel handle so callers (the ISA-assertion test) can inspect
     ``.asm``; the result itself is written into ``y`` / ``y_scales``.
     """
     if gate_up_split is None:
         gate_up_split = bool(_env_int("AITER_TRITON_MOE_GLUON_GU_SPLIT", 0))
     gate_up_split = bool(gate_up_split) and apply_swiglu
+    epilogue = _resolve_epilogue(epilogue)
     block_m = routing_data.block_m
     expt_data = routing_data.expt_data
     grid_m = routing_data.n_blocks(y.shape[1], block_m)
@@ -1124,6 +1169,7 @@ def moe_gemm_gluon(
             out_quant,
             cfg_items,
             gate_up_split,
+            epilogue,
         )
 
     grid_n, kcfg, num_warps, waves_per_eu, _cfg, _tc = _spec(
@@ -1405,6 +1451,7 @@ def moe_gemm1_a4w4_mxfp4_out(
     swiglu_add_residual: bool = False,
     config: dict | None = None,
     gate_up_split: bool | None = None,
+    epilogue: EpilogueMode | int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """gemm1 with the activation **and** the MXFP4 output quant fused into the epilogue.
 
@@ -1470,44 +1517,16 @@ def moe_gemm1_a4w4_mxfp4_out(
         y_scales=y_scales,
         config=config,
         gate_up_split=gate_up_split,
+        epilogue=epilogue,
     )
     return y[0], y_scales
 
 
-_TUNING_KEYS = (
-    "BLOCK_M",
-    "BLOCK_N",
-    "BLOCK_K",
-    "K_UNROLL",
-    "MINI_BLOCK_K",
-    "MINI_BLOCK_M",
-    "MINI_BLOCK_N",
-    "NUM_LDS_BUFFER",
-    "mfma_instr_shape",
-    "warps_per_cta",
-    "tiles_per_warp",
-    "k_width",
-    "transposed",
-    "WAVES_PER_EU",
-    "TILE_SCHED",
-    "GROUP_M",
-    "NUM_XCDS",
-    "token_mod",
-    "token_scale_mod",
-    "expert_mod",
-    "expert_scale_mod",
-    "result_mod",
-    "result_scale_mod",
-    "WARP_PIPELINE",
-    "VGPR_PREFETCH_K",
-    "A_SCALE_SORTED_SHUFFLED",
-    "B_SCALE_SHUFFLED",
-    "B_IN_REG",
-    "B_PRESHUFFLED",
-    "ACT_FAST_RCP",
-    "WAIT_COMMIT_SCHEME",
-)
+_TUNING_KEYS = TuningSpec._fields
 
 
 def _tuning_args(c: dict) -> tuple:
-    return tuple(c[k] for k in _TUNING_KEYS)
+    """Keep older config dictionaries valid when optional tuning fields are added."""
+    return tuple(
+        c[k] if k in c else TuningSpec._field_defaults[k] for k in _TUNING_KEYS
+    )

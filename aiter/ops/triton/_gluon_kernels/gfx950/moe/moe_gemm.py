@@ -63,7 +63,6 @@ The output buffer still carries the leading ``(1, M, N)`` axis that ``reduce_gro
 indexes.
 """
 
-import os
 from typing import NamedTuple
 
 import triton.language as tl
@@ -102,235 +101,29 @@ from ._types import (
     WaitCommitScheme,
 )
 
-#: DIAGNOSTIC -- subtract from every computed wait_group count (a stronger wait).
-#: Used to tell an under-wait apart from a schedule that is merely slow: under
-#: WaitCommitScheme.PER_FILL the model counts G = NM + NN groups per stage while the
-#: emission commits 6 at NM=NN=2, so the count is conservative there and exact at the
-#: coarser levels -- if a level only works with a bias, its emission and its model
-#: disagree.
-_WAIT_BIAS: gl.constexpr = gl.constexpr(
-    int(os.environ.get("AITER_TRITON_MOE_GLUON_WAIT_BIAS", "0"))
-)
-
-#: Commit-group granularity and wait placement are NOT an env flag: they are
-#: ``KernelTuningConfig.WAIT_COMMIT_SCHEME``, a :class:`WaitCommitScheme`, so the tuner
-#: can sweep them like any other tile knob. A @gluon.jit body cannot compare an IntEnum
-#: member, so the branches go through the config's ``commit_per_*()`` predicates and the
-#: constexpr helpers through :func:`_groups_per_stage`.
-
-#: Run ``_pipeline_step_frozen`` -- the verbatim snapshot of the 2026-09-01 best kernel's
-#: step -- instead of ``_pipeline_step_impl``. The two are identical at the moment the
-#: snapshot was taken, so this is a no-op until ``_pipeline_step_impl`` is refactored;
-#: after that it is the A/B against a known-good schedule.
-_FROZEN_STEP: gl.constexpr = gl.constexpr(
-    int(os.environ.get("AITER_TRITON_MOE_GLUON_FROZEN_STEP", "0"))
-)
-
-#: Rotate the MXFP4 staging buffers so a mini tile's LDS read is one iteration behind
-#: its write, instead of immediately after it.
-#:
-#: With one buffer the walk is `barrier; write; barrier; read; store` per tile -- two
-#: full-CTA syncs, and the read's `s_waitcnt lgkmcnt(0)` sits directly on the write it
-#: depends on. With two buffers the write of tile i and the read of tile i-1 target
-#: different memory, so the order becomes `read(i-1); store(i-1); write(i); barrier`:
-#: one barrier per tile instead of two, and the read consumes data that was written a
-#: whole iteration earlier, with a barrier already between them.
-#:
-#: Ordering is load-bearing. The read must precede the write *within* an iteration:
-#: buffer B[i%2] was last read at iteration i-1, and only the barrier that closes
-#: iteration i-1 separates that read from the write at iteration i.
-_EPI_ROTATE: gl.constexpr = gl.constexpr(
-    int(os.environ.get("AITER_TRITON_MOE_GLUON_EPI_ROTATE", "0"))
-)
-
-#: Gate/linear interleave granularity along N for the activation.
-#:
-#: 1 (default) -- the packing the callers use today: g,l,g,l. A lane's accumulator
-#:   quad then holds g,l,g,l, so the gate half sits at stride 2 and every v_pk_* in
-#:   the swiglu needs two v_mov_b32 to gather an aligned pair (96 of them).
-#: 2 -- g,g,l,l, so the split lands on a register-pair boundary. Requires the weights
-#:   and weight scales to be permuted with ``swiglu_group2_perm`` over N; without that
-#:   the kernel computes the activation on the wrong operands.
-_ACT_GROUP: gl.constexpr = gl.constexpr(
-    int(os.environ.get("AITER_TRITON_MOE_GLUON_ACT_GROUP", "1"))
-)
-
-#: Fold the gate half's activation into the LAST K iteration, under ``gate_up_split``.
-#:
-#: :func:`_slot_index` is N-outer, so on the final drain step every gate-side
-#: accumulator retires before the first linear-side MFMA is issued. Peeling that step
-#: out of the drain loop lets the silu for mini-M block ``mi`` be emitted between the
-#: ``(mi, 0)`` and ``(mi, 1)`` MFMA clusters, where its 64 exp2 and 64 rcp retire under
-#: MFMAs instead of after the K loop with nothing left to hide behind. The recorded
-#: ``activation cost, frozen`` is +12.5 us, which bounds what this can buy.
-#:
-#: Register pressure should be a wash: the activated tile overwrites the accumulator it
-#: came from, and all NM*NN of them were live into the epilogue regardless. It is close
-#: to the margin though (388 VGPR / 132 AGPR / 0 spills), so the register count is part
-#: of the gate, not a footnote.
-#:
-#: Only the epilogue-operand retire moves: the peeled step has ``DO_DS_READ=False`` and
-#: therefore issues no ``wait_group`` at all, so draining the bias/gammas commit group
-#: ahead of it leaves every other step's wait accounting untouched.
-_FUSE_ACT_MFMA: gl.constexpr = gl.constexpr(
-    int(os.environ.get("AITER_TRITON_MOE_GLUON_FUSE_ACT_MFMA", "0"))
-)
-
-#: EXPERIMENT, NOT CORRECT -- drop the lgkmcnt wait in front of the epilogue's staged
-#: LDS read, to measure what that wait costs.
-#:
-#: ATT puts ds_write_b8 + s_waitcnt at 1209 of the 1593 stall cycles/wave that the
-#: STORE role carries inside the drain -- the single largest non-overlappable term
-#: there, larger than the 192 MFMAs. The arithmetic (ACT 1.4, QUANT 1.8 stall per
-#: execution) already hides under the MFMAs; this does not, because ds_write ->
-#: waitcnt -> barrier -> ds_read is a cross-lane serialisation point.
-#:
-#: Reading the staging buffer without waiting for the writes is a race: the result is
-#: wrong. This exists only to bound what removing the wait could buy.
-_EPI_RELAXED_LDS: gl.constexpr = gl.constexpr(
-    int(os.environ.get("AITER_TRITON_MOE_GLUON_EPI_RELAXED_LDS", "0"))
-)
-
-#: ABLATION, for measuring what the epilogue costs. DCE-safe: the store keeps its
-#: shape and byte count and the accumulator stays live, so every MFMA survives. That
-#: is the whole point of it being a kernel flag rather than a call argument --
-#: ``apply_swiglu=False`` also removes the gating, which doubles the emitted width and
-#: measures output traffic instead of the activation (699.8 us vs 621.5 at K=7168).
-#:   1 -- drop the swiglu transcendentals, keep the same [MBM, MBN] -> [MBM, OUT_MBN]
-#:        reduction (matches the FlyDSL AITER_FLYDSL_NO_ACT stub, so the two sides
-#:        ablate the same thing and the activation costs are comparable).
-#:   2 -- also drop bias and gammas: the whole epilogue except the store.
-#: Measurement only: it computes the wrong answer, so it must never ship enabled.
-_NO_EPI: gl.constexpr = gl.constexpr(
-    int(os.environ.get("AITER_TRITON_MOE_GLUON_NO_EPI", "0"))
-)
-
-#: Advance the HBM pointers once per unrolled body instead of once per K step, and
-#: address the steps inside the body with the buffer op's ``soffset`` (SGPR) field.
-#: Each of the four operand pointers is a 64-bit scalar, so a per-step bump is an
-#: s_add_u32/s_addc_u32 pair -- 8 SALU ops per step, K_UNROLL times per body, plus a
-#: fresh buffer resource descriptor for each. Hoisting the bump to the body leaves one
-#: set, and the per-step displacement becomes a loop-invariant constant in soffset.
-#: Requires the ``soffset`` parameter on buffer_load / buffer_load_to_shared.
-_SOFF_UNROLL: gl.constexpr = gl.constexpr(
-    int(os.environ.get("AITER_TRITON_MOE_GLUON_SOFF_UNROLL", "0"))
-)
-
-#: EXPERIMENT -- emit the LDS->register reads with the MFMAs rather than with the fills,
-#: i.e. before them instead of after. Under WarpPipeline.COMPILER that is what puts them
-#: in the ``mfma`` stage instead of ``mem``: the default split is
-#:   mfma: the MFMAs                       (16 ops)
-#:   mem : ds_read + global->LDS fills     (40 ops)
-#: which is badly unbalanced, so the wave group in the mfma stage idles at the border.
-#: Moving the reads across gives 48 / 8 the other way; whether that is better is an
-#: empirical question, hence the flag. See _DS_MOVE for the per-operand version.
-#:
-#: RACE, under COMPILER: session 075e0eea found a WAR hazard on the LDS buffer with the
-#: ds_reads in the mfma stage. Each tile is filled cooperatively -- a wave writes one
-#: slice and reads the whole tile -- but wait_group is a *per-wave* vmcnt retire, so a
-#: wave can read having waited only for its own fills. An empty "sync" stage ahead of
-#: the mfma one used to give the pass a boundary to fence there; it was removed, so
-#: nothing fences it now. Wrong results are nondeterministic, which means correctness
-#: for this combination has to be re-run several times, not once.
-_DS_IN_MFMA: gl.constexpr = gl.constexpr(
-    int(os.environ.get("AITER_TRITON_MOE_GLUON_DS_IN_MFMA", "0"))
-)
-
-#: EXPERIMENT -- hand the backend scheduler an interleave for the K-stage region.
-#: Gluon emits one dot per mini block, so a stage is ~60 MFMAs back to back followed by
-#: a clump of ds_read and global->LDS fills; FlyDSL instead pins 4 x (16 MFMA, 2 loads)
-#: with rocdl.sched_barrier. Splitting the dot to match is not available here -- the
-#: preshuffled scale tile is read whole, so MINI_BLOCK_N/K cannot be subdivided -- but
-#: sched_group_barrier expresses the same schedule without touching the source order,
-#: and iglp_opt asks for a canned version of it.
-#:   1 = iglp_opt(0)   2 = iglp_opt(1)
-#:   3 = 4 x (16 MFMA, 6 ds_read, 4 vmem)   4 = 8 x (8 MFMA, 3 ds_read, 2 vmem)
-_SCHED_MODE: gl.constexpr = gl.constexpr(
-    int(os.environ.get("AITER_TRITON_MOE_GLUON_SCHED_MODE", "0"))
-)
-
 _SG_MFMA: gl.constexpr = gl.constexpr(8)
 _SG_DS_READ: gl.constexpr = gl.constexpr(256)
 _SG_VMEM: gl.constexpr = gl.constexpr(16)
 
 
 @gluon.jit
-def _sched_hint():
+def _sched_hint(MODE: gl.constexpr):
     """Scheduling recipe for one K stage, emitted at the top of its region."""
-    if require_constexpr(_SCHED_MODE == 1):
+    if require_constexpr(MODE == 1):
         gl.amd.cdna4.iglp_opt(0)
-    elif require_constexpr(_SCHED_MODE == 2):
+    elif require_constexpr(MODE == 2):
         gl.amd.cdna4.iglp_opt(1)
-    elif require_constexpr(_SCHED_MODE == 3):
+    elif require_constexpr(MODE == 3):
         for _ in gl.static_range(4):
             gl.amd.cdna4.sched_group_barrier(_SG_MFMA, 16, 0)
             gl.amd.cdna4.sched_group_barrier(_SG_DS_READ, 6, 0)
             gl.amd.cdna4.sched_group_barrier(_SG_VMEM, 4, 0)
-    elif require_constexpr(_SCHED_MODE == 4):
+    elif require_constexpr(MODE == 4):
         for _ in gl.static_range(8):
             gl.amd.cdna4.sched_group_barrier(_SG_MFMA, 8, 0)
             gl.amd.cdna4.sched_group_barrier(_SG_DS_READ, 3, 0)
             gl.amd.cdna4.sched_group_barrier(_SG_VMEM, 2, 0)
 
-
-#: EXPERIMENT -- how many operands' LDS reads move up into the ``mfma`` group:
-#: 0 = none (both stay with the fills), 1 = A only, 2 = A and B. Finer than _DS_IN_MFMA,
-#: which is all-or-nothing.
-_DS_MOVE: gl.constexpr = gl.constexpr(
-    int(os.environ.get("AITER_TRITON_MOE_GLUON_DS_MOVE", "0"))
-)
-
-#: EXPERIMENT -- hand-written ping-pong instead of the TritonAMDGPUWarpPipeline pass.
-#: Same 2x2 slicing, same layouts, same fill schedule; only the synchronisation is
-#: ours. Built on the gluon ops added for this: cdna4.wave_id / cond_barrier / setprio
-#: / bare_barrier. Intended to run with TRITON_HIP_DISABLE_MEMBAR=1 so that *every*
-#: barrier in the loop is one we wrote.
-#:
-#: Per stage we emit exactly one LDS-fenced gl.barrier() at the stage head plus one
-#: bare_barrier() per slot. One fence per stage is sufficient in lockstep: groups are
-#: issued G = NM+NN per stage, and slot 0's wait_group is the *strongest* of the stage
-#: (6 vs 7 here), so the fence placed after it establishes, for every wave, retirement
-#: of every fill any slot of this stage will read. WAR is covered by the next stage's
-#: head fence, which drains the ds_reads before their slot is refilled.
-#:
-#: The wave groups run in lockstep. The half-iteration cond_barrier phase shift that
-#: used to bracket the K loop is gone: the tuned config ran it off, and with it on the
-#: manual path raced -- it failed the bit-exact output tests nondeterministically while
-#: every tolerance-based test still passed.
-#:
-#: SCOPE, since the per-slot rendezvous was removed from ``_pipeline_step_impl``: the
-#: step-level manual ping-pong now exists only in ``_pipeline_step_frozen``, so this
-#: flag no longer selects between two step implementations. What it still gates in the
-#: live path is the prologue fence, which sits in the kernel body rather than in the
-#: step. ``WarpPipeline.MANUAL`` is the tuning-config value that will subsume it once
-#: the rendezvous is rebuilt inside the unified step body; until then the live step
-#: refuses that value and this env flag is the only manual control there is.
-_MANUAL_PP: gl.constexpr = gl.constexpr(
-    int(os.environ.get("AITER_TRITON_MOE_GLUON_MANUAL_PP", "0"))
-)
-
-#: EXPERIMENT -- only drain lgkmcnt at the K-step boundary, not at every warp-pipeline
-#: region boundary. The backend puts s_waitcnt lgkmcnt(0) in front of every s_barrier,
-#: so with the ds_reads in the mfma region each of the NM*NN slots pays one. But the WAR
-#: window this closes is the buffer rotation -- the tile read at step k is refilled at
-#: step k+1 -- so the drain is only load-bearing at the *last* slot of a stage. Marking
-#: the earlier slots' reads `load_shared_relaxed` (syncedViaAsyncWait) drops their
-#: drains; the final slot's plain load still emits lgkmcnt(0), which waits for the
-#: relaxed ones too, so the stage boundary stays fenced.
-_LATE_LGKM: gl.constexpr = gl.constexpr(
-    int(os.environ.get("AITER_TRITON_MOE_GLUON_LATE_LGKM", "0"))
-)
-
-#: EXPERIMENT -- priority given to the ``mem`` warp-pipeline stage (default 1).
-#: Setting it to 0 makes both stages equal priority, disabling the ping-pong's
-#: asymmetric s_setprio. Inert unless WarpPipeline.COMPILER: the nop stage ignores it.
-_MEM_PRIO: gl.constexpr = gl.constexpr(
-    int(os.environ.get("AITER_TRITON_MOE_GLUON_MEM_PRIO", "1"))
-)
-
-_NO_MFMA: gl.constexpr = gl.constexpr(
-    int(os.environ.get("AITER_TRITON_MOE_GLUON_NO_MFMA", "0"))
-)
 
 _DQ_MXFP4: gl.constexpr = gl.constexpr(int(DtypeQuant.MXFP4))
 _TS_XCD_GROUP_M: gl.constexpr = gl.constexpr(int(TileSched.XCD_GROUP_M))
@@ -413,6 +206,7 @@ def _build_configs(cfg):
         _at(f, 9),
         _at(f, 10),
         _at(f, 11),
+        _at(f, 12),
     )
     tuning_cfg = KernelTuningConfig(
         func_cfg,
@@ -447,6 +241,12 @@ def _build_configs(cfg):
         _at(t, 28),
         _at(t, 29),
         _at(t, 30),
+        _at(t, 31),
+        _at(t, 32),
+        _at(t, 33),
+        _at(t, 34),
+        _at(t, 35),
+        _at(t, 36),
     )
     return func_cfg, tuning_cfg
 
@@ -806,6 +606,8 @@ def _a_block_frags(
     func_cfg,
     tc,
     RELAXED: gl.constexpr = False,
+    READ_PAYLOAD: gl.constexpr = True,
+    READ_SCALE: gl.constexpr = True,
 ):
     """Every LDS->register A fragment of one mini-M block, all mini-K, as a flat tuple.
 
@@ -831,8 +633,12 @@ def _a_block_frags(
             scale_ptr,
             _mini_scale_off(scale_offs, i * SK_MINI, HAS),
             RELAXED,
+            READ_PAYLOAD,
+            READ_SCALE,
         )
-        if require_constexpr(HAS):
+        if require_constexpr(not READ_PAYLOAD):
+            a = a_s
+        if require_constexpr(HAS and READ_SCALE):
             slot = a_s
         else:
             slot = a
@@ -852,6 +658,8 @@ def _b_block_frags(
     b_ptr=None,
     b_frag_offs=None,
     RELAXED: gl.constexpr = False,
+    READ_PAYLOAD: gl.constexpr = True,
+    READ_SCALE: gl.constexpr = True,
 ):
     """The operand-B mirror of :func:`_a_block_frags`, over one mini-N block."""
     NUM_MINI: gl.constexpr = tc.num_mini_k()
@@ -868,8 +676,12 @@ def _b_block_frags(
             b_ptr,
             b_frag_offs,
             RELAXED,
+            READ_PAYLOAD,
+            READ_SCALE,
         )
-        if require_constexpr(HAS):
+        if require_constexpr(not READ_PAYLOAD):
+            b = b_s
+        if require_constexpr(HAS and READ_SCALE):
             slot = b_s
         else:
             slot = b
@@ -909,8 +721,6 @@ def _maybe_block_dot(
 @gluon.jit
 def _block_dot(a_frags, b_frags, acc, N_MINI: gl.constexpr, func_cfg, tuning_cfg):
     """The MFMAs of one mini (M, N) block over ``N_MINI`` mini-K steps."""
-    if require_constexpr(_NO_MFMA):
-        return acc
     for i in gl.static_range(N_MINI):
         if require_constexpr(func_cfg.has_scale(0)):
             a_s = a_frags[2 * i + 1]
@@ -1066,19 +876,6 @@ class _PipelineState:
         self.acc = acc
 
 
-#: EXPERIMENT -- concentrate the E8M0 scale copies on the two middle regions instead of
-#: letting each region carry its own tile's scale. At NM=NN=2 the payload fills are
-#: B(0), A(0), A(1), B(1) over regions 0..3 and the B tiles are 2 buffer_load_dwordx4
-#: each against A's 1, so regions 0 and 3 are the heavy ones; this puts
-#: scale A(0), scale B(0) on region 1 and scale A(1), scale B(1) on region 2. It also
-#: pairs each A tile's scale with the B tile's scale that shares a region, which is the
-#: grouping a combined A+B scale staging buffer would need to fold them into one
-#: buffer_load_dword (512 + 1024 = 1536 B, under the 2048 B a CTA-wide access moves).
-_SCALE_FILL_MID: gl.constexpr = gl.constexpr(
-    int(os.environ.get("AITER_TRITON_MOE_GLUON_SCALE_FILL_MID", "0"))
-)
-
-
 @gluon.constexpr_function
 def _slot_index(mi, ni, NM, NN):
     """Position of slot ``(mi, ni)`` in the traversal: N outer, M inner.
@@ -1104,14 +901,10 @@ def _slot_index(mi, ni, NM, NN):
 def _relax_read(mi, ni, NM, NN):
     """May this slot's LDS reads skip the pre-barrier lgkmcnt drain?
 
-    Yes for every slot but the last of the stage: the buffer a read touches is not
-    refilled until the next K step, so the only boundary that has to be fenced is the
-    stage's own last one -- and the plain load there emits lgkmcnt(0), which drains the
-    relaxed reads too. Off unless _LATE_LGKM.
+    Keep the last actual read plain so it retires the earlier relaxed reads before
+    the next K step reuses their buffers. Larger splits have compute-only tail slots.
     """
-    if not _LATE_LGKM:
-        return False
-    return _slot_index(mi, ni, NM, NN) < _v(NM) * _v(NN) - 1
+    return _slot_index(mi, ni, NM, NN) < _v(NM) + _v(NN) - 1
 
 
 @gluon.constexpr_function
@@ -1201,22 +994,22 @@ def _read_b_tile(mi, ni, NM, NN):
 
 
 @gluon.constexpr_function
-def _scale_fill_slot(is_a, tile, NM, NN):
+def _scale_fill_slot(is_a, tile, NM, NN, SCALE_FILL_MID=False):
     """Slot index that issues the scale copy for A(tile) / B(tile).
 
     Default: the same slot as the payload, so a tile's scale and payload share one
-    commit group. Under ``_SCALE_FILL_MID`` at NM=NN=2 both A(0)/B(0) scales go to
+    commit group. Under ``SCALE_FILL_MID`` at NM=NN=2 both A(0)/B(0) scales go to
     slot 1 and both A(1)/B(1) scales to slot 2.
     """
     is_a, tile = bool(_v(is_a)), _v(tile)
     NM, NN = _v(NM), _v(NN)
-    if _SCALE_FILL_MID and NM == 2 and NN == 2:
+    if _v(SCALE_FILL_MID) and NM == 2 and NN == 2:
         return 1 + tile
     return _fill_group_pos(is_a, tile, NM, NN)
 
 
 @gluon.constexpr_function
-def _slot_scale_fills(mi, ni, NM, NN, want_a):
+def _slot_scale_fills(mi, ni, NM, NN, want_a, SCALE_FILL_MID=False):
     """Tile whose A (resp. B) scale copy slot ``(mi, ni)`` issues, or None.
 
     Still one slot per mini block even when several share a scale tile: the commit
@@ -1226,7 +1019,7 @@ def _slot_scale_fills(mi, ni, NM, NN, want_a):
     s = _slot_index(mi, ni, NM, NN)
     n = NM if _v(want_a) else NN
     for t in range(_v(n)):
-        if _scale_fill_slot(_v(want_a), t, NM, NN) == s:
+        if _scale_fill_slot(_v(want_a), t, NM, NN, SCALE_FILL_MID) == s:
             return t
     return None
 
@@ -1262,7 +1055,7 @@ def _groups_per_stage(NM, NN, SCHEME):
 
 
 @gluon.constexpr_function
-def _slot_wait(mi, ni, NM, NN, STAGES_BETWEEN, ANY_FILL, SCHEME):
+def _slot_wait(mi, ni, NM, NN, STAGES_BETWEEN, ANY_FILL, SCHEME, SCALE_FILL_MID=False):
     """Outstanding-group count that retires everything slot ``(mi, ni)`` is about to read.
 
     A group is retired once ``wait_group(n)`` leaves at most ``n`` behind it. Counting
@@ -1293,29 +1086,35 @@ def _slot_wait(mi, ni, NM, NN, STAGES_BETWEEN, ANY_FILL, SCHEME):
     if ta is not None:
         # The payload and the scale of the same tile can sit in different commit
         # groups (see _scale_fill_slot); the later of the two is what has to retire.
-        p = max(_fill_group_pos(True, ta, NM, NN), _scale_fill_slot(True, ta, NM, NN))
+        p = max(
+            _fill_group_pos(True, ta, NM, NN),
+            _scale_fill_slot(True, ta, NM, NN, SCALE_FILL_MID),
+        )
         out = base if PER_STAGE else G - 1 - p + base
     tb = _read_b_tile(mi, ni, NM, NN)
     if tb is not None:
-        p = max(_fill_group_pos(False, tb, NM, NN), _scale_fill_slot(False, tb, NM, NN))
+        p = max(
+            _fill_group_pos(False, tb, NM, NN),
+            _scale_fill_slot(False, tb, NM, NN, SCALE_FILL_MID),
+        )
         w = base if PER_STAGE else G - 1 - p + base
         out = w if out is None else min(out, w)
     return out
 
 
 @gluon.constexpr_function
-def _stage_wait(NM, NN, STAGES_BETWEEN, ANY_FILL, SCHEME):
+def _stage_wait(NM, NN, STAGES_BETWEEN, ANY_FILL, SCHEME, SCALE_FILL_MID=False):
     """Strongest (smallest) wait_group count over all slots of a stage."""
     NM, NN = _v(NM), _v(NN)
     ws = [
-        _slot_wait(mi, ni, NM, NN, STAGES_BETWEEN, ANY_FILL, SCHEME)
+        _slot_wait(mi, ni, NM, NN, STAGES_BETWEEN, ANY_FILL, SCHEME, SCALE_FILL_MID)
         for ni in range(NN)
         for mi in range(NM)
     ]
     ws = [w for w in ws if w is not None]
     if not ws:
         return None
-    return max(min(ws) - _WAIT_BIAS, 0)
+    return max(min(ws), 0)
 
 
 @gluon.jit
@@ -1327,6 +1126,7 @@ def _stage_wait_group(
     ANY_FILL: gl.constexpr,
     SCHEME: gl.constexpr,
     WAIT_SLACK: gl.constexpr = 0,
+    SCALE_FILL_MID: gl.constexpr = False,
 ):
     """One wait_group for the whole stage, emitted ahead of the slot walk.
 
@@ -1340,7 +1140,9 @@ def _stage_wait_group(
     slots read, so they never retire first; leaving them out of the count would make
     the wait retire one real group too few.
     """
-    WAIT: gl.constexpr = _stage_wait(NM, NN, STAGES_BETWEEN, ANY_FILL, SCHEME)
+    WAIT: gl.constexpr = _stage_wait(
+        NM, NN, STAGES_BETWEEN, ANY_FILL, SCHEME, SCALE_FILL_MID
+    )
     if require_constexpr(WAIT is not None):
         lds.wait_fill_lds_num_group(WAIT + WAIT_SLACK)
 
@@ -1356,6 +1158,7 @@ def _slot_wait_group(
     ANY_FILL: gl.constexpr,
     SCHEME: gl.constexpr,
     WAIT_SLACK: gl.constexpr = 0,
+    SCALE_FILL_MID: gl.constexpr = False,
 ):
     """Emit slot ``(mi, ni)``'s ``wait_group``, or nothing if it reads nothing.
 
@@ -1368,7 +1171,9 @@ def _slot_wait_group(
 
     ``WAIT_SLACK``: see :func:`_stage_wait_group`.
     """
-    WAIT: gl.constexpr = _slot_wait(mi, ni, NM, NN, STAGES_BETWEEN, ANY_FILL, SCHEME)
+    WAIT: gl.constexpr = _slot_wait(
+        mi, ni, NM, NN, STAGES_BETWEEN, ANY_FILL, SCHEME, SCALE_FILL_MID
+    )
     if require_constexpr(WAIT is not None):
         lds.wait_fill_lds_num_group(WAIT + WAIT_SLACK)
 
@@ -1377,7 +1182,7 @@ def _slot_wait_group(
 def _slot_advance(mi, ni, NM, NN, KI, KU):
     """Does slot ``(mi, ni)`` own the pointer bump onto the next ``BLOCK_K`` stage?
 
-    The stage's last slot -- and, when ``_SOFF_UNROLL`` folded the body's steps into
+    The stage's last slot -- and, when ``SOFF_UNROLL`` folded the body's steps into
     ``soffset``, only on the body's last step, which then bumps by ``KU`` at once. With
     the flag off ``KI``/``KU`` are ``0``/``1`` and the last term is vacuous.
     """
@@ -1408,7 +1213,7 @@ def _slot_fills(
     against exactly those boundaries.
 
     ``KI``/``KU`` are this step's index within the unrolled body and the unroll factor.
-    With ``_SOFF_UNROLL`` they turn the per-step pointer bump into a per-body one: every
+    With ``SOFF_UNROLL`` they turn the per-step pointer bump into a per-body one: every
     copy addresses ``base + KI * step`` through ``soffset`` and ``ADVANCE`` then moves the
     base on by ``KU`` steps at once. With the flag off, ``KU`` is 1 and this is the
     original one-bump-per-step form.
@@ -1427,8 +1232,12 @@ def _slot_fills(
     A_TILE: gl.constexpr = _fill_tile_of(POS, NM, NN, True)
     B_TILE: gl.constexpr = _fill_tile_of(POS, NM, NN, False)
     # Scale copies may be placed on a different slot than their payload.
-    A_SC: gl.constexpr = _slot_scale_fills(mi, ni, NM, NN, True)
-    B_SC: gl.constexpr = _slot_scale_fills(mi, ni, NM, NN, False)
+    A_SC: gl.constexpr = _slot_scale_fills(
+        mi, ni, NM, NN, True, pc.tuning_cfg.SCALE_FILL_MID
+    )
+    B_SC: gl.constexpr = _slot_scale_fills(
+        mi, ni, NM, NN, False, pc.tuning_cfg.SCALE_FILL_MID
+    )
     # Where the commit_group marks go, per WaitCommitScheme. Exactly one of the three
     # is True, and _slot_wait counts groups at the same granularity.
     MARK_FILL: gl.constexpr = pc.tuning_cfg.commit_per_fill()
@@ -1438,7 +1247,7 @@ def _slot_fills(
     # in elements (they are added to a typed pointer), soffset is in bytes, so each is
     # scaled by its operand's storage width. All constexpr, so these fold into a literal
     # and the SGPR holding them is hoisted out of the loop.
-    SOFF: gl.constexpr = _SOFF_UNROLL and KI > 0
+    SOFF: gl.constexpr = pc.tuning_cfg.SOFF_UNROLL and KI > 0
     A_SOFF: gl.constexpr = (
         KI * pc.a_step * (func_cfg.operand_elem_ty(0).primitive_bitwidth // 8)
         if SOFF
@@ -1523,7 +1332,7 @@ def _slot_fills(
         # nondeterministic output in 7 runs out of 8, with the barrier count unchanged.
         pc.lds.commit_fill_lds()
     if require_constexpr(ADVANCE):
-        # KU is 1 unless _SOFF_UNROLL folded the body's steps into soffset, in which
+        # KU is 1 unless SOFF_UNROLL folded the body's steps into soffset, in which
         # case one bump at the last step of the body covers all of them.
         a_hbm_ptr = a_hbm_ptr + KU * pc.a_step
         b_hbm_ptr = b_hbm_ptr + KU * pc.b_step
@@ -1541,6 +1350,8 @@ def _slot_a_read(
     mi: gl.constexpr,
     a_scale_read_hbm_ptr,
     RELAXED: gl.constexpr = False,
+    READ_PAYLOAD: gl.constexpr = True,
+    READ_SCALE: gl.constexpr = True,
 ):
     return _a_block_frags(
         pc.lds,
@@ -1551,6 +1362,8 @@ def _slot_a_read(
         pc.func_cfg,
         pc.tuning_cfg,
         RELAXED,
+        READ_PAYLOAD,
+        READ_SCALE,
     )
 
 
@@ -1577,6 +1390,8 @@ def _slot_b_read(
     ni: gl.constexpr,
     b_scale_read_hbm_ptr,
     RELAXED: gl.constexpr = False,
+    READ_PAYLOAD: gl.constexpr = True,
+    READ_SCALE: gl.constexpr = True,
 ):
     return _b_block_frags(
         pc.lds,
@@ -1591,6 +1406,8 @@ def _slot_b_read(
         None,
         _opt_at(pc.b_frag_offs, ni, pc.tuning_cfg.B_IN_REG),
         RELAXED,
+        READ_PAYLOAD,
+        READ_SCALE,
     )
 
 
@@ -1613,13 +1430,13 @@ def _slot_reads(
     b_scale_read_hbm_ptr,
     WANT_A: gl.constexpr,
     WANT_B: gl.constexpr,
+    WANT_A_SCALE: gl.constexpr,
+    WANT_B_SCALE: gl.constexpr,
 ):
     """The LDS reads slot ``(mi, ni)`` owns, as ``(a_frags, b_frags)`` to append.
 
-    ``WANT_A``/``WANT_B`` say which of the two this stage group is claiming -- the reads
-    are split between ``mem`` and ``mfma`` by _DS_IN_MFMA / _DS_MOVE, so the body calls
-    this twice with complementary flags. Either tuple is empty when the slot reads
-    nothing of that operand, which makes the append at the call site unconditional.
+    Payload and scale reads can belong to different stage groups. Missing components
+    temporarily alias the present component; _merge_read_frags selects the real values.
     """
     NM: gl.constexpr = pc.tuning_cfg.num_mini_m()
     NN: gl.constexpr = pc.tuning_cfg.num_mini_n()
@@ -1628,11 +1445,40 @@ def _slot_reads(
     RELAXED: gl.constexpr = _relax_read(mi, ni, NM, NN)
     a_frags = ()
     b_frags = ()
-    if require_constexpr(WANT_A and A_TILE is not None):
-        a_frags = _slot_a_read(pc, DS_READ_INX, A_TILE, a_scale_read_hbm_ptr, RELAXED)
-    if require_constexpr(WANT_B and B_TILE is not None):
-        b_frags = _slot_b_read(pc, DS_READ_INX, B_TILE, b_scale_read_hbm_ptr, RELAXED)
+    if require_constexpr(
+        (WANT_A or (WANT_A_SCALE and pc.func_cfg.a_has_scale())) and A_TILE is not None
+    ):
+        a_frags = _slot_a_read(
+            pc, DS_READ_INX, A_TILE, a_scale_read_hbm_ptr, RELAXED, WANT_A, WANT_A_SCALE
+        )
+    if require_constexpr(
+        (WANT_B or (WANT_B_SCALE and pc.func_cfg.b_has_scale())) and B_TILE is not None
+    ):
+        b_frags = _slot_b_read(
+            pc, DS_READ_INX, B_TILE, b_scale_read_hbm_ptr, RELAXED, WANT_B, WANT_B_SCALE
+        )
     return a_frags, b_frags
+
+
+@gluon.jit
+def _merge_read_frags(mem, mfma, tc, operand: gl.constexpr):
+    if require_constexpr(len(mem) == 0):
+        return mfma
+    elif require_constexpr(len(mfma) == 0):
+        return mem
+    else:
+        out = ()
+        for i in gl.static_range(tc.num_mini_k()):
+            if require_constexpr(tc.ds_read_in_mfma(operand)):
+                payload = mfma[2 * i]
+            else:
+                payload = mem[2 * i]
+            if require_constexpr(tc.ds_read_in_mfma(operand, scale=True)):
+                scale = mfma[2 * i + 1]
+            else:
+                scale = mem[2 * i + 1]
+            out = out + (payload, scale)
+        return out
 
 
 @gluon.jit
@@ -1688,35 +1534,35 @@ def _pipeline_step(
     copy of it from the best measured kernel. ``FROZEN_STEP=1`` runs the snapshot, so a
     refactor can be compared against the known-good schedule without a checkout.
     """
-    if require_constexpr(_FROZEN_STEP):
+    if require_constexpr(pc.tuning_cfg.FROZEN_STEP):
         out = _pipeline_step_frozen(
-        pc,
-        st,
-        BUFFER_LOAD_INX,
-        DS_READ_INX,
-        STAGES_BETWEEN,
-        DO_BUFFER_LOAD,
-        DO_DS_READ,
-        IN_LOOP,
-        DO_MFMA,
-        KI,
-        KU,
-        WAIT_SLACK,
+            pc,
+            st,
+            BUFFER_LOAD_INX,
+            DS_READ_INX,
+            STAGES_BETWEEN,
+            DO_BUFFER_LOAD,
+            DO_DS_READ,
+            IN_LOOP,
+            DO_MFMA,
+            KI,
+            KU,
+            WAIT_SLACK,
         )
     else:
         out = _pipeline_step_impl(
-        pc,
-        st,
-        BUFFER_LOAD_INX,
-        DS_READ_INX,
-        STAGES_BETWEEN,
-        DO_BUFFER_LOAD,
-        DO_DS_READ,
-        IN_LOOP,
-        DO_MFMA,
-        KI,
-        KU,
-        WAIT_SLACK,
+            pc,
+            st,
+            BUFFER_LOAD_INX,
+            DS_READ_INX,
+            STAGES_BETWEEN,
+            DO_BUFFER_LOAD,
+            DO_DS_READ,
+            IN_LOOP,
+            DO_MFMA,
+            KI,
+            KU,
+            WAIT_SLACK,
         )
     return out
 
@@ -1759,14 +1605,16 @@ def _pipeline_step_impl(
     PIPE: gl.constexpr = tc.warp_pipeline_compiler() and DO_DS_READ and IN_LOOP
     STAGE: gl.constexpr = pick_stage(PIPE)
 
-    READ_A_IN_MFMA: gl.constexpr = _DS_IN_MFMA or _DS_MOVE >= 1
-    READ_B_IN_MFMA: gl.constexpr = _DS_IN_MFMA or _DS_MOVE >= 2
+    READ_A_IN_MFMA: gl.constexpr = tc.ds_read_in_mfma(0)
+    READ_B_IN_MFMA: gl.constexpr = tc.ds_read_in_mfma(1)
+    READ_A_SCALE_IN_MFMA: gl.constexpr = tc.ds_read_in_mfma(0, scale=True)
+    READ_B_SCALE_IN_MFMA: gl.constexpr = tc.ds_read_in_mfma(1, scale=True)
 
     SCHEME: gl.constexpr = tc.WAIT_COMMIT_SCHEME
     STAGE_WAIT: gl.constexpr = tc.wait_at_stage_head()
 
-    KIE: gl.constexpr = KI if _SOFF_UNROLL else 0
-    KUE: gl.constexpr = KU if _SOFF_UNROLL else 1
+    KIE: gl.constexpr = KI if tc.SOFF_UNROLL else 0
+    KUE: gl.constexpr = KU if tc.SOFF_UNROLL else 1
 
     a_hbm_ptr = st.a_hbm_ptr
     b_hbm_ptr = st.b_hbm_ptr
@@ -1784,11 +1632,18 @@ def _pipeline_step_impl(
     # wait inside a stage region, and the two are alternative answers to the same
     # question anyway -- iglp_opt overlaps MFMA with memory inside a wave, the
     # pipeliner does it by ping-ponging two wave groups.
-    if require_constexpr(_SCHED_MODE != 0 and DO_DS_READ and not PIPE):
-        _sched_hint()
+    if require_constexpr(tc.SCHED_MODE != 0 and DO_DS_READ and not PIPE):
+        _sched_hint(tc.SCHED_MODE)
     if require_constexpr(DO_DS_READ and STAGE_WAIT):
         _stage_wait_group(
-            pc.lds, NM, NN, STAGES_BETWEEN, DO_BUFFER_LOAD, SCHEME, WAIT_SLACK
+            pc.lds,
+            NM,
+            NN,
+            STAGES_BETWEEN,
+            DO_BUFFER_LOAD,
+            SCHEME,
+            WAIT_SLACK,
+            tc.SCALE_FILL_MID,
         )
     for ni in gl.static_range(NN):
         for mi in gl.static_range(NM):
@@ -1803,6 +1658,7 @@ def _pipeline_step_impl(
                     DO_BUFFER_LOAD,
                     SCHEME,
                     WAIT_SLACK,
+                    tc.SCALE_FILL_MID,
                 )
 
             if require_constexpr(DO_MFMA):
@@ -1812,8 +1668,8 @@ def _pipeline_step_impl(
                 dot_a = ()
                 dot_b = ()
 
-            with STAGE("mem", priority=_MEM_PRIO):
-                a_new, b_new = _slot_reads(
+            with STAGE("mem"):
+                a_mem, b_mem = _slot_reads(
                     pc,
                     DS_READ_INX,
                     mi,
@@ -1822,9 +1678,9 @@ def _pipeline_step_impl(
                     b_scale_read_hbm_ptr,
                     DO_DS_READ and not READ_A_IN_MFMA,
                     DO_DS_READ and not READ_B_IN_MFMA,
+                    DO_DS_READ and not READ_A_SCALE_IN_MFMA,
+                    DO_DS_READ and not READ_B_SCALE_IN_MFMA,
                 )
-                a_cur = a_cur + a_new
-                b_cur = b_cur + b_new
                 if require_constexpr(DO_BUFFER_LOAD):
                     (
                         a_hbm_ptr,
@@ -1846,8 +1702,13 @@ def _pipeline_step_impl(
                         # the step closes the stage group itself, after the walk
                         STAGE_MARK=False,
                     )
+                    if require_constexpr(
+                        PIPE and tc.commit_per_stage() and mi == NM - 1 and ni == NN - 1
+                    ):
+                        # Close the copy group before the border, ahead of the next wait.
+                        pc.lds.commit_fill_lds()
 
-            with STAGE("mfma", priority=0):
+            with STAGE("mfma"):
                 slot_acc = _maybe_block_dot(
                     dot_a,
                     dot_b,
@@ -1857,7 +1718,7 @@ def _pipeline_step_impl(
                     tc,
                     DO_MFMA,
                 )
-                a_new, b_new = _slot_reads(
+                a_mfma, b_mfma = _slot_reads(
                     pc,
                     DS_READ_INX,
                     mi,
@@ -1866,16 +1727,18 @@ def _pipeline_step_impl(
                     b_scale_read_hbm_ptr,
                     DO_DS_READ and READ_A_IN_MFMA,
                     DO_DS_READ and READ_B_IN_MFMA,
+                    DO_DS_READ and READ_A_SCALE_IN_MFMA,
+                    DO_DS_READ and READ_B_SCALE_IN_MFMA,
                 )
-                a_cur = a_cur + a_new
-                b_cur = b_cur + b_new
+            a_cur = a_cur + _merge_read_frags(a_mem, a_mfma, tc, 0)
+            b_cur = b_cur + _merge_read_frags(b_mem, b_mfma, tc, 1)
             acc = acc + (slot_acc,)
 
             a_new, b_new = _slot_tails(pc, a_cur, b_cur, mi, ni, DO_DS_READ)
             a_tail = a_tail + a_new
             b_tail = b_tail + b_new
 
-    if require_constexpr(tc.commit_per_stage() and DO_BUFFER_LOAD):
+    if require_constexpr(tc.commit_per_stage() and DO_BUFFER_LOAD and not PIPE):
         # One group for the whole stage, closed after the walk -- see _slot_fills.
         pc.lds.commit_fill_lds()
 
@@ -1918,7 +1781,7 @@ def _drain_last_fused(pc, st, bias_tiles, x_static_scale, func_cfg, tuning_cfg):
     :func:`_slot_index` is N outer, so the visit order is ``(0,0), (1,0), (0,1), (1,1)``
     and every gate-side accumulator is final before the first linear-side MFMA issues.
     The silu for mini-M block ``mi`` therefore lands *between* MFMA clusters and its
-    exp2/rcp retire under them. See :data:`_FUSE_ACT_MFMA`.
+    exp2/rcp retire under them.
 
     Returns the accumulator tuple with each ``ni == 0`` slot replaced by
     ``silu(bias + acc)`` -- the same value :func:`_epilogue_one_tile` would have
@@ -1948,9 +1811,9 @@ def _drain_last_fused(pc, st, bias_tiles, x_static_scale, func_cfg, tuning_cfg):
                 # so it overlaps the ni == 1 clusters still to come.
                 if require_constexpr(func_cfg.has_x_static_scale):
                     slot_acc = slot_acc * x_static_scale
-                if require_constexpr(func_cfg.has_bias and _NO_EPI < 2):
+                if require_constexpr(func_cfg.has_bias and func_cfg.epilogue < 2):
                     slot_acc = slot_acc + bias_tiles[0][None, :]
-                if require_constexpr(not _NO_EPI):
+                if require_constexpr(func_cfg.epilogue == 0):
                     slot_acc = _swiglu_gate(
                         slot_acc, act.alpha, act.limit, tc.ACT_FAST_RCP
                     )
@@ -2071,7 +1934,7 @@ def _epi_stage_flush(
     """Read one staged MXFP4 mini tile back out of LDS and store it.
 
     The second half of :func:`_epilogue_one_tile`'s staged store, split out so
-    ``_EPI_ROTATE`` can run it one iteration behind the write that produced it.
+    ``rotating epilogue`` can run it one iteration behind the write that produced it.
     """
     BM: gl.constexpr = tuning_cfg.BLOCK_M
     BN: gl.constexpr = tuning_cfg.BLOCK_N
@@ -2083,8 +1946,9 @@ def _epi_stage_flush(
     SL: gl.constexpr = tuning_cfg.result_store_layout(MBM, OUT_MBN // MX_GROUP, 8)
     raw_n0 = pid_n * BN + ni * MBN
     n0 = raw_n0 // ARN
-    pv = qp_smem.load(PL)
-    sv = qs_smem.load(SL)
+    # The caller's fenced barrier has retired every wave's staging writes.
+    pv = gl.amd.cdna4.async_copy.load_shared_relaxed(qp_smem, PL)
+    sv = gl.amd.cdna4.async_copy.load_shared_relaxed(qs_smem, SL)
     pm = BM * block_id + mi * MBM + gl.arange(0, MBM, layout=gl.SliceLayout(1, PL))
     pn = gl.arange(0, OUT_MBN // 2, layout=gl.SliceLayout(0, PL))
     gl.amd.cdna4.buffer_store(
@@ -2139,8 +2003,8 @@ def _epi_block_flush(
     # write, so this fence is load-bearing. Only one is needed: nothing reuses the
     # buffer afterwards.
     gl.barrier()
-    pv = qp_smem.load(PL)
-    sv = qs_smem.load(SL)
+    pv = gl.amd.cdna4.async_copy.load_shared_relaxed(qp_smem, PL)
+    sv = gl.amd.cdna4.async_copy.load_shared_relaxed(qs_smem, SL)
     pm = BM * block_id + gl.arange(0, BM, layout=gl.SliceLayout(1, PL))
     pn = gl.arange(0, OUT_MBN // 2, layout=gl.SliceLayout(0, PL))
     gl.amd.cdna4.buffer_store(
@@ -2225,7 +2089,7 @@ def _epilogue_one_tile(
         if require_constexpr(func_cfg.gu_split()):
             lin = lin * x_static_scale
 
-    if require_constexpr(func_cfg.has_bias and _NO_EPI < 2):
+    if require_constexpr(func_cfg.has_bias and func_cfg.epilogue < 2):
         # fp32, expert indexed, over the RAW N axis (before the halving). Split: one
         # tile per side, so each accumulator takes its own.
         if require_constexpr(not GATE_PRE):
@@ -2233,7 +2097,7 @@ def _epilogue_one_tile(
         if require_constexpr(func_cfg.gu_split()):
             lin = lin + bias_tiles[ni + 1][None, :]
 
-    if require_constexpr(func_cfg.gu_split() and _NO_EPI):
+    if require_constexpr(func_cfg.gu_split() and func_cfg.epilogue != 0):
         # Ablation: the same [MBM, MBN] x 2 -> [MBM, MBN] reduction, minus exp2/rcp.
         out = sub * lin
         gl.static_assert(out.shape[1] == OUT_MBN)
@@ -2250,7 +2114,7 @@ def _epilogue_one_tile(
             FAST_RCP=tuning_cfg.ACT_FAST_RCP,
         )
         gl.static_assert(out.shape[1] == OUT_MBN)
-    elif require_constexpr(func_cfg.has_activation() and _NO_EPI):
+    elif require_constexpr(func_cfg.has_activation() and func_cfg.epilogue != 0):
         # Ablation: the same reshape/split reduction _swiglu does, minus exp2/rcp/clip.
         gelu, linear = tl.split(
             tl.reshape(sub, (sub.shape[0], sub.shape[1] // 2, 2))
@@ -2264,7 +2128,7 @@ def _epilogue_one_tile(
             act.limit,
             ADD_RESIDUAL=act.add_residual,
             FAST_RCP=tuning_cfg.ACT_FAST_RCP,
-            GROUP=_ACT_GROUP,
+            GROUP=3,
         )
         gl.static_assert(out.shape[1] == OUT_MBN)
     else:
@@ -2273,7 +2137,7 @@ def _epilogue_one_tile(
 
     offs_m = BM * block_id + mi * MBM + gl.arange(0, MBM)
     mask_m = offs_m < M_e
-    if require_constexpr(func_cfg.has_gammas and _NO_EPI < 2):
+    if require_constexpr(func_cfg.has_gammas and func_cfg.epilogue < 2):
         if require_constexpr(gamma_smem is not None):
             # Only a ds_read: the global copy that filled this ran before the K
             # loop. `out.type.layout` is the one way to name the post-swiglu
@@ -2379,7 +2243,7 @@ def _epilogue_one_tile(
                 qp_smem.slice(STAGE_ROW, MBM).store(payload)
                 qs_smem.slice(STAGE_ROW, MBM).store(scale)
             elif require_constexpr(STAGE_ONLY):
-                # _EPI_ROTATE: stage and leave it; the caller flushes this buffer one
+                # rotating epilogue: stage and leave it; the caller flushes this buffer one
                 # iteration later, after its own barrier.
                 qp_smem.store(payload)
                 qs_smem.store(scale)
@@ -2387,15 +2251,10 @@ def _epilogue_one_tile(
                 gl.barrier()
                 qp_smem.store(payload)
                 qs_smem.store(scale)
+                # Relaxed reads still require cross-wave staging-write visibility.
                 gl.barrier()
-                if require_constexpr(_EPI_RELAXED_LDS):
-                    payload_v = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                        qp_smem, PL
-                    )
-                    scale_v = gl.amd.cdna4.async_copy.load_shared_relaxed(qs_smem, SL)
-                else:
-                    payload_v = qp_smem.load(PL)
-                    scale_v = qs_smem.load(SL)
+                payload_v = gl.amd.cdna4.async_copy.load_shared_relaxed(qp_smem, PL)
+                scale_v = gl.amd.cdna4.async_copy.load_shared_relaxed(qs_smem, SL)
 
                 pm = BM * block_id + mi * MBM + gl.arange(
                     0, MBM, layout=gl.SliceLayout(1, PL)
@@ -2511,17 +2370,7 @@ def _epilogue_store(
     QSH: gl.constexpr = gl.SwizzledSharedLayout(
         vec=1, per_phase=1, max_phase=1, order=[1, 0]
     )
-    ROT: gl.constexpr = _EPI_ROTATE != 0 and func_cfg.output_quant is not None
-    gl.static_assert(
-        not (func_cfg.gu_split() and _ACT_GROUP != 1),
-        "gate_up_split and ACT_GROUP=2 are alternative repackings of the same operand "
-        "pair and the caller can only have permuted its weights for one of them",
-    )
-    gl.static_assert(
-        not (ROT and func_cfg.gu_split()),
-        "_EPI_ROTATE is inapplicable under gate_up_split: the split walk already "
-        "stages every tile before any flush, so there is no per-tile barrier to hide",
-    )
+    ROT: gl.constexpr = func_cfg.output_quant is not None and not func_cfg.gu_split()
     # Split stages the whole block, not one mini tile: NM tiles into one buffer, flushed
     # once at the end of the walk. Costs NM x the LDS (still a few KB, overlaid on the
     # dead pipeline buffers) and buys NM-1 barrier pairs and one wide store instead of
@@ -2536,7 +2385,7 @@ def _epilogue_store(
         qp_smem: gl.constexpr = None
         qs_smem: gl.constexpr = None
     if require_constexpr(ROT):
-        # Second bank for _EPI_ROTATE. Same overlay argument as above, so the footprint
+        # Second bank for rotating epilogue. Same overlay argument as above, so the footprint
         # still does not grow.
         qp_smem2 = gl.allocate_shared_memory(gl.uint8, [MBM, OUT_MBN // 2], layout=QSH)
         qs_smem2 = gl.allocate_shared_memory(
@@ -2920,7 +2769,7 @@ def _moe_gemm_body(
     # It reads every mini block of buffer 0, so it waits out that buffer's whole group
     # set -- the NB-2 buffers behind it stay in flight, the last one not yet issued.
     lds.wait_fill_lds_num_group((NB - 2) * G)
-    if require_constexpr(_MANUAL_PP):
+    if require_constexpr(tuning_cfg.MANUAL_PP):
         gl.amd.cdna4.sched_barrier(0)
         # The prologue fills are cooperative -- every wave writes a slice and then
         # reads the whole tile -- so the wait (a per-wave vmcnt retire) is not enough
@@ -3109,25 +2958,9 @@ def _moe_gemm_body(
     # what keeps every load inside K -- getting it wrong reads into the next expert's
     # weights while every correctness case still passes. The final step reads nothing and
     # just consumes the fragments still in registers.
-    # FUSE: the last step is peeled so the gate half's activation can be interleaved
-    # with its MFMAs. Legal without touching any wait count because that step alone has
-    # DO_DS_READ == False and therefore issues no wait_group -- see _FUSE_ACT_MFMA.
-    # Works with FROZEN_STEP too. The earlier exclusion assumed the snapshot owned a
-    # cross-wave rendezvous that a hand-rolled last step could desynchronise, but two
-    # things make that a non-issue. `_drain_last_fused` calls neither step
-    # implementation -- it is a standalone `_maybe_block_dot` walk -- and the step it
-    # replaces is the one with DO_LDS_LOAD == False, where the frozen copy's
-    # `MPP = DO_LDS_LOAD` is already False and it emits no barrier, no setprio and no
-    # rendezvous at all. There is nothing there to desynchronise. (Measured separately:
-    # neither build has any wave-id-dependent control flow -- zero v_mbcnt, zero
-    # cond_barrier -- and ATT shows all waves in lockstep at 4 and 8 waves, so the
-    # "cross-wave rendezvous" the old comment worried about does not exist.)
-    #
-    # The snapshot's "identical assembly" property is unaffected while FUSE is off,
-    # which is the default; with it on the frozen build changes by construction and its
-    # fingerprint has to be re-recorded.
+    # The live path fuses the final activation; the reference keeps its pinned drain.
     FUSE: gl.constexpr = (
-        _FUSE_ACT_MFMA
+        not tuning_cfg.FROZEN_STEP
         and func_cfg.gu_split()
         and tuning_cfg.num_mini_n() == 2
     )

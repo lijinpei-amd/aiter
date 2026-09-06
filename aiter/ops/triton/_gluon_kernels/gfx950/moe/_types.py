@@ -5,7 +5,7 @@
 grouped GEMMs.
 """
 
-from enum import IntEnum
+from enum import IntEnum, IntFlag
 from typing import NamedTuple
 
 from triton.experimental import gluon
@@ -17,8 +17,10 @@ from ._lang import unwrap as _unwrap
 __all__ = [
     "ActKind",
     "ActivationSpec",
+    "DSReadOperand",
     "DotKind",
     "DtypeQuant",
+    "EpilogueMode",
     "FuncSpec",
     "NonQuantExpertTensor",
     "NonQuantTokenTensor",
@@ -27,6 +29,7 @@ __all__ = [
     "ResultTensor",
     "RoutingMeta",
     "ScaleSwizzle",
+    "SchedMode",
     "TileSched",
     "TuningSpec",
     "WaitCommitScheme",
@@ -63,6 +66,45 @@ class ScaleSwizzle(IntEnum):
 class ActKind(IntEnum):
     SILU = 0  # alpha == 1.0
     SWIGLU_OAI = 1  # alpha != 1.0
+
+
+class EpilogueMode(IntEnum):
+    """Epilogue arithmetic, including shape-preserving benchmark ablations.
+
+    Both NOP modes keep the gated reduction (gate * up), output quantisation and
+    stores, so they preserve the output shape and traffic. NOP_ACTIVATION omits the
+    activation function; NOP also omits bias and gammas. Operand dequantisation,
+    including a per-tensor activation scale, still applies in every mode.
+    """
+
+    DEFAULT = 0
+    NOP_ACTIVATION = 1
+    NOP = 2
+
+
+class DSReadOperand(IntFlag):
+    """Components whose reads belong to the MFMA region instead of the memory region.
+
+    Payload and scale placement are independent for both operands. Components that
+    do not use LDS follow the same placement for their register loads.
+    """
+
+    NONE = 0
+    A = 1
+    B = 2
+    A_SCALE = 4
+    B_SCALE = 8
+    ALL = A | B | A_SCALE | B_SCALE
+
+
+class SchedMode(IntEnum):
+    """Backend scheduling hint for a K stage without compiler warp pipelining."""
+
+    NONE = 0
+    IGLP_0 = 1
+    IGLP_1 = 2
+    MFMA_16 = 3  # 4 x (16 MFMA, 6 LDS reads, 4 VMEM operations)
+    MFMA_8 = 4  # 8 x (8 MFMA, 3 LDS reads, 2 VMEM operations)
 
 
 class DotKind(IntEnum):
@@ -158,6 +200,7 @@ class FuncSpec(NamedTuple):
     # Trailing, with a default: every construction site is positional, so a new field
     # anywhere else would silently reinterpret the existing ones.
     gate_up_split: bool = False
+    epilogue: int = int(EpilogueMode.DEFAULT)
 
 
 class TuningSpec(NamedTuple):
@@ -216,6 +259,18 @@ class TuningSpec(NamedTuple):
     #: :class:`WaitCommitScheme` -- how coarsely the global->LDS copies are committed,
     #: and hence how many groups a ``wait_group`` count has to walk past.
     WAIT_COMMIT_SCHEME: int = int(WaitCommitScheme.PER_FILL)
+    #: :class:`DSReadOperand` mask; each payload and scale may move independently.
+    DS_READ_IN_MFMA: int = int(DSReadOperand.NONE)
+    SCHED_MODE: int = int(SchedMode.NONE)
+    #: Emit the manual prologue fence. Independent of WARP_PIPELINE, whose MANUAL
+    #: mode describes the per-slot rendezvous available only in the frozen step.
+    MANUAL_PP: bool = False
+    #: Run the preserved reference step instead of the live implementation.
+    FROZEN_STEP: bool = False
+    #: Advance HBM pointers per unrolled body and address its steps through soffset.
+    SOFF_UNROLL: bool = False
+    #: At a 2x2 mini-tile split, fill scales in the two middle slots.
+    SCALE_FILL_MID: bool = False
 
 
 class ActivationSpec(NamedTuple):

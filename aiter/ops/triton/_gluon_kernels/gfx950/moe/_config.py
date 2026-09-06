@@ -30,8 +30,11 @@ _SCALE_MINI_M_ENV = int(
 from ._types import (
     ActivationSpec,
     DotKind,
+    DSReadOperand,
     DtypeQuant,
+    EpilogueMode,
     ScaleSwizzle,
+    SchedMode,
     WaitCommitScheme,
     WarpPipeline,
     dq_has_scale,
@@ -208,6 +211,7 @@ class KernelFuncConfig:
     # caller's weights, weight scales and bias must be permuted to match; see
     # ``activations.py::gate_up_split_perm``.
     gate_up_split: gl.constexpr
+    epilogue: gl.constexpr  # EpilogueMode
 
     @gluon.constexpr_function
     def __init__(
@@ -224,6 +228,7 @@ class KernelFuncConfig:
         has_gather,
         has_x_static_scale,
         gate_up_split=False,
+        epilogue=int(EpilogueMode.DEFAULT),
     ):
         self.token_dtype_quant = gl.constexpr(_v(token_dtype_quant))
         self.expert_dtype_quant = gl.constexpr(_v(expert_dtype_quant))
@@ -237,6 +242,7 @@ class KernelFuncConfig:
         self.has_gather = gl.constexpr(_v(has_gather))
         self.has_x_static_scale = gl.constexpr(_v(has_x_static_scale))
         self.gate_up_split = gl.constexpr(bool(_v(gate_up_split)))
+        self.epilogue = gl.constexpr(int(_v(epilogue)))
 
     # -- activation accessors (the spec's `activation` is a NamedTuple in a constexpr,
     #    so unwrap it here rather than at every use site) --
@@ -421,6 +427,12 @@ class KernelTuningConfig:
     B_PRESHUFFLED: gl.constexpr
     ACT_FAST_RCP: gl.constexpr
     WAIT_COMMIT_SCHEME: gl.constexpr
+    DS_READ_IN_MFMA: gl.constexpr
+    SCHED_MODE: gl.constexpr
+    MANUAL_PP: gl.constexpr
+    FROZEN_STEP: gl.constexpr
+    SOFF_UNROLL: gl.constexpr
+    SCALE_FILL_MID: gl.constexpr
 
     @gluon.constexpr_function
     def __init__(
@@ -457,6 +469,12 @@ class KernelTuningConfig:
         B_PRESHUFFLED=False,
         ACT_FAST_RCP=False,
         WAIT_COMMIT_SCHEME=int(WaitCommitScheme.PER_FILL),
+        DS_READ_IN_MFMA=int(DSReadOperand.NONE),
+        SCHED_MODE=int(SchedMode.NONE),
+        MANUAL_PP=False,
+        FROZEN_STEP=False,
+        SOFF_UNROLL=False,
+        SCALE_FILL_MID=False,
     ):
         self.func_cfg = func_cfg
         self.BLOCK_M = gl.constexpr(_v(BLOCK_M))
@@ -491,6 +509,24 @@ class KernelTuningConfig:
         self.B_PRESHUFFLED = gl.constexpr(bool(_v(B_PRESHUFFLED)))
         self.ACT_FAST_RCP = gl.constexpr(bool(_v(ACT_FAST_RCP)))
         self.WAIT_COMMIT_SCHEME = gl.constexpr(int(_v(WAIT_COMMIT_SCHEME)))
+        self.DS_READ_IN_MFMA = gl.constexpr(int(_v(DS_READ_IN_MFMA)))
+        self.SCHED_MODE = gl.constexpr(int(_v(SCHED_MODE)))
+        self.MANUAL_PP = gl.constexpr(bool(_v(MANUAL_PP)))
+        self.FROZEN_STEP = gl.constexpr(bool(_v(FROZEN_STEP)))
+        self.SOFF_UNROLL = gl.constexpr(bool(_v(SOFF_UNROLL)))
+        self.SCALE_FILL_MID = gl.constexpr(bool(_v(SCALE_FILL_MID)))
+
+    @gluon.constexpr_function
+    def ds_read_in_mfma(self, operand, scale=False):
+        """Whether one component's read is assigned to the MFMA region.
+
+        ``operand`` is 0 for A (tokens), 1 for B (experts); ``scale`` selects its
+        scale rather than its payload. A component absent from a dtype emits no read.
+        """
+        operand = _v(operand)
+        assert operand in (0, 1), "operand must be 0 (A) or 1 (B)"
+        bit = 1 << (operand + (2 if _v(scale) else 0))
+        return bool(_v(self.DS_READ_IN_MFMA) & bit)
 
     @gluon.constexpr_function
     def num_warps(self):
@@ -1182,6 +1218,22 @@ class KernelTuningConfig:
         instr = _v(self.mfma_instr_shape)
         warps = _v(self.warps_per_cta)
         tiles = _v(self.tiles_per_warp)
+
+        assert _v(fc.epilogue) in (
+            int(EpilogueMode.DEFAULT),
+            int(EpilogueMode.NOP_ACTIVATION),
+            int(EpilogueMode.NOP),
+        ), f"epilogue {_v(fc.epilogue)} is not an EpilogueMode"
+        assert _v(self.DS_READ_IN_MFMA) >= 0 and not (
+            _v(self.DS_READ_IN_MFMA) & ~int(DSReadOperand.ALL)
+        ), f"DS_READ_IN_MFMA {_v(self.DS_READ_IN_MFMA)} has unknown operand bits"
+        assert _v(self.SCHED_MODE) in (
+            int(SchedMode.NONE),
+            int(SchedMode.IGLP_0),
+            int(SchedMode.IGLP_1),
+            int(SchedMode.MFMA_16),
+            int(SchedMode.MFMA_8),
+        ), f"SCHED_MODE {_v(self.SCHED_MODE)} is not a SchedMode"
 
         # -- host preconditions (no N tail, no K tail; only the even case exists) --
         assert N % BN == 0, f"N {N} % BLOCK_N {BN} != 0; the wrapper must fall back"
