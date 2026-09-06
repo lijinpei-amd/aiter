@@ -12,6 +12,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._config import (
     KernelFuncConfig,
     KernelTuningConfig,
 )
+from aiter.ops.triton._gluon_kernels.gfx950.moe._entry import MoeKernelConfig
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     ActivationSpec,
     ActKind,
@@ -23,7 +24,6 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     TuningSpec,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_gemm import (
-    MoeKernelConfig,
     _build_configs,
     _PipelinePointers,
     _PipelineRegFragments,
@@ -138,8 +138,8 @@ def test_pipeline_state_aggregates_round_trip_separately(has_scales):
         "b_hbm_ptr",
         "a_scale_hbm_ptr",
         "b_scale_hbm_ptr",
-        "a_scale_read_hbm_ptr",
-        "b_scale_read_hbm_ptr",
+        "a_scale_direct_hbm_ptr",
+        "b_scale_direct_hbm_ptr",
     )
     pointer_values = [gl.tensor(object(), gl.pointer_type(gl.uint8)) for _ in range(6)]
     if not has_scales:

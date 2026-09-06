@@ -32,6 +32,11 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._config import (
     KernelFuncConfig,
     KernelTuningConfig,
 )
+from aiter.ops.triton._gluon_kernels.gfx950.moe._entry import (
+    MoeKernelConfig,
+    _moe_gluon_gemm1,
+    _moe_gluon_gemm2,
+)
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     ActivationSpec,
     ActKind,
@@ -50,11 +55,6 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     WaitCommitScheme,
     WarpPipeline,
     dq_pack_divisor,
-)
-from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_gemm import (
-    MoeKernelConfig,
-    _moe_gluon_gemm1,
-    _moe_gluon_gemm2,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.logger import AiterTritonLogger

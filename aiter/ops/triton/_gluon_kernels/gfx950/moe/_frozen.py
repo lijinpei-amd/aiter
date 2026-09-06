@@ -18,7 +18,7 @@ The shared pointer and register aggregates are adapted at the step boundary; the
 snapshot's scheduling statements, including its separate prologue fence, stay fixed.
 
 This module is imported from the *bottom* of ``moe_gemm``: the snapshot calls back into
-the shared, non-frozen halves of the kernel (``_slot_a_read``, ``_maybe_block_dot``, the
+the shared, non-frozen halves of the kernel (``_ds_read_a``, ``_maybe_block_dot``, the
 placement helpers), so the cycle is only breakable in that direction.
 """
 
@@ -28,14 +28,14 @@ from triton.experimental.gluon import language as gl
 from ._lang import require_constexpr
 from ._lang import unwrap as _v
 from .moe_gemm import (
-    _fill_order,
-    _fill_tile_of,
+    _buffer_load_order,
+    _buffer_load_tile,
+    _ds_read_a,
+    _ds_read_b,
     _make_reg_fragments,
     _maybe_block_dot,
     _opt_at,
     _PipelinePointers,
-    _slot_a_read,
-    _slot_b_read,
     _slot_index,
     _take_pairs,
     _take_reg_pairs,
@@ -58,15 +58,15 @@ def _frozen_prologue_fence():
 # compiles (validate() insists), which is what the frozen EVEN test amounted to.
 # ------------------------------------------------------------------------------
 @gluon.constexpr_function
-def _fill_group_pos_frozen(is_a, i, NM, NN):
+def _buffer_load_group_pos_frozen(is_a, i, NM, NN):
     """Position of one mini-block fill's commit group inside its stage."""
     is_a, i = _v(is_a), _v(i)
-    order = _fill_order(NM, NN)
+    order = _buffer_load_order(NM, NN)
     return order.index((1 if is_a else 0, i))
 
 
 @gluon.constexpr_function
-def _fills_before_frozen(mi, ni, NM, NN, ANY):
+def _buffer_loads_before_frozen(mi, ni, NM, NN, ANY):
     """Groups this stage has already committed when slot ``(mi, ni)`` is reached.
 
     Counted against the N-outer walk of :func:`_slot_index`. Legacy issues A(m) at
@@ -80,28 +80,28 @@ def _fills_before_frozen(mi, ni, NM, NN, ANY):
 
 
 @gluon.constexpr_function
-def _read_a_tile_frozen(mi, ni, NM, NN):
+def _ds_read_a_tile_frozen(mi, ni, NM, NN):
     """Operand-A mini block slot ``(mi, ni)`` reads out of LDS, or None.
 
     Even: the same one-per-slot assignment the fills use, so a slot's fill and its read
-    name the *same* position in :func:`_fill_order`. Its wait then works out to
+    name the *same* position in :func:`_buffer_load_order`. Its wait then works out to
     ``G - 1 - s + STAGES_BETWEEN * G + s`` -- the ``s`` cancels and every slot waits on
     the same constant, which is exactly the uniform ``wait_group`` the reference kernel
     uses. Legacy: A(mi) at ``ni == 0``, which bunches both reads onto slot (0, 0).
     """
     mi, ni, NM, NN = _v(mi), _v(ni), _v(NM), _v(NN)
-    return _fill_tile_of(_slot_fill_pos_frozen(mi, ni, NM, NN), NM, NN, True)
+    return _buffer_load_tile(_buffer_load_pos_frozen(mi, ni, NM, NN), NM, NN, True)
 
 
 @gluon.constexpr_function
-def _read_b_tile_frozen(mi, ni, NM, NN):
+def _ds_read_b_tile_frozen(mi, ni, NM, NN):
     """Operand-B mini block slot ``(mi, ni)`` reads out of LDS, or None."""
     mi, ni, NM, NN = _v(mi), _v(ni), _v(NM), _v(NN)
-    return _fill_tile_of(_slot_fill_pos_frozen(mi, ni, NM, NN), NM, NN, False)
+    return _buffer_load_tile(_buffer_load_pos_frozen(mi, ni, NM, NN), NM, NN, False)
 
 
 @gluon.constexpr_function
-def _scale_fill_slot_frozen(is_a, tile, NM, NN):
+def _scale_buffer_load_slot_frozen(is_a, tile, NM, NN):
     """Slot index that issues the scale copy for A(tile) / B(tile).
 
     Default: the same slot as the payload, so a tile's scale and payload share one
@@ -112,12 +112,12 @@ def _scale_fill_slot_frozen(is_a, tile, NM, NN):
     NM, NN = _v(NM), _v(NN)
     if 1 and NM == 2 and NN == 2:
         return 1 + tile
-    return _fill_group_pos_frozen(is_a, tile, NM, NN)
+    return _buffer_load_group_pos_frozen(is_a, tile, NM, NN)
 
 
 @gluon.constexpr_function
-def _slot_fill_pos_frozen(mi, ni, NM, NN):
-    """Which fill (position in :func:`_fill_order`) slot ``(mi, ni)`` issues, or None.
+def _buffer_load_pos_frozen(mi, ni, NM, NN):
+    """Which fill (position in :func:`_buffer_load_order`) slot ``(mi, ni)`` issues, or None.
 
     Even: one fill per slot, in flat slot order -- exactly the tutorial's layout, where
     each of the four ``mfma``/``mem`` region pairs moves one tile and commits one group.
@@ -130,23 +130,23 @@ def _slot_fill_pos_frozen(mi, ni, NM, NN):
 
 
 @gluon.constexpr_function
-def _slot_scale_fills_frozen(mi, ni, NM, NN, want_a):
+def _scale_buffer_load_tile_frozen(mi, ni, NM, NN, want_a):
     """Tile whose A (resp. B) scale copy slot ``(mi, ni)`` issues, or None.
 
     Still one slot per mini block even when several share a scale tile: the commit
-    group has to be emitted either way, because _slot_wait counts G = NM + NN groups
-    per stage. fill_a_scale_lds drops the redundant *copy* and leaves the group empty.
+    group has to be emitted either way, because _buffer_load_wait counts G = NM + NN groups
+    per stage. buffer_load_a_scale drops the redundant *copy* and leaves the group empty.
     """
     s = _slot_index(mi, ni, NM, NN)
     n = NM if _v(want_a) else NN
     for t in range(_v(n)):
-        if _scale_fill_slot_frozen(_v(want_a), t, NM, NN) == s:
+        if _scale_buffer_load_slot_frozen(_v(want_a), t, NM, NN) == s:
             return t
     return None
 
 
 @gluon.constexpr_function
-def _slot_wait_frozen(mi, ni, NM, NN, STAGES_BETWEEN, ANY_FILL):
+def _buffer_load_wait_frozen(mi, ni, NM, NN, STAGES_BETWEEN, ANY_BUFFER_LOAD):
     """Outstanding-group count that retires everything slot ``(mi, ni)`` is about to read.
 
     A group is retired once ``wait_group(n)`` leaves at most ``n`` behind it. Counting
@@ -157,28 +157,36 @@ def _slot_wait_frozen(mi, ni, NM, NN, STAGES_BETWEEN, ANY_FILL):
     """
     mi, ni, NM, NN = _v(mi), _v(ni), _v(NM), _v(NN)
     G = NM + NN
-    base = _v(STAGES_BETWEEN) * G + _fills_before_frozen(mi, ni, NM, NN, ANY_FILL)
+    base = _v(STAGES_BETWEEN) * G + _buffer_loads_before_frozen(
+        mi, ni, NM, NN, ANY_BUFFER_LOAD
+    )
     out = None
-    ta = _read_a_tile_frozen(mi, ni, NM, NN)
+    ta = _ds_read_a_tile_frozen(mi, ni, NM, NN)
     if ta is not None:
         # The payload and the scale of the same tile can sit in different commit
-        # groups (see _scale_fill_slot); the later of the two is what has to retire.
-        p = max(_fill_group_pos_frozen(True, ta, NM, NN), _scale_fill_slot_frozen(True, ta, NM, NN))
+        # groups (see _scale_buffer_load_slot); the later of the two is what has to retire.
+        p = max(
+            _buffer_load_group_pos_frozen(True, ta, NM, NN),
+            _scale_buffer_load_slot_frozen(True, ta, NM, NN),
+        )
         out = G - 1 - p + base
-    tb = _read_b_tile_frozen(mi, ni, NM, NN)
+    tb = _ds_read_b_tile_frozen(mi, ni, NM, NN)
     if tb is not None:
-        p = max(_fill_group_pos_frozen(False, tb, NM, NN), _scale_fill_slot_frozen(False, tb, NM, NN))
+        p = max(
+            _buffer_load_group_pos_frozen(False, tb, NM, NN),
+            _scale_buffer_load_slot_frozen(False, tb, NM, NN),
+        )
         w = G - 1 - p + base
         out = w if out is None else min(out, w)
     return out
 
 
 @gluon.constexpr_function
-def _stage_wait_frozen(NM, NN, STAGES_BETWEEN, ANY_FILL):
+def _stage_buffer_load_wait_frozen(NM, NN, STAGES_BETWEEN, ANY_BUFFER_LOAD):
     """Strongest (smallest) wait_group count over all slots of a stage."""
     NM, NN = _v(NM), _v(NN)
     ws = [
-        _slot_wait_frozen(mi, ni, NM, NN, STAGES_BETWEEN, ANY_FILL)
+        _buffer_load_wait_frozen(mi, ni, NM, NN, STAGES_BETWEEN, ANY_BUFFER_LOAD)
         for ni in range(NN)
         for mi in range(NM)
     ]
@@ -189,26 +197,28 @@ def _stage_wait_frozen(NM, NN, STAGES_BETWEEN, ANY_FILL):
 
 
 @gluon.jit
-def _stage_wait_group_frozen(
-    lds,
+def _stage_buffer_load_wait_group_frozen(
+    lds_ptrs,
     mi: gl.constexpr,
     ni: gl.constexpr,
     NM: gl.constexpr,
     NN: gl.constexpr,
     STAGES_BETWEEN: gl.constexpr,
-    ANY_FILL: gl.constexpr,
+    ANY_BUFFER_LOAD: gl.constexpr,
     WAIT_SLACK: gl.constexpr = 0,
 ):
     """One wait_group per stage, emitted at its first slot, instead of one per slot."""
-    WAIT: gl.constexpr = _stage_wait_frozen(NM, NN, STAGES_BETWEEN, ANY_FILL)
+    WAIT: gl.constexpr = _stage_buffer_load_wait_frozen(
+        NM, NN, STAGES_BETWEEN, ANY_BUFFER_LOAD
+    )
     if require_constexpr(_slot_index(mi, ni, NM, NN) == 0 and WAIT is not None):
-        lds.wait_fill_lds_num_group(WAIT + WAIT_SLACK)
+        lds_ptrs.wait_buffer_load_groups(WAIT + WAIT_SLACK)
 
 
 @gluon.jit
-def _slot_fills_frozen(
+def _buffer_load_frozen(
     pc,
-    BUFFER_LOAD_INX,
+    BUFFER_LOAD_IDX,
     mi: gl.constexpr,
     ni: gl.constexpr,
     a_hbm_ptr,
@@ -221,7 +231,7 @@ def _slot_fills_frozen(
 ):
     """The global->LDS copies slot ``(mi, ni)`` owns, each its own commit group.
 
-    FROZEN SNAPSHOT -- do not refactor; ``_slot_fills`` is the live one.
+    FROZEN SNAPSHOT -- do not refactor; ``_buffer_load`` is the live one.
 
     Specialised on the flags the ~625 us kernel ran with, so nothing here reads
     os.environ: a commit group per fill (what ``WaitCommitScheme.PER_FILL`` now names,
@@ -240,64 +250,64 @@ def _slot_fills_frozen(
     NM: gl.constexpr = pc.tuning_cfg.num_mini_m()
     NN: gl.constexpr = pc.tuning_cfg.num_mini_n()
     # Under the even schedule the slot owns at most one fill, named by its position in
-    # _fill_order; under the legacy one the (ni == 0) / (mi == 0) predicates below pick.
-    POS: gl.constexpr = _slot_fill_pos_frozen(mi, ni, NM, NN)
-    A_TILE: gl.constexpr = _fill_tile_of(POS, NM, NN, True)
-    B_TILE: gl.constexpr = _fill_tile_of(POS, NM, NN, False)
+    # _buffer_load_order; under the legacy one the (ni == 0) / (mi == 0) predicates below pick.
+    POS: gl.constexpr = _buffer_load_pos_frozen(mi, ni, NM, NN)
+    A_TILE: gl.constexpr = _buffer_load_tile(POS, NM, NN, True)
+    B_TILE: gl.constexpr = _buffer_load_tile(POS, NM, NN, False)
     # Scale copies may be placed on a different slot than their payload.
-    A_SC: gl.constexpr = _slot_scale_fills_frozen(mi, ni, NM, NN, True)
-    B_SC: gl.constexpr = _slot_scale_fills_frozen(mi, ni, NM, NN, False)
+    A_SC: gl.constexpr = _scale_buffer_load_tile_frozen(mi, ni, NM, NN, True)
+    B_SC: gl.constexpr = _scale_buffer_load_tile_frozen(mi, ni, NM, NN, False)
     # Byte displacement of this step from the body's base pointer. The *_step values are
     # in elements (they are added to a typed pointer), soffset is in bytes, so each is
     # scaled by its operand's storage width. All constexpr, so these fold into a literal
     # and the SGPR holding them is hoisted out of the loop.
     # SOFF_UNROLL = 0: every copy addresses its own base, no soffset.
     if require_constexpr(A_TILE is not None):
-        pc.lds.fill_a_payload_lds(
-            BUFFER_LOAD_INX, A_TILE, a_hbm_ptr, pc.a_offs[A_TILE], 0
+        pc.lds_ptrs.buffer_load_a_payload(
+            BUFFER_LOAD_IDX, A_TILE, a_hbm_ptr, pc.a_hbm_offs[A_TILE], 0
         )
         # Payload and its own scale share one commit group; a scale placed elsewhere
         # gets its own below.
         if require_constexpr(A_SC == A_TILE):
-            pc.lds.fill_a_scale_lds(
-                BUFFER_LOAD_INX,
+            pc.lds_ptrs.buffer_load_a_scale(
+                BUFFER_LOAD_IDX,
                 A_TILE,
                 a_scale_hbm_ptr,
-                _opt_at(pc.a_scale_offs, A_TILE, func_cfg.a_has_scale()),
+                _opt_at(pc.a_scale_hbm_offs, A_TILE, func_cfg.a_has_scale()),
                 0,
             )
-        pc.lds.commit_fill_lds()
+        pc.lds_ptrs.commit_buffer_load()
     if require_constexpr(A_SC is not None and A_SC != A_TILE):
-        pc.lds.fill_a_scale_lds(
-            BUFFER_LOAD_INX,
+        pc.lds_ptrs.buffer_load_a_scale(
+            BUFFER_LOAD_IDX,
             A_SC,
             a_scale_hbm_ptr,
-            _opt_at(pc.a_scale_offs, A_SC, func_cfg.a_has_scale()),
+            _opt_at(pc.a_scale_hbm_offs, A_SC, func_cfg.a_has_scale()),
             0,
         )
-        pc.lds.commit_fill_lds()
+        pc.lds_ptrs.commit_buffer_load()
     if require_constexpr(B_TILE is not None):
-        pc.lds.fill_b_payload_lds(
-            BUFFER_LOAD_INX, B_TILE, b_hbm_ptr, pc.b_offs[B_TILE], 0
+        pc.lds_ptrs.buffer_load_b_payload(
+            BUFFER_LOAD_IDX, B_TILE, b_hbm_ptr, pc.b_hbm_offs[B_TILE], 0
         )
         if require_constexpr(B_SC == B_TILE):
-            pc.lds.fill_b_scale_lds(
-                BUFFER_LOAD_INX,
+            pc.lds_ptrs.buffer_load_b_scale(
+                BUFFER_LOAD_IDX,
                 B_TILE,
                 b_scale_hbm_ptr,
-                _opt_at(pc.b_scale_offs, B_TILE, func_cfg.b_has_scale()),
+                _opt_at(pc.b_scale_hbm_offs, B_TILE, func_cfg.b_has_scale()),
                 0,
             )
-        pc.lds.commit_fill_lds()
+        pc.lds_ptrs.commit_buffer_load()
     if require_constexpr(B_SC is not None and B_SC != B_TILE):
-        pc.lds.fill_b_scale_lds(
-            BUFFER_LOAD_INX,
+        pc.lds_ptrs.buffer_load_b_scale(
+            BUFFER_LOAD_IDX,
             B_SC,
             b_scale_hbm_ptr,
-            _opt_at(pc.b_scale_offs, B_SC, func_cfg.b_has_scale()),
+            _opt_at(pc.b_scale_hbm_offs, B_SC, func_cfg.b_has_scale()),
             0,
         )
-        pc.lds.commit_fill_lds()
+        pc.lds_ptrs.commit_buffer_load()
     if require_constexpr(ADVANCE):
         # One bump per step: the frozen kernel did not fold steps into soffset.
         a_hbm_ptr = a_hbm_ptr + KU * pc.a_step
@@ -312,10 +322,10 @@ def _slot_fills_frozen(
 @gluon.jit
 def _pipeline_step_frozen(
     pc,
-    ptrs,
+    hbm_ptrs,
     regs,
-    BUFFER_LOAD_INX,
-    DS_READ_INX,
+    BUFFER_LOAD_IDX,
+    DS_READ_IDX,
     STAGES_BETWEEN: gl.constexpr,
     DO_BUFFER_LOAD: gl.constexpr,
     DO_DS_READ: gl.constexpr,
@@ -353,7 +363,7 @@ def _pipeline_step_frozen(
     layout.
 
     Every fill is its own commit group, so each slot waits for exactly the mini block it
-    is about to read rather than for the whole stage -- see :func:`_slot_wait`, whose
+    is about to read rather than for the whole stage -- see :func:`_buffer_load_wait`, whose
     ``STAGES_BETWEEN`` is ``NUM_LDS_BUFFER - 2`` in the steady state (one buffer is being
     filled by ``buffer_load ... lds`` while one is being consumed by ``ds_read``).
 
@@ -433,12 +443,12 @@ def _pipeline_step_frozen(
     KIE: gl.constexpr = 0
     KUE: gl.constexpr = 1
 
-    a_hbm_ptr = ptrs.a_hbm_ptr
-    b_hbm_ptr = ptrs.b_hbm_ptr
-    a_scale_hbm_ptr = ptrs.a_scale_hbm_ptr
-    b_scale_hbm_ptr = ptrs.b_scale_hbm_ptr
-    a_scale_read_hbm_ptr = ptrs.a_scale_read_hbm_ptr
-    b_scale_read_hbm_ptr = ptrs.b_scale_read_hbm_ptr
+    a_hbm_ptr = hbm_ptrs.a_hbm_ptr
+    b_hbm_ptr = hbm_ptrs.b_hbm_ptr
+    a_scale_hbm_ptr = hbm_ptrs.a_scale_hbm_ptr
+    b_scale_hbm_ptr = hbm_ptrs.b_scale_hbm_ptr
+    a_scale_direct_hbm_ptr = hbm_ptrs.a_scale_direct_hbm_ptr
+    b_scale_direct_hbm_ptr = hbm_ptrs.b_scale_direct_hbm_ptr
 
     # Fragments this step reads, appended mini block by mini block. `a_cur` grows once
     # per mi (at ni == 0) and `b_cur` once per ni (at mi == 0), so block `mi` always
@@ -461,8 +471,15 @@ def _pipeline_step_frozen(
                 gl.amd.cdna4.sched_barrier(0)
             # _STAGE_WAIT = 1, so the per-slot wait form never applied.
             if require_constexpr(DO_DS_READ):
-                _stage_wait_group_frozen(
-                    pc.lds, mi, ni, NM, NN, STAGES_BETWEEN, DO_BUFFER_LOAD, WAIT_SLACK
+                _stage_buffer_load_wait_group_frozen(
+                    pc.lds_ptrs,
+                    mi,
+                    ni,
+                    NM,
+                    NN,
+                    STAGES_BETWEEN,
+                    DO_BUFFER_LOAD,
+                    WAIT_SLACK,
                 )
 
             if require_constexpr(DO_MFMA):
@@ -526,20 +543,24 @@ def _pipeline_step_frozen(
                 DO_MFMA,
             )
             if require_constexpr(MPP):
-                if require_constexpr(_read_a_tile_frozen(mi, ni, NM, NN) is not None):
-                    a_cur = a_cur + _slot_a_read(
+                if require_constexpr(
+                    _ds_read_a_tile_frozen(mi, ni, NM, NN) is not None
+                ):
+                    a_cur = a_cur + _ds_read_a(
                         pc,
-                        DS_READ_INX,
-                        _read_a_tile_frozen(mi, ni, NM, NN),
-                        a_scale_read_hbm_ptr,
+                        DS_READ_IDX,
+                        _ds_read_a_tile_frozen(mi, ni, NM, NN),
+                        a_scale_direct_hbm_ptr,
                         False,
                     )
-                if require_constexpr(_read_b_tile_frozen(mi, ni, NM, NN) is not None):
-                    b_cur = b_cur + _slot_b_read(
+                if require_constexpr(
+                    _ds_read_b_tile_frozen(mi, ni, NM, NN) is not None
+                ):
+                    b_cur = b_cur + _ds_read_b(
                         pc,
-                        DS_READ_INX,
-                        _read_b_tile_frozen(mi, ni, NM, NN),
-                        b_scale_read_hbm_ptr,
+                        DS_READ_IDX,
+                        _ds_read_b_tile_frozen(mi, ni, NM, NN),
+                        b_scale_direct_hbm_ptr,
                         False,
                     )
             acc = acc + (slot_acc,)
@@ -550,18 +571,16 @@ def _pipeline_step_frozen(
                     b_hbm_ptr,
                     a_scale_hbm_ptr,
                     b_scale_hbm_ptr,
-                ) = _slot_fills_frozen(
+                ) = _buffer_load_frozen(
                     pc,
-                    BUFFER_LOAD_INX,
+                    BUFFER_LOAD_IDX,
                     mi,
                     ni,
                     a_hbm_ptr,
                     b_hbm_ptr,
                     a_scale_hbm_ptr,
                     b_scale_hbm_ptr,
-                    ADVANCE=(mi == NM - 1)
-                    and (ni == NN - 1)
-                    and (KIE == KUE - 1),
+                    ADVANCE=(mi == NM - 1) and (ni == NN - 1) and (KIE == KUE - 1),
                     KI=KIE,
                     KU=KUE,
                 )
@@ -569,19 +588,19 @@ def _pipeline_step_frozen(
             # even schedule slot (0, 1) reads B(0), not B(1), so the legacy `ni == 0` /
             # `mi == 0` predicates would reach past the end of the half-built tuple.
             if require_constexpr(
-                DO_DS_READ and _read_a_tile_frozen(mi, ni, NM, NN) is not None
+                DO_DS_READ and _ds_read_a_tile_frozen(mi, ni, NM, NN) is not None
             ):
                 a_tail = a_tail + _take_pairs(
                     a_cur,
-                    _read_a_tile_frozen(mi, ni, NM, NN) * NUM_MINI + HEAD_MINI,
+                    _ds_read_a_tile_frozen(mi, ni, NM, NN) * NUM_MINI + HEAD_MINI,
                     PF_MINI,
                 )
             if require_constexpr(
-                DO_DS_READ and _read_b_tile_frozen(mi, ni, NM, NN) is not None
+                DO_DS_READ and _ds_read_b_tile_frozen(mi, ni, NM, NN) is not None
             ):
                 b_tail = b_tail + _take_pairs(
                     b_cur,
-                    _read_b_tile_frozen(mi, ni, NM, NN) * NUM_MINI + HEAD_MINI,
+                    _ds_read_b_tile_frozen(mi, ni, NM, NN) * NUM_MINI + HEAD_MINI,
                     PF_MINI,
                 )
 
@@ -589,12 +608,12 @@ def _pipeline_step_frozen(
 
     if require_constexpr(DO_DS_READ):
         if require_constexpr(A_HAS):
-            a_scale_read_hbm_ptr = (
-                a_scale_read_hbm_ptr + pc.s_step * pc.a_scale_stride_k
+            a_scale_direct_hbm_ptr = (
+                a_scale_direct_hbm_ptr + pc.s_step * pc.a_scale_stride_k
             )
         if require_constexpr(B_HAS):
-            b_scale_read_hbm_ptr = (
-                b_scale_read_hbm_ptr + pc.s_step * pc.b_scale_stride_k
+            b_scale_direct_hbm_ptr = (
+                b_scale_direct_hbm_ptr + pc.s_step * pc.b_scale_stride_k
             )
     else:
         a_tail = _take_reg_pairs(regs.a_payload, regs.a_scale, 0, NM * PF_MINI)
@@ -605,6 +624,6 @@ def _pipeline_step_frozen(
         b_hbm_ptr,
         a_scale_hbm_ptr,
         b_scale_hbm_ptr,
-        a_scale_read_hbm_ptr,
-        b_scale_read_hbm_ptr,
+        a_scale_direct_hbm_ptr,
+        b_scale_direct_hbm_ptr,
     ), _make_reg_fragments(a_tail, b_tail, acc)
