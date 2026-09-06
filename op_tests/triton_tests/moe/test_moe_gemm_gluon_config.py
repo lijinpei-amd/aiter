@@ -25,6 +25,8 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
 from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_gemm import (
     MoeKernelConfig,
     _build_configs,
+    _PipelinePointers,
+    _PipelineRegFragments,
 )
 from aiter.ops.triton.moe import moe_op_gemm_gluon as host
 
@@ -84,9 +86,9 @@ def _plain(value):
 @pytest.mark.parametrize(
     "field,value",
     [
+        ("B_PRESHUFFLED", True),
         ("DS_READ_IN_MFMA", int(DSReadOperand.B | DSReadOperand.A_SCALE)),
         ("SCHED_MODE", int(SchedMode.MFMA_16)),
-        ("MANUAL_PP", True),
         ("FROZEN_STEP", True),
         ("SOFF_UNROLL", True),
         ("SCALE_FILL_MID", True),
@@ -112,19 +114,63 @@ def test_host_and_kernel_config_field_order(config, field, value):
             assert _plain(getattr(aggregate, name)) == _plain(expected), name
 
 
-def test_legacy_specs_and_config_dict_keep_defaults(config):
+def test_trailing_fields_and_older_config_dict_keep_defaults(config):
     func = FuncSpec(*_func_spec()[:12])
     assert func.epilogue == EpilogueMode.DEFAULT
-    old_config = {name: config[name] for name in TuningSpec._fields[:31]}
+    old_config = {name: config[name] for name in TuningSpec._fields[:30]}
     tuning = _tuning_spec(old_config)
-    assert tuning == TuningSpec(*tuning[:31])
-    assert tuning[31:] == (0, 0, False, False, False, False)
+    assert tuning == TuningSpec(*tuning[:30])
+    assert tuning[30:] == (0, 0, False, False, False)
     fc = KernelFuncConfig(*func[:12])
-    tc = KernelTuningConfig(fc, *tuning[:31])
+    tc = KernelTuningConfig(fc, *tuning[:30])
     assert _plain(fc.epilogue) == EpilogueMode.DEFAULT
-    for name in TuningSpec._fields[31:]:
+    for name in TuningSpec._fields[30:]:
         assert _plain(getattr(tc, name)) == getattr(tuning, name)
     assert _plain(tc.validate(4096, 7168))
+
+
+@pytest.mark.parametrize("has_scales", [False, True])
+def test_pipeline_state_aggregates_round_trip_separately(has_scales):
+    # Opaque handles need no GPU or IR builder. Real Triton tensors still exercise
+    # the aggregate types used to flatten and rebuild values across device calls.
+    pointer_names = (
+        "a_hbm_ptr",
+        "b_hbm_ptr",
+        "a_scale_hbm_ptr",
+        "b_scale_hbm_ptr",
+        "a_scale_read_hbm_ptr",
+        "b_scale_read_hbm_ptr",
+    )
+    pointer_values = [gl.tensor(object(), gl.pointer_type(gl.uint8)) for _ in range(6)]
+    if not has_scales:
+        pointer_values[2:] = [None] * 4
+    pointers = _PipelinePointers(*pointer_values)
+    fragment_names = ("a_payload", "a_scale", "b_payload", "b_scale", "acc")
+    fragment_values = [
+        gl.tuple([gl.tensor(object(), dtype) for _ in range(2)])
+        for dtype in (gl.uint8, gl.uint8, gl.uint8, gl.uint8, gl.float32)
+    ]
+    fragments = _PipelineRegFragments(*fragment_values)
+    states = gl.tuple((pointers, fragments))
+    handles = []
+    states._flatten_ir(handles)
+    expected = [value.handle for value in pointer_values if value is not None]
+    expected += [value.handle for values in fragment_values for value in values]
+    assert handles == expected
+    restored, cursor = states.type._unflatten_ir(handles, 0)
+    assert cursor == len(handles)
+    assert tuple(name for name, _ in restored[0].type.fields) == pointer_names
+    assert tuple(name for name, _ in restored[1].type.fields) == fragment_names
+    for name, value in zip(pointer_names, pointer_values):
+        actual = getattr(restored[0], name)
+        if value is None:
+            assert isinstance(actual, gl.constexpr) and actual.value is None
+        else:
+            assert actual.handle is value.handle
+    for name, values in zip(fragment_names, fragment_values):
+        assert [value.handle for value in getattr(restored[1], name)] == [
+            value.handle for value in values
+        ]
 
 
 @pytest.mark.parametrize("mask", range(16))
@@ -168,7 +214,6 @@ def test_legacy_read_placement_translation(monkeypatch, settings, expected):
 def test_legacy_schedule_settings_reach_the_tuning_spec(monkeypatch):
     for name, value in {
         "SCHED_MODE": "4",
-        "MANUAL_PP": "1",
         "FROZEN_STEP": "1",
         "SOFF_UNROLL": "1",
         "SCALE_FILL_MID": "1",
@@ -177,7 +222,22 @@ def test_legacy_schedule_settings_reach_the_tuning_spec(monkeypatch):
     config = host.get_gluon_config_uncached(
         128, 4096, 7168, DtypeQuant.MXFP4, DtypeQuant.MXFP4
     )
-    assert _tuning_spec(config)[32:] == (SchedMode.MFMA_8, True, True, True, True)
+    assert _tuning_spec(config)[31:] == (SchedMode.MFMA_8, True, True, True)
+
+
+@pytest.mark.parametrize("field", ["MANUAL_PP", "B_IN_REG"])
+def test_removed_controls_do_not_change_tuning(config, monkeypatch, field):
+    baseline = host.get_gluon_config_uncached(
+        128, 4096, 7168, DtypeQuant.MXFP4, DtypeQuant.MXFP4
+    )
+    monkeypatch.setenv("AITER_TRITON_MOE_GLUON_" + field, "1")
+    actual = host.get_gluon_config_uncached(
+        128, 4096, 7168, DtypeQuant.MXFP4, DtypeQuant.MXFP4
+    )
+    assert actual == baseline
+    assert field not in actual
+    assert field not in TuningSpec._fields
+    assert _tuning_spec({**config, field: True}) == _tuning_spec(config)
 
 
 @pytest.mark.parametrize("epilogue", list(EpilogueMode))

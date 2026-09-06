@@ -3,11 +3,10 @@
 
 """Re-run the tuned gfx950 Gluon MoE GEMM1 configuration: perf and correctness.
 
-The kernel is selected entirely by environment variables, and the tuned set is neither
-the default nor derivable from the code -- reconstructing it by hand costs about 45 us,
-because ``WAIT_COMMIT_SCHEME``, ``MPP_CLOSE_BARRIER`` and ``TRITON_MEMBAR_DEDUP_BARE`` are all
-easy to leave out and all matter. ``BEST`` below is that set, recorded so the number is
-reproducible; see the comments there for what each of the non-obvious ones buys.
+The host launcher translates this script's environment variables into kernel tuning
+configuration. ``BEST`` records the tuned recipe, including ``WAIT_COMMIT_SCHEME``
+and ``TRITON_MEMBAR_DEDUP_BARE``, so measurements can be reproduced. The frozen
+reference owns its fixed rendezvous schedule.
 
 Perf is measured the way the reported numbers were: ``rocprofv3 --kernel-trace`` over a
 saturating back-to-back launch loop, median of the dispatch durations with the warmup
@@ -46,8 +45,7 @@ TEST_FILE = "op_tests/triton_tests/moe/test_moe_gemm_a4w4.py"
 #: The tuned flag set. Everything here is a deviation from the default that was measured
 #: to matter; the ones worth calling out:
 #:   SHUFFLED_W_SCALES -- the CDNA4_SCALE weight-scale preshuffle.
-#:   WAIT_COMMIT_SCHEME / MPP_CLOSE_BARRIER / MPP_BARRIER_STRIDE=4 -- together these give
-#:     three barriers per K loop body instead of twelve.
+#:   WAIT_COMMIT_SCHEME -- the copy-commit and wait granularity for the live step.
 #: The two occupancy knobs live in PER_WARPS below rather than here, because they are
 #: only safe at 8 waves; see the comment there.
 BEST = {
@@ -67,16 +65,10 @@ BEST = {
     "AITER_TRITON_MOE_GLUON_WARP_PIPELINE": "0",
     "AITER_TRITON_MOE_GLUON_DS_IN_MFMA": "1",
     "AITER_TRITON_MOE_GLUON_ACT_FAST_RCP": "1",
-    # Selects the implementation when WARP_PIPELINE=1: 1 = hand-emitted rendezvous,
-    # 0 = the warp-pipeline pass. Inert while WARP_PIPELINE=0. Measured with the
-    # master on: manual ~652/659 us (8/4 wave), pass-driven ~701/699.
-    "AITER_TRITON_MOE_GLUON_MANUAL_PP": "1",
-    "AITER_TRITON_MOE_GLUON_MPP_BARRIER_STRIDE": "4",
-    "AITER_TRITON_MOE_GLUON_MPP_CLOSE_BARRIER": "0",
     # WaitCommitScheme.PER_FILL: a commit group per copy, and one wait_group per K
     # stage rather than one per slot. Was ONE_MARK=0 + STAGE_WAIT=1, which are now one
     # knob -- the wait count is measured in commit groups, so the two were never
-    # independent. Still active without MPP: the wait is gated on DO_DS_READ only.
+    # independent. The wait is gated on DO_DS_READ only.
     "AITER_TRITON_MOE_GLUON_WAIT_COMMIT_SCHEME": "1",
     "TRITON_MEMBAR_DEDUP_BARE": "1",
 }

@@ -205,8 +205,8 @@ class FuncSpec(NamedTuple):
 
 class TuningSpec(NamedTuple):
     """Plain-Python mirror of :class:`KernelTuningConfig`'s fields, carried as a single
-    ``gl.constexpr`` leaf so the launch-time argument specializer walks one item instead
-    of twenty-six. Field order must match the aggregate's constructor, skipping its
+    ``gl.constexpr`` leaf so the launch-time argument specializer walks one item.
+    Field order must match the aggregate's constructor, skipping its
     leading ``func_cfg`` field -- that one is rebuilt from :class:`FuncSpec`."""
 
     BLOCK_M: int
@@ -242,16 +242,10 @@ class TuningSpec(NamedTuple):
     #: read operand B's scales from a CDNA4_SCALE-preshuffled tensor. The weights are
     #: static, so unlike the A-side shuffle this costs nothing at run time.
     B_SCALE_SHUFFLED: bool = False
-    #: load operand B straight from global into the MFMA fragment registers, never
-    #: staging it in LDS. What FlyDSL does (BufferCopy128b), and the reason its
-    #: ds_read_b128 count is half ours.
-    B_IN_REG: bool = False
     #: read operand B from a 16-column-blocked weight tensor -- aiter's
-    #: utils/shuffle.py::shuffle_weight(w, (16, 16)). Independent of B_IN_REG: with it
-    #: the fragment-layout global load coalesces, and without it the LDS tile takes the
-    #: matching permutation, which drops the staging unit from 32 rows to 16 and removes
-    #: its padding. Changes the operand contract, so the caller has to supply the
-    #: permuted tensor.
+    #: utils/shuffle.py::shuffle_weight(w, (16, 16)). The LDS tile takes the matching
+    #: permutation, which drops the staging unit from 32 rows to 16 and removes its
+    #: padding. Changes the operand contract, so the caller supplies the permuted tensor.
     B_PRESHUFFLED: bool = False
     #: use the hardware reciprocal in the fused SwiGLU instead of an IEEE divide,
     #: as the FlyDSL port does. ~1 ulp, well inside the bf16 the result is stored as.
@@ -262,9 +256,6 @@ class TuningSpec(NamedTuple):
     #: :class:`DSReadOperand` mask; each payload and scale may move independently.
     DS_READ_IN_MFMA: int = int(DSReadOperand.NONE)
     SCHED_MODE: int = int(SchedMode.NONE)
-    #: Emit the manual prologue fence. Independent of WARP_PIPELINE, whose MANUAL
-    #: mode describes the per-slot rendezvous available only in the frozen step.
-    MANUAL_PP: bool = False
     #: Run the preserved reference step instead of the live implementation.
     FROZEN_STEP: bool = False
     #: Advance HBM pointers per unrolled body and address its steps through soffset.

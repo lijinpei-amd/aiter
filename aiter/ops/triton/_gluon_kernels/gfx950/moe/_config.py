@@ -423,13 +423,11 @@ class KernelTuningConfig:
     VGPR_PREFETCH_K: gl.constexpr
     A_SCALE_SORTED_SHUFFLED: gl.constexpr
     B_SCALE_SHUFFLED: gl.constexpr
-    B_IN_REG: gl.constexpr
     B_PRESHUFFLED: gl.constexpr
     ACT_FAST_RCP: gl.constexpr
     WAIT_COMMIT_SCHEME: gl.constexpr
     DS_READ_IN_MFMA: gl.constexpr
     SCHED_MODE: gl.constexpr
-    MANUAL_PP: gl.constexpr
     FROZEN_STEP: gl.constexpr
     SOFF_UNROLL: gl.constexpr
     SCALE_FILL_MID: gl.constexpr
@@ -465,13 +463,11 @@ class KernelTuningConfig:
         VGPR_PREFETCH_K,
         A_SCALE_SORTED_SHUFFLED=False,
         B_SCALE_SHUFFLED=False,
-        B_IN_REG=False,
         B_PRESHUFFLED=False,
         ACT_FAST_RCP=False,
         WAIT_COMMIT_SCHEME=int(WaitCommitScheme.PER_FILL),
         DS_READ_IN_MFMA=int(DSReadOperand.NONE),
         SCHED_MODE=int(SchedMode.NONE),
-        MANUAL_PP=False,
         FROZEN_STEP=False,
         SOFF_UNROLL=False,
         SCALE_FILL_MID=False,
@@ -505,13 +501,11 @@ class KernelTuningConfig:
         self.VGPR_PREFETCH_K = gl.constexpr(int(_v(VGPR_PREFETCH_K)))
         self.A_SCALE_SORTED_SHUFFLED = gl.constexpr(bool(_v(A_SCALE_SORTED_SHUFFLED)))
         self.B_SCALE_SHUFFLED = gl.constexpr(bool(_v(B_SCALE_SHUFFLED)))
-        self.B_IN_REG = gl.constexpr(bool(_v(B_IN_REG)))
         self.B_PRESHUFFLED = gl.constexpr(bool(_v(B_PRESHUFFLED)))
         self.ACT_FAST_RCP = gl.constexpr(bool(_v(ACT_FAST_RCP)))
         self.WAIT_COMMIT_SCHEME = gl.constexpr(int(_v(WAIT_COMMIT_SCHEME)))
         self.DS_READ_IN_MFMA = gl.constexpr(int(_v(DS_READ_IN_MFMA)))
         self.SCHED_MODE = gl.constexpr(int(_v(SCHED_MODE)))
-        self.MANUAL_PP = gl.constexpr(bool(_v(MANUAL_PP)))
         self.FROZEN_STEP = gl.constexpr(bool(_v(FROZEN_STEP)))
         self.SOFF_UNROLL = gl.constexpr(bool(_v(SOFF_UNROLL)))
         self.SCALE_FILL_MID = gl.constexpr(bool(_v(SCALE_FILL_MID)))
@@ -752,12 +746,6 @@ class KernelTuningConfig:
         that keeps this True.
         """
         shape = self.scale_shape(idx)
-        if _v(idx) == 1 and _v(self.B_IN_REG):
-            # B's payload is carried in registers two K-stages deep; its scales have to
-            # ride the same pipeline or the MFMA would pair stage k's payload with a
-            # different stage's scale. Only safe because a wave-private B (warps (1, 4))
-            # is not re-fetched per warp -- under warps (n, 1) it would be.
-            return False
         if self.scale_shuffled(idx):
             # Fragment-ordered in HBM, so the copy is linear and the LDS tile keeps the
             # same permutation; the read is then a 32-bit ds_read. Staying on LDS also
@@ -1188,8 +1176,6 @@ class KernelTuningConfig:
         fc = self.func_cfg
         per_stage = 0
         for idx in (0, 1):
-            if idx == 1 and _v(self.B_IN_REG):
-                continue
             shape = self.lds_shape(idx)
             width = fc.operand_elem_ty(idx).primitive_bitwidth // 8
             # lds_shape() is one mini block; a stage holds num_lds_tiles() of them

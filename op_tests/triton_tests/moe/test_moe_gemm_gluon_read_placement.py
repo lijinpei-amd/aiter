@@ -217,7 +217,6 @@ def _assert_repeated_output(case, config, label):
         pytest.param("SCHED_MODE", 2, id="iglp1"),
         pytest.param("SCHED_MODE", 3, id="mfma16"),
         pytest.param("SCHED_MODE", 4, id="mfma8"),
-        pytest.param("MANUAL_PP", True, id="manual-prologue"),
         pytest.param("SOFF_UNROLL", True, id="soffset-unroll"),
         pytest.param("SCALE_FILL_MID", False, id="scales-with-payload"),
     ],
