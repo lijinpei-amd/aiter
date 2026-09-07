@@ -26,6 +26,21 @@ fields of `TuningSpec`, with defaults for omitted optional fields.
 | `FROZEN_STEP` | Select the preserved reference step and its original unfused drain. |
 | `SOFF_UNROLL` | Advance HBM pointers once per unrolled body and use scalar offsets within it. |
 | `SCALE_FILL_MID` | At a 2x2 mini-tile split, fill scales in the middle slots; wait counts use the same setting. |
+| `WAIT_COMMIT_SCHEME` | `PER_OP=1`, `PER_SLOT=2`, `PER_STAGE_WHOLE=3`, or `PER_STAGE_WARP_PIPELINE=4`; see the boundaries below. |
+
+`PER_STAGE_WARP_PIPELINE` commits after the last memory work in the K stage,
+before its final MFMA region. `PER_STAGE_WHOLE` commits after the full stage's
+work, including MFMA. Each marker stays just inside its region's closing border
+so the compiler keeps the next wait outside the region. These locations also
+apply with `WARP_PIPELINE=NONE`. Value 3
+preserves the whole-stage boundary used by the cold-bench recipes; callers that
+previously selected `PER_STAGE` with the compiler warp pipeline should select
+`PER_STAGE_WARP_PIPELINE` for the memory-region boundary.
+
+Both per-stage schemes use `wait_per_stage` once before the `ni`/`mi` loops.
+`PER_OP` and `PER_SLOT` use `wait_per_slot` before each slot that reads LDS.
+The fill-only prologue commits each stage at its last copy slot, and drain steps
+that issue no copies do not commit a group.
 
 Payload and scale placement are independent. Missing components emit no reads;
 components loaded directly into registers follow the same region selection.
@@ -139,7 +154,7 @@ preserved best code. Full traces and their independent audit are retained under
 The subsequent pointer/register refactor uses `fe5ec1ffc` as its preserved
 baseline. Both frozen output variants still compile to identical encoded `.text`.
 Removing the live manual prologue fence changes impl code generation. The live
-`PER_STAGE` prologue also drops its duplicate outer wait: the first slot already
+per-stage prologue also drops its duplicate outer wait: the stage head already
 waits for the same buffer before any copies or reads. Other commit schemes keep
 their outer wait, and the frozen prologue is unchanged. A compiler scheduling
 boundary immediately after the first live wait limits scalar temporary lifetimes

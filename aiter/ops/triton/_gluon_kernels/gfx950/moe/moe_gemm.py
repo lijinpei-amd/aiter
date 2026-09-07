@@ -503,7 +503,19 @@ def _make_reg_fragments(a_frags, b_frags, acc):
 
 
 @gluon.jit
-def _buffer_load_wait_group(
+def wait_per_stage(
+    pc,
+    STAGES_BETWEEN: gl.constexpr,
+    WAIT_SLACK: gl.constexpr = 0,
+):
+    """Wait once before the slot walk for either per-stage commit boundary."""
+    if require_constexpr(pc.tuning_cfg.commit_per_stage()):
+        # Epilogue copies are newer than every group this pipeline step consumes.
+        pc.lds_ptrs.wait_buffer_load_groups(STAGES_BETWEEN + WAIT_SLACK)
+
+
+@gluon.jit
+def wait_per_slot(
     pc,
     mi: gl.constexpr,
     ni: gl.constexpr,
@@ -511,21 +523,18 @@ def _buffer_load_wait_group(
     DO_BUFFER_LOAD: gl.constexpr,
     WAIT_SLACK: gl.constexpr = 0,
 ):
-    """Wait per slot or at the stage head, matching the selected commit scheme."""
+    """Wait for this slot's copies in the per-op and per-slot commit modes."""
     tc: gl.constexpr = pc.tuning_cfg
-    WAIT: gl.constexpr = _buffer_load_wait(tc, mi, ni, STAGES_BETWEEN, DO_BUFFER_LOAD)
-    if require_constexpr(WAIT is not None):
-        # Epilogue copies are newer than every group this pipeline step consumes.
-        pc.lds_ptrs.wait_buffer_load_groups(WAIT + WAIT_SLACK)
-    elif require_constexpr(
-        not tc.commit_per_stage()
-        and (
+    if require_constexpr(not tc.commit_per_stage()):
+        WAIT: gl.constexpr = _buffer_load_wait(tc, mi, ni, STAGES_BETWEEN, DO_BUFFER_LOAD)
+        if require_constexpr(WAIT is not None):
+            pc.lds_ptrs.wait_buffer_load_groups(WAIT + WAIT_SLACK)
+        elif require_constexpr(
             _ds_read_a_tile(mi, ni, tc.num_mini_m(), tc.num_mini_n()) is not None
             or _ds_read_b_tile(mi, ni, tc.num_mini_m(), tc.num_mini_n()) is not None
-        )
-    ):
-        # Synchronous register-to-LDS payload staging still needs a cooperative fence.
-        gl.barrier()
+        ):
+            # Synchronous register-to-LDS staging still needs a cooperative fence.
+            gl.barrier()
 
 
 @gluon.constexpr_function
@@ -945,8 +954,10 @@ def _pipeline_step_impl(
         "WarpPipeline.MANUAL is implemented only by _pipeline_step_frozen: run it with "
         "AITER_TRITON_MOE_GLUON_FROZEN_STEP=1, or pick NONE / COMPILER",
     )
-    PIPE: gl.constexpr = tc.warp_pipeline_compiler() and DO_DS_READ and IN_LOOP
-    STAGE: gl.constexpr = pick_stage(PIPE)
+    WAR_PIPELINE_COMPILER: gl.constexpr = (
+        tc.warp_pipeline_compiler() and DO_DS_READ and IN_LOOP
+    )
+    STAGE: gl.constexpr = pick_stage(WAR_PIPELINE_COMPILER)
 
     READ_A_IN_MFMA: gl.constexpr = tc.ds_read_in_mfma(0)
     READ_B_IN_MFMA: gl.constexpr = tc.ds_read_in_mfma(1)
@@ -967,12 +978,14 @@ def _pipeline_step_impl(
     # wait inside a stage region, and the two are alternative answers to the same
     # question anyway -- iglp_opt overlaps MFMA with memory inside a wave, the
     # pipeliner does it by ping-ponging two wave groups.
-    if require_constexpr(tc.SCHED_MODE != 0 and DO_DS_READ and not PIPE):
+    if require_constexpr(tc.SCHED_MODE != 0 and DO_DS_READ and not WAR_PIPELINE_COMPILER):
         _sched_hint(tc.SCHED_MODE)
+    if require_constexpr(DO_DS_READ):
+        wait_per_stage(pc, STAGES_BETWEEN, WAIT_SLACK)
     for ni in gl.static_range(NN):
         for mi in gl.static_range(NM):
             if require_constexpr(DO_DS_READ):
-                _buffer_load_wait_group(
+                wait_per_slot(
                     pc, mi, ni, STAGES_BETWEEN, DO_BUFFER_LOAD, WAIT_SLACK
                 )
 
@@ -1013,11 +1026,15 @@ def _pipeline_step_impl(
                     ):
                         # Keep pointer updates inside this region, ahead of its border.
                         hbm_ptrs = _advance_hbm_ptrs(pc, hbm_ptrs, KUE, FILL_K_PHASE)
-                    if require_constexpr(
-                        PIPE and tc.commit_per_stage() and mi == NM - 1 and ni == NN - 1
-                    ):
-                        # Close the copy group before the border, ahead of the next wait.
-                        pc.lds_ptrs.commit_buffer_load()
+
+                if require_constexpr(
+                    DO_BUFFER_LOAD
+                    and tc.commit_per_stage_warp_pipeline()
+                    and mi == NM - 1
+                    and ni == NN - 1
+                ):
+                    # Close after the last memory work, before the region border.
+                    pc.lds_ptrs.commit_buffer_load()
 
             with STAGE("mfma"):
                 if require_constexpr(DO_MFMA):
@@ -1057,6 +1074,15 @@ def _pipeline_step_impl(
                     # Keep pointer arithmetic before the border so the next wait is
                     # the first operation between pipeline regions.
                     hbm_ptrs = _advance_direct_scale_hbm_ptrs(pc, hbm_ptrs)
+                if require_constexpr(
+                    DO_BUFFER_LOAD
+                    and tc.commit_per_stage_whole()
+                    and mi == NM - 1
+                    and ni == NN - 1
+                ):
+                    # Close after the full stage's MFMA/read work. Keep the marker
+                    # before the border so the next wait stays outside the region.
+                    pc.lds_ptrs.commit_buffer_load()
             a_cur = a_cur + _merge_ds_read_frags(a_mem, a_mfma, tc, 0)
             b_cur = b_cur + _merge_ds_read_frags(b_mem, b_mfma, tc, 1)
             acc = acc + (slot_acc,)
@@ -1064,10 +1090,6 @@ def _pipeline_step_impl(
             a_new, b_new = _ds_read_tails(pc, a_cur, b_cur, mi, ni, DO_DS_READ)
             a_tail = a_tail + a_new
             b_tail = b_tail + b_new
-
-    if require_constexpr(tc.commit_per_stage() and DO_BUFFER_LOAD and not PIPE):
-        # One group for the whole stage, closed after the walk -- see _buffer_load.
-        pc.lds_ptrs.commit_buffer_load()
 
     if require_constexpr(not DO_DS_READ):
         a_tail = _take_reg_pairs(regs.a_payload, regs.a_scale, 0, NM * PF_MINI)

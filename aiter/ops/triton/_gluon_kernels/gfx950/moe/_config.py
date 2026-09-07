@@ -604,7 +604,15 @@ class KernelTuningConfig:
 
     @gluon.constexpr_function
     def commit_per_stage(self):
-        return _v(self.WAIT_COMMIT_SCHEME) == int(WaitCommitScheme.PER_STAGE)
+        return self.commit_per_stage_warp_pipeline() or self.commit_per_stage_whole()
+
+    @gluon.constexpr_function
+    def commit_per_stage_warp_pipeline(self):
+        return _v(self.WAIT_COMMIT_SCHEME) == int(WaitCommitScheme.PER_STAGE_WARP_PIPELINE)
+
+    @gluon.constexpr_function
+    def commit_per_stage_whole(self):
+        return _v(self.WAIT_COMMIT_SCHEME) == int(WaitCommitScheme.PER_STAGE_WHOLE)
 
     @gluon.constexpr_function
     def commit_groups_per_stage(self):
@@ -613,7 +621,7 @@ class KernelTuningConfig:
 
     @gluon.constexpr_function
     def wait_at_stage_head(self):
-        """PER_STAGE waits once at the stage head; other modes wait per read slot."""
+        """Both per-stage modes wait once at the head; other modes wait per read slot."""
         return self.commit_per_stage()
 
     @gluon.constexpr_function
@@ -1435,12 +1443,14 @@ class KernelTuningConfig:
         assert _v(self.WAIT_COMMIT_SCHEME) in (
             int(WaitCommitScheme.PER_OP),
             int(WaitCommitScheme.PER_SLOT),
-            int(WaitCommitScheme.PER_STAGE),
+            int(WaitCommitScheme.PER_STAGE_WARP_PIPELINE),
+            int(WaitCommitScheme.PER_STAGE_WHOLE),
         ), (
             f"WAIT_COMMIT_SCHEME {_v(self.WAIT_COMMIT_SCHEME)} is not a WaitCommitScheme: "
             f"PER_OP {int(WaitCommitScheme.PER_OP)}, "
             f"PER_SLOT {int(WaitCommitScheme.PER_SLOT)}, "
-            f"PER_STAGE {int(WaitCommitScheme.PER_STAGE)}"
+            f"PER_STAGE_WARP_PIPELINE {int(WaitCommitScheme.PER_STAGE_WARP_PIPELINE)}, "
+            f"PER_STAGE_WHOLE {int(WaitCommitScheme.PER_STAGE_WHOLE)}"
         )
 
         # -- resource budgets --

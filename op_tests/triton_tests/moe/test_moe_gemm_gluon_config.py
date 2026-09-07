@@ -137,7 +137,8 @@ def test_trailing_fields_and_older_config_dict_keep_defaults(config):
     "scheme,groups,stage_head",
     [(WaitCommitScheme.PER_OP, 8, False),
      (WaitCommitScheme.PER_SLOT, 4, False),
-     (WaitCommitScheme.PER_STAGE, 1, True)],
+     (WaitCommitScheme.PER_STAGE_WARP_PIPELINE, 1, True),
+     (WaitCommitScheme.PER_STAGE_WHOLE, 1, True)],
 )
 def test_commit_scheme_counts_real_payload_and_scale_groups(config, scheme, groups, stage_head):
     config["WAIT_COMMIT_SCHEME"] = int(scheme)

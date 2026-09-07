@@ -52,7 +52,7 @@ def _config(mask=0, pipeline=WarpPipeline.NONE):
         result_scale_mod="",
         WARP_PIPELINE=int(pipeline),
         VGPR_PREFETCH_K=256,
-        WAIT_COMMIT_SCHEME=int(WaitCommitScheme.PER_STAGE),
+        WAIT_COMMIT_SCHEME=int(WaitCommitScheme.PER_STAGE_WHOLE),
         DS_READ_IN_MFMA=mask,
         SCALE_FILL_MID=True,
     )._asdict()
