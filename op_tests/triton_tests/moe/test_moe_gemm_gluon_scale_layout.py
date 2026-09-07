@@ -238,10 +238,9 @@ def test_dot_helpers_forward_scale_phase(monkeypatch, block_k, dtype, phase):
 
     monkeypatch.setattr(gl, "static_range", range)
     monkeypatch.setattr(gl.amd.cdna4, "mfma_scaled_packed", mfma)
-    monkeypatch.setattr(kernel, "_block_dot", kernel._block_dot.fn)
     monkeypatch.setattr(kernel, "_dot", kernel._dot.fn)
     args = (("A", "A-scale"), ("B", "B-scale"), 13, 1, fc, tc)
-    assert kernel._maybe_block_dot.fn(*args, False, phase) == 13
+    assert kernel._maybe_block_dot.fn((), (), 13, 1, fc, tc, False, phase) == 13
     assert calls == []
     assert kernel._maybe_block_dot.fn(*args, True, phase) == 14
     assert len(calls) == 1

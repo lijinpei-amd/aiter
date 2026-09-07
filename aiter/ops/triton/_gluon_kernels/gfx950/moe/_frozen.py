@@ -18,7 +18,7 @@ The shared pointer and register aggregates are adapted at the step boundary; the
 snapshot's scheduling statements, including its separate prologue fence, stay fixed.
 
 This module is imported from the *bottom* of ``moe_gemm``: the snapshot calls back into
-the shared, non-frozen halves of the kernel (``_ds_read_a``, ``_maybe_block_dot``, the
+the shared, non-frozen halves of the kernel (``_ds_read_operand``, ``_maybe_block_dot``, the
 placement helpers), so the cycle is only breakable in that direction.
 """
 
@@ -29,8 +29,7 @@ from ._lang import require_constexpr
 from ._lang import unwrap as _v
 from ._schedule import _buffer_load_order, _buffer_load_tile
 from .moe_gemm import (
-    _ds_read_a,
-    _ds_read_b,
+    _ds_read_operand,
     _make_reg_fragments,
     _maybe_block_dot,
     _opt_at,
@@ -543,21 +542,23 @@ def _pipeline_step_frozen(
                 if require_constexpr(
                     _ds_read_a_tile_frozen(mi, ni, NM, NN) is not None
                 ):
-                    a_cur = a_cur + _ds_read_a(
+                    a_cur = a_cur + _ds_read_operand(
                         pc,
                         DS_READ_IDX,
                         _ds_read_a_tile_frozen(mi, ni, NM, NN),
                         a_scale_hbm_ptr,
+                        0,
                         False,
                     )
                 if require_constexpr(
                     _ds_read_b_tile_frozen(mi, ni, NM, NN) is not None
                 ):
-                    b_cur = b_cur + _ds_read_b(
+                    b_cur = b_cur + _ds_read_operand(
                         pc,
                         DS_READ_IDX,
                         _ds_read_b_tile_frozen(mi, ni, NM, NN),
                         b_scale_hbm_ptr,
+                        1,
                         False,
                     )
             acc = acc + (slot_acc,)

@@ -206,91 +206,67 @@ def _opt_at(t, i: gl.constexpr, PRESENT: gl.constexpr):
 
 
 @gluon.jit
-def _ds_read_a_block(
+def _ds_read_block(
     lds_ptrs,
     DS_READ_IDX,
-    mi: gl.constexpr,
+    tile: gl.constexpr,
     scale_hbm_ptr,
     scale_hbm_offs,
     func_cfg,
     tc,
+    operand: gl.constexpr,
     RELAXED: gl.constexpr = False,
     READ_PAYLOAD: gl.constexpr = True,
     READ_SCALE: gl.constexpr = True,
 ):
-    """Every LDS->register A fragment of one mini-M block, all mini-K, as a flat tuple.
+    """One operand's fragments for a mini-M/N block, all mini-K, as a flat tuple.
+
+    ``operand`` is 0 for A or 1 for B.
 
     Two entries per mini-K step -- payload, scale -- so :func:`_pipeline_step` can hold
-    the tail of one stage across a pipeline iteration and hand it to :func:`_block_dot`
+    the tail of one stage across a pipeline iteration and hand it to :func:`_maybe_block_dot`
     one stage later.
 
     The pair is present even for an operand with no scale: the tuple is loop-carried, so
     Triton asks every element for its ``.type`` and a ``None`` there aborts codegen. An
     absent scale therefore parks the payload's own SSA value in the slot -- a duplicate
-    reference costs no register -- and :func:`_block_dot` puts the ``None`` back from the
+    reference costs no register -- and :func:`_maybe_block_dot` puts the ``None`` back from the
     same compile-time predicate.
     """
     NUM_MINI: gl.constexpr = tc.num_mini_k()
     SK_MINI: gl.constexpr = tc.MINI_BLOCK_K // MX_GROUP
-    HAS: gl.constexpr = func_cfg.has_scale(0)
+    HAS: gl.constexpr = func_cfg.has_scale(operand)
     frags = ()
     for i in gl.static_range(NUM_MINI):
-        a, a_s = lds_ptrs.ds_read_a_frag(
-            DS_READ_IDX,
-            mi,
-            i,
-            scale_hbm_ptr,
-            _mini_scale_hbm_offset(scale_hbm_offs, i * SK_MINI, HAS),
-            RELAXED,
-            READ_PAYLOAD,
-            READ_SCALE,
-        )
-        if require_constexpr(not READ_PAYLOAD):
-            a = a_s
-        if require_constexpr(HAS and READ_SCALE):
-            slot = a_s
+        if require_constexpr(operand == 0):
+            payload, scale = lds_ptrs.ds_read_a_frag(
+                DS_READ_IDX,
+                tile,
+                i,
+                scale_hbm_ptr,
+                _mini_scale_hbm_offset(scale_hbm_offs, i * SK_MINI, HAS),
+                RELAXED,
+                READ_PAYLOAD,
+                READ_SCALE,
+            )
         else:
-            slot = a
-        frags = frags + (a, slot)
-    return frags
-
-
-@gluon.jit
-def _ds_read_b_block(
-    lds_ptrs,
-    DS_READ_IDX,
-    ni: gl.constexpr,
-    scale_hbm_ptr,
-    scale_hbm_offs,
-    func_cfg,
-    tc,
-    RELAXED: gl.constexpr = False,
-    READ_PAYLOAD: gl.constexpr = True,
-    READ_SCALE: gl.constexpr = True,
-):
-    """The operand-B mirror of :func:`_ds_read_a_block`, over one mini-N block."""
-    NUM_MINI: gl.constexpr = tc.num_mini_k()
-    SK_MINI: gl.constexpr = tc.MINI_BLOCK_K // MX_GROUP
-    HAS: gl.constexpr = func_cfg.has_scale(1)
-    frags = ()
-    for i in gl.static_range(NUM_MINI):
-        b, b_s = lds_ptrs.ds_read_b_frag(
-            DS_READ_IDX,
-            ni,
-            i,
-            scale_hbm_ptr,
-            _mini_scale_hbm_offset(scale_hbm_offs, i * SK_MINI, HAS),
-            RELAXED,
-            READ_PAYLOAD,
-            READ_SCALE,
-        )
+            payload, scale = lds_ptrs.ds_read_b_frag(
+                DS_READ_IDX,
+                tile,
+                i,
+                scale_hbm_ptr,
+                _mini_scale_hbm_offset(scale_hbm_offs, i * SK_MINI, HAS),
+                RELAXED,
+                READ_PAYLOAD,
+                READ_SCALE,
+            )
         if require_constexpr(not READ_PAYLOAD):
-            b = b_s
+            payload = scale
         if require_constexpr(HAS and READ_SCALE):
-            slot = b_s
+            slot = scale
         else:
-            slot = b
-        frags = frags + (b, slot)
+            slot = payload
+        frags = frags + (payload, slot)
     return frags
 
 
@@ -318,35 +294,20 @@ def _maybe_block_dot(
     DO_MFMA: gl.constexpr,
     K_PHASE: gl.constexpr = 0,
 ):
-    """:func:`_block_dot`, or the accumulator untouched when the step emits no MFMA."""
+    """Accumulate ``N_MINI`` mini-K steps when this stage emits MFMA."""
     if require_constexpr(DO_MFMA):
-        return _block_dot(a_frags, b_frags, acc, N_MINI, func_cfg, tuning_cfg, K_PHASE)
-    return acc
-
-
-@gluon.jit
-def _block_dot(
-    a_frags,
-    b_frags,
-    acc,
-    N_MINI: gl.constexpr,
-    func_cfg,
-    tuning_cfg,
-    K_PHASE: gl.constexpr = 0,
-):
-    """The MFMAs of one mini (M, N) block over ``N_MINI`` mini-K steps."""
-    for i in gl.static_range(N_MINI):
-        if require_constexpr(func_cfg.has_scale(0)):
-            a_s = a_frags[2 * i + 1]
-        else:
-            a_s = _NO_SCALE
-        if require_constexpr(func_cfg.has_scale(1)):
-            b_s = b_frags[2 * i + 1]
-        else:
-            b_s = _NO_SCALE
-        acc = _dot(
-            a_frags[2 * i], a_s, b_frags[2 * i], b_s, acc, func_cfg, tuning_cfg, K_PHASE
-        )
+        for i in gl.static_range(N_MINI):
+            if require_constexpr(func_cfg.has_scale(0)):
+                a_s = a_frags[2 * i + 1]
+            else:
+                a_s = _NO_SCALE
+            if require_constexpr(func_cfg.has_scale(1)):
+                b_s = b_frags[2 * i + 1]
+            else:
+                b_s = _NO_SCALE
+            acc = _dot(
+                a_frags[2 * i], a_s, b_frags[2 * i], b_s, acc, func_cfg, tuning_cfg, K_PHASE
+            )
     return acc
 
 
@@ -464,7 +425,7 @@ class _PipelineRegFragments:
     """Prefetched A/B payloads and scales, plus one accumulator per (ni, mi) slot.
 
     Operand tuples are ordered by non-K mini block, then mini-K step. An unscaled
-    operand aliases its payload in the scale tuple; _block_dot ignores that slot.
+    operand aliases its payload in the scale tuple; _maybe_block_dot ignores that slot.
     """
 
     a_payload: tl.tuple | tuple
@@ -700,47 +661,29 @@ def _advance_scale_hbm_ptrs(pc, hbm_ptrs):
 
 
 @gluon.jit
-def _ds_read_a(
+def _ds_read_operand(
     pc,
     DS_READ_IDX,
-    mi: gl.constexpr,
-    a_scale_hbm_ptr,
+    tile: gl.constexpr,
+    scale_hbm_ptr,
+    operand: gl.constexpr,
     RELAXED: gl.constexpr = False,
     READ_PAYLOAD: gl.constexpr = True,
     READ_SCALE: gl.constexpr = True,
 ):
-    return _ds_read_a_block(
+    if require_constexpr(operand == 0):
+        scale_hbm_offs = pc.a_scale_hbm_offs
+    else:
+        scale_hbm_offs = pc.b_scale_hbm_offs
+    return _ds_read_block(
         pc.lds_ptrs,
         DS_READ_IDX,
-        mi,
-        a_scale_hbm_ptr,
-        _opt_at(pc.a_scale_hbm_offs, mi, pc.func_cfg.a_has_scale()),
+        tile,
+        scale_hbm_ptr,
+        _opt_at(scale_hbm_offs, tile, pc.func_cfg.has_scale(operand)),
         pc.func_cfg,
         pc.tuning_cfg,
-        RELAXED,
-        READ_PAYLOAD,
-        READ_SCALE,
-    )
-
-
-@gluon.jit
-def _ds_read_b(
-    pc,
-    DS_READ_IDX,
-    ni: gl.constexpr,
-    b_scale_hbm_ptr,
-    RELAXED: gl.constexpr = False,
-    READ_PAYLOAD: gl.constexpr = True,
-    READ_SCALE: gl.constexpr = True,
-):
-    return _ds_read_b_block(
-        pc.lds_ptrs,
-        DS_READ_IDX,
-        ni,
-        b_scale_hbm_ptr,
-        _opt_at(pc.b_scale_hbm_offs, ni, pc.func_cfg.b_has_scale()),
-        pc.func_cfg,
-        pc.tuning_cfg,
+        operand,
         RELAXED,
         READ_PAYLOAD,
         READ_SCALE,
@@ -783,11 +726,12 @@ def _ds_read(
     if require_constexpr(
         (WANT_A or (WANT_A_SCALE and pc.func_cfg.a_has_scale())) and A_TILE is not None
     ):
-        a_frags = _ds_read_a(
+        a_frags = _ds_read_operand(
             pc,
             DS_READ_IDX,
             A_TILE,
             a_scale_hbm_ptr,
+            0,
             True,
             WANT_A,
             WANT_A_SCALE,
@@ -795,11 +739,12 @@ def _ds_read(
     if require_constexpr(
         (WANT_B or (WANT_B_SCALE and pc.func_cfg.b_has_scale())) and B_TILE is not None
     ):
-        b_frags = _ds_read_b(
+        b_frags = _ds_read_operand(
             pc,
             DS_READ_IDX,
             B_TILE,
             b_scale_hbm_ptr,
+            1,
             True,
             WANT_B,
             WANT_B_SCALE,
