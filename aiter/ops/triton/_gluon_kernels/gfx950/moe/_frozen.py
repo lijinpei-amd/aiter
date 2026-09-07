@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Frozen snapshot of the gfx950 Gluon MoE K-loop step.
+"""Frozen prologue and K-loop step for the gfx950 Gluon MoE kernel.
 
 ``_pipeline_step_frozen`` is a verbatim copy of ``moe_gemm._pipeline_step_impl`` taken
 from the best measured kernel (2026-09-02), with every env-var constexpr replaced by its
@@ -29,6 +29,7 @@ from ._lang import require_constexpr
 from ._lang import unwrap as _v
 from ._schedule import _buffer_load_order, _buffer_load_tile
 from .moe_gemm import (
+    _advance_hbm_ptrs,
     _ds_read_operand,
     _make_reg_fragments,
     _maybe_block_dot,
@@ -46,6 +47,35 @@ def _frozen_prologue_fence():
     gl.amd.cdna4.sched_barrier(0)
     gl.barrier()
     gl.amd.cdna4.sched_barrier(0)
+
+
+@gluon.jit
+def _prologue_frozen(pc, hbm_ptrs):
+    """Fill NB-1 buffers, then retain the snapshot's whole-buffer wait and fence."""
+    tc: gl.constexpr = pc.tuning_cfg
+    NB: gl.constexpr = tc.NUM_LDS_BUFFER
+    NM: gl.constexpr = tc.num_mini_m()
+    NN: gl.constexpr = tc.num_mini_n()
+    for i in gl.static_range(NB - 1):
+        for ni in gl.static_range(NN):
+            for mi in gl.static_range(NM):
+                _buffer_load_frozen(
+                    pc,
+                    i,
+                    mi,
+                    ni,
+                    hbm_ptrs.a_hbm_ptr,
+                    hbm_ptrs.b_hbm_ptr,
+                    hbm_ptrs.a_scale_hbm_ptr,
+                    hbm_ptrs.b_scale_hbm_ptr,
+                )
+                if require_constexpr(mi == NM - 1 and ni == NN - 1):
+                    hbm_ptrs = _advance_hbm_ptrs(
+                        pc, hbm_ptrs, K_PHASE=tc.scale_k_phase(i)
+                    )
+    pc.lds_ptrs.wait_buffer_load_groups((NB - 2) * (NM + NN))
+    _frozen_prologue_fence()
+    return hbm_ptrs
 
 
 # --- frozen placement / wait helpers ------------------------------------------

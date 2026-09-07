@@ -6,22 +6,145 @@
 import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+from triton.language.core import _aggregate as aggregate
 
 from aiter.ops.triton._triton_kernels.moe.activations import (
     _swiglu,
     _swiglu_combine,
     _swiglu_pair,
 )
+from aiter.ops.triton.utils.common_utils import strip_annotate
 
 from ._lang import MX_GROUP_CE as MX_GROUP
 from ._lang import WARP_SIZE_CE as WARP_SIZE
+from ._lang import optional as _opt
 from ._lang import require_constexpr
 from ._lang import unwrap as _v
-from ._offsets import _n_start, _slot_index
+from ._offsets import _n_split_offs, _n_start, _slot_index
 from ._quant import mxfp4_quant_gluon
 from ._types import DtypeQuant
 
 _DQ_MXFP4: gl.constexpr = gl.constexpr(int(DtypeQuant.MXFP4))
+
+
+@aggregate
+@strip_annotate
+class _EpilogueInputs:
+    """Optional epilogue vectors and the async groups pending during the drain."""
+
+    bias_hbm_base: gl.tensor | gl.constexpr
+    gammas_hbm_ptr: gl.tensor | gl.constexpr
+    gamma_lds_ptr: gl.shared_memory_descriptor | gl.constexpr
+    bias_lds_ptr: gl.shared_memory_descriptor | gl.constexpr
+    groups: gl.constexpr
+
+    @gluon.constexpr_function
+    def __init__(
+        self, bias_hbm_base, gammas_hbm_ptr, gamma_lds_ptr, bias_lds_ptr, groups
+    ):
+        self.bias_hbm_base = _opt(bias_hbm_base)
+        self.gammas_hbm_ptr = _opt(gammas_hbm_ptr)
+        self.gamma_lds_ptr = _opt(gamma_lds_ptr)
+        self.bias_lds_ptr = _opt(bias_lds_ptr)
+        self.groups = gl.constexpr(_v(groups))
+
+
+@gluon.jit
+def _stage_epilogue_inputs(
+    bias_hbm_ptr,
+    stride_bias_e,
+    rt,
+    expt_id,
+    start_m,
+    block_id,
+    pid_n,
+    N,
+    M_e,
+    func_cfg,
+    tuning_cfg,
+):
+    """Prepare bias and gammas, staging them in LDS before the pipeline drain."""
+    BM: gl.constexpr = tuning_cfg.BLOCK_M
+    BN: gl.constexpr = tuning_cfg.BLOCK_N
+    if require_constexpr(func_cfg.has_bias):
+        bias_hbm_base = bias_hbm_ptr + expt_id.to(gl.int64) * stride_bias_e
+    else:
+        bias_hbm_base: gl.constexpr = None
+    if require_constexpr(func_cfg.has_gammas):
+        gammas_hbm_ptr = rt.gammas + start_m
+    else:
+        gammas_hbm_ptr: gl.constexpr = None
+
+    # Stage the epilogue's two vectors in LDS, allocated and filled together here rather
+    # than in the prologue: the drain issues no fills of its own, so these copies have its
+    # whole run of MFMAs to themselves and are done well before the epilogue's
+    # wait_group(0). Keeping the allocation next to its one use also lets the shared-memory
+    # allocator see that these buffers never overlap the K-loop's.
+    #
+    # Both tiles are flat: `.index()` drops the leading axis but keeps the layout's rank,
+    # so a [rows, mini] tile cannot be viewed as one mini block. `.slice(start, length)`
+    # preserves rank, so a 1-D tile slices cleanly into per-mini-block views.
+    #
+    # The gammas tile is EPI_T elements, not BLOCK_M: buffer_load_to_shared requires
+    # exactly 32 or 128 bits per thread, so the copy has to cover one element per thread
+    # of the CTA. BLOCK_M=128 over 256 threads would be half of one, so the tile runs to
+    # 256 and the surplus is masked off and never read. Bias is BLOCK_N, which is already
+    # a whole number of elements per thread.
+    EPI_T: gl.constexpr = tuning_cfg.num_warps() * WARP_SIZE
+    EPI_BPT: gl.constexpr = BN // EPI_T
+    EPI_LDS: gl.constexpr = (
+        EPI_T >= BM and BN % EPI_T == 0 and (EPI_BPT == 1 or EPI_BPT == 4)
+    )
+    EPI_SH: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=1, per_phase=1, max_phase=1, order=[0]
+    )
+    EPI_GC: gl.constexpr = gl.BlockedLayout(
+        [1], [WARP_SIZE], [tuning_cfg.num_warps()], [0]
+    )
+    EPI_BC: gl.constexpr = gl.BlockedLayout(
+        [EPI_BPT], [WARP_SIZE], [tuning_cfg.num_warps()], [0]
+    )
+    if require_constexpr(EPI_LDS and func_cfg.has_gammas):
+        gamma_lds_ptr = gl.allocate_shared_memory(gl.float32, [EPI_T], layout=EPI_SH)
+    else:
+        gamma_lds_ptr: gl.constexpr = None
+    if require_constexpr(EPI_LDS and func_cfg.has_bias):
+        bias_lds_ptr = gl.allocate_shared_memory(gl.float32, [BN], layout=EPI_SH)
+    else:
+        bias_lds_ptr: gl.constexpr = None
+
+    # They are committed as one group, which is newer than every pipeline group still in
+    # flight. That inflates the outstanding count every drain wait is measured against,
+    # so each step is handed WAIT_SLACK=EPI_GROUPS and its wait_group count comes out
+    # numerically the same as before.
+    EPI_GROUPS: gl.constexpr = (
+        1 if EPI_LDS and (func_cfg.has_gammas or func_cfg.has_bias) else 0
+    )
+    if require_constexpr(EPI_LDS):
+        if require_constexpr(func_cfg.has_gammas):
+            g_offs = BM * block_id + gl.arange(0, EPI_T, layout=EPI_GC)
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                gamma_lds_ptr, gammas_hbm_ptr, g_offs, mask=g_offs < M_e, other=0.0
+            )
+        if require_constexpr(func_cfg.has_bias):
+            epi_b_offs = _n_split_offs(
+                pid_n,
+                gl.arange(0, BN, layout=EPI_BC),
+                N,
+                func_cfg,
+                tuning_cfg,
+            )
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                bias_lds_ptr, bias_hbm_base, epi_b_offs
+            )
+        if require_constexpr(func_cfg.has_gammas or func_cfg.has_bias):
+            # EPI_LDS is only a layout-feasibility flag, so it can be set with neither
+            # vector present -- nothing was issued then, and an empty commit group would
+            # still count against every drain wait.
+            gl.amd.cdna4.async_copy.commit_group()
+    return _EpilogueInputs(
+        bias_hbm_base, gammas_hbm_ptr, gamma_lds_ptr, bias_lds_ptr, EPI_GROUPS
+    )
 
 
 @gluon.jit
@@ -338,12 +461,10 @@ def _epilogue_one_tile(
         gl.static_assert(ARN == 1)
         out = sub
 
-    offs_m = BM * block_id + mi * MBM + gl.arange(0, MBM)
-    mask_m = offs_m < M_e
     if require_constexpr(func_cfg.has_gammas and func_cfg.epilogue < 2):
         if require_constexpr(gamma_lds_ptr is not None):
-            # Only a ds_read: the global copy that filled this ran before the K
-            # loop. `out.type.layout` is the one way to name the post-swiglu
+            # Only a ds_read: the global copy that filled this ran before the
+            # drain. `out.type.layout` is the one way to name the post-swiglu
             # layout, so the read has to sit here rather than above the walk.
             g = gamma_lds_ptr.slice(mi * MBM, MBM).load(
                 gl.SliceLayout(1, out.type.layout)
@@ -535,15 +656,7 @@ def _epilogue_store(
     BN: gl.constexpr = tuning_cfg.BLOCK_N
     MBM: gl.constexpr = tuning_cfg.MINI_BLOCK_M
     MBN: gl.constexpr = tuning_cfg.MINI_BLOCK_N
-    ARN: gl.constexpr = func_cfg.activation_reduction_n()
     OUT_MBN: gl.constexpr = MBN // func_cfg.mini_n_reduction()
-    act: gl.constexpr = func_cfg.act()
-    # Hoisted: a `x: gl.constexpr = ...` inside a static_range would be a reassignment
-    # on the second unrolled iteration, which Gluon rejects outright.
-    out_ty: gl.constexpr = y_hbm_ptr.dtype.element_ty
-    store_layout: gl.constexpr = tuning_cfg.result_store_layout(
-        MBM, OUT_MBN, out_ty.primitive_bitwidth
-    )
 
     NN: gl.constexpr = BN // MBN
     NM: gl.constexpr = BM // MBM
@@ -552,7 +665,7 @@ def _epilogue_store(
     # walk indices -- bias in mi, gammas in ni -- so the per-tile form below issues
     # NM*NN of them where NN (resp. NM) is enough. Own loop variables: reusing `mi`/`ni`
     # here would shadow the walk's.
-    # Both are staged in LDS (filled before the K loop, see _moe_gemm_body);
+    # Both are staged in LDS (filled before the drain, see _stage_epilogue_inputs);
     # the read then carries the accumulator's own M/N slice layout, so nothing downstream
     # changes. Otherwise the block-level load still comes from global.
     bias_tiles = _epi_bias_tiles(
