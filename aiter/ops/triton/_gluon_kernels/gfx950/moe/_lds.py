@@ -321,13 +321,7 @@ class LDSManager:
 
     @gluon.jit
     def commit_buffer_load(self):
-        """One commit group per mini-block fill.
-
-        Finer than one group per stage on purpose: a slot only ever reads one mini
-        block, so a per-mini-block group lets its ``wait_group`` name exactly that copy
-        instead of the whole stage's. That is what makes a per-slot wait -- and with it
-        the warp-pipelined mfma/mem interleave -- expressible at all.
-        """
+        """Close the current async-copy group at the caller's configured boundary."""
         gl.amd.cdna4.async_copy.commit_group()
 
     @gluon.jit

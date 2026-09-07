@@ -90,11 +90,13 @@ from ._offsets import (
     _n_split_offs,
     _slot_index,
 )
-from ._types import (
-    DotKind,
-    TileSched,
-    WaitCommitScheme,
+from ._schedule import (
+    _buffer_load_ops,
+    _buffer_load_wait,
+    _ds_read_a_tile,
+    _ds_read_b_tile,
 )
+from ._types import DotKind, TileSched
 
 _SG_MFMA: gl.constexpr = gl.constexpr(8)
 _SG_DS_READ: gl.constexpr = gl.constexpr(256)
@@ -569,283 +571,30 @@ def _relax_ds_read(mi, ni, NM, NN):
     return _slot_index(mi, ni, NM, NN) < _v(NM) + _v(NN) - 1
 
 
-@gluon.constexpr_function
-def _buffer_load_order(NM, NN):
-    """The ``NM + NN`` mini-block fills of one stage as ``(is_a, tile)``, in issue order.
-
-    Even at NM = NN = 2: B(0), A(0), A(1), B(1) -- the reference kernel's load order
-    ``B_left -> A_top -> A_bot -> B_right``. Paired with the N-outer slot walk of
-    :func:`_slot_index` it reproduces that kernel's four regions exactly:
-
-        region 0  DOT(A_top, B_left)   fill B(0)
-        region 1  DOT(A_bot, B_left)   fill A(0)
-        region 2  DOT(A_top, B_right)  fill A(1)
-        region 3  DOT(A_bot, B_right)  fill B(1)
-
-    Otherwise: A and B interleaved -- A(0), B(0), A(1), B(1) ... -- so consecutive slots
-    alternate operand and the byte volume per slot stays as level as two tile sizes
-    allow. The reference order is only defined for the 2x2 split it was designed for, so
-    anything else keeps the interleave.
-    """
-    NM, NN = _v(NM), _v(NN)
-    if NM == 2 and NN == 2:
-        return [(0, 0), (1, 0), (1, 1), (0, 1)]
-    out = []
-    for i in range(max(NM, NN)):
-        if i < NM:
-            out.append((1, i))
-        if i < NN:
-            out.append((0, i))
-    return out
-
-
-@gluon.constexpr_function
-def _buffer_load_group_pos(is_a, i, NM, NN):
-    """Position of one mini-block fill's commit group inside its stage."""
-    is_a, i = _v(is_a), _v(i)
-    order = _buffer_load_order(NM, NN)
-    return order.index((1 if is_a else 0, i))
-
-
-@gluon.constexpr_function
-def _buffer_load_pos(mi, ni, NM, NN):
-    """Which fill (position in :func:`_buffer_load_order`) slot ``(mi, ni)`` issues, or None.
-
-    One fill per slot, in flat slot order -- exactly the tutorial's layout, where each of
-    the four ``mfma``/``mem`` region pairs moves one tile and commits one group. Both
-    axes are split (validate() insists), so there are never more fills than slots.
-    """
-    mi, ni, NM, NN = _v(mi), _v(ni), _v(NM), _v(NN)
-    s = _slot_index(mi, ni, NM, NN)
-    return s if s < NM + NN else None
-
-
-@gluon.constexpr_function
-def _buffer_load_tile(pos, NM, NN, want_a):
-    """Tile index of fill ``pos`` if it is an A (resp. B) fill, else None.
-
-    Two constexpr calls rather than unpacking a tuple inside the unrolled slot loop,
-    where the binding would be a reassignment.
-    """
-    pos = _v(pos)
-    if pos is None:
-        return None
-    is_a, tile = _buffer_load_order(NM, NN)[pos]
-    return tile if bool(is_a) == bool(_v(want_a)) else None
-
-
-@gluon.constexpr_function
-def _ds_read_a_tile(mi, ni, NM, NN):
-    """Operand-A mini block slot ``(mi, ni)`` reads out of LDS, or None.
-
-    The same one-per-slot assignment the fills use, so a slot's fill and its read name
-    the *same* position in :func:`_buffer_load_order`. Its wait then works out to
-    ``G - 1 - s + STAGES_BETWEEN * G + s`` -- the ``s`` cancels and every slot waits on
-    the same constant, which is exactly the uniform ``wait_group`` the reference kernel
-    uses.
-    """
-    mi, ni, NM, NN = _v(mi), _v(ni), _v(NM), _v(NN)
-    return _buffer_load_tile(_buffer_load_pos(mi, ni, NM, NN), NM, NN, True)
-
-
-@gluon.constexpr_function
-def _ds_read_b_tile(mi, ni, NM, NN):
-    """Operand-B mini block slot ``(mi, ni)`` reads out of LDS, or None."""
-    mi, ni, NM, NN = _v(mi), _v(ni), _v(NM), _v(NN)
-    return _buffer_load_tile(_buffer_load_pos(mi, ni, NM, NN), NM, NN, False)
-
-
-@gluon.constexpr_function
-def _scale_buffer_load_slot(is_a, tile, NM, NN, SCALE_FILL_MID=False):
-    """Slot index that issues the scale copy for A(tile) / B(tile).
-
-    Default: the same slot as the payload, so a tile's scale and payload share one
-    commit group. Under ``SCALE_FILL_MID`` at NM=NN=2 both A(0)/B(0) scales go to
-    slot 1 and both A(1)/B(1) scales to slot 2.
-    """
-    is_a, tile = bool(_v(is_a)), _v(tile)
-    NM, NN = _v(NM), _v(NN)
-    if _v(SCALE_FILL_MID) and NM == 2 and NN == 2:
-        return 1 + tile
-    return _buffer_load_group_pos(is_a, tile, NM, NN)
-
-
-@gluon.constexpr_function
-def _scale_buffer_load_tile(mi, ni, NM, NN, want_a, SCALE_FILL_MID=False):
-    """Tile whose A (resp. B) scale copy slot ``(mi, ni)`` issues, or None.
-
-    Still one slot per mini block even when several share a scale tile: the commit
-    group has to be emitted either way, because _buffer_load_wait counts G = NM + NN groups
-    per stage. buffer_load_a_scale drops the redundant *copy* and leaves the group empty.
-    """
-    s = _slot_index(mi, ni, NM, NN)
-    n = NM if _v(want_a) else NN
-    for t in range(_v(n)):
-        if _scale_buffer_load_slot(_v(want_a), t, NM, NN, SCALE_FILL_MID) == s:
-            return t
-    return None
-
-
-@gluon.constexpr_function
-def _buffer_loads_before(mi, ni, NM, NN, ANY):
-    """Groups this stage has already committed when slot ``(mi, ni)`` is reached.
-
-    Counted against the N-outer walk of :func:`_slot_index`: one fill per slot, so the
-    walk's position is the count, capped at the ``NM + NN`` a stage has.
-    """
-    mi, ni, NM, NN = _v(mi), _v(ni), _v(NM), _v(NN)
-    if not _v(ANY):
-        return 0
-    return min(_slot_index(mi, ni, NM, NN), NM + NN)
-
-
-@gluon.constexpr_function
-def _groups_per_stage(NM, NN, SCHEME):
-    """Commit groups one K stage emits at commit granularity ``SCHEME``.
-
-    The device-side twin of ``KernelTuningConfig.commit_groups_per_stage()`` -- the same
-    three cases, reached from the constexpr helpers, which are handed NM/NN rather than
-    the config. ``PER_FILL`` counts the payload fills only and is therefore conservative
-    when a scale sits on a slot of its own; the other two are exact.
-    """
-    NM, NN, SCHEME = _v(NM), _v(NN), _v(SCHEME)
-    if SCHEME == int(WaitCommitScheme.PER_SLOT):
-        return NM * NN
-    if SCHEME == int(WaitCommitScheme.PER_STAGE):
-        return 1
-    return NM + NN
-
-
-@gluon.constexpr_function
-def _buffer_load_wait(
-    mi, ni, NM, NN, STAGES_BETWEEN, ANY_BUFFER_LOAD, SCHEME, SCALE_FILL_MID=False
-):
-    """Outstanding-group count that retires everything slot ``(mi, ni)`` is about to read.
-
-    A group is retired once ``wait_group(n)`` leaves at most ``n`` behind it. Counting
-    forward from the target group: the rest of its own stage, then ``STAGES_BETWEEN``
-    whole stages, then whatever the current stage has committed so far. The slot reads
-    A(mi) when ``ni == 0`` and B(ni) when ``mi == 0``; when it reads both, the later
-    group's (smaller) count wins. ``None`` means the slot reads nothing and needs no wait.
-
-    Everything here is counted in groups, so it is only a description of the real stream
-    while ``SCHEME`` is the granularity :func:`_buffer_load` actually commits at -- which
-    is why the two read one knob. Under ``PER_SLOT`` a slot commits exactly one group, so
-    the ordinals ``_buffer_load_group_pos`` / ``_scale_buffer_load_slot`` return (they are slot indices)
-    line up with the stream directly.
-    """
-    mi, ni, NM, NN = _v(mi), _v(ni), _v(NM), _v(NN)
-    SCHEME = _v(SCHEME)
-    PER_STAGE = SCHEME == int(WaitCommitScheme.PER_STAGE)
-    G = _groups_per_stage(NM, NN, SCHEME)
-    if PER_STAGE:
-        # One group per stage: the stage's own group is not committed until its last
-        # slot, so nothing of it is outstanding here and every fill sits at p == 0.
-        # The count is therefore just the whole stages in flight.
-        base = _v(STAGES_BETWEEN)
-    else:
-        base = _v(STAGES_BETWEEN) * G + _buffer_loads_before(
-            mi, ni, NM, NN, ANY_BUFFER_LOAD
-        )
-    out = None
-    ta = _ds_read_a_tile(mi, ni, NM, NN)
-    if ta is not None:
-        # The payload and the scale of the same tile can sit in different commit
-        # groups (see _scale_buffer_load_slot); the later of the two is what has to retire.
-        p = max(
-            _buffer_load_group_pos(True, ta, NM, NN),
-            _scale_buffer_load_slot(True, ta, NM, NN, SCALE_FILL_MID),
-        )
-        out = base if PER_STAGE else G - 1 - p + base
-    tb = _ds_read_b_tile(mi, ni, NM, NN)
-    if tb is not None:
-        p = max(
-            _buffer_load_group_pos(False, tb, NM, NN),
-            _scale_buffer_load_slot(False, tb, NM, NN, SCALE_FILL_MID),
-        )
-        w = base if PER_STAGE else G - 1 - p + base
-        out = w if out is None else min(out, w)
-    return out
-
-
-@gluon.constexpr_function
-def _stage_buffer_load_wait(
-    NM, NN, STAGES_BETWEEN, ANY_BUFFER_LOAD, SCHEME, SCALE_FILL_MID=False
-):
-    """Strongest (smallest) wait_group count over all slots of a stage."""
-    NM, NN = _v(NM), _v(NN)
-    ws = [
-        _buffer_load_wait(
-            mi, ni, NM, NN, STAGES_BETWEEN, ANY_BUFFER_LOAD, SCHEME, SCALE_FILL_MID
-        )
-        for ni in range(NN)
-        for mi in range(NM)
-    ]
-    ws = [w for w in ws if w is not None]
-    if not ws:
-        return None
-    return max(min(ws), 0)
-
-
-@gluon.jit
-def _stage_buffer_load_wait_group(
-    lds_ptrs,
-    NM: gl.constexpr,
-    NN: gl.constexpr,
-    STAGES_BETWEEN: gl.constexpr,
-    ANY_BUFFER_LOAD: gl.constexpr,
-    SCHEME: gl.constexpr,
-    WAIT_SLACK: gl.constexpr = 0,
-    SCALE_FILL_MID: gl.constexpr = False,
-):
-    """One wait_group for the whole stage, emitted ahead of the slot walk.
-
-    Selected by ``WaitCommitScheme.PER_FILL`` -- see
-    ``KernelTuningConfig.wait_at_stage_head()`` for why only that level may hoist it.
-    The count is the strongest over the stage's slots, so it stands in for all of them
-    and no slot needs one of its own.
-
-    ``WAIT_SLACK`` is the number of commit groups outstanding that this pipeline did
-    not issue -- see :func:`_pipeline_step_impl`. They are newer than everything the
-    slots read, so they never retire first; leaving them out of the count would make
-    the wait retire one real group too few.
-    """
-    WAIT: gl.constexpr = _stage_buffer_load_wait(
-        NM, NN, STAGES_BETWEEN, ANY_BUFFER_LOAD, SCHEME, SCALE_FILL_MID
-    )
-    if require_constexpr(WAIT is not None):
-        lds_ptrs.wait_buffer_load_groups(WAIT + WAIT_SLACK)
-
-
 @gluon.jit
 def _buffer_load_wait_group(
-    lds_ptrs,
+    pc,
     mi: gl.constexpr,
     ni: gl.constexpr,
-    NM: gl.constexpr,
-    NN: gl.constexpr,
     STAGES_BETWEEN: gl.constexpr,
-    ANY_BUFFER_LOAD: gl.constexpr,
-    SCHEME: gl.constexpr,
+    DO_BUFFER_LOAD: gl.constexpr,
     WAIT_SLACK: gl.constexpr = 0,
-    SCALE_FILL_MID: gl.constexpr = False,
 ):
-    """Emit slot ``(mi, ni)``'s ``wait_group``, or nothing if it reads nothing.
-
-    What the coarser commit levels (``PER_SLOT``, ``PER_STAGE``) use: one group then
-    covers several tiles, so an earlier slot's wait does not imply this one's.
-
-    A separate function only so the ``: gl.constexpr`` binding is legal: inside the
-    unrolled slot loop it would be a reassignment, and without the annotation the count
-    reaches ``wait_group`` as a runtime tensor.
-
-    ``WAIT_SLACK``: see :func:`_stage_buffer_load_wait_group`.
-    """
-    WAIT: gl.constexpr = _buffer_load_wait(
-        mi, ni, NM, NN, STAGES_BETWEEN, ANY_BUFFER_LOAD, SCHEME, SCALE_FILL_MID
-    )
+    """Wait per slot or at the stage head, matching the selected commit scheme."""
+    tc: gl.constexpr = pc.tuning_cfg
+    WAIT: gl.constexpr = _buffer_load_wait(tc, mi, ni, STAGES_BETWEEN, DO_BUFFER_LOAD)
     if require_constexpr(WAIT is not None):
-        lds_ptrs.wait_buffer_load_groups(WAIT + WAIT_SLACK)
+        # Epilogue copies are newer than every group this pipeline step consumes.
+        pc.lds_ptrs.wait_buffer_load_groups(WAIT + WAIT_SLACK)
+    elif require_constexpr(
+        not tc.commit_per_stage()
+        and (
+            _ds_read_a_tile(mi, ni, tc.num_mini_m(), tc.num_mini_n()) is not None
+            or _ds_read_b_tile(mi, ni, tc.num_mini_m(), tc.num_mini_n()) is not None
+        )
+    ):
+        # Synchronous register-to-LDS payload staging still needs a cooperative fence.
+        gl.barrier()
 
 
 @gluon.constexpr_function
@@ -869,36 +618,19 @@ def _buffer_load(
     KI: gl.constexpr = 0,
     STAGE_MARK: gl.constexpr = True,
 ):
-    """The global->LDS copies slot ``(mi, ni)`` owns, committed per WAIT_COMMIT_SCHEME.
-
-    ``PER_FILL`` marks after each copy, ``PER_SLOT`` once at the end of the slot,
-    ``PER_STAGE`` once at the last slot of the stage. Nothing else about the schedule
-    moves: the same copies are issued from the same slots either way, only the
-    ``commit_group`` boundaries between them change -- and :func:`_buffer_load_wait` counts
-    against exactly those boundaries.
-
-    ``KI`` selects the scalar offset within an unrolled body. The caller advances
-    the pointer bundle after this slot's copies; this helper only fills and commits.
-    """
+    """Issue this slot's copies and commit at the configured op/slot/stage boundary."""
     func_cfg: gl.constexpr = pc.func_cfg
-    NM: gl.constexpr = pc.tuning_cfg.num_mini_m()
-    NN: gl.constexpr = pc.tuning_cfg.num_mini_n()
-    # The slot owns at most one fill, named by its position in _buffer_load_order.
-    POS: gl.constexpr = _buffer_load_pos(mi, ni, NM, NN)
-    A_TILE: gl.constexpr = _buffer_load_tile(POS, NM, NN, True)
-    B_TILE: gl.constexpr = _buffer_load_tile(POS, NM, NN, False)
-    # Scale copies may be placed on a different slot than their payload.
-    A_SC: gl.constexpr = _scale_buffer_load_tile(
-        mi, ni, NM, NN, True, pc.tuning_cfg.SCALE_FILL_MID
-    )
-    B_SC: gl.constexpr = _scale_buffer_load_tile(
-        mi, ni, NM, NN, False, pc.tuning_cfg.SCALE_FILL_MID
-    )
-    # Where the commit_group marks go, per WaitCommitScheme. Exactly one of the three
-    # is True, and _buffer_load_wait counts groups at the same granularity.
-    MARK_BUFFER_LOAD: gl.constexpr = pc.tuning_cfg.commit_per_fill()
-    MARK_SLOT: gl.constexpr = pc.tuning_cfg.commit_per_slot()
-    MARK_STAGE: gl.constexpr = pc.tuning_cfg.commit_per_stage()
+    tc: gl.constexpr = pc.tuning_cfg
+    NM: gl.constexpr = tc.num_mini_m()
+    NN: gl.constexpr = tc.num_mini_n()
+    OPS: gl.constexpr = _buffer_load_ops(tc, mi, ni)
+    A_TILE: gl.constexpr = OPS[0]
+    A_SC: gl.constexpr = OPS[1]
+    B_TILE: gl.constexpr = OPS[2]
+    B_SC: gl.constexpr = OPS[3]
+    MARK_OP: gl.constexpr = tc.commit_per_op()
+    MARK_SLOT: gl.constexpr = tc.commit_per_slot()
+    MARK_STAGE: gl.constexpr = tc.commit_per_stage()
     # Byte displacement of this step from the body's base pointer. The *_step values are
     # in elements (they are added to a typed pointer), soffset is in bytes, so each is
     # scaled by its operand's storage width. All constexpr, so these fold into a literal
@@ -925,19 +657,9 @@ def _buffer_load(
         pc.lds_ptrs.buffer_load_a_payload(
             BUFFER_LOAD_IDX, A_TILE, hbm_ptrs.a_hbm_ptr, pc.a_hbm_offs[A_TILE], A_SOFF
         )
-        # Payload and its own scale share one commit group; a scale placed elsewhere
-        # gets its own below.
-        if require_constexpr(A_SC == A_TILE):
-            pc.lds_ptrs.buffer_load_a_scale(
-                BUFFER_LOAD_IDX,
-                A_TILE,
-                hbm_ptrs.a_scale_hbm_ptr,
-                _opt_at(pc.a_scale_hbm_offs, A_TILE, func_cfg.a_has_scale()),
-                A_SSOFF,
-            )
-        if require_constexpr(MARK_BUFFER_LOAD):
+        if require_constexpr(MARK_OP and tc.payload_via_lds(0)):
             pc.lds_ptrs.commit_buffer_load()
-    if require_constexpr(A_SC is not None and A_SC != A_TILE):
+    if require_constexpr(A_SC is not None):
         pc.lds_ptrs.buffer_load_a_scale(
             BUFFER_LOAD_IDX,
             A_SC,
@@ -945,23 +667,15 @@ def _buffer_load(
             _opt_at(pc.a_scale_hbm_offs, A_SC, func_cfg.a_has_scale()),
             A_SSOFF,
         )
-        if require_constexpr(MARK_BUFFER_LOAD):
+        if require_constexpr(MARK_OP):
             pc.lds_ptrs.commit_buffer_load()
     if require_constexpr(B_TILE is not None):
         pc.lds_ptrs.buffer_load_b_payload(
             BUFFER_LOAD_IDX, B_TILE, hbm_ptrs.b_hbm_ptr, pc.b_hbm_offs[B_TILE], B_SOFF
         )
-        if require_constexpr(B_SC == B_TILE):
-            pc.lds_ptrs.buffer_load_b_scale(
-                BUFFER_LOAD_IDX,
-                B_TILE,
-                hbm_ptrs.b_scale_hbm_ptr,
-                _opt_at(pc.b_scale_hbm_offs, B_TILE, func_cfg.b_has_scale()),
-                B_SSOFF,
-            )
-        if require_constexpr(MARK_BUFFER_LOAD):
+        if require_constexpr(MARK_OP and tc.payload_via_lds(1)):
             pc.lds_ptrs.commit_buffer_load()
-    if require_constexpr(B_SC is not None and B_SC != B_TILE):
+    if require_constexpr(B_SC is not None):
         pc.lds_ptrs.buffer_load_b_scale(
             BUFFER_LOAD_IDX,
             B_SC,
@@ -969,7 +683,7 @@ def _buffer_load(
             _opt_at(pc.b_scale_hbm_offs, B_SC, func_cfg.b_has_scale()),
             B_SSOFF,
         )
-        if require_constexpr(MARK_BUFFER_LOAD):
+        if require_constexpr(MARK_OP):
             pc.lds_ptrs.commit_buffer_load()
     if require_constexpr(MARK_SLOT):
         # One group for everything this mini block just issued.
@@ -1293,9 +1007,6 @@ def _pipeline_step_impl(
     READ_A_SCALE_IN_MFMA: gl.constexpr = tc.ds_read_in_mfma(0, scale=True)
     READ_B_SCALE_IN_MFMA: gl.constexpr = tc.ds_read_in_mfma(1, scale=True)
 
-    SCHEME: gl.constexpr = tc.WAIT_COMMIT_SCHEME
-    STAGE_WAIT: gl.constexpr = tc.wait_at_stage_head()
-
     KIE: gl.constexpr = KI if tc.SOFF_UNROLL else 0
     KUE: gl.constexpr = KU if tc.SOFF_UNROLL else 1
 
@@ -1310,31 +1021,11 @@ def _pipeline_step_impl(
     # pipeliner does it by ping-ponging two wave groups.
     if require_constexpr(tc.SCHED_MODE != 0 and DO_DS_READ and not PIPE):
         _sched_hint(tc.SCHED_MODE)
-    if require_constexpr(DO_DS_READ and STAGE_WAIT):
-        _stage_buffer_load_wait_group(
-            pc.lds_ptrs,
-            NM,
-            NN,
-            STAGES_BETWEEN,
-            DO_BUFFER_LOAD,
-            SCHEME,
-            WAIT_SLACK,
-            tc.SCALE_FILL_MID,
-        )
     for ni in gl.static_range(NN):
         for mi in gl.static_range(NM):
-            if require_constexpr(DO_DS_READ and not STAGE_WAIT):
+            if require_constexpr(DO_DS_READ):
                 _buffer_load_wait_group(
-                    pc.lds_ptrs,
-                    mi,
-                    ni,
-                    NM,
-                    NN,
-                    STAGES_BETWEEN,
-                    DO_BUFFER_LOAD,
-                    SCHEME,
-                    WAIT_SLACK,
-                    tc.SCALE_FILL_MID,
+                    pc, mi, ni, STAGES_BETWEEN, DO_BUFFER_LOAD, WAIT_SLACK
                 )
 
             if require_constexpr(
@@ -1412,6 +1103,10 @@ def _pipeline_step_impl(
                     DO_DS_READ and READ_A_SCALE_IN_MFMA,
                     DO_DS_READ and READ_B_SCALE_IN_MFMA,
                 )
+                if require_constexpr(DO_DS_READ and mi == NM - 1 and ni == NN - 1):
+                    # Keep pointer arithmetic before the border so the next wait is
+                    # the first operation between pipeline regions.
+                    hbm_ptrs = _advance_direct_scale_hbm_ptrs(pc, hbm_ptrs)
             a_cur = a_cur + _merge_ds_read_frags(a_mem, a_mfma, tc, 0)
             b_cur = b_cur + _merge_ds_read_frags(b_mem, b_mfma, tc, 1)
             acc = acc + (slot_acc,)
@@ -1424,9 +1119,7 @@ def _pipeline_step_impl(
         # One group for the whole stage, closed after the walk -- see _buffer_load.
         pc.lds_ptrs.commit_buffer_load()
 
-    if require_constexpr(DO_DS_READ):
-        hbm_ptrs = _advance_direct_scale_hbm_ptrs(pc, hbm_ptrs)
-    else:
+    if require_constexpr(not DO_DS_READ):
         a_tail = _take_reg_pairs(regs.a_payload, regs.a_scale, 0, NM * PF_MINI)
         b_tail = _take_reg_pairs(regs.b_payload, regs.b_scale, 0, NN * PF_MINI)
 
@@ -1589,12 +1282,6 @@ def _moe_gemm_body(
         a_scale_hbm_ptr,
         b_scale_hbm_ptr,
     )
-    # Commit groups per stage, at whatever granularity WAIT_COMMIT_SCHEME emits them.
-    # The prologue wait below counts in these, so it has to move with the scheme: with
-    # a per-stage commit the stream is one group per buffer, and (NB-2) * (NM+NN) would
-    # leave every prologue fill outstanding instead of retiring buffer 0's.
-    G: gl.constexpr = tuning_cfg.commit_groups_per_stage()
-
     MAIN: gl.constexpr = NUM_K - NB
     # steps left after the peel, rounded down to a whole number of unrolled bodies
     UNROLLED: gl.constexpr = ((MAIN - 1) // tuning_cfg.K_UNROLL) * tuning_cfg.K_UNROLL
@@ -1645,27 +1332,27 @@ def _moe_gemm_body(
     for i in gl.static_range(NB - 1):
         for ni in gl.static_range(NN):
             for mi in gl.static_range(NM):
-                _buffer_load(
-                    pc,
-                    hbm_ptrs,
-                    i,
-                    mi,
-                    ni,
-                )
+                if require_constexpr(tuning_cfg.FROZEN_STEP):
+                    _buffer_load_frozen(
+                        pc,
+                        i,
+                        mi,
+                        ni,
+                        hbm_ptrs.a_hbm_ptr,
+                        hbm_ptrs.b_hbm_ptr,
+                        hbm_ptrs.a_scale_hbm_ptr,
+                        hbm_ptrs.b_scale_hbm_ptr,
+                    )
+                else:
+                    _buffer_load(pc, hbm_ptrs, i, mi, ni)
                 if require_constexpr(mi == NM - 1 and ni == NN - 1):
                     hbm_ptrs = _advance_hbm_ptrs(pc, hbm_ptrs)
 
-    # Prologue read: stage 0, whose MFMA window has nothing before it, so only its head
-    # is dotted here. Its tail seeds the carried fragments the first loop step consumes.
-    # It reads every mini block of buffer 0, so it waits out that buffer's whole group
-    # set -- the NB-2 buffers behind it stay in flight, the last one not yet issued.
-    if require_constexpr(tuning_cfg.FROZEN_STEP or not tuning_cfg.commit_per_stage()):
-        lds_ptrs.wait_buffer_load_groups((NB - 2) * G)
+    # Only the snapshot retains its original whole-buffer prologue wait and fence.
     if require_constexpr(tuning_cfg.FROZEN_STEP):
+        lds_ptrs.wait_buffer_load_groups((NB - 2) * (NM + NN))
         _frozen_prologue_fence()
-    # PER_STAGE waits for buffer 0 in the first slot below, before any reads or
-    # fills. It needs no duplicate outer wait. Other schemes retain the whole-buffer
-    # prologue wait; only the snapshot retains the earlier explicit fence.
+    # The live prologue uses the same slot/stage waits as the steady-state step.
     # The prologue's own step: it fills the buffer held back above and issues the first
     # ds_read, but has nothing carried in to dot yet -- which is exactly a pipeline step
     # with the MFMAs switched off. Reusing _pipeline_step keeps the fill/read/wait
@@ -1919,4 +1606,8 @@ def _moe_gemm_body(
 # step and calls back into the shared halves of the kernel, so it can only be bound once
 # everything it names exists. ``_pipeline_step`` looks the name up at compile time, which
 # is well after this line has run.
-from ._frozen import _frozen_prologue_fence, _pipeline_step_frozen
+from ._frozen import (
+    _buffer_load_frozen,
+    _frozen_prologue_fence,
+    _pipeline_step_frozen,
+)
