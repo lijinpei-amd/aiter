@@ -377,7 +377,7 @@ def test_pipeline_stage_commit_boundaries(
     monkeypatch.setattr(kernel, "_take_reg_pairs", lambda *args: ())
     monkeypatch.setattr(kernel, "_make_reg_fragments", lambda *args: args)
     monkeypatch.setattr(kernel, "_advance_hbm_ptrs", lambda pc, ptrs, *args: ptrs)
-    monkeypatch.setattr(kernel, "_advance_direct_scale_hbm_ptrs", lambda pc, ptrs: ptrs)
+    monkeypatch.setattr(kernel, "_advance_scale_hbm_ptrs", lambda pc, ptrs: ptrs)
     monkeypatch.setattr(kernel, "_maybe_block_dot", lambda *args: events.append(("dot",)))
 
     kernel._pipeline_step_impl.fn(
@@ -395,6 +395,7 @@ def test_pipeline_stage_commit_boundaries(
             assert events[commit + 1] == ("exit", "mem")
             assert events[commit + 2] == ("enter", "mfma")
         else:
-            assert events[commit - 1] == ("dot",)
-            assert events[commit + 1] == ("exit", "mfma")
+            assert events[commit - 2] == ("exit", "mfma")
+            assert events[commit - 1] == ("enter", "commit")
+            assert events[commit + 1] == ("exit", "commit")
             assert commit == len(events) - 2

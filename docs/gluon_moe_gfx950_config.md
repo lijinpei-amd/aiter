@@ -28,11 +28,11 @@ fields of `TuningSpec`, with defaults for omitted optional fields.
 | `SCALE_FILL_MID` | At a 2x2 mini-tile split, fill scales in the middle slots; wait counts use the same setting. |
 | `WAIT_COMMIT_SCHEME` | `PER_OP=1`, `PER_SLOT=2`, `PER_STAGE_WHOLE=3`, or `PER_STAGE_WARP_PIPELINE=4`; see the boundaries below. |
 
-`PER_STAGE_WARP_PIPELINE` commits after the last memory work in the K stage,
-before its final MFMA region. `PER_STAGE_WHOLE` commits after the full stage's
-work, including MFMA. Each marker stays just inside its region's closing border
-so the compiler keeps the next wait outside the region. These locations also
-apply with `WARP_PIPELINE=NONE`. Value 3
+`PER_STAGE_WARP_PIPELINE` commits inside the last memory region in the K stage,
+after its memory work and before the final MFMA region. `PER_STAGE_WHOLE` commits
+outside MFMA, after the full stage's work. With compiler pipelining enabled, this
+post-MFMA commit has its own `commit` region so the next wait stays outside a
+region. The region wrappers emit no borders with `WARP_PIPELINE=NONE`. Value 3
 preserves the whole-stage boundary used by the cold-bench recipes; callers that
 previously selected `PER_STAGE` with the compiler warp pipeline should select
 `PER_STAGE_WARP_PIPELINE` for the memory-region boundary.
@@ -91,7 +91,7 @@ the LDS source buffer. Direct scale fallbacks still address HBM.
 argument or pointer return value. Its caller uses `_advance_hbm_ptrs` after the
 last slot, inside the memory region, to advance payload and LDS-staged scale
 pointers. With `SOFF_UNROLL`, this happens once per unrolled body. `_ds_read`
-loads the next operands, and `_advance_direct_scale_hbm_ptrs` advances only the
+loads the next operands, and `_advance_scale_hbm_ptrs` advances only the
 scales loaded straight into registers, after every stage read. Thus each scale
 pointer advances only at its selected load path, including during the prologue
 and drain. The drain advances neither copy pointers nor pointers for a stage it
