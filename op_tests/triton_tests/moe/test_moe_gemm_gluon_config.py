@@ -156,12 +156,10 @@ def test_pipeline_state_aggregates_round_trip_separately(has_scales):
         "b_hbm_ptr",
         "a_scale_hbm_ptr",
         "b_scale_hbm_ptr",
-        "a_scale_direct_hbm_ptr",
-        "b_scale_direct_hbm_ptr",
     )
-    pointer_values = [gl.tensor(object(), gl.pointer_type(gl.uint8)) for _ in range(6)]
+    pointer_values = [gl.tensor(object(), gl.pointer_type(gl.uint8)) for _ in pointer_names]
     if not has_scales:
-        pointer_values[2:] = [None] * 4
+        pointer_values[2:] = [None] * 2
     pointers = _PipelinePointers(*pointer_values)
     fragment_names = ("a_payload", "a_scale", "b_payload", "b_scale", "acc")
     fragment_values = [

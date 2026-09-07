@@ -311,9 +311,9 @@ def _buffer_load_frozen(
         # One bump per step: the frozen kernel did not fold steps into soffset.
         a_hbm_ptr = a_hbm_ptr + KU * pc.a_step
         b_hbm_ptr = b_hbm_ptr + KU * pc.b_step
-        if require_constexpr(func_cfg.a_has_scale()):
+        if require_constexpr(func_cfg.a_has_scale() and pc.tuning_cfg.scale_via_lds(0)):
             a_scale_hbm_ptr = a_scale_hbm_ptr + KU * pc.s_step * pc.a_scale_stride_k
-        if require_constexpr(func_cfg.b_has_scale()):
+        if require_constexpr(func_cfg.b_has_scale() and pc.tuning_cfg.scale_via_lds(1)):
             b_scale_hbm_ptr = b_scale_hbm_ptr + KU * pc.s_step * pc.b_scale_stride_k
     return a_hbm_ptr, b_hbm_ptr, a_scale_hbm_ptr, b_scale_hbm_ptr
 
@@ -446,8 +446,6 @@ def _pipeline_step_frozen(
     b_hbm_ptr = hbm_ptrs.b_hbm_ptr
     a_scale_hbm_ptr = hbm_ptrs.a_scale_hbm_ptr
     b_scale_hbm_ptr = hbm_ptrs.b_scale_hbm_ptr
-    a_scale_direct_hbm_ptr = hbm_ptrs.a_scale_direct_hbm_ptr
-    b_scale_direct_hbm_ptr = hbm_ptrs.b_scale_direct_hbm_ptr
 
     # Fragments this step reads, appended mini block by mini block. `a_cur` grows once
     # per mi (at ni == 0) and `b_cur` once per ni (at mi == 0), so block `mi` always
@@ -549,7 +547,7 @@ def _pipeline_step_frozen(
                         pc,
                         DS_READ_IDX,
                         _ds_read_a_tile_frozen(mi, ni, NM, NN),
-                        a_scale_direct_hbm_ptr,
+                        a_scale_hbm_ptr,
                         False,
                     )
                 if require_constexpr(
@@ -559,7 +557,7 @@ def _pipeline_step_frozen(
                         pc,
                         DS_READ_IDX,
                         _ds_read_b_tile_frozen(mi, ni, NM, NN),
-                        b_scale_direct_hbm_ptr,
+                        b_scale_hbm_ptr,
                         False,
                     )
             acc = acc + (slot_acc,)
@@ -606,14 +604,10 @@ def _pipeline_step_frozen(
             # _SLOT_SCHED_BARRIER = 0: no end-of-slot scheduler fence.
 
     if require_constexpr(DO_DS_READ):
-        if require_constexpr(A_HAS):
-            a_scale_direct_hbm_ptr = (
-                a_scale_direct_hbm_ptr + pc.s_step * pc.a_scale_stride_k
-            )
-        if require_constexpr(B_HAS):
-            b_scale_direct_hbm_ptr = (
-                b_scale_direct_hbm_ptr + pc.s_step * pc.b_scale_stride_k
-            )
+        if require_constexpr(A_HAS and not tc.scale_via_lds(0)):
+            a_scale_hbm_ptr = a_scale_hbm_ptr + pc.s_step * pc.a_scale_stride_k
+        if require_constexpr(B_HAS and not tc.scale_via_lds(1)):
+            b_scale_hbm_ptr = b_scale_hbm_ptr + pc.s_step * pc.b_scale_stride_k
     else:
         a_tail = _take_reg_pairs(regs.a_payload, regs.a_scale, 0, NM * PF_MINI)
         b_tail = _take_reg_pairs(regs.b_payload, regs.b_scale, 0, NN * PF_MINI)
@@ -623,6 +617,4 @@ def _pipeline_step_frozen(
         b_hbm_ptr,
         a_scale_hbm_ptr,
         b_scale_hbm_ptr,
-        a_scale_direct_hbm_ptr,
-        b_scale_direct_hbm_ptr,
     ), _make_reg_fragments(a_tail, b_tail, acc)
