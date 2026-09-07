@@ -5,11 +5,14 @@
 translates legacy benchmark environment variables, so `~/gluon_cold_bench.sh`
 continues to select the recorded impl and frozen configurations.
 
-The low-level entry points `_moe_gluon_gemm1` and `_moe_gluon_gemm2`, their
-`MoeKernelConfig` argument, and launch metadata live in `_entry.py`. The shared
-GEMM body and pipeline remain in `moe_gemm.py`; `_offsets.py` computes A/B HBM
-offsets and mini-tile indices, and `_epilogue.py` owns output activation,
-quantization, staging, and stores. The host launch API is unchanged.
+The low-level entry points `_moe_gluon_gemm1` and `_moe_gluon_gemm2` and launch
+metadata live in `_entry.py`. Each entry constructs `KernelFuncConfig` and
+`KernelTuningConfig` from the launch specs and passes them directly to
+`_moe_gemm_body` alongside constexpr `N` and `K`. The host caches the two specs
+and dimensions as four constexpr arguments. The shared GEMM body and pipeline
+remain in `moe_gemm.py`; `_offsets.py` computes A/B HBM offsets and mini-tile
+indices, and `_epilogue.py` owns output activation, quantization, staging, and
+stores. The host launch API is unchanged.
 
 ## Tuning options
 

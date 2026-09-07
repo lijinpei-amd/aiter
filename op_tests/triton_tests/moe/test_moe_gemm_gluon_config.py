@@ -12,7 +12,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._config import (
     KernelFuncConfig,
     KernelTuningConfig,
 )
-from aiter.ops.triton._gluon_kernels.gfx950.moe._entry import MoeKernelConfig
+from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import constexpr_fields
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     ActivationSpec,
     ActKind,
@@ -25,7 +25,6 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     WaitCommitScheme,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_gemm import (
-    _build_configs,
     _PipelinePointers,
     _PipelineRegFragments,
 )
@@ -84,6 +83,7 @@ def _plain(value):
     return tuple(value) if isinstance(value, list) else value
 
 
+@pytest.mark.parametrize("with_optional_specs", [False, True])
 @pytest.mark.parametrize(
     "field,value",
     [
@@ -95,18 +95,21 @@ def _plain(value):
         ("SCALE_FILL_MID", True),
     ],
 )
-def test_host_and_kernel_config_field_order(config, field, value):
-    """The explicit device-side tuple indices must match the host spec exactly."""
+def test_launch_specs_match_kernel_config_field_order(config, field, value, with_optional_specs):
+    """Host construction and device argument unpacking must preserve every field."""
     config[field] = value
     func = _func_spec(EpilogueMode.NOP)
+    if not with_optional_specs:
+        func = func._replace(activation=None, output_quant=None)
     tuning = _tuning_spec(config)
-    launch = MoeKernelConfig(
-        gl.constexpr(func), gl.constexpr(tuning), gl.constexpr(4096), gl.constexpr(7168)
-    )
     host_func = KernelFuncConfig(*func)
     host_tuning = KernelTuningConfig(host_func, *tuning)
-    # The builder only constructs constexpr aggregates; its Python body needs no GPU.
-    device_func, device_tuning = _build_configs.fn(launch)
+    # Starred arguments pass through Gluon's tuple lowering before construction.
+    # Boxing must keep nested ActivationSpec tuples and absent values intact.
+    device_func = KernelFuncConfig(*gl.tuple(constexpr_fields(gl.constexpr(func))))
+    device_tuning = KernelTuningConfig(
+        device_func, *gl.tuple(constexpr_fields(gl.constexpr(tuning)))
+    )
     for aggregate in (host_func, device_func):
         for name, expected in func._asdict().items():
             assert _plain(getattr(aggregate, name)) == _plain(expected), name
@@ -291,8 +294,8 @@ def test_epilogue_launch_specs_are_cached_separately(config, monkeypatch):
     nop = host._launch_spec(**args, epilogue=int(EpilogueMode.NOP))
     assert default is host._launch_spec(**args, epilogue=int(EpilogueMode.DEFAULT))
     assert default[0] == nop[0]
-    assert _plain(default[1].func).epilogue == EpilogueMode.DEFAULT
-    assert _plain(nop[1].func).epilogue == EpilogueMode.NOP
+    assert _plain(default[1][0]).epilogue == EpilogueMode.DEFAULT
+    assert _plain(nop[1][0]).epilogue == EpilogueMode.NOP
 
 
 @pytest.mark.parametrize(

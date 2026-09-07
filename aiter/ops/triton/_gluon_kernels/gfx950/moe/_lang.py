@@ -17,7 +17,7 @@ __all__ = [
     "WARP_SIZE",
     "WARP_SIZE_CE",
     "const",
-    "field_at",
+    "constexpr_fields",
     "nop_warp_pipeline_stage",
     "optional",
     "pick_warp_pipeline_stage",
@@ -59,6 +59,12 @@ def const(v):
 
 
 @gluon.constexpr_function
+def constexpr_fields(spec):
+    """Box spec fields so starred arguments preserve nested tuples and None."""
+    return tuple(gl.constexpr(value) for value in unwrap(spec))
+
+
+@gluon.constexpr_function
 def optional(buf):
     """Wrap an optional shared buffer so an absent one is a constexpr, not raw None."""
     if buf is None or (isinstance(buf, gl.constexpr) and buf.value is None):
@@ -80,13 +86,6 @@ def require_constexpr(cond):
         cond, gl.tensor
     ), f"expected a compile-time value, got a runtime {type(cond).__name__}"
     return cond
-
-
-@gluon.constexpr_function
-def field_at(spec, i):
-    """Index one field out of a plain-Python NamedTuple carried inside a constexpr."""
-    spec = spec.value if isinstance(spec, gl.constexpr) else spec
-    return spec[i]
 
 
 class nop_warp_pipeline_stage:

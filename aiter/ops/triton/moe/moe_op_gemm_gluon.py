@@ -33,7 +33,6 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._config import (
     KernelTuningConfig,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._entry import (
-    MoeKernelConfig,
     _moe_gluon_gemm1,
     _moe_gluon_gemm2,
 )
@@ -688,9 +687,8 @@ def _launch_spec(
 ):
     """Host-side constexpr work, memoised.
 
-    Building the two aggregates plus the 36 ``gl.constexpr`` wrappers costs ~65 us of
-    Python, which at decode is comparable to the whole kernel. Everything here depends
-    only on compile-time values, so it is computed once per distinct configuration.
+    The host aggregates and launch constants depend only on compile-time values,
+    so they are computed once per distinct configuration.
     """
     from triton.experimental.gluon import language as gl
 
@@ -721,14 +719,15 @@ def _launch_spec(
     tuning_cfg_host = KernelTuningConfig(func_cfg_host, *tuning_spec)
     grid_n = tuning_cfg_host.grid_N(N)
     grid_n = grid_n.value if hasattr(grid_n, "value") else grid_n
-    kcfg = MoeKernelConfig(
+    # Keep each spec in one constexpr so launch specialization sees four leaves.
+    constexpr_args = (
         gl.constexpr(func_spec),
         gl.constexpr(tuning_spec),
         gl.constexpr(N),
         gl.constexpr(K),
     )
     num_warps = c["warps_per_cta"][0] * c["warps_per_cta"][1]
-    return grid_n, kcfg, num_warps, c["WAVES_PER_EU"], c, tuning_cfg_host
+    return grid_n, constexpr_args, num_warps, c["WAVES_PER_EU"], c, tuning_cfg_host
 
 
 #: Attribute the padded-row token map is memoised under, on the ``ExptData`` instance.
@@ -986,7 +985,7 @@ def _spec_key(vals, out):
     launch here -- but between two launches of one *already compiled* kernel only two
     things can move: the 16-byte alignment of each pointer (which it bakes in as
     ``tt.divisibility``) and the runtime scalars. Constexprs cannot move, because they
-    are pinned by the identity of the memoised ``kcfg`` in the cache key.
+    are pinned by the identity of the memoised ``constexpr_args`` in the cache key.
 
     Recurses into the aggregates, whose fields are ordinary launch arguments.
     """
@@ -1000,7 +999,7 @@ def _spec_key(vals, out):
     return out
 
 
-def _fast_launch(kernel, grid_x, args, num_warps, waves_per_eu, kcfg):
+def _fast_launch(kernel, grid_x, args, num_warps, waves_per_eu, constexpr_args):
     """Dispatch a previously compiled kernel directly, or ``None`` to take the slow path.
 
     ``JITFunction.run`` spends ~33 of its ~41 us re-deriving state that is identical
@@ -1027,7 +1026,7 @@ def _fast_launch(kernel, grid_x, args, num_warps, waves_per_eu, kcfg):
     if knobs.runtime.debug:
         return None
 
-    key = (id(kernel), id(kcfg), num_warps, waves_per_eu, grid_x)
+    key = (id(kernel), id(constexpr_args), num_warps, waves_per_eu, grid_x)
     entry = _FAST_LAUNCH_CACHE.get(key)
     if entry is None:
         return None
@@ -1046,11 +1045,13 @@ def _fast_launch(kernel, grid_x, args, num_warps, waves_per_eu, kcfg):
     return compiled
 
 
-def _fast_launch_memoise(kernel, grid_x, args, num_warps, waves_per_eu, kcfg, compiled):
+def _fast_launch_memoise(
+    kernel, grid_x, args, num_warps, waves_per_eu, constexpr_args, compiled
+):
     """Record a completed slow-path launch so the next identical one can skip it."""
     if compiled is None or not _env_int("AITER_TRITON_MOE_GLUON_FAST_LAUNCH", 1):
         return
-    key = (id(kernel), id(kcfg), num_warps, waves_per_eu, grid_x)
+    key = (id(kernel), id(constexpr_args), num_warps, waves_per_eu, grid_x)
     cpp = None
     if _env_int("AITER_TRITON_MOE_GLUON_CPP_LAUNCH", 0):
         # Off by default: the first build of a given signature costs ~12 s of ninja.
@@ -1068,10 +1069,10 @@ def _fast_launch_memoise(kernel, grid_x, args, num_warps, waves_per_eu, kcfg, co
         compiled.run,
         compiled.function,
         compiled.packed_metadata,
-        # The key holds id(kcfg); keep the object alive so that address cannot be
-        # recycled by a later allocation and turn a stale entry into a silent hit.
+        # Keep constexpr_args alive so its address cannot be recycled by a later
+        # allocation and turn a stale entry into a silent hit.
         # Same hazard as _B_SCALE_SHUFFLE_ATTR above, same fix.
-        (kernel, kcfg),
+        (kernel, constexpr_args),
         cpp,
     )
 
@@ -1167,7 +1168,7 @@ def moe_gemm_gluon(
             epilogue,
         )
 
-    grid_n, kcfg, num_warps, waves_per_eu, _cfg, _tc = _spec(
+    grid_n, constexpr_args, num_warps, waves_per_eu, _cfg, _tc = _spec(
         tuple(sorted((k, _hashable(v)) for k, v in config.items())) if config else None
     )
 
@@ -1187,7 +1188,7 @@ def moe_gemm_gluon(
             # BLOCK_K/32 == 8) times scale_stride_k. 8 * 32 == the 256 B a stage spans.
             a_scale_stride_m, a_scale_stride_k = 0, 32
             _cfg = dict(_cfg, A_SCALE_SORTED_SHUFFLED=True)
-            grid_n, kcfg, num_warps, waves_per_eu, _cfg, _tc = _spec(
+            grid_n, constexpr_args, num_warps, waves_per_eu, _cfg, _tc = _spec(
                 tuple(sorted((k, _hashable(v)) for k, v in _cfg.items()))
             )
 
@@ -1214,7 +1215,7 @@ def moe_gemm_gluon(
             b_scales, b_swizzle = shuf_w, ScaleSwizzle.CDNA4_SCALE
             b_scale_stride_k = 32
             _cfg = dict(_cfg, B_SCALE_SHUFFLED=True)
-            grid_n, kcfg, num_warps, waves_per_eu, _cfg, _tc = _spec(
+            grid_n, constexpr_args, num_warps, waves_per_eu, _cfg, _tc = _spec(
                 tuple(sorted((k, _hashable(v)) for k, v in _cfg.items()))
             )
 
@@ -1224,7 +1225,7 @@ def moe_gemm_gluon(
         if shuf_b is not None:
             w_payload = shuf_b
             _cfg = dict(_cfg, B_PRESHUFFLED=True)
-            grid_n, kcfg, num_warps, waves_per_eu, _cfg, _tc = _spec(
+            grid_n, constexpr_args, num_warps, waves_per_eu, _cfg, _tc = _spec(
                 tuple(sorted((k, _hashable(v)) for k, v in _cfg.items()))
             )
 
@@ -1314,13 +1315,10 @@ def moe_gemm_gluon(
         res.stride_n,
         res.out_dim,
         rt.n_expts_act,
-        kcfg.func,
-        kcfg.tuning,
-        kcfg.N,
-        kcfg.K,
+        *constexpr_args,
     )
     grid_x = grid_m * grid_n
-    fast = _fast_launch(kernel, grid_x, args, num_warps, waves_per_eu, kcfg)
+    fast = _fast_launch(kernel, grid_x, args, num_warps, waves_per_eu, constexpr_args)
     if fast is not None:
         return fast
     if _LLVM_FN_ATTRS:
@@ -1337,7 +1335,7 @@ def moe_gemm_gluon(
             waves_per_eu=waves_per_eu,
         )
     _fast_launch_memoise(
-        kernel, grid_x, args, num_warps, waves_per_eu, kcfg, compiled
+        kernel, grid_x, args, num_warps, waves_per_eu, constexpr_args, compiled
     )
     return compiled
 

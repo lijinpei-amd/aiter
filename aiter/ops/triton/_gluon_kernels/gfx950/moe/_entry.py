@@ -3,42 +3,20 @@
 
 """Kernel entry points and launch metadata for the gfx950 Gluon MoE GEMMs."""
 
-from typing import NamedTuple
-
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from ._config import KernelFuncConfig, KernelTuningConfig
+from ._lang import constexpr_fields
 from ._lang import unwrap_attr as _cv
 from ._types import QuantExpertTensor, QuantTokenTensor, ResultTensor, RoutingMeta
 from .moe_gemm import _moe_gemm_body
 
 __all__ = [
-    "MoeKernelConfig",
     "_moe_gluon_gemm1",
     "_moe_gluon_gemm2",
     "moe_gemm_launch_metadata",
 ]
-
-
-class MoeKernelConfig(NamedTuple):
-    """Every compile-time knob, as **four** leaves.
-
-    A ``@gluon.aggregate`` cannot be a kernel argument, so the config is *constructed
-    twice*: once on the host off these same numbers (for the grid tuple), once in-kernel
-    (for the layouts). Keeping the arithmetic in ``KernelTuningConfig`` is what stops the
-    two from drifting.
-
-    ``func`` and ``tuning`` are whole plain-Python NamedTuples inside a single
-    ``gl.constexpr`` rather than 36 separate constexpr fields: Triton's argument
-    specializer walks every leaf of a tuple argument on **every launch**, and at decode
-    the launch path is the critical path (a T=1 grouped GEMM is a ~30 us kernel behind a
-    ~100 us host issue). Four leaves instead of thirty-eight is worth the indirection.
-    """
-
-    func: gl.constexpr  # FuncSpec
-    tuning: gl.constexpr  # TuningSpec
-    N: gl.constexpr
-    K: gl.constexpr
 
 
 def moe_gemm_launch_metadata(grid, kernel, args):
@@ -124,6 +102,8 @@ def _moe_gluon_gemm1(
     CFG_K: gl.constexpr,
 ):
     """gemm1: gather + X @ W1 + bias + swiglu, optionally fused MXFP4 output quant."""
+    func_cfg = KernelFuncConfig(*constexpr_fields(CFG_FUNC))
+    tuning_cfg = KernelTuningConfig(func_cfg, *constexpr_fields(CFG_TUNING))
     _moe_gemm_body(
         QuantTokenTensor(
             A_DTYPE_QUANT,
@@ -177,7 +157,10 @@ def _moe_gluon_gemm1(
         x_static_scale_ptr,
         grid_m,
         grid_n,
-        MoeKernelConfig(CFG_FUNC, CFG_TUNING, CFG_N, CFG_K),
+        func_cfg,
+        tuning_cfg,
+        CFG_N,
+        CFG_K,
     )
 
 
@@ -236,6 +219,8 @@ def _moe_gluon_gemm2(
     CFG_K: gl.constexpr,
 ):
     """gemm2: X @ W2 + bias, multiplied by the router combine weight (gammas)."""
+    func_cfg = KernelFuncConfig(*constexpr_fields(CFG_FUNC))
+    tuning_cfg = KernelTuningConfig(func_cfg, *constexpr_fields(CFG_TUNING))
     _moe_gemm_body(
         QuantTokenTensor(
             A_DTYPE_QUANT,
@@ -289,5 +274,8 @@ def _moe_gluon_gemm2(
         x_static_scale_ptr,
         grid_m,
         grid_n,
-        MoeKernelConfig(CFG_FUNC, CFG_TUNING, CFG_N, CFG_K),
+        func_cfg,
+        tuning_cfg,
+        CFG_N,
+        CFG_K,
     )
