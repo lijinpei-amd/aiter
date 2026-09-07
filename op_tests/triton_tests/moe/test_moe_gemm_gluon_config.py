@@ -22,6 +22,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     FuncSpec,
     SchedMode,
     TuningSpec,
+    WaitCommitScheme,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_gemm import (
     _build_configs,
@@ -127,6 +128,20 @@ def test_trailing_fields_and_older_config_dict_keep_defaults(config):
     for name in TuningSpec._fields[30:]:
         assert _plain(getattr(tc, name)) == getattr(tuning, name)
     assert _plain(tc.validate(4096, 7168))
+
+
+@pytest.mark.parametrize(
+    "scheme,groups,stage_head",
+    [(WaitCommitScheme.PER_OP, 8, False),
+     (WaitCommitScheme.PER_SLOT, 4, False),
+     (WaitCommitScheme.PER_STAGE, 1, True)],
+)
+def test_commit_scheme_counts_real_payload_and_scale_groups(config, scheme, groups, stage_head):
+    config["WAIT_COMMIT_SCHEME"] = int(scheme)
+    tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
+    assert _plain(tc.scale_via_lds(0)) and _plain(tc.scale_via_lds(1))
+    assert _plain(tc.commit_groups_per_stage()) == groups
+    assert _plain(tc.wait_at_stage_head()) is stage_head
 
 
 @pytest.mark.parametrize("has_scales", [False, True])

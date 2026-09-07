@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from triton.compiler.errors import CompilationError, CompileTimeAssertionFailure
 
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     EpilogueMode,
@@ -196,14 +197,27 @@ def test_component_read_placement(case, mask, pipeline):
     _assert_repeated_output(case, config, f"mask={mask}, pipeline={pipeline.name}")
 
 
-def _assert_repeated_output(case, config, label):
-    output = torch.empty_like(case.baseline)
+def _assert_repeated_output(case, config, label, *, split=True):
+    baseline = case.baseline
+    if not split:
+        baseline = torch.empty_like(case.baseline)
+        _launch(case, baseline, config=_config(), split=False)
+        torch.testing.assert_close(
+            baseline[0],
+            _expected(
+                case, split=False, epilogue=EpilogueMode.DEFAULT,
+                alpha=1.0, limit=None, residual=False,
+            ),
+            rtol=2e-4,
+            atol=2e-5,
+        )
+    output = torch.empty_like(baseline)
     for repeat in range(16):
         output.fill_(float("nan"))
-        _launch(case, output, config=config)
+        _launch(case, output, config=config, split=split)
         torch.testing.assert_close(
             output.view(torch.int32),
-            case.baseline.view(torch.int32),
+            baseline.view(torch.int32),
             rtol=0,
             atol=0,
             msg=f"{label}, repeat={repeat}",
@@ -230,29 +244,81 @@ def test_explicit_pipeline_controls(case, field, value):
 @pytest.mark.parametrize(
     "pipeline", [WarpPipeline.NONE, WarpPipeline.COMPILER], ids=["none", "compiler"]
 )
-def test_rectangular_read_schedule(case, pipeline):
+@pytest.mark.parametrize("scheme", list(WaitCommitScheme), ids=lambda scheme: scheme.name)
+@pytest.mark.parametrize("shape", [(4, 2), (2, 4)], ids=["4x2", "2x4"])
+def test_rectangular_read_schedule(case, pipeline, scheme, shape):
     # A 4x2 walk reads only in slots 0..5. Slots 6 and 7 do not read, so delaying
     # the non-relaxed read until the final slot would leave every actual read relaxed.
     config = _config(mask=15, pipeline=pipeline)
-    config["MINI_BLOCK_M"] = 32
-    _assert_repeated_output(case, config, f"4x2 mini tiles, pipeline={pipeline.name}")
+    config["WAIT_COMMIT_SCHEME"] = int(scheme)
+    if shape == (4, 2):
+        config["MINI_BLOCK_M"] = 32
+    else:
+        config.update(MINI_BLOCK_N=64, warps_per_cta=(2, 2))
+    _assert_repeated_output(
+        case, config, f"{shape} mini tiles, {scheme.name}, pipeline={pipeline.name}",
+        split=shape != (2, 4),
+    )
 
 
 @pytest.mark.parametrize(
     "scheme",
-    [WaitCommitScheme.PER_FILL, WaitCommitScheme.PER_SLOT],
-    ids=["per-fill", "per-slot"],
+    list(WaitCommitScheme),
+    ids=lambda scheme: scheme.name,
 )
 @pytest.mark.parametrize(
     "middle", [False, True], ids=["scales-with-payload", "middle-scales"]
 )
-def test_scale_wait_accounting(case, scheme, middle):
+@pytest.mark.parametrize(
+    "pipeline", [WarpPipeline.NONE, WarpPipeline.COMPILER], ids=["none", "compiler"]
+)
+def test_scale_wait_accounting(case, scheme, middle, pipeline):
     # A payload and B scales cross into MFMA; their partners stay in the memory
     # region. Moving the scale fills changes which commit group each read needs.
-    config = _config(mask=9)
+    config = _config(mask=9, pipeline=pipeline)
     config["WAIT_COMMIT_SCHEME"] = int(scheme)
     config["SCALE_FILL_MID"] = middle
-    _assert_repeated_output(case, config, f"{scheme.name}, SCALE_FILL_MID={middle}")
+    _assert_repeated_output(
+        case, config, f"{scheme.name}, SCALE_FILL_MID={middle}, {pipeline.name}"
+    )
+
+
+@pytest.mark.parametrize("scheme", list(WaitCommitScheme), ids=lambda scheme: scheme.name)
+@pytest.mark.parametrize(
+    "pipeline", [WarpPipeline.NONE, WarpPipeline.COMPILER], ids=["none", "compiler"]
+)
+def test_direct_scale_loads_do_not_add_async_groups(case, scheme, pipeline):
+    config = _config(mask=9, pipeline=pipeline)
+    # Four E8M0 entries per row force both scales onto the direct register path.
+    config.update(
+        BLOCK_K=128, MINI_BLOCK_K=128, VGPR_PREFETCH_K=128,
+        WAIT_COMMIT_SCHEME=int(scheme),
+    )
+    _assert_repeated_output(case, config, f"direct A/B scales, {scheme.name}, {pipeline.name}")
+
+
+@pytest.mark.parametrize("scheme", list(WaitCommitScheme), ids=lambda scheme: scheme.name)
+@pytest.mark.parametrize(
+    "pipeline", [WarpPipeline.NONE, WarpPipeline.COMPILER], ids=["none", "compiler"]
+)
+def test_multiple_mini_k_reads_share_one_stage_wait_plan(case, scheme, pipeline):
+    config = _config(mask=9, pipeline=pipeline)
+    config.update(MINI_BLOCK_K=128, WAIT_COMMIT_SCHEME=int(scheme))
+    _assert_repeated_output(case, config, f"two mini-K fragments, {scheme.name}, {pipeline.name}")
+
+
+def test_partial_register_prefetch_is_rejected(case):
+    config = _config()
+    config.update(MINI_BLOCK_K=128, VGPR_PREFETCH_K=128)
+    output = torch.empty_like(case.baseline)
+    with pytest.raises(CompilationError) as error:
+        _launch(case, output, config=config)
+    # Triton wraps an assertion from a nested JIT function in CompilationError.
+    cause = error.value
+    while cause is not None and not isinstance(cause, CompileTimeAssertionFailure):
+        cause = cause.__cause__ or cause.__context__
+    assert isinstance(cause, CompileTimeAssertionFailure), str(error.value)
+    assert "split-stage prologue" in str(cause)
 
 
 @pytest.mark.parametrize("split", [False, True], ids=["interleaved", "split"])

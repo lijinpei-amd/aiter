@@ -151,32 +151,23 @@ class WarpPipeline(IntEnum):
 
 
 class WaitCommitScheme(IntEnum):
-    """Granularity of the global->LDS commit groups, and where their wait goes.
+    """Commit granularity and wait placement for the live HBM-to-LDS pipeline.
 
-    One knob for both halves on purpose: ``wait_group(n)`` counts *groups*, so the
-    emission granularity and the wait arithmetic are the same decision seen from two
-    sides. Splitting them is what used to make the coarser levels look broken -- the
-    commits moved and the model counting them did not.
+    * ``PER_OP`` commits each asynchronous copy separately and waits before each
+      slot's LDS reads. Payload and scale copies have separate groups; a shared
+      scale tile contributes only its owner's copy. Synchronous payload staging
+      and direct HBM scale loads contribute no asynchronous group.
+    * ``PER_SLOT`` commits once after each slot, including slots with no copies,
+      and waits before each slot's LDS reads.
+    * ``PER_STAGE`` commits once after the whole K stage and waits once at the
+      head of each stage that reads LDS.
 
-    Per slot ``(mi, ni)`` of the ``num_mini_m() x num_mini_n()`` walk, one K stage
-    emits:
-
-    * ``PER_FILL`` -- one group per copy: the A payload, the B payload and any scale
-      that a different slot owns. ``num_mini_m() + num_mini_n()`` payload groups per
-      stage, 6 marks at 2x2 with the scales displaced.
-    * ``PER_SLOT`` -- one group per mini block, ``num_mini_m() * num_mini_n()``.
-    * ``PER_STAGE`` -- one group for the whole stage, committed at its last slot.
-
-    The wait placement follows from that. Under ``PER_FILL`` the groups a slot reads
-    are named individually, so every slot of a stage computes a wait and the *strongest*
-    of them, emitted once at the stage head, covers all of them -- one ``wait_group``
-    per stage rather than ``num_mini_m() * num_mini_n()`` of them, each of which
-    Membar follows with a barrier. The coarser levels bunch several tiles behind one
-    group, so a slot's wait is no longer implied by an earlier slot's and each is
-    emitted where it is needed, at the head of its own slot.
+    The shared schedule derives group counts and read dependencies from the same
+    copy ownership used by the emitter. The frozen snapshot keeps its own pinned
+    commit and wait schedule.
     """
 
-    PER_FILL = 1
+    PER_OP = 1
     PER_SLOT = 2
     PER_STAGE = 3
 
@@ -252,7 +243,7 @@ class TuningSpec(NamedTuple):
     ACT_FAST_RCP: bool = False
     #: :class:`WaitCommitScheme` -- how coarsely the global->LDS copies are committed,
     #: and hence how many groups a ``wait_group`` count has to walk past.
-    WAIT_COMMIT_SCHEME: int = int(WaitCommitScheme.PER_FILL)
+    WAIT_COMMIT_SCHEME: int = int(WaitCommitScheme.PER_OP)
     #: :class:`DSReadOperand` mask; each payload and scale may move independently.
     DS_READ_IN_MFMA: int = int(DSReadOperand.NONE)
     SCHED_MODE: int = int(SchedMode.NONE)

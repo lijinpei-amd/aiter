@@ -27,9 +27,8 @@ from triton.experimental.gluon import language as gl
 
 from ._lang import require_constexpr
 from ._lang import unwrap as _v
+from ._schedule import _buffer_load_order, _buffer_load_tile
 from .moe_gemm import (
-    _buffer_load_order,
-    _buffer_load_tile,
     _ds_read_a,
     _ds_read_b,
     _make_reg_fragments,
@@ -234,9 +233,9 @@ def _buffer_load_frozen(
     FROZEN SNAPSHOT -- do not refactor; ``_buffer_load`` is the live one.
 
     Specialised on the flags the ~625 us kernel ran with, so nothing here reads
-    os.environ: a commit group per fill (what ``WaitCommitScheme.PER_FILL`` now names,
-    then the ONE_MARK 0 default) and SOFF_UNROLL 0 (pointers bump every step, so KI and
-    every *_SOFF are 0). EVEN_FILL was 1 and is gone -- both axes are split in any
+    os.environ: the legacy per-fill groups (the former ONE_MARK 0 default) and
+    SOFF_UNROLL 0 (pointers bump every step, so KI and every *_SOFF are 0).
+    EVEN_FILL was 1 and is gone -- both axes are split in any
     config that compiles, so the schedule it selected is the only one.
     ``KI`` is kept in the signature only so the two stay call-compatible.
 
@@ -394,8 +393,8 @@ def _pipeline_step_frozen(
     #   SLOT_SCHED_BARRIER 0  SOFF_UNROLL 0  STAGE_WAIT 1  WARP_PIPELINE 1
     # Six came from BEST (DS_IN_MFMA MANUAL_PP MPP_BARRIER_STRIDE MPP_CLOSE_BARRIER
     # NO_SYNC_STAGE STAGE_WAIT); the rest are each flag's code default.
-    # ONE_MARK 0 + STAGE_WAIT 1 is what WaitCommitScheme.PER_FILL now means as one
-    # value, so the live path reaches this same schedule through the tuning config.
+    # Preserve the legacy ONE_MARK 0 + STAGE_WAIT 1 schedule independently of the
+    # live path's commit/wait configuration.
     # What remains conditional depends only on this function's parameters: DO_MFMA,
     # DO_DS_READ, DO_BUFFER_LOAD, the mi/ni slot indices, and pc's func/tuning cfg.
     # --------------------------------------------------------------------------------

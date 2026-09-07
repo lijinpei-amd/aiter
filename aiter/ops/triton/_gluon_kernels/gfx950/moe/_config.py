@@ -20,6 +20,7 @@ from aiter.ops.triton.utils.common_utils import strip_annotate
 
 from ._lang import MX_GROUP, WARP_SIZE
 from ._lang import unwrap as _v
+from ._schedule import _buffer_load_groups
 
 #: Non-K extent of one A-scale fill tile, when it should differ from MINI_BLOCK_M.
 #: 0 = follow MINI_BLOCK_M. Read here rather than inside the constexpr_function: those
@@ -465,7 +466,7 @@ class KernelTuningConfig:
         B_SCALE_SHUFFLED=False,
         B_PRESHUFFLED=False,
         ACT_FAST_RCP=False,
-        WAIT_COMMIT_SCHEME=int(WaitCommitScheme.PER_FILL),
+        WAIT_COMMIT_SCHEME=int(WaitCommitScheme.PER_OP),
         DS_READ_IN_MFMA=int(DSReadOperand.NONE),
         SCHED_MODE=int(SchedMode.NONE),
         FROZEN_STEP=False,
@@ -591,13 +592,11 @@ class KernelTuningConfig:
         return _v(self.WARP_PIPELINE) == int(WarpPipeline.MANUAL)
 
     # -- commit-group granularity (WaitCommitScheme) --------------------------------
-    # The emission level and the wait arithmetic are one decision: wait_group(n) counts
-    # groups, so a commit moved without the count that walks past it is a wrong wait,
-    # not a slower one. Both sides read these two methods and nothing else.
+    # Emission and wait arithmetic use the same copy schedule and group boundaries.
 
     @gluon.constexpr_function
-    def commit_per_fill(self):
-        return _v(self.WAIT_COMMIT_SCHEME) == int(WaitCommitScheme.PER_FILL)
+    def commit_per_op(self):
+        return _v(self.WAIT_COMMIT_SCHEME) == int(WaitCommitScheme.PER_OP)
 
     @gluon.constexpr_function
     def commit_per_slot(self):
@@ -609,47 +608,13 @@ class KernelTuningConfig:
 
     @gluon.constexpr_function
     def commit_groups_per_stage(self):
-        """Commit groups one ``BLOCK_K`` stage emits under the selected scheme.
-
-        ``PER_FILL`` is the payload count, ``num_mini_m() + num_mini_n()``: a scale that
-        sits on another slot commits a group of its own on top, so the model is
-        *conservative* there -- it counts fewer groups per stage than are emitted, and a
-        wait derived from it therefore retires more than it has to. The other two levels
-        are exact.
-        """
-        if self.commit_per_slot():
-            return self.num_mini_m() * self.num_mini_n()
-        if self.commit_per_stage():
-            return 1
-        return self.num_mini_m() + self.num_mini_n()
+        """Exact number of groups in the live stage's shared copy schedule."""
+        return len(_buffer_load_groups(self))
 
     @gluon.constexpr_function
     def wait_at_stage_head(self):
-        """Emit one ``wait_group`` per stage (at its first slot) rather than one per slot.
-
-        True for ``PER_FILL`` and ``PER_STAGE``; only ``PER_SLOT`` needs a wait per slot.
-
-        The waits are not free. Membar inserts a barrier after *every* ``ttg.async_wait``
-        unconditionally (Membar.cpp, the MemWaitOp path, which returns before the
-        conflict analysis is consulted), and each such ``ttg.barrier`` is a workgroup
-        release fence and hence an ``s_waitcnt lgkmcnt(0)``. So one wait hoisted out of
-        N is N-1 barriers and N-1 lgkm drains removed.
-
-        ``PER_FILL``: every group a slot reads is named individually, so the strongest
-        slot wait of the stage implies all the others. Strongest = smallest count, since
-        ``wait_group(n)`` leaves at most ``n`` groups outstanding.
-
-        ``PER_STAGE``: stronger still -- ``_slot_wait`` returns ``STAGES_BETWEEN`` for
-        *every* slot, because the stage's own group is not committed until its last slot
-        and so contributes nothing outstanding. All four counts are equal, so the hoisted
-        ``min()`` is not an approximation of them: it *is* them, and the other three
-        waits are pure duplicates.
-
-        ``PER_SLOT`` is the one level that must stay per-slot: one group covers a whole
-        mini block there, so ``_fills_before`` differs between slots and a slot's wait is
-        genuinely not implied by an earlier slot's.
-        """
-        return self.commit_per_fill() or self.commit_per_stage()
+        """PER_STAGE waits once at the stage head; other modes wait per read slot."""
+        return self.commit_per_stage()
 
     @gluon.constexpr_function
     def num_lds_tiles(self, idx):
@@ -1418,16 +1383,14 @@ class KernelTuningConfig:
             )
 
         # -- commit-group granularity --
-        # An out-of-range value would fall through commit_groups_per_stage()'s tail and
-        # silently run the PER_FILL model against a different emission, which is a wrong
-        # wait rather than a rejected config.
+        # Reject unknown schemes before building the shared copy/group schedule.
         assert _v(self.WAIT_COMMIT_SCHEME) in (
-            int(WaitCommitScheme.PER_FILL),
+            int(WaitCommitScheme.PER_OP),
             int(WaitCommitScheme.PER_SLOT),
             int(WaitCommitScheme.PER_STAGE),
         ), (
             f"WAIT_COMMIT_SCHEME {_v(self.WAIT_COMMIT_SCHEME)} is not a WaitCommitScheme: "
-            f"PER_FILL {int(WaitCommitScheme.PER_FILL)}, "
+            f"PER_OP {int(WaitCommitScheme.PER_OP)}, "
             f"PER_SLOT {int(WaitCommitScheme.PER_SLOT)}, "
             f"PER_STAGE {int(WaitCommitScheme.PER_STAGE)}"
         )

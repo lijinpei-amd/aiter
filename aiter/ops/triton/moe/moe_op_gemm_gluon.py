@@ -487,15 +487,13 @@ def get_gluon_config_uncached(
             "ACT_FAST_RCP": bool(
                 _env_int("AITER_TRITON_MOE_GLUON_ACT_FAST_RCP", 0)
             ),
-            # How coarsely the global->LDS copies of a K stage are committed, and hence
-            # where the wait that retires them goes: PER_FILL (1) marks every copy and
-            # hoists one wait to the stage head, PER_SLOT (2) and PER_STAGE (3) mark
-            # once per mini block / per stage and wait at the head of each slot. One
-            # knob for both halves because wait_group counts groups -- see
-            # WaitCommitScheme.
+            # PER_OP (1) commits each async copy; PER_SLOT (2) commits each slot.
+            # Both wait before each read slot. PER_STAGE (3) commits the whole K
+            # stage and waits once at the read stage's head. Counts and copy ownership
+            # come from the same schedule; see WaitCommitScheme.
             "WAIT_COMMIT_SCHEME": _env_int(
                 "AITER_TRITON_MOE_GLUON_WAIT_COMMIT_SCHEME",
-                int(WaitCommitScheme.PER_FILL),
+                int(WaitCommitScheme.PER_OP),
             ),
             "DS_READ_IN_MFMA": _ds_read_in_mfma_from_env(),
             "SCHED_MODE": _env_int(
