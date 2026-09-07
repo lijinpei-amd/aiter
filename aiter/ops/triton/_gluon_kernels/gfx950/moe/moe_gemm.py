@@ -561,16 +561,6 @@ def _make_reg_fragments(a_frags, b_frags, acc):
     return _PipelineRegFragments(a_payload, a_scale, b_payload, b_scale, acc)
 
 
-@gluon.constexpr_function
-def _relax_ds_read(mi, ni, NM, NN):
-    """May this slot's LDS reads skip the pre-barrier lgkmcnt drain?
-
-    Keep the last actual read plain so it retires the earlier relaxed reads before
-    the next K step reuses their buffers. Larger splits have compute-only tail slots.
-    """
-    return _slot_index(mi, ni, NM, NN) < _v(NM) + _v(NN) - 1
-
-
 @gluon.jit
 def _buffer_load_wait_group(
     pc,
@@ -795,7 +785,7 @@ def _ds_read_b(
 
 
 # --- per-slot constexpr binding -----------------------------------------------
-# ``_ds_read_a_tile`` / ``_ds_read_b_tile`` / ``_relax_ds_read`` are pure functions of the slot
+# ``_ds_read_a_tile`` / ``_ds_read_b_tile`` are pure functions of the slot
 # position, and the slot body wants each of them several times. They cannot be hoisted
 # to a local at the top of the slot loop: ``X: gl.constexpr = ...`` there is rejected on
 # the second unrolled iteration ("constexpr cannot be reassigned"), and an unannotated
@@ -825,7 +815,6 @@ def _ds_read(
     NN: gl.constexpr = pc.tuning_cfg.num_mini_n()
     A_TILE: gl.constexpr = _ds_read_a_tile(mi, ni, NM, NN)
     B_TILE: gl.constexpr = _ds_read_b_tile(mi, ni, NM, NN)
-    RELAXED: gl.constexpr = _relax_ds_read(mi, ni, NM, NN)
     a_frags = ()
     b_frags = ()
     if require_constexpr(
@@ -836,7 +825,7 @@ def _ds_read(
             DS_READ_IDX,
             A_TILE,
             a_scale_direct_hbm_ptr,
-            RELAXED,
+            True,
             WANT_A,
             WANT_A_SCALE,
         )
@@ -848,7 +837,7 @@ def _ds_read(
             DS_READ_IDX,
             B_TILE,
             b_scale_direct_hbm_ptr,
-            RELAXED,
+            True,
             WANT_B,
             WANT_B_SCALE,
         )
