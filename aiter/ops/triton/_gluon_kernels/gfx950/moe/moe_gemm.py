@@ -679,7 +679,7 @@ def _advance_hbm_ptrs(pc, hbm_ptrs, STEPS: gl.constexpr = 1, K_PHASE: gl.constex
 
 
 @gluon.jit
-def _advance_direct_scale_hbm_ptrs(pc, hbm_ptrs):
+def _advance_scale_hbm_ptrs(pc, hbm_ptrs):
     """Advance only scales loaded straight into registers, once per consumed stage."""
     a_scale_hbm_ptr = hbm_ptrs.a_scale_hbm_ptr
     b_scale_hbm_ptr = hbm_ptrs.b_scale_hbm_ptr
@@ -1073,15 +1073,15 @@ def _pipeline_step_impl(
                 if require_constexpr(DO_DS_READ and mi == NM - 1 and ni == NN - 1):
                     # Keep pointer arithmetic before the border so the next wait is
                     # the first operation between pipeline regions.
-                    hbm_ptrs = _advance_direct_scale_hbm_ptrs(pc, hbm_ptrs)
-                if require_constexpr(
-                    DO_BUFFER_LOAD
-                    and tc.commit_per_stage_whole()
-                    and mi == NM - 1
-                    and ni == NN - 1
-                ):
-                    # Close after the full stage's MFMA/read work. Keep the marker
-                    # before the border so the next wait stays outside the region.
+                    hbm_ptrs = _advance_scale_hbm_ptrs(pc, hbm_ptrs)
+            if require_constexpr(
+                DO_BUFFER_LOAD
+                and tc.commit_per_stage_whole()
+                and mi == NM - 1
+                and ni == NN - 1
+            ):
+                # Bound the post-MFMA commit so the next wait stays outside a region.
+                with STAGE("commit"):
                     pc.lds_ptrs.commit_buffer_load()
             a_cur = a_cur + _merge_ds_read_frags(a_mem, a_mfma, tc, 0)
             b_cur = b_cur + _merge_ds_read_frags(b_mem, b_mfma, tc, 1)
