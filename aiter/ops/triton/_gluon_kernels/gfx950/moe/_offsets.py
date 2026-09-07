@@ -213,13 +213,12 @@ def _a_scale_hbm_offsets(a, rt, block_id, M_e, start_m, pid_m, K, func_cfg, tuni
         # moe_sort_scales has already applied the gather and the fragment permute,
         # so there is no table lookup and no per-row stride here: the tile is one
         # contiguous run and `asl` (the fragment layout) already places each lane on
-        # the byte it needs. The stage bump is a flat 256 B, which the host encodes
-        # as scale_stride_k = 32 against the shared s_step = SK.
+        # the byte it needs. A K256 scale group spans 256 B per row stripe;
+        # K128 payload stages reuse the same group before advancing the pointer.
         gl.static_assert(
             tuning_cfg.sorted_shuffled_ok(),
-            "A_SCALE_SORTED_SHUFFLED needs the layout moe_sort_scales writes: "
-            "16x16x128, warps (n, 1), tiles_per_warp (2, 1), BLOCK_K 256, "
-            "BLOCK_M == 32 * warps_m, MINI_BLOCK_M == BLOCK_M",
+            "A_SCALE_SORTED_SHUFFLED requires MFMA 16x16x128, BLOCK_K 128 or 256, "
+            "and whole 32-row A stripes",
         )
         # The shuffle indexes the *padded* row space -- expert e starts at
         # token_offs_pad[e] whole blocks -- while start_m is the raw offset and is
