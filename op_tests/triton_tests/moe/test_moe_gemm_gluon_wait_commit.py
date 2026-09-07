@@ -3,6 +3,7 @@
 
 """Check emitted async groups against an independent CPU completion queue."""
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -79,7 +80,9 @@ class _ScheduleConfig:
         return self.WAIT_COMMIT_SCHEME == WaitCommitScheme.PER_SLOT
 
     def commit_per_stage(self):
-        return self.WAIT_COMMIT_SCHEME == WaitCommitScheme.PER_STAGE
+        return self.WAIT_COMMIT_SCHEME in (
+            WaitCommitScheme.PER_STAGE_WARP_PIPELINE, WaitCommitScheme.PER_STAGE_WHOLE,
+        )
 
 
 def _config(shape, scheme, middle, traffic):
@@ -261,7 +264,7 @@ def test_emitted_groups_and_waits_retire_required_copies(shape, scheme, middle, 
                     wait = _buffer_load_wait(tc, slot % tc.nm, slot // tc.nm, between, filling)
                     if wait is not None:
                         wait += slack
-                        if scheme == WaitCommitScheme.PER_STAGE:
+                        if tc.commit_per_stage():
                             assert slot == 0
                             assert wait == between + slack
                         else:
@@ -271,7 +274,7 @@ def test_emitted_groups_and_waits_retire_required_copies(shape, scheme, middle, 
                             assert wait == len(committed[newest_required + 1:])
                         while len(queue) > wait:
                             completed.update(queue.pop(0))
-                    elif scheme != WaitCommitScheme.PER_STAGE:
+                    elif not tc.commit_per_stage():
                         assert not target
                     assert target <= completed, (slot, required, wait, queue)
                     if filling:
@@ -281,8 +284,11 @@ def test_emitted_groups_and_waits_retire_required_copies(shape, scheme, middle, 
                             committed.append(issued)
 
 
-def test_stage_commit_can_close_after_the_slot_walk(monkeypatch):
-    tc = _config((4, 2), WaitCommitScheme.PER_STAGE, False, "shared-a-pair")
+@pytest.mark.parametrize("scheme", [
+    WaitCommitScheme.PER_STAGE_WARP_PIPELINE, WaitCommitScheme.PER_STAGE_WHOLE,
+])
+def test_stage_commit_can_close_after_the_slot_walk(scheme, monkeypatch):
+    tc = _config((4, 2), scheme, False, "shared-a-pair")
     copies, _ = _reference_slots(tc)
     _, emitted = _trace_emitter(tc, monkeypatch, defer_stage_commit=True)
     assert emitted == _reference_groups(tc, copies)
@@ -297,12 +303,98 @@ def test_synchronous_reads_keep_a_cooperative_fence(scheme, monkeypatch):
         lds_ptrs=SimpleNamespace(wait_buffer_load_groups=waits.append),
     )
     monkeypatch.setattr(kernel.gl, "barrier", lambda: barriers.append(True))
+    kernel.wait_per_stage.fn(pc, 1)
     for ni in range(tc.nn):
         for mi in range(tc.nm):
-            kernel._buffer_load_wait_group.fn(pc, mi, ni, 1, True)
-    if scheme == WaitCommitScheme.PER_STAGE:
+            kernel.wait_per_slot.fn(pc, mi, ni, 1, True)
+    if tc.commit_per_stage():
         assert waits == [1]
         assert not barriers
     else:
         assert not waits
         assert len(barriers) == tc.nm + tc.nn
+
+
+@pytest.mark.parametrize("scheme", [
+    WaitCommitScheme.PER_STAGE_WARP_PIPELINE, WaitCommitScheme.PER_STAGE_WHOLE,
+], ids=lambda scheme: scheme.name)
+@pytest.mark.parametrize("compiler", [False, True], ids=["none", "compiler"])
+@pytest.mark.parametrize("fill,read,dot,in_loop", [
+    (True, False, False, False),
+    (True, True, False, False),
+    (True, True, True, True),
+    (False, True, True, False),
+], ids=["fill", "prefetch", "loop", "drain"])
+def test_pipeline_stage_commit_boundaries(
+    scheme, compiler, fill, read, dot, in_loop, monkeypatch
+):
+    """Execute the live step and record ordering around its actual region borders."""
+    events = []
+    tc = _config((2, 2), scheme, False, "no-scales")
+    tc.num_mini_k = tc.num_prefetch_mini = lambda: 1
+    tc.warp_pipeline_compiler = lambda: compiler
+    tc.warp_pipeline_manual = lambda: False
+    tc.commit_per_stage_warp_pipeline = lambda: scheme == WaitCommitScheme.PER_STAGE_WARP_PIPELINE
+    tc.commit_per_stage_whole = lambda: scheme == WaitCommitScheme.PER_STAGE_WHOLE
+    tc.ds_read_in_mfma = lambda *args, **kwargs: False
+    tc.scale_k_phase = lambda phase: 0
+    tc.NUM_LDS_BUFFER = 3
+    tc.SCHED_MODE = 0
+    pc = SimpleNamespace(
+        func_cfg=tc, tuning_cfg=tc,
+        lds_ptrs=SimpleNamespace(
+            wait_buffer_load_groups=lambda count: events.append(("wait", count)),
+            commit_buffer_load=lambda: events.append(("commit",)),
+        ),
+    )
+    pointers = SimpleNamespace(a_scale_hbm_ptr=None, b_scale_hbm_ptr=None)
+    regs = SimpleNamespace(a_payload=(), a_scale=(), b_payload=(), b_scale=(), acc=(0,) * 4)
+
+    @contextmanager
+    def stage(name):
+        events.append(("enter", name))
+        yield
+        events.append(("exit", name))
+
+    def pick_stage(enabled):
+        assert bool(unwrap(enabled)) == (compiler and read and in_loop)
+        return stage
+
+    def buffer_load(*args, **kwargs):
+        assert kwargs["STAGE_MARK"] is False
+        events.append(("load",))
+
+    monkeypatch.setattr(kernel, "pick_stage", pick_stage)
+    monkeypatch.setattr(kernel.gl, "static_range", range)
+    monkeypatch.setattr(kernel.gl, "static_assert", lambda value, message: None)
+    monkeypatch.setattr(kernel.gl.amd.cdna4, "sched_barrier", lambda mask: None)
+    monkeypatch.setattr(kernel, "wait_per_stage", kernel.wait_per_stage.fn)
+    monkeypatch.setattr(kernel, "wait_per_slot", kernel.wait_per_slot.fn)
+    monkeypatch.setattr(kernel, "_buffer_load", buffer_load)
+    monkeypatch.setattr(kernel, "_ds_read", lambda *args: ((), ()))
+    monkeypatch.setattr(kernel, "_merge_ds_read_frags", lambda *args: ())
+    monkeypatch.setattr(kernel, "_ds_read_tails", lambda *args: ((), ()))
+    monkeypatch.setattr(kernel, "_take_reg_pairs", lambda *args: ())
+    monkeypatch.setattr(kernel, "_make_reg_fragments", lambda *args: args)
+    monkeypatch.setattr(kernel, "_advance_hbm_ptrs", lambda pc, ptrs, *args: ptrs)
+    monkeypatch.setattr(kernel, "_advance_direct_scale_hbm_ptrs", lambda pc, ptrs: ptrs)
+    monkeypatch.setattr(kernel, "_maybe_block_dot", lambda *args: events.append(("dot",)))
+
+    kernel._pipeline_step_impl.fn(
+        pc, pointers, regs, 2, 0, 1, fill, read, in_loop, dot, WAIT_SLACK=2,
+    )
+    assert [event for event in events if event[0] == "wait"] == ([("wait", 3)] if read else [])
+    if read:
+        assert events[0] == ("wait", 3), "Stage waits must precede the entire slot walk."
+    assert events.count(("commit",)) == int(fill)
+    if fill:
+        commit = events.index(("commit",))
+        assert events[:commit].count(("load",)) == 4
+        if scheme == WaitCommitScheme.PER_STAGE_WARP_PIPELINE:
+            assert events[commit - 1] == ("load",)
+            assert events[commit + 1] == ("exit", "mem")
+            assert events[commit + 2] == ("enter", "mfma")
+        else:
+            assert events[commit - 1] == ("dot",)
+            assert events[commit + 1] == ("exit", "mfma")
+            assert commit == len(events) - 2

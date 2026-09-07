@@ -159,8 +159,11 @@ class WaitCommitScheme(IntEnum):
       and direct HBM scale loads contribute no asynchronous group.
     * ``PER_SLOT`` commits once after each slot, including slots with no copies,
       and waits before each slot's LDS reads.
-    * ``PER_STAGE`` commits once after the whole K stage and waits once at the
-      head of each stage that reads LDS.
+    * ``PER_STAGE_WARP_PIPELINE`` commits once after the last memory region of
+      the K stage, before its final MFMA region.
+    * ``PER_STAGE_WHOLE`` commits once after the whole K stage, including MFMA.
+      Both per-stage modes wait once at the head of each stage that reads LDS.
+      Their commit locations also apply when the compiler warp pipeline is off.
 
     The shared schedule derives group counts and read dependencies from the same
     copy ownership used by the emitter. The frozen snapshot keeps its own pinned
@@ -169,7 +172,9 @@ class WaitCommitScheme(IntEnum):
 
     PER_OP = 1
     PER_SLOT = 2
-    PER_STAGE = 3
+    # Preserve the whole-stage setting used by existing cold-bench recipes.
+    PER_STAGE_WHOLE = 3
+    PER_STAGE_WARP_PIPELINE = 4
 
 
 class FuncSpec(NamedTuple):

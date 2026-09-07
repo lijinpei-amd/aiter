@@ -19,6 +19,10 @@ miscompile.
 import pytest
 import torch
 
+from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
+    WaitCommitScheme,
+    WarpPipeline,
+)
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import moe_gemm_torch
 from aiter.ops.triton.moe.moe_op_gemm_gluon import (
     gluon_supported,
@@ -134,6 +138,52 @@ def test_dtype_inference():
     # of ours either -- both must be refused rather than guessed at.
     assert infer_dtype_quant(u8, None) is None
     assert infer_dtype_quant(bf, u8) is None
+
+
+@pytest.mark.parametrize("scheme", list(WaitCommitScheme), ids=lambda scheme: scheme.name)
+@pytest.mark.parametrize("pipeline", [WarpPipeline.NONE, WarpPipeline.COMPILER],
+                         ids=["none", "compiler"])
+def test_bf16_pipeline_wait_commit(scheme, pipeline, monkeypatch):
+    """Exercise unscaled copies through the prologue, loop, remainder, and drain."""
+    import os
+
+    from op_tests.triton_tests.moe.test_moe_gemm_gluon_read_placement import _config
+
+    if get_arch() != "gfx950":
+        pytest.skip("Gluon MoE kernels are gfx950 only.")
+    for name in os.environ:
+        if name.startswith("AITER_TRITON_MOE_GLUON_"):
+            monkeypatch.delenv(name)
+    torch.manual_seed(42)
+    m, n, k, experts, topk = 257, 512, 768, 4, 2
+    rdata, gather, _ = routing(
+        torch.randn((m, experts), device="cuda", dtype=torch.float16), topk
+    )
+    rdata.gate_scal = None
+    x = (torch.randn((m, k), device="cuda") * 0.1).bfloat16()
+    w = (torch.randn((experts, n, k), device="cuda") * 0.1).bfloat16().transpose(1, 2)
+    config = _config(pipeline=pipeline)
+    config.update(
+        BLOCK_K=64, MINI_BLOCK_K=64, VGPR_PREFETCH_K=64,
+        mfma_instr_shape=(32, 32, 16), warps_per_cta=(2, 4), tiles_per_warp=(1, 1),
+        SCALE_FILL_MID=False, WAIT_COMMIT_SCHEME=int(scheme),
+    )
+    raw = moe_gemm_torch(x.float(), w.float(), None, rdata, gather)
+    gate, linear = raw.chunk(2, dim=-1)
+    expected = torch.nn.functional.silu(gate) * linear
+    output = torch.empty((1, m * topk, n // 2), device="cuda", dtype=torch.bfloat16)
+    first = None
+    for repeat in range(16):
+        output.fill_(float("nan"))
+        moe_gemm_gluon(
+            output, x, w, None, None, None, None, rdata, gather, None, n, k,
+            True, 1.0, None, False, config=config, gate_up_split=True,
+        )
+        if first is None:
+            assert_close(expected, output[0], description="BF16 pipeline wait/commit")
+            first = output.clone()
+        else:
+            assert torch.equal(first, output), (scheme, pipeline, repeat)
 
 
 def test_bf16_times_mxfp4_is_refused(device="cuda"):

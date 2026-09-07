@@ -66,7 +66,7 @@ BEST = {
     "AITER_TRITON_MOE_GLUON_DS_IN_MFMA": "1",
     "AITER_TRITON_MOE_GLUON_ACT_FAST_RCP": "1",
     # WaitCommitScheme.PER_OP: commit each async payload/scale copy and wait per
-    # read slot. The cold-bench impl arm overrides this with PER_STAGE (3); the
+    # read slot. The cold-bench impl arm overrides this with PER_STAGE_WHOLE (3); the
     # frozen arm keeps its private snapshot's commit/wait schedule.
     "AITER_TRITON_MOE_GLUON_WAIT_COMMIT_SCHEME": "1",
     "TRITON_MEMBAR_DEDUP_BARE": "1",
