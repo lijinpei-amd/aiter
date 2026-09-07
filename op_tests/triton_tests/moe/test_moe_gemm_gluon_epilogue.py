@@ -9,11 +9,15 @@ import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from aiter.ops.triton._gluon_kernels.gfx950.moe._entry import MoeKernelConfig
+from aiter.ops.triton._gluon_kernels.gfx950.moe._config import (
+    KernelFuncConfig,
+    KernelTuningConfig,
+)
 from aiter.ops.triton._gluon_kernels.gfx950.moe._epilogue import (
     _epi_block_flush,
     _epi_stage_flush,
 )
+from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import constexpr_fields
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     ActivationSpec,
     ActKind,
@@ -21,7 +25,6 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     FuncSpec,
     TuningSpec,
 )
-from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_gemm import _build_configs
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 
@@ -104,7 +107,8 @@ def _epilogue_probe(
     TUNING: gl.constexpr,
     N: gl.constexpr = 512,
 ):
-    func, tuning = _build_configs(MoeKernelConfig(FUNC, TUNING, N, 256))
+    func = KernelFuncConfig(*constexpr_fields(FUNC))
+    tuning = KernelTuningConfig(func, *constexpr_fields(TUNING))
     SH: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
     block_id = gl.program_id(0)
     pid_n = gl.program_id(1)

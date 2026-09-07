@@ -76,7 +76,6 @@ from ._config import KernelFuncConfig, KernelTuningConfig
 from ._epilogue import _epi_bias_tiles, _epilogue_store
 from ._lang import MX_GROUP_CE as MX_GROUP
 from ._lang import WARP_SIZE_CE as WARP_SIZE
-from ._lang import field_at as _at
 from ._lang import optional as _opt
 from ._lang import pick_warp_pipeline_stage as pick_stage
 from ._lang import require_constexpr
@@ -127,66 +126,6 @@ _TS_GROUP_M: gl.constexpr = gl.constexpr(int(TileSched.GROUP_M))
 _DK_MFMA: gl.constexpr = gl.constexpr(int(DotKind.MFMA))
 _DK_MFMA_SCALED: gl.constexpr = gl.constexpr(int(DotKind.MFMA_SCALED))
 _DK_UPCAST_MFMA: gl.constexpr = gl.constexpr(int(DotKind.UPCAST_MFMA))
-
-
-@gluon.jit
-def _build_configs(cfg):
-    f: gl.constexpr = cfg.func
-    t: gl.constexpr = cfg.tuning
-    func_cfg = KernelFuncConfig(
-        _at(f, 0),
-        _at(f, 1),
-        _at(f, 2),
-        _at(f, 3),
-        _at(f, 4),
-        _at(f, 5),
-        _at(f, 6),
-        _at(f, 7),
-        _at(f, 8),
-        _at(f, 9),
-        _at(f, 10),
-        _at(f, 11),
-        _at(f, 12),
-    )
-    tuning_cfg = KernelTuningConfig(
-        func_cfg,
-        _at(t, 0),
-        _at(t, 1),
-        _at(t, 2),
-        _at(t, 3),
-        _at(t, 4),
-        _at(t, 5),
-        _at(t, 6),
-        _at(t, 7),
-        _at(t, 8),
-        _at(t, 9),
-        _at(t, 10),
-        _at(t, 11),
-        _at(t, 12),
-        _at(t, 13),
-        _at(t, 14),
-        _at(t, 15),
-        _at(t, 16),
-        _at(t, 17),
-        _at(t, 18),
-        _at(t, 19),
-        _at(t, 20),
-        _at(t, 21),
-        _at(t, 22),
-        _at(t, 23),
-        _at(t, 24),
-        _at(t, 25),
-        _at(t, 26),
-        _at(t, 27),
-        _at(t, 28),
-        _at(t, 29),
-        _at(t, 30),
-        _at(t, 31),
-        _at(t, 32),
-        _at(t, 33),
-        _at(t, 34),
-    )
-    return func_cfg, tuning_cfg
 
 
 @gluon.constexpr_function
@@ -1178,10 +1117,12 @@ def _moe_gemm_body(
     x_static_scale_hbm_ptr,
     grid_m,
     grid_n,
-    cfg,  # MoeKernelConfig
+    func_cfg,
+    tuning_cfg,
+    N: gl.constexpr,
+    K: gl.constexpr,
 ):
-    func_cfg, tuning_cfg = _build_configs(cfg)
-    gl.static_assert(tuning_cfg.validate(cfg.N, cfg.K))
+    gl.static_assert(tuning_cfg.validate(N, K))
 
     BM: gl.constexpr = tuning_cfg.BLOCK_M
     BN: gl.constexpr = tuning_cfg.BLOCK_N
@@ -1190,7 +1131,7 @@ def _moe_gemm_body(
     PK_A: gl.constexpr = BK // func_cfg.a_pack_divisor()
     PK_B: gl.constexpr = BK // func_cfg.b_pack_divisor()
     SK: gl.constexpr = BK // MX_GROUP
-    NUM_K: gl.constexpr = tuning_cfg.num_k_tiles(cfg.K)
+    NUM_K: gl.constexpr = tuning_cfg.num_k_tiles(K)
 
     # One offset grid per mini block. Each is built at *its own* mini tile's copy
     # layout, so the split into MINI_BLOCK_M rows / MINI_BLOCK_N columns costs no
@@ -1245,14 +1186,12 @@ def _moe_gemm_body(
     else:
         b_scale_hbm_ptr: gl.constexpr = None
 
-    b_hbm_offs = _b_payload_hbm_offsets(b, pid_n, cfg.N, cfg.K, func_cfg, tuning_cfg)
+    b_hbm_offs = _b_payload_hbm_offsets(b, pid_n, N, K, func_cfg, tuning_cfg)
 
     a_scale_hbm_offs = _a_scale_hbm_offsets(
-        a, rt, block_id, M_e, start_m, pid_m, cfg.K, func_cfg, tuning_cfg
+        a, rt, block_id, M_e, start_m, pid_m, K, func_cfg, tuning_cfg
     )
-    b_scale_hbm_offs = _b_scale_hbm_offsets(
-        b, pid_n, cfg.N, cfg.K, func_cfg, tuning_cfg
-    )
+    b_scale_hbm_offs = _b_scale_hbm_offsets(b, pid_n, N, K, func_cfg, tuning_cfg)
 
     lds_ptrs = LDSManager.alloc(func_cfg, tuning_cfg)
 
@@ -1494,7 +1433,7 @@ def _moe_gemm_body(
             epi_b_offs = _n_split_offs(
                 pid_n,
                 gl.arange(0, BN, layout=EPI_BC),
-                cfg.N,
+                N,
                 func_cfg,
                 tuning_cfg,
             )
@@ -1554,7 +1493,7 @@ def _moe_gemm_body(
             pc,
             regs,
             _epi_bias_tiles(
-                bias_lds_ptr, bias_hbm_base, pid_n, cfg.N, func_cfg, tuning_cfg
+                bias_lds_ptr, bias_hbm_base, pid_n, N, func_cfg, tuning_cfg
             ),
             x_static_scale,
             func_cfg,
@@ -1579,7 +1518,7 @@ def _moe_gemm_body(
         bias_hbm_base,
         block_id,
         pid_n,
-        cfg.N,
+        N,
         M_e,
         gammas_hbm_ptr,
         gamma_lds_ptr,
