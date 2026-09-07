@@ -878,12 +878,11 @@ class KernelTuningConfig:
         """Does this config produce the layout the C++ shuffle was written against?"""
         # The permutation lives in the LDS tile's SharedLinearLayout, which is a
         # property of the byte order the shuffle writes -- not of how warps are split.
-        # So the warp arrangement is free here; what the shuffle does require is the
-        # 16x16x128 operand, BLOCK_K 256 (K_PACK == 2, else it zero-pads half the
-        # bytes) and one A tile per stage.
+        # The warp arrangement is free. The shuffle always packs K256;
+        # a K128 payload stage selects one half.
         return (
             list(_v(self.mfma_instr_shape)) == [16, 16, 128]
-            and _v(self.BLOCK_K) == 256
+            and _v(self.BLOCK_K) in (128, 256)
             and _v(self.BLOCK_M) % 32 == 0
             # A mini block only has to be a whole number of 32-row stripes: the shuffle
             # writes one 256 B run per stripe, so a mini block is a contiguous slice.
@@ -896,6 +895,24 @@ class KernelTuningConfig:
         if _v(idx) == 0:
             return _v(self.A_SCALE_SORTED_SHUFFLED)
         return _v(self.B_SCALE_SHUFFLED)
+
+    @gluon.constexpr_function
+    def scale_packed_k128(self, idx):
+        return _v(self.BLOCK_K) == 128 and self.scale_shuffled(idx)
+
+    @gluon.constexpr_function
+    def scale_k_phase(self, step):
+        """Which K128 half of the packed K256 scale word this stage consumes."""
+        if self.scale_packed_k128(0) or self.scale_packed_k128(1):
+            return _v(step) % 2
+        return 0
+
+    @gluon.constexpr_function
+    def scale_hbm_steps(self, idx, steps, phase=0):
+        """Scale pointer displacement in units of one payload stage's scale stride."""
+        if self.scale_packed_k128(idx):
+            return ((_v(phase) + _v(steps)) // 2) * 2
+        return _v(steps)
 
     @gluon.constexpr_function
     def shuffled_scale_mem_layout(self, idx):
@@ -1012,8 +1029,8 @@ class KernelTuningConfig:
         return [d // 2, d % 2]
 
     @gluon.constexpr_function
-    def scale_packed_sel(self, idx):
-        """Byte of the dword that matrix instruction ``i`` reads, for ``i % 4``.
+    def scale_packed_sel(self, idx, k_phase=0):
+        """Byte selectors in MFMA order, for one K128 half or the full K256 word.
 
         The instruction index counts non-K major and K minor, so its low two bits are
         the fragment's first two register bases in that order. CDNA4_SCALE numbers the
@@ -1021,34 +1038,39 @@ class KernelTuningConfig:
         """
         if not self.scale_packed_ok(idx):
             return None
+        if self.scale_packed_k128(idx):
+            return [2 * _v(k_phase), 2 * _v(k_phase) + 1]
         return [0, 2, 1, 3]
 
     @gluon.constexpr_function
     def scale_packed_ok(self, idx):
         """Can this operand's scale fragment be fed as one dword per lane?
 
-        The two within-dword steps have to be the fragment's *first two* register bases:
-        register-private, so every lane owns all four bytes, and first, so the selector
-        list can address them as the low two bits of the instruction index.
+        K256 folds K+4 and non-K+16; K128 folds only non-K+16 and selects
+        its K half separately. Each folded step must be register-private.
         """
         if not self.scale_shuffled(idx):
             return False
         regs = [list(b) for b in self.dot_operand_scale_fragment_layout(idx).reg_bases]
+        if self.scale_packed_k128(idx):
+            return len(regs) >= 1 and regs[0] == [16, 0]
         if len(regs) < 2:
             return False
         return regs[0] == [0, 4] and regs[1] == [16, 0]
 
     @gluon.constexpr_function
     def packed_scale_shape(self, idx):
+        """Physical i32 storage, including both K128 halves even when one is unused."""
         nonk = self.scale_nonk(idx)
-        return [nonk, _v(self.BLOCK_K) // 128]
+        return [nonk, max(256, _v(self.BLOCK_K)) // 128]
 
     @gluon.constexpr_function
     def packed_scale_frag_layout(self, idx):
-        """The i32 scale fragment: the u8 one with its two within-dword bases folded in."""
+        """The i32 fragment with its within-dword register bases folded in."""
         frag = self.dot_operand_scale_fragment_layout(idx)
+        folded = 1 if self.scale_packed_k128(idx) else 2
         return gl.DistributedLinearLayout(
-            reg_bases=[self.scale_dword_delta(b) for b in frag.reg_bases[2:]],
+            reg_bases=[self.scale_dword_delta(b) for b in frag.reg_bases[folded:]],
             lane_bases=[self.scale_dword_delta(b) for b in frag.lane_bases],
             warp_bases=[self.scale_dword_delta(b) for b in frag.warp_bases],
             block_bases=[],
@@ -1065,8 +1087,8 @@ class KernelTuningConfig:
 
     @gluon.constexpr_function
     def sorted_shuffled_c_k1(self, K):
-        """Number of BLOCK_K stages the shuffle lays out per 128-row chunk."""
-        return (_v(K) // MX_GROUP) // (4 * (_v(self.BLOCK_K) // 128))
+        """Number of K256 scale groups per row stripe."""
+        return _v(K) // 256
 
     @gluon.constexpr_function
     def sorted_shuffled_chunk_dwords(self, K):
@@ -1152,7 +1174,8 @@ class KernelTuningConfig:
             # accepts a config whose real footprint is larger than it believes.
             if fc.has_scale(idx):
                 s = self.scale_shape(idx)
-                per_stage += n_tiles * s[0] * s[1]
+                scale_k = 8 if self.scale_packed_k128(idx) else s[1]
+                per_stage += n_tiles * s[0] * scale_k
         return per_stage * _v(self.NUM_LDS_BUFFER)
 
     @gluon.constexpr_function
@@ -1210,6 +1233,31 @@ class KernelTuningConfig:
 
         # -- the constexpr rotating buffer index only folds if this holds --
         assert _v(self.K_UNROLL) >= 1, "K_UNROLL must be at least 1"
+        if self.scale_packed_k128(0) or self.scale_packed_k128(1):
+            assert self.scale_packed_k128(0) and self.scale_packed_k128(1), (
+                "packed K128 scales require both operands to use packed scale words"
+            )
+            assert K % 256 == 0, "packed K128 scales require complete K256 scale words"
+            assert _v(self.MINI_BLOCK_K) == BK, (
+                "packed K128 scales require MINI_BLOCK_K == BLOCK_K"
+            )
+            assert _v(self.K_UNROLL) % 2 == 0, (
+                "packed K128 scales require even K_UNROLL"
+            )
+            assert not _v(self.FROZEN_STEP), (
+                "packed K128 scales require the live pipeline"
+            )
+            assert list(instr) == [16, 16, 128], (
+                "packed K128 scales require MFMA 16x16x128"
+            )
+            for idx in (0, 1):
+                if self.scale_packed_k128(idx):
+                    assert fc.pack_divisor(idx) == 1, (
+                        "packed K128 scale pairing requires MXFP8 operands"
+                    )
+                    assert fc.has_scale(idx) and self.scale_packed_ok(idx), (
+                        f"operand {idx}'s packed K128 scales require register-private non-K +16"
+                    )
 
         # -- the pipeline must issue exactly one fill per K tile --
         n_k = K // BK

@@ -558,6 +558,40 @@ def get_gluon_config_uncached(
     return cfg
 
 
+def _default_launch_config(block_m, N, K, dq_a, dq_b, small_grid, apply_swiglu):
+    """Share automatic stage-specific geometry with the capability check."""
+    c = get_gluon_config(block_m, N, K, dq_a, dq_b, small_grid)
+    if (
+        apply_swiglu
+        and dq_a == dq_b == DtypeQuant.MXFP8
+        and block_m == 128
+        and N % 256 == 0
+        and K % 256 == 0
+        and K // 128 >= 3
+        and not c["FROZEN_STEP"]
+    ):
+        # FP8 K128 has the same payload byte tiles as FP4 K256. The scale
+        # preshuffle still packs K256, with consecutive payload stages selecting
+        # alternate halves of each dword. Gate/up ordering remains the caller's.
+        c = dict(
+            c,
+            BLOCK_N=256,
+            BLOCK_K=128,
+            MINI_BLOCK_M=64,
+            MINI_BLOCK_N=128,
+            MINI_BLOCK_K=128,
+            mfma_instr_shape=(16, 16, 128),
+            warps_per_cta=(1, 4),
+            tiles_per_warp=(2, 2),
+            NUM_LDS_BUFFER=3,
+            K_UNROLL=6,
+            VGPR_PREFETCH_K=128,
+            A_SCALE_SORTED_SHUFFLED=True,
+            B_SCALE_SHUFFLED=True,
+        )
+    return c
+
+
 def _small_grid(routing_data, M, N) -> bool:
     """True when the launch would not fill the machine at the default N tile."""
     grid_m = routing_data.n_blocks(M, routing_data.block_m)
@@ -581,6 +615,7 @@ def gluon_supported(
     N: int,
     K: int,
     w_static_scale=None,
+    apply_swiglu: bool = False,
 ) -> tuple[bool, str]:
     """The capability predicate. Returns ``(ok, reason)``; ``reason`` is logged when
     the call falls back to the Triton kernel."""
@@ -626,8 +661,9 @@ def gluon_supported(
     if block_m not in _SUPPORTED_BLOCK_M:
         return False, f"block_m {block_m} outside {_SUPPORTED_BLOCK_M}"
 
-    cfg = get_gluon_config(
-        block_m, N, K, dq_a, dq_b, _small_grid(routing_data, y.shape[1], N)
+    cfg = _default_launch_config(
+        block_m, N, K, dq_a, dq_b, _small_grid(routing_data, y.shape[1], N),
+        apply_swiglu,
     )
     if N % cfg["BLOCK_N"] != 0:
         return False, f"N {N} % BLOCK_N {cfg['BLOCK_N']} != 0"
@@ -695,7 +731,9 @@ def _launch_spec(
     c = (
         dict(config_items)
         if config_items
-        else get_gluon_config(block_m, N, K, dq_a, dq_b, small_grid)
+        else _default_launch_config(
+            block_m, N, K, dq_a, dq_b, small_grid, act is not None
+        )
     )
     func_spec = FuncSpec(
         int(dq_a),
@@ -802,6 +840,23 @@ def _sorted_token_id_map(expt_data, gather_indx, n_expts_act, block_m, n_blocks,
     return built
 
 
+def _scale_shuffle_supported(cfg, operand):
+    """Whether this operand can consume the packed K256 scale byte order."""
+    block_k = int(cfg["BLOCK_K"])
+    if tuple(cfg["mfma_instr_shape"]) != (16, 16, 128) or block_k not in (128, 256):
+        return False
+    if block_k == 128:
+        # Each full dword serves two K128 stages. Both non-K bytes must belong
+        # to this wave, and the unrolled loop must preserve the two-stage phase.
+        return (
+            int(cfg["MINI_BLOCK_K"]) == 128
+            and int(cfg["K_UNROLL"]) % 2 == 0
+            and not cfg.get("FROZEN_STEP", False)
+            and int(cfg["tiles_per_warp"][operand]) >= 2
+        )
+    return True
+
+
 def _sorted_shuffle_a_scales(x_scales, routing_data, gather_indx, K, cfg):
     """Run the C++ pre-pass that sorts + fragment-permutes the token scales.
 
@@ -818,11 +873,13 @@ def _sorted_shuffle_a_scales(x_scales, routing_data, gather_indx, K, cfg):
         return None
     block_m = int(cfg["BLOCK_M"])
     # Mirrors KernelTuningConfig.sorted_shuffled_ok(): the permutation is carried by the
-    # LDS tile's layout, so the warp split is free -- only the operand shape, BLOCK_K
-    # and one-A-tile-per-stage matter.
+    # LDS tile's layout. K128 payload stages consume alternate halves of the same
+    # K256 scale dwords, so their host-side permutation and allocation are identical.
     if (
-        list(cfg["mfma_instr_shape"]) != [16, 16, 128]
-        or int(cfg["BLOCK_K"]) != 256
+        not _scale_shuffle_supported(cfg, 0)
+        or x_scales.ndim != 2
+        or x_scales.shape[1] != K // MX_GROUP_SIZE
+        or not x_scales.is_contiguous()
         or block_m % 32 != 0
         # The buffer is one 256 B run per 32-row stripe, so a mini block that is a
         # whole number of stripes is a contiguous slice of it; the kernel indexes the
@@ -937,11 +994,12 @@ def _shuffled_b_scales(w_scales, cfg):
     if w_scales is None:
         return None
     if (
-        list(cfg["mfma_instr_shape"]) != [16, 16, 128]
-        or int(cfg["BLOCK_K"]) != 256
+        not _scale_shuffle_supported(cfg, 1)
         # Stripe-based like the A shuffle: one 256 B run per 32 columns, so a mini
         # block that is a whole number of stripes is a contiguous slice of the tile.
         or int(cfg["MINI_BLOCK_N"]) % 32 != 0
+        or w_scales.shape[-1] % 32 != 0
+        or w_scales.shape[-2] % 8 != 0
     ):
         return None
     hit = getattr(w_scales, _B_SCALE_SHUFFLE_ATTR, None)
@@ -952,6 +1010,7 @@ def _shuffled_b_scales(w_scales, cfg):
         # back to (E, K*, N/32) for the Triton kernels, and materialising that view
         # would undo the very byte order the shuffle exists to produce. What the kernel
         # reads is the pre-transpose (E, N/32, K) tile, which is already contiguous.
+        # The N rows keep their input order, including separate gate/up halves.
         hit = _shuffle_scale_tile_gfx950(w_scales.transpose(-1, -2), 32, 8)
         try:
             setattr(w_scales, _B_SCALE_SHUFFLE_ATTR, hit)
@@ -1172,25 +1231,55 @@ def moe_gemm_gluon(
         tuple(sorted((k, _hashable(v)) for k, v in config.items())) if config else None
     )
 
-    # Optional token-scale pre-pass. Only rebuilds the launch spec when the shuffle
-    # actually applied, so the default path keeps its memoised spec untouched.
+    # Tuning flags request preparation of the public raw scale inputs. Only pass an
+    # effective shuffle flag to the kernel when preparation actually succeeded.
     a_scales, a_swizzle = x_scales, ScaleSwizzle.NONE
     a_scale_stride_m = 0 if x_scales is None else x_scales.stride(0)
     a_scale_stride_k = 0 if x_scales is None else x_scales.stride(1)
-    if _env_int("AITER_TRITON_MOE_GLUON_SORTED_SCALES", 0) and apply_swiglu:
+    if (
+        _cfg.get("A_SCALE_SORTED_SHUFFLED", False)
+        or _env_int("AITER_TRITON_MOE_GLUON_SORTED_SCALES", 0)
+    ) and apply_swiglu:
         shuffled = _sorted_shuffle_a_scales(
             x_scales, routing_data, gather_indx, K, _cfg
         )
         if shuffled is not None:
             a_scales, a_swizzle = shuffled, ScaleSwizzle.SORTED_SHUFFLED
             # The gather and the row stride are baked into the buffer; all the kernel
-            # still needs is the stage bump, and it computes that as s_step (== SK, so
-            # BLOCK_K/32 == 8) times scale_stride_k. 8 * 32 == the 256 B a stage spans.
+            # still needs is the packed K stride: eight scales span 256 bytes.
+            # A K128 kernel reuses that scale tile over two payload stages.
             a_scale_stride_m, a_scale_stride_k = 0, 32
-            _cfg = dict(_cfg, A_SCALE_SORTED_SHUFFLED=True)
-            grid_n, constexpr_args, num_warps, waves_per_eu, _cfg, _tc = _spec(
-                tuple(sorted((k, _hashable(v)) for k, v in _cfg.items()))
-            )
+    a_shuffled = a_swizzle == ScaleSwizzle.SORTED_SHUFFLED
+    b_scales, b_swizzle = w_scales, ScaleSwizzle.NONE
+    b_scale_stride_k = 0 if w_scales is None else w_scales.stride(1)
+    if _cfg.get("B_SCALE_SHUFFLED", False) or _env_int(
+        "AITER_TRITON_MOE_GLUON_SHUFFLED_W_SCALES", 0
+    ):
+        shuf_w = _shuffled_b_scales(w_scales, _cfg)
+        if shuf_w is not None:
+            b_scales, b_swizzle = shuf_w, ScaleSwizzle.CDNA4_SCALE
+            b_scale_stride_k = 32
+    b_shuffled = b_swizzle == ScaleSwizzle.CDNA4_SCALE
+    if int(_cfg["BLOCK_K"]) == 128 and not (a_shuffled and b_shuffled):
+        # The K128 packed MFMA requires matching packed-scale representations on
+        # both operands. An unavailable sorter or a one-sided request uses raw
+        # scales on both sides, with their original pointers and strides.
+        a_scales, a_swizzle = x_scales, ScaleSwizzle.NONE
+        a_scale_stride_m = 0 if x_scales is None else x_scales.stride(0)
+        a_scale_stride_k = 0 if x_scales is None else x_scales.stride(1)
+        b_scales, b_swizzle = w_scales, ScaleSwizzle.NONE
+        b_scale_stride_k = 0 if w_scales is None else w_scales.stride(1)
+        a_shuffled = b_shuffled = False
+    if (
+        bool(_cfg.get("A_SCALE_SORTED_SHUFFLED", False)) != a_shuffled
+        or bool(_cfg.get("B_SCALE_SHUFFLED", False)) != b_shuffled
+    ):
+        _cfg = dict(
+            _cfg, A_SCALE_SORTED_SHUFFLED=a_shuffled, B_SCALE_SHUFFLED=b_shuffled
+        )
+        grid_n, constexpr_args, num_warps, waves_per_eu, _cfg, _tc = _spec(
+            tuple(sorted((k, _hashable(v)) for k, v in _cfg.items()))
+        )
 
     # The Quant* tuples carry the scale pointer and strides unconditionally; when the
     # operand has no scale the kernel never reads them, so a null pointer and zero
@@ -1207,18 +1296,6 @@ def moe_gemm_gluon(
         routing_data.n_expts_act,
         a_swizzle,
     )
-    b_scales, b_swizzle = w_scales, ScaleSwizzle.NONE
-    b_scale_stride_k = 0 if w_scales is None else w_scales.stride(1)
-    if _env_int("AITER_TRITON_MOE_GLUON_SHUFFLED_W_SCALES", 0):
-        shuf_w = _shuffled_b_scales(w_scales, _cfg)
-        if shuf_w is not None:
-            b_scales, b_swizzle = shuf_w, ScaleSwizzle.CDNA4_SCALE
-            b_scale_stride_k = 32
-            _cfg = dict(_cfg, B_SCALE_SHUFFLED=True)
-            grid_n, constexpr_args, num_warps, waves_per_eu, _cfg, _tc = _spec(
-                tuple(sorted((k, _hashable(v)) for k, v in _cfg.items()))
-            )
-
     w_payload = w
     if _env_int("AITER_TRITON_MOE_GLUON_B_PRESHUFFLED", 0):
         shuf_b = _preshuffled_b(w, _cfg, N, K, dq_b)
@@ -1403,6 +1480,7 @@ def try_gluon_grouped_gemm(
         N=N,
         K=K,
         w_static_scale=w_static_scale,
+        apply_swiglu=apply_swiglu,
     )
     if not ok:
         _LOGGER.debug(f"{op_name}: falling back to the Triton kernel: {why}")
@@ -1486,6 +1564,7 @@ def moe_gemm1_a4w4_mxfp4_out(
         out_quant=DtypeQuant.MXFP4,
         N=N,
         K=K,
+        apply_swiglu=True,
     )
     if not ok:
         raise NotImplementedError(f"fused MXFP4 gemm1 not available: {why}")

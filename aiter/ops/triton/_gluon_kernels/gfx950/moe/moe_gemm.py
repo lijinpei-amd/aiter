@@ -129,10 +129,10 @@ _DK_UPCAST_MFMA: gl.constexpr = gl.constexpr(int(DotKind.UPCAST_MFMA))
 
 
 @gluon.constexpr_function
-def _packed_sel(tuning_cfg, idx):
+def _packed_sel(tuning_cfg, idx, k_phase=0):
     """The byte-selector list for a pre-packed scale operand, or None if it is not."""
     if tuning_cfg.scale_packed_ok(idx) and tuning_cfg.scale_via_lds(idx):
-        return tuning_cfg.scale_packed_sel(idx)
+        return tuning_cfg.scale_packed_sel(idx, k_phase)
     return None
 
 
@@ -144,11 +144,11 @@ def _any_packed(tuning_cfg):
 
 
 @gluon.jit
-def _dot(a, a_scale, b, b_scale, acc, func_cfg, tuning_cfg):
+def _dot(a, a_scale, b, b_scale, acc, func_cfg, tuning_cfg, K_PHASE: gl.constexpr = 0):
     """The one matrix instruction, dispatched on the operand pair."""
     kind: gl.constexpr = func_cfg.dot_kind()
-    a_sel: gl.constexpr = _packed_sel(tuning_cfg, 0)
-    b_sel: gl.constexpr = _packed_sel(tuning_cfg, 1)
+    a_sel: gl.constexpr = _packed_sel(tuning_cfg, 0, K_PHASE)
+    b_sel: gl.constexpr = _packed_sel(tuning_cfg, 1, K_PHASE)
     any_packed: gl.constexpr = _any_packed(tuning_cfg)
     if require_constexpr(kind == _DK_MFMA_SCALED and any_packed):
         # At least one scale tile arrived as pre-packed dwords; the other, if any,
@@ -316,15 +316,24 @@ def _maybe_block_dot(
     func_cfg,
     tuning_cfg,
     DO_MFMA: gl.constexpr,
+    K_PHASE: gl.constexpr = 0,
 ):
     """:func:`_block_dot`, or the accumulator untouched when the step emits no MFMA."""
     if require_constexpr(DO_MFMA):
-        return _block_dot(a_frags, b_frags, acc, N_MINI, func_cfg, tuning_cfg)
+        return _block_dot(a_frags, b_frags, acc, N_MINI, func_cfg, tuning_cfg, K_PHASE)
     return acc
 
 
 @gluon.jit
-def _block_dot(a_frags, b_frags, acc, N_MINI: gl.constexpr, func_cfg, tuning_cfg):
+def _block_dot(
+    a_frags,
+    b_frags,
+    acc,
+    N_MINI: gl.constexpr,
+    func_cfg,
+    tuning_cfg,
+    K_PHASE: gl.constexpr = 0,
+):
     """The MFMAs of one mini (M, N) block over ``N_MINI`` mini-K steps."""
     for i in gl.static_range(N_MINI):
         if require_constexpr(func_cfg.has_scale(0)):
@@ -335,7 +344,9 @@ def _block_dot(a_frags, b_frags, acc, N_MINI: gl.constexpr, func_cfg, tuning_cfg
             b_s = b_frags[2 * i + 1]
         else:
             b_s = _NO_SCALE
-        acc = _dot(a_frags[2 * i], a_s, b_frags[2 * i], b_s, acc, func_cfg, tuning_cfg)
+        acc = _dot(
+            a_frags[2 * i], a_s, b_frags[2 * i], b_s, acc, func_cfg, tuning_cfg, K_PHASE
+        )
     return acc
 
 
@@ -546,6 +557,7 @@ def _buffer_load(
     ni: gl.constexpr,
     KI: gl.constexpr = 0,
     STAGE_MARK: gl.constexpr = True,
+    K_PHASE: gl.constexpr = 0,
 ):
     """Issue this slot's copies and commit at the configured op/slot/stage boundary."""
     func_cfg: gl.constexpr = pc.func_cfg
@@ -577,10 +589,14 @@ def _buffer_load(
     )
     # E8M0 scales are byte-sized, so the scale strides are already byte counts.
     A_SSOFF: gl.constexpr = (
-        KI * pc.s_step * pc.a_scale_stride_k if SOFF and func_cfg.a_has_scale() else 0
+        tc.scale_hbm_steps(0, KI, (K_PHASE - KI) % 2) * pc.s_step * pc.a_scale_stride_k
+        if SOFF and func_cfg.a_has_scale()
+        else 0
     )
     B_SSOFF: gl.constexpr = (
-        KI * pc.s_step * pc.b_scale_stride_k if SOFF and func_cfg.b_has_scale() else 0
+        tc.scale_hbm_steps(1, KI, (K_PHASE - KI) % 2) * pc.s_step * pc.b_scale_stride_k
+        if SOFF and func_cfg.b_has_scale()
+        else 0
     )
     if require_constexpr(A_TILE is not None):
         pc.lds_ptrs.buffer_load_a_payload(
@@ -634,15 +650,25 @@ def _buffer_load(
 
 
 @gluon.jit
-def _advance_hbm_ptrs(pc, hbm_ptrs, STEPS: gl.constexpr = 1):
+def _advance_hbm_ptrs(pc, hbm_ptrs, STEPS: gl.constexpr = 1, K_PHASE: gl.constexpr = 0):
     a_hbm_ptr = hbm_ptrs.a_hbm_ptr + STEPS * pc.a_step
     b_hbm_ptr = hbm_ptrs.b_hbm_ptr + STEPS * pc.b_step
     a_scale_hbm_ptr = hbm_ptrs.a_scale_hbm_ptr
     b_scale_hbm_ptr = hbm_ptrs.b_scale_hbm_ptr
     if require_constexpr(pc.func_cfg.a_has_scale()):
-        a_scale_hbm_ptr = a_scale_hbm_ptr + STEPS * pc.s_step * pc.a_scale_stride_k
+        a_scale_hbm_ptr = (
+            a_scale_hbm_ptr
+            + pc.tuning_cfg.scale_hbm_steps(0, STEPS, K_PHASE)
+            * pc.s_step
+            * pc.a_scale_stride_k
+        )
     if require_constexpr(pc.func_cfg.b_has_scale()):
-        b_scale_hbm_ptr = b_scale_hbm_ptr + STEPS * pc.s_step * pc.b_scale_stride_k
+        b_scale_hbm_ptr = (
+            b_scale_hbm_ptr
+            + pc.tuning_cfg.scale_hbm_steps(1, STEPS, K_PHASE)
+            * pc.s_step
+            * pc.b_scale_stride_k
+        )
     return _PipelinePointers(
         a_hbm_ptr,
         b_hbm_ptr,
@@ -851,6 +877,7 @@ def _pipeline_step(
     KI: gl.constexpr = 0,
     KU: gl.constexpr = 1,
     WAIT_SLACK: gl.constexpr = 0,
+    K_PHASE: gl.constexpr = 0,
 ):
     """Pick the live implementation or the frozen 2026-09-01 snapshot.
 
@@ -889,6 +916,7 @@ def _pipeline_step(
             KI,
             KU,
             WAIT_SLACK,
+            K_PHASE,
         )
     return out
 
@@ -908,6 +936,7 @@ def _pipeline_step_impl(
     KI: gl.constexpr = 0,
     KU: gl.constexpr = 1,
     WAIT_SLACK: gl.constexpr = 0,
+    K_PHASE: gl.constexpr = 0,
 ):
     func_cfg: gl.constexpr = pc.func_cfg
     tc: gl.constexpr = pc.tuning_cfg
@@ -937,6 +966,8 @@ def _pipeline_step_impl(
 
     KIE: gl.constexpr = KI if tc.SOFF_UNROLL else 0
     KUE: gl.constexpr = KU if tc.SOFF_UNROLL else 1
+    FILL_K_PHASE: gl.constexpr = tc.scale_k_phase(K_PHASE + tc.NUM_LDS_BUFFER - 1)
+    DOT_K_PHASE: gl.constexpr = tc.scale_k_phase(K_PHASE - 1)
 
     a_cur = ()
     b_cur = ()
@@ -997,12 +1028,13 @@ def _pipeline_step_impl(
                         ni,
                         KI=KIE,
                         STAGE_MARK=False,
+                        K_PHASE=FILL_K_PHASE,
                     )
                     if require_constexpr(
                         _slot_advances_hbm_ptrs(mi, ni, NM, NN, KIE, KUE)
                     ):
                         # Keep pointer updates inside this region, ahead of its border.
-                        hbm_ptrs = _advance_hbm_ptrs(pc, hbm_ptrs, KUE)
+                        hbm_ptrs = _advance_hbm_ptrs(pc, hbm_ptrs, KUE, FILL_K_PHASE)
                     if require_constexpr(
                         PIPE and tc.commit_per_stage() and mi == NM - 1 and ni == NN - 1
                     ):
@@ -1018,6 +1050,7 @@ def _pipeline_step_impl(
                     func_cfg,
                     tc,
                     DO_MFMA,
+                    DOT_K_PHASE,
                 )
                 a_mfma, b_mfma = _ds_read(
                     pc,
@@ -1055,7 +1088,15 @@ def _pipeline_step_impl(
 
 
 @gluon.jit
-def _drain_last_fused(pc, regs, bias_tiles, x_static_scale, func_cfg, tuning_cfg):
+def _drain_last_fused(
+    pc,
+    regs,
+    bias_tiles,
+    x_static_scale,
+    func_cfg,
+    tuning_cfg,
+    K_PHASE: gl.constexpr = 0,
+):
     """The final drain step, with the gate half's activation folded into it.
 
     That step reads nothing, fills nothing and waits on nothing -- it only retires the
@@ -1090,6 +1131,7 @@ def _drain_last_fused(pc, regs, bias_tiles, x_static_scale, func_cfg, tuning_cfg
                 func_cfg,
                 tc,
                 True,
+                K_PHASE,
             )
             if require_constexpr(ni == 0):
                 # Gate side: everything up to and including the reciprocal, issued here
@@ -1188,10 +1230,16 @@ def _moe_gemm_body(
 
     b_hbm_offs = _b_payload_hbm_offsets(b, pid_n, N, K, func_cfg, tuning_cfg)
 
-    a_scale_hbm_offs = _a_scale_hbm_offsets(
-        a, rt, block_id, M_e, start_m, pid_m, K, func_cfg, tuning_cfg
-    )
-    b_scale_hbm_offs = _b_scale_hbm_offsets(b, pid_n, N, K, func_cfg, tuning_cfg)
+    if require_constexpr(func_cfg.a_has_scale()):
+        a_scale_hbm_offs = _a_scale_hbm_offsets(
+            a, rt, block_id, M_e, start_m, pid_m, K, func_cfg, tuning_cfg
+        )
+    else:
+        a_scale_hbm_offs: gl.constexpr = None
+    if require_constexpr(func_cfg.b_has_scale()):
+        b_scale_hbm_offs = _b_scale_hbm_offsets(b, pid_n, N, K, func_cfg, tuning_cfg)
+    else:
+        b_scale_hbm_offs: gl.constexpr = None
 
     lds_ptrs = LDSManager.alloc(func_cfg, tuning_cfg)
 
@@ -1272,9 +1320,13 @@ def _moe_gemm_body(
                         hbm_ptrs.b_scale_hbm_ptr,
                     )
                 else:
-                    _buffer_load(pc, hbm_ptrs, i, mi, ni)
+                    _buffer_load(
+                        pc, hbm_ptrs, i, mi, ni, K_PHASE=tuning_cfg.scale_k_phase(i)
+                    )
                 if require_constexpr(mi == NM - 1 and ni == NN - 1):
-                    hbm_ptrs = _advance_hbm_ptrs(pc, hbm_ptrs)
+                    hbm_ptrs = _advance_hbm_ptrs(
+                        pc, hbm_ptrs, K_PHASE=tuning_cfg.scale_k_phase(i)
+                    )
 
     # Only the snapshot retains its original whole-buffer prologue wait and fence.
     if require_constexpr(tuning_cfg.FROZEN_STEP):
@@ -1325,7 +1377,15 @@ def _moe_gemm_body(
         # while it is still visibly gl.zeros -- inside the loop that is a phi and the
         # zero is invisible.
         hbm_ptrs, regs = _pipeline_step(
-            pc, hbm_ptrs, regs, 0, 1 % NB, STAGES_BETWEEN, True, True
+            pc,
+            hbm_ptrs,
+            regs,
+            0,
+            1 % NB,
+            STAGES_BETWEEN,
+            True,
+            True,
+            K_PHASE=tuning_cfg.scale_k_phase(1),
         )
 
         # steady state over the remaining MAIN-1 steps, body unrolled K_UNROLL times.
@@ -1361,12 +1421,21 @@ def _moe_gemm_body(
                     IN_LOOP=True,
                     KI=i,
                     KU=tuning_cfg.K_UNROLL,
+                    K_PHASE=tuning_cfg.scale_k_phase(i + 2),
                 )
 
         # remainder (0 .. K_UNROLL-1 steps); NUM_K is constexpr so this stays static
         for j in gl.static_range(1 + UNROLLED, MAIN):
             hbm_ptrs, regs = _pipeline_step(
-                pc, hbm_ptrs, regs, j % NB, (j + 1) % NB, STAGES_BETWEEN, True, True
+                pc,
+                hbm_ptrs,
+                regs,
+                j % NB,
+                (j + 1) % NB,
+                STAGES_BETWEEN,
+                True,
+                True,
+                K_PHASE=tuning_cfg.scale_k_phase(j + 1),
             )
 
     if require_constexpr(func_cfg.has_bias):
@@ -1468,6 +1537,7 @@ def _moe_gemm_body(
             False,
             i + 1 < NB,
             WAIT_SLACK=EPI_GROUPS,
+            K_PHASE=tuning_cfg.scale_k_phase(MAIN + i + 1),
         )
 
     # Hoisted out of the mini-tile loop: one scalar load, not one per tile.
@@ -1498,6 +1568,7 @@ def _moe_gemm_body(
             x_static_scale,
             func_cfg,
             tuning_cfg,
+            K_PHASE=tuning_cfg.scale_k_phase(NUM_K - 1),
         )
     else:
         acc = regs.acc
