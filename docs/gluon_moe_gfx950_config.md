@@ -61,7 +61,8 @@ Each step takes invariant data in `_PipelineConst` and carries two separate
 aggregates through the K loop:
 
 - `_PipelinePointers`, named `hbm_ptrs` at call sites, contains the A/B payload
-  and scale HBM pointers plus the direct scale HBM pointers used by register loads.
+  HBM pointers and one scale HBM pointer per operand, shared by the mutually
+  exclusive LDS-staging and direct-register scale paths.
 - `_PipelineRegFragments` contains separate A/B payload and scale tuples and the
   MFMA accumulators. Operand tuples run by mini block, then mini-K step;
   accumulators follow the N-outer, M-inner slot traversal.
@@ -73,11 +74,13 @@ the LDS source buffer. Direct scale fallbacks still address HBM.
 
 `_buffer_load` only issues copies and commit markers. It has no `ADVANCE`
 argument or pointer return value. Its caller uses `_advance_hbm_ptrs` after the
-last slot, inside the memory region. With `SOFF_UNROLL`, this happens once per
-unrolled body. `_ds_read` loads the next operands, and
-`_advance_direct_scale_hbm_ptrs` advances direct scale pointers after every stage
-read. The drain advances neither copy pointers nor pointers for a stage it does
-not read.
+last slot, inside the memory region, to advance payload and LDS-staged scale
+pointers. With `SOFF_UNROLL`, this happens once per unrolled body. `_ds_read`
+loads the next operands, and `_advance_direct_scale_hbm_ptrs` advances only the
+scales loaded straight into registers, after every stage read. Thus each scale
+pointer advances only at its selected load path, including during the prologue
+and drain. The drain advances neither copy pointers nor pointers for a stage it
+does not read.
 
 ## Epilogue function configuration
 

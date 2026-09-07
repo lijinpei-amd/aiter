@@ -425,22 +425,17 @@ class _PipelinePointers:
     """HBM addresses carried between K stages, independent of register fragments.
 
     Every address here is in HBM -- the LDS side of the pipeline is entirely inside
-    ``_PipelineConst.lds_ptrs``. The plain ``*_hbm_ptr`` are the copy *sources*, walked one
-    ``BLOCK_K`` per stage; the ``*_direct_hbm_ptr`` are the consume-side pointers used by
-    the register fallback, when a tile is too small to be written to LDS coalesced and
-    is loaded straight from HBM at MFMA time instead.
-
-    HBM copy pointers advance after the stage's last buffer load. Direct scale HBM
-    pointers advance after their fragments are loaded, independently of the copies
-    running ahead in the LDS ring. Both walk K at the same rate.
+    ``_PipelineConst.lds_ptrs``. Each operand has one scale pointer: its scale loads
+    either stage through LDS or go straight to registers. LDS source pointers advance
+    after the stage's last buffer load; direct scale pointers advance after the stage's
+    register loads. Only the selected path advances a scale pointer, so direct scales
+    stay at the consumed K stage while LDS copies run ahead in the ring.
     """
 
     a_hbm_ptr: gl.tensor
     b_hbm_ptr: gl.tensor
     a_scale_hbm_ptr: gl.tensor | gl.constexpr
     b_scale_hbm_ptr: gl.tensor | gl.constexpr
-    a_scale_direct_hbm_ptr: gl.tensor | gl.constexpr
-    b_scale_direct_hbm_ptr: gl.tensor | gl.constexpr
 
     # constexpr_function, not @gluon.jit: Triton's aggregate metaclass calls __init__
     # itself from outside kernel scope, which a JITFunction refuses, and a bare Python
@@ -454,8 +449,6 @@ class _PipelinePointers:
         b_hbm_ptr,
         a_scale_hbm_ptr,
         b_scale_hbm_ptr,
-        a_scale_direct_hbm_ptr,
-        b_scale_direct_hbm_ptr,
     ):
         self.a_hbm_ptr = a_hbm_ptr
         self.b_hbm_ptr = b_hbm_ptr
@@ -463,8 +456,6 @@ class _PipelinePointers:
         # (a8w8, bf16), which the field annotation rejects -- it has to be constexpr.
         self.a_scale_hbm_ptr = _opt(a_scale_hbm_ptr)
         self.b_scale_hbm_ptr = _opt(b_scale_hbm_ptr)
-        self.a_scale_direct_hbm_ptr = _opt(a_scale_direct_hbm_ptr)
-        self.b_scale_direct_hbm_ptr = _opt(b_scale_direct_hbm_ptr)
 
 
 @aggregate
@@ -651,18 +642,19 @@ def _buffer_load(
 
 @gluon.jit
 def _advance_hbm_ptrs(pc, hbm_ptrs, STEPS: gl.constexpr = 1, K_PHASE: gl.constexpr = 0):
+    """Advance payload and LDS-staged scale sources after their buffer loads."""
     a_hbm_ptr = hbm_ptrs.a_hbm_ptr + STEPS * pc.a_step
     b_hbm_ptr = hbm_ptrs.b_hbm_ptr + STEPS * pc.b_step
     a_scale_hbm_ptr = hbm_ptrs.a_scale_hbm_ptr
     b_scale_hbm_ptr = hbm_ptrs.b_scale_hbm_ptr
-    if require_constexpr(pc.func_cfg.a_has_scale()):
+    if require_constexpr(pc.func_cfg.a_has_scale() and pc.tuning_cfg.scale_via_lds(0)):
         a_scale_hbm_ptr = (
             a_scale_hbm_ptr
             + pc.tuning_cfg.scale_hbm_steps(0, STEPS, K_PHASE)
             * pc.s_step
             * pc.a_scale_stride_k
         )
-    if require_constexpr(pc.func_cfg.b_has_scale()):
+    if require_constexpr(pc.func_cfg.b_has_scale() and pc.tuning_cfg.scale_via_lds(1)):
         b_scale_hbm_ptr = (
             b_scale_hbm_ptr
             + pc.tuning_cfg.scale_hbm_steps(1, STEPS, K_PHASE)
@@ -674,30 +666,27 @@ def _advance_hbm_ptrs(pc, hbm_ptrs, STEPS: gl.constexpr = 1, K_PHASE: gl.constex
         b_hbm_ptr,
         a_scale_hbm_ptr,
         b_scale_hbm_ptr,
-        hbm_ptrs.a_scale_direct_hbm_ptr,
-        hbm_ptrs.b_scale_direct_hbm_ptr,
     )
 
 
 @gluon.jit
 def _advance_direct_scale_hbm_ptrs(pc, hbm_ptrs):
-    a_scale_direct_hbm_ptr = hbm_ptrs.a_scale_direct_hbm_ptr
-    b_scale_direct_hbm_ptr = hbm_ptrs.b_scale_direct_hbm_ptr
-    if require_constexpr(pc.func_cfg.a_has_scale()):
-        a_scale_direct_hbm_ptr = (
-            a_scale_direct_hbm_ptr + pc.s_step * pc.a_scale_stride_k
-        )
-    if require_constexpr(pc.func_cfg.b_has_scale()):
-        b_scale_direct_hbm_ptr = (
-            b_scale_direct_hbm_ptr + pc.s_step * pc.b_scale_stride_k
-        )
+    """Advance only scales loaded straight into registers, once per consumed stage."""
+    a_scale_hbm_ptr = hbm_ptrs.a_scale_hbm_ptr
+    b_scale_hbm_ptr = hbm_ptrs.b_scale_hbm_ptr
+    if require_constexpr(
+        pc.func_cfg.a_has_scale() and not pc.tuning_cfg.scale_via_lds(0)
+    ):
+        a_scale_hbm_ptr = a_scale_hbm_ptr + pc.s_step * pc.a_scale_stride_k
+    if require_constexpr(
+        pc.func_cfg.b_has_scale() and not pc.tuning_cfg.scale_via_lds(1)
+    ):
+        b_scale_hbm_ptr = b_scale_hbm_ptr + pc.s_step * pc.b_scale_stride_k
     return _PipelinePointers(
         hbm_ptrs.a_hbm_ptr,
         hbm_ptrs.b_hbm_ptr,
-        hbm_ptrs.a_scale_hbm_ptr,
-        hbm_ptrs.b_scale_hbm_ptr,
-        a_scale_direct_hbm_ptr,
-        b_scale_direct_hbm_ptr,
+        a_scale_hbm_ptr,
+        b_scale_hbm_ptr,
     )
 
 
@@ -706,7 +695,7 @@ def _ds_read_a(
     pc,
     DS_READ_IDX,
     mi: gl.constexpr,
-    a_scale_direct_hbm_ptr,
+    a_scale_hbm_ptr,
     RELAXED: gl.constexpr = False,
     READ_PAYLOAD: gl.constexpr = True,
     READ_SCALE: gl.constexpr = True,
@@ -715,7 +704,7 @@ def _ds_read_a(
         pc.lds_ptrs,
         DS_READ_IDX,
         mi,
-        a_scale_direct_hbm_ptr,
+        a_scale_hbm_ptr,
         _opt_at(pc.a_scale_hbm_offs, mi, pc.func_cfg.a_has_scale()),
         pc.func_cfg,
         pc.tuning_cfg,
@@ -730,7 +719,7 @@ def _ds_read_b(
     pc,
     DS_READ_IDX,
     ni: gl.constexpr,
-    b_scale_direct_hbm_ptr,
+    b_scale_hbm_ptr,
     RELAXED: gl.constexpr = False,
     READ_PAYLOAD: gl.constexpr = True,
     READ_SCALE: gl.constexpr = True,
@@ -739,7 +728,7 @@ def _ds_read_b(
         pc.lds_ptrs,
         DS_READ_IDX,
         ni,
-        b_scale_direct_hbm_ptr,
+        b_scale_hbm_ptr,
         _opt_at(pc.b_scale_hbm_offs, ni, pc.func_cfg.b_has_scale()),
         pc.func_cfg,
         pc.tuning_cfg,
@@ -764,8 +753,8 @@ def _ds_read(
     DS_READ_IDX,
     mi: gl.constexpr,
     ni: gl.constexpr,
-    a_scale_direct_hbm_ptr,
-    b_scale_direct_hbm_ptr,
+    a_scale_hbm_ptr,
+    b_scale_hbm_ptr,
     WANT_A: gl.constexpr,
     WANT_B: gl.constexpr,
     WANT_A_SCALE: gl.constexpr,
@@ -789,7 +778,7 @@ def _ds_read(
             pc,
             DS_READ_IDX,
             A_TILE,
-            a_scale_direct_hbm_ptr,
+            a_scale_hbm_ptr,
             True,
             WANT_A,
             WANT_A_SCALE,
@@ -801,7 +790,7 @@ def _ds_read(
             pc,
             DS_READ_IDX,
             B_TILE,
-            b_scale_direct_hbm_ptr,
+            b_scale_hbm_ptr,
             True,
             WANT_B,
             WANT_B_SCALE,
@@ -1012,8 +1001,8 @@ def _pipeline_step_impl(
                     DS_READ_IDX,
                     mi,
                     ni,
-                    hbm_ptrs.a_scale_direct_hbm_ptr,
-                    hbm_ptrs.b_scale_direct_hbm_ptr,
+                    hbm_ptrs.a_scale_hbm_ptr,
+                    hbm_ptrs.b_scale_hbm_ptr,
                     DO_DS_READ and not READ_A_IN_MFMA,
                     DO_DS_READ and not READ_B_IN_MFMA,
                     DO_DS_READ and not READ_A_SCALE_IN_MFMA,
@@ -1057,8 +1046,8 @@ def _pipeline_step_impl(
                     DS_READ_IDX,
                     mi,
                     ni,
-                    hbm_ptrs.a_scale_direct_hbm_ptr,
-                    hbm_ptrs.b_scale_direct_hbm_ptr,
+                    hbm_ptrs.a_scale_hbm_ptr,
+                    hbm_ptrs.b_scale_hbm_ptr,
                     DO_DS_READ and READ_A_IN_MFMA,
                     DO_DS_READ and READ_B_IN_MFMA,
                     DO_DS_READ and READ_A_SCALE_IN_MFMA,
@@ -1253,8 +1242,6 @@ def _moe_gemm_body(
     hbm_ptrs = _PipelinePointers(
         a.ptr,
         b_hbm_ptr,
-        a_scale_hbm_ptr,
-        b_scale_hbm_ptr,
         a_scale_hbm_ptr,
         b_scale_hbm_ptr,
     )

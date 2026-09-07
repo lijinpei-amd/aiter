@@ -253,8 +253,6 @@ class _Pointers:
     b_hbm_ptr: int = 0
     a_scale_hbm_ptr: int = 0
     b_scale_hbm_ptr: int = 0
-    a_scale_direct_hbm_ptr: int = 0
-    b_scale_direct_hbm_ptr: int = 0
 
 
 def _source_body(jit_function):
