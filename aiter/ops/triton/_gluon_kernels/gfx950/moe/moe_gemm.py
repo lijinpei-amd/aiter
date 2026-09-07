@@ -984,17 +984,6 @@ def _pipeline_step_impl(
                 # barrier provide synchronization; this adds no hardware rendezvous.
                 gl.amd.cdna4.sched_barrier(0)
 
-            if require_constexpr(DO_MFMA):
-                dot_a = _take_reg_pairs(
-                    regs.a_payload, regs.a_scale, mi * PF_MINI, PF_MINI
-                )
-                dot_b = _take_reg_pairs(
-                    regs.b_payload, regs.b_scale, ni * PF_MINI, PF_MINI
-                )
-            else:
-                dot_a = ()
-                dot_b = ()
-
             with STAGE("mem"):
                 a_mem, b_mem = _ds_read(
                     pc,
@@ -1031,6 +1020,17 @@ def _pipeline_step_impl(
                         pc.lds_ptrs.commit_buffer_load()
 
             with STAGE("mfma"):
+                if require_constexpr(DO_MFMA):
+                    dot_a = _take_reg_pairs(
+                        regs.a_payload, regs.a_scale, mi * PF_MINI, PF_MINI
+                    )
+                    dot_b = _take_reg_pairs(
+                        regs.b_payload, regs.b_scale, ni * PF_MINI, PF_MINI
+                    )
+                else:
+                    dot_a = ()
+                    dot_b = ()
+
                 slot_acc = _maybe_block_dot(
                     dot_a,
                     dot_b,
