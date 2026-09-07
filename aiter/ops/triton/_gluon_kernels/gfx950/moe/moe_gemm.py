@@ -73,9 +73,8 @@ from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.common_utils import strip_annotate
 
 from ._config import KernelFuncConfig, KernelTuningConfig
-from ._epilogue import _epi_bias_tiles, _epilogue_store
+from ._epilogue import _epi_bias_tiles, _epilogue_store, _stage_epilogue_inputs
 from ._lang import MX_GROUP_CE as MX_GROUP
-from ._lang import WARP_SIZE_CE as WARP_SIZE
 from ._lang import optional as _opt
 from ._lang import pick_warp_pipeline_stage as pick_stage
 from ._lang import require_constexpr
@@ -86,7 +85,6 @@ from ._offsets import (
     _a_scale_hbm_offsets,
     _b_payload_hbm_offsets,
     _b_scale_hbm_offsets,
-    _n_split_offs,
     _slot_index,
 )
 from ._schedule import (
@@ -1122,8 +1120,6 @@ def _moe_gemm_body(
 ):
     gl.static_assert(tuning_cfg.validate(N, K))
 
-    BM: gl.constexpr = tuning_cfg.BLOCK_M
-    BN: gl.constexpr = tuning_cfg.BLOCK_N
     BK: gl.constexpr = tuning_cfg.BLOCK_K
     NB: gl.constexpr = tuning_cfg.NUM_LDS_BUFFER
     PK_A: gl.constexpr = BK // func_cfg.a_pack_divisor()
@@ -1259,33 +1255,20 @@ def _moe_gemm_body(
     # hide behind. The group order is unchanged -- the held-back stage is still the
     # newest -- so every _buffer_load_wait() count downstream still holds, and by the time the
     # first pipeline step runs the outstanding set is the same (NB-1)*G either way.
-    for i in gl.static_range(NB - 1):
-        for ni in gl.static_range(NN):
-            for mi in gl.static_range(NM):
-                if require_constexpr(tuning_cfg.FROZEN_STEP):
-                    _buffer_load_frozen(
-                        pc,
-                        i,
-                        mi,
-                        ni,
-                        hbm_ptrs.a_hbm_ptr,
-                        hbm_ptrs.b_hbm_ptr,
-                        hbm_ptrs.a_scale_hbm_ptr,
-                        hbm_ptrs.b_scale_hbm_ptr,
-                    )
-                else:
+    if require_constexpr(tuning_cfg.FROZEN_STEP):
+        hbm_ptrs = _prologue_frozen(pc, hbm_ptrs)
+    else:
+        for i in gl.static_range(NB - 1):
+            for ni in gl.static_range(NN):
+                for mi in gl.static_range(NM):
                     _buffer_load(
                         pc, hbm_ptrs, i, mi, ni, K_PHASE=tuning_cfg.scale_k_phase(i)
                     )
-                if require_constexpr(mi == NM - 1 and ni == NN - 1):
-                    hbm_ptrs = _advance_hbm_ptrs(
-                        pc, hbm_ptrs, K_PHASE=tuning_cfg.scale_k_phase(i)
-                    )
+                    if require_constexpr(mi == NM - 1 and ni == NN - 1):
+                        hbm_ptrs = _advance_hbm_ptrs(
+                            pc, hbm_ptrs, K_PHASE=tuning_cfg.scale_k_phase(i)
+                        )
 
-    # Only the snapshot retains its original whole-buffer prologue wait and fence.
-    if require_constexpr(tuning_cfg.FROZEN_STEP):
-        lds_ptrs.wait_buffer_load_groups((NB - 2) * (NM + NN))
-        _frozen_prologue_fence()
     # The live prologue uses the same slot/stage waits as the steady-state step.
     # The prologue's own step: it fills the buffer held back above and issues the first
     # ds_read, but has nothing carried in to dot yet -- which is exactly a pipeline step
@@ -1392,82 +1375,19 @@ def _moe_gemm_body(
                 K_PHASE=tuning_cfg.scale_k_phase(j + 1),
             )
 
-    if require_constexpr(func_cfg.has_bias):
-        bias_hbm_base = bias_hbm_ptr + expt_id.to(gl.int64) * stride_bias_e
-    else:
-        bias_hbm_base: gl.constexpr = None
-    if require_constexpr(func_cfg.has_gammas):
-        gammas_hbm_ptr = rt.gammas + start_m
-    else:
-        gammas_hbm_ptr: gl.constexpr = None
-
-    # Stage the epilogue's two vectors in LDS, allocated and filled together here rather
-    # than in the prologue: the drain issues no fills of its own, so these copies have its
-    # whole run of MFMAs to themselves and are done well before the epilogue's
-    # wait_group(0). Keeping the allocation next to its one use also lets the shared-memory
-    # allocator see that these buffers never overlap the K-loop's.
-    #
-    # Both tiles are flat: `.index()` drops the leading axis but keeps the layout's rank,
-    # so a [rows, mini] tile cannot be viewed as one mini block. `.slice(start, length)`
-    # preserves rank, so a 1-D tile slices cleanly into per-mini-block views.
-    #
-    # The gammas tile is EPI_T elements, not BLOCK_M: buffer_load_to_shared requires
-    # exactly 32 or 128 bits per thread, so the copy has to cover one element per thread
-    # of the CTA. BLOCK_M=128 over 256 threads would be half of one, so the tile runs to
-    # 256 and the surplus is masked off and never read. Bias is BLOCK_N, which is already
-    # a whole number of elements per thread.
-    EPI_T: gl.constexpr = tuning_cfg.num_warps() * WARP_SIZE
-    EPI_BPT: gl.constexpr = BN // EPI_T
-    EPI_LDS: gl.constexpr = (
-        EPI_T >= BM and BN % EPI_T == 0 and (EPI_BPT == 1 or EPI_BPT == 4)
+    epi = _stage_epilogue_inputs(
+        bias_hbm_ptr,
+        stride_bias_e,
+        rt,
+        expt_id,
+        start_m,
+        block_id,
+        pid_n,
+        N,
+        M_e,
+        func_cfg,
+        tuning_cfg,
     )
-    EPI_SH: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=1, per_phase=1, max_phase=1, order=[0]
-    )
-    EPI_GC: gl.constexpr = gl.BlockedLayout(
-        [1], [WARP_SIZE], [tuning_cfg.num_warps()], [0]
-    )
-    EPI_BC: gl.constexpr = gl.BlockedLayout(
-        [EPI_BPT], [WARP_SIZE], [tuning_cfg.num_warps()], [0]
-    )
-    if require_constexpr(EPI_LDS and func_cfg.has_gammas):
-        gamma_lds_ptr = gl.allocate_shared_memory(gl.float32, [EPI_T], layout=EPI_SH)
-    else:
-        gamma_lds_ptr: gl.constexpr = None
-    if require_constexpr(EPI_LDS and func_cfg.has_bias):
-        bias_lds_ptr = gl.allocate_shared_memory(gl.float32, [BN], layout=EPI_SH)
-    else:
-        bias_lds_ptr: gl.constexpr = None
-
-    # They are committed as one group, which is newer than every pipeline group still in
-    # flight. That inflates the outstanding count every drain wait is measured against,
-    # so each step is handed WAIT_SLACK=EPI_GROUPS and its wait_group count comes out
-    # numerically the same as before.
-    EPI_GROUPS: gl.constexpr = (
-        1 if EPI_LDS and (func_cfg.has_gammas or func_cfg.has_bias) else 0
-    )
-    if require_constexpr(EPI_LDS):
-        if require_constexpr(func_cfg.has_gammas):
-            g_offs = BM * block_id + gl.arange(0, EPI_T, layout=EPI_GC)
-            gl.amd.cdna4.async_copy.buffer_load_to_shared(
-                gamma_lds_ptr, gammas_hbm_ptr, g_offs, mask=g_offs < M_e, other=0.0
-            )
-        if require_constexpr(func_cfg.has_bias):
-            epi_b_offs = _n_split_offs(
-                pid_n,
-                gl.arange(0, BN, layout=EPI_BC),
-                N,
-                func_cfg,
-                tuning_cfg,
-            )
-            gl.amd.cdna4.async_copy.buffer_load_to_shared(
-                bias_lds_ptr, bias_hbm_base, epi_b_offs
-            )
-        if require_constexpr(func_cfg.has_gammas or func_cfg.has_bias):
-            # EPI_LDS is only a layout-feasibility flag, so it can be set with neither
-            # vector present -- nothing was issued then, and an empty commit group would
-            # still count against every drain wait.
-            gl.amd.cdna4.async_copy.commit_group()
 
     # drain: the last NB stages are consumed with NO copy at all. This, not masking, is
     # what keeps every load inside K -- getting it wrong reads into the next expert's
@@ -1490,7 +1410,7 @@ def _moe_gemm_body(
             NB - 2 - i,
             False,
             i + 1 < NB,
-            WAIT_SLACK=EPI_GROUPS,
+            WAIT_SLACK=epi.groups,
             K_PHASE=tuning_cfg.scale_k_phase(MAIN + i + 1),
         )
 
@@ -1499,7 +1419,7 @@ def _moe_gemm_body(
         x_static_scale = gl.load(x_static_scale_hbm_ptr)
     else:
         x_static_scale: gl.constexpr = None
-    if require_constexpr(EPI_LDS and (func_cfg.has_gammas or func_cfg.has_bias)):
+    if require_constexpr(epi.groups > 0):
         # The copies were issued at the top of the drain in their own commit group, so
         # this retires them (and nothing else -- every pipeline group is older). The fill
         # is spread over every warp and each warp reads a whole mini block out of it, so
@@ -1507,7 +1427,7 @@ def _moe_gemm_body(
         #
         # Under FUSE this sits one step earlier, before the peeled step rather than after
         # it, because that step now consumes the bias. Every step it still follows was
-        # handed WAIT_SLACK=EPI_GROUPS while the group was outstanding, and the peeled
+        # handed WAIT_SLACK=epi.groups while the group was outstanding, and the peeled
         # step issues no wait, so no count changes.
         gl.amd.cdna4.async_copy.wait_group(0)
         gl.barrier()
@@ -1517,7 +1437,7 @@ def _moe_gemm_body(
             pc,
             regs,
             _epi_bias_tiles(
-                bias_lds_ptr, bias_hbm_base, pid_n, N, func_cfg, tuning_cfg
+                epi.bias_lds_ptr, epi.bias_hbm_base, pid_n, N, func_cfg, tuning_cfg
             ),
             x_static_scale,
             func_cfg,
@@ -1540,14 +1460,14 @@ def _moe_gemm_body(
         ys_hbm_ptr,
         res.scale_stride_m,
         res.scale_stride_n,
-        bias_hbm_base,
+        epi.bias_hbm_base,
         block_id,
         pid_n,
         N,
         M_e,
-        gammas_hbm_ptr,
-        gamma_lds_ptr,
-        bias_lds_ptr,
+        epi.gammas_hbm_ptr,
+        epi.gamma_lds_ptr,
+        epi.bias_lds_ptr,
         x_static_scale,
         func_cfg,
         tuning_cfg,
@@ -1555,12 +1475,9 @@ def _moe_gemm_body(
     )
 
 
-# Imported last, and not at the top: ``_frozen`` is a snapshot of this module's K-loop
-# step and calls back into the shared halves of the kernel, so it can only be bound once
-# everything it names exists. ``_pipeline_step`` looks the name up at compile time, which
-# is well after this line has run.
+# Imported last: the frozen prologue and step call shared helpers from this module.
+# JIT functions resolve these names at compile time, after both modules have loaded.
 from ._frozen import (
-    _buffer_load_frozen,
-    _frozen_prologue_fence,
     _pipeline_step_frozen,
+    _prologue_frozen,
 )

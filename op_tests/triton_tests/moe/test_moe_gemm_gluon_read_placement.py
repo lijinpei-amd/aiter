@@ -348,3 +348,30 @@ def test_epilogue_modes_have_distinct_arithmetic(case, split, epilogue):
                 atol=0,
                 msg=f"epilogue={epilogue.name}, split={split}, repeat={repeat}",
             )
+
+
+@pytest.mark.parametrize("has_bias", [False, True], ids=["no-bias", "bias"])
+@pytest.mark.parametrize("has_gammas", [False, True], ids=["no-gammas", "gammas"])
+@pytest.mark.parametrize("num_warps", [4, 8], ids=["lds", "global"])
+def test_epilogue_optional_vectors(case, has_bias, has_gammas, num_warps):
+    vectors = SimpleNamespace(**vars(case))
+    vectors.bias = case.bias if has_bias else None
+    vectors.gammas = case.gammas if has_gammas else None
+    config = _config()
+    config["warps_per_cta"] = (num_warps // 4, 4)
+    values = case.raw + case.bias_rows if has_bias else case.raw
+    gate, linear = values.chunk(2, dim=-1)
+    expected = torch.nn.functional.silu(gate) * linear
+    if has_gammas:
+        expected = expected * case.gammas[:, None]
+
+    output = torch.empty_like(case.baseline)
+    first = None
+    for repeat in range(16):
+        output.fill_(float("nan"))
+        _launch(vectors, output, config=config)
+        if first is None:
+            torch.testing.assert_close(output[0], expected, rtol=2e-4, atol=2e-5)
+            first = output.clone()
+        else:
+            assert torch.equal(first, output), (has_bias, has_gammas, num_warps, repeat)
