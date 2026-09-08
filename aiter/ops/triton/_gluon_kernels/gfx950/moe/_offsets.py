@@ -162,7 +162,10 @@ def _b_payload_hbm_offsets(b, pid_n, N, K, func_cfg, tuning_cfg):
     MBN: gl.constexpr = tuning_cfg.MINI_BLOCK_N
     NN: gl.constexpr = tuning_cfg.num_mini_n()
     PK_B: gl.constexpr = tuning_cfg.BLOCK_K // func_cfg.b_pack_divisor()
-    cl_b: gl.constexpr = tuning_cfg.dot_operand_copy_layout(1)
+    if require_constexpr(tuning_cfg.B_IN_REG):
+        cl_b: gl.constexpr = tuning_cfg.dot_operand_fragment_layout(1)
+    else:
+        cl_b: gl.constexpr = tuning_cfg.dot_operand_copy_layout(1)
     KB: gl.constexpr = K // func_cfg.b_pack_divisor()
     b_hbm_offs = ()
     for ni in gl.static_range(NN):
@@ -190,6 +193,40 @@ def _b_payload_hbm_offsets(b, pid_n, N, K, func_cfg, tuning_cfg):
 
 
 @gluon.jit
+def _shuffled_scale_register_offsets(
+    layout: gl.constexpr,
+    nonk0,
+    NONK: gl.constexpr,
+    SK: gl.constexpr,
+    K,
+    PACKED_K128: gl.constexpr = False,
+):
+    """Logical scale grid in the CDNA4_SCALE / SORTED_SHUFFLED byte order.
+
+    Each 32-row stripe stores 256 K values' scales in 256 bytes. Within a
+    dword, non-K +16 advances one byte and K +128 advances two bytes. K128
+    stages load the complete packed word, matching the LDS scale representation.
+    """
+    if require_constexpr(PACKED_K128):
+        rr = gl.arange(0, NONK, layout=gl.SliceLayout(1, layout))[:, None]
+        cc = gl.arange(0, 2, layout=gl.SliceLayout(0, layout))[None, :]
+        word = rr * 2 + cc
+        offsets = (nonk0 // 32 + word // 64) * K + (word % 64) * 4
+    else:
+        nn = nonk0 + gl.arange(0, NONK, layout=gl.SliceLayout(1, layout))[:, None]
+        kk = gl.arange(0, SK, layout=gl.SliceLayout(0, layout))[None, :]
+        offsets = (
+            (nn // 32) * K
+            + (kk // 8) * 256
+            + (kk % 4) * 64
+            + (nn % 16) * 4
+            + ((kk % 8) // 4) * 2
+            + (nn % 32) // 16
+        )
+    return offsets
+
+
+@gluon.jit
 def _a_scale_hbm_offsets(a, rt, block_id, M_e, start_m, pid_m, K, func_cfg, tuning_cfg):
     """Byte offsets of the A scale tiles, one per mini-M block (``None`` if unscaled).
 
@@ -206,10 +243,29 @@ def _a_scale_hbm_offsets(a, rt, block_id, M_e, start_m, pid_m, K, func_cfg, tuni
     SK: gl.constexpr = tuning_cfg.BLOCK_K // MX_GROUP
     if require_constexpr(tuning_cfg.scale_via_lds(0)):
         asl: gl.constexpr = tuning_cfg.dot_operand_scale_copy_layout(0)
+    elif require_constexpr(tuning_cfg.scale_packed_k128(0)):
+        asl: gl.constexpr = tuning_cfg.packed_scale_frag_layout(0)
+    elif require_constexpr(tuning_cfg.scale_shuffled(0)):
+        asl: gl.constexpr = tuning_cfg.shuffled_scale_mem_layout(0)
     else:
         asl: gl.constexpr = tuning_cfg.dot_operand_scale_fragment_layout(0)
 
-    if require_constexpr(tuning_cfg.A_SCALE_SORTED_SHUFFLED):
+    if require_constexpr(
+        tuning_cfg.scale_shuffled(0) and not tuning_cfg.scale_via_lds(0)
+    ):
+        a_scale_hbm_offs = ()
+        for mi in gl.static_range(NM):
+            a_scale_hbm_offs = a_scale_hbm_offs + (
+                _shuffled_scale_register_offsets(
+                    asl,
+                    pid_m * BM + mi * MBM,
+                    MBM,
+                    SK,
+                    K,
+                    tuning_cfg.scale_packed_k128(0),
+                ),
+            )
+    elif require_constexpr(tuning_cfg.A_SCALE_SORTED_SHUFFLED):
         # moe_sort_scales has already applied the gather and the fragment permute,
         # so there is no table lookup and no per-row stride here: the tile is one
         # contiguous run and `asl` (the fragment layout) already places each lane on
@@ -282,13 +338,30 @@ def _b_scale_hbm_offsets(b, pid_n, N, K, func_cfg, tuning_cfg):
     SK: gl.constexpr = tuning_cfg.BLOCK_K // MX_GROUP
     if require_constexpr(tuning_cfg.scale_via_lds(1)):
         bsl: gl.constexpr = tuning_cfg.dot_operand_scale_copy_layout(1)
+    elif require_constexpr(tuning_cfg.scale_packed_k128(1)):
+        bsl: gl.constexpr = tuning_cfg.packed_scale_frag_layout(1)
     elif require_constexpr(tuning_cfg.scale_shuffled(1)):
         # address-ordered, so the widened load fills registers correctly
         bsl: gl.constexpr = tuning_cfg.shuffled_scale_mem_layout(1)
     else:
         bsl: gl.constexpr = tuning_cfg.dot_operand_scale_fragment_layout(1)
 
-    if require_constexpr(tuning_cfg.B_SCALE_SHUFFLED):
+    if require_constexpr(
+        tuning_cfg.scale_shuffled(1) and not tuning_cfg.scale_via_lds(1)
+    ):
+        b_scale_hbm_offs = ()
+        for ni in gl.static_range(NN):
+            b_scale_hbm_offs = b_scale_hbm_offs + (
+                _shuffled_scale_register_offsets(
+                    bsl,
+                    _n_start(pid_n, ni, N, func_cfg, tuning_cfg),
+                    MBN,
+                    SK,
+                    K,
+                    tuning_cfg.scale_packed_k128(1),
+                ),
+            )
+    elif require_constexpr(tuning_cfg.B_SCALE_SHUFFLED):
         # utils/shuffle.py::shuffle_scale_moe (CDNA4_SCALE) has already permuted the
         # weight scales into MFMA fragment order: per expert the tile is
         # (N/32, K) bytes, and within a 32-row stripe lane L of a stage reads the

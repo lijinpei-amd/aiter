@@ -258,6 +258,16 @@ class TuningSpec(NamedTuple):
     SOFF_UNROLL: bool = False
     #: At a 2x2 mini-tile split, fill scales in the two middle slots.
     SCALE_FILL_MID: bool = False
+    #: Load preshuffled B directly into registers at its global-load slot.
+    B_IN_REG: bool = False
+    #: Scale storage is independent of B payload storage and of the other scale.
+    B_SCALE_IN_REG: bool = False
+    A_SCALE_IN_REG: bool = False
+    #: Per-component ring depths. Zero inherits the legacy NUM_LDS_BUFFER value.
+    A_NUM_BUFFER: int = 0
+    B_NUM_BUFFER: int = 0
+    A_SCALE_NUM_BUFFER: int = 0
+    B_SCALE_NUM_BUFFER: int = 0
 
 
 class ActivationSpec(NamedTuple):

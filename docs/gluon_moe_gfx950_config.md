@@ -9,8 +9,9 @@ The low-level entry points `_moe_gluon_gemm1` and `_moe_gluon_gemm2` and launch
 metadata live in `_entry.py`. Each entry constructs `KernelFuncConfig` and
 `KernelTuningConfig` from the launch specs and passes them directly to
 `_moe_gemm_body` alongside constexpr `N` and `K`. The host caches the two specs
-and dimensions as four constexpr arguments. The shared GEMM body and pipeline
-remain in `moe_gemm.py`; `_offsets.py` computes A/B HBM offsets and mini-tile
+and dimensions as four constexpr arguments. The shared GEMM body and legacy pipeline
+remain in `moe_gemm.py`; `_buffered.py` implements independent component queues.
+`_offsets.py` computes A/B HBM offsets and mini-tile
 indices, and `_epilogue.py` owns output activation, quantization, staging, and
 stores. The host launch API is unchanged.
 
@@ -24,9 +25,29 @@ fields of `TuningSpec`, with defaults for omitted optional fields.
 | `DS_READ_IN_MFMA` | `DSReadOperand` bitmask: `A=1`, `B=2`, `A_SCALE=4`, `B_SCALE=8`. Set bits place the corresponding read in the MFMA region; unset bits place it in the memory region. `ALL=15`. |
 | `SCHED_MODE` | `SchedMode.NONE`, `IGLP_0`, `IGLP_1`, `MFMA_16`, or `MFMA_8`. Hints apply outside compiler warp-pipeline regions. |
 | `FROZEN_STEP` | Select the preserved reference step and its original unfused drain. |
-| `SOFF_UNROLL` | Advance HBM pointers once per unrolled body and use scalar offsets within it. |
+| `SOFF_UNROLL` | In the legacy pipeline, advance HBM pointers once per unrolled body and use scalar offsets within it. Independent component queues advance their pointers at each fill. |
 | `SCALE_FILL_MID` | At a 2x2 mini-tile split, fill scales in the middle slots; wait counts use the same setting. |
 | `WAIT_COMMIT_SCHEME` | `PER_OP=1`, `PER_SLOT=2`, `PER_STAGE_WHOLE=3`, or `PER_STAGE_WARP_PIPELINE=4`; see the boundaries below. |
+| `B_IN_REG` | Load the B payload into registers with `buffer_load` at its normal global-load slot, bypassing LDS staging. Requires `B_PRESHUFFLED=True`. Defaults to `False`. |
+| `A_SCALE_IN_REG`, `B_SCALE_IN_REG` | Load the selected scale component directly into registers. Both options are independent of each other and of `B_IN_REG`; neither requires preshuffled B payload. Defaults to `False`. |
+| `A_NUM_BUFFER`, `B_NUM_BUFFER` | Number of pipeline buffers for each payload component. Positive integers, including 1, are supported. Omitted or zero values inherit `NUM_LDS_BUFFER`. |
+| `A_SCALE_NUM_BUFFER`, `B_SCALE_NUM_BUFFER` | Number of pipeline buffers for each scale component, independent of the payload counts. Omitted or zero values inherit `NUM_LDS_BUFFER`. `A_SCALE_NUMB_BUFFER` is accepted as a dictionary/environment alias for `A_SCALE_NUM_BUFFER`. |
+
+Setting any register-storage flag or positive component buffer count selects the
+component pipeline. Its unroll factor is
+`gcd(A_NUM_BUFFER, B_NUM_BUFFER, A_SCALE_NUM_BUFFER, B_SCALE_NUM_BUFFER)`, after
+resolving inherited counts. All four counts participate, including scale counts
+for unscaled operand types. For example, counts `(4, 2, 4, 2)` unroll twice, and
+`(3, 2, 3, 2)` unroll once. The legacy `K_UNROLL` field does not override this
+factor. Configurations that omit all new options retain their existing
+`NUM_LDS_BUFFER`/`K_UNROLL` recipe. `FROZEN_STEP` rejects the new options so the
+preserved reference keeps its original schedule.
+
+All seven new fields also accept the `AITER_TRITON_MOE_GLUON_` environment prefix
+used by the benchmark scripts. A config dictionary with `B_PRESHUFFLED=True`
+means the caller supplied weights in the existing 16-column-blocked order;
+`AITER_TRITON_MOE_GLUON_B_PRESHUFFLED=1` instead requests host preparation of raw
+weights. `B_IN_REG` without preshuffled weights raises an error.
 
 `PER_STAGE_WARP_PIPELINE` commits inside the last memory region in the K stage,
 after its memory work and before the final MFMA region. `PER_STAGE_WHOLE` commits
@@ -37,10 +58,12 @@ preserves the whole-stage boundary used by the cold-bench recipes; callers that
 previously selected `PER_STAGE` with the compiler warp pipeline should select
 `PER_STAGE_WARP_PIPELINE` for the memory-region boundary.
 
-Both per-stage schemes use `wait_per_stage` once before the `ni`/`mi` loops.
-`PER_OP` and `PER_SLOT` use `wait_per_slot` before each slot that reads LDS.
-The fill-only prologue commits each stage at its last copy slot, and drain steps
-that issue no copies do not commit a group.
+The legacy per-stage schemes use `wait_per_stage` once before the `ni`/`mi`
+loops. `PER_OP` and `PER_SLOT` use `wait_per_slot` before each slot that reads
+LDS. Its fill-only prologue commits each stage at its last copy slot, and drain
+steps that issue no copies do not commit a group. Independent queues compute
+waits from each component's producer stage, including empty slot/stage groups
+in the prologue and drain.
 
 Payload and scale placement are independent. Missing components emit no reads;
 components loaded directly into registers follow the same region selection.
@@ -65,14 +88,73 @@ The legacy `DS_IN_MFMA=1` maps to mask 15. `DS_MOVE=1` maps to mask 5;
 `DS_MOVE>=2` maps to mask 15. An explicit
 `AITER_TRITON_MOE_GLUON_DS_READ_IN_MFMA` takes precedence over both.
 
-`MANUAL_PP` and `B_IN_REG` have been removed from the tuning configuration. Their
-legacy environment variables and dictionary keys are ignored. Positional
-`TuningSpec` construction must use the current field order. `B_PRESHUFFLED` still
-selects the permuted weight layout staged through LDS.
+`MANUAL_PP` has been removed from the tuning configuration; its legacy environment
+variable and dictionary key are ignored. The new storage and buffer fields are
+trailing optional fields of `TuningSpec`, so older positional constructions keep
+their meaning. `B_PRESHUFFLED` selects the permuted weight layout for either LDS
+staging or `B_IN_REG` loads.
+
+## Tuned register/buffer recipes
+
+The opt-in recipes in
+[`scripts/gluon_moe_register_tuned`](../scripts/gluon_moe_register_tuned/README.md)
+cover GEMM1 on MI350X with T=1024, N=2048, K=7168, E=33, top-k=8,
+preshuffled B, split gate/up SiLU, and FP32 output. Both the best B-register
+and best independent LDS-buffer recipes are retained for each dtype.
+
+| Dtype | Legacy baseline | Tuned B in registers | Tuned B in LDS |
+| --- | ---: | ---: | ---: |
+| a4w4 / MXFP4 | 145.201 us | 139.741 us | 136.521 us |
+| a8w8 / MXFP8 | 256.992 us | 228.941 us | 219.642 us |
+| a16w16 / BF16 | 500.864 us | 421.983 us | 470.983 us |
+
+These are medians from five interleaved rounds on one GPU, with 40 warmups and
+100 measured dispatches per recipe per round. A 768 MiB flush precedes each
+wrapper call; MX scale sorting follows the flush. Timings contain only GEMM1.
+Every final recipe passed 16 exact-output cold replays per round and has zero
+VGPR spills/private memory. The tuned B-register recipes lower latency by 3.8%,
+10.9%, and 15.7% against the respective original recipes. Independently buffered
+LDS B is the faster choice for the two MX dtypes on this workload.
+
+The [four-wave MXFP4-output follow-up](gluon_moe_gfx950_register_perf.md)
+records the separate T4096/N4096 benchmark near 615 us. The transferred recipes
+regress on that workload; preshuffling B with the original LDS pipeline improves
+its measured latency. The results above apply to the smaller FP32-output workload.
+
+The winning B-register recipes use `expert_mod=".cg"` and effective buffer counts
+`(4,2,3,3)` for MXFP4 and `(3,3,3,3)` for MXFP8/BF16. Their GCD unrolls are 1, 3,
+and 3. The scale-register flags remain independent; the selected MX recipes use
+LDS scales. Cache policy accounts for much of the MX improvement: tuned legacy
+controls measured 136.941 us for MXFP4 and 230.401 us for MXFP8.
+
+The reusable runner is
+[`scripts/gluon_moe_register_tune.py`](../scripts/gluon_moe_register_tune.py).
+It accepts candidate dictionaries and records correctness, determinism, compiler
+resources, source hashes, and cold profiler traces. The linked recipe README
+contains replay commands and the complete measurement protocol.
+
+Tuning exposed two configuration/scheduling defects that are now covered by
+regressions: unquantized output must unwrap `output_quant` before checking for
+None, and pointer advances must stay before the final compiler-pipeline stage
+border so a subsequent unrolled wait remains at a region head. The default
+legacy kernels still match their preserved encoded machine-code hashes and
+resource metadata for all three dtypes.
 
 ## Pipeline state
 
-Each step takes invariant data in `_PipelineConst` and carries two separate
+Both pipelines take invariant data in `_PipelineConst`. The independent pipeline
+in `_buffered.py` fills stream `i` at K stage `r + depth[i] - 1` while reading
+stage `r`. Each stream keeps its own LDS index or register queue and HBM pointer.
+B register loads occur in the same slot as B LDS copies. Scale register loads
+also use their configured fill slots, including `SCALE_FILL_MID`.
+
+The prologue and drain suppress individual fills outside K, so buffer counts may
+exceed the number of K stages. A one-buffer stream fills before its read, with
+barriers protecting reuse. Packed K128 scales keep both halves in one word;
+selecting the half before MFMA permits an odd GCD without changing the unroll.
+LDS reads retain the completion waits needed before buffers are overwritten.
+
+The legacy pipeline carries two separate
 aggregates through the K loop:
 
 - `_PipelinePointers`, named `hbm_ptrs` at call sites, contains the A/B payload

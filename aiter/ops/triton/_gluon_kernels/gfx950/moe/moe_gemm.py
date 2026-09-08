@@ -129,7 +129,12 @@ _DK_UPCAST_MFMA: gl.constexpr = gl.constexpr(int(DotKind.UPCAST_MFMA))
 @gluon.constexpr_function
 def _packed_sel(tuning_cfg, idx, k_phase=0):
     """The byte-selector list for a pre-packed scale operand, or None if it is not."""
-    if tuning_cfg.scale_packed_ok(idx) and tuning_cfg.scale_via_lds(idx):
+    if tuning_cfg.independent_buffers() and tuning_cfg.num_mini_k() > 1:
+        return None
+    if tuning_cfg.scale_packed_ok(idx) and (
+        tuning_cfg.scale_via_lds(idx)
+        or (tuning_cfg.independent_buffers() and tuning_cfg.scale_packed_k128(idx))
+    ):
         return tuning_cfg.scale_packed_sel(idx, k_phase)
     return None
 
@@ -304,7 +309,14 @@ def _maybe_block_dot(
             else:
                 b_s = _NO_SCALE
             acc = _dot(
-                a_frags[2 * i], a_s, b_frags[2 * i], b_s, acc, func_cfg, tuning_cfg, K_PHASE
+                a_frags[2 * i],
+                a_s,
+                b_frags[2 * i],
+                b_s,
+                acc,
+                func_cfg,
+                tuning_cfg,
+                K_PHASE,
             )
     return acc
 
@@ -385,10 +397,10 @@ class _PipelinePointers:
 
     Every address here is in HBM -- the LDS side of the pipeline is entirely inside
     ``_PipelineConst.lds_ptrs``. Each operand has one scale pointer: its scale loads
-    either stage through LDS or go straight to registers. LDS source pointers advance
-    after the stage's last buffer load; direct scale pointers advance after the stage's
-    register loads. Only the selected path advances a scale pointer, so direct scales
-    stay at the consumed K stage while LDS copies run ahead in the ring.
+    either stage through LDS or go straight to registers. In the legacy pipeline,
+    LDS source pointers advance after the stage's last buffer load and direct scales
+    advance after their consume-side register loads. The independent queues advance
+    every stream at its fill point, so their pointers can address different K stages.
     """
 
     a_hbm_ptr: gl.tensor
@@ -485,7 +497,9 @@ def wait_per_slot(
     """Wait for this slot's copies in the per-op and per-slot commit modes."""
     tc: gl.constexpr = pc.tuning_cfg
     if require_constexpr(not tc.commit_per_stage()):
-        WAIT: gl.constexpr = _buffer_load_wait(tc, mi, ni, STAGES_BETWEEN, DO_BUFFER_LOAD)
+        WAIT: gl.constexpr = _buffer_load_wait(
+            tc, mi, ni, STAGES_BETWEEN, DO_BUFFER_LOAD
+        )
         if require_constexpr(WAIT is not None):
             pc.lds_ptrs.wait_buffer_load_groups(WAIT + WAIT_SLACK)
         elif require_constexpr(
@@ -921,16 +935,16 @@ def _pipeline_step_impl(
     # wait inside a stage region, and the two are alternative answers to the same
     # question anyway -- iglp_opt overlaps MFMA with memory inside a wave, the
     # pipeliner does it by ping-ponging two wave groups.
-    if require_constexpr(tc.SCHED_MODE != 0 and DO_DS_READ and not WAR_PIPELINE_COMPILER):
+    if require_constexpr(
+        tc.SCHED_MODE != 0 and DO_DS_READ and not WAR_PIPELINE_COMPILER
+    ):
         _sched_hint(tc.SCHED_MODE)
     if require_constexpr(DO_DS_READ):
         wait_per_stage(pc, STAGES_BETWEEN, WAIT_SLACK)
     for ni in gl.static_range(NN):
         for mi in gl.static_range(NM):
             if require_constexpr(DO_DS_READ):
-                wait_per_slot(
-                    pc, mi, ni, STAGES_BETWEEN, DO_BUFFER_LOAD, WAIT_SLACK
-                )
+                wait_per_slot(pc, mi, ni, STAGES_BETWEEN, DO_BUFFER_LOAD, WAIT_SLACK)
 
             if require_constexpr(
                 DO_DS_READ and not DO_MFMA and _slot_index(mi, ni, NM, NN) == 0
@@ -1244,136 +1258,139 @@ def _moe_gemm_body(
     PF_MINI: gl.constexpr = tuning_cfg.num_prefetch_mini()
     HEAD_MINI: gl.constexpr = NUM_MINI - PF_MINI
 
-    # Prologue fill: all but the *last* buffer, no mma. Walks the slot grid rather than
-    # A-then-B so the commit groups land in the same order _buffer_load_wait() assumes for a
-    # loop stage.
-    #
-    # The last buffer is held back deliberately. Filling all NB here would mean stalling
-    # on buffer 0 with NB whole stages already in flight and nothing but the wait to do;
-    # issuing NB-1 lets the wait drop to (NB-2)*G, and the buffer that was not filled is
-    # then issued *after* the first ds_read + MFMA, which is real work for its latency to
-    # hide behind. The group order is unchanged -- the held-back stage is still the
-    # newest -- so every _buffer_load_wait() count downstream still holds, and by the time the
-    # first pipeline step runs the outstanding set is the same (NB-1)*G either way.
-    if require_constexpr(tuning_cfg.FROZEN_STEP):
-        hbm_ptrs = _prologue_frozen(pc, hbm_ptrs)
+    if require_constexpr(tuning_cfg.independent_buffers()):
+        regs = _run_buffered_pipeline(pc, hbm_ptrs, NUM_K)
     else:
-        for i in gl.static_range(NB - 1):
-            for ni in gl.static_range(NN):
-                for mi in gl.static_range(NM):
-                    _buffer_load(
-                        pc, hbm_ptrs, i, mi, ni, K_PHASE=tuning_cfg.scale_k_phase(i)
-                    )
-                    if require_constexpr(mi == NM - 1 and ni == NN - 1):
-                        hbm_ptrs = _advance_hbm_ptrs(
-                            pc, hbm_ptrs, K_PHASE=tuning_cfg.scale_k_phase(i)
+        # Prologue fill: all but the *last* buffer, no mma. Walks the slot grid rather than
+        # A-then-B so the commit groups land in the same order _buffer_load_wait() assumes for a
+        # loop stage.
+        #
+        # The last buffer is held back deliberately. Filling all NB here would mean stalling
+        # on buffer 0 with NB whole stages already in flight and nothing but the wait to do;
+        # issuing NB-1 lets the wait drop to (NB-2)*G, and the buffer that was not filled is
+        # then issued *after* the first ds_read + MFMA, which is real work for its latency to
+        # hide behind. The group order is unchanged -- the held-back stage is still the
+        # newest -- so every _buffer_load_wait() count downstream still holds, and by the time the
+        # first pipeline step runs the outstanding set is the same (NB-1)*G either way.
+        if require_constexpr(tuning_cfg.FROZEN_STEP):
+            hbm_ptrs = _prologue_frozen(pc, hbm_ptrs)
+        else:
+            for i in gl.static_range(NB - 1):
+                for ni in gl.static_range(NN):
+                    for mi in gl.static_range(NM):
+                        _buffer_load(
+                            pc, hbm_ptrs, i, mi, ni, K_PHASE=tuning_cfg.scale_k_phase(i)
                         )
+                        if require_constexpr(mi == NM - 1 and ni == NN - 1):
+                            hbm_ptrs = _advance_hbm_ptrs(
+                                pc, hbm_ptrs, K_PHASE=tuning_cfg.scale_k_phase(i)
+                            )
 
-    # The live prologue uses the same slot/stage waits as the steady-state step.
-    # The prologue's own step: it fills the buffer held back above and issues the first
-    # ds_read, but has nothing carried in to dot yet -- which is exactly a pipeline step
-    # with the MFMAs switched off. Reusing _pipeline_step keeps the fill/read/wait
-    # interleave and the commit-group order in one place instead of
-    # a second hand-rolled copy that has to be kept in step with it.
-    #
-    # Holding the last fill back is what makes that possible: this step reads one buffer
-    # while filling one, with NB-2 whole stages in between -- the same STAGES_BETWEEN the
-    # loop runs at, so the slot waits it computes are the steady-state ones.
-    #
-    # This single MFMA-less step seeds the register fragments. A split stage would
-    # need to dot its head here, so HEAD_MINI must be zero.
-    gl.static_assert(
-        HEAD_MINI == 0,
-        "split-stage prologue (VGPR_PREFETCH_K < BLOCK_K) is unsupported",
-    )
-    acc0 = ()
-    for ni in gl.static_range(NN):
-        for mi in gl.static_range(NM):
-            acc0 = acc0 + (
-                gl.zeros(
-                    [MBM, MBN],
-                    dtype=func_cfg.mma_acc_dtype,
-                    layout=tuning_cfg.dot_result_fragment_layout(),
-                ),
-            )
-    hbm_ptrs, regs = _pipeline_step(
-        pc,
-        hbm_ptrs,
-        _PipelineRegFragments((), (), (), (), acc0),
-        NB - 1,
-        0,
-        STAGES_BETWEEN,
-        True,
-        True,
-        DO_MFMA=False,
-    )
-    # The whole main sequence is guarded: MAIN is 0 when NUM_K == NUM_LDS_BUFFER, and
-    # then every stage belongs to the drain and there is no step here at all.
-    if require_constexpr(MAIN > 0):
-        # First step peeled out. Its MFMAs are the ones that consume the accumulator
-        # while it is still visibly gl.zeros -- inside the loop that is a phi and the
-        # zero is invisible.
+        # The live prologue uses the same slot/stage waits as the steady-state step.
+        # The prologue's own step: it fills the buffer held back above and issues the first
+        # ds_read, but has nothing carried in to dot yet -- which is exactly a pipeline step
+        # with the MFMAs switched off. Reusing _pipeline_step keeps the fill/read/wait
+        # interleave and the commit-group order in one place instead of
+        # a second hand-rolled copy that has to be kept in step with it.
+        #
+        # Holding the last fill back is what makes that possible: this step reads one buffer
+        # while filling one, with NB-2 whole stages in between -- the same STAGES_BETWEEN the
+        # loop runs at, so the slot waits it computes are the steady-state ones.
+        #
+        # This single MFMA-less step seeds the register fragments. A split stage would
+        # need to dot its head here, so HEAD_MINI must be zero.
+        gl.static_assert(
+            HEAD_MINI == 0,
+            "split-stage prologue (VGPR_PREFETCH_K < BLOCK_K) is unsupported",
+        )
+        acc0 = ()
+        for ni in gl.static_range(NN):
+            for mi in gl.static_range(NM):
+                acc0 = acc0 + (
+                    gl.zeros(
+                        [MBM, MBN],
+                        dtype=func_cfg.mma_acc_dtype,
+                        layout=tuning_cfg.dot_result_fragment_layout(),
+                    ),
+                )
         hbm_ptrs, regs = _pipeline_step(
             pc,
             hbm_ptrs,
-            regs,
+            _PipelineRegFragments((), (), (), (), acc0),
+            NB - 1,
             0,
-            1 % NB,
             STAGES_BETWEEN,
             True,
             True,
-            K_PHASE=tuning_cfg.scale_k_phase(1),
+            DO_MFMA=False,
         )
-
-        # steady state over the remaining MAIN-1 steps, body unrolled K_UNROLL times.
-        #
-        # The buffer index is what decides whether every ds_read and buffer_load address
-        # constant-folds. When K_UNROLL is a multiple of NB the trip lands back on the
-        # buffer phase it started on, so global step 1+_k+i is congruent to 1+i mod NB
-        # and the index is a literal. Otherwise it has to come from the induction
-        # variable, which is what decouples the two knobs -- at a measured ~12%
-        # (676 -> 756 us at the tuned shape), because the offsets then live in registers
-        # instead of the instruction encoding. So: pay it only when asked for a factor
-        # that does not divide.
-        #
-        # The wait_group counts are the same either way; _buffer_load_wait reads only
-        # STAGES_BETWEEN and the slot position, never which buffer.
-        for _k in tl.range(0, UNROLLED, tuning_cfg.K_UNROLL):
-            for i in gl.static_range(tuning_cfg.K_UNROLL):
-                if require_constexpr(tuning_cfg.K_UNROLL % NB == 0):
-                    buffer_load_step = (i + 1) % NB
-                    ds_read_step = (i + 2) % NB
-                else:
-                    buffer_load_step = (_k + i + 1) % NB
-                    ds_read_step = (_k + i + 2) % NB
-                hbm_ptrs, regs = _pipeline_step(
-                    pc,
-                    hbm_ptrs,
-                    regs,
-                    buffer_load_step,
-                    ds_read_step,
-                    STAGES_BETWEEN,
-                    True,
-                    True,
-                    IN_LOOP=True,
-                    KI=i,
-                    KU=tuning_cfg.K_UNROLL,
-                    K_PHASE=tuning_cfg.scale_k_phase(i + 2),
-                )
-
-        # remainder (0 .. K_UNROLL-1 steps); NUM_K is constexpr so this stays static
-        for j in gl.static_range(1 + UNROLLED, MAIN):
+        # The whole main sequence is guarded: MAIN is 0 when NUM_K == NUM_LDS_BUFFER, and
+        # then every stage belongs to the drain and there is no step here at all.
+        if require_constexpr(MAIN > 0):
+            # First step peeled out. Its MFMAs are the ones that consume the accumulator
+            # while it is still visibly gl.zeros -- inside the loop that is a phi and the
+            # zero is invisible.
             hbm_ptrs, regs = _pipeline_step(
                 pc,
                 hbm_ptrs,
                 regs,
-                j % NB,
-                (j + 1) % NB,
+                0,
+                1 % NB,
                 STAGES_BETWEEN,
                 True,
                 True,
-                K_PHASE=tuning_cfg.scale_k_phase(j + 1),
+                K_PHASE=tuning_cfg.scale_k_phase(1),
             )
+
+            # steady state over the remaining MAIN-1 steps, body unrolled K_UNROLL times.
+            #
+            # The buffer index is what decides whether every ds_read and buffer_load address
+            # constant-folds. When K_UNROLL is a multiple of NB the trip lands back on the
+            # buffer phase it started on, so global step 1+_k+i is congruent to 1+i mod NB
+            # and the index is a literal. Otherwise it has to come from the induction
+            # variable, which is what decouples the two knobs -- at a measured ~12%
+            # (676 -> 756 us at the tuned shape), because the offsets then live in registers
+            # instead of the instruction encoding. So: pay it only when asked for a factor
+            # that does not divide.
+            #
+            # The wait_group counts are the same either way; _buffer_load_wait reads only
+            # STAGES_BETWEEN and the slot position, never which buffer.
+            for _k in tl.range(0, UNROLLED, tuning_cfg.K_UNROLL):
+                for i in gl.static_range(tuning_cfg.K_UNROLL):
+                    if require_constexpr(tuning_cfg.K_UNROLL % NB == 0):
+                        buffer_load_step = (i + 1) % NB
+                        ds_read_step = (i + 2) % NB
+                    else:
+                        buffer_load_step = (_k + i + 1) % NB
+                        ds_read_step = (_k + i + 2) % NB
+                    hbm_ptrs, regs = _pipeline_step(
+                        pc,
+                        hbm_ptrs,
+                        regs,
+                        buffer_load_step,
+                        ds_read_step,
+                        STAGES_BETWEEN,
+                        True,
+                        True,
+                        IN_LOOP=True,
+                        KI=i,
+                        KU=tuning_cfg.K_UNROLL,
+                        K_PHASE=tuning_cfg.scale_k_phase(i + 2),
+                    )
+
+            # remainder (0 .. K_UNROLL-1 steps); NUM_K is constexpr so this stays static
+            for j in gl.static_range(1 + UNROLLED, MAIN):
+                hbm_ptrs, regs = _pipeline_step(
+                    pc,
+                    hbm_ptrs,
+                    regs,
+                    j % NB,
+                    (j + 1) % NB,
+                    STAGES_BETWEEN,
+                    True,
+                    True,
+                    K_PHASE=tuning_cfg.scale_k_phase(j + 1),
+                )
 
     epi = _stage_epilogue_inputs(
         bias_hbm_ptr,
@@ -1400,18 +1417,25 @@ def _moe_gemm_body(
         and tuning_cfg.num_mini_n() == 2
     )
     DRAIN: gl.constexpr = NB - 1 if FUSE else NB
-    for i in gl.static_range(DRAIN):
+    if require_constexpr(not tuning_cfg.independent_buffers()):
+        for i in gl.static_range(DRAIN):
+            hbm_ptrs, regs = _pipeline_step(
+                pc,
+                hbm_ptrs,
+                regs,
+                0,
+                (MAIN + i + 1) % NB,
+                NB - 2 - i,
+                False,
+                i + 1 < NB,
+                WAIT_SLACK=epi.groups,
+                K_PHASE=tuning_cfg.scale_k_phase(MAIN + i + 1),
+            )
+    elif require_constexpr(not FUSE):
+        # Independent queues have already prefetched the final stage. Its packed
+        # scales are canonicalized to the low half before reaching the common dot.
         hbm_ptrs, regs = _pipeline_step(
-            pc,
-            hbm_ptrs,
-            regs,
-            0,
-            (MAIN + i + 1) % NB,
-            NB - 2 - i,
-            False,
-            i + 1 < NB,
-            WAIT_SLACK=epi.groups,
-            K_PHASE=tuning_cfg.scale_k_phase(MAIN + i + 1),
+            pc, hbm_ptrs, regs, 0, 0, 0, False, False, K_PHASE=1
         )
 
     # Hoisted out of the mini-tile loop: one scalar load, not one per tile.
@@ -1442,7 +1466,11 @@ def _moe_gemm_body(
             x_static_scale,
             func_cfg,
             tuning_cfg,
-            K_PHASE=tuning_cfg.scale_k_phase(NUM_K - 1),
+            K_PHASE=(
+                0
+                if tuning_cfg.independent_buffers()
+                else tuning_cfg.scale_k_phase(NUM_K - 1)
+            ),
         )
     else:
         acc = regs.acc
@@ -1475,8 +1503,9 @@ def _moe_gemm_body(
     )
 
 
-# Imported last: the frozen prologue and step call shared helpers from this module.
+# Imported last: both pipeline implementations call shared helpers from this module.
 # JIT functions resolve these names at compile time, after both modules have loaded.
+from ._buffered import _run_buffered_pipeline
 from ._frozen import (
     _pipeline_step_frozen,
     _prologue_frozen,
