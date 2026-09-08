@@ -10,6 +10,7 @@ argument, only its class can. Keeping the arithmetic in the aggregate is what st
 host grid math and the device tile math from drifting.
 """
 
+import math
 import os
 
 from triton.experimental import gluon
@@ -148,14 +149,14 @@ def byte_unit_lds_layout(shape, nk_dim, elem_bits, unit_rows, preshuffled):
     unit_rows = _v(unit_rows)
     rank = len(shape)
     kd = 1 - nk_dim
-    els = lambda nbytes: nbytes * 8 // elem_bits  # noqa: E731
+    els = lambda nbytes: nbytes * 8 // elem_bits
 
     U = els(LDS_UNIT_K_BYTES)  # elements per 128 B K unit
     V = els(LDS_LANE_BYTES)  # elements per 16 B lane access
     rows, kelems = shape[nk_dim], shape[kd]
 
-    K = lambda vs: _pow2_bases(kd, rank, vs)  # noqa: E731
-    NK = lambda vs: _pow2_bases(nk_dim, rank, vs)  # noqa: E731
+    K = lambda vs: _pow2_bases(kd, rank, vs)
+    NK = lambda vs: _pow2_bases(nk_dim, rank, vs)
 
     if preshuffled:
         # 16 B of K, then the 16 rows, then the rest of the 128 B unit.
@@ -432,6 +433,13 @@ class KernelTuningConfig:
     FROZEN_STEP: gl.constexpr
     SOFF_UNROLL: gl.constexpr
     SCALE_FILL_MID: gl.constexpr
+    B_IN_REG: gl.constexpr
+    B_SCALE_IN_REG: gl.constexpr
+    A_SCALE_IN_REG: gl.constexpr
+    A_NUM_BUFFER: gl.constexpr
+    B_NUM_BUFFER: gl.constexpr
+    A_SCALE_NUM_BUFFER: gl.constexpr
+    B_SCALE_NUM_BUFFER: gl.constexpr
 
     @gluon.constexpr_function
     def __init__(
@@ -472,6 +480,13 @@ class KernelTuningConfig:
         FROZEN_STEP=False,
         SOFF_UNROLL=False,
         SCALE_FILL_MID=False,
+        B_IN_REG=False,
+        B_SCALE_IN_REG=False,
+        A_SCALE_IN_REG=False,
+        A_NUM_BUFFER=0,
+        B_NUM_BUFFER=0,
+        A_SCALE_NUM_BUFFER=0,
+        B_SCALE_NUM_BUFFER=0,
     ):
         self.func_cfg = func_cfg
         self.BLOCK_M = gl.constexpr(_v(BLOCK_M))
@@ -510,6 +525,70 @@ class KernelTuningConfig:
         self.FROZEN_STEP = gl.constexpr(bool(_v(FROZEN_STEP)))
         self.SOFF_UNROLL = gl.constexpr(bool(_v(SOFF_UNROLL)))
         self.SCALE_FILL_MID = gl.constexpr(bool(_v(SCALE_FILL_MID)))
+        self.B_IN_REG = gl.constexpr(bool(_v(B_IN_REG)))
+        self.B_SCALE_IN_REG = gl.constexpr(bool(_v(B_SCALE_IN_REG)))
+        self.A_SCALE_IN_REG = gl.constexpr(bool(_v(A_SCALE_IN_REG)))
+        self.A_NUM_BUFFER = gl.constexpr(int(_v(A_NUM_BUFFER)))
+        self.B_NUM_BUFFER = gl.constexpr(int(_v(B_NUM_BUFFER)))
+        self.A_SCALE_NUM_BUFFER = gl.constexpr(int(_v(A_SCALE_NUM_BUFFER)))
+        self.B_SCALE_NUM_BUFFER = gl.constexpr(int(_v(B_SCALE_NUM_BUFFER)))
+
+    @gluon.constexpr_function
+    def num_buffers(self, operand, scale=False):
+        """Ring depth for one payload or scale; zero keeps the legacy shared depth."""
+        operand = _v(operand)
+        assert operand in (0, 1), "operand must be 0 (A) or 1 (B)"
+        if _v(scale):
+            depth = self.A_SCALE_NUM_BUFFER if operand == 0 else self.B_SCALE_NUM_BUFFER
+        else:
+            depth = self.A_NUM_BUFFER if operand == 0 else self.B_NUM_BUFFER
+        return _v(depth) or _v(self.NUM_LDS_BUFFER)
+
+    @gluon.constexpr_function
+    def scale_in_reg(self, operand):
+        """Whether tuning explicitly selects direct-register scales for an operand."""
+        return bool(
+            _v(self.A_SCALE_IN_REG if _v(operand) == 0 else self.B_SCALE_IN_REG)
+        )
+
+    @gluon.constexpr_function
+    def independent_buffers(self):
+        """Use component rings when any of the independent storage knobs is set."""
+        return bool(
+            _v(self.B_IN_REG)
+            or _v(self.B_SCALE_IN_REG)
+            or _v(self.A_SCALE_IN_REG)
+            or _v(self.A_NUM_BUFFER)
+            or _v(self.B_NUM_BUFFER)
+            or _v(self.A_SCALE_NUM_BUFFER)
+            or _v(self.B_SCALE_NUM_BUFFER)
+        )
+
+    @gluon.constexpr_function
+    def pipeline_depth(self):
+        """Largest ring among the components present in the operand dtypes."""
+        depth = max(self.num_buffers(0), self.num_buffers(1))
+        for operand in (0, 1):
+            if self.func_cfg.has_scale(operand):
+                depth = max(depth, self.num_buffers(operand, True))
+        return depth
+
+    @gluon.constexpr_function
+    def pipeline_unroll(self):
+        """Component rings use the GCD of all four configured buffer counts.
+
+        Omitted independent options retain the existing K_UNROLL recipe, including
+        the recorded frozen kernels. Absent scale operands still participate in the
+        GCD when independent buffering is requested.
+        """
+        if not self.independent_buffers():
+            return _v(self.K_UNROLL)
+        return math.gcd(
+            self.num_buffers(0),
+            self.num_buffers(1),
+            self.num_buffers(0, True),
+            self.num_buffers(1, True),
+        )
 
     @gluon.constexpr_function
     def ds_read_in_mfma(self, operand, scale=False):
@@ -608,7 +687,9 @@ class KernelTuningConfig:
 
     @gluon.constexpr_function
     def commit_per_stage_warp_pipeline(self):
-        return _v(self.WAIT_COMMIT_SCHEME) == int(WaitCommitScheme.PER_STAGE_WARP_PIPELINE)
+        return _v(self.WAIT_COMMIT_SCHEME) == int(
+            WaitCommitScheme.PER_STAGE_WARP_PIPELINE
+        )
 
     @gluon.constexpr_function
     def commit_per_stage_whole(self):
@@ -718,6 +799,8 @@ class KernelTuningConfig:
         makes every ``wait_group`` conservative -- so the tuner should prefer a BLOCK_K
         that keeps this True.
         """
+        if self.scale_in_reg(idx):
+            return False
         shape = self.scale_shape(idx)
         if self.scale_shuffled(idx):
             # Fragment-ordered in HBM, so the copy is linear and the LDS tile keeps the
@@ -731,6 +814,8 @@ class KernelTuningConfig:
     @gluon.constexpr_function
     def payload_via_lds(self, idx):
         """Same question for the payload operand at 128-bit per lane."""
+        if _v(idx) == 1 and _v(self.B_IN_REG):
+            return False
         shape = self.lds_shape(idx)
         vec = self.copy_contiguity(idx)
         return shape[0] * shape[1] >= WARP_SIZE * vec
@@ -743,9 +828,9 @@ class KernelTuningConfig:
         16 B contiguous store, and a lane-local even/odd gate-up pair for the fused
         activation) instead of 4 strided M rows.
         """
-        assert _v(self.transposed), (
-            "transposed=True is pinned, see the module docstring"
-        )
+        assert _v(
+            self.transposed
+        ), "transposed=True is pinned, see the module docstring"
         return gl.amd.AMDMFMALayout(
             version=4,
             instr_shape=_v(self.mfma_instr_shape),
@@ -1169,22 +1254,23 @@ class KernelTuningConfig:
     @gluon.constexpr_function
     def lds_bytes(self):
         fc = self.func_cfg
-        per_stage = 0
+        total = 0
         for idx in (0, 1):
             shape = self.lds_shape(idx)
             width = fc.operand_elem_ty(idx).primitive_bitwidth // 8
             # lds_shape() is one mini block; a stage holds num_lds_tiles() of them
             n_tiles = self.num_lds_tiles(idx)
-            per_stage += n_tiles * shape[0] * shape[1] * width
-            # LDSManager.alloc() allocates the scale buffer whenever the operand has
-            # a scale, not only when it is filled by a direct-to-LDS copy, so the
-            # budget has to count it the same way -- otherwise the host shrink loop
-            # accepts a config whose real footprint is larger than it believes.
-            if fc.has_scale(idx):
+            if idx == 0 or not _v(self.B_IN_REG):
+                total += n_tiles * shape[0] * shape[1] * width * self.num_buffers(idx)
+            # Legacy small-tile fallbacks keep their unused allocation. Independent
+            # queues allocate scales only when they actually stage through LDS.
+            if fc.has_scale(idx) and (
+                not self.independent_buffers() or self.scale_via_lds(idx)
+            ):
                 s = self.scale_shape(idx)
                 scale_k = 8 if self.scale_packed_k128(idx) else s[1]
-                per_stage += n_tiles * s[0] * scale_k
-        return per_stage * _v(self.NUM_LDS_BUFFER)
+                total += n_tiles * s[0] * scale_k * self.num_buffers(idx, True)
+        return total
 
     @gluon.constexpr_function
     def acc_vgprs_per_lane(self):
@@ -1216,6 +1302,18 @@ class KernelTuningConfig:
             int(SchedMode.MFMA_16),
             int(SchedMode.MFMA_8),
         ), f"SCHED_MODE {_v(self.SCHED_MODE)} is not a SchedMode"
+        assert not _v(self.B_IN_REG) or self.operand_preshuffled(
+            1
+        ), "B_IN_REG requires B_PRESHUFFLED"
+        assert not (
+            _v(self.FROZEN_STEP) and self.independent_buffers()
+        ), "FROZEN_STEP does not support register storage or per-component buffer counts"
+        for idx in (0, 1):
+            for scale in (False, True):
+                assert self.num_buffers(idx, scale) >= 1, (
+                    f"{'A' if idx == 0 else 'B'}{'_SCALE' if scale else ''}_NUM_BUFFER "
+                    f"({self.num_buffers(idx, scale)}) must be positive"
+                )
 
         # -- host preconditions (no N tail, no K tail; only the even case exists) --
         assert N % BN == 0, f"N {N} % BLOCK_N {BN} != 0; the wrapper must fall back"
@@ -1225,7 +1323,7 @@ class KernelTuningConfig:
         assert BK % _v(self.MINI_BLOCK_K) == 0
         assert _v(self.MINI_BLOCK_K) % instr[2] == 0
         assert BK % MX_GROUP == 0
-        if _v(self.MINI_BLOCK_K) < BK:
+        if _v(self.MINI_BLOCK_K) < BK and not self.independent_buffers():
             # The LDS scale path slices per mini-tile; the register fallback advances a
             # flat offset by MINI_BLOCK_K/32 and hands mfma_scaled a fragment still
             # shaped for the whole BLOCK_K. The two disagree, and the only symptom is
@@ -1240,36 +1338,39 @@ class KernelTuningConfig:
                 )
 
         # -- the constexpr rotating buffer index only folds if this holds --
-        assert _v(self.K_UNROLL) >= 1, "K_UNROLL must be at least 1"
+        assert self.pipeline_unroll() >= 1, "K_UNROLL must be at least 1"
         if self.scale_packed_k128(0) or self.scale_packed_k128(1):
-            assert self.scale_packed_k128(0) and self.scale_packed_k128(1), (
-                "packed K128 scales require both operands to use packed scale words"
-            )
+            assert self.scale_packed_k128(0) and self.scale_packed_k128(
+                1
+            ), "packed K128 scales require both operands to use packed scale words"
             assert K % 256 == 0, "packed K128 scales require complete K256 scale words"
-            assert _v(self.MINI_BLOCK_K) == BK, (
-                "packed K128 scales require MINI_BLOCK_K == BLOCK_K"
-            )
-            assert _v(self.K_UNROLL) % 2 == 0, (
-                "packed K128 scales require even K_UNROLL"
-            )
-            assert not _v(self.FROZEN_STEP), (
-                "packed K128 scales require the live pipeline"
-            )
-            assert list(instr) == [16, 16, 128], (
-                "packed K128 scales require MFMA 16x16x128"
-            )
+            assert (
+                _v(self.MINI_BLOCK_K) == BK
+            ), "packed K128 scales require MINI_BLOCK_K == BLOCK_K"
+            assert (
+                self.independent_buffers() or _v(self.K_UNROLL) % 2 == 0
+            ), "packed K128 scales require even K_UNROLL"
+            assert not _v(
+                self.FROZEN_STEP
+            ), "packed K128 scales require the live pipeline"
+            assert list(instr) == [
+                16,
+                16,
+                128,
+            ], "packed K128 scales require MFMA 16x16x128"
             for idx in (0, 1):
                 if self.scale_packed_k128(idx):
-                    assert fc.pack_divisor(idx) == 1, (
-                        "packed K128 scale pairing requires MXFP8 operands"
-                    )
-                    assert fc.has_scale(idx) and self.scale_packed_ok(idx), (
-                        f"operand {idx}'s packed K128 scales require register-private non-K +16"
-                    )
+                    assert (
+                        fc.pack_divisor(idx) == 1
+                    ), "packed K128 scale pairing requires MXFP8 operands"
+                    assert fc.has_scale(idx) and self.scale_packed_ok(
+                        idx
+                    ), f"operand {idx}'s packed K128 scales require register-private non-K +16"
 
         # -- the pipeline must issue exactly one fill per K tile --
         n_k = K // BK
-        assert n_k >= _v(self.NUM_LDS_BUFFER), (
+        assert n_k >= 1, "K must contain at least one BLOCK_K tile"
+        assert self.independent_buffers() or n_k >= _v(self.NUM_LDS_BUFFER), (
             f"K/BLOCK_K ({n_k}) < NUM_LDS_BUFFER ({_v(self.NUM_LDS_BUFFER)}): the "
             f"prologue alone would over-read past the end of the K strip"
         )
@@ -1366,7 +1467,7 @@ class KernelTuningConfig:
             # whole MX group, or the fused quant's amax crosses the warp boundary. That
             # extent is instr_n * tiles_per_warp_n -- warps tile *above* it, so the
             # warp count is irrelevant here.
-            if fc.output_quant is not None:
+            if _v(fc.output_quant) is not None:
                 warp_n = instr[1] * tiles[1]
                 assert warp_n % MX_GROUP == 0, (
                     f"gate_up_split with a fused MX output quant needs a warp's "
@@ -1378,7 +1479,7 @@ class KernelTuningConfig:
 
         # -- the fused MX output quant groups 32 *emitted* columns, so the raw tile has
         #    to carry 32 * activation_reduction_n of them --
-        elif fc.output_quant is not None:
+        elif _v(fc.output_quant) is not None:
             arn = fc.activation_reduction_n()
             assert BN % (MX_GROUP * arn) == 0, (
                 f"BLOCK_N {BN} must be a multiple of {MX_GROUP * arn} in raw "
@@ -1416,7 +1517,7 @@ class KernelTuningConfig:
         # one is being consumed by ds_read: the wait is NUM_LDS_BUFFER-2, and two
         # buffers leave nothing to overlap with (the wait folds to wait_group(0) and
         # drains every copy on every stage -- measured 1217 us against 1028 us).
-        assert _v(self.NUM_LDS_BUFFER) >= 3, (
+        assert self.independent_buffers() or _v(self.NUM_LDS_BUFFER) >= 3, (
             f"NUM_LDS_BUFFER {_v(self.NUM_LDS_BUFFER)} < 3: one buffer is being filled "
             "and one consumed on every step, leaving nothing to overlap a copy with"
         )
@@ -1434,9 +1535,9 @@ class KernelTuningConfig:
                 "handoff is a whole number of mini-K steps"
             )
             assert BK % pk == 0, f"BLOCK_K {BK} % VGPR_PREFETCH_K {pk} != 0"
-            assert pk % _v(self.MINI_BLOCK_K) == 0, (
-                f"VGPR_PREFETCH_K {pk} % MINI_BLOCK_K {_v(self.MINI_BLOCK_K)} != 0"
-            )
+            assert (
+                pk % _v(self.MINI_BLOCK_K) == 0
+            ), f"VGPR_PREFETCH_K {pk} % MINI_BLOCK_K {_v(self.MINI_BLOCK_K)} != 0"
 
         # -- commit-group granularity --
         # Reject unknown schemes before building the shared copy/group schedule.
@@ -1472,7 +1573,7 @@ class KernelTuningConfig:
 def make_scale_swizzle_check(scale_swizzle, BLOCK_K):
     """``CDNA4_SCALE`` keeps the direct-to-LDS write coalesced but costs BLOCK_K>=256."""
     if _v(scale_swizzle) == int(ScaleSwizzle.CDNA4_SCALE):
-        assert _v(BLOCK_K) >= 256, (
-            "CDNA4_SCALE preshuffle needs MX_SCALE_BLOCK_K >= 8, i.e. BLOCK_K >= 256"
-        )
+        assert (
+            _v(BLOCK_K) >= 256
+        ), "CDNA4_SCALE preshuffle needs MX_SCALE_BLOCK_K >= 8, i.e. BLOCK_K >= 256"
     return True

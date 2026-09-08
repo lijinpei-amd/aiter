@@ -1,0 +1,116 @@
+[
+  {
+    "name": "b_in_reg",
+    "config": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 256,
+      "BLOCK_K": 64,
+      "K_UNROLL": 3,
+      "MINI_BLOCK_K": 64,
+      "MINI_BLOCK_M": 64,
+      "MINI_BLOCK_N": 128,
+      "NUM_LDS_BUFFER": 3,
+      "mfma_instr_shape": [
+        16,
+        16,
+        32
+      ],
+      "warps_per_cta": [
+        1,
+        4
+      ],
+      "tiles_per_warp": [
+        1,
+        1
+      ],
+      "k_width": null,
+      "transposed": true,
+      "WAVES_PER_EU": 0,
+      "TILE_SCHED": 0,
+      "GROUP_M": 1,
+      "NUM_XCDS": 1,
+      "token_mod": "",
+      "token_scale_mod": "",
+      "expert_mod": ".cg",
+      "expert_scale_mod": "",
+      "result_mod": "",
+      "result_scale_mod": "",
+      "WARP_PIPELINE": 1,
+      "VGPR_PREFETCH_K": 64,
+      "A_SCALE_SORTED_SHUFFLED": false,
+      "B_SCALE_SHUFFLED": false,
+      "B_PRESHUFFLED": false,
+      "ACT_FAST_RCP": false,
+      "WAIT_COMMIT_SCHEME": 3,
+      "DS_READ_IN_MFMA": 1,
+      "SCHED_MODE": 0,
+      "FROZEN_STEP": false,
+      "SOFF_UNROLL": false,
+      "SCALE_FILL_MID": false,
+      "B_IN_REG": true,
+      "B_SCALE_IN_REG": false,
+      "A_SCALE_IN_REG": false,
+      "A_NUM_BUFFER": 3,
+      "B_NUM_BUFFER": 3,
+      "A_SCALE_NUM_BUFFER": 3,
+      "B_SCALE_NUM_BUFFER": 3
+    }
+  },
+  {
+    "name": "b_in_lds",
+    "config": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "K_UNROLL": 3,
+      "MINI_BLOCK_K": 64,
+      "MINI_BLOCK_M": 64,
+      "MINI_BLOCK_N": 64,
+      "NUM_LDS_BUFFER": 3,
+      "mfma_instr_shape": [
+        16,
+        16,
+        32
+      ],
+      "warps_per_cta": [
+        2,
+        2
+      ],
+      "tiles_per_warp": [
+        1,
+        1
+      ],
+      "k_width": null,
+      "transposed": true,
+      "WAVES_PER_EU": 0,
+      "TILE_SCHED": 0,
+      "GROUP_M": 1,
+      "NUM_XCDS": 1,
+      "token_mod": "",
+      "token_scale_mod": "",
+      "expert_mod": "",
+      "expert_scale_mod": "",
+      "result_mod": "",
+      "result_scale_mod": "",
+      "WARP_PIPELINE": 1,
+      "VGPR_PREFETCH_K": 64,
+      "A_SCALE_SORTED_SHUFFLED": false,
+      "B_SCALE_SHUFFLED": false,
+      "B_PRESHUFFLED": false,
+      "ACT_FAST_RCP": false,
+      "WAIT_COMMIT_SCHEME": 3,
+      "DS_READ_IN_MFMA": 3,
+      "SCHED_MODE": 0,
+      "FROZEN_STEP": false,
+      "SOFF_UNROLL": false,
+      "SCALE_FILL_MID": false,
+      "B_IN_REG": false,
+      "B_SCALE_IN_REG": false,
+      "A_SCALE_IN_REG": false,
+      "A_NUM_BUFFER": 4,
+      "B_NUM_BUFFER": 4,
+      "A_SCALE_NUM_BUFFER": 4,
+      "B_SCALE_NUM_BUFFER": 4
+    }
+  }
+]

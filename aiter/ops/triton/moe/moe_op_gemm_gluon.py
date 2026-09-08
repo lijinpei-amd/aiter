@@ -67,6 +67,19 @@ _LOGGER = AiterTritonLogger()
 #: MX group size. Fixed by the OCP microscaling spec for both E2M1 and E4M3; not a knob.
 MX_GROUP_SIZE = 32
 _SUPPORTED_BLOCK_M = (16, 32, 64, 128)
+_COMPONENT_BUFFER_KEYS = (
+    "A_NUM_BUFFER",
+    "B_NUM_BUFFER",
+    "A_SCALE_NUM_BUFFER",
+    "B_SCALE_NUM_BUFFER",
+)
+_REGISTER_STORAGE_KEYS = ("B_IN_REG", "B_SCALE_IN_REG", "A_SCALE_IN_REG")
+
+
+def _uses_independent_buffers(config):
+    return any(
+        config.get(key, 0) for key in _COMPONENT_BUFFER_KEYS + _REGISTER_STORAGE_KEYS
+    ) or bool(config.get("A_SCALE_NUMB_BUFFER", 0))
 
 
 def _can_overflow_int32(t: torch.Tensor | None, drop_leading: int = 0) -> bool:
@@ -371,8 +384,10 @@ def get_gluon_config_uncached(
                 # warps -- that is what lets operand A pack four E8M0 bytes into one i32
                 # (scale_packed_ok). At tiles (1, n) the M split is 16 and A falls back
                 # to eight ds_read_u8 plus a v_perm per dword.
-                out_tiles = (_env_int("AITER_TRITON_MOE_GLUON_FLY_TILES_M", 1),
-                             _env_int("AITER_TRITON_MOE_GLUON_FLY_TILES_N", 1))
+                out_tiles = (
+                    _env_int("AITER_TRITON_MOE_GLUON_FLY_TILES_M", 1),
+                    _env_int("AITER_TRITON_MOE_GLUON_FLY_TILES_N", 1),
+                )
                 if block_m % (out_instr[0] * out_warps[0] * out_tiles[0]) != 0:
                     out_tiles = (1, out_tiles[1])
                 if bn % (out_instr[1] * out_warps[1] * out_tiles[1]) != 0:
@@ -400,11 +415,15 @@ def get_gluon_config_uncached(
             out_mini_n = _env_int("AITER_TRITON_MOE_GLUON_MINI_BLOCK_N", bn)
             gm = out_instr[0] * out_warps[0]
             gn = out_instr[1] * out_warps[1] * out_tiles[1]
-            if not (0 < out_mini_m <= block_m and block_m % out_mini_m == 0
-                    and out_mini_m % gm == 0):
+            if not (
+                0 < out_mini_m <= block_m
+                and block_m % out_mini_m == 0
+                and out_mini_m % gm == 0
+            ):
                 out_mini_m = block_m
-            if not (0 < out_mini_n <= bn and bn % out_mini_n == 0
-                    and out_mini_n % gn == 0):
+            if not (
+                0 < out_mini_n <= bn and bn % out_mini_n == 0 and out_mini_n % gn == 0
+            ):
                 out_mini_n = bn
 
         # A 16x16x128 operand that is not preshuffled is staged in LDS as 32-row units
@@ -435,6 +454,17 @@ def get_gluon_config_uncached(
             "MINI_BLOCK_M": out_mini_m,
             "MINI_BLOCK_N": out_mini_n,
             "NUM_LDS_BUFFER": n_buf,
+            # Zero inherits NUM_LDS_BUFFER; explicit component counts select the
+            # independent pipeline and its GCD-based unroll factor.
+            "A_NUM_BUFFER": _env_int("AITER_TRITON_MOE_GLUON_A_NUM_BUFFER", 0),
+            "B_NUM_BUFFER": _env_int("AITER_TRITON_MOE_GLUON_B_NUM_BUFFER", 0),
+            "A_SCALE_NUM_BUFFER": _env_int(
+                "AITER_TRITON_MOE_GLUON_A_SCALE_NUM_BUFFER",
+                _env_int("AITER_TRITON_MOE_GLUON_A_SCALE_NUMB_BUFFER", 0),
+            ),
+            "B_SCALE_NUM_BUFFER": _env_int(
+                "AITER_TRITON_MOE_GLUON_B_SCALE_NUM_BUFFER", 0
+            ),
             "mfma_instr_shape": out_instr,
             "warps_per_cta": out_warps,
             "tiles_per_warp": out_tiles,
@@ -483,9 +513,14 @@ def get_gluon_config_uncached(
             "A_SCALE_SORTED_SHUFFLED": False,
             "B_SCALE_SHUFFLED": False,
             "B_PRESHUFFLED": False,
-            "ACT_FAST_RCP": bool(
-                _env_int("AITER_TRITON_MOE_GLUON_ACT_FAST_RCP", 0)
+            "B_IN_REG": bool(_env_int("AITER_TRITON_MOE_GLUON_B_IN_REG", 0)),
+            "B_SCALE_IN_REG": bool(
+                _env_int("AITER_TRITON_MOE_GLUON_B_SCALE_IN_REG", 0)
             ),
+            "A_SCALE_IN_REG": bool(
+                _env_int("AITER_TRITON_MOE_GLUON_A_SCALE_IN_REG", 0)
+            ),
+            "ACT_FAST_RCP": bool(_env_int("AITER_TRITON_MOE_GLUON_ACT_FAST_RCP", 0)),
             # PER_OP (1) commits each async copy; PER_SLOT (2) commits each slot.
             # Both wait before each read slot. PER_STAGE (3) commits the whole K
             # stage and waits once at the read stage's head. Counts and copy ownership
@@ -662,14 +697,22 @@ def gluon_supported(
         return False, f"block_m {block_m} outside {_SUPPORTED_BLOCK_M}"
 
     cfg = _default_launch_config(
-        block_m, N, K, dq_a, dq_b, _small_grid(routing_data, y.shape[1], N),
+        block_m,
+        N,
+        K,
+        dq_a,
+        dq_b,
+        _small_grid(routing_data, y.shape[1], N),
         apply_swiglu,
     )
     if N % cfg["BLOCK_N"] != 0:
         return False, f"N {N} % BLOCK_N {cfg['BLOCK_N']} != 0"
     if K % cfg["BLOCK_K"] != 0:
         return False, f"K {K} % BLOCK_K {cfg['BLOCK_K']} != 0"
-    if K // cfg["BLOCK_K"] < cfg["NUM_LDS_BUFFER"]:
+    if (
+        not _uses_independent_buffers(cfg)
+        and K // cfg["BLOCK_K"] < cfg["NUM_LDS_BUFFER"]
+    ):
         return False, "K strip shorter than the pipeline depth"
     # The fill schedule hands each slot of the NM x NN walk one mini-block copy, so it
     # needs at least as many slots as copies -- both axes split. Refused here rather
@@ -847,10 +890,11 @@ def _scale_shuffle_supported(cfg, operand):
         return False
     if block_k == 128:
         # Each full dword serves two K128 stages. Both non-K bytes must belong
-        # to this wave, and the unrolled loop must preserve the two-stage phase.
+        # to this wave. The legacy loop requires even unrolling; the independent
+        # component pipeline tracks the two-stage phase across its GCD-sized body.
         return (
             int(cfg["MINI_BLOCK_K"]) == 128
-            and int(cfg["K_UNROLL"]) % 2 == 0
+            and (_uses_independent_buffers(cfg) or int(cfg["K_UNROLL"]) % 2 == 0)
             and not cfg.get("FROZEN_STEP", False)
             and int(cfg["tiles_per_warp"][operand]) >= 2
         )
@@ -905,7 +949,9 @@ def _sorted_shuffle_a_scales(x_scales, routing_data, gather_indx, K, cfg):
 
     k_pack = 256 // 128
     c_m1, c_k1 = block_m // 32, (K // 32) // (4 * k_pack)
-    out = torch.empty(n_blocks * c_m1 * c_k1 * 4 * 16 * 4, dtype=torch.uint8, device=dev)
+    out = torch.empty(
+        n_blocks * c_m1 * c_k1 * 4 * 16 * 4, dtype=torch.uint8, device=dev
+    )
     try:
         mxfp4_moe_sort_scales(
             x_scales,
@@ -1305,6 +1351,8 @@ def moe_gemm_gluon(
             grid_n, constexpr_args, num_warps, waves_per_eu, _cfg, _tc = _spec(
                 tuple(sorted((k, _hashable(v)) for k, v in _cfg.items()))
             )
+    if _cfg.get("B_IN_REG", False) and not _cfg.get("B_PRESHUFFLED", False):
+        raise ValueError("B_IN_REG requires B_PRESHUFFLED weights")
 
     b = QuantExpertTensor.make(
         dq_b,
@@ -1599,6 +1647,12 @@ _TUNING_KEYS = TuningSpec._fields
 
 def _tuning_args(c: dict) -> tuple:
     """Keep older config dictionaries valid when optional tuning fields are added."""
+    if "A_SCALE_NUMB_BUFFER" in c:
+        alias = c["A_SCALE_NUMB_BUFFER"]
+        canonical = c.get("A_SCALE_NUM_BUFFER", 0)
+        if canonical and canonical != alias:
+            raise ValueError("A_SCALE_NUM_BUFFER and A_SCALE_NUMB_BUFFER disagree")
+        c = dict(c, A_SCALE_NUM_BUFFER=alias)
     return tuple(
         c[k] if k in c else TuningSpec._field_defaults[k] for k in _TUNING_KEYS
     )
