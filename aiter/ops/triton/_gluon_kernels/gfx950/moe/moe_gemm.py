@@ -800,8 +800,8 @@ def _pipeline_step(
     STAGES_BETWEEN: gl.constexpr,
     DO_BUFFER_LOAD: gl.constexpr,
     DO_DS_READ: gl.constexpr,
-    IN_LOOP: gl.constexpr = False,
-    DO_MFMA: gl.constexpr = True,
+    DO_MFMA: gl.constexpr,
+    IN_LOOP: gl.constexpr,
     KI: gl.constexpr = 0,
     KU: gl.constexpr = 1,
     WAIT_SLACK: gl.constexpr = 0,
@@ -839,8 +839,8 @@ def _pipeline_step(
             STAGES_BETWEEN,
             DO_BUFFER_LOAD,
             DO_DS_READ,
-            IN_LOOP,
             DO_MFMA,
+            IN_LOOP,
             KI,
             KU,
             WAIT_SLACK,
@@ -859,8 +859,8 @@ def _pipeline_step_impl(
     STAGES_BETWEEN: gl.constexpr,
     DO_BUFFER_LOAD: gl.constexpr,
     DO_DS_READ: gl.constexpr,
-    IN_LOOP: gl.constexpr = False,
-    DO_MFMA: gl.constexpr = True,
+    DO_MFMA: gl.constexpr,
+    IN_LOOP: gl.constexpr,
     KI: gl.constexpr = 0,
     KU: gl.constexpr = 1,
     WAIT_SLACK: gl.constexpr = 0,
@@ -884,9 +884,7 @@ def _pipeline_step_impl(
         "WarpPipeline.MANUAL is implemented only by _pipeline_step_frozen: run it with "
         "AITER_TRITON_MOE_GLUON_FROZEN_STEP=1, or pick NONE / COMPILER",
     )
-    WAR_PIPELINE_COMPILER: gl.constexpr = (
-        tc.warp_pipeline_compiler() and DO_DS_READ and IN_LOOP
-    )
+    WAR_PIPELINE_COMPILER: gl.constexpr = tc.warp_pipeline_compiler() and IN_LOOP
     STAGE: gl.constexpr = pick_stage(WAR_PIPELINE_COMPILER)
 
     READ_A_IN_MFMA: gl.constexpr = tc.ds_read_in_mfma(0)
@@ -1293,9 +1291,10 @@ def _moe_gemm_body(
             NB - 1,
             0,
             STAGES_BETWEEN,
-            True,
-            True,
+            DO_BUFFER_LOAD=True,
+            DO_DS_READ=True,
             DO_MFMA=False,
+            IN_LOOP=False,
         )
         # The whole main sequence is guarded: MAIN is 0 when NUM_K == NUM_LDS_BUFFER, and
         # then every stage belongs to the drain and there is no step here at all.
@@ -1310,8 +1309,10 @@ def _moe_gemm_body(
                 0,
                 1 % NB,
                 STAGES_BETWEEN,
-                True,
-                True,
+                DO_BUFFER_LOAD=True,
+                DO_DS_READ=True,
+                DO_MFMA=True,
+                IN_LOOP=False,
                 K_PHASE=tuning_cfg.scale_k_phase(1),
             )
 
@@ -1343,8 +1344,9 @@ def _moe_gemm_body(
                         buffer_load_step,
                         ds_read_step,
                         STAGES_BETWEEN,
-                        True,
-                        True,
+                        DO_BUFFER_LOAD=True,
+                        DO_DS_READ=True,
+                        DO_MFMA=True,
                         IN_LOOP=True,
                         KI=i,
                         KU=tuning_cfg.K_UNROLL,
@@ -1360,8 +1362,10 @@ def _moe_gemm_body(
                     j % NB,
                     (j + 1) % NB,
                     STAGES_BETWEEN,
-                    True,
-                    True,
+                    DO_BUFFER_LOAD=True,
+                    DO_DS_READ=True,
+                    DO_MFMA=True,
+                    IN_LOOP=False,
                     K_PHASE=tuning_cfg.scale_k_phase(j + 1),
                 )
 
@@ -1399,8 +1403,10 @@ def _moe_gemm_body(
                 0,
                 (MAIN + i + 1) % NB,
                 NB - 2 - i,
-                False,
-                i + 1 < NB,
+                DO_BUFFER_LOAD=False,
+                DO_DS_READ=i + 1 < NB,
+                DO_MFMA=True,
+                IN_LOOP=False,
                 WAIT_SLACK=epi.groups,
                 K_PHASE=tuning_cfg.scale_k_phase(MAIN + i + 1),
             )
@@ -1408,7 +1414,17 @@ def _moe_gemm_body(
         # Independent queues have already prefetched the final stage. Its packed
         # scales are canonicalized to the low half before reaching the common dot.
         hbm_ptrs, regs = _pipeline_step(
-            pc, hbm_ptrs, regs, 0, 0, 0, False, False, K_PHASE=1
+            pc,
+            hbm_ptrs,
+            regs,
+            0,
+            0,
+            0,
+            DO_BUFFER_LOAD=False,
+            DO_DS_READ=False,
+            DO_MFMA=True,
+            IN_LOOP=False,
+            K_PHASE=1,
         )
 
     # Hoisted out of the mini-tile loop: one scalar load, not one per tile.

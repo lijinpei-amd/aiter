@@ -381,7 +381,7 @@ def test_pipeline_stage_commit_boundaries(
     monkeypatch.setattr(kernel, "_maybe_block_dot", lambda *args: events.append(("dot",)))
 
     kernel._pipeline_step_impl.fn(
-        pc, pointers, regs, 2, 0, 1, fill, read, in_loop, dot, WAIT_SLACK=2,
+        pc, pointers, regs, 2, 0, 1, fill, read, dot, in_loop, WAIT_SLACK=2,
     )
     assert [event for event in events if event[0] == "wait"] == ([("wait", 3)] if read else [])
     if read:
