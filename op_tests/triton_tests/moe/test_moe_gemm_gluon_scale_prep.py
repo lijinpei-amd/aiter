@@ -24,15 +24,17 @@ def _clean_tuning_environment(monkeypatch):
         if name.startswith("AITER_TRITON_MOE_GLUON_"):
             monkeypatch.delenv(name)
     host._launch_spec.cache_clear()
+    host._validate_launch_config.cache_clear()
     host._get_gluon_config_cached.cache_clear()
     yield
     host._launch_spec.cache_clear()
+    host._validate_launch_config.cache_clear()
     host._get_gluon_config_cached.cache_clear()
 
 
 def _spec(**overrides):
     args = {
-        "block_m": 128, "N": 512, "K": 768,
+        "block_m": 128, "N": 512, "K": 2560,
         "dq_a": DtypeQuant.MXFP8, "dq_b": DtypeQuant.MXFP8,
         "small_grid": False, "has_bias": False, "has_gammas": False,
         "has_gather": True, "has_x_static_scale": False,
@@ -44,8 +46,12 @@ def _spec(**overrides):
 
 
 def _config(block_k=128):
-    return dict(_spec()[4], BLOCK_K=block_k, MINI_BLOCK_K=block_k,
-                VGPR_PREFETCH_K=block_k)
+    config = dict(_spec()[4], BLOCK_K=block_k, MINI_BLOCK_K=block_k,
+                  VGPR_PREFETCH_K=block_k)
+    if block_k == 256:
+        config.update(BLOCK_N=128, MINI_BLOCK_N=64, NUM_LDS_BUFFER=2,
+                      warps_per_cta=(2, 2))
+    return config
 
 
 @pytest.mark.parametrize("split", [False, True])
@@ -69,14 +75,13 @@ def test_mxfp8_gemm1_default_uses_paired_k128_scales(split):
     {"dq_b": DtypeQuant.MXFP4},
     {"block_m": 64},
     {"N": 384},
-    {"K": 640},
-    {"K": 256},
+    {"K": 1408},
 ])
 def test_other_launches_keep_the_existing_tuning_ladder(overrides):
     cfg = _spec(**overrides)[4]
     expected = host.get_gluon_config(
         overrides.get("block_m", 128), overrides.get("N", 512),
-        overrides.get("K", 768), overrides.get("dq_a", DtypeQuant.MXFP8),
+        overrides.get("K", 2560), overrides.get("dq_a", DtypeQuant.MXFP8),
         overrides.get("dq_b", DtypeQuant.MXFP8), False,
     )
     assert cfg == expected
@@ -94,7 +99,7 @@ def test_a4_defaults_are_unchanged(block_m, small_grid):
     assert not cfg["A_SCALE_SORTED_SHUFFLED"] and not cfg["B_SCALE_SHUFFLED"]
 
 
-@pytest.mark.parametrize("k", [512, 768, 7168])
+@pytest.mark.parametrize("k", [1280, 2560, 7168])
 def test_stage1_capability_uses_the_selected_default_geometry(k):
     cfg = _spec(K=k)[4]
     tc = _spec(K=k)[5]
@@ -112,7 +117,7 @@ def test_stage1_capability_uses_the_selected_default_geometry(k):
 
 
 def test_explicit_and_frozen_configs_keep_their_geometry(monkeypatch):
-    cfg = host.get_gluon_config(128, 512, 768, DtypeQuant.MXFP8, DtypeQuant.MXFP8)
+    cfg = host.get_gluon_config(128, 512, 2560, DtypeQuant.MXFP8, DtypeQuant.MXFP8)
     explicit = _spec(config_items=tuple(sorted(cfg.items())))[4]
     assert explicit == cfg
     monkeypatch.setenv("AITER_TRITON_MOE_GLUON_FROZEN_STEP", "1")
@@ -124,7 +129,7 @@ def test_explicit_and_frozen_configs_keep_their_geometry(monkeypatch):
 
 
 @pytest.mark.parametrize("field,value", [
-    ("MINI_BLOCK_K", 64), ("K_UNROLL", 3), ("FROZEN_STEP", True),
+    ("MINI_BLOCK_K", 64), ("FROZEN_STEP", True),
     ("mfma_instr_shape", (32, 32, 64)),
 ])
 def test_incompatible_k128_geometry_refuses_scale_preparation(field, value):
@@ -164,7 +169,7 @@ def test_b_preshuffle_preserves_n_order_and_reuses_the_k256_format():
     assert host._shuffled_b_scales(raw, _config(256)) is packed
 
 
-def _inputs(k=768):
+def _inputs(k=2560):
     m, n, experts, topk = 4, 512, 2, 2
     expt_data = SimpleNamespace(
         hist=torch.tensor([4, 4], dtype=torch.int32),
@@ -203,8 +208,98 @@ def _capture_launch(case, config, split, monkeypatch):
     )
     assert result is sentinel
     assert captured["a_ptr"] is case.x and captured["b_ptr"] is case.w
+    assert captured["NUM_K"] == case.k // host._cval(captured["CFG_TUNING"]).BLOCK_K
     assert host._cval(captured["CFG_FUNC"]).gate_up_split == split
     return captured
+
+
+@pytest.mark.parametrize("routing_block_m,config_block_m", [(64, 128), (128, 64)])
+def test_block_m_mismatch_is_rejected_before_preparation(
+    routing_block_m, config_block_m, monkeypatch
+):
+    case = _inputs()
+    case.routing_data.block_m = routing_block_m
+    cfg = dict(_config(), BLOCK_M=config_block_m)
+
+    def unexpected_work(*_):
+        pytest.fail("incompatible routing must be rejected before preparation")
+
+    monkeypatch.setattr(host, "_sorted_shuffle_a_scales", unexpected_work)
+    monkeypatch.setattr(host, "_shuffled_b_scales", unexpected_work)
+    monkeypatch.setattr(host, "_fast_launch", unexpected_work)
+    with pytest.raises(AssertionError, match="BLOCK_M.*must match routing block_m"):
+        host.moe_gemm_gluon(
+            case.y, case.x, case.w, case.xs, case.ws, None, None,
+            case.routing_data, case.gather, None, case.n, case.k,
+            True, 1.0, None, False, config=cfg,
+        )
+
+
+@pytest.mark.parametrize("k", [0, 256, 640, 768])
+def test_short_strips_are_rejected_before_launch(k, monkeypatch):
+    case = _inputs(k=k)
+    cfg = _config()
+
+    def unexpected_launch(*_):
+        pytest.fail("an invalid pipeline must be rejected before launch")
+
+    monkeypatch.setattr(host, "_sorted_shuffle_a_scales", lambda *_: None)
+    monkeypatch.setattr(host, "_shuffled_b_scales", lambda *_: None)
+    monkeypatch.setattr(host, "_fast_launch", unexpected_launch)
+    with pytest.raises(AssertionError, match="NUM_K.*NB_MAX.*PEELED.*UNROLL"):
+        host.moe_gemm_gluon(
+            case.y, case.x, case.w, case.xs, case.ws, None, None,
+            case.routing_data, case.gather, None, case.n, case.k,
+            True, 1.0, None, False, config=cfg,
+        )
+
+
+@pytest.mark.parametrize("requested,available", [(True, False), (False, True)])
+def test_minimum_uses_resolved_scale_storage_after_preparation(
+    requested, available, monkeypatch
+):
+    case = _inputs(k=768)
+    cfg = dict(_config(), K_UNROLL=1, A_SCALE_NUM_BUFFER=4, B_SCALE_NUM_BUFFER=4,
+               A_SCALE_SORTED_SHUFFLED=requested, B_SCALE_SHUFFLED=requested)
+    raw_tc = host._probe_tuning_config(
+        dict(cfg, A_SCALE_SORTED_SHUFFLED=False, B_SCALE_SHUFFLED=False),
+        DtypeQuant.MXFP8, DtypeQuant.MXFP8,
+    )
+    assert raw_tc.min_num_k() == 9
+    packed_tc = host._probe_tuning_config(
+        dict(cfg, A_SCALE_SORTED_SHUFFLED=True, B_SCALE_SHUFFLED=True),
+        DtypeQuant.MXFP8, DtypeQuant.MXFP8,
+    )
+    assert packed_tc.min_num_k() == 6
+    monkeypatch.setenv("AITER_TRITON_MOE_GLUON_SORTED_SCALES", "1")
+    monkeypatch.setenv("AITER_TRITON_MOE_GLUON_SHUFFLED_W_SCALES", "1")
+    packed_a = torch.empty(2 * 128 * case.k // 32, dtype=torch.uint8)
+    packed_b = torch.empty(2, case.n // 32, case.k, dtype=torch.uint8)
+    monkeypatch.setattr(host, "_sorted_shuffle_a_scales",
+                        lambda *_: packed_a if available else None)
+    monkeypatch.setattr(host, "_shuffled_b_scales", lambda *_: packed_b)
+    if available:
+        args = _capture_launch(case, cfg, True, monkeypatch)
+        assert args["NUM_K"] == 6
+        assert host._cval(args["CFG_TUNING"]).A_SCALE_SORTED_SHUFFLED
+    else:
+        with pytest.raises(AssertionError, match="NUM_K.*UNROLL \\(4\\)"):
+            _capture_launch(case, cfg, True, monkeypatch)
+
+
+@pytest.mark.parametrize("k", [256, 640, 768])
+def test_capability_rejects_strips_below_selected_pipeline_minimum(k, monkeypatch):
+    monkeypatch.setattr(host, "get_arch", lambda: "gfx950")
+    case = _inputs(k=k)
+    ok, why = host.gluon_supported(
+        x=case.x, w=case.w, x_scales=case.xs, w_scales=case.ws,
+        y=case.y, bias=None, routing_data=case.routing_data,
+        swizzle_mx_scale=None, split_k=1, x_static_scale=None,
+        quant_static_scale=None, out_quant=None, N=case.n, K=case.k,
+        apply_swiglu=True,
+    )
+    assert not ok
+    assert "NUM_K" in why and "PEELED" in why and "UNROLL" in why
 
 
 @pytest.mark.parametrize("block_k", [128, 256])

@@ -3,23 +3,28 @@
 
 """CPU checks for the host/device configuration contract of the Gluon MoE GEMM."""
 
+import math
 import os
 
 import pytest
 from triton.experimental.gluon import language as gl
 
-from aiter.ops.triton._gluon_kernels.gfx950.moe._buffered import (
+from aiter.ops.triton._gluon_kernels.gfx950.moe._buffered_schedule import (
     _groups as buffered_groups,
 )
-from aiter.ops.triton._gluon_kernels.gfx950.moe._buffered import (
+from aiter.ops.triton._gluon_kernels.gfx950.moe._buffered_schedule import (
     _ops as buffered_ops,
 )
-from aiter.ops.triton._gluon_kernels.gfx950.moe._buffered import (
+from aiter.ops.triton._gluon_kernels.gfx950.moe._buffered_schedule import (
     _wait as buffered_wait,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._config import (
     KernelFuncConfig,
     KernelTuningConfig,
+)
+from aiter.ops.triton._gluon_kernels.gfx950.moe._entry import (
+    _moe_gluon_gemm1,
+    _moe_gluon_gemm2,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import constexpr_fields
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
@@ -90,6 +95,19 @@ def _tuning_spec(config):
 def _plain(value):
     value = host._cval(value)
     return tuple(value) if isinstance(value, list) else value
+
+
+@pytest.mark.parametrize("kernel", [_moe_gluon_gemm1, _moe_gluon_gemm2])
+def test_num_k_is_a_runtime_scalar_without_specialization(kernel):
+    param = next(param for param in kernel.params if param.name == "NUM_K")
+    assert not param.is_constexpr
+    assert param.do_not_specialize
+
+
+@pytest.mark.parametrize("kernel", [_moe_gluon_gemm1, _moe_gluon_gemm2])
+def test_a_scale_row_stride_preserves_sub_16_byte_alignment(kernel):
+    param = next(param for param in kernel.params if param.name == "a_scale_stride_m")
+    assert param.is_constexpr
 
 
 @pytest.mark.parametrize("with_optional_specs", [False, True])
@@ -289,9 +307,10 @@ def test_register_storage_options_are_independent(config, storage_mask):
         A_SCALE_IN_REG=bool(storage_mask & 4),
         B_PRESHUFFLED=bool(storage_mask & 1),
         A_NUM_BUFFER=2,
-        B_NUM_BUFFER=1,
+        B_NUM_BUFFER=3,
         A_SCALE_NUM_BUFFER=2,
-        B_SCALE_NUM_BUFFER=1,
+        B_SCALE_NUM_BUFFER=3,
+        K_UNROLL=1,
     )
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     assert _plain(tc.payload_via_lds(0))
@@ -304,26 +323,37 @@ def test_register_storage_options_are_independent(config, storage_mask):
     bm, bn, bk = (config[key] for key in ("BLOCK_M", "BLOCK_N", "BLOCK_K"))
     expected = bm * bk // 2 * 2
     if not storage_mask & 1:
-        expected += bn * bk // 2
+        expected += bn * bk // 2 * 3
     if not storage_mask & 2:
-        expected += bn * bk // 32
+        expected += bn * bk // 32 * 3
     if not storage_mask & 4:
         expected += bm * bk // 32 * 2
     assert _plain(tc.lds_bytes()) == expected
-    assert _plain(tc.pipeline_unroll()) == 1
+    expected_unroll = math.lcm(
+        3 if storage_mask & 3 else 1, 2 if storage_mask & 4 else 1
+    )
+    assert _plain(tc.pipeline_unroll()) == expected_unroll
     assert _plain(tc.validate(4096, 7168))
-    assert _plain(tc.validate(4096, bk))
+    assert _plain(tc.validate(4096, bk * _plain(tc.min_num_k())))
+    with pytest.raises(AssertionError, match="NUM_K"):
+        tc.validate(4096, bk)
 
 
 @pytest.mark.parametrize(
-    "counts,expected",
-    [((6, 4, 2, 8), 2), ((4, 4, 2, 2), 2), ((0, 4, 0, 6), 1), ((1, 1, 1, 1), 1)],
+    "counts,period,expected",
+    [((6, 4, 2, 8), 8, 8), ((4, 4, 2, 2), 4, 8), ((0, 4, 0, 6), 12, 12)],
 )
-def test_component_buffer_counts_determine_gcd_unroll(config, counts, expected):
+def test_register_component_buffer_counts_determine_lcm_unroll(
+    config, counts, period, expected
+):
     config.update(zip(host._COMPONENT_BUFFER_KEYS, counts, strict=True))
-    config["K_UNROLL"] = 7
+    config.update(
+        K_UNROLL=7, B_IN_REG=True, B_PRESHUFFLED=True,
+        A_SCALE_IN_REG=True, B_SCALE_IN_REG=True,
+    )
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     assert _plain(tc.independent_buffers())
+    assert _plain(tc.pipeline_register_period()) == period
     assert _plain(tc.pipeline_unroll()) == expected
     resolved = [count or config["NUM_LDS_BUFFER"] for count in counts]
     assert [
@@ -334,21 +364,29 @@ def test_component_buffer_counts_determine_gcd_unroll(config, counts, expected):
     assert _plain(tc.pipeline_depth()) == max(resolved)
 
 
-def test_legacy_unroll_is_preserved_until_independent_storage_is_selected(config):
+def test_lds_depths_do_not_constrain_unroll(config):
     config["K_UNROLL"] = 7
     fc = KernelFuncConfig(*_func_spec())
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
     assert not _plain(tc.independent_buffers())
     assert _plain(tc.pipeline_unroll()) == 7
+    config.update(A_NUM_BUFFER=2, B_NUM_BUFFER=4, A_SCALE_NUM_BUFFER=2)
+    tc = KernelTuningConfig(fc, *_tuning_spec(config))
+    assert _plain(tc.pipeline_unroll()) == 7
     config["A_SCALE_IN_REG"] = True
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
     assert _plain(tc.independent_buffers())
-    assert _plain(tc.pipeline_unroll()) == config["NUM_LDS_BUFFER"]
+    assert _plain(tc.pipeline_unroll()) == 8
 
 
-def test_absent_scales_participate_in_gcd_but_not_pipeline_depth(config):
+@pytest.mark.parametrize("register_b", [False, True])
+def test_absent_scales_do_not_participate_in_depth_unroll_or_validation(
+    config, register_b
+):
     config.update(
-        A_NUM_BUFFER=3, B_NUM_BUFFER=3, A_SCALE_NUM_BUFFER=8, B_SCALE_NUM_BUFFER=10
+        A_NUM_BUFFER=3, B_NUM_BUFFER=4, A_SCALE_NUM_BUFFER=-1, B_SCALE_NUM_BUFFER=1,
+        B_IN_REG=register_b, B_PRESHUFFLED=register_b,
+        A_SCALE_IN_REG=True, B_SCALE_IN_REG=True,
     )
     fc = KernelFuncConfig(
         *_func_spec()._replace(
@@ -359,16 +397,53 @@ def test_absent_scales_participate_in_gcd_but_not_pipeline_depth(config):
         )
     )
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    assert _plain(tc.pipeline_depth()) == 3
-    assert _plain(tc.pipeline_unroll()) == 1
+    assert _plain(tc.pipeline_depth()) == 4
+    assert _plain(tc.pipeline_unroll()) == (4 if register_b else 3)
+    assert _plain(tc.validate_pipeline(7168))
 
 
 @pytest.mark.parametrize("field", host._COMPONENT_BUFFER_KEYS)
-def test_negative_component_buffer_counts_are_rejected(config, field):
-    config[field] = -1
+@pytest.mark.parametrize("depth", [-1, 1])
+def test_active_component_buffer_counts_below_two_are_rejected(config, field, depth):
+    config[field] = depth
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
-    with pytest.raises(AssertionError, match=field + ".*must be positive"):
+    with pytest.raises(AssertionError, match=field + ".*must be at least 2"):
         tc.validate(4096, 7168)
+
+
+@pytest.mark.parametrize("depth", [-1, 0, 1])
+def test_inherited_buffer_counts_are_validated_after_resolution(config, depth):
+    config["NUM_LDS_BUFFER"] = depth
+    fc = KernelFuncConfig(*_func_spec())
+    tc = KernelTuningConfig(fc, *_tuning_spec(config))
+    with pytest.raises(AssertionError, match="A_NUM_BUFFER.*must be at least 2"):
+        tc.validate_pipeline(7168)
+    config.update(dict.fromkeys(host._COMPONENT_BUFFER_KEYS, 2))
+    tc = KernelTuningConfig(fc, *_tuning_spec(config))
+    assert _plain(tc.validate(4096, 7168))
+
+
+@pytest.mark.parametrize("unroll", [-1, 0])
+@pytest.mark.parametrize("registers", [False, True])
+def test_unroll_must_be_positive_even_with_register_rings(config, unroll, registers):
+    config.update(K_UNROLL=unroll, A_SCALE_IN_REG=registers)
+    tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
+    with pytest.raises(AssertionError, match="K_UNROLL must be at least 1"):
+        tc.validate_pipeline(7168)
+
+
+@pytest.mark.parametrize("depth", [2, 3])
+@pytest.mark.parametrize("unroll", [1, 2, 3, 7])
+def test_shared_depth_exact_minimum_and_all_unroll_remainders(config, depth, unroll):
+    config.update(NUM_LDS_BUFFER=depth, K_UNROLL=unroll)
+    tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
+    assert _plain(tc.pipeline_peeled()) == 1
+    minimum = depth + 1 + unroll
+    assert _plain(tc.min_num_k()) == minimum
+    for remainder in range(unroll):
+        assert _plain(tc.validate(4096, (minimum + remainder) * config["BLOCK_K"]))
+    with pytest.raises(AssertionError, match="NUM_K.*NB_MAX.*PEELED.*UNROLL"):
+        tc.validate(4096, (minimum - 1) * config["BLOCK_K"])
 
 
 @pytest.mark.parametrize(
@@ -396,10 +471,10 @@ def test_independent_register_scales_allow_mini_k_slicing(config):
 
 
 def test_independent_buffers_still_require_nonempty_k(config):
-    config["A_NUM_BUFFER"] = 1
+    config["A_NUM_BUFFER"] = 2
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     with pytest.raises(
-        AssertionError, match="K must contain at least one BLOCK_K tile"
+        AssertionError, match="NUM_K.*must be at least"
     ):
         tc.validate(4096, 0)
 
@@ -431,13 +506,14 @@ def test_a_scale_buffer_alias_is_accepted(config, monkeypatch):
     assert _tuning_spec(env_config).A_SCALE_NUM_BUFFER == 2
 
 
-def test_independent_buffers_allow_odd_gcd_with_packed_k128_scales(config):
+@pytest.mark.parametrize("independent", [False, True])
+def test_packed_k128_scales_allow_odd_unroll(config, independent):
     config.update(
         BLOCK_K=128,
         MINI_BLOCK_K=128,
         VGPR_PREFETCH_K=128,
         K_UNROLL=3,
-        A_NUM_BUFFER=3,
+        A_NUM_BUFFER=3 if independent else 0,
         A_SCALE_SORTED_SHUFFLED=True,
         B_SCALE_SHUFFLED=True,
     )
@@ -539,7 +615,7 @@ def test_invalid_controls_are_rejected(config, field, value, error):
         tc.validate(4096, 7168)
 
 
-def _audit_buffer_schedule(tc, num_k):
+def _audit_buffer_schedule(tc, num_k, epilogue_groups=0):
     """Compare group waits with a complete chronological copy/read simulation.
 
     The oracle records absolute K tiles and group sequence numbers. It does not
@@ -598,9 +674,9 @@ def _audit_buffer_schedule(tc, num_k):
         if not async_kind[kind]
     }
     depth = _plain(tc.pipeline_depth())
-    single = any(
-        depths[kind] == 1 for kind in range(4) if kind % 2 == 0 or has_scale[kind // 2]
-    )
+    main = num_k - depth
+    peeled = _plain(tc.pipeline_peeled())
+    assert num_k >= depth + peeled + _plain(tc.pipeline_unroll())
     scheme = _plain(tc.WAIT_COMMIT_SCHEME)
     per_stage = scheme in (
         WaitCommitScheme.PER_STAGE_WHOLE,
@@ -627,9 +703,13 @@ def _audit_buffer_schedule(tc, num_k):
             if required
             else None
         )
-        assert buffered_wait(tc, stage, num_k, slot) == expected
-        if depth - 1 <= stage <= num_k - depth:
-            assert buffered_wait(tc, None, num_k, slot) == expected
+        draining = stage > main
+        relative_stage = stage - main - 1 if draining else stage
+        assert buffered_wait(
+            tc, relative_stage, slot, draining, epilogue_groups
+        ) == expected
+        if peeled + 1 <= stage <= main:
+            assert buffered_wait(tc, None, slot) == expected
 
     for stage in range(1 - depth, num_k):
         pending_stage = []
@@ -652,7 +732,9 @@ def _audit_buffer_schedule(tc, num_k):
                 pending_stage.extend(asynchronous)
                 groups = (tuple(pending_stage),) if slot == nslots - 1 else ()
             expected_groups.append(groups)
-        actual_groups = buffered_groups(tc, stage, num_k)
+        draining = stage > main
+        relative_stage = stage - main - 1 if draining else stage
+        actual_groups = buffered_groups(tc, relative_stage, draining)
         assert actual_groups == tuple(
             tuple(tuple(copy[:2] for copy in group) for group in groups)
             for groups in expected_groups
@@ -674,24 +756,25 @@ def _audit_buffer_schedule(tc, num_k):
                     group_for_copy[copy] = len(committed)
                 committed.append(group)
 
-        if stage < 0 or single:
+        if stage < 0:
             for slot in range(nslots):
                 fill_slot(slot)
         if stage >= 0:
-            if not single and per_stage:
+            if per_stage:
                 check_wait(stage, None)
             for slot in range(nslots):
-                if not single and not per_stage:
+                if not per_stage:
                     check_wait(stage, slot)
                 for kind, tile, target in required_copies(stage, slot):
                     if async_kind[kind]:
                         assert lds[kind, tile, target % depths[kind]] == target
                     else:
                         assert queues[kind, tile][0] == target
-                if not single:
-                    fill_slot(slot)
+                fill_slot(slot)
         for key, queue in queues.items():
             queues[key] = queue[1:] + queue[:1]
+        if stage == main:
+            committed.extend(() for _ in range(epilogue_groups))
     expected_loads = {
         (kind, tile, target)
         for ops in fill_slots
@@ -704,7 +787,7 @@ def _audit_buffer_schedule(tc, num_k):
 @pytest.mark.parametrize("scheme", list(WaitCommitScheme))
 @pytest.mark.parametrize("storage_mask", range(8))
 @pytest.mark.parametrize(
-    "counts", [(3, 3, 3, 3), (2, 4, 3, 2), (4, 2, 2, 4), (1, 3, 2, 1)]
+    "counts", [(3, 3, 3, 3), (2, 4, 3, 2), (4, 2, 2, 4), (2, 5, 2, 2)]
 )
 @pytest.mark.parametrize("geometry", ["pair", "middle_shared_a", "unequal_tiles"])
 def test_independent_buffer_waits_match_copy_history(
@@ -726,15 +809,16 @@ def test_independent_buffer_waits_match_copy_history(
     elif geometry == "unequal_tiles":
         config.update(MINI_BLOCK_N=64, SCALE_FILL_MID=True)
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
-    # One strip shorter than several rings, one with warmup, runtime-loop steady
-    # state and drain. The latter also checks the stage=None fast-path wait counts.
-    for num_k in (2, 9):
-        _audit_buffer_schedule(tc, num_k)
+    minimum = tc.pipeline_depth() + tc.pipeline_peeled() + tc.pipeline_unroll()
+    # Both strips contain warmup, a runtime main body and a complete drain. The
+    # second commits output-epilogue copies before shallow queues finish filling.
+    _audit_buffer_schedule(tc, minimum)
+    _audit_buffer_schedule(tc, minimum + 3, epilogue_groups=2)
 
 
 @pytest.mark.parametrize("scheme", list(WaitCommitScheme))
 @pytest.mark.parametrize("register_b", [False, True])
-@pytest.mark.parametrize("counts", [(3, 2, 1, 1), (1, 1, 1, 1)])
+@pytest.mark.parametrize("counts", [(3, 2, 1, 1), (2, 2, 1, 1)])
 def test_independent_buffer_schedule_without_scales(config, scheme, register_b, counts):
     config.update(zip(host._COMPONENT_BUFFER_KEYS, counts, strict=True))
     config.update(
@@ -749,5 +833,6 @@ def test_independent_buffer_schedule_without_scales(config, scheme, register_b, 
         )
     )
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    for num_k in (1, 2, 9):
-        _audit_buffer_schedule(tc, num_k)
+    minimum = tc.pipeline_depth() + tc.pipeline_peeled() + tc.pipeline_unroll()
+    _audit_buffer_schedule(tc, minimum)
+    _audit_buffer_schedule(tc, minimum + 3, epilogue_groups=2)

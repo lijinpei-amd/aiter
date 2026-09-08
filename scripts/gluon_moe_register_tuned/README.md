@@ -3,7 +3,9 @@
 These recipes were tuned on MI350X for GEMM1 with 1,024 input tokens, N=2,048,
 K=7,168, 33 experts, top-k=8, preshuffled B, split gate/up SiLU, and FP32 output.
 Each JSON file contains complete `config` dictionaries named `b_in_reg` and
-`b_in_lds`. Both use the independent buffer pipeline.
+`b_in_lds`. Both now use the unified component-buffer pipeline. The measurements
+below predate that refactor and its runtime loop bounds; replaying a recipe uses
+the current unroll policy and requires new performance measurements.
 
 The [four-wave MXFP4-output follow-up](../../docs/gluon_moe_gfx950_register_perf.md)
 records the separate T4096/N4096 benchmark near 615 us. These transferred recipes
@@ -30,9 +32,13 @@ register-scale options were also screened and remain covered by regression tests
 
 The B-register recipes use the following effective controls. Buffer counts are
 listed as A, B, A scale, B scale; zero-valued fields in a JSON recipe inherit
-`NUM_LDS_BUFFER=3`. The effective unroll is the GCD of all four counts.
+`NUM_LDS_BUFFER=3`. The listed measured unroll used the former GCD policy.
+The current driver rounds `K_UNROLL` up to a multiple of the active register
+depths' LCM; absent scales and LDS rings do not participate. Resolved active
+depths must be at least two. See the [configuration contract](../../docs/gluon_moe_gfx950_config.md)
+for the exact minimum K and current scheduling rules.
 
-| Dtype | BLOCK_K | MFMA | Warps | Buffer counts | GCD | WARP_PIPELINE | WAIT_COMMIT_SCHEME | DS_READ_IN_MFMA |
+| Dtype | BLOCK_K | MFMA | Warps | Buffer counts | Measured unroll | WARP_PIPELINE | WAIT_COMMIT_SCHEME | DS_READ_IN_MFMA |
 | --- | ---: | --- | --- | --- | ---: | ---: | ---: | ---: |
 | MXFP4 | 256 | 16,16,128 | 1,4 | 4,2,3,3 | 1 | 0 | 3 | 0 |
 | MXFP8 | 128 | 16,16,128 | 1,4 | 3,3,3,3 | 3 | 1 | 3 | 0 |

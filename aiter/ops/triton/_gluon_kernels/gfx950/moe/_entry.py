@@ -49,14 +49,14 @@ def moe_gemm_launch_metadata(grid, kernel, args):
 
 @gluon.jit(
     launch_metadata=moe_gemm_launch_metadata,
-    do_not_specialize=["grid_m", "grid_n"],
+    do_not_specialize=["grid_m", "grid_n", "NUM_K"],
 )
 def _moe_gluon_gemm1(
     a_ptr,
     a_scale_ptr,
     a_num_token,
     a_stride_m,
-    a_scale_stride_m,
+    a_scale_stride_m: gl.constexpr,
     b_ptr,
     b_scale_ptr,
     b_stride_e,
@@ -80,6 +80,7 @@ def _moe_gluon_gemm1(
     x_static_scale_ptr,
     grid_m,
     grid_n,
+    NUM_K,
     A_DTYPE_QUANT: gl.constexpr,
     A_HIDDEN_DIM: gl.constexpr,
     A_TOPK: gl.constexpr,
@@ -161,19 +162,20 @@ def _moe_gluon_gemm1(
         tuning_cfg,
         CFG_N,
         CFG_K,
+        NUM_K,
     )
 
 
 @gluon.jit(
     launch_metadata=moe_gemm_launch_metadata,
-    do_not_specialize=["grid_m", "grid_n"],
+    do_not_specialize=["grid_m", "grid_n", "NUM_K"],
 )
 def _moe_gluon_gemm2(
     a_ptr,
     a_scale_ptr,
     a_num_token,
     a_stride_m,
-    a_scale_stride_m,
+    a_scale_stride_m: gl.constexpr,
     b_ptr,
     b_scale_ptr,
     b_stride_e,
@@ -197,6 +199,7 @@ def _moe_gluon_gemm2(
     x_static_scale_ptr,
     grid_m,
     grid_n,
+    NUM_K,
     A_DTYPE_QUANT: gl.constexpr,
     A_HIDDEN_DIM: gl.constexpr,
     A_TOPK: gl.constexpr,
@@ -278,4 +281,5 @@ def _moe_gluon_gemm2(
         tuning_cfg,
         CFG_N,
         CFG_K,
+        NUM_K,
     )

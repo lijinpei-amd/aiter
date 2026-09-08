@@ -8,40 +8,72 @@ continues to select the recorded impl and frozen configurations.
 The low-level entry points `_moe_gluon_gemm1` and `_moe_gluon_gemm2` and launch
 metadata live in `_entry.py`. Each entry constructs `KernelFuncConfig` and
 `KernelTuningConfig` from the launch specs and passes them directly to
-`_moe_gemm_body` alongside constexpr `N` and `K`. The host caches the two specs
-and dimensions as four constexpr arguments. The shared GEMM body and legacy pipeline
-remain in `moe_gemm.py`; `_buffered.py` implements independent component queues.
+`_moe_gemm_body` alongside constexpr `N` and `K` and a runtime `NUM_K` scalar.
+The host computes `NUM_K = K // BLOCK_K` and disables specialization of that
+argument. Shape and layout calculations may still use constexpr `K`; the K-loop
+bounds derive from the runtime scalar. The A-scale row stride is constexpr so
+raw rows retain their 4- or 8-byte alignment when they are not 16-byte aligned.
+The host caches the two specs and
+dimensions as four constexpr arguments. `_buffered.py` implements one driver for
+shared and independent component depths, and `_buffered_schedule.py` computes
+the compile-time issue history and waits. The shared GEMM body remains in
+`moe_gemm.py`.
 `_offsets.py` computes A/B HBM offsets and mini-tile
 indices, and `_epilogue.py` owns output activation, quantization, staging, and
 stores. The host launch API is unchanged.
 
 ## Tuning options
 
-Pass these fields in the launcher's `config` dictionary. They are also trailing
-fields of `TuningSpec`, with defaults for omitted optional fields.
+Pass these fields in the launcher's `config` dictionary. They are carried in
+`TuningSpec`, with defaults for omitted optional fields.
+The config's `BLOCK_M` must match `routing_data.block_m`: the router builds
+padded offsets and the block map for that geometry, and the host rejects a
+mismatch before preparing scales or launching the GEMM.
 
 | Field | Values and meaning |
 | --- | --- |
 | `DS_READ_IN_MFMA` | `DSReadOperand` bitmask: `A=1`, `B=2`, `A_SCALE=4`, `B_SCALE=8`. Set bits place the corresponding read in the MFMA region; unset bits place it in the memory region. `ALL=15`. |
 | `SCHED_MODE` | `SchedMode.NONE`, `IGLP_0`, `IGLP_1`, `MFMA_16`, or `MFMA_8`. Hints apply outside compiler warp-pipeline regions. |
-| `FROZEN_STEP` | Select the preserved reference step and its original unfused drain. |
-| `SOFF_UNROLL` | In the legacy pipeline, advance HBM pointers once per unrolled body and use scalar offsets within it. Independent component queues advance their pointers at each fill. |
+| `FROZEN_STEP` | Select the preserved reference step within the common driver, with an unfused final MFMA. Its existing restrictions on component overrides, register flags and packed K128 scales remain. |
+| `SOFF_UNROLL` | Advance HBM pointers once per unrolled body and use scalar offsets within it. With packed K128 scales and odd unroll, use per-fill pointer advances so scale-word phases remain correct. |
 | `SCALE_FILL_MID` | At a 2x2 mini-tile split, fill scales in the middle slots; wait counts use the same setting. |
 | `WAIT_COMMIT_SCHEME` | `PER_OP=1`, `PER_SLOT=2`, `PER_STAGE_WHOLE=3`, or `PER_STAGE_WARP_PIPELINE=4`; see the boundaries below. |
 | `B_IN_REG` | Load the B payload into registers with `buffer_load` at its normal global-load slot, bypassing LDS staging. Requires `B_PRESHUFFLED=True`. Defaults to `False`. |
 | `A_SCALE_IN_REG`, `B_SCALE_IN_REG` | Load the selected scale component directly into registers. Both options are independent of each other and of `B_IN_REG`; neither requires preshuffled B payload. Defaults to `False`. |
-| `A_NUM_BUFFER`, `B_NUM_BUFFER` | Number of pipeline buffers for each payload component. Positive integers, including 1, are supported. Omitted or zero values inherit `NUM_LDS_BUFFER`. |
-| `A_SCALE_NUM_BUFFER`, `B_SCALE_NUM_BUFFER` | Number of pipeline buffers for each scale component, independent of the payload counts. Omitted or zero values inherit `NUM_LDS_BUFFER`. `A_SCALE_NUMB_BUFFER` is accepted as a dictionary/environment alias for `A_SCALE_NUM_BUFFER`. |
+| `A_NUM_BUFFER`, `B_NUM_BUFFER` | Number of pipeline buffers for each payload component. Omitted or zero values inherit `NUM_LDS_BUFFER`; each resolved active depth must be at least 2. |
+| `A_SCALE_NUM_BUFFER`, `B_SCALE_NUM_BUFFER` | Number of buffers for each active scale component, independent of the payload counts and at least 2 after inheritance. Absent scales do not participate in validation or scheduling. `A_SCALE_NUMB_BUFFER` is accepted as a dictionary/environment alias for `A_SCALE_NUM_BUFFER`. |
+| `K_UNROLL` | Requested main-loop unroll, at least 1. The effective unroll is rounded up to the next multiple of all active register-ring depths' least common multiple. |
 
-Setting any register-storage flag or positive component buffer count selects the
-component pipeline. Its unroll factor is
-`gcd(A_NUM_BUFFER, B_NUM_BUFFER, A_SCALE_NUM_BUFFER, B_SCALE_NUM_BUFFER)`, after
-resolving inherited counts. All four counts participate, including scale counts
-for unscaled operand types. For example, counts `(4, 2, 4, 2)` unroll twice, and
-`(3, 2, 3, 2)` unroll once. The legacy `K_UNROLL` field does not override this
-factor. Configurations that omit all new options retain their existing
-`NUM_LDS_BUFFER`/`K_UNROLL` recipe. `FROZEN_STEP` rejects the new options so the
-preserved reference keeps its original schedule.
+The same component driver runs whether depths are inherited or explicit. LDS
+indices may vary at runtime, so LDS-only components do not constrain unrolling.
+Register tuples use static ring indices in each unrolled body; its length must
+return every register ring to its initial slot. If the active register depths
+are 2 and 3, their period is 6: requested `K_UNROLL=4` becomes `UNROLL=6`, and
+requested `K_UNROLL=7` becomes `UNROLL=12`. With all active components in LDS,
+`UNROLL=K_UNROLL`. Scale components that fall back to register loads because of
+their layout also participate; absent scales never do. `FROZEN_STEP` retains
+its existing rejection of explicit component-depth and register-storage options.
+
+Let `NB_MAX` be the largest resolved active depth and `PEELED` the number of
+initial main iterations needed before invariant steady-state waits. The first
+MFMA is always peeled, so `PEELED >= 1`; unequal-depth warmup may require more.
+The host and device use the same issue-history helper to determine this value.
+The exact host requirement is:
+
+```text
+NUM_K = K / BLOCK_K
+NUM_K >= NB_MAX + PEELED + UNROLL
+```
+
+This guarantees at least one complete runtime unrolled body. Equal depths need
+only the first peel, giving `NUM_K >= NB_MAX + UNROLL + 1`. `K % BLOCK_K == 0`
+and all layout-specific divisibility rules still apply, including complete K256
+words for packed K128 scales. `KernelTuningConfig.min_num_k()` exposes the
+threshold and `validate_pipeline(K)` applies the resolved-depth and K checks.
+The launcher checks depths and K divisibility before preparation, then validates
+the complete effective configuration before launch. The final check matters
+when scale preparation succeeds or falls back: moving scales between LDS and
+registers can change `UNROLL`, `PEELED`, and the minimum accepted K.
 
 All seven new fields also accept the `AITER_TRITON_MOE_GLUON_` environment prefix
 used by the benchmark scripts. A config dictionary with `B_PRESHUFFLED=True`
@@ -58,12 +90,11 @@ preserves the whole-stage boundary used by the cold-bench recipes; callers that
 previously selected `PER_STAGE` with the compiler warp pipeline should select
 `PER_STAGE_WARP_PIPELINE` for the memory-region boundary.
 
-The legacy per-stage schemes use `wait_per_stage` once before the `ni`/`mi`
-loops. `PER_OP` and `PER_SLOT` use `wait_per_slot` before each slot that reads
-LDS. Its fill-only prologue commits each stage at its last copy slot, and drain
-steps that issue no copies do not commit a group. Independent queues compute
-waits from each component's producer stage, including empty slot/stage groups
-in the prologue and drain.
+Per-stage schemes wait before the `ni`/`mi` slot walk; `PER_OP` and `PER_SLOT`
+wait before each slot's LDS reads. Wait counts follow each component's producer
+and the actual committed groups, including empty slot/stage groups during the
+prologue and drain. Direct-register loads own no LDS async-copy groups. Their
+register dependencies provide VMEM completion before use.
 
 Payload and scale placement are independent. Missing components emit no reads;
 components loaded directly into registers follow the same region selection.
@@ -108,7 +139,8 @@ and best independent LDS-buffer recipes are retained for each dtype.
 | a8w8 / MXFP8 | 256.992 us | 228.941 us | 219.642 us |
 | a16w16 / BF16 | 500.864 us | 421.983 us | 470.983 us |
 
-These are medians from five interleaved rounds on one GPU, with 40 warmups and
+These historical measurements precede the unified runtime driver. They are
+medians from five interleaved rounds on one GPU, with 40 warmups and
 100 measured dispatches per recipe per round. A 768 MiB flush precedes each
 wrapper call; MX scale sorting follows the flush. Timings contain only GEMM1.
 Every final recipe passed 16 exact-output cold replays per round and has zero
@@ -122,9 +154,11 @@ regress on that workload; preshuffling B with the original LDS pipeline improves
 its measured latency. The results above apply to the smaller FP32-output workload.
 
 The winning B-register recipes use `expert_mod=".cg"` and effective buffer counts
-`(4,2,3,3)` for MXFP4 and `(3,3,3,3)` for MXFP8/BF16. Their GCD unrolls are 1, 3,
-and 3. The scale-register flags remain independent; the selected MX recipes use
-LDS scales. Cache policy accounts for much of the MX improvement: tuned legacy
+`(4,2,3,3)` for MXFP4 and `(3,3,3,3)` for MXFP8/BF16. The measurements used the
+former GCD policy, with unrolls 1, 3, and 3. Replaying these dictionaries now
+applies the register-ring LCM policy above and requires new performance
+measurements. The scale-register flags remain independent; the selected MX
+recipes use LDS scales. Cache policy accounted for much of the MX improvement: tuned legacy
 controls measured 136.941 us for MXFP4 and 230.401 us for MXFP8.
 
 The reusable runner is
@@ -136,26 +170,41 @@ contains replay commands and the complete measurement protocol.
 Tuning exposed two configuration/scheduling defects that are now covered by
 regressions: unquantized output must unwrap `output_quant` before checking for
 None, and pointer advances must stay before the final compiler-pipeline stage
-border so a subsequent unrolled wait remains at a region head. The default
-legacy kernels still match their preserved encoded machine-code hashes and
-resource metadata for all three dtypes.
+border so a subsequent unrolled wait remains at a region head. At the time of
+those measurements, the default kernels matched their preserved encoded
+machine-code hashes and resource metadata for all three dtypes.
 
 ## Pipeline state
 
-Both pipelines take invariant data in `_PipelineConst`. The independent pipeline
-in `_buffered.py` fills stream `i` at K stage `r + depth[i] - 1` while reading
-stage `r`. Each stream keeps its own LDS index or register queue and HBM pointer.
-B register loads occur in the same slot as B LDS copies. Scale register loads
-also use their configured fill slots, including `SCALE_FILL_MID`.
+The driver takes invariant data in `_PipelineConst`. Each active stream has its
+own depth `NB`, LDS ring or register queue, and HBM pointer. B register loads
+occupy the same logical fill slot as B LDS copies. Scale register loads also use
+their configured fill slots, including `SCALE_FILL_MID`.
 
-The prologue and drain suppress individual fills outside K, so buffer counts may
-exceed the number of K stages. A one-buffer stream fills before its read, with
-barriers protecting reuse. Packed K128 scales keep both halves in one word;
-selecting the half before MFMA permits an odd GCD without changing the unroll.
-LDS reads retain the completion waits needed before buffers are overwritten.
+The prologue has `NB_MAX - 1` fill-only stages. A component starts at
+`NB_DELTA = NB_MAX - NB`, loading tiles 0 through `NB - 2`. A seed stage then
+reads tile 0 and loads tile `NB - 1`, without an MFMA. Each logical main
+iteration `x` accumulates tile `x`, reads tile `x + 1`, and loads tile `x + NB`
+for each stream. `MAIN = NUM_K - NB_MAX` remains a runtime value.
 
-The legacy pipeline carries two separate
-aggregates through the K loop:
+After the peeled iterations, the driver executes complete statically unrolled
+bodies up to the runtime bound. Short bodies use statically expanded guarded
+remainder steps. When `UNROLL > 6` and the active register period exceeds one,
+a runtime remainder loop avoids register spills caused by the long chain of
+guarded tuple updates. Register rings keep distinct SSA slots through a whole unrolled body;
+the finite prologue, remainder and drain rotate their logical queues. Packed
+K128 scale words retain both halves until the read selects the current half.
+Ring and packed-scale phases continue across every phase boundary.
+
+The pipeline drain has `NB_MAX` MFMAs. Drain iteration `j` continues a
+component's fill only while `j < NB_DELTA`, so every active stream loads exactly
+`NUM_K` tiles. The first `NB_MAX - 1` drain iterations still read the next tile;
+the separate final MFMA consumes the prefetched operands without another read
+or fill. Eligible output epilogues fuse with that last MFMA; other paths execute
+it once before the output epilogue. Epilogue input copies overlap the drain and
+participate in its group history.
+
+The K loop carries two aggregates plus the component register rings:
 
 - `_PipelinePointers`, named `hbm_ptrs` at call sites, contains the A/B payload
   HBM pointers and one scale HBM pointer per operand, shared by the mutually
@@ -166,18 +215,11 @@ aggregates through the K loop:
 
 `_PipelineConst.lds_ptrs` holds the `LDSManager` descriptors, named
 `a_payload_lds_ptr`, `a_scale_lds_ptr`, `b_payload_lds_ptr`, and `b_scale_lds_ptr`.
-`BUFFER_LOAD_IDX` selects the LDS destination buffer and `DS_READ_IDX` selects
-the LDS source buffer. Direct scale fallbacks still address HBM.
-
-`_buffer_load` only issues copies and commit markers. It has no `ADVANCE`
-argument or pointer return value. Its caller uses `_advance_hbm_ptrs` after the
-last slot, inside the memory region, to advance payload and LDS-staged scale
-pointers. With `SOFF_UNROLL`, this happens once per unrolled body. `_ds_read`
-loads the next operands, and `_advance_scale_hbm_ptrs` advances only the
-scales loaded straight into registers, after every stage read. Thus each scale
-pointer advances only at its selected load path, including during the prologue
-and drain. The drain advances neither copy pointers nor pointers for a stage it
-does not read.
+LDS tile `t` occupies slot `t % NB` for that component. `_fill_slot` issues
+copies and commits, `_read_slot` supplies the next register fragments, and
+`_advance` moves only pointers whose streams actually filled. With
+`SOFF_UNROLL`, the last step advances by the complete body's fill count.
+Cooperative LDS barriers and read-result dependencies protect buffer reuse.
 
 ## Epilogue function configuration
 
@@ -206,11 +248,15 @@ stages the whole block before its flush. The interleaved activation passes
 alternate packing). Eligible live gate/up split kernels fuse the final activation
 into the MFMA drain.
 
-The frozen step keeps its recorded schedule, including its fixed prologue fence,
-literal priority instructions, and original unfused drain. This is necessary for `FROZEN_STEP` to
-remain the same reference kernel. It does not acquire the live step's read-placement
-or scheduling options. Use the complete frozen recipe from the cold benchmark
+The frozen step keeps its fixed prologue fence and literal priority instructions
+within the common runtime driver. It retains an unfused final MFMA and its
+existing restrictions. It does not acquire the live step's read-placement or
+scheduling options. Use the complete frozen recipe from the cold benchmark
 wrapper when comparing it with the best impl recipe.
+
+The encoded-code comparisons and timing results below describe earlier
+refactors, before the unified runtime loop. The current refactor's source
+snapshot and validation artifacts are under `bench_out/independent_iter_20260908/`.
 
 The preceding scheduling-configuration refactor was checked against commit
 `ad02ed5b7`. The best impl and frozen compiled `.text` sections match byte for byte
