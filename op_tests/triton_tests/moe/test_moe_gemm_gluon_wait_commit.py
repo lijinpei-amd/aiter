@@ -210,6 +210,9 @@ def _trace_emitter(tc, monkeypatch, defer_stage_commit=False):
     tc.num_buffers = lambda operand, scale=False: 3
     tc.pipeline_depth = lambda: 3
     tc.pipeline_peeled = lambda: 1
+    tc.pipeline_register_period = lambda: (
+        3 if any(tc.has_scale(op) and not tc.scale_via_lds(op) for op in (0, 1)) else 1
+    )
     tc.num_mini_k = lambda: 1
     tc.pipeline_depth = lambda: 3
     tc.operand_elem_ty = lambda operand: SimpleNamespace(primitive_bitwidth=8)
@@ -236,12 +239,17 @@ def _trace_emitter(tc, monkeypatch, defer_stage_commit=False):
         b_scale_hbm_ptr=4,
     )
     buffers = ((), (0,) * (3 * tc.nm), (0,) * (3 * tc.nn))
+
+    def check_assumption(value):
+        assert value
+
     with monkeypatch.context() as patch:
         patch.setattr(_lds, "_buffer_load_to_lds", sink.copy)
         patch.setattr(buffered, "_index", buffered._index.fn)
         patch.setattr(buffered, "_phase", buffered._phase.fn)
         patch.setattr(buffered, "_replace_tile", buffered._replace_tile.fn)
         patch.setattr(buffered.gl, "static_range", range)
+        patch.setattr(buffered.gl, "assume", check_assumption)
         for slot in range(tc.nm * tc.nn):
             sink.slot = slot
             buffers = buffered._fill_slot.fn(

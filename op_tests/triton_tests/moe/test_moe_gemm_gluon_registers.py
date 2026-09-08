@@ -525,7 +525,7 @@ def test_minimum_k_and_every_reachable_unroll_remainder(dtype, schedule, monkeyp
         # value must survive into the IR controlling the unrolled loop.
         runtime_argument = host._moe_gluon_gemm1.arg_names.index("NUM_K")
         assert runtime_argument not in host._moe_gluon_gemm1.constexprs
-        assert "scf.for" in kernel.asm["ttgir"]
+        assert re.search(r"scf\.(for|while)\b", kernel.asm["ttgir"])
         assert "%NUM_K: i32" in kernel.asm["ttgir"]
         assert re.search(r"arith\.(subi|addi) %NUM_K,", kernel.asm["ttgir"])
     below = first - stride

@@ -56,6 +56,7 @@ class _Config(_ScheduleConfig):
         self.MINI_BLOCK_M = self.MINI_BLOCK_N = 1
         self.MINI_BLOCK_K = 128 if packed else 256
         self.mma_acc_dtype = None
+        self.output_quant = None
 
     def num_buffers(self, operand, scale=False):
         return self.depths[operand * 2 + bool(scale)]
@@ -372,6 +373,9 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         machine.current_read = args[3]
         return fill_fn(*args, **kwargs)
 
+    def check_assumption(value):
+        assert value
+
     def init_buffers(pc):
         return tuple(
             (
@@ -413,7 +417,7 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         patch.setattr(pipeline.gl, "static_range", range)
         patch.setattr(pipeline.tl, "range", range)
         patch.setattr(pipeline.gl, "static_assert", lambda value, message: None)
-        patch.setattr(pipeline.gl, "assume", lambda value: None)
+        patch.setattr(pipeline.gl, "assume", check_assumption)
         patch.setattr(pipeline.gl, "zeros", lambda *args, **kwargs: 0)
         patch.setattr(pipeline.gl, "barrier", lambda: None)
         patch.setattr(pipeline.gl.amd.cdna4, "sched_barrier", lambda mask: None)
@@ -456,6 +460,10 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
     "depths,register_mask,options",
     [
         ((2, 2, 2, 2), 0, {}),
+        ((2, 1, 2, 1), 0, {"scales": False, "unroll": 2}),
+        ((3, 3, 3, 3), 0, {}),
+        ((3, 1, 3, 1), 0, {"scales": False}),
+        ((3, 1, 3, 1), 0, {"scales": False, "unroll": 2}),
         ((3, 3, 3, 3), 1, {}),
         ((3, 3, 3, 3), 2, {"read_mask": 5}),
         ((3, 3, 3, 3), 4, {"read_mask": 10}),
