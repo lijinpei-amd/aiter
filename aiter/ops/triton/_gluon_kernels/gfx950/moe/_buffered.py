@@ -9,6 +9,8 @@ Register rings keep fixed SSA slots throughout each complete unrolled body;
 only the finite prologue, remainder and drain rotate the logical queues.
 """
 
+import math
+
 import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
@@ -37,7 +39,11 @@ def _index(
         if require_constexpr(IN_LOOP and tc.pipeline_unroll() % depth == 0):
             out = (tc.pipeline_peeled() + KI + 1 + advance) % depth
         else:
-            out = (step + advance) % depth
+            tile = step + advance
+            if require_constexpr(tc.pipeline_register_period() == 1):
+                # Avoid signed ring arithmetic without disturbing live register queues.
+                gl.assume(tile >= 0)
+            out = tile % depth
     return out
 
 
@@ -679,7 +685,13 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
     main = NUM_K - depth
     gl.assume(main >= peeled + unroll)
     remaining = main - peeled
-    unroll_end = remaining // unroll * unroll
+    countdown: gl.constexpr = (
+        not pc.func_cfg.a_has_scale()
+        and not pc.func_cfg.b_has_scale()
+        and tc.pipeline_register_period() == 1
+    )
+    if require_constexpr(not countdown):
+        unroll_end = remaining // unroll * unroll
     buffers = _init_buffers(pc)
     if require_constexpr(tc.FROZEN_STEP):
         ptrs = _prologue_frozen(pc, ptrs)
@@ -705,18 +717,38 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
     ptrs, buffers, regs = _step(pc, ptrs, buffers, regs, 0, 0, DOT=False)
     for x in gl.static_range(peeled):
         ptrs, buffers, regs = _step(pc, ptrs, buffers, regs, x + 1, x + 1)
-    for base in tl.range(0, unroll_end, unroll):
-        for u in gl.static_range(unroll):
-            ptrs, buffers, regs = _step(
-                pc,
-                ptrs,
-                buffers,
-                regs,
-                peeled + base + u + 1,
-                None,
-                KI=u,
-                IN_LOOP=True,
-            )
+    # Payload-only LDS bodies benefit from removing the live rounded bound.
+    if require_constexpr(not countdown):
+        for base in tl.range(0, unroll_end, unroll):
+            for u in gl.static_range(unroll):
+                ptrs, buffers, regs = _step(
+                    pc,
+                    ptrs,
+                    buffers,
+                    regs,
+                    peeled + base + u + 1,
+                    None,
+                    KI=u,
+                    IN_LOOP=True,
+                )
+    else:
+        base = 0
+        left = remaining
+        while left >= unroll:
+            for u in gl.static_range(unroll):
+                ptrs, buffers, regs = _step(
+                    pc,
+                    ptrs,
+                    buffers,
+                    regs,
+                    peeled + base + u + 1,
+                    None,
+                    KI=u,
+                    IN_LOOP=True,
+                )
+            base += unroll
+            left -= unroll
+        unroll_end = remaining - left
     if require_constexpr(unroll > 6 and tc.pipeline_register_period() > 1):
         # Long register-ring unrolls need a single remainder loop: a chain of
         # guarded tuple updates constrains allocation in the main body and spills
@@ -754,19 +786,49 @@ def _drain_buffered_pipeline(
 ):
     tc: gl.constexpr = pc.tuning_cfg
     main = NUM_K - tc.pipeline_depth()
-    # Every stream reads all remaining tiles, even after its own fills stop.
-    # The final MFMA is always separate, and consumes these prefetched fragments.
-    for j in gl.static_range(tc.pipeline_depth() - 1):
-        ptrs, buffers, regs = _step(
-            pc,
-            ptrs,
-            buffers,
-            regs,
-            main + j + 1,
-            j,
-            DRAIN=True,
-            EPILOGUE_GROUPS=EPILOGUE_GROUPS,
-        )
+    period: gl.constexpr = math.lcm(
+        tc.num_buffers(0),
+        tc.num_buffers(1),
+        tc.num_buffers(0, True) if pc.func_cfg.a_has_scale() else 1,
+        tc.num_buffers(1, True) if pc.func_cfg.b_has_scale() else 1,
+        2 if tc.scale_packed_k128(0) or tc.scale_packed_k128(1) else 1,
+    )
+    # Keep short LDS rings in immediate offsets; live queues and quantized
+    # epilogues need the smaller dynamic drain to avoid allocation pressure.
+    if require_constexpr(
+        period <= 3
+        and tc.pipeline_unroll() % period == 0
+        and tc.pipeline_register_period() == 1
+        and pc.func_cfg.output_quant is None
+    ):
+        phase = main % period
+        for p in gl.static_range(period):
+            if phase == p:
+                for j in gl.static_range(tc.pipeline_depth() - 1):
+                    ptrs, buffers, regs = _step(
+                        pc,
+                        ptrs,
+                        buffers,
+                        regs,
+                        main + j + 1,
+                        j,
+                        DRAIN=True,
+                        EPILOGUE_GROUPS=EPILOGUE_GROUPS,
+                        KI=p + j - tc.pipeline_peeled(),
+                        STATIC_PHASE=True,
+                    )
+    else:
+        for j in gl.static_range(tc.pipeline_depth() - 1):
+            ptrs, buffers, regs = _step(
+                pc,
+                ptrs,
+                buffers,
+                regs,
+                main + j + 1,
+                j,
+                DRAIN=True,
+                EPILOGUE_GROUPS=EPILOGUE_GROUPS,
+            )
     return regs
 
 
