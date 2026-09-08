@@ -168,7 +168,7 @@ class LDSManager:
             b_payload_lds_ptr: gl.constexpr = None
         if require_constexpr(
             func_cfg.has_scale(0)
-            and (not tuning_cfg.independent_buffers() or tuning_cfg.scale_via_lds(0))
+            and (tuning_cfg.FROZEN_STEP or tuning_cfg.scale_via_lds(0))
         ):
             as_shape: gl.constexpr = tuning_cfg.scale_shape(0)
             if require_constexpr(tuning_cfg.scale_shuffled(0)):
@@ -193,7 +193,7 @@ class LDSManager:
             a_scale_lds_ptr: gl.constexpr = None
         if require_constexpr(
             func_cfg.has_scale(1)
-            and (not tuning_cfg.independent_buffers() or tuning_cfg.scale_via_lds(1))
+            and (tuning_cfg.FROZEN_STEP or tuning_cfg.scale_via_lds(1))
         ):
             bs_shape: gl.constexpr = tuning_cfg.scale_shape(1)
             if require_constexpr(tuning_cfg.scale_shuffled(1)):
@@ -559,7 +559,7 @@ class LDSManager:
             elif require_constexpr(
                 cfg.scale_packed_ok(0)
                 and cfg.scale_via_lds(0)
-                and not (cfg.independent_buffers() and cfg.num_mini_k() > 1)
+                and not (not cfg.FROZEN_STEP and cfg.num_mini_k() > 1)
             ):
                 # Straight to i32: the dword the shuffle assembled is the operand the
                 # matrix instruction wants, so there is nothing left to do to it.
@@ -583,7 +583,7 @@ class LDSManager:
                     RELAXED,
                 )
                 if require_constexpr(
-                    cfg.independent_buffers() and cfg.num_mini_k() > 1
+                    not cfg.FROZEN_STEP and cfg.num_mini_k() > 1
                 ):
                     a_scale_val = gl.amd.slice(
                         a_scale_val,
@@ -676,7 +676,7 @@ class LDSManager:
             elif require_constexpr(
                 cfg.scale_packed_ok(1)
                 and cfg.scale_via_lds(1)
-                and not (cfg.independent_buffers() and cfg.num_mini_k() > 1)
+                and not (not cfg.FROZEN_STEP and cfg.num_mini_k() > 1)
             ):
                 b_scale_val = _ds_read(
                     self.b_scale_lds_ptr.index(
@@ -702,7 +702,7 @@ class LDSManager:
                     RELAXED,
                 )
                 if require_constexpr(
-                    cfg.independent_buffers() and cfg.num_mini_k() > 1
+                    not cfg.FROZEN_STEP and cfg.num_mini_k() > 1
                 ):
                     b_scale_val = gl.amd.slice(
                         b_scale_val,

@@ -82,8 +82,8 @@ WARPS = 4
 #:
 #: **The Gluon contract is the FROZEN step, not impl.** ``_pipeline_step_frozen`` holds
 #: the best measured schedule, and it is what must not regress while
-#: ``_pipeline_step_impl`` is being refactored. Frozen is NOT insulated from that work:
-#: it shares the epilogue, ``_slot_a_read``/``_slot_b_read``, ``_maybe_block_dot``, the
+#: ``_buffered`` is being refactored. Frozen is NOT insulated from that work:
+#: it shares the epilogue, ``_ds_read_operand``, ``_maybe_block_dot``, the
 #: LDS helpers, the tuning config and the whole kernel body, so any change to those
 #: shows up here. Only the step itself is pinned.
 #:

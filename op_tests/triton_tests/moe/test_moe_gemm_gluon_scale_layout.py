@@ -3,17 +3,18 @@
 
 """CPU oracles for packed E8M0 bytes and their K128 pipeline consumers."""
 
-import ast
-import inspect
-import textwrap
+import math
 from collections import defaultdict
+from contextlib import nullcontext
 from dataclasses import dataclass
+from functools import cache
 from itertools import product
 from types import SimpleNamespace
 
 import pytest
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton._gluon_kernels.gfx950.moe import _buffered as buffered
 from aiter.ops.triton._gluon_kernels.gfx950.moe import moe_gemm as kernel
 from aiter.ops.triton._gluon_kernels.gfx950.moe._config import (
     KernelFuncConfig,
@@ -184,7 +185,6 @@ def test_packed_words_and_selectors_match_producer(
 @pytest.mark.parametrize(
     "changes,k,diagnostic",
     [
-        ({"K_UNROLL": 3}, 7168, "even K_UNROLL"),
         ({"A_SCALE_SORTED_SHUFFLED": False}, 7168, "both operands"),
         ({"B_SCALE_SHUFFLED": False}, 7168, "both operands"),
         (
@@ -209,7 +209,11 @@ class _HostView:
         self.config = config
 
     def __getattr__(self, name):
-        return unwrap(getattr(self.config, name))
+        value = unwrap(getattr(self.config, name))
+        if callable(value):
+            value = cache(value)
+        setattr(self, name, value)
+        return value
 
 
 @pytest.mark.parametrize(
@@ -254,74 +258,69 @@ class _Pointers:
     b_scale_hbm_ptr: int = 0
 
 
-def _source_body(jit_function):
-    source = textwrap.dedent(inspect.getsource(jit_function.fn))
-    return ast.parse(source).body[0].body
+@dataclass(frozen=True)
+class _Payload:
+    stage: int
+    operand: int
+    tile: int
 
 
-def _has_call(node, names):
-    return any(
-        isinstance(child, ast.Call)
-        and isinstance(child.func, ast.Name)
-        and child.func.id in names
-        for child in ast.walk(node)
-    )
+class _ScaleWord(int):
+    def to(self, _dtype):
+        return self
+
+    def __rshift__(self, amount):
+        return _ScaleWord(int(self) >> amount)
 
 
-def _scalar_schedule():
-    """Execute production's outer loops/call sites, omitting GPU setup/epilogue.
-
-    Keeping the original AST, including all call arguments, catches incorrect
-    phase wiring in the seed, peel, loop, remainder, and fused/unfused drain.
-    The oracle below independently expects monotonically numbered K stages.
-    """
-    calls = {"_buffer_load", "_pipeline_step", "_drain_last_fused"}
-    selected = []
-    for node in _source_body(kernel._moe_gemm_body):
-        assignment = isinstance(node, ast.AnnAssign) and isinstance(
-            node.target, ast.Name
-        )
-        if _has_call(node, calls) or (
-            assignment and node.target.id in {"MAIN", "UNROLLED", "FUSE", "DRAIN"}
-        ):
-            selected.append(node)
-    assert any(isinstance(node, ast.For) for node in selected)
-    return compile(
-        ast.fix_missing_locations(ast.Module(selected, [])),
-        "<moe scalar schedule>",
-        "exec",
-    )
-
-
-def _step_phase_expressions():
-    names = {"KIE", "KUE", "FILL_K_PHASE", "DOT_K_PHASE"}
-    selected = [
-        node
-        for node in _source_body(kernel._pipeline_step_impl)
-        if isinstance(node, ast.AnnAssign)
-        and isinstance(node.target, ast.Name)
-        and node.target.id in names
-    ]
-    assert {node.target.id for node in selected} == names
-    return compile(
-        ast.fix_missing_locations(ast.Module(selected, [])), "<moe step phases>", "exec"
-    )
+@dataclass
+class _Fragments:
+    a_payload: tuple
+    a_scale: tuple
+    b_payload: tuple
+    b_scale: tuple
+    acc: tuple
 
 
 class _CopyRecorder:
-    def __init__(self, buffers):
-        self.buffers = buffers
+    """Scalar HBM/LDS model with distinct values for both halves of a scale word."""
+
+    def __init__(self, tc, b_step):
+        self.depths = [tc.num_buffers(kind // 2, bool(kind % 2)) for kind in range(4)]
+        self.b_step = b_step
         self.addresses = defaultdict(list)
+        self.reads = defaultdict(list)
+        self.lds = {}
+        self.dot_tiles = defaultdict(list)
 
     def _record(self, kind, buffer, tile, pointer, offsets, soffset):
-        assert offsets == 0
+        assert offsets == tile
         history = self.addresses[kind, tile]
         stage = len(history)
-        assert unwrap(buffer) == stage % self.buffers
-        expected = (stage // 2) * 256 if kind % 2 else stage * 128
+        expected = (
+            (stage // 2) * 256
+            if kind % 2
+            else stage * (self.b_step if kind == 2 else 128)
+        )
         address = unwrap(pointer + soffset)
         assert address == expected, (kind, tile, stage, address, expected)
         history.append(address)
+        if kind % 2:
+            even = stage // 2 * 2
+            value = _ScaleWord((even + 1) | ((even + 2) << 16))
+        else:
+            value = _Payload(stage, kind // 2, tile)
+        if buffer is not None:
+            assert buffer == stage % self.depths[kind]
+            key = kind, tile, buffer
+            if key in self.lds:
+                assert stage - self.depths[kind] in self.reads[kind, tile], (
+                    "LDS slot overwritten before its read",
+                    key,
+                    stage,
+                )
+            self.lds[key] = value
+        return value
 
     def buffer_load_a_payload(self, *args):
         self._record(0, *args)
@@ -335,126 +334,167 @@ class _CopyRecorder:
     def buffer_load_b_scale(self, *args):
         self._record(3, *args)
 
+    def buffer_load_b_register(self, pointer, offsets, soffset):
+        return (self._record(2, None, offsets, pointer, offsets, soffset),)
+
+    def buffer_load_scale_register(self, operand, pointer, offsets, soffset, K_PHASE):
+        kind = operand * 2 + 1
+        assert K_PHASE == len(self.addresses[kind, offsets]) % 2
+        return (self._record(kind, None, offsets, pointer, offsets, soffset),)
+
+    def _read(self, kind, tile, slot):
+        stage = len(self.reads[kind, tile])
+        assert slot == stage % self.depths[kind]
+        self.reads[kind, tile].append(stage)
+        return self.lds[kind, tile, slot]
+
+    def _read_frag(
+        self,
+        operand,
+        buffer,
+        tile,
+        k,
+        _scale_ptr,
+        _offsets,
+        RELAXED,
+        READ_PAYLOAD,
+        READ_SCALE,
+        SCALE_READ_IDX,
+    ):
+        assert k == 0
+        payload = self._read(operand * 2, tile, buffer) if READ_PAYLOAD else None
+        scale = (
+            self._read(operand * 2 + 1, tile, SCALE_READ_IDX) if READ_SCALE else None
+        )
+        return payload, scale
+
+    def ds_read_a_frag(self, *args, **kwargs):
+        return self._read_frag(0, *args, **kwargs)
+
+    def ds_read_b_frag(self, *args, **kwargs):
+        return self._read_frag(1, *args, **kwargs)
+
     def commit_buffer_load(self):
         pass
 
+    def wait_buffer_load_groups(self, _groups):
+        pass
 
-@pytest.mark.parametrize("buffers", [3, 4])
-@pytest.mark.parametrize("unroll", [2, 4, 6])
-@pytest.mark.parametrize("stages", [4, 6, 8, 10, 18, 56])
-@pytest.mark.parametrize("soff", [False, True], ids=["pointer-per-stage", "soffset"])
-@pytest.mark.parametrize("fused", [False, True], ids=["ordinary-drain", "fused-drain"])
-def test_pipeline_phases_and_packed_scale_addresses(
-    monkeypatch, buffers, unroll, stages, soff, fused
-):
-    tc = _HostView(
-        _config(fused=fused, NUM_LDS_BUFFER=buffers, K_UNROLL=unroll, SOFF_UNROLL=soff)
-    )
-    assert tc.validate(4096, stages * 128)
+    def dot(self, a, b, acc, num_mini, _fc, _tc, enabled, phase):
+        if not enabled:
+            return acc
+        assert num_mini == 1 and phase == 0
+        ap, asc = a
+        bp, bsc = b
+        history = self.dot_tiles[ap.tile, bp.tile]
+        stage = len(history)
+        assert ap.stage == bp.stage == stage
+        assert int(asc) & 0xFFFF == int(bsc) & 0xFFFF == stage + 1
+        history.append(stage)
+        return acc + 1
+
+
+def _run_scalar_pipeline(monkeypatch, tc, stages, fused):
+    """Execute the production driver, reads, fills, ring updates and final MFMA."""
     fc = _HostView(tc.func_cfg)
-    sink = _CopyRecorder(buffers)
+    b_step = 128 * 16 if tc.B_IN_REG else 128
+    sink = _CopyRecorder(tc, b_step)
     pc = SimpleNamespace(
         tuning_cfg=tc,
         func_cfg=fc,
         lds_ptrs=sink,
-        a_hbm_offs=(0, 0),
-        b_hbm_offs=(0, 0),
-        a_scale_hbm_offs=(0, 0),
-        b_scale_hbm_offs=(0, 0),
+        a_hbm_offs=(0, 1),
+        b_hbm_offs=(0, 1),
+        a_scale_hbm_offs=(0, 1),
+        b_scale_hbm_offs=(0, 1),
         a_step=128,
-        b_step=128,
+        b_step=b_step,
         s_step=4,
         a_scale_stride_k=32,
         b_scale_stride_k=32,
     )
-    emit = kernel._buffer_load.fn
-    advance = kernel._advance_hbm_ptrs.fn
-    phase_code = _step_phase_expressions()
-    schedule = _scalar_schedule()
-    reads, dots = [], []
 
-    def step(
-        pc,
-        pointers,
-        regs,
-        buffer,
-        read_buffer,
-        between,
-        filling,
-        reading,
-        DO_MFMA=True,
-        IN_LOOP=False,
-        KI=0,
-        KU=1,
-        WAIT_SLACK=0,
-        K_PHASE=0,
-    ):
-        del IN_LOOP, between, WAIT_SLACK
-        scope = {"gl": gl, "tc": tc, "KI": KI, "KU": KU, "K_PHASE": K_PHASE}
-        exec(phase_code, scope)  # noqa: S102 - scalar AST from the kernel under test
-        if reading:
-            assert read_buffer == len(reads) % buffers
-            assert K_PHASE == len(reads) % 2
-            reads.append(K_PHASE)
-        if DO_MFMA:
-            assert scope["DOT_K_PHASE"] == len(dots) % 2
-            dots.append(scope["DOT_K_PHASE"])
-        if filling:
-            for ni, mi in product(range(2), range(2)):
-                emit(
-                    pc,
-                    pointers,
-                    buffer,
-                    mi,
-                    ni,
-                    KI=scope["KIE"],
-                    K_PHASE=scope["FILL_K_PHASE"],
-                )
-                if kernel._slot_advances_hbm_ptrs(
-                    mi, ni, 2, 2, scope["KIE"], scope["KUE"]
-                ):
-                    pointers = advance(
-                        pc, pointers, scope["KUE"], scope["FILL_K_PHASE"]
-                    )
-        return pointers, regs
-
-    def final_dot(pc, regs, bias, x_scale, func_cfg, tuning_cfg, K_PHASE=0):
-        assert K_PHASE == len(dots) % 2
-        dots.append(K_PHASE)
-        return regs.acc
+    def check_assumption(condition, message=""):
+        assert condition, message
 
     with monkeypatch.context() as patch:
-        patch.setattr(kernel, "_opt_at", kernel._opt_at.fn)
-        patch.setattr(kernel, "_PipelinePointers", _Pointers)
-        patch.setattr(kernel, "_pipeline_step_impl", step)
-        scope = {
-            "gl": SimpleNamespace(static_range=range, constexpr=gl.constexpr),
-            "tl": SimpleNamespace(range=range),
-            "require_constexpr": bool,
-            "tuning_cfg": tc,
-            "func_cfg": fc,
-            "pc": pc,
-            "hbm_ptrs": _Pointers(),
-            "NB": buffers,
-            "NUM_K": stages,
-            "NM": 2,
-            "NN": 2,
-            "STAGES_BETWEEN": buffers - 2,
-            "acc0": (0, 0, 0, 0),
-            "epi": SimpleNamespace(groups=0, bias_lds_ptr=None, bias_hbm_base=None),
-            "pid_n": 0,
-            "N": 4096,
-            "x_static_scale": None,
-            "_buffer_load": emit,
-            "_advance_hbm_ptrs": advance,
-            "_pipeline_step": kernel._pipeline_step.fn,
-            "_PipelineRegFragments": lambda *args: SimpleNamespace(acc=args[-1]),
-            "_drain_last_fused": final_dot,
-            "_epi_bias_tiles": lambda *args: None,
-        }
-        exec(schedule, scope)  # noqa: S102 - scalar AST from the kernel under test
-    assert len(reads) == len(dots) == stages
+        patch.setattr(gl, "static_range", range)
+        patch.setattr(gl, "static_assert", check_assumption)
+        patch.setattr(gl, "assume", check_assumption)
+        patch.setattr(gl, "zeros", lambda *_args, **_kwargs: 0)
+        patch.setattr(gl, "barrier", lambda: None)
+        patch.setattr(gl.amd.cdna4, "sched_barrier", lambda *_: None)
+        patch.setattr(buffered.tl, "range", range)
+        patch.setattr(buffered, "pick_stage", lambda _: lambda _name: nullcontext())
+        for name in (
+            "_index",
+            "_phase",
+            "_replace_tile",
+            "_rotate",
+            "_rotate_buffers",
+            "_init_buffers",
+            "_fill_slot",
+            "_advance",
+            "_read_tile",
+            "_read_slot",
+            "_step",
+            "_step_live",
+            "_make_reg_fragments",
+            "_merge_ds_read_frags",
+            "_take_reg_pairs",
+        ):
+            patch.setattr(buffered, name, getattr(buffered, name).fn)
+        patch.setattr(buffered, "_PipelinePointers", _Pointers)
+        patch.setattr(buffered, "_PipelineRegFragments", _Fragments)
+        patch.setattr(kernel, "_PipelineRegFragments", _Fragments)
+        patch.setattr(buffered, "_maybe_block_dot", sink.dot)
+        patch.setattr(kernel, "_maybe_block_dot", sink.dot)
+        patch.setattr(kernel, "_take_reg_pairs", kernel._take_reg_pairs.fn)
+        ptrs, queues, regs = buffered._run_buffered_pipeline.fn(pc, _Pointers(), stages)
+        final = buffered._drain_buffered_pipeline.fn(pc, ptrs, queues, regs, stages, 0)
+        if fused:
+            acc = kernel._drain_last_fused.fn(pc, final, None, None, fc, tc)
+        else:
+            acc = buffered._last_mfma.fn(pc, final)
+    assert acc == (stages,) * 4
     assert set(sink.addresses) == set(product(range(4), range(2)))
     assert all(len(history) == stages for history in sink.addresses.values())
-    assert scope["hbm_ptrs"].a_scale_hbm_ptr == (stages // 2) * 256
-    assert scope["hbm_ptrs"].b_scale_hbm_ptr == (stages // 2) * 256
+    assert all(history == list(range(stages)) for history in sink.dot_tiles.values())
+    assert len(sink.dot_tiles) == 4
+
+
+@pytest.mark.parametrize("counts", [(2, 2, 2, 2), (3, 3, 3, 3), (4, 2, 2, 3)])
+@pytest.mark.parametrize("unroll", [1, 3, 4])
+@pytest.mark.parametrize("registers", [False, True])
+@pytest.mark.parametrize("soff", [False, True], ids=["pointer-per-stage", "soffset"])
+@pytest.mark.parametrize("fused", [False, True], ids=["ordinary-drain", "fused-drain"])
+def test_pipeline_phases_and_packed_scale_addresses(
+    monkeypatch, counts, unroll, registers, soff, fused
+):
+    tc = _HostView(
+        _config(
+            fused=fused,
+            K_UNROLL=unroll,
+            SOFF_UNROLL=soff,
+            A_NUM_BUFFER=counts[0],
+            B_NUM_BUFFER=counts[1],
+            A_SCALE_NUM_BUFFER=counts[2],
+            B_SCALE_NUM_BUFFER=counts[3],
+            B_IN_REG=registers,
+            B_PRESHUFFLED=registers,
+            A_SCALE_IN_REG=registers,
+            B_SCALE_IN_REG=registers,
+        )
+    )
+    minimum = (tc.min_num_k() + 1) // 2 * 2
+    effective_unroll = tc.pipeline_unroll()
+    # Complete K256 scale words constrain NUM_K to even values. Visit the minimum,
+    # every reachable remainder, and a longer strip with additional ring wraps.
+    lengths = {
+        minimum + 2 * offset
+        for offset in range(effective_unroll // math.gcd(2, effective_unroll))
+    }
+    lengths.add(minimum + 2 * effective_unroll)
+    for stages in sorted(lengths):
+        assert tc.validate(4096, stages * 128)
+        _run_scalar_pipeline(monkeypatch, tc, stages, fused)

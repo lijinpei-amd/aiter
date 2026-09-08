@@ -318,7 +318,7 @@ def test_partial_register_prefetch_is_rejected(case):
     while cause is not None and not isinstance(cause, CompileTimeAssertionFailure):
         cause = cause.__cause__ or cause.__context__
     assert isinstance(cause, CompileTimeAssertionFailure), str(error.value)
-    assert "split-stage prologue" in str(cause)
+    assert "pipeline requires VGPR_PREFETCH_K == BLOCK_K" in str(cause)
 
 
 @pytest.mark.parametrize("split", [False, True], ids=["interleaved", "split"])

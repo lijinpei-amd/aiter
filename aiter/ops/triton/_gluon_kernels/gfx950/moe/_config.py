@@ -19,6 +19,7 @@ from triton.language.core import _aggregate as aggregate
 
 from aiter.ops.triton.utils.common_utils import strip_annotate
 
+from ._buffered_schedule import _pipeline_peeled
 from ._lang import MX_GROUP, WARP_SIZE
 from ._lang import unwrap as _v
 from ._schedule import _buffer_load_groups
@@ -535,7 +536,7 @@ class KernelTuningConfig:
 
     @gluon.constexpr_function
     def num_buffers(self, operand, scale=False):
-        """Ring depth for one payload or scale; zero keeps the legacy shared depth."""
+        """Ring depth for one payload or scale; zero inherits NUM_LDS_BUFFER."""
         operand = _v(operand)
         assert operand in (0, 1), "operand must be 0 (A) or 1 (B)"
         if _v(scale):
@@ -553,7 +554,7 @@ class KernelTuningConfig:
 
     @gluon.constexpr_function
     def independent_buffers(self):
-        """Use component rings when any of the independent storage knobs is set."""
+        """Whether a component depth or storage placement was explicitly selected."""
         return bool(
             _v(self.B_IN_REG)
             or _v(self.B_SCALE_IN_REG)
@@ -574,21 +575,66 @@ class KernelTuningConfig:
         return depth
 
     @gluon.constexpr_function
-    def pipeline_unroll(self):
-        """Component rings use the GCD of all four configured buffer counts.
+    def pipeline_register_period(self):
+        """LCM of the active register rings; absent scales have no ring.
 
-        Omitted independent options retain the existing K_UNROLL recipe, including
-        the recorded frozen kernels. Absent scale operands still participate in the
-        GCD when independent buffering is requested.
+        LDS slots may use runtime indices. Register tuples need static indices in
+        the main loop, so an unrolled body must return each ring to its first slot.
         """
-        if not self.independent_buffers():
-            return _v(self.K_UNROLL)
-        return math.gcd(
-            self.num_buffers(0),
-            self.num_buffers(1),
-            self.num_buffers(0, True),
-            self.num_buffers(1, True),
+        period = 1
+        for operand in (0, 1):
+            if operand == 1 and _v(self.B_IN_REG):
+                period = math.lcm(period, self.num_buffers(operand))
+            if self.func_cfg.has_scale(operand) and not self.scale_via_lds(operand):
+                period = math.lcm(period, self.num_buffers(operand, True))
+        return period
+
+    @gluon.constexpr_function
+    def pipeline_unroll(self):
+        """Smallest register-ring-compatible unroll at least as large as K_UNROLL."""
+        requested = _v(self.K_UNROLL)
+        assert requested >= 1, "K_UNROLL must be at least 1"
+        period = self.pipeline_register_period()
+        return (requested + period - 1) // period * period
+
+    @gluon.constexpr_function
+    def pipeline_peeled(self):
+        """Main iterations before the runtime loop, including wait-history warmup."""
+        return _pipeline_peeled(self)
+
+    @gluon.constexpr_function
+    def min_num_k(self):
+        """Minimum strip that executes at least one complete unrolled body."""
+        return self.pipeline_depth() + self.pipeline_peeled() + self.pipeline_unroll()
+
+    @gluon.constexpr_function
+    def validate_buffer_counts(self):
+        """Only components present in the operand formats participate."""
+        for operand in (0, 1):
+            for scale in (False, True):
+                if scale and not self.func_cfg.has_scale(operand):
+                    continue
+                depth = self.num_buffers(operand, scale)
+                assert depth >= 2, (
+                    f"{'A' if operand == 0 else 'B'}{'_SCALE' if scale else ''}_NUM_BUFFER "
+                    f"({depth}) must be at least 2"
+                )
+        assert _v(self.K_UNROLL) >= 1, "K_UNROLL must be at least 1"
+        return True
+
+    @gluon.constexpr_function
+    def validate_pipeline(self, K):
+        """Host/device contract for the resolved component rings and runtime loop."""
+        self.validate_buffer_counts()
+        num_k = self.num_k_tiles(K)
+        depth = self.pipeline_depth()
+        peeled = self.pipeline_peeled()
+        unroll = self.pipeline_unroll()
+        assert num_k >= depth + peeled + unroll, (
+            f"NUM_K ({num_k}) must be at least NB_MAX ({depth}) + PEELED ({peeled}) "
+            f"+ UNROLL ({unroll}) = {depth + peeled + unroll}"
         )
+        return True
 
     @gluon.constexpr_function
     def ds_read_in_mfma(self, operand, scale=False):
@@ -1262,10 +1308,8 @@ class KernelTuningConfig:
             n_tiles = self.num_lds_tiles(idx)
             if idx == 0 or not _v(self.B_IN_REG):
                 total += n_tiles * shape[0] * shape[1] * width * self.num_buffers(idx)
-            # Legacy small-tile fallbacks keep their unused allocation. Independent
-            # queues allocate scales only when they actually stage through LDS.
             if fc.has_scale(idx) and (
-                not self.independent_buffers() or self.scale_via_lds(idx)
+                _v(self.FROZEN_STEP) or self.scale_via_lds(idx)
             ):
                 s = self.scale_shape(idx)
                 scale_k = 8 if self.scale_packed_k128(idx) else s[1]
@@ -1308,12 +1352,7 @@ class KernelTuningConfig:
         assert not (
             _v(self.FROZEN_STEP) and self.independent_buffers()
         ), "FROZEN_STEP does not support register storage or per-component buffer counts"
-        for idx in (0, 1):
-            for scale in (False, True):
-                assert self.num_buffers(idx, scale) >= 1, (
-                    f"{'A' if idx == 0 else 'B'}{'_SCALE' if scale else ''}_NUM_BUFFER "
-                    f"({self.num_buffers(idx, scale)}) must be positive"
-                )
+        self.validate_buffer_counts()
 
         # -- host preconditions (no N tail, no K tail; only the even case exists) --
         assert N % BN == 0, f"N {N} % BLOCK_N {BN} != 0; the wrapper must fall back"
@@ -1323,18 +1362,11 @@ class KernelTuningConfig:
         assert BK % _v(self.MINI_BLOCK_K) == 0
         assert _v(self.MINI_BLOCK_K) % instr[2] == 0
         assert BK % MX_GROUP == 0
-        if _v(self.MINI_BLOCK_K) < BK and not self.independent_buffers():
-            # The LDS scale path slices per mini-tile; the register fallback advances a
-            # flat offset by MINI_BLOCK_K/32 and hands mfma_scaled a fragment still
-            # shaped for the whole BLOCK_K. The two disagree, and the only symptom is
-            # the backend's "Operands must have the same scale factor" at lowering
-            # time, which names neither knob. Refuse the pair here instead.
+        if _v(self.MINI_BLOCK_K) < BK and _v(self.FROZEN_STEP):
             for idx in (0, 1):
-                assert not self.func_cfg.has_scale(idx) or self.scale_via_lds(idx), (
-                    f"MINI_BLOCK_K ({_v(self.MINI_BLOCK_K)}) < BLOCK_K ({BK}) needs "
-                    f"operand {idx}'s scale on the LDS path, but its tile is too small "
-                    "for a coalesced direct-to-LDS copy; raise BLOCK_K or set "
-                    "MINI_BLOCK_K == BLOCK_K"
+                assert not fc.has_scale(idx) or self.scale_via_lds(idx), (
+                    f"FROZEN_STEP with MINI_BLOCK_K ({_v(self.MINI_BLOCK_K)}) < "
+                    f"BLOCK_K ({BK}) requires operand {idx}'s scales in LDS"
                 )
 
         # -- the constexpr rotating buffer index only folds if this holds --
@@ -1347,9 +1379,6 @@ class KernelTuningConfig:
             assert (
                 _v(self.MINI_BLOCK_K) == BK
             ), "packed K128 scales require MINI_BLOCK_K == BLOCK_K"
-            assert (
-                self.independent_buffers() or _v(self.K_UNROLL) % 2 == 0
-            ), "packed K128 scales require even K_UNROLL"
             assert not _v(
                 self.FROZEN_STEP
             ), "packed K128 scales require the live pipeline"
@@ -1367,15 +1396,8 @@ class KernelTuningConfig:
                         idx
                     ), f"operand {idx}'s packed K128 scales require register-private non-K +16"
 
-        # -- the pipeline must issue exactly one fill per K tile --
-        n_k = K // BK
-        assert n_k >= 1, "K must contain at least one BLOCK_K tile"
-        assert self.independent_buffers() or n_k >= _v(self.NUM_LDS_BUFFER), (
-            f"K/BLOCK_K ({n_k}) < NUM_LDS_BUFFER ({_v(self.NUM_LDS_BUFFER)}): the "
-            f"prologue alone would over-read past the end of the K strip"
-        )
-        n_fill = _v(self.NUM_LDS_BUFFER) + (n_k - _v(self.NUM_LDS_BUFFER))
-        assert n_fill == n_k, "fill count must equal cdiv(K, BLOCK_K)"
+        # The prologue, peeled iterations and a complete unrolled body must fit.
+        self.validate_pipeline(K)
 
         # -- the mini block is the unit of LDS allocation, of the global->LDS copy, of
         #    the MFMA and of the accumulator, so it must align to the CTA tiling;
@@ -1510,17 +1532,6 @@ class KernelTuningConfig:
                 "MFMAs depend on the slot's own ds_read and there is no mem stage to "
                 "hide behind them"
             )
-
-        # -- pipeline wait depth --
-        # The loop is wait-first / commit-last and always copies into a buffer no live
-        # stage occupies, so on every step one buffer is being filled by buffer_load and
-        # one is being consumed by ds_read: the wait is NUM_LDS_BUFFER-2, and two
-        # buffers leave nothing to overlap with (the wait folds to wait_group(0) and
-        # drains every copy on every stage -- measured 1217 us against 1028 us).
-        assert self.independent_buffers() or _v(self.NUM_LDS_BUFFER) >= 3, (
-            f"NUM_LDS_BUFFER {_v(self.NUM_LDS_BUFFER)} < 3: one buffer is being filled "
-            "and one consumed on every step, leaving nothing to overlap a copy with"
-        )
 
         # -- register prefetch depth --
         # VGPR_PREFETCH_K is how much of a BLOCK_K stage is read into registers one step

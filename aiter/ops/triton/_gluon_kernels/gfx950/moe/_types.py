@@ -124,12 +124,9 @@ class TileSched(IntEnum):
 class WarpPipeline(IntEnum):
     """Which inter-wave ping-pong the K-loop step is built for.
 
-    All three run the *same* ``_pipeline_step_impl`` body: a slot always emits its MFMAs,
-    then its ``ds_read``s, then its global->LDS fills, and the mode only decides whether
-    stage borders are laid down between those groups (see
-    ``_lang.pick_warp_pipeline_stage``). Nothing about the schedule is duplicated per
-    mode, so a change to the fill placement or the wait arithmetic cannot land in one
-    mode and miss another.
+    All modes share the runtime component-pipeline driver. The live step places
+    MFMA and memory work in regions selected by ``_lang.pick_warp_pipeline_stage``;
+    the explicit frozen step retains the reference's manual rendezvous sequence.
 
     * ``NONE`` -- no borders. One wave group, the MFMAs and the memory work overlapped
       only by the machine scheduler.
@@ -208,6 +205,8 @@ class TuningSpec(NamedTuple):
     BLOCK_M: int
     BLOCK_N: int
     BLOCK_K: int
+    #: Requested unroll factor, rounded up to a multiple of every active register
+    #: ring depth. LDS rings can keep runtime indices and impose no extra factor.
     K_UNROLL: int
     MINI_BLOCK_K: int
     MINI_BLOCK_M: int
@@ -252,7 +251,7 @@ class TuningSpec(NamedTuple):
     #: :class:`DSReadOperand` mask; each payload and scale may move independently.
     DS_READ_IN_MFMA: int = int(DSReadOperand.NONE)
     SCHED_MODE: int = int(SchedMode.NONE)
-    #: Run the preserved reference step instead of the live implementation.
+    #: Run the preserved reference step within the common runtime pipeline driver.
     FROZEN_STEP: bool = False
     #: Advance HBM pointers per unrolled body and address its steps through soffset.
     SOFF_UNROLL: bool = False
@@ -263,7 +262,8 @@ class TuningSpec(NamedTuple):
     #: Scale storage is independent of B payload storage and of the other scale.
     B_SCALE_IN_REG: bool = False
     A_SCALE_IN_REG: bool = False
-    #: Per-component ring depths. Zero inherits the legacy NUM_LDS_BUFFER value.
+    #: Per-component ring depths. Zero inherits NUM_LDS_BUFFER; every active
+    #: component must resolve to at least two buffers, including register storage.
     A_NUM_BUFFER: int = 0
     B_NUM_BUFFER: int = 0
     A_SCALE_NUM_BUFFER: int = 0
@@ -341,7 +341,8 @@ class QuantTokenTensor(NamedTuple):
     scale_ptr: gl.tensor
     num_token: gl.tensor
     stride_m: gl.tensor  # payload elements, i.e. hidden_dim // 2 for MXFP4
-    scale_stride_m: gl.tensor
+    # Preserve row alignment below 16 bytes for direct-to-LDS scale copies.
+    scale_stride_m: gl.constexpr
     scale_stride_k: gl.constexpr  # constexpr: folds the stage bump into the address
     hidden_dim: gl.constexpr  # logical extent; packed extent from dtype_quant
     topk: gl.constexpr

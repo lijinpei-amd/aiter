@@ -13,7 +13,7 @@ prints the provenance it used so a number can always be traced back to a build.
     python scripts/gluon_moe_gemm1_run_best.py --ab AITER_TRITON_MOE_GLUON_FROZEN_STEP
 
 ``--ab KEY`` interleaves KEY=0 against KEY=1 round by round and reports paired
-deltas. Use it while refactoring ``_pipeline_step_impl``: ``FROZEN_STEP=1`` runs
+deltas. Use it while refactoring ``_buffered._step_live``: ``FROZEN_STEP=1`` runs
 ``_pipeline_step_frozen``, the verbatim snapshot of the step this number was measured
 with, so a refactor is compared against the known-good schedule rather than against a
 remembered figure. Sequential sweeps have disagreed in sign with interleaved ones

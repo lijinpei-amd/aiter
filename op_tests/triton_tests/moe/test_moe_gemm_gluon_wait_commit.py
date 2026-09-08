@@ -9,8 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from aiter.ops.triton._gluon_kernels.gfx950.moe import _buffered as buffered
 from aiter.ops.triton._gluon_kernels.gfx950.moe import _lds
-from aiter.ops.triton._gluon_kernels.gfx950.moe import moe_gemm as kernel
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import unwrap
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
     _buffer_load_group_schedule,
@@ -81,7 +81,8 @@ class _ScheduleConfig:
 
     def commit_per_stage(self):
         return self.WAIT_COMMIT_SCHEME in (
-            WaitCommitScheme.PER_STAGE_WARP_PIPELINE, WaitCommitScheme.PER_STAGE_WHOLE,
+            WaitCommitScheme.PER_STAGE_WARP_PIPELINE,
+            WaitCommitScheme.PER_STAGE_WHOLE,
         )
 
 
@@ -114,8 +115,7 @@ def _reference_slots(tc):
         payloads = [(2, 0), (0, 0), (0, 1), (2, 1)]
     else:
         payloads = sorted(
-            [(0, tile) for tile in range(tc.nm)]
-            + [(2, tile) for tile in range(tc.nn)],
+            [(0, tile) for tile in range(tc.nm)] + [(2, tile) for tile in range(tc.nn)],
             key=lambda copy: (copy[1], copy[0]),
         )
     copies = [[] for _ in range(tc.nm * tc.nn)]
@@ -130,7 +130,9 @@ def _reference_slots(tc):
         owner = tile - tile % tc.a_scale_ratio if operand == 0 else tile
         reads[slot].add((kind + 1, owner))
         if tile == owner:
-            scale_slot = 1 + tile if tc.SCALE_FILL_MID and (tc.nm, tc.nn) == (2, 2) else slot
+            scale_slot = (
+                1 + tile if tc.SCALE_FILL_MID and (tc.nm, tc.nn) == (2, 2) else slot
+            )
             copies[scale_slot].append((kind + 1, tile))
     # Within a slot the four copy kinds issue in A, A-scale, B, B-scale order.
     return [tuple(sorted(slot)) for slot in copies], reads
@@ -145,7 +147,9 @@ def _reference_groups(tc, copies):
         return tuple(tuple((copy,) for copy in slot) for slot in asynchronous)
     if tc.WAIT_COMMIT_SCHEME == WaitCommitScheme.PER_SLOT:
         return tuple((slot,) for slot in asynchronous)
-    return ((),) * (len(copies) - 1) + ((tuple(copy for slot in asynchronous for copy in slot),),)
+    return ((),) * (len(copies) - 1) + (
+        (tuple(copy for slot in asynchronous for copy in slot),),
+    )
 
 
 class _Descriptor:
@@ -185,6 +189,10 @@ class _LDSRecorder:
     def buffer_load_b_scale(self, *args):
         _lds.LDSManager.buffer_load_b_scale.fn(self, *args)
 
+    def buffer_load_scale_register(self, *args, **kwargs):
+        # A register load has no LDS destination and owns no async-copy group.
+        return (0,)
+
     def copy(self, descriptor, base, offsets, asynchronous, modifier, soffset):
         stage, kind, tile = descriptor
         assert stage == 2, "The emitter must index the requested LDS stage."
@@ -198,42 +206,88 @@ class _LDSRecorder:
 
 
 def _trace_emitter(tc, monkeypatch, defer_stage_commit=False):
+    tc.B_IN_REG = False
+    tc.num_buffers = lambda operand, scale=False: 3
+    tc.pipeline_depth = lambda: 3
+    tc.pipeline_peeled = lambda: 1
+    tc.num_mini_k = lambda: 1
+    tc.pipeline_depth = lambda: 3
+    tc.operand_elem_ty = lambda operand: SimpleNamespace(primitive_bitwidth=8)
+    tc.scale_hbm_steps = lambda operand, steps, phase: steps
     sink = _LDSRecorder(tc)
     pc = SimpleNamespace(
-        lds_ptrs=sink, func_cfg=tc, tuning_cfg=tc,
-        a_hbm_offs=(0,) * tc.nm, b_hbm_offs=(0,) * tc.nn,
-        a_scale_hbm_offs=(0,) * tc.nm, b_scale_hbm_offs=(0,) * tc.nn,
-        a_step=0, b_step=0, s_step=0,
-        a_scale_stride_k=0, b_scale_stride_k=0,
+        lds_ptrs=sink,
+        func_cfg=tc,
+        tuning_cfg=tc,
+        a_hbm_offs=(0,) * tc.nm,
+        b_hbm_offs=(0,) * tc.nn,
+        a_scale_hbm_offs=(0,) * tc.nm,
+        b_scale_hbm_offs=(0,) * tc.nn,
+        a_step=0,
+        b_step=0,
+        s_step=0,
+        a_scale_stride_k=0,
+        b_scale_stride_k=0,
     )
     pointers = SimpleNamespace(
-        a_hbm_ptr=1, a_scale_hbm_ptr=2, b_hbm_ptr=3, b_scale_hbm_ptr=4,
+        a_hbm_ptr=1,
+        a_scale_hbm_ptr=2,
+        b_hbm_ptr=3,
+        b_scale_hbm_ptr=4,
     )
+    buffers = ((), (0,) * (3 * tc.nm), (0,) * (3 * tc.nn))
     with monkeypatch.context() as patch:
         patch.setattr(_lds, "_buffer_load_to_lds", sink.copy)
-        patch.setattr(kernel, "_opt_at", kernel._opt_at.fn)
+        patch.setattr(buffered, "_index", buffered._index.fn)
+        patch.setattr(buffered, "_phase", buffered._phase.fn)
+        patch.setattr(buffered, "_replace_tile", buffered._replace_tile.fn)
+        patch.setattr(buffered.gl, "static_range", range)
         for slot in range(tc.nm * tc.nn):
             sink.slot = slot
-            kernel._buffer_load.fn(
-                pc, pointers, 2, slot % tc.nm, slot // tc.nm,
-                STAGE_MARK=not defer_stage_commit,
+            buffers = buffered._fill_slot.fn(
+                pc,
+                pointers,
+                buffers,
+                0,
+                None,
+                False,
+                slot % tc.nm,
+                slot // tc.nm,
+                MARK_STAGE=not defer_stage_commit,
             )
     if defer_stage_commit:
         assert not any(sink.groups)
         sink.commit_buffer_load()
     assert not sink.pending
-    return tuple(tuple(slot) for slot in sink.copies), tuple(tuple(slot) for slot in sink.groups)
+    return tuple(tuple(slot) for slot in sink.copies), tuple(
+        tuple(slot) for slot in sink.groups
+    )
 
 
 @pytest.mark.parametrize("shape", [(2, 2), (4, 2), (2, 4), (4, 4)])
-@pytest.mark.parametrize("scheme", list(WaitCommitScheme), ids=lambda scheme: scheme.name)
-@pytest.mark.parametrize("middle", [False, True], ids=["paired-scales", "middle-scales"])
+@pytest.mark.parametrize(
+    "scheme", list(WaitCommitScheme), ids=lambda scheme: scheme.name
+)
+@pytest.mark.parametrize(
+    "middle", [False, True], ids=["paired-scales", "middle-scales"]
+)
 @pytest.mark.parametrize(
     "traffic",
-    ["both-scales", "no-scales", "a-direct-scale", "b-direct-scale", "direct-scales",
-     "shared-a-pair", "shared-a-whole", "a-synchronous", "synchronous"],
+    [
+        "both-scales",
+        "no-scales",
+        "a-direct-scale",
+        "b-direct-scale",
+        "direct-scales",
+        "shared-a-pair",
+        "shared-a-whole",
+        "a-synchronous",
+        "synchronous",
+    ],
 )
-def test_emitted_groups_and_waits_retire_required_copies(shape, scheme, middle, traffic, monkeypatch):
+def test_emitted_groups_and_waits_retire_required_copies(
+    shape, scheme, middle, traffic, monkeypatch
+):
     tc = _config(shape, scheme, middle, traffic)
     copies, reads = _reference_slots(tc)
     expected = _reference_groups(tc, copies)
@@ -254,14 +308,17 @@ def test_emitted_groups_and_waits_retire_required_copies(shape, scheme, middle, 
             for slack in (0, 1, 2):
                 queue = [
                     {(stage, kind, tile) for kind, tile in group}
-                    for stage in range(between + 1) for group in flat
+                    for stage in range(between + 1)
+                    for group in flat
                 ]
                 queue.extend({("epilogue", index)} for index in range(slack))
                 committed = list(queue)
                 completed = set()
                 for slot, required in enumerate(reads):
                     target = {(0, kind, tile) for kind, tile in required}
-                    wait = _buffer_load_wait(tc, slot % tc.nm, slot // tc.nm, between, filling)
+                    wait = _buffer_load_wait(
+                        tc, slot % tc.nm, slot // tc.nm, between, filling
+                    )
                     if wait is not None:
                         wait += slack
                         if tc.commit_per_stage():
@@ -270,8 +327,10 @@ def test_emitted_groups_and_waits_retire_required_copies(shape, scheme, middle, 
                         else:
                             # Any larger count could leave the last required copy
                             # pending; any smaller one unnecessarily drains newer work.
-                            newest_required = max(i for i, group in enumerate(committed) if group & target)
-                            assert wait == len(committed[newest_required + 1:])
+                            newest_required = max(
+                                i for i, group in enumerate(committed) if group & target
+                            )
+                            assert wait == len(committed[newest_required + 1 :])
                         while len(queue) > wait:
                             completed.update(queue.pop(0))
                     elif not tc.commit_per_stage():
@@ -284,9 +343,13 @@ def test_emitted_groups_and_waits_retire_required_copies(shape, scheme, middle, 
                             committed.append(issued)
 
 
-@pytest.mark.parametrize("scheme", [
-    WaitCommitScheme.PER_STAGE_WARP_PIPELINE, WaitCommitScheme.PER_STAGE_WHOLE,
-])
+@pytest.mark.parametrize(
+    "scheme",
+    [
+        WaitCommitScheme.PER_STAGE_WARP_PIPELINE,
+        WaitCommitScheme.PER_STAGE_WHOLE,
+    ],
+)
 def test_stage_commit_can_close_after_the_slot_walk(scheme, monkeypatch):
     tc = _config((4, 2), scheme, False, "shared-a-pair")
     copies, _ = _reference_slots(tc)
@@ -294,61 +357,96 @@ def test_stage_commit_can_close_after_the_slot_walk(scheme, monkeypatch):
     assert emitted == _reference_groups(tc, copies)
 
 
-@pytest.mark.parametrize("scheme", list(WaitCommitScheme), ids=lambda scheme: scheme.name)
+@pytest.mark.parametrize(
+    "scheme", list(WaitCommitScheme), ids=lambda scheme: scheme.name
+)
 def test_synchronous_reads_keep_a_cooperative_fence(scheme, monkeypatch):
-    tc = _config((4, 2), scheme, False, "synchronous")
+    from aiter.ops.triton._gluon_kernels.gfx950.moe import _buffered as pipeline
+
     waits, barriers = [], []
-    pc = SimpleNamespace(
-        tuning_cfg=tc,
-        lds_ptrs=SimpleNamespace(wait_buffer_load_groups=waits.append),
+    tc = _config((4, 2), scheme, False, "synchronous")
+    tc.num_mini_k = lambda: 1
+    tc.pipeline_depth = lambda: 3
+    tc.warp_pipeline_compiler = lambda: False
+    tc.commit_per_stage_warp_pipeline = lambda: (
+        scheme == WaitCommitScheme.PER_STAGE_WARP_PIPELINE
     )
-    monkeypatch.setattr(kernel.gl, "barrier", lambda: barriers.append(True))
-    kernel.wait_per_stage.fn(pc, 1)
-    for ni in range(tc.nn):
-        for mi in range(tc.nm):
-            kernel.wait_per_slot.fn(pc, mi, ni, 1, True)
-    if tc.commit_per_stage():
-        assert waits == [1]
-        assert not barriers
-    else:
-        assert not waits
-        assert len(barriers) == tc.nm + tc.nn
-
-
-@pytest.mark.parametrize("scheme", [
-    WaitCommitScheme.PER_STAGE_WARP_PIPELINE, WaitCommitScheme.PER_STAGE_WHOLE,
-], ids=lambda scheme: scheme.name)
-@pytest.mark.parametrize("compiler", [False, True], ids=["none", "compiler"])
-@pytest.mark.parametrize("fill,read,dot,in_loop", [
-    (True, False, False, False),
-    (True, True, False, False),
-    (True, True, True, True),
-    (False, True, True, False),
-], ids=["fill", "prefetch", "loop", "drain"])
-def test_pipeline_stage_commit_boundaries(
-    scheme, compiler, fill, read, dot, in_loop, monkeypatch
-):
-    """Execute the live step and record ordering around its actual region borders."""
-    events = []
-    tc = _config((2, 2), scheme, False, "no-scales")
-    tc.num_mini_k = tc.num_prefetch_mini = lambda: 1
-    tc.warp_pipeline_compiler = lambda: compiler
-    tc.warp_pipeline_manual = lambda: False
-    tc.commit_per_stage_warp_pipeline = lambda: scheme == WaitCommitScheme.PER_STAGE_WARP_PIPELINE
     tc.commit_per_stage_whole = lambda: scheme == WaitCommitScheme.PER_STAGE_WHOLE
-    tc.ds_read_in_mfma = lambda *args, **kwargs: False
-    tc.scale_k_phase = lambda phase: 0
-    tc.NUM_LDS_BUFFER = 3
     tc.SCHED_MODE = 0
     pc = SimpleNamespace(
-        func_cfg=tc, tuning_cfg=tc,
+        tuning_cfg=tc,
+        func_cfg=tc,
+        lds_ptrs=SimpleNamespace(
+            wait_buffer_load_groups=waits.append, commit_buffer_load=lambda: None
+        ),
+    )
+    regs = SimpleNamespace(
+        a_payload=(), a_scale=(), b_payload=(), b_scale=(), acc=(0,) * 8
+    )
+    monkeypatch.setattr(pipeline.gl, "barrier", lambda: barriers.append(True))
+    monkeypatch.setattr(pipeline.gl, "static_range", range)
+    monkeypatch.setattr(pipeline, "_read_slot", lambda *args: ((), ()))
+    monkeypatch.setattr(
+        pipeline, "_fill_slot", lambda pc, ptrs, buffers, *args, **kwargs: buffers
+    )
+    monkeypatch.setattr(pipeline, "_advance", lambda pc, ptrs, *args: ptrs)
+    monkeypatch.setattr(pipeline, "_rotate_buffers", lambda buffers, tc: buffers)
+    monkeypatch.setattr(pipeline, "_merge_ds_read_frags", lambda *args: ())
+    monkeypatch.setattr(pipeline, "_take_reg_pairs", lambda *args: ())
+    monkeypatch.setattr(pipeline, "_make_reg_fragments", lambda *args: args)
+    monkeypatch.setattr(pipeline, "_maybe_block_dot", lambda *args: 0)
+    pipeline._step_live.fn(
+        pc, None, ((), (), ()), regs, 1, None, False, 0, False, True, 0
+    )
+    assert not waits
+    assert len(barriers) == (1 if tc.commit_per_stage() else tc.nm * tc.nn)
+
+
+@pytest.mark.parametrize(
+    "scheme",
+    [
+        WaitCommitScheme.PER_STAGE_WARP_PIPELINE,
+        WaitCommitScheme.PER_STAGE_WHOLE,
+    ],
+    ids=lambda scheme: scheme.name,
+)
+@pytest.mark.parametrize("compiler", [False, True], ids=["none", "compiler"])
+@pytest.mark.parametrize(
+    "dot,in_loop,drain",
+    [
+        (False, False, False),
+        (True, True, False),
+        (True, False, True),
+    ],
+    ids=["prefetch", "loop", "drain"],
+)
+def test_pipeline_stage_commit_boundaries(
+    scheme, compiler, dot, in_loop, drain, monkeypatch
+):
+    """Execute the unified step and record ordering at its actual region borders."""
+    from aiter.ops.triton._gluon_kernels.gfx950.moe import _buffered as pipeline
+
+    events = []
+    tc = _config((2, 2), scheme, False, "no-scales")
+    tc.num_mini_k = lambda: 1
+    tc.pipeline_depth = lambda: 3
+    tc.warp_pipeline_compiler = lambda: compiler
+    tc.commit_per_stage_warp_pipeline = lambda: (
+        scheme == WaitCommitScheme.PER_STAGE_WARP_PIPELINE
+    )
+    tc.commit_per_stage_whole = lambda: scheme == WaitCommitScheme.PER_STAGE_WHOLE
+    tc.SCHED_MODE = 0
+    pc = SimpleNamespace(
+        func_cfg=tc,
+        tuning_cfg=tc,
         lds_ptrs=SimpleNamespace(
             wait_buffer_load_groups=lambda count: events.append(("wait", count)),
             commit_buffer_load=lambda: events.append(("commit",)),
         ),
     )
-    pointers = SimpleNamespace(a_scale_hbm_ptr=None, b_scale_hbm_ptr=None)
-    regs = SimpleNamespace(a_payload=(), a_scale=(), b_payload=(), b_scale=(), acc=(0,) * 4)
+    regs = SimpleNamespace(
+        a_payload=(), a_scale=(), b_payload=(), b_scale=(), acc=(0,) * 4
+    )
 
     @contextmanager
     def stage(name):
@@ -357,45 +455,44 @@ def test_pipeline_stage_commit_boundaries(
         events.append(("exit", name))
 
     def pick_stage(enabled):
-        assert bool(unwrap(enabled)) == (compiler and read and in_loop)
+        assert bool(unwrap(enabled)) == (compiler and in_loop)
         return stage
 
-    def buffer_load(*args, **kwargs):
-        assert kwargs["STAGE_MARK"] is False
+    def buffer_load(pc, ptrs, buffers, *args, **kwargs):
+        assert kwargs["MARK_STAGE"] is False
         events.append(("load",))
+        return buffers
 
-    monkeypatch.setattr(kernel, "pick_stage", pick_stage)
-    monkeypatch.setattr(kernel.gl, "static_range", range)
-    monkeypatch.setattr(kernel.gl, "static_assert", lambda value, message: None)
-    monkeypatch.setattr(kernel.gl.amd.cdna4, "sched_barrier", lambda mask: None)
-    monkeypatch.setattr(kernel, "wait_per_stage", kernel.wait_per_stage.fn)
-    monkeypatch.setattr(kernel, "wait_per_slot", kernel.wait_per_slot.fn)
-    monkeypatch.setattr(kernel, "_buffer_load", buffer_load)
-    monkeypatch.setattr(kernel, "_ds_read", lambda *args: ((), ()))
-    monkeypatch.setattr(kernel, "_merge_ds_read_frags", lambda *args: ())
-    monkeypatch.setattr(kernel, "_ds_read_tails", lambda *args: ((), ()))
-    monkeypatch.setattr(kernel, "_take_reg_pairs", lambda *args: ())
-    monkeypatch.setattr(kernel, "_make_reg_fragments", lambda *args: args)
-    monkeypatch.setattr(kernel, "_advance_hbm_ptrs", lambda pc, ptrs, *args: ptrs)
-    monkeypatch.setattr(kernel, "_advance_scale_hbm_ptrs", lambda pc, ptrs: ptrs)
-    monkeypatch.setattr(kernel, "_maybe_block_dot", lambda *args: events.append(("dot",)))
-
-    kernel._pipeline_step_impl.fn(
-        pc, pointers, regs, 2, 0, 1, fill, read, dot, in_loop, WAIT_SLACK=2,
+    monkeypatch.setattr(pipeline, "pick_stage", pick_stage)
+    monkeypatch.setattr(pipeline.gl, "static_range", range)
+    monkeypatch.setattr(pipeline.gl.amd.cdna4, "sched_barrier", lambda mask: None)
+    monkeypatch.setattr(pipeline, "_wait", lambda *args: 3)
+    monkeypatch.setattr(pipeline, "_fill_slot", buffer_load)
+    monkeypatch.setattr(pipeline, "_read_slot", lambda *args: ((), ()))
+    monkeypatch.setattr(pipeline, "_merge_ds_read_frags", lambda *args: ())
+    monkeypatch.setattr(pipeline, "_take_reg_pairs", lambda *args: ())
+    monkeypatch.setattr(pipeline, "_make_reg_fragments", lambda *args: args)
+    monkeypatch.setattr(pipeline, "_rotate_buffers", lambda buffers, tc: buffers)
+    monkeypatch.setattr(pipeline, "_advance", lambda pc, ptrs, *args: ptrs)
+    monkeypatch.setattr(
+        pipeline, "_maybe_block_dot", lambda *args: events.append(("dot",))
     )
-    assert [event for event in events if event[0] == "wait"] == ([("wait", 3)] if read else [])
-    if read:
-        assert events[0] == ("wait", 3), "Stage waits must precede the entire slot walk."
-    assert events.count(("commit",)) == int(fill)
-    if fill:
-        commit = events.index(("commit",))
-        assert events[:commit].count(("load",)) == 4
-        if scheme == WaitCommitScheme.PER_STAGE_WARP_PIPELINE:
-            assert events[commit - 1] == ("load",)
-            assert events[commit + 1] == ("exit", "mem")
-            assert events[commit + 2] == ("enter", "mfma")
-        else:
-            assert events[commit - 2] == ("exit", "mfma")
-            assert events[commit - 1] == ("enter", "commit")
-            assert events[commit + 1] == ("exit", "commit")
-            assert commit == len(events) - 2
+    pipeline._step_live.fn(
+        pc, None, ((), (), ()), regs, 1, 0 if drain else None, drain, 0, in_loop, dot, 2
+    )
+    assert [event for event in events if event[0] == "wait"] == [("wait", 3)]
+    assert events[0] == ("wait", 3)
+    # Stage/slot commit schemes retain empty groups during the drain. The FIFO
+    # accounting models those exact commits, including their region placement.
+    assert events.count(("commit",)) == 1
+    commit = events.index(("commit",))
+    assert events[:commit].count(("load",)) == 4
+    if scheme == WaitCommitScheme.PER_STAGE_WARP_PIPELINE:
+        assert events[commit - 1] == ("load",)
+        assert events[commit + 1] == ("exit", "mem")
+        assert events[commit + 2] == ("enter", "mfma")
+    else:
+        assert events[commit - 2] == ("exit", "mfma")
+        assert events[commit - 1] == ("enter", "commit")
+        assert events[commit + 1] == ("exit", "commit")
+        assert commit == len(events) - 2

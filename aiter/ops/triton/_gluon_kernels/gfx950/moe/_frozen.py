@@ -9,7 +9,7 @@ tuned value so no stray flag can perturb the reference schedule. It lives in its
 module for exactly that reason: nothing here is meant to be refactored alongside the
 live step, and keeping the two apart makes an accidental edit visible in the diff.
 
-``AITER_TRITON_MOE_GLUON_FROZEN_STEP=1`` selects it -- see ``moe_gemm._pipeline_step``.
+``AITER_TRITON_MOE_GLUON_FROZEN_STEP=1`` selects it -- see ``_buffered._step``.
 The acceptance test for a re-snapshot is *identical assembly* against ``FROZEN_STEP=0``,
 which is also what proves the ``*_frozen`` helper twins below are still in sync with
 their live counterparts.
@@ -17,9 +17,9 @@ their live counterparts.
 The shared pointer and register aggregates are adapted at the step boundary; the
 snapshot's scheduling statements, including its separate prologue fence, stay fixed.
 
-This module is imported from the *bottom* of ``moe_gemm``: the snapshot calls back into
-the shared, non-frozen halves of the kernel (``_ds_read_operand``, ``_maybe_block_dot``, the
-placement helpers), so the cycle is only breakable in that direction.
+The shared ``moe_gemm`` helpers are imported after this module's definitions.
+The unified driver also imports these frozen steps, so deferring the shared
+imports lets either module initialize first. JIT resolves the helpers later.
 """
 
 from triton.experimental import gluon
@@ -28,17 +28,6 @@ from triton.experimental.gluon import language as gl
 from ._lang import require_constexpr
 from ._lang import unwrap as _v
 from ._schedule import _buffer_load_order, _buffer_load_tile
-from .moe_gemm import (
-    _advance_hbm_ptrs,
-    _ds_read_operand,
-    _make_reg_fragments,
-    _maybe_block_dot,
-    _opt_at,
-    _PipelinePointers,
-    _slot_index,
-    _take_pairs,
-    _take_reg_pairs,
-)
 
 
 @gluon.jit
@@ -259,7 +248,7 @@ def _buffer_load_frozen(
 ):
     """The global->LDS copies slot ``(mi, ni)`` owns, each its own commit group.
 
-    FROZEN SNAPSHOT -- do not refactor; ``_buffer_load`` is the live one.
+    FROZEN SNAPSHOT -- do not refactor; ``_buffered._fill_slot`` is the live one.
 
     Specialised on the flags the ~625 us kernel ran with, so nothing here reads
     os.environ: the legacy per-fill groups (the former ONE_MARK 0 default) and
@@ -375,12 +364,12 @@ def _pipeline_step_frozen(
     and 622.3 us saturating (bf16).
 
     Select with AITER_TRITON_MOE_GLUON_FROZEN_STEP=1 to A/B a refactor of
-    ``_pipeline_step_impl`` against the known-good schedule. Immediately after a
+    ``_buffered._step_live`` against the known-good schedule. Immediately after a
     re-snapshot the two must compile to *identical* assembly -- that, not perf, is
     the check that the copy is faithful.
 
-    Re-snapshot procedure: replay ``_pipeline_step_impl`` here with the flag values
-    listed below folded in, then diff the ``.amdgcn`` of FROZEN_STEP=0 against
+    Re-snapshot procedure: copy the live step here with the flag values listed
+    below folded in, then diff the ``.amdgcn`` of FROZEN_STEP=0 against
     FROZEN_STEP=1 and require zero differing instruction lines.
 
 
@@ -455,7 +444,7 @@ def _pipeline_step_frozen(
     gl.static_assert(
         HEAD_MINI == 0,
         "_pipeline_step_frozen is the VGPR_PREFETCH_K == BLOCK_K schedule; "
-        "HEAD_MINI != 0 needs _pipeline_step_impl",
+        "split-stage prefetch is unsupported",
     )
     # The frozen kernel always stages B through LDS.
     # PIPE (the warp-pipeline *pass*) is dead here: it needs `not _MANUAL_PP` and the
@@ -649,3 +638,17 @@ def _pipeline_step_frozen(
         a_scale_hbm_ptr,
         b_scale_hbm_ptr,
     ), _make_reg_fragments(a_tail, b_tail, acc)
+
+
+# The driver imports these steps; defer shared helpers until the steps exist.
+from .moe_gemm import (
+    _advance_hbm_ptrs,
+    _ds_read_operand,
+    _make_reg_fragments,
+    _maybe_block_dot,
+    _opt_at,
+    _PipelinePointers,
+    _slot_index,
+    _take_pairs,
+    _take_reg_pairs,
+)

@@ -76,12 +76,6 @@ _COMPONENT_BUFFER_KEYS = (
 _REGISTER_STORAGE_KEYS = ("B_IN_REG", "B_SCALE_IN_REG", "A_SCALE_IN_REG")
 
 
-def _uses_independent_buffers(config):
-    return any(
-        config.get(key, 0) for key in _COMPONENT_BUFFER_KEYS + _REGISTER_STORAGE_KEYS
-    ) or bool(config.get("A_SCALE_NUMB_BUFFER", 0))
-
-
 def _can_overflow_int32(t: torch.Tensor | None, drop_leading: int = 0) -> bool:
     """Largest byte-element offset addressable in the tensor, after optionally dropping
     the leading (expert) axis -- the kernel folds that stride into the 64-bit scalar
@@ -233,6 +227,11 @@ def _probe_lds_bytes_uncached(cfg: dict, dq_a, dq_b) -> int:
     """LDS footprint of a candidate config, computed by the *aggregate* rather than by a
     second copy of the arithmetic -- the host and the device must not be able to
     disagree about whether a config fits."""
+    return _probe_tuning_config(cfg, dq_a, dq_b).lds_bytes()
+
+
+def _probe_tuning_config(cfg: dict, dq_a, dq_b):
+    """Build the shape-independent configuration used by capability checks."""
     from triton.experimental.gluon import language as gl
 
     func = KernelFuncConfig(
@@ -248,7 +247,17 @@ def _probe_lds_bytes_uncached(cfg: dict, dq_a, dq_b) -> int:
         False,
         False,
     )
-    return KernelTuningConfig(func, *_tuning_args(cfg)).lds_bytes()
+    return KernelTuningConfig(func, *_tuning_args(cfg))
+
+
+@cache
+def _pipeline_error(cfg_items: tuple, dq_a, dq_b, K):
+    """Share the exact device ring and minimum-strip contract with host fallback."""
+    try:
+        _probe_tuning_config(dict(cfg_items), dq_a, dq_b).validate_pipeline(K)
+    except AssertionError as error:
+        return str(error)
+    return None
 
 
 @cache
@@ -332,7 +341,7 @@ def get_gluon_config_uncached(
     while block_n > gran_n and N % block_n != 0:
         block_n //= 2
     min_k = max(128, instr[2])
-    while block_k > min_k and (K % block_k != 0 or K // block_k < nb):
+    while block_k > min_k and (K % block_k != 0 or K // block_k < 2 * nb + 1):
         block_k //= 2
 
     def _build(bn, bk, n_buf):
@@ -445,17 +454,14 @@ def get_gluon_config_uncached(
             "BLOCK_M": block_m,
             "BLOCK_N": bn,
             "BLOCK_K": out_bk,
-            # Independent of NUM_LDS_BUFFER: the rotating LDS index is a runtime
-            # value in the unrolled body, so the trip no longer has to land back
-            # on the same buffer phase. Defaults to n_buf, which is what it was
-            # pinned to when the two were coupled.
+            # LDS indices may vary at runtime. Register rings round this requested
+            # factor up to a multiple of their active depths' least common multiple.
             "K_UNROLL": _env_int("AITER_TRITON_MOE_GLUON_K_UNROLL", n_buf),
             "MINI_BLOCK_K": out_bk,
             "MINI_BLOCK_M": out_mini_m,
             "MINI_BLOCK_N": out_mini_n,
             "NUM_LDS_BUFFER": n_buf,
-            # Zero inherits NUM_LDS_BUFFER; explicit component counts select the
-            # independent pipeline and its GCD-based unroll factor.
+            # Zero inherits NUM_LDS_BUFFER in the common component pipeline.
             "A_NUM_BUFFER": _env_int("AITER_TRITON_MOE_GLUON_A_NUM_BUFFER", 0),
             "B_NUM_BUFFER": _env_int("AITER_TRITON_MOE_GLUON_B_NUM_BUFFER", 0),
             "A_SCALE_NUM_BUFFER": _env_int(
@@ -602,7 +608,7 @@ def _default_launch_config(block_m, N, K, dq_a, dq_b, small_grid, apply_swiglu):
         and block_m == 128
         and N % 256 == 0
         and K % 256 == 0
-        and K // 128 >= 3
+        and K // 128 >= 10
         and not c["FROZEN_STEP"]
     ):
         # FP8 K128 has the same payload byte tiles as FP4 K256. The scale
@@ -709,11 +715,14 @@ def gluon_supported(
         return False, f"N {N} % BLOCK_N {cfg['BLOCK_N']} != 0"
     if K % cfg["BLOCK_K"] != 0:
         return False, f"K {K} % BLOCK_K {cfg['BLOCK_K']} != 0"
-    if (
-        not _uses_independent_buffers(cfg)
-        and K // cfg["BLOCK_K"] < cfg["NUM_LDS_BUFFER"]
-    ):
-        return False, "K strip shorter than the pipeline depth"
+    pipeline_error = _pipeline_error(
+        tuple(sorted((key, _hashable(value)) for key, value in cfg.items())),
+        dq_a,
+        dq_b,
+        K,
+    )
+    if pipeline_error is not None:
+        return False, pipeline_error
     # The fill schedule hands each slot of the NM x NN walk one mini-block copy, so it
     # needs at least as many slots as copies -- both axes split. Refused here rather
     # than in validate() so a tile that cannot split falls back instead of failing the
@@ -778,6 +787,9 @@ def _launch_spec(
             block_m, N, K, dq_a, dq_b, small_grid, act is not None
         )
     )
+    assert c["BLOCK_M"] == block_m, (
+        f"config BLOCK_M {c['BLOCK_M']} must match routing block_m {block_m}"
+    )
     func_spec = FuncSpec(
         int(dq_a),
         int(dq_b),
@@ -798,6 +810,11 @@ def _launch_spec(
     # use, so the grid math and the tile math cannot drift.
     func_cfg_host = KernelFuncConfig(*func_spec)
     tuning_cfg_host = KernelTuningConfig(func_cfg_host, *tuning_spec)
+    # Storage can still change during scale preparation, which changes the exact
+    # minimum K. Validate inherited depths and shape arithmetic now; validate the
+    # complete effective configuration once preparation has resolved its layouts.
+    tuning_cfg_host.validate_buffer_counts()
+    tuning_cfg_host.num_k_tiles(K)
     grid_n = tuning_cfg_host.grid_N(N)
     grid_n = grid_n.value if hasattr(grid_n, "value") else grid_n
     # Keep each spec in one constexpr so launch specialization sees four leaves.
@@ -809,6 +826,12 @@ def _launch_spec(
     )
     num_warps = c["warps_per_cta"][0] * c["warps_per_cta"][1]
     return grid_n, constexpr_args, num_warps, c["WAVES_PER_EU"], c, tuning_cfg_host
+
+
+@cache
+def _validate_launch_config(tuning_cfg, N, K):
+    """Validate each cached effective layout once, before any kernel launch."""
+    return tuning_cfg.validate(N, K)
 
 
 #: Attribute the padded-row token map is memoised under, on the ``ExptData`` instance.
@@ -890,11 +913,9 @@ def _scale_shuffle_supported(cfg, operand):
         return False
     if block_k == 128:
         # Each full dword serves two K128 stages. Both non-K bytes must belong
-        # to this wave. The legacy loop requires even unrolling; the independent
-        # component pipeline tracks the two-stage phase across its GCD-sized body.
+        # to this wave; the component pipeline tracks the phase across any unroll.
         return (
             int(cfg["MINI_BLOCK_K"]) == 128
-            and (_uses_independent_buffers(cfg) or int(cfg["K_UNROLL"]) % 2 == 0)
             and not cfg.get("FROZEN_STEP", False)
             and int(cfg["tiles_per_warp"][operand]) >= 2
         )
@@ -938,9 +959,8 @@ def _sorted_shuffle_a_scales(x_scales, routing_data, gather_indx, K, cfg):
     dev = x_scales.device
     expt_data = routing_data.expt_data
     n_expts_act = routing_data.n_expts_act
-    # Derive the block bound from this config's BLOCK_M rather than taking the launch
-    # grid's: a tuner-supplied config may override BLOCK_M, and the buffer has to be
-    # sized in the same block space the kernel will index it in.
+    # _launch_spec requires the config and routing to use the same BLOCK_M, so this
+    # bound sizes the scale buffer in the same block space as the launch grid.
     n_blocks = routing_data.n_blocks(int(gather_indx.shape[0]), block_m)
     max_sorted = n_blocks * block_m
     sorted_token_ids, cumsum = _sorted_token_id_map(
@@ -1211,6 +1231,8 @@ def moe_gemm_gluon(
     scales is MXFP8, fp8 alone is FP8_E4M3 (unit scales, still on the scaled pipe),
     bf16 alone is BF16 -- so every ``moe_gemm_*`` op calls this one function.
     :func:`gluon_supported` must have said yes for these tensors first.
+    An explicit config's ``BLOCK_M`` must match ``routing_data.block_m`` because
+    the routing offsets and block map are built for that geometry.
 
     ``y_scales`` non-None selects the fused MXFP4 output quant: ``y`` then holds the
     E2M1 payload (``N // ARN // 2`` uint8 columns) and ``y_scales`` the E8M0 exponents,
@@ -1353,6 +1375,7 @@ def moe_gemm_gluon(
             )
     if _cfg.get("B_IN_REG", False) and not _cfg.get("B_PRESHUFFLED", False):
         raise ValueError("B_IN_REG requires B_PRESHUFFLED weights")
+    _validate_launch_config(_tc, N, K)
 
     b = QuantExpertTensor.make(
         dq_b,
@@ -1424,6 +1447,7 @@ def moe_gemm_gluon(
         x_static_scale,
         grid_m,
         grid_n,
+        K // int(_cfg["BLOCK_K"]),
         a.dtype_quant,
         a.hidden_dim,
         a.topk,
