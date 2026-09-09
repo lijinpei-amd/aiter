@@ -351,8 +351,6 @@ class _CopyRecorder:
         buffer,
         tile,
         k,
-        _scale_ptr,
-        _offsets,
         READ_PAYLOAD,
         READ_SCALE,
         SCALE_READ_IDX,

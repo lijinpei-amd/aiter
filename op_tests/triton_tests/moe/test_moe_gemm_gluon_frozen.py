@@ -52,6 +52,27 @@ def test_frozen_step_pipeline_modes_are_bitwise_deterministic(frozen_case, mode)
         ), (mode, repeat)
 
 
+def test_frozen_unshuffled_k128_scales_load_directly(monkeypatch):
+    if get_arch() != "gfx950":
+        pytest.skip("Gluon MoE kernels are gfx950 only.")
+    for name in os.environ:
+        if name.startswith("AITER_TRITON_MOE_GLUON_"):
+            monkeypatch.delenv(name)
+    monkeypatch.setenv("AITER_TRITON_MOE_GLUON_B_PRESHUFFLED", "1")
+    case = _build_register_case("mxfp8", m=257, n=512, k=2048, experts=4, topk=2)
+    config = dict(
+        _register_config("mxfp8"),
+        FROZEN_STEP=True,
+        A_SCALE_SORTED_SHUFFLED=False,
+        B_SCALE_SHUFFLED=False,
+    )
+    tc = host._probe_tuning_config(config, DtypeQuant.MXFP8, DtypeQuant.MXFP8)
+    assert not host._cval(tc.scale_via_lds(0))
+    assert not host._cval(tc.scale_via_lds(1))
+    _launch_register_case(case, config)
+    torch.testing.assert_close(case.output[0], case.expected, rtol=3e-4, atol=3e-4)
+
+
 @pytest.mark.parametrize("gated", [False, True], ids=["gemm2", "gemm1"])
 @pytest.mark.parametrize("depth", [2, 3])
 @pytest.mark.parametrize("dtype", ["bf16", "mxfp4"])
