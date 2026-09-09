@@ -44,7 +44,10 @@ class _Config(_ScheduleConfig):
         super().__init__(*shape, scheme, middle)
         self.depths = depths  # A, A scale, B, B scale.
         self.scales = (scales, scales)
-        self.payload_async = (True, not bool(register_mask & 1))
+        self.payload_async = (
+            not bool(register_mask & 8),
+            not bool(register_mask & 1),
+        )
         self.scale_async = (not bool(register_mask & 2), not bool(register_mask & 4))
         self.B_IN_REG = bool(register_mask & 1)
         self.packed = packed
@@ -208,35 +211,23 @@ class _Machine:
             self.pending.append(token)
         return fragments
 
-    def buffer_load_a_payload(self, ring, mini, pointer, offset, soff=0):
-        self.load(0, ring, mini, pointer + soff)
+    def buffer_load_payload(
+        self, operand, VIA_LDS, ring, mini, pointer, offset, soff=0
+    ):
+        fragments = self.load(operand * 2, ring, mini, pointer + soff)
+        if not VIA_LDS:
+            return fragments
 
-    def buffer_load_b_payload(self, ring, mini, pointer, offset, soff=0):
-        self.load(2, ring, mini, pointer + soff)
-
-    def buffer_load_a_scale(self, ring, mini, pointer, offset, soff=0):
-        self.load(
-            1,
-            ring,
-            mini,
-            pointer + soff,
-            (self.current_read + self.tc.depths[1] - 1) % 2,
+    def buffer_load_scale(
+        self, operand, VIA_LDS, ring, mini, pointer, offset, soff=0, K_PHASE=0
+    ):
+        kind = operand * 2 + 1
+        phase = (
+            (self.current_read + self.tc.depths[kind] - 1) % 2 if VIA_LDS else K_PHASE
         )
-
-    def buffer_load_b_scale(self, ring, mini, pointer, offset, soff=0):
-        self.load(
-            3,
-            ring,
-            mini,
-            pointer + soff,
-            (self.current_read + self.tc.depths[3] - 1) % 2,
-        )
-
-    def buffer_load_b_register(self, pointer, offset, soff=0):
-        return self.load(2, None, offset, pointer + soff)
-
-    def buffer_load_scale_register(self, operand, pointer, offset, soff=0, *, K_PHASE):
-        return self.load(operand * 2 + 1, None, offset, pointer + soff, K_PHASE)
+        fragments = self.load(kind, ring, mini, pointer + soff, phase)
+        if not VIA_LDS:
+            return fragments
 
     def commit_buffer_load(self):
         group = tuple(self.pending)
@@ -294,7 +285,7 @@ class _Machine:
         self.reads.add(token)
         return fragments[k]
 
-    def ds_read(
+    def ds_read_frag(
         self,
         operand,
         ring,
@@ -314,12 +305,6 @@ class _Machine:
             else None
         )
         return payload, scale
-
-    def ds_read_a_frag(self, *args, **kwargs):
-        return self.ds_read(0, *args, **kwargs)
-
-    def ds_read_b_frag(self, *args, **kwargs):
-        return self.ds_read(1, *args, **kwargs)
 
     def dot(self, a, b, accumulator, mk, fc, tc, enabled, phase):
         if not enabled:
@@ -379,11 +364,11 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         return tuple(
             (
                 (None,)
-                * (tc.depths[kind] * (tc.nn if kind != 1 else tc.nm) * tc.num_mini_k())
+                * (tc.depths[kind] * (tc.nm if kind < 2 else tc.nn) * tc.num_mini_k())
                 if kind in tc.active_kinds() and not tc.is_async(kind)
                 else ()
             )
-            for kind in (2, 1, 3)
+            for kind in (0, 2, 1, 3)
         )
 
     with monkeypatch.context() as patch:
@@ -464,17 +449,18 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         ((3, 1, 3, 1), 0, {"scales": False}),
         ((3, 1, 3, 1), 0, {"scales": False, "unroll": 2}),
         ((3, 3, 3, 3), 1, {}),
+        ((3, 3, 3, 3), 8, {}),
         ((3, 3, 3, 3), 2, {"read_mask": 5}),
         ((3, 3, 3, 3), 4, {"read_mask": 10}),
-        ((3, 3, 3, 3), 7, {"read_mask": 15}),
+        ((3, 3, 3, 3), 15, {"read_mask": 15}),
         ((5, 5, 2, 2), 0, {"read_mask": 10}),
-        ((5, 2, 2, 3), 7, {"middle": True, "soff": True}),
+        ((5, 2, 2, 3), 15, {"middle": True, "soff": True}),
         ((2, 4, 3, 2), 6, {"shape": (4, 2), "read_mask": 5}),
         ((3, 2, 4, 3), 0, {"shape": (2, 4), "read_mask": 10}),
         ((2, 1, 3, 1), 1, {"scales": False}),
         ((3, 2, 2, 3), 6, {"packed": True, "middle": True, "soff": True}),
         ((3, 3, 3, 3), 6, {"packed": True, "soff": True}),
-        ((2, 4, 3, 2), 7, {"packed": True}),
+        ((2, 4, 3, 2), 15, {"packed": True}),
     ],
 )
 def test_emitted_unified_pipeline_all_reachable_remainders(
@@ -499,7 +485,7 @@ def test_emitted_unified_pipeline_all_reachable_remainders(
 @pytest.mark.parametrize(
     "scheme", list(WaitCommitScheme), ids=lambda scheme: scheme.name
 )
-@pytest.mark.parametrize("register_mask", range(8))
+@pytest.mark.parametrize("register_mask", range(16))
 def test_peeled_wait_prefix_is_minimal(scheme, register_mask):
     tc = _Config(scheme, (2, 4, 6, 3), register_mask, middle=True)
     slots = (None,) if tc.commit_per_stage() else range(tc.nm * tc.nn)

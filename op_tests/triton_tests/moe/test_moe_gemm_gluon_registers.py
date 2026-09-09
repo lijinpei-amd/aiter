@@ -277,6 +277,107 @@ def test_register_b_uses_buffer_load_and_less_lds(register_case):
     assert any(" lds" in line for line in loads), "A must still load directly to LDS"
 
 
+def test_small_a_payload_uses_register_ring(monkeypatch):
+    """A tile too small for one full copy per CTA wave must stay in registers."""
+    _clean_register_environment(monkeypatch)
+    case = _build_register_case("bf16", m=257, n=512, k=512, experts=4, topk=2)
+    config = _register_config("bf16")
+    config.update(
+        BLOCK_K=32,
+        MINI_BLOCK_K=32,
+        MINI_BLOCK_M=16,
+        MINI_BLOCK_N=128,
+        VGPR_PREFETCH_K=32,
+        mfma_instr_shape=(16, 16, 16),
+        warps_per_cta=(1, 4),
+        tiles_per_warp=(1, 2),
+        K_UNROLL=3,
+    )
+    tc = host._probe_tuning_config(config, DtypeQuant.BF16, DtypeQuant.BF16)
+    assert not host._cval(tc.payload_via_lds(0))
+    assert host._cval(tc.payload_via_lds(1))
+
+    kernel = _launch_register_case(case, config)
+    torch.testing.assert_close(case.output[0], case.expected, rtol=3e-4, atol=3e-5)
+    loads = [
+        line
+        for line in kernel.asm["amdgcn"].splitlines()
+        if re.search(r"\bbuffer_load_dwordx4\b", line)
+    ]
+    assert any(" lds" not in line for line in loads), "A must load into registers"
+    assert any(" lds" in line for line in loads), "B must load directly to LDS"
+
+
+def test_small_b_payload_uses_register_ring_without_preshuffle(monkeypatch):
+    """Automatic register routing also supports an ordinary, unshuffled B tensor."""
+    _clean_register_environment(monkeypatch)
+    monkeypatch.setenv("AITER_TRITON_MOE_GLUON_B_PRESHUFFLED", "0")
+    case = _build_register_case("bf16", m=257, n=512, k=512, experts=4, topk=2)
+    config = _register_config("bf16")
+    config.update(
+        BLOCK_N=32,
+        BLOCK_K=32,
+        MINI_BLOCK_K=32,
+        MINI_BLOCK_M=64,
+        MINI_BLOCK_N=16,
+        VGPR_PREFETCH_K=32,
+        mfma_instr_shape=(16, 16, 16),
+        warps_per_cta=(4, 1),
+        tiles_per_warp=(1, 1),
+        K_UNROLL=3,
+        B_IN_REG=False,
+        B_PRESHUFFLED=False,
+    )
+    tc = host._probe_tuning_config(config, DtypeQuant.BF16, DtypeQuant.BF16)
+    assert host._cval(tc.payload_via_lds(0))
+    assert not host._cval(tc.payload_via_lds(1))
+
+    kernel = _launch_register_case(case, config)
+    torch.testing.assert_close(case.output[0], case.expected, rtol=3e-4, atol=3e-5)
+    loads = [
+        line
+        for line in kernel.asm["amdgcn"].splitlines()
+        if re.search(r"\bbuffer_load_dwordx4\b", line)
+    ]
+    assert any(" lds" in line for line in loads), "A must load directly to LDS"
+    assert any(" lds" not in line for line in loads), "B must load into registers"
+
+
+def test_small_a_and_b_payloads_share_register_pipeline(monkeypatch):
+    """Both payload register rings can advance together without any payload LDS."""
+    _clean_register_environment(monkeypatch)
+    monkeypatch.setenv("AITER_TRITON_MOE_GLUON_B_PRESHUFFLED", "0")
+    case = _build_register_case("bf16", m=257, n=512, k=512, experts=4, topk=2)
+    config = _register_config("bf16")
+    config.update(
+        BLOCK_N=64,
+        BLOCK_K=32,
+        MINI_BLOCK_K=32,
+        MINI_BLOCK_M=32,
+        MINI_BLOCK_N=32,
+        VGPR_PREFETCH_K=32,
+        mfma_instr_shape=(16, 16, 16),
+        warps_per_cta=(2, 2),
+        tiles_per_warp=(1, 1),
+        K_UNROLL=3,
+        B_IN_REG=False,
+        B_PRESHUFFLED=False,
+    )
+    tc = host._probe_tuning_config(config, DtypeQuant.BF16, DtypeQuant.BF16)
+    assert not host._cval(tc.payload_via_lds(0))
+    assert not host._cval(tc.payload_via_lds(1))
+
+    kernel = _launch_register_case(case, config)
+    torch.testing.assert_close(case.output[0], case.expected, rtol=3e-4, atol=3e-5)
+    loads = [
+        line
+        for line in kernel.asm["amdgcn"].splitlines()
+        if re.search(r"\bbuffer_load_dwordx4\b", line)
+    ]
+    assert loads
+    assert all(" lds" not in line for line in loads)
+
+
 def test_unquantized_gate_up_split_allows_small_warp_extent(register_case):
     """FP32 output needs no warp-local 32-element output-scale reduction."""
     if register_case.dtype == "bf16":

@@ -61,7 +61,7 @@ def _active(tc, kind, stage, drain=False):
 
 @gluon.constexpr_function
 def _async(tc, kind):
-    """Direct-register and synchronous copies own no LDS async-copy group."""
+    """Direct-register loads own no LDS async-copy group."""
     return tc.scale_via_lds(kind // 2) if kind % 2 else tc.payload_via_lds(kind // 2)
 
 

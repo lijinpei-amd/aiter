@@ -152,7 +152,7 @@ def _scale_buffer_load_tile_frozen(mi, ni, NM, NN, want_a):
 
     Still one slot per mini block even when several share a scale tile: the commit
     group has to be emitted either way, because _buffer_load_wait counts G = NM + NN groups
-    per stage. buffer_load_a_scale drops the redundant *copy* and leaves the group empty.
+    per stage. buffer_load_scale drops the redundant *copy* and leaves the group empty.
     """
     s = _slot_index(mi, ni, NM, NN)
     n = NM if _v(want_a) else NN
@@ -280,13 +280,19 @@ def _buffer_load_frozen(
     # and the SGPR holding them is hoisted out of the loop.
     # SOFF_UNROLL = 0: every copy addresses its own base, no soffset.
     if require_constexpr(A_TILE is not None):
-        pc.lds_ptrs.buffer_load_a_payload(
-            BUFFER_LOAD_IDX, A_TILE, a_hbm_ptr, pc.a_hbm_offs[A_TILE], 0
+        pc.lds_ptrs.buffer_load_payload(
+            0, True, BUFFER_LOAD_IDX, A_TILE, a_hbm_ptr, pc.a_hbm_offs[A_TILE], 0
         )
         # Payload and its own scale share one commit group; a scale placed elsewhere
         # gets its own below.
-        if require_constexpr(A_SC == A_TILE):
-            pc.lds_ptrs.buffer_load_a_scale(
+        if require_constexpr(
+            A_SC == A_TILE
+            and func_cfg.has_scale(0)
+            and pc.tuning_cfg.scale_via_lds(0)
+        ):
+            pc.lds_ptrs.buffer_load_scale(
+                0,
+                True,
                 BUFFER_LOAD_IDX,
                 A_TILE,
                 a_scale_hbm_ptr,
@@ -295,20 +301,31 @@ def _buffer_load_frozen(
             )
         pc.lds_ptrs.commit_buffer_load()
     if require_constexpr(A_SC is not None and A_SC != A_TILE):
-        pc.lds_ptrs.buffer_load_a_scale(
-            BUFFER_LOAD_IDX,
-            A_SC,
-            a_scale_hbm_ptr,
-            _opt_at(pc.a_scale_hbm_offs, A_SC, func_cfg.a_has_scale()),
-            0,
-        )
+        if require_constexpr(
+            func_cfg.has_scale(0) and pc.tuning_cfg.scale_via_lds(0)
+        ):
+            pc.lds_ptrs.buffer_load_scale(
+                0,
+                True,
+                BUFFER_LOAD_IDX,
+                A_SC,
+                a_scale_hbm_ptr,
+                _opt_at(pc.a_scale_hbm_offs, A_SC, func_cfg.a_has_scale()),
+                0,
+            )
         pc.lds_ptrs.commit_buffer_load()
     if require_constexpr(B_TILE is not None):
-        pc.lds_ptrs.buffer_load_b_payload(
-            BUFFER_LOAD_IDX, B_TILE, b_hbm_ptr, pc.b_hbm_offs[B_TILE], 0
+        pc.lds_ptrs.buffer_load_payload(
+            1, True, BUFFER_LOAD_IDX, B_TILE, b_hbm_ptr, pc.b_hbm_offs[B_TILE], 0
         )
-        if require_constexpr(B_SC == B_TILE):
-            pc.lds_ptrs.buffer_load_b_scale(
+        if require_constexpr(
+            B_SC == B_TILE
+            and func_cfg.has_scale(1)
+            and pc.tuning_cfg.scale_via_lds(1)
+        ):
+            pc.lds_ptrs.buffer_load_scale(
+                1,
+                True,
                 BUFFER_LOAD_IDX,
                 B_TILE,
                 b_scale_hbm_ptr,
@@ -317,13 +334,18 @@ def _buffer_load_frozen(
             )
         pc.lds_ptrs.commit_buffer_load()
     if require_constexpr(B_SC is not None and B_SC != B_TILE):
-        pc.lds_ptrs.buffer_load_b_scale(
-            BUFFER_LOAD_IDX,
-            B_SC,
-            b_scale_hbm_ptr,
-            _opt_at(pc.b_scale_hbm_offs, B_SC, func_cfg.b_has_scale()),
-            0,
-        )
+        if require_constexpr(
+            func_cfg.has_scale(1) and pc.tuning_cfg.scale_via_lds(1)
+        ):
+            pc.lds_ptrs.buffer_load_scale(
+                1,
+                True,
+                BUFFER_LOAD_IDX,
+                B_SC,
+                b_scale_hbm_ptr,
+                _opt_at(pc.b_scale_hbm_offs, B_SC, func_cfg.b_has_scale()),
+                0,
+            )
         pc.lds_ptrs.commit_buffer_load()
     if require_constexpr(ADVANCE):
         # One bump per step: the frozen kernel did not fold steps into soffset.

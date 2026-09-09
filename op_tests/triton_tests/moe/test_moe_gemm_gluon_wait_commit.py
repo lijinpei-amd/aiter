@@ -100,10 +100,10 @@ def _config(shape, scheme, middle, traffic):
         tc.a_scale_ratio = 2
     elif traffic == "shared-a-whole":
         tc.a_scale_ratio = tc.nm
-    elif traffic == "a-synchronous":
+    elif traffic == "a-register-payload":
         tc.scales = (False, False)
         tc.payload_async = (False, True)
-    elif traffic == "synchronous":
+    elif traffic == "register-payloads":
         tc.scales = (False, False)
         tc.payload_async = (False, False)
     return tc
@@ -177,28 +177,30 @@ class _LDSRecorder:
         self.copies = [[] for _ in range(tc.nm * tc.nn)]
         self.groups = [[] for _ in self.copies]
 
-    def buffer_load_a_payload(self, *args):
-        _lds.LDSManager.buffer_load_a_payload.fn(self, *args)
+    def buffer_load_payload(self, operand, VIA_LDS, buffer, tile, *args):
+        if VIA_LDS:
+            _lds.LDSManager.buffer_load_payload.fn(
+                self, operand, VIA_LDS, buffer, tile, *args
+            )
+        else:
+            # A direct-register load is issued but owns no LDS async-copy group.
+            self.copies[self.slot].append((operand * 2, tile))
+            return (0,)
 
-    def buffer_load_a_scale(self, *args):
-        _lds.LDSManager.buffer_load_a_scale.fn(self, *args)
+    def buffer_load_scale(self, operand, VIA_LDS, *args, **kwargs):
+        if VIA_LDS:
+            _lds.LDSManager.buffer_load_scale.fn(
+                self, operand, VIA_LDS, *args, **kwargs
+            )
+        else:
+            # A register load has no LDS destination and owns no async-copy group.
+            return (0,)
 
-    def buffer_load_b_payload(self, *args):
-        _lds.LDSManager.buffer_load_b_payload.fn(self, *args)
-
-    def buffer_load_b_scale(self, *args):
-        _lds.LDSManager.buffer_load_b_scale.fn(self, *args)
-
-    def buffer_load_scale_register(self, *args, **kwargs):
-        # A register load has no LDS destination and owns no async-copy group.
-        return (0,)
-
-    def copy(self, descriptor, base, offsets, asynchronous, modifier, soffset):
+    def copy(self, descriptor, base, offsets, modifier, soffset):
         stage, kind, tile = descriptor
         assert stage == 2, "The emitter must index the requested LDS stage."
         self.copies[self.slot].append((kind, tile))
-        if asynchronous:
-            self.pending.append((kind, tile))
+        self.pending.append((kind, tile))
 
     def commit_buffer_load(self):
         self.groups[self.slot].append(tuple(self.pending))
@@ -238,7 +240,12 @@ def _trace_emitter(tc, monkeypatch, defer_stage_commit=False):
         b_hbm_ptr=3,
         b_scale_hbm_ptr=4,
     )
-    buffers = ((), (0,) * (3 * tc.nm), (0,) * (3 * tc.nn))
+    buffers = (
+        (0,) * (3 * tc.nm) if not tc.payload_via_lds(0) else (),
+        (0,) * (3 * tc.nn) if not tc.payload_via_lds(1) else (),
+        (0,) * (3 * tc.nm),
+        (0,) * (3 * tc.nn),
+    )
 
     def check_assumption(value):
         assert value
@@ -289,8 +296,8 @@ def _trace_emitter(tc, monkeypatch, defer_stage_commit=False):
         "direct-scales",
         "shared-a-pair",
         "shared-a-whole",
-        "a-synchronous",
-        "synchronous",
+        "a-register-payload",
+        "register-payloads",
     ],
 )
 def test_emitted_groups_and_waits_retire_required_copies(
@@ -368,11 +375,11 @@ def test_stage_commit_can_close_after_the_slot_walk(scheme, monkeypatch):
 @pytest.mark.parametrize(
     "scheme", list(WaitCommitScheme), ids=lambda scheme: scheme.name
 )
-def test_synchronous_reads_keep_a_cooperative_fence(scheme, monkeypatch):
+def test_register_only_slots_need_no_cooperative_fence(scheme, monkeypatch):
     from aiter.ops.triton._gluon_kernels.gfx950.moe import _buffered as pipeline
 
     waits, barriers = [], []
-    tc = _config((4, 2), scheme, False, "synchronous")
+    tc = _config((4, 2), scheme, False, "register-payloads")
     tc.num_mini_k = lambda: 1
     tc.pipeline_depth = lambda: 3
     tc.warp_pipeline_compiler = lambda: False
@@ -404,10 +411,10 @@ def test_synchronous_reads_keep_a_cooperative_fence(scheme, monkeypatch):
     monkeypatch.setattr(pipeline, "_make_reg_fragments", lambda *args: args)
     monkeypatch.setattr(pipeline, "_maybe_block_dot", lambda *args: 0)
     pipeline._step_live.fn(
-        pc, None, ((), (), ()), regs, 1, None, False, 0, False, True, 0
+        pc, None, ((), (), (), ()), regs, 1, None, False, 0, False, True, 0
     )
     assert not waits
-    assert len(barriers) == (1 if tc.commit_per_stage() else tc.nm * tc.nn)
+    assert not barriers
 
 
 @pytest.mark.parametrize(
@@ -486,7 +493,17 @@ def test_pipeline_stage_commit_boundaries(
         pipeline, "_maybe_block_dot", lambda *args: events.append(("dot",))
     )
     pipeline._step_live.fn(
-        pc, None, ((), (), ()), regs, 1, 0 if drain else None, drain, 0, in_loop, dot, 2
+        pc,
+        None,
+        ((), (), (), ()),
+        regs,
+        1,
+        0 if drain else None,
+        drain,
+        0,
+        in_loop,
+        dot,
+        2,
     )
     assert [event for event in events if event[0] == "wait"] == [("wait", 3)]
     assert events[0] == ("wait", 3)

@@ -152,8 +152,8 @@ class WaitCommitScheme(IntEnum):
 
     * ``PER_OP`` commits each asynchronous copy separately and waits before each
       slot's LDS reads. Payload and scale copies have separate groups; a shared
-      scale tile contributes only its owner's copy. Synchronous payload staging
-      and direct HBM scale loads contribute no asynchronous group.
+      scale tile contributes only its owner's copy. Direct HBM payload and scale
+      loads into registers contribute no asynchronous group.
     * ``PER_SLOT`` commits once after each slot, including slots with no copies,
       and waits before each slot's LDS reads.
     * ``PER_STAGE_WARP_PIPELINE`` commits once after the last memory region of

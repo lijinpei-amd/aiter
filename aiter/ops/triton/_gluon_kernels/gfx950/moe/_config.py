@@ -583,7 +583,7 @@ class KernelTuningConfig:
         """
         period = 1
         for operand in (0, 1):
-            if operand == 1 and _v(self.B_IN_REG):
+            if not self.payload_via_lds(operand):
                 period = math.lcm(period, self.num_buffers(operand))
             if self.func_cfg.has_scale(operand) and not self.scale_via_lds(operand):
                 period = math.lcm(period, self.num_buffers(operand, True))
@@ -859,12 +859,16 @@ class KernelTuningConfig:
 
     @gluon.constexpr_function
     def payload_via_lds(self, idx):
-        """Same question for the payload operand at 128-bit per lane."""
+        """Whether the payload uses a 128-bit-per-lane direct copy through LDS.
+
+        Payload tiles that cannot give every wavefront one complete access stay in
+        the register ring. There is deliberately no register-to-LDS fallback.
+        """
         if _v(idx) == 1 and _v(self.B_IN_REG):
             return False
         shape = self.lds_shape(idx)
         vec = self.copy_contiguity(idx)
-        return shape[0] * shape[1] >= WARP_SIZE * vec
+        return shape[0] * shape[1] >= WARP_SIZE * vec * self.num_warps()
 
     @gluon.constexpr_function
     def dot_result_fragment_layout(self):
@@ -1306,7 +1310,7 @@ class KernelTuningConfig:
             width = fc.operand_elem_ty(idx).primitive_bitwidth // 8
             # lds_shape() is one mini block; a stage holds num_lds_tiles() of them
             n_tiles = self.num_lds_tiles(idx)
-            if idx == 0 or not _v(self.B_IN_REG):
+            if self.payload_via_lds(idx):
                 total += n_tiles * shape[0] * shape[1] * width * self.num_buffers(idx)
             if fc.has_scale(idx) and (
                 _v(self.FROZEN_STEP) or self.scale_via_lds(idx)
@@ -1352,6 +1356,12 @@ class KernelTuningConfig:
         assert not (
             _v(self.FROZEN_STEP) and self.independent_buffers()
         ), "FROZEN_STEP does not support register storage or per-component buffer counts"
+        if _v(self.FROZEN_STEP):
+            for idx in (0, 1):
+                assert self.payload_via_lds(idx), (
+                    f"FROZEN_STEP requires operand {idx}'s payload in LDS; "
+                    "use the live pipeline for a direct-register payload"
+                )
         self.validate_buffer_counts()
 
         # -- host preconditions (no N tail, no K tail; only the even case exists) --
@@ -1424,22 +1434,6 @@ class KernelTuningConfig:
             f"MINI_BLOCK_N {_v(self.MINI_BLOCK_N)} must be a multiple of "
             f"instr[1]*warps[1]*tiles[1] = {instr[1] * warps[1] * tiles[1]}"
         )
-
-        # -- a mini block is also the granule of the global->LDS copy, so once an operand
-        #    is actually split it must still give every warp a full 128-bit access.
-        #    Below that, _bases_to_distributed runs out of bases for the warp dimension
-        #    and pads it with zeros, which makes the surplus warps re-fetch and re-write
-        #    a tile another warp already owns: correct, but pure wasted HBM traffic. --
-        for idx in (0, 1):
-            if self.num_lds_tiles(idx) > 1 and self.payload_via_lds(idx):
-                tile = self.lds_shape(idx)
-                vec = self.copy_contiguity(idx)
-                need = WARP_SIZE * vec * self.num_warps()
-                assert tile[0] * tile[1] >= need, (
-                    f"operand {idx}'s mini tile {tile} holds {tile[0] * tile[1]} "
-                    f"elements, below the {need} one 128-bit access per warp needs; "
-                    f"raise MINI_BLOCK_{'M' if idx == 0 else 'N'} or BLOCK_K"
-                )
 
         # -- MFMA shape must fit the tile --
         assert BM % (instr[0] * warps[0] * tiles[0]) == 0
