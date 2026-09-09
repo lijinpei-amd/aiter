@@ -36,6 +36,12 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._entry import (
     _moe_gluon_gemm1,
     _moe_gluon_gemm2,
 )
+from aiter.ops.triton._gluon_kernels.gfx950.moe._frozen import (
+    _validate_frozen_pipeline,
+)
+from aiter.ops.triton._gluon_kernels.gfx950.moe._pipeline import (
+    _validate_pipeline as _validate_live_pipeline,
+)
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     ActivationSpec,
     ActKind,
@@ -74,6 +80,12 @@ _COMPONENT_BUFFER_KEYS = (
     "B_SCALE_NUM_BUFFER",
 )
 _REGISTER_STORAGE_KEYS = ("B_IN_REG", "B_SCALE_IN_REG", "A_SCALE_IN_REG")
+_DS_READ_FIELDS = (
+    ("DS_READ_A_PAYLOAD_IN_MFMA", DSReadOperand.A),
+    ("DS_READ_A_SCALE_IN_MFMA", DSReadOperand.A_SCALE),
+    ("DS_READ_B_PAYLOAD_IN_MFMA", DSReadOperand.B),
+    ("DS_READ_B_SCALE_IN_MFMA", DSReadOperand.B_SCALE),
+)
 
 
 def _can_overflow_int32(t: torch.Tensor | None, drop_leading: int = 0) -> bool:
@@ -142,9 +154,10 @@ def _env_int(name: str, default: int) -> int:
     return default if v is None else int(v)
 
 
-def _env_mod(name: str, default: str) -> str:
+def _env_cache_modifier(name: str, default: str, legacy_name: str) -> str:
     """Cache-modifier override, for A/B-testing L1/L2 policy without editing source."""
-    return os.environ.get("AITER_TRITON_MOE_GLUON_" + name, default)
+    prefix = "AITER_TRITON_MOE_GLUON_"
+    return os.environ.get(prefix + name, os.environ.get(prefix + legacy_name, default))
 
 
 def _ds_read_in_mfma_from_env() -> int:
@@ -164,6 +177,23 @@ def _ds_read_in_mfma_from_env() -> int:
     if move >= 1:
         return int(DSReadOperand.A | DSReadOperand.A_SCALE)
     return int(DSReadOperand.NONE)
+
+
+def _ds_read_flags(mask: int) -> dict[str, bool]:
+    """Expand the legacy environment mask into independent tuning fields."""
+    assert mask >= 0 and not (mask & ~int(DSReadOperand.ALL)), (
+        f"DS_READ_IN_MFMA {mask} has unknown operand bits"
+    )
+    return {name: bool(mask & bit) for name, bit in _DS_READ_FIELDS}
+
+
+def _ds_read_flags_from_env() -> dict[str, bool]:
+    flags = _ds_read_flags(_ds_read_in_mfma_from_env())
+    for name, _ in _DS_READ_FIELDS:
+        value = os.environ.get("AITER_TRITON_MOE_GLUON_" + name)
+        if value is not None:
+            flags[name] = bool(int(value))
+    return flags
 
 
 def _resolve_epilogue(epilogue: EpilogueMode | int | None) -> int:
@@ -250,11 +280,21 @@ def _probe_tuning_config(cfg: dict, dq_a, dq_b):
     return KernelTuningConfig(func, *_tuning_args(cfg))
 
 
+def _validate_selected_pipeline(tuning_cfg, K):
+    validator = (
+        _validate_frozen_pipeline
+        if _cval(tuning_cfg.FROZEN_STEP)
+        else _validate_live_pipeline
+    )
+    return validator(tuning_cfg, K)
+
+
 @cache
 def _pipeline_error(cfg_items: tuple, dq_a, dq_b, K):
     """Share the exact device ring and minimum-strip contract with host fallback."""
     try:
-        _probe_tuning_config(dict(cfg_items), dq_a, dq_b).validate_pipeline(K)
+        tc = _probe_tuning_config(dict(cfg_items), dq_a, dq_b)
+        _validate_selected_pipeline(tc, K)
     except AssertionError as error:
         return str(error)
     return None
@@ -333,6 +373,7 @@ def get_gluon_config_uncached(
         nonk = 32
     nb = _env_int("AITER_TRITON_MOE_GLUON_NB", nb)
     instr = _mfma_instr(dq_a, dq_b, nonk)
+    ds_read_flags = _ds_read_flags_from_env()
 
     # shrink the N tile until it divides N (the kernel has no N tail by construction).
     # The warp split is derived per candidate BLOCK_N inside _build, so use the
@@ -489,12 +530,20 @@ def get_gluon_config_uncached(
             ),
             "GROUP_M": _env_int("AITER_TRITON_MOE_GLUON_GROUP_M", 4),
             "NUM_XCDS": _env_int("AITER_TRITON_MOE_GLUON_NUM_XCDS", 8),
-            "token_mod": _env_mod("TOKEN_MOD", ""),
-            "token_scale_mod": _env_mod("TOKEN_SCALE_MOD", ""),
+            "token_cache_modifier": _env_cache_modifier(
+                "TOKEN_CACHE_MODIFIER", "", "TOKEN_MOD"
+            ),
+            "token_scale_cache_modifier": _env_cache_modifier(
+                "TOKEN_SCALE_CACHE_MODIFIER", "", "TOKEN_SCALE_MOD"
+            ),
             # .cg (non-temporal) on the weight payload: at decode every line is read
             # once, so streaming it keeps it from evicting anything that is reused.
             # Dropping it costs 10% more HBM traffic.
-            "expert_mod": _env_mod("EXPERT_MOD", ".cg" if block_m <= 32 else ""),
+            "expert_cache_modifier": _env_cache_modifier(
+                "EXPERT_CACHE_MODIFIER",
+                ".cg" if block_m <= 32 else "",
+                "EXPERT_MOD",
+            ),
             # ...but NOT on the weight scales. The scale tensor is (E, K/32, N) with K
             # contiguous, so one 128 B line holds 128 consecutive K-scales for a single
             # n, while a BLOCK_K stage consumes only BLOCK_K/32 of them -- 16 bytes at
@@ -502,9 +551,15 @@ def get_gluon_config_uncached(
             # survive in L2; marking it non-temporal turns all 8 touches into separate
             # HBM fetches. Measured on H7168-I2048-E33-k8 T=32 stage 1: 651 -> 517 MB of
             # HBM reads, L2 hit 16% -> 33%, 122.6 -> 96.9 us.
-            "expert_scale_mod": _env_mod("EXPERT_SCALE_MOD", ""),
-            "result_mod": _env_mod("RESULT_MOD", ""),
-            "result_scale_mod": _env_mod("RESULT_SCALE_MOD", ""),
+            "expert_scale_cache_modifier": _env_cache_modifier(
+                "EXPERT_SCALE_CACHE_MODIFIER", "", "EXPERT_SCALE_MOD"
+            ),
+            "result_cache_modifier": _env_cache_modifier(
+                "RESULT_CACHE_MODIFIER", "", "RESULT_MOD"
+            ),
+            "result_scale_cache_modifier": _env_cache_modifier(
+                "RESULT_SCALE_CACHE_MODIFIER", "", "RESULT_SCALE_MOD"
+            ),
             # Which inter-wave ping-pong the K-loop step lays borders down for, a
             # WarpPipeline: 0 none, 1 hand each slot's MFMAs and its ds_read/copy shadow
             # to TritonAMDGPUWarpPipeline as an mfma/mem stage pair, 2 the hand-emitted
@@ -535,7 +590,7 @@ def get_gluon_config_uncached(
                 "AITER_TRITON_MOE_GLUON_WAIT_COMMIT_SCHEME",
                 int(WaitCommitScheme.PER_OP),
             ),
-            "DS_READ_IN_MFMA": _ds_read_in_mfma_from_env(),
+            **ds_read_flags,
             "SCHED_MODE": _env_int(
                 "AITER_TRITON_MOE_GLUON_SCHED_MODE", int(SchedMode.NONE)
             ),
@@ -831,7 +886,8 @@ def _launch_spec(
 @cache
 def _validate_launch_config(tuning_cfg, N, K):
     """Validate each cached effective layout once, before any kernel launch."""
-    return tuning_cfg.validate(N, K)
+    tuning_cfg.validate(N, K)
+    return _validate_selected_pipeline(tuning_cfg, K)
 
 
 #: Attribute the padded-row token map is memoised under, on the ``ExptData`` instance.
@@ -1671,6 +1727,25 @@ _TUNING_KEYS = TuningSpec._fields
 
 def _tuning_args(c: dict) -> tuple:
     """Keep older config dictionaries valid when optional tuning fields are added."""
+    aliases = {
+        "token_mod": "token_cache_modifier",
+        "token_scale_mod": "token_scale_cache_modifier",
+        "expert_mod": "expert_cache_modifier",
+        "expert_scale_mod": "expert_scale_cache_modifier",
+        "result_mod": "result_cache_modifier",
+        "result_scale_mod": "result_scale_cache_modifier",
+    }
+    for legacy, canonical in aliases.items():
+        if legacy in c:
+            if canonical in c and c[canonical] != c[legacy]:
+                raise ValueError(f"{canonical} and legacy {legacy} disagree")
+            c = dict(c, **{canonical: c[legacy]})
+    if "DS_READ_IN_MFMA" in c:
+        legacy_flags = _ds_read_flags(int(c["DS_READ_IN_MFMA"]))
+        for name, value in legacy_flags.items():
+            if name in c and bool(c[name]) != value:
+                raise ValueError(f"{name} and legacy DS_READ_IN_MFMA disagree")
+        c = dict(c, **legacy_flags)
     if "A_SCALE_NUMB_BUFFER" in c:
         alias = c["A_SCALE_NUMB_BUFFER"]
         canonical = c.get("A_SCALE_NUM_BUFFER", 0)

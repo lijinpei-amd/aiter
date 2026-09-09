@@ -15,11 +15,184 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from ._buffered_schedule import _active, _ops, _wait
 from ._lang import pick_warp_pipeline_stage as pick_stage
 from ._lang import require_constexpr
 from ._offsets import _slot_index
-from ._schedule import _ds_read_a_tile, _ds_read_b_tile
+from ._schedule import (
+    _buffer_load_pos,
+    _buffer_load_tile,
+    _ds_read_a_tile,
+    _ds_read_b_tile,
+    _scale_buffer_load_tile,
+)
+
+
+@gluon.constexpr_function
+def _ops(tc, mi, ni):
+    """Payload/scale fills owned by a slot, including register destinations."""
+    nm, nn = tc.num_mini_m(), tc.num_mini_n()
+    pos = _buffer_load_pos(mi, ni, nm, nn)
+    ops = []
+    for idx in range(2):
+        ops.append(_buffer_load_tile(pos, nm, nn, idx == 0))
+        tile = None
+        if tc.func_cfg.has_scale(idx):
+            tile = _scale_buffer_load_tile(mi, ni, nm, nn, idx == 0, tc.SCALE_FILL_MID)
+            if (
+                idx == 0
+                and tile is not None
+                and tc.scale_via_lds(0)
+                and tc.scale_shuffled(0)
+                and tile % tc.scale_tile_ratio_a() != 0
+            ):
+                tile = None
+        ops.append(tile)
+    return tuple(ops)
+
+
+@gluon.constexpr_function
+def _active(tc, kind, stage, drain=False):
+    """Whether a component fills at this compile-time relative stage.
+
+    ``None`` denotes a main-loop stage. Before the drain, ``stage`` is the
+    absolute read stage and gates only staggered prologue startup. In the
+    drain it is the zero-based drain iteration, independent of runtime K.
+    """
+    if kind % 2 and not tc.func_cfg.has_scale(kind // 2):
+        return False
+    depth = tc.num_buffers(kind // 2, bool(kind % 2))
+    if drain:
+        return stage < tc.pipeline_depth() - depth
+    return stage is None or stage + depth - 1 >= 0
+
+
+@gluon.constexpr_function
+def _async(tc, kind):
+    """Direct-register loads own no LDS async-copy group."""
+    return tc.scale_via_lds(kind // 2) if kind % 2 else tc.payload_via_lds(kind // 2)
+
+
+@gluon.constexpr_function
+def _groups(tc, stage, drain=False):
+    """Committed groups per slot, including explicit empty slot/stage groups."""
+    schedule, whole = [], ()
+    for ni in range(tc.num_mini_n()):
+        for mi in range(tc.num_mini_m()):
+            ops = tuple(
+                (kind, tile)
+                for kind, tile in enumerate(_ops(tc, mi, ni))
+                if tile is not None
+                and _active(tc, kind, stage, drain)
+                and _async(tc, kind)
+            )
+            if tc.commit_per_op():
+                groups = tuple((op,) for op in ops)
+            elif tc.commit_per_slot():
+                groups = (ops,)
+            else:
+                whole += ops
+                groups = (
+                    (whole,)
+                    if mi == tc.num_mini_m() - 1 and ni == tc.num_mini_n() - 1
+                    else ()
+                )
+            schedule.append(groups)
+    return tuple(schedule)
+
+
+@gluon.constexpr_function
+def _wait(tc, stage, slot, drain=False, epilogue_groups=0):
+    """Count groups newer than the youngest producer required by this read.
+
+    For a stage commit, ``slot=None`` waits for all operands at the stage head.
+    The drain uses a local origin: its first read is stage one, and epilogue
+    groups commit between stages zero and one. Once a producer is newer than
+    those epilogue groups, they no longer contribute to its wait allowance.
+    """
+    nm, nn = tc.num_mini_m(), tc.num_mini_n()
+    r = stage + 1 if drain else tc.pipeline_depth() if stage is None else stage
+    required = []
+    for ni in range(nn):
+        for mi in range(nm):
+            if slot is not None and _slot_index(mi, ni, nm, nn) != slot:
+                continue
+            for idx in range(2):
+                tile = (
+                    _ds_read_a_tile(mi, ni, nm, nn)
+                    if idx == 0
+                    else _ds_read_b_tile(mi, ni, nm, nn)
+                )
+                if tile is None:
+                    continue
+                if tc.payload_via_lds(idx):
+                    required.append((r - tc.num_buffers(idx) + 1, idx * 2, tile))
+                if tc.func_cfg.has_scale(idx) and tc.scale_via_lds(idx):
+                    owner = tile
+                    if idx == 0 and tc.scale_shuffled(0):
+                        owner -= owner % tc.scale_tile_ratio_a()
+                    required.append(
+                        (r - tc.num_buffers(idx, True) + 1, idx * 2 + 1, owner)
+                    )
+    if not required:
+        return None
+
+    timeline = []
+    for s in range(r - tc.pipeline_depth() + 1, r + 1):
+        if drain:
+            schedule = _groups(tc, s - 1, True) if s > 0 else _groups(tc, None)
+        else:
+            schedule = _groups(tc, None if stage is None else s)
+        for pos, groups in enumerate(schedule):
+            if s == r and (slot is None or pos >= slot):
+                break
+            timeline.extend(
+                tuple((s, kind, tile) for kind, tile in group) for group in groups
+            )
+        if drain and s == 0:
+            timeline.extend(() for _ in range(epilogue_groups))
+
+    latest = max(
+        i for i, group in enumerate(timeline) if any(op in group for op in required)
+    )
+    return len(timeline) - latest - 1
+
+
+@gluon.constexpr_function
+def _pipeline_peeled(tc):
+    """Smallest initial main prefix after which every wait is invariant.
+
+    The first MFMA is always peeled to retain its visible zero accumulator.
+    With every active depth at least two, read stage ``NB_MAX - 2`` already
+    has an entirely full producer history. Checking the finite prefix also
+    handles configurations where shared groups hide some staggered fills.
+    """
+    # These schemes commit even empty prologue slots/stages. Their group
+    # distances already match the steady state when a component first reads.
+    # At depth three or below, the mandatory first peel covers any warmup.
+    if not tc.commit_per_op() or tc.pipeline_depth() <= 3:
+        return 1
+    slots = range(tc.num_mini_m() * tc.num_mini_n())
+    steady = tuple(_wait(tc, None, slot) for slot in slots)
+    peeled = 1
+    for x in range(max(0, tc.pipeline_depth() - 2)):
+        if tuple(_wait(tc, x + 1, slot) for slot in slots) != steady:
+            peeled = x + 1
+    return peeled
+
+
+@gluon.constexpr_function
+def _validate_pipeline(tc, K):
+    """Validate the live component rings and runtime-loop lower bound."""
+    tc.validate_buffer_counts()
+    num_k = tc.num_k_tiles(K)
+    depth = tc.pipeline_depth()
+    peeled = _pipeline_peeled(tc)
+    unroll = tc.pipeline_unroll()
+    assert num_k >= depth + peeled + unroll, (
+        f"NUM_K ({num_k}) must be at least NB_MAX ({depth}) + PEELED ({peeled}) "
+        f"+ UNROLL ({unroll}) = {depth + peeled + unroll}"
+    )
+    return True
 
 
 @gluon.jit
@@ -37,7 +210,7 @@ def _index(
         depth: gl.constexpr = tc.num_buffers(kind // 2, kind % 2 != 0)
         advance: gl.constexpr = depth - 1 if FILL else 0
         if require_constexpr(IN_LOOP and tc.pipeline_unroll() % depth == 0):
-            out = (tc.pipeline_peeled() + KI + 1 + advance) % depth
+            out = (_pipeline_peeled(tc) + KI + 1 + advance) % depth
         else:
             tile = step + advance
             if require_constexpr(tc.pipeline_register_period() == 1):
@@ -50,7 +223,7 @@ def _index(
 @gluon.jit
 def _phase(tc, step, KI: gl.constexpr, IN_LOOP: gl.constexpr):
     if require_constexpr(IN_LOOP and tc.pipeline_unroll() % 2 == 0):
-        phase = (tc.pipeline_peeled() + KI + 1) % 2
+        phase = (_pipeline_peeled(tc) + KI + 1) % 2
     else:
         phase = step % 2
     return phase
@@ -201,7 +374,7 @@ def _fill_slot(
     )
     as_soff: gl.constexpr = (
         tc.scale_hbm_steps(
-            0, offset_step, (tc.pipeline_peeled() + tc.num_buffers(0, True)) % 2
+            0, offset_step, (_pipeline_peeled(tc) + tc.num_buffers(0, True)) % 2
         )
         * pc.s_step
         * pc.a_scale_stride_k
@@ -210,7 +383,7 @@ def _fill_slot(
     )
     bs_soff: gl.constexpr = (
         tc.scale_hbm_steps(
-            1, offset_step, (tc.pipeline_peeled() + tc.num_buffers(1, True)) % 2
+            1, offset_step, (_pipeline_peeled(tc) + tc.num_buffers(1, True)) % 2
         )
         * pc.s_step
         * pc.b_scale_stride_k
@@ -672,7 +845,7 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
     )
     depth: gl.constexpr = tc.pipeline_depth()
     unroll: gl.constexpr = tc.pipeline_unroll()
-    peeled: gl.constexpr = tc.pipeline_peeled()
+    peeled: gl.constexpr = _pipeline_peeled(tc)
     main = NUM_K - depth
     gl.assume(main >= peeled + unroll)
     remaining = main - peeled
@@ -802,7 +975,7 @@ def _drain_buffered_pipeline(
                         j,
                         DRAIN=True,
                         EPILOGUE_GROUPS=EPILOGUE_GROUPS,
-                        KI=p + j - tc.pipeline_peeled(),
+                        KI=p + j - _pipeline_peeled(tc),
                         STATIC_PHASE=True,
                     )
     else:

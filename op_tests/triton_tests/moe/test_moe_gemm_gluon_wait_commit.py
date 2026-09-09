@@ -9,8 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from aiter.ops.triton._gluon_kernels.gfx950.moe import _buffered as buffered
 from aiter.ops.triton._gluon_kernels.gfx950.moe import _lds
+from aiter.ops.triton._gluon_kernels.gfx950.moe import _pipeline as buffered
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import unwrap
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
     _buffer_load_group_schedule,
@@ -34,10 +34,10 @@ class _ScheduleConfig:
     payload_async: tuple = (True, True)
     a_scale_ratio: int = 1
     SOFF_UNROLL: bool = False
-    token_mod: str = ""
-    token_scale_mod: str = ""
-    expert_mod: str = ""
-    expert_scale_mod: str = ""
+    token_cache_modifier: str = ""
+    token_scale_cache_modifier: str = ""
+    expert_cache_modifier: str = ""
+    expert_scale_cache_modifier: str = ""
 
     @property
     def func_cfg(self):
@@ -376,7 +376,7 @@ def test_stage_commit_can_close_after_the_slot_walk(scheme, monkeypatch):
     "scheme", list(WaitCommitScheme), ids=lambda scheme: scheme.name
 )
 def test_register_only_slots_need_no_cooperative_fence(scheme, monkeypatch):
-    from aiter.ops.triton._gluon_kernels.gfx950.moe import _buffered as pipeline
+    from aiter.ops.triton._gluon_kernels.gfx950.moe import _pipeline as pipeline
 
     waits, barriers = [], []
     tc = _config((4, 2), scheme, False, "register-payloads")
@@ -439,7 +439,7 @@ def test_pipeline_stage_commit_boundaries(
     scheme, compiler, dot, in_loop, drain, monkeypatch
 ):
     """Execute the unified step and record ordering at its actual region borders."""
-    from aiter.ops.triton._gluon_kernels.gfx950.moe import _buffered as pipeline
+    from aiter.ops.triton._gluon_kernels.gfx950.moe import _pipeline as pipeline
 
     events = []
     tc = _config((2, 2), scheme, False, "no-scales")

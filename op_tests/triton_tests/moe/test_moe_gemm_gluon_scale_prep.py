@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from aiter.ops.triton._gluon_kernels.gfx950.moe._pipeline import _pipeline_peeled
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     ActivationSpec,
     ActKind,
@@ -265,12 +266,22 @@ def test_minimum_uses_resolved_scale_storage_after_preparation(
         dict(cfg, A_SCALE_SORTED_SHUFFLED=False, B_SCALE_SHUFFLED=False),
         DtypeQuant.MXFP8, DtypeQuant.MXFP8,
     )
-    assert raw_tc.min_num_k() == 9
+    assert (
+        raw_tc.pipeline_depth()
+        + _pipeline_peeled(raw_tc)
+        + raw_tc.pipeline_unroll()
+        == 9
+    )
     packed_tc = host._probe_tuning_config(
         dict(cfg, A_SCALE_SORTED_SHUFFLED=True, B_SCALE_SHUFFLED=True),
         DtypeQuant.MXFP8, DtypeQuant.MXFP8,
     )
-    assert packed_tc.min_num_k() == 6
+    assert (
+        packed_tc.pipeline_depth()
+        + _pipeline_peeled(packed_tc)
+        + packed_tc.pipeline_unroll()
+        == 6
+    )
     monkeypatch.setenv("AITER_TRITON_MOE_GLUON_SORTED_SCALES", "1")
     monkeypatch.setenv("AITER_TRITON_MOE_GLUON_SHUFFLED_W_SCALES", "1")
     packed_a = torch.empty(2 * 128 * case.k // 32, dtype=torch.uint8)

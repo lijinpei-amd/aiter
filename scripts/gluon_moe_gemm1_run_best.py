@@ -13,7 +13,7 @@ prints the provenance it used so a number can always be traced back to a build.
     python scripts/gluon_moe_gemm1_run_best.py --ab AITER_TRITON_MOE_GLUON_FROZEN_STEP
 
 ``--ab KEY`` interleaves KEY=0 against KEY=1 round by round and reports paired
-deltas. Use it while refactoring ``_buffered._step_live``: ``FROZEN_STEP=1`` runs
+deltas. Use it while refactoring ``_pipeline._step_live``: ``FROZEN_STEP=1`` runs
 ``_pipeline_step_frozen``, the verbatim snapshot of the step this number was measured
 with, so a refactor is compared against the known-good schedule rather than against a
 remembered figure. Sequential sweeps have disagreed in sign with interleaved ones
@@ -31,7 +31,7 @@ import re
 import statistics as s
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -67,7 +67,9 @@ def provenance(llc):
     """Everything that decides which machine code comes out, printed once."""
     print(f"llc          {llc}")
     if llc.exists():
-        mtime = datetime.fromtimestamp(llc.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        mtime = datetime.fromtimestamp(
+            llc.stat().st_mtime, tz=timezone.utc
+        ).astimezone().strftime("%Y-%m-%d %H:%M")
         print(f"             built {mtime}")
         try:
             h = subprocess.run(
@@ -92,8 +94,8 @@ def provenance(llc):
         ok = path.exists() and needle in path.read_text()
         print(f"{name:12s} {'patched' if ok else 'NOT PATCHED (perf will be worse)'}")
     print(f"llc flags    {LLC_FLAGS}")
-    print(f"overrides    " + " ".join(f"{k.split('GLUON_')[-1]}={v}"
-                                      for k, v in OVERRIDES.items()))
+    print("overrides    " + " ".join(f"{k.split('GLUON_')[-1]}={v}"
+                                     for k, v in OVERRIDES.items()))
 
 
 def sets(extra=None):
@@ -148,7 +150,7 @@ def main():
                 m = medians(p)
                 got[name] += m
                 print(f"  {name:16s} " + " ".join(f"{x:7.1f}" for x in m))
-        base = got[list(arms)[0]]
+        base = got[next(iter(arms))]
         print()
         for name, v in got.items():
             d = [x - y for x, y in zip(v, base)]

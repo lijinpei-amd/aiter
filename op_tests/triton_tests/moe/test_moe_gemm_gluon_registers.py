@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from aiter.ops.triton._gluon_kernels.gfx950.moe._pipeline import _pipeline_peeled
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import DtypeQuant, EpilogueMode
 from aiter.ops.triton.moe import moe_op_gemm_gluon as host
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import moe_gemm_torch
@@ -217,7 +218,6 @@ def test_register_buffers_with_compiler_pipeline(register_case, read_mask):
     config = _register_config(register_case.dtype)
     config.update(
         WARP_PIPELINE=1,
-        DS_READ_IN_MFMA=read_mask,
         B_IN_REG=True,
         A_SCALE_IN_REG=True,
         B_SCALE_IN_REG=True,
@@ -226,6 +226,7 @@ def test_register_buffers_with_compiler_pipeline(register_case, read_mask):
         A_SCALE_NUM_BUFFER=4,
         B_SCALE_NUM_BUFFER=2,
     )
+    config.update(host._ds_read_flags(read_mask))
     _assert_register_case(register_case, config)
 
 
@@ -601,7 +602,9 @@ def test_minimum_k_and_every_reachable_unroll_remainder(dtype, schedule, monkeyp
         DtypeQuant, {"mxfp4": "MXFP4", "mxfp8": "MXFP8", "bf16": "BF16"}[dtype]
     )
     tc = host._probe_tuning_config(config, dtype_quant, dtype_quant)
-    minimum = host._cval(tc.min_num_k())
+    minimum = host._cval(
+        tc.pipeline_depth() + _pipeline_peeled(tc) + tc.pipeline_unroll()
+    )
     unroll = host._cval(tc.pipeline_unroll())
     stride = 2 if packed else 1
     first = (minimum + stride - 1) // stride * stride

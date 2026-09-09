@@ -310,12 +310,12 @@ class KernelTuningConfig:
     # tile scheduler: XCD swizzle policy
     TILE_SCHED: gl.constexpr
     # cache modifiers
-    token_mod: gl.constexpr
-    token_scale_mod: gl.constexpr
-    expert_mod: gl.constexpr
-    expert_scale_mod: gl.constexpr
-    result_mod: gl.constexpr
-    result_scale_mod: gl.constexpr
+    token_cache_modifier: gl.constexpr
+    token_scale_cache_modifier: gl.constexpr
+    expert_cache_modifier: gl.constexpr
+    expert_scale_cache_modifier: gl.constexpr
+    result_cache_modifier: gl.constexpr
+    result_scale_cache_modifier: gl.constexpr
     # warp pipelining. NOT a placeholder: the mechanism is
     #   with gl.amd.warp_pipeline_stage(label, priority): ...
     WARP_PIPELINE: gl.constexpr

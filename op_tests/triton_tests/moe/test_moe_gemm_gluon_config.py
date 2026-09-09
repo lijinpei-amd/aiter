@@ -9,15 +9,6 @@ import os
 import pytest
 from triton.experimental.gluon import language as gl
 
-from aiter.ops.triton._gluon_kernels.gfx950.moe._buffered_schedule import (
-    _groups as buffered_groups,
-)
-from aiter.ops.triton._gluon_kernels.gfx950.moe._buffered_schedule import (
-    _ops as buffered_ops,
-)
-from aiter.ops.triton._gluon_kernels.gfx950.moe._buffered_schedule import (
-    _wait as buffered_wait,
-)
 from aiter.ops.triton._gluon_kernels.gfx950.moe._config import (
     KernelFuncConfig,
     KernelTuningConfig,
@@ -27,6 +18,18 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._entry import (
     _moe_gluon_gemm2,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import constexpr_fields
+from aiter.ops.triton._gluon_kernels.gfx950.moe._pipeline import (
+    _groups as buffered_groups,
+)
+from aiter.ops.triton._gluon_kernels.gfx950.moe._pipeline import (
+    _ops as buffered_ops,
+)
+from aiter.ops.triton._gluon_kernels.gfx950.moe._pipeline import (
+    _pipeline_peeled,
+)
+from aiter.ops.triton._gluon_kernels.gfx950.moe._pipeline import (
+    _wait as buffered_wait,
+)
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     ActivationSpec,
     ActKind,
@@ -97,6 +100,11 @@ def _plain(value):
     return tuple(value) if isinstance(value, list) else value
 
 
+def _validate(tc, N, K):
+    tc.validate(N, K)
+    return host._validate_selected_pipeline(tc, K)
+
+
 @pytest.mark.parametrize("kernel", [_moe_gluon_gemm1, _moe_gluon_gemm2])
 def test_num_k_is_a_runtime_scalar_without_specialization(kernel):
     param = next(param for param in kernel.params if param.name == "NUM_K")
@@ -115,7 +123,10 @@ def test_a_scale_row_stride_preserves_sub_16_byte_alignment(kernel):
     "field,value",
     [
         ("B_PRESHUFFLED", True),
-        ("DS_READ_IN_MFMA", int(DSReadOperand.B | DSReadOperand.A_SCALE)),
+        ("DS_READ_A_PAYLOAD_IN_MFMA", True),
+        ("DS_READ_A_SCALE_IN_MFMA", True),
+        ("DS_READ_B_PAYLOAD_IN_MFMA", True),
+        ("DS_READ_B_SCALE_IN_MFMA", True),
         ("SCHED_MODE", int(SchedMode.MFMA_16)),
         ("FROZEN_STEP", True),
         ("SOFF_UNROLL", True),
@@ -160,13 +171,71 @@ def test_trailing_fields_and_older_config_dict_keep_defaults(config):
     old_config = {name: config[name] for name in TuningSpec._fields[:30]}
     tuning = _tuning_spec(old_config)
     assert tuning == TuningSpec(*tuning[:30])
-    assert tuning[30:] == (0, 0, False, False, False, False, False, False, 0, 0, 0, 0)
+    assert tuning[30:] == tuple(
+        TuningSpec._field_defaults[name] for name in TuningSpec._fields[30:]
+    )
     fc = KernelFuncConfig(*func[:12])
     tc = KernelTuningConfig(fc, *tuning[:30])
     assert _plain(fc.epilogue) == EpilogueMode.DEFAULT
     for name in TuningSpec._fields[30:]:
         assert _plain(getattr(tc, name)) == getattr(tuning, name)
-    assert _plain(tc.validate(4096, 7168))
+    assert _plain(_validate(tc, 4096, 7168))
+
+
+@pytest.mark.parametrize(
+    "legacy,canonical",
+    [
+        ("token_mod", "token_cache_modifier"),
+        ("token_scale_mod", "token_scale_cache_modifier"),
+        ("expert_mod", "expert_cache_modifier"),
+        ("expert_scale_mod", "expert_scale_cache_modifier"),
+        ("result_mod", "result_cache_modifier"),
+        ("result_scale_mod", "result_scale_cache_modifier"),
+    ],
+)
+def test_legacy_cache_modifier_config_names(config, legacy, canonical):
+    config.pop(canonical)
+    config[legacy] = ".cg"
+    assert getattr(_tuning_spec(config), canonical) == ".cg"
+
+    config[canonical] = ""
+    with pytest.raises(ValueError, match=f"{canonical} and legacy {legacy} disagree"):
+        _tuning_spec(config)
+
+
+@pytest.mark.parametrize(
+    "field,canonical_env,legacy_env",
+    [
+        ("token_cache_modifier", "TOKEN_CACHE_MODIFIER", "TOKEN_MOD"),
+        (
+            "token_scale_cache_modifier",
+            "TOKEN_SCALE_CACHE_MODIFIER",
+            "TOKEN_SCALE_MOD",
+        ),
+        ("expert_cache_modifier", "EXPERT_CACHE_MODIFIER", "EXPERT_MOD"),
+        (
+            "expert_scale_cache_modifier",
+            "EXPERT_SCALE_CACHE_MODIFIER",
+            "EXPERT_SCALE_MOD",
+        ),
+        ("result_cache_modifier", "RESULT_CACHE_MODIFIER", "RESULT_MOD"),
+        (
+            "result_scale_cache_modifier",
+            "RESULT_SCALE_CACHE_MODIFIER",
+            "RESULT_SCALE_MOD",
+        ),
+    ],
+)
+@pytest.mark.parametrize("legacy", [False, True], ids=["canonical", "legacy"])
+def test_cache_modifier_environment_names(
+    monkeypatch, field, canonical_env, legacy_env, legacy
+):
+    suffix = legacy_env if legacy else canonical_env
+    monkeypatch.setenv("AITER_TRITON_MOE_GLUON_" + suffix, ".ca")
+    config = host.get_gluon_config_uncached(
+        128, 4096, 7168, DtypeQuant.MXFP4, DtypeQuant.MXFP4
+    )
+    assert config[field] == ".ca"
 
 
 @pytest.mark.parametrize(
@@ -184,7 +253,7 @@ def test_commit_scheme_counts_real_payload_and_scale_groups(
     config["WAIT_COMMIT_SCHEME"] = int(scheme)
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     assert _plain(tc.scale_via_lds(0)) and _plain(tc.scale_via_lds(1))
-    assert _plain(tc.commit_groups_per_stage()) == groups
+    assert sum(len(slot) for slot in buffered_groups(tc, None)) == groups
     assert _plain(tc.wait_at_stage_head()) is stage_head
 
 
@@ -234,7 +303,7 @@ def test_pipeline_state_aggregates_round_trip_separately(has_scales):
 
 @pytest.mark.parametrize("mask", range(16))
 def test_payload_and_scale_read_placement_are_independent(config, mask):
-    config["DS_READ_IN_MFMA"] = mask
+    config.update(host._ds_read_flags(mask))
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     actual = {
         component
@@ -247,7 +316,32 @@ def test_payload_and_scale_read_placement_are_independent(config, mask):
         if _plain(tc.ds_read_in_mfma(operand, scale))
     }
     assert sum(actual) == mask
-    assert _plain(tc.validate(4096, 7168))
+    assert _plain(_validate(tc, 4096, 7168))
+
+
+@pytest.mark.parametrize("mask", [0, 5, 15])
+def test_legacy_read_placement_config_key(config, mask):
+    for name, _ in host._DS_READ_FIELDS:
+        config.pop(name)
+    config["DS_READ_IN_MFMA"] = mask
+    tuning = _tuning_spec(config)
+    actual = sum(
+        int(bit) for name, bit in host._DS_READ_FIELDS if getattr(tuning, name)
+    )
+    assert actual == mask
+
+    config["DS_READ_A_PAYLOAD_IN_MFMA"] = not bool(mask & DSReadOperand.A)
+    with pytest.raises(ValueError, match="legacy DS_READ_IN_MFMA disagree"):
+        _tuning_spec(config)
+
+
+@pytest.mark.parametrize("mask", [-1, 16])
+def test_legacy_read_placement_config_key_rejects_unknown_bits(config, mask):
+    for name, _ in host._DS_READ_FIELDS:
+        config.pop(name)
+    config["DS_READ_IN_MFMA"] = mask
+    with pytest.raises(AssertionError, match="unknown operand bits"):
+        _tuning_spec(config)
 
 
 @pytest.mark.parametrize(
@@ -267,7 +361,26 @@ def test_legacy_read_placement_translation(monkeypatch, settings, expected):
     config = host.get_gluon_config_uncached(
         128, 4096, 7168, DtypeQuant.MXFP4, DtypeQuant.MXFP4
     )
-    assert _tuning_spec(config).DS_READ_IN_MFMA == expected
+    tuning = _tuning_spec(config)
+    actual = sum(
+        int(bit) for name, bit in host._DS_READ_FIELDS if getattr(tuning, name)
+    )
+    assert actual == expected
+
+
+@pytest.mark.parametrize("field,bit", host._DS_READ_FIELDS)
+def test_individual_read_placement_environment(monkeypatch, field, bit):
+    monkeypatch.setenv("AITER_TRITON_MOE_GLUON_" + field, "1")
+    config = host.get_gluon_config_uncached(
+        128, 4096, 7168, DtypeQuant.MXFP4, DtypeQuant.MXFP4
+    )
+    tuning = _tuning_spec(config)
+    actual = sum(
+        int(component)
+        for name, component in host._DS_READ_FIELDS
+        if getattr(tuning, name)
+    )
+    assert actual == int(bit)
 
 
 def test_legacy_schedule_settings_reach_the_tuning_spec(monkeypatch):
@@ -281,7 +394,13 @@ def test_legacy_schedule_settings_reach_the_tuning_spec(monkeypatch):
     config = host.get_gluon_config_uncached(
         128, 4096, 7168, DtypeQuant.MXFP4, DtypeQuant.MXFP4
     )
-    assert _tuning_spec(config)[31:35] == (SchedMode.MFMA_8, True, True, True)
+    tuning = _tuning_spec(config)
+    assert (
+        tuning.SCHED_MODE,
+        tuning.FROZEN_STEP,
+        tuning.SOFF_UNROLL,
+        tuning.SCALE_FILL_MID,
+    ) == (SchedMode.MFMA_8, True, True, True)
 
 
 @pytest.mark.parametrize("field", ["MANUAL_PP"])
@@ -333,10 +452,11 @@ def test_register_storage_options_are_independent(config, storage_mask):
         3 if storage_mask & 3 else 1, 2 if storage_mask & 4 else 1
     )
     assert _plain(tc.pipeline_unroll()) == expected_unroll
-    assert _plain(tc.validate(4096, 7168))
-    assert _plain(tc.validate(4096, bk * _plain(tc.min_num_k())))
+    assert _plain(_validate(tc, 4096, 7168))
+    minimum = tc.pipeline_depth() + _pipeline_peeled(tc) + tc.pipeline_unroll()
+    assert _plain(_validate(tc, 4096, bk * _plain(minimum)))
     with pytest.raises(AssertionError, match="NUM_K"):
-        tc.validate(4096, bk)
+        host._validate_selected_pipeline(tc, bk)
 
 
 @pytest.mark.parametrize(
@@ -352,7 +472,6 @@ def test_register_component_buffer_counts_determine_lcm_unroll(
         A_SCALE_IN_REG=True, B_SCALE_IN_REG=True,
     )
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
-    assert _plain(tc.independent_buffers())
     assert _plain(tc.pipeline_register_period()) == period
     assert _plain(tc.pipeline_unroll()) == expected
     resolved = [count or config["NUM_LDS_BUFFER"] for count in counts]
@@ -368,14 +487,12 @@ def test_lds_depths_do_not_constrain_unroll(config):
     config["K_UNROLL"] = 7
     fc = KernelFuncConfig(*_func_spec())
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    assert not _plain(tc.independent_buffers())
     assert _plain(tc.pipeline_unroll()) == 7
     config.update(A_NUM_BUFFER=2, B_NUM_BUFFER=4, A_SCALE_NUM_BUFFER=2)
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
     assert _plain(tc.pipeline_unroll()) == 7
     config["A_SCALE_IN_REG"] = True
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    assert _plain(tc.independent_buffers())
     assert _plain(tc.pipeline_unroll()) == 8
 
 
@@ -410,7 +527,7 @@ def test_small_payload_tiles_use_register_rings(config):
     assert not _plain(tc.payload_via_lds(1))
     assert _plain(tc.pipeline_register_period()) == 6
     assert _plain(tc.lds_bytes()) == 0
-    assert _plain(tc.validate(64, 512))
+    assert _plain(_validate(tc, 64, 512))
 
     config.update(A_NUM_BUFFER=0, B_NUM_BUFFER=0, FROZEN_STEP=True)
     frozen = KernelTuningConfig(fc, *_tuning_spec(config))
@@ -438,7 +555,7 @@ def test_absent_scales_do_not_participate_in_depth_unroll_or_validation(
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
     assert _plain(tc.pipeline_depth()) == 4
     assert _plain(tc.pipeline_unroll()) == (4 if register_b else 3)
-    assert _plain(tc.validate_pipeline(7168))
+    assert _plain(host._validate_selected_pipeline(tc, 7168))
 
 
 @pytest.mark.parametrize("field", host._COMPONENT_BUFFER_KEYS)
@@ -456,10 +573,10 @@ def test_inherited_buffer_counts_are_validated_after_resolution(config, depth):
     fc = KernelFuncConfig(*_func_spec())
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
     with pytest.raises(AssertionError, match="A_NUM_BUFFER.*must be at least 2"):
-        tc.validate_pipeline(7168)
+        host._validate_selected_pipeline(tc, 7168)
     config.update(dict.fromkeys(host._COMPONENT_BUFFER_KEYS, 2))
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    assert _plain(tc.validate(4096, 7168))
+    assert _plain(_validate(tc, 4096, 7168))
 
 
 @pytest.mark.parametrize("unroll", [-1, 0])
@@ -468,7 +585,7 @@ def test_unroll_must_be_positive_even_with_register_rings(config, unroll, regist
     config.update(K_UNROLL=unroll, A_SCALE_IN_REG=registers)
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     with pytest.raises(AssertionError, match="K_UNROLL must be at least 1"):
-        tc.validate_pipeline(7168)
+        host._validate_selected_pipeline(tc, 7168)
 
 
 @pytest.mark.parametrize("depth", [2, 3])
@@ -476,13 +593,14 @@ def test_unroll_must_be_positive_even_with_register_rings(config, unroll, regist
 def test_shared_depth_exact_minimum_and_all_unroll_remainders(config, depth, unroll):
     config.update(NUM_LDS_BUFFER=depth, K_UNROLL=unroll)
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
-    assert _plain(tc.pipeline_peeled()) == 1
+    assert _plain(_pipeline_peeled(tc)) == 1
     minimum = depth + 1 + unroll
-    assert _plain(tc.min_num_k()) == minimum
     for remainder in range(unroll):
-        assert _plain(tc.validate(4096, (minimum + remainder) * config["BLOCK_K"]))
+        assert _plain(
+            _validate(tc, 4096, (minimum + remainder) * config["BLOCK_K"])
+        )
     with pytest.raises(AssertionError, match="NUM_K.*NB_MAX.*PEELED.*UNROLL"):
-        tc.validate(4096, (minimum - 1) * config["BLOCK_K"])
+        host._validate_selected_pipeline(tc, (minimum - 1) * config["BLOCK_K"])
 
 
 @pytest.mark.parametrize(
@@ -506,16 +624,16 @@ def test_register_weights_require_preshuffle(config):
 def test_independent_register_scales_allow_mini_k_slicing(config):
     config.update(MINI_BLOCK_K=128, A_SCALE_IN_REG=True, B_SCALE_IN_REG=True)
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
-    assert _plain(tc.validate(4096, 7168))
+    assert _plain(_validate(tc, 4096, 7168))
 
 
-def test_independent_buffers_still_require_nonempty_k(config):
+def test_component_buffers_still_require_nonempty_k(config):
     config["A_NUM_BUFFER"] = 2
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     with pytest.raises(
         AssertionError, match="NUM_K.*must be at least"
     ):
-        tc.validate(4096, 0)
+        host._validate_selected_pipeline(tc, 0)
 
 
 @pytest.mark.parametrize(
@@ -566,7 +684,7 @@ def test_packed_k128_scales_allow_odd_unroll(config, independent):
     )
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
     assert _plain(tc.pipeline_unroll()) == 3
-    assert _plain(tc.validate(4096, 7168))
+    assert _plain(_validate(tc, 4096, 7168))
     assert host._scale_shuffle_supported(config, 0)
     assert host._scale_shuffle_supported(config, 1)
 
@@ -589,7 +707,7 @@ def test_gate_up_small_warp_extent_only_requires_mx_group_for_quantized_output(
     fc = KernelFuncConfig(*_func_spec()._replace(output_quant=output_quant))
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
     if output_quant is None:
-        assert _plain(tc.validate(2048, 7168))
+        assert _plain(_validate(tc, 2048, 7168))
     else:
         with pytest.raises(AssertionError, match="a warp's emitted N extent"):
             tc.validate(2048, 7168)
@@ -602,7 +720,7 @@ def test_epilogue_modes_preserve_output_geometry(config, epilogue):
     assert _plain(func.activation_reduction_n()) == 2
     assert _plain(func.mini_n_reduction()) == 1
     assert _plain(tc.grid_N(4096)) == 16
-    assert _plain(tc.validate(4096, 7168))
+    assert _plain(_validate(tc, 4096, 7168))
 
 
 def test_epilogue_launch_specs_are_cached_separately(config, monkeypatch):
@@ -638,8 +756,6 @@ def test_epilogue_launch_specs_are_cached_separately(config, monkeypatch):
 @pytest.mark.parametrize(
     "field,value,error",
     [
-        ("DS_READ_IN_MFMA", -1, "unknown operand bits"),
-        ("DS_READ_IN_MFMA", 16, "unknown operand bits"),
         ("SCHED_MODE", -1, "not a SchedMode"),
         ("SCHED_MODE", 5, "not a SchedMode"),
         ("epilogue", 3, "not an EpilogueMode"),
@@ -714,7 +830,7 @@ def _audit_buffer_schedule(tc, num_k, epilogue_groups=0):
     }
     depth = _plain(tc.pipeline_depth())
     main = num_k - depth
-    peeled = _plain(tc.pipeline_peeled())
+    peeled = _plain(_pipeline_peeled(tc))
     assert num_k >= depth + peeled + _plain(tc.pipeline_unroll())
     scheme = _plain(tc.WAIT_COMMIT_SCHEME)
     per_stage = scheme in (
@@ -848,7 +964,7 @@ def test_independent_buffer_waits_match_copy_history(
     elif geometry == "unequal_tiles":
         config.update(MINI_BLOCK_N=64, SCALE_FILL_MID=True)
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
-    minimum = tc.pipeline_depth() + tc.pipeline_peeled() + tc.pipeline_unroll()
+    minimum = tc.pipeline_depth() + _pipeline_peeled(tc) + tc.pipeline_unroll()
     # Both strips contain warmup, a runtime main body and a complete drain. The
     # second commits output-epilogue copies before shallow queues finish filling.
     _audit_buffer_schedule(tc, minimum)
@@ -872,6 +988,6 @@ def test_independent_buffer_schedule_without_scales(config, scheme, register_b, 
         )
     )
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    minimum = tc.pipeline_depth() + tc.pipeline_peeled() + tc.pipeline_unroll()
+    minimum = tc.pipeline_depth() + _pipeline_peeled(tc) + tc.pipeline_unroll()
     _audit_buffer_schedule(tc, minimum)
     _audit_buffer_schedule(tc, minimum + 3, epilogue_groups=2)

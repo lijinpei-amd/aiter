@@ -17,23 +17,10 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.language.core import _aggregate as aggregate
 
-from aiter.ops.triton.utils.common_utils import strip_annotate
-
-from ._buffered_schedule import _pipeline_peeled
-from ._lang import MX_GROUP, WARP_SIZE
-from ._lang import unwrap as _v
-from ._schedule import _buffer_load_groups
-
-#: Non-K extent of one A-scale fill tile, when it should differ from MINI_BLOCK_M.
-#: 0 = follow MINI_BLOCK_M. Read here rather than inside the constexpr_function: those
-#: bodies are traced by the Gluon compiler, which rejects os.environ.get.
-_SCALE_MINI_M_ENV = int(
-    os.environ.get("AITER_TRITON_MOE_GLUON_SCALE_MINI_BLOCK_M", "0")
-)
-from ._types import (
-    ActivationSpec,
+from ._lang import (
+    MX_GROUP,
+    WARP_SIZE,
     DotKind,
-    DSReadOperand,
     DtypeQuant,
     EpilogueMode,
     ScaleSwizzle,
@@ -44,8 +31,18 @@ from ._types import (
     dq_mx_format,
     dq_pack_divisor,
     dq_uses_mfma_scaled,
+    strip_annotate,
+)
+from ._lang import (
+    unwrap as _v,
 )
 
+#: Non-K extent of one A-scale fill tile, when it should differ from MINI_BLOCK_M.
+#: 0 = follow MINI_BLOCK_M. Read here rather than inside the constexpr_function: those
+#: bodies are traced by the Gluon compiler, which rejects os.environ.get.
+_SCALE_MINI_M_ENV = int(
+    os.environ.get("AITER_TRITON_MOE_GLUON_SCALE_MINI_BLOCK_M", "0")
+)
 __all__ = ["KernelFuncConfig", "KernelTuningConfig"]
 
 #: gfx950 LDS capacity, mirrors utils/_triton/arch_info.py::_LDS_CAP_BYTES["gfx950"].
@@ -250,7 +247,7 @@ class KernelFuncConfig:
     # -- activation accessors (the spec's `activation` is a NamedTuple in a constexpr,
     #    so unwrap it here rather than at every use site) --
     @gluon.constexpr_function
-    def act(self) -> ActivationSpec | None:
+    def act(self):
         return _v(self.activation)
 
     @gluon.constexpr_function
@@ -377,20 +374,6 @@ class KernelFuncConfig:
             return gl.float8e4nv
         return gl.uint8
 
-    @gluon.constexpr_function
-    def num_async_loads_per_stage(self):
-        """Loads issued per pipeline stage, i.e. what one ``commit_group`` covers.
-
-        Dtype dependent: bf16 has no scale tensors, so it is 2 not 4. Never hardcode.
-        """
-        n = 2
-        if dq_has_scale(self.token_dtype_quant):
-            n += 1
-        if dq_has_scale(self.expert_dtype_quant):
-            n += 1
-        return n
-
-
 @aggregate
 @strip_annotate
 class KernelTuningConfig:
@@ -416,12 +399,12 @@ class KernelTuningConfig:
     TILE_SCHED: gl.constexpr
     GROUP_M: gl.constexpr
     NUM_XCDS: gl.constexpr
-    token_mod: gl.constexpr
-    token_scale_mod: gl.constexpr
-    expert_mod: gl.constexpr
-    expert_scale_mod: gl.constexpr
-    result_mod: gl.constexpr
-    result_scale_mod: gl.constexpr
+    token_cache_modifier: gl.constexpr
+    token_scale_cache_modifier: gl.constexpr
+    expert_cache_modifier: gl.constexpr
+    expert_scale_cache_modifier: gl.constexpr
+    result_cache_modifier: gl.constexpr
+    result_scale_cache_modifier: gl.constexpr
     WARP_PIPELINE: gl.constexpr
     VGPR_PREFETCH_K: gl.constexpr
     A_SCALE_SORTED_SHUFFLED: gl.constexpr
@@ -429,7 +412,10 @@ class KernelTuningConfig:
     B_PRESHUFFLED: gl.constexpr
     ACT_FAST_RCP: gl.constexpr
     WAIT_COMMIT_SCHEME: gl.constexpr
-    DS_READ_IN_MFMA: gl.constexpr
+    DS_READ_A_PAYLOAD_IN_MFMA: gl.constexpr
+    DS_READ_A_SCALE_IN_MFMA: gl.constexpr
+    DS_READ_B_PAYLOAD_IN_MFMA: gl.constexpr
+    DS_READ_B_SCALE_IN_MFMA: gl.constexpr
     SCHED_MODE: gl.constexpr
     FROZEN_STEP: gl.constexpr
     SOFF_UNROLL: gl.constexpr
@@ -463,12 +449,12 @@ class KernelTuningConfig:
         TILE_SCHED,
         GROUP_M,
         NUM_XCDS,
-        token_mod,
-        token_scale_mod,
-        expert_mod,
-        expert_scale_mod,
-        result_mod,
-        result_scale_mod,
+        token_cache_modifier,
+        token_scale_cache_modifier,
+        expert_cache_modifier,
+        expert_scale_cache_modifier,
+        result_cache_modifier,
+        result_scale_cache_modifier,
         WARP_PIPELINE,
         VGPR_PREFETCH_K,
         A_SCALE_SORTED_SHUFFLED=False,
@@ -476,7 +462,10 @@ class KernelTuningConfig:
         B_PRESHUFFLED=False,
         ACT_FAST_RCP=False,
         WAIT_COMMIT_SCHEME=int(WaitCommitScheme.PER_OP),
-        DS_READ_IN_MFMA=int(DSReadOperand.NONE),
+        DS_READ_A_PAYLOAD_IN_MFMA=False,
+        DS_READ_A_SCALE_IN_MFMA=False,
+        DS_READ_B_PAYLOAD_IN_MFMA=False,
+        DS_READ_B_SCALE_IN_MFMA=False,
         SCHED_MODE=int(SchedMode.NONE),
         FROZEN_STEP=False,
         SOFF_UNROLL=False,
@@ -507,12 +496,12 @@ class KernelTuningConfig:
         self.TILE_SCHED = gl.constexpr(_v(TILE_SCHED))
         self.GROUP_M = gl.constexpr(_v(GROUP_M))
         self.NUM_XCDS = gl.constexpr(_v(NUM_XCDS))
-        self.token_mod = gl.constexpr(_v(token_mod))
-        self.token_scale_mod = gl.constexpr(_v(token_scale_mod))
-        self.expert_mod = gl.constexpr(_v(expert_mod))
-        self.expert_scale_mod = gl.constexpr(_v(expert_scale_mod))
-        self.result_mod = gl.constexpr(_v(result_mod))
-        self.result_scale_mod = gl.constexpr(_v(result_scale_mod))
+        self.token_cache_modifier = gl.constexpr(_v(token_cache_modifier))
+        self.token_scale_cache_modifier = gl.constexpr(_v(token_scale_cache_modifier))
+        self.expert_cache_modifier = gl.constexpr(_v(expert_cache_modifier))
+        self.expert_scale_cache_modifier = gl.constexpr(_v(expert_scale_cache_modifier))
+        self.result_cache_modifier = gl.constexpr(_v(result_cache_modifier))
+        self.result_scale_cache_modifier = gl.constexpr(_v(result_scale_cache_modifier))
         # int, not bool: WarpPipeline has three values and True still lands on COMPILER.
         self.WARP_PIPELINE = gl.constexpr(int(_v(WARP_PIPELINE)))
         self.VGPR_PREFETCH_K = gl.constexpr(int(_v(VGPR_PREFETCH_K)))
@@ -521,7 +510,18 @@ class KernelTuningConfig:
         self.B_PRESHUFFLED = gl.constexpr(bool(_v(B_PRESHUFFLED)))
         self.ACT_FAST_RCP = gl.constexpr(bool(_v(ACT_FAST_RCP)))
         self.WAIT_COMMIT_SCHEME = gl.constexpr(int(_v(WAIT_COMMIT_SCHEME)))
-        self.DS_READ_IN_MFMA = gl.constexpr(int(_v(DS_READ_IN_MFMA)))
+        self.DS_READ_A_PAYLOAD_IN_MFMA = gl.constexpr(
+            bool(_v(DS_READ_A_PAYLOAD_IN_MFMA))
+        )
+        self.DS_READ_A_SCALE_IN_MFMA = gl.constexpr(
+            bool(_v(DS_READ_A_SCALE_IN_MFMA))
+        )
+        self.DS_READ_B_PAYLOAD_IN_MFMA = gl.constexpr(
+            bool(_v(DS_READ_B_PAYLOAD_IN_MFMA))
+        )
+        self.DS_READ_B_SCALE_IN_MFMA = gl.constexpr(
+            bool(_v(DS_READ_B_SCALE_IN_MFMA))
+        )
         self.SCHED_MODE = gl.constexpr(int(_v(SCHED_MODE)))
         self.FROZEN_STEP = gl.constexpr(bool(_v(FROZEN_STEP)))
         self.SOFF_UNROLL = gl.constexpr(bool(_v(SOFF_UNROLL)))
@@ -550,19 +550,6 @@ class KernelTuningConfig:
         """Whether tuning explicitly selects direct-register scales for an operand."""
         return bool(
             _v(self.A_SCALE_IN_REG if _v(operand) == 0 else self.B_SCALE_IN_REG)
-        )
-
-    @gluon.constexpr_function
-    def independent_buffers(self):
-        """Whether a component depth or storage placement was explicitly selected."""
-        return bool(
-            _v(self.B_IN_REG)
-            or _v(self.B_SCALE_IN_REG)
-            or _v(self.A_SCALE_IN_REG)
-            or _v(self.A_NUM_BUFFER)
-            or _v(self.B_NUM_BUFFER)
-            or _v(self.A_SCALE_NUM_BUFFER)
-            or _v(self.B_SCALE_NUM_BUFFER)
         )
 
     @gluon.constexpr_function
@@ -598,16 +585,6 @@ class KernelTuningConfig:
         return (requested + period - 1) // period * period
 
     @gluon.constexpr_function
-    def pipeline_peeled(self):
-        """Main iterations before the runtime loop, including wait-history warmup."""
-        return _pipeline_peeled(self)
-
-    @gluon.constexpr_function
-    def min_num_k(self):
-        """Minimum strip that executes at least one complete unrolled body."""
-        return self.pipeline_depth() + self.pipeline_peeled() + self.pipeline_unroll()
-
-    @gluon.constexpr_function
     def validate_buffer_counts(self):
         """Only components present in the operand formats participate."""
         for operand in (0, 1):
@@ -623,20 +600,6 @@ class KernelTuningConfig:
         return True
 
     @gluon.constexpr_function
-    def validate_pipeline(self, K):
-        """Host/device contract for the resolved component rings and runtime loop."""
-        self.validate_buffer_counts()
-        num_k = self.num_k_tiles(K)
-        depth = self.pipeline_depth()
-        peeled = self.pipeline_peeled()
-        unroll = self.pipeline_unroll()
-        assert num_k >= depth + peeled + unroll, (
-            f"NUM_K ({num_k}) must be at least NB_MAX ({depth}) + PEELED ({peeled}) "
-            f"+ UNROLL ({unroll}) = {depth + peeled + unroll}"
-        )
-        return True
-
-    @gluon.constexpr_function
     def ds_read_in_mfma(self, operand, scale=False):
         """Whether one component's read is assigned to the MFMA region.
 
@@ -645,8 +608,19 @@ class KernelTuningConfig:
         """
         operand = _v(operand)
         assert operand in (0, 1), "operand must be 0 (A) or 1 (B)"
-        bit = 1 << (operand + (2 if _v(scale) else 0))
-        return bool(_v(self.DS_READ_IN_MFMA) & bit)
+        if operand == 0:
+            flag = (
+                self.DS_READ_A_SCALE_IN_MFMA
+                if _v(scale)
+                else self.DS_READ_A_PAYLOAD_IN_MFMA
+            )
+        else:
+            flag = (
+                self.DS_READ_B_SCALE_IN_MFMA
+                if _v(scale)
+                else self.DS_READ_B_PAYLOAD_IN_MFMA
+            )
+        return bool(_v(flag))
 
     @gluon.constexpr_function
     def num_warps(self):
@@ -742,11 +716,6 @@ class KernelTuningConfig:
         return _v(self.WAIT_COMMIT_SCHEME) == int(WaitCommitScheme.PER_STAGE_WHOLE)
 
     @gluon.constexpr_function
-    def commit_groups_per_stage(self):
-        """Exact number of groups in the live stage's shared copy schedule."""
-        return len(_buffer_load_groups(self))
-
-    @gluon.constexpr_function
     def wait_at_stage_head(self):
         """Both per-stage modes wait once at the head; other modes wait per read slot."""
         return self.commit_per_stage()
@@ -778,26 +747,10 @@ class KernelTuningConfig:
         ]
 
     @gluon.constexpr_function
-    def a_lds_shape(self):
-        return self.lds_shape(0)
-
-    @gluon.constexpr_function
-    def b_lds_shape(self):
-        return self.lds_shape(1)
-
-    @gluon.constexpr_function
     def scale_shape(self, idx):
         """E8M0 scale tile of one operand, [mini non-K extent, BLOCK_K/32]."""
         non_k = _v(self.MINI_BLOCK_M) if _v(idx) == 0 else _v(self.MINI_BLOCK_N)
         return [non_k, _v(self.BLOCK_K) // MX_GROUP]
-
-    @gluon.constexpr_function
-    def a_scale_shape(self):
-        return self.scale_shape(0)
-
-    @gluon.constexpr_function
-    def b_scale_shape(self):
-        return self.scale_shape(1)
 
     @gluon.constexpr_function
     def copy_contiguity(self, idx):
@@ -1000,7 +953,7 @@ class KernelTuningConfig:
     @gluon.constexpr_function
     def dot_operand_scale_fragment_layout(self, idx):
         idx = _v(idx)
-        shape = self.a_scale_shape() if idx == 0 else self.b_scale_shape()
+        shape = self.scale_shape(idx)
         return gl.amd.cdna4.get_mfma_scale_layout(
             self.dot_operand_fragment_layout(idx), shape, MX_GROUP
         )
@@ -1254,7 +1207,7 @@ class KernelTuningConfig:
     def dot_operand_scale_copy_layout(self, idx):
         """32-bit-per-lane blocked layout for the scale direct-to-LDS write."""
         idx = _v(idx)
-        shape = self.a_scale_shape() if idx == 0 else self.b_scale_shape()
+        shape = self.scale_shape(idx)
         if self.scale_shuffled(idx):
             # Flat run, 4 contiguous bytes per lane.
             return gl.BlockedLayout(
@@ -1340,9 +1293,6 @@ class KernelTuningConfig:
             int(EpilogueMode.NOP_ACTIVATION),
             int(EpilogueMode.NOP),
         ), f"epilogue {_v(fc.epilogue)} is not an EpilogueMode"
-        assert _v(self.DS_READ_IN_MFMA) >= 0 and not (
-            _v(self.DS_READ_IN_MFMA) & ~int(DSReadOperand.ALL)
-        ), f"DS_READ_IN_MFMA {_v(self.DS_READ_IN_MFMA)} has unknown operand bits"
         assert _v(self.SCHED_MODE) in (
             int(SchedMode.NONE),
             int(SchedMode.IGLP_0),
@@ -1353,9 +1303,18 @@ class KernelTuningConfig:
         assert not _v(self.B_IN_REG) or self.operand_preshuffled(
             1
         ), "B_IN_REG requires B_PRESHUFFLED"
-        assert not (
-            _v(self.FROZEN_STEP) and self.independent_buffers()
-        ), "FROZEN_STEP does not support register storage or per-component buffer counts"
+        has_custom_storage = bool(
+            _v(self.B_IN_REG)
+            or _v(self.B_SCALE_IN_REG)
+            or _v(self.A_SCALE_IN_REG)
+            or _v(self.A_NUM_BUFFER)
+            or _v(self.B_NUM_BUFFER)
+            or _v(self.A_SCALE_NUM_BUFFER)
+            or _v(self.B_SCALE_NUM_BUFFER)
+        )
+        assert not (_v(self.FROZEN_STEP) and has_custom_storage), (
+            "FROZEN_STEP does not support register storage or per-component buffer counts"
+        )
         if _v(self.FROZEN_STEP):
             for idx in (0, 1):
                 assert self.payload_via_lds(idx), (
@@ -1405,9 +1364,6 @@ class KernelTuningConfig:
                     assert fc.has_scale(idx) and self.scale_packed_ok(
                         idx
                     ), f"operand {idx}'s packed K128 scales require register-private non-K +16"
-
-        # The prologue, peeled iterations and a complete unrolled body must fit.
-        self.validate_pipeline(K)
 
         # -- the mini block is the unit of LDS allocation, of the global->LDS copy, of
         #    the MFMA and of the accumulator, so it must align to the CTA tiling;

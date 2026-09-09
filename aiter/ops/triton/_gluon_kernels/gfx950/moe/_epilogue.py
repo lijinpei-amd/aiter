@@ -489,7 +489,7 @@ def _epilogue_one_tile(
             y_hbm_ptr,
             rows[:, None] * y_stride_m + (out_n0 + sn)[None, :] * y_stride_n,
             mask=(rows < M_e)[:, None],
-            cache=tuning_cfg.result_mod,
+            cache=tuning_cfg.result_cache_modifier,
         )
     else:
         # Fused MXFP4 output quant, straight off the fp32 accumulator.

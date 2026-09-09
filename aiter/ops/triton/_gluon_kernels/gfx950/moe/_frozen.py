@@ -293,7 +293,11 @@ class _FrozenLDSManager:
             lds_ptr = self.a_payload_lds_ptr
         else:
             lds_ptr = self.b_payload_lds_ptr
-        cache: gl.constexpr = cfg.token_mod if operand == 0 else cfg.expert_mod
+        cache: gl.constexpr = (
+            cfg.token_cache_modifier
+            if operand == 0
+            else cfg.expert_cache_modifier
+        )
         _buffer_load_to_lds(
             lds_ptr.index(BUFFER_LOAD_IDX * cfg.num_lds_tiles(operand) + tile),
             hbm_ptr,
@@ -329,7 +333,9 @@ class _FrozenLDSManager:
             else:
                 lds_ptr = self.b_scale_lds_ptr
             cache: gl.constexpr = (
-                cfg.token_scale_mod if operand == 0 else cfg.expert_scale_mod
+                cfg.token_scale_cache_modifier
+                if operand == 0
+                else cfg.expert_scale_cache_modifier
             )
             _buffer_load_to_lds(
                 lds_ptr.index(
@@ -820,7 +826,7 @@ def _buffer_load_frozen(
 ):
     """The global->LDS copies slot ``(mi, ni)`` owns, each its own commit group.
 
-    FROZEN SNAPSHOT -- do not refactor; ``_buffered._fill_slot`` is the live one.
+    FROZEN SNAPSHOT -- do not refactor; ``_pipeline._fill_slot`` is the live one.
 
     Specialised on the flags the ~625 us kernel ran with, so nothing here reads
     os.environ: the legacy per-fill groups (the former ONE_MARK 0 default) and
@@ -943,7 +949,11 @@ def _load_scale_register_frozen(
     tc: gl.constexpr = pc.tuning_cfg
     gl.static_assert(pc.func_cfg.has_scale(operand))
     gl.static_assert(not tc.scale_via_lds(operand))
-    cache: gl.constexpr = tc.token_scale_mod if operand == 0 else tc.expert_scale_mod
+    cache: gl.constexpr = (
+        tc.token_scale_cache_modifier
+        if operand == 0
+        else tc.expert_scale_cache_modifier
+    )
     if require_constexpr(tc.scale_shuffled(operand)):
         # One dword per lane instead of four ubytes: issue at the address-ordered
         # permutation so the widened load fills registers correctly, then renumber
@@ -1042,7 +1052,7 @@ def _pipeline_step_frozen(
     and 622.3 us saturating (bf16).
 
     Select with AITER_TRITON_MOE_GLUON_FROZEN_STEP=1 to A/B a refactor of
-    ``_buffered._step_live`` against the known-good schedule. Immediately after a
+    ``_pipeline._step_live`` against the known-good schedule. Immediately after a
     re-snapshot the two must compile to *identical* assembly -- that, not perf, is
     the check that the copy is faithful.
 
@@ -1316,6 +1326,27 @@ def _pipeline_step_frozen(
     ), _make_reg_fragments(a_tail, b_tail, acc)
 
 
+@gluon.constexpr_function
+def _pipeline_peeled_frozen(tc):
+    """The frozen schedule always peels its seed and first visible MFMA."""
+    return 1
+
+
+@gluon.constexpr_function
+def _validate_frozen_pipeline(tc, K):
+    """Validate the frozen driver's rings and runtime-loop lower bound."""
+    tc.validate_buffer_counts()
+    num_k = tc.num_k_tiles(K)
+    depth = tc.pipeline_depth()
+    peeled = _pipeline_peeled_frozen(tc)
+    unroll = tc.pipeline_unroll()
+    assert num_k >= depth + peeled + unroll, (
+        f"NUM_K ({num_k}) must be at least NB_MAX ({depth}) + PEELED ({peeled}) "
+        f"+ UNROLL ({unroll}) = {depth + peeled + unroll}"
+    )
+    return True
+
+
 @gluon.jit
 def _index_frozen(
     tc,
@@ -1331,7 +1362,7 @@ def _index_frozen(
         depth: gl.constexpr = tc.num_buffers(kind // 2, kind % 2 != 0)
         advance: gl.constexpr = depth - 1 if FILL else 0
         if require_constexpr(IN_LOOP and tc.pipeline_unroll() % depth == 0):
-            out = (tc.pipeline_peeled() + KI + 1 + advance) % depth
+            out = (_pipeline_peeled_frozen(tc) + KI + 1 + advance) % depth
         else:
             tile = step + advance
             if require_constexpr(tc.pipeline_register_period() == 1):
@@ -1453,7 +1484,7 @@ def _run_frozen_pipeline(pc, ptrs, NUM_K):
     )
     depth: gl.constexpr = tc.pipeline_depth()
     unroll: gl.constexpr = tc.pipeline_unroll()
-    peeled: gl.constexpr = tc.pipeline_peeled()
+    peeled: gl.constexpr = _pipeline_peeled_frozen(tc)
     main = NUM_K - depth
     gl.assume(main >= peeled + unroll)
     remaining = main - peeled
@@ -1569,7 +1600,7 @@ def _drain_frozen_pipeline(
                         j,
                         DRAIN=True,
                         EPILOGUE_GROUPS=EPILOGUE_GROUPS,
-                        KI=p + j - tc.pipeline_peeled(),
+                        KI=p + j - _pipeline_peeled_frozen(tc),
                         STATIC_PHASE=True,
                     )
     else:
@@ -1638,6 +1669,7 @@ def _moe_gemm_body_frozen(
     """The complete frozen kernel body, selected once by the entry point."""
     gl.static_assert(tuning_cfg.FROZEN_STEP)
     gl.static_assert(tuning_cfg.validate(N, K))
+    gl.static_assert(_validate_frozen_pipeline(tuning_cfg, K))
 
     BK: gl.constexpr = tuning_cfg.BLOCK_K
     PK_A: gl.constexpr = BK // func_cfg.a_pack_divisor()

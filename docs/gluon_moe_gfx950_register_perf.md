@@ -38,7 +38,8 @@ does not introduce library caching of changing activation scales.
 The shared recipe uses BM128/BN256/BK256, mini-M64/mini-N128/mini-K256,
 MFMA(16,16,128), warps(1,4), tiles(2,2), full-stage K prefetching, and shuffled
 A/B scales with scale mini-M128. It retains legacy three-buffer/unroll-3
-scheduling, `WARP_PIPELINE=0`, `WAIT_COMMIT_SCHEME=3`, `DS_READ_IN_MFMA=15`,
+scheduling, `WARP_PIPELINE=0`, `WAIT_COMMIT_SCHEME=3`, and all four
+`DS_READ_*_IN_MFMA` fields enabled,
 `SCALE_FILL_MID=True`, tile schedule 2, group-M 4, eight XCDs, and waves-per-EU 1.
 The B cache modifier remains the original empty setting in both cases.
 
