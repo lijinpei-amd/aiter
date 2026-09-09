@@ -567,7 +567,6 @@ def _pipeline_step_frozen(
                         _ds_read_a_tile_frozen(mi, ni, NM, NN),
                         a_scale_hbm_ptr,
                         0,
-                        False,
                     )
                 if require_constexpr(
                     _ds_read_b_tile_frozen(mi, ni, NM, NN) is not None
@@ -578,7 +577,6 @@ def _pipeline_step_frozen(
                         _ds_read_b_tile_frozen(mi, ni, NM, NN),
                         b_scale_hbm_ptr,
                         1,
-                        False,
                     )
             acc = acc + (slot_acc,)
 
