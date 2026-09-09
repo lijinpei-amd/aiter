@@ -112,10 +112,7 @@ class LDSManager:
             )
         else:
             b_payload_lds_ptr: gl.constexpr = None
-        if require_constexpr(
-            func_cfg.has_scale(0)
-            and (tuning_cfg.FROZEN_STEP or tuning_cfg.scale_via_lds(0))
-        ):
+        if require_constexpr(func_cfg.has_scale(0) and tuning_cfg.scale_via_lds(0)):
             as_shape: gl.constexpr = tuning_cfg.scale_shape(0)
             if require_constexpr(tuning_cfg.scale_shuffled(0)):
                 # Flat: direct-to-LDS on gfx9 cannot scatter, so the staging tile has to
@@ -137,10 +134,7 @@ class LDSManager:
                 )
         else:
             a_scale_lds_ptr: gl.constexpr = None
-        if require_constexpr(
-            func_cfg.has_scale(1)
-            and (tuning_cfg.FROZEN_STEP or tuning_cfg.scale_via_lds(1))
-        ):
+        if require_constexpr(func_cfg.has_scale(1) and tuning_cfg.scale_via_lds(1)):
             bs_shape: gl.constexpr = tuning_cfg.scale_shape(1)
             if require_constexpr(tuning_cfg.scale_shuffled(1)):
                 # Flat: direct-to-LDS on gfx9 cannot scatter, so the staging tile has to
@@ -428,8 +422,7 @@ class LDSManager:
                         SCALE_READ_IDX * cfg.num_lds_tiles(operand) + tile
                     )
             if require_constexpr(
-                cfg.scale_packed_ok(operand)
-                and not (not cfg.FROZEN_STEP and cfg.num_mini_k() > 1)
+                cfg.scale_packed_ok(operand) and not (cfg.num_mini_k() > 1)
             ):
                 # Straight to i32: the dword the shuffle assembled is the operand the
                 # matrix instruction wants, so there is nothing left to do to it.
@@ -450,7 +443,7 @@ class LDSManager:
                     ),
                     cfg.dot_operand_scale_fragment_layout(operand),
                 )
-                if require_constexpr(not cfg.FROZEN_STEP and cfg.num_mini_k() > 1):
+                if require_constexpr(cfg.num_mini_k() > 1):
                     scale_val = gl.amd.slice(
                         scale_val,
                         [cfg.scale_shape(operand)[0], cfg.MINI_BLOCK_K // MX_GROUP],

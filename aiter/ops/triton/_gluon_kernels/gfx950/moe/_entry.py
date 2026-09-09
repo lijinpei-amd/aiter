@@ -7,16 +7,71 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from ._config import KernelFuncConfig, KernelTuningConfig
-from ._lang import constexpr_fields
+from ._frozen import _moe_gemm_body_frozen
+from ._lang import constexpr_fields, require_constexpr
 from ._lang import unwrap_attr as _cv
 from ._types import QuantExpertTensor, QuantTokenTensor, ResultTensor, RoutingMeta
-from .moe_gemm import _moe_gemm_body
+from .moe_gemm import _moe_gemm_body as _moe_gemm_body_live
 
 __all__ = [
     "_moe_gluon_gemm1",
     "_moe_gluon_gemm2",
     "moe_gemm_launch_metadata",
 ]
+
+
+@gluon.jit
+def _moe_gemm_body(
+    a,
+    b,
+    res,
+    rt,
+    bias_hbm_ptr,
+    stride_bias_e,
+    x_static_scale_hbm_ptr,
+    grid_m,
+    grid_n,
+    func_cfg,
+    tuning_cfg,
+    N: gl.constexpr,
+    K: gl.constexpr,
+    NUM_K,
+):
+    """Select the frozen or live body once, before entering either implementation."""
+    if require_constexpr(tuning_cfg.FROZEN_STEP):
+        _moe_gemm_body_frozen(
+            a,
+            b,
+            res,
+            rt,
+            bias_hbm_ptr,
+            stride_bias_e,
+            x_static_scale_hbm_ptr,
+            grid_m,
+            grid_n,
+            func_cfg,
+            tuning_cfg,
+            N,
+            K,
+            NUM_K,
+        )
+    else:
+        _moe_gemm_body_live(
+            a,
+            b,
+            res,
+            rt,
+            bias_hbm_ptr,
+            stride_bias_e,
+            x_static_scale_hbm_ptr,
+            grid_m,
+            grid_n,
+            func_cfg,
+            tuning_cfg,
+            N,
+            K,
+            NUM_K,
+        )
 
 
 def moe_gemm_launch_metadata(grid, kernel, args):

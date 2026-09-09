@@ -698,8 +698,8 @@ class KernelTuningConfig:
         return _v(self.BLOCK_N) // _v(self.MINI_BLOCK_N)
 
     # -- inter-wave ping-pong (WarpPipeline) ----------------------------------------
-    # The three modes share one step body; these only say which stage borders it lays
-    # down. See _lang.pick_warp_pipeline_stage.
+    # NONE and COMPILER share the live step body; MANUAL selects the frozen body.
+    # See _lang.pick_warp_pipeline_stage.
 
     @gluon.constexpr_function
     def warp_pipeline_enabled(self):

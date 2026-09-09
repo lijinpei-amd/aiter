@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Frozen prologue and K-loop step for the gfx950 Gluon MoE kernel.
+"""Frozen gfx950 Gluon MoE kernel path.
 
 ``_pipeline_step_frozen`` is a verbatim copy of ``moe_gemm._pipeline_step_impl`` taken
 from the best measured kernel (2026-09-02), with every env-var constexpr replaced by its
@@ -9,26 +9,597 @@ tuned value so no stray flag can perturb the reference schedule. It lives in its
 module for exactly that reason: nothing here is meant to be refactored alongside the
 live step, and keeping the two apart makes an accidental edit visible in the diff.
 
-``AITER_TRITON_MOE_GLUON_FROZEN_STEP=1`` selects it -- see ``_buffered._step``.
-The acceptance test for a re-snapshot is *identical assembly* against ``FROZEN_STEP=0``,
-which is also what proves the ``*_frozen`` helper twins below are still in sync with
-their live counterparts.
+``AITER_TRITON_MOE_GLUON_FROZEN_STEP=1`` selects this body at the kernel entry.
+The complete performance-sensitive path lives here: LDS allocation and access,
+dot selection, pipeline state, prologue, runtime loop, drain, and final MFMA. Shared
+offset construction and epilogue primitives remain outside because they contain no
+frozen/live policy.
 
-The shared pointer and register aggregates are adapted at the step boundary; the
-snapshot's scheduling statements, including its separate prologue fence, stay fixed.
-
-The shared ``moe_gemm`` helpers are imported after this module's definitions.
-The unified driver also imports these frozen steps, so deferring the shared
-imports lets either module initialize first. JIT resolves the helpers later.
+The acceptance test for this extraction is byte-identical generated code against the
+pre-extraction frozen builds. That keeps the snapshot's scheduling statements,
+including its separate prologue fence, fixed while the live implementation evolves.
 """
 
+import math
+
+import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+from triton.language.core import _aggregate as aggregate
 
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
+from aiter.ops.triton.utils.common_utils import strip_annotate
+
+from ._config import KernelFuncConfig, KernelTuningConfig
+from ._epilogue import _epilogue_store, _stage_epilogue_inputs
 from ._lang import MX_GROUP_CE as MX_GROUP
+from ._lang import optional as _opt
 from ._lang import require_constexpr
 from ._lang import unwrap as _v
+from ._offsets import (
+    _a_payload_hbm_offsets,
+    _a_scale_hbm_offsets,
+    _b_payload_hbm_offsets,
+    _b_scale_hbm_offsets,
+    _slot_index,
+)
 from ._schedule import _buffer_load_order, _buffer_load_tile
+from ._types import DotKind, TileSched
+
+_TS_XCD_GROUP_M: gl.constexpr = gl.constexpr(int(TileSched.XCD_GROUP_M))
+_TS_GROUP_M: gl.constexpr = gl.constexpr(int(TileSched.GROUP_M))
+_DK_MFMA: gl.constexpr = gl.constexpr(int(DotKind.MFMA))
+_DK_MFMA_SCALED: gl.constexpr = gl.constexpr(int(DotKind.MFMA_SCALED))
+_DK_UPCAST_MFMA: gl.constexpr = gl.constexpr(int(DotKind.UPCAST_MFMA))
+_NO_SCALE: gl.constexpr = gl.constexpr(None)
+
+
+@gluon.constexpr_function
+def _packed_sel(tuning_cfg, idx, k_phase=0):
+    """The frozen K256 selector for an LDS-staged packed scale operand."""
+    if tuning_cfg.scale_packed_ok(idx) and tuning_cfg.scale_via_lds(idx):
+        return tuning_cfg.scale_packed_sel(idx, k_phase)
+    return None
+
+
+@gluon.constexpr_function
+def _any_packed(tuning_cfg):
+    return (
+        _packed_sel(tuning_cfg, 0) is not None or _packed_sel(tuning_cfg, 1) is not None
+    )
+
+
+@gluon.jit
+def _dot(a, a_scale, b, b_scale, acc, func_cfg, tuning_cfg, K_PHASE: gl.constexpr = 0):
+    """The frozen snapshot's matrix-instruction dispatch."""
+    kind: gl.constexpr = func_cfg.dot_kind()
+    a_sel: gl.constexpr = _packed_sel(tuning_cfg, 0, K_PHASE)
+    b_sel: gl.constexpr = _packed_sel(tuning_cfg, 1, K_PHASE)
+    any_packed: gl.constexpr = _any_packed(tuning_cfg)
+    if require_constexpr(kind == _DK_MFMA_SCALED and any_packed):
+        out = gl.amd.cdna4.mfma_scaled_packed(
+            a=a,
+            a_scale=a_scale,
+            a_scale_sel=a_sel,
+            a_format=func_cfg.mx_format(0),
+            b=b,
+            b_scale=b_scale,
+            b_scale_sel=b_sel,
+            b_format=func_cfg.mx_format(1),
+            acc=acc,
+        )
+    elif require_constexpr(kind == _DK_MFMA_SCALED):
+        out = gl.amd.cdna4.mfma_scaled(
+            a=a,
+            a_scale=a_scale,
+            a_format=func_cfg.mx_format(0),
+            b=b,
+            b_scale=b_scale,
+            b_format=func_cfg.mx_format(1),
+            acc=acc,
+        )
+    elif require_constexpr(kind == _DK_UPCAST_MFMA):
+        out = gl.amd.cdna4.mfma(a, b, acc)
+    else:
+        gl.static_assert(kind == _DK_MFMA)
+        out = gl.amd.cdna4.mfma(a, b, acc)
+    return out
+
+
+@gluon.jit
+def _opt_at(t, i: gl.constexpr, PRESENT: gl.constexpr):
+    if require_constexpr(PRESENT):
+        out = t[i]
+    else:
+        out = _NO_SCALE
+    return out
+
+
+@gluon.jit
+def _take_pairs(frags, LO: gl.constexpr, N: gl.constexpr):
+    out = ()
+    for i in gl.static_range(N):
+        out = out + (frags[2 * (LO + i)], frags[2 * (LO + i) + 1])
+    return out
+
+
+@gluon.jit
+def _maybe_block_dot(
+    a_frags,
+    b_frags,
+    acc,
+    N_MINI: gl.constexpr,
+    func_cfg,
+    tuning_cfg,
+    DO_MFMA: gl.constexpr,
+    K_PHASE: gl.constexpr = 0,
+):
+    if require_constexpr(DO_MFMA):
+        for i in gl.static_range(N_MINI):
+            if require_constexpr(func_cfg.has_scale(0)):
+                a_s = a_frags[2 * i + 1]
+            else:
+                a_s = _NO_SCALE
+            if require_constexpr(func_cfg.has_scale(1)):
+                b_s = b_frags[2 * i + 1]
+            else:
+                b_s = _NO_SCALE
+            acc = _dot(
+                a_frags[2 * i],
+                a_s,
+                b_frags[2 * i],
+                b_s,
+                acc,
+                func_cfg,
+                tuning_cfg,
+                K_PHASE,
+            )
+    return acc
+
+
+@gluon.jit
+def _ds_read(lds_ptr, layout: gl.constexpr):
+    return lds_ptr.load(layout)
+
+
+@gluon.jit
+def _buffer_load_to_lds(
+    lds_ptr,
+    hbm_ptr,
+    hbm_offs,
+    cache: gl.constexpr,
+    SOFF: gl.constexpr = 0,
+):
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(
+        lds_ptr, hbm_ptr, hbm_offs, cache_modifier=cache, soffset=SOFF
+    )
+
+
+@aggregate
+@strip_annotate
+class _FrozenLDSManager:
+    """The LDS shape and accessors used by the frozen snapshot."""
+
+    func_cfg: KernelFuncConfig
+    tuning_cfg: KernelTuningConfig
+    a_payload_lds_ptr: gl.shared_memory_descriptor | gl.constexpr
+    a_scale_lds_ptr: gl.shared_memory_descriptor | gl.constexpr
+    b_payload_lds_ptr: gl.shared_memory_descriptor | gl.constexpr
+    b_scale_lds_ptr: gl.shared_memory_descriptor | gl.constexpr
+
+    @gluon.constexpr_function
+    def __init__(
+        self,
+        func_cfg,
+        tuning_cfg,
+        a_payload_lds_ptr,
+        a_scale_lds_ptr,
+        b_payload_lds_ptr,
+        b_scale_lds_ptr,
+    ):
+        self.func_cfg = func_cfg
+        self.tuning_cfg = tuning_cfg
+        self.a_payload_lds_ptr = _opt(a_payload_lds_ptr)
+        self.a_scale_lds_ptr = _opt(a_scale_lds_ptr)
+        self.b_payload_lds_ptr = _opt(b_payload_lds_ptr)
+        self.b_scale_lds_ptr = _opt(b_scale_lds_ptr)
+
+    @gluon.jit
+    def alloc(func_cfg, tuning_cfg):
+        NBA: gl.constexpr = tuning_cfg.num_buffers(0)
+        NBB: gl.constexpr = tuning_cfg.num_buffers(1)
+        NBAS: gl.constexpr = tuning_cfg.num_buffers(0, True)
+        NBBS: gl.constexpr = tuning_cfg.num_buffers(1, True)
+        NMA: gl.constexpr = tuning_cfg.num_lds_tiles(0)
+        NMB: gl.constexpr = tuning_cfg.num_lds_tiles(1)
+        a_ty: gl.constexpr = func_cfg.operand_elem_ty(0)
+        b_ty: gl.constexpr = func_cfg.operand_elem_ty(1)
+        a_shape: gl.constexpr = tuning_cfg.lds_shape(0)
+        b_shape: gl.constexpr = tuning_cfg.lds_shape(1)
+
+        if require_constexpr(tuning_cfg.payload_via_lds(0)):
+            a_payload_lds_ptr = gl.allocate_shared_memory(
+                a_ty,
+                [NBA * NMA, a_shape[0], a_shape[1]],
+                layout=tuning_cfg.dot_operand_lds_layout(0),
+            )
+        else:
+            a_payload_lds_ptr: gl.constexpr = None
+        if require_constexpr(tuning_cfg.payload_via_lds(1)):
+            b_payload_lds_ptr = gl.allocate_shared_memory(
+                b_ty,
+                [NBB * NMB, b_shape[0], b_shape[1]],
+                layout=tuning_cfg.dot_operand_lds_layout(1),
+            )
+        else:
+            b_payload_lds_ptr: gl.constexpr = None
+        if require_constexpr(func_cfg.has_scale(0)):
+            as_shape: gl.constexpr = tuning_cfg.scale_shape(0)
+            if require_constexpr(tuning_cfg.scale_shuffled(0)):
+                a_scale_lds_ptr = gl.allocate_shared_memory(
+                    gl.uint8,
+                    [NBAS * tuning_cfg.num_scale_tiles_a()]
+                    + tuning_cfg.scale_flat_shape(0),
+                    layout=tuning_cfg.dot_operand_scale_lds_layout(0),
+                )
+            else:
+                a_scale_lds_ptr = gl.allocate_shared_memory(
+                    gl.uint8,
+                    [NBAS * NMA, as_shape[0], as_shape[1]],
+                    layout=tuning_cfg.dot_operand_scale_lds_layout(0),
+                )
+        else:
+            a_scale_lds_ptr: gl.constexpr = None
+        if require_constexpr(func_cfg.has_scale(1)):
+            bs_shape: gl.constexpr = tuning_cfg.scale_shape(1)
+            if require_constexpr(tuning_cfg.scale_shuffled(1)):
+                b_scale_lds_ptr = gl.allocate_shared_memory(
+                    gl.uint8,
+                    [NBBS * NMB] + tuning_cfg.scale_flat_shape(1),
+                    layout=tuning_cfg.dot_operand_scale_lds_layout(1),
+                )
+            else:
+                b_scale_lds_ptr = gl.allocate_shared_memory(
+                    gl.uint8,
+                    [NBBS * NMB, bs_shape[0], bs_shape[1]],
+                    layout=tuning_cfg.dot_operand_scale_lds_layout(1),
+                )
+        else:
+            b_scale_lds_ptr: gl.constexpr = None
+
+        return _FrozenLDSManager(
+            func_cfg,
+            tuning_cfg,
+            a_payload_lds_ptr,
+            a_scale_lds_ptr,
+            b_payload_lds_ptr,
+            b_scale_lds_ptr,
+        )
+
+    @gluon.jit
+    def buffer_load_payload(
+        self,
+        operand: gl.constexpr,
+        VIA_LDS: gl.constexpr,
+        BUFFER_LOAD_IDX,
+        tile: gl.constexpr,
+        hbm_ptr,
+        hbm_offs,
+        SOFF: gl.constexpr = 0,
+    ):
+        cfg: gl.constexpr = self.tuning_cfg
+        gl.static_assert(VIA_LDS)
+        if require_constexpr(operand == 0):
+            lds_ptr = self.a_payload_lds_ptr
+        else:
+            lds_ptr = self.b_payload_lds_ptr
+        cache: gl.constexpr = cfg.token_mod if operand == 0 else cfg.expert_mod
+        _buffer_load_to_lds(
+            lds_ptr.index(BUFFER_LOAD_IDX * cfg.num_lds_tiles(operand) + tile),
+            hbm_ptr,
+            hbm_offs,
+            cache,
+            SOFF,
+        )
+
+    @gluon.jit
+    def buffer_load_scale(
+        self,
+        operand: gl.constexpr,
+        VIA_LDS: gl.constexpr,
+        BUFFER_LOAD_IDX,
+        tile: gl.constexpr,
+        hbm_ptr,
+        hbm_offs,
+        SOFF: gl.constexpr = 0,
+        K_PHASE=0,
+    ):
+        cfg: gl.constexpr = self.tuning_cfg
+        gl.static_assert(VIA_LDS)
+        ratio: gl.constexpr = (
+            cfg.scale_tile_ratio_a() if operand == 0 and cfg.scale_shuffled(0) else 1
+        )
+        if require_constexpr(
+            self.func_cfg.has_scale(operand)
+            and cfg.scale_via_lds(operand)
+            and tile % ratio == 0
+        ):
+            if require_constexpr(operand == 0):
+                lds_ptr = self.a_scale_lds_ptr
+            else:
+                lds_ptr = self.b_scale_lds_ptr
+            cache: gl.constexpr = (
+                cfg.token_scale_mod if operand == 0 else cfg.expert_scale_mod
+            )
+            _buffer_load_to_lds(
+                lds_ptr.index(
+                    BUFFER_LOAD_IDX * (cfg.num_lds_tiles(operand) // ratio)
+                    + tile // ratio
+                ),
+                hbm_ptr,
+                hbm_offs,
+                cache,
+                SOFF,
+            )
+
+    @gluon.jit
+    def commit_buffer_load(self):
+        gl.amd.cdna4.async_copy.commit_group()
+
+    @gluon.jit
+    def wait_buffer_load_groups(self, num_group: gl.constexpr):
+        gl.amd.cdna4.async_copy.wait_group(num_group)
+
+    @gluon.jit
+    def _payload_slice(
+        self,
+        lds_ptr,
+        DS_READ_IDX,
+        n_tiles: gl.constexpr,
+        tile: gl.constexpr,
+        mini_idx: gl.constexpr,
+        k_dim: gl.constexpr,
+        pack: gl.constexpr,
+    ):
+        cfg: gl.constexpr = self.tuning_cfg
+        tile_lds_ptr = lds_ptr.index(DS_READ_IDX * n_tiles + tile)
+        if require_constexpr(cfg.num_mini_k() > 1):
+            width: gl.constexpr = cfg.MINI_BLOCK_K // pack
+            tile_lds_ptr = tile_lds_ptr.slice(mini_idx * width, width, dim=k_dim)
+        return tile_lds_ptr
+
+    @gluon.jit
+    def _scale_slice(
+        self,
+        lds_ptr,
+        DS_READ_IDX,
+        n_tiles: gl.constexpr,
+        tile: gl.constexpr,
+        mini_idx: gl.constexpr,
+    ):
+        cfg: gl.constexpr = self.tuning_cfg
+        tile_lds_ptr = lds_ptr.index(DS_READ_IDX * n_tiles + tile)
+        if require_constexpr(cfg.num_mini_k() > 1):
+            width: gl.constexpr = cfg.MINI_BLOCK_K // MX_GROUP
+            tile_lds_ptr = tile_lds_ptr.slice(mini_idx * width, width, dim=1)
+        return tile_lds_ptr
+
+    @gluon.jit
+    def _a_scale_tile(self, DS_READ_IDX, mi: gl.constexpr):
+        cfg: gl.constexpr = self.tuning_cfg
+        RA: gl.constexpr = cfg.scale_tile_ratio_a() if cfg.scale_shuffled(0) else 1
+        tile_lds_ptr = self.a_scale_lds_ptr.index(
+            DS_READ_IDX * (cfg.num_lds_tiles(0) // RA) + mi // RA
+        )
+        if require_constexpr(RA > 1):
+            stripes: gl.constexpr = cfg.MINI_BLOCK_M // 32
+            tile_lds_ptr = tile_lds_ptr.slice((mi % RA) * stripes, stripes, dim=0)
+        return tile_lds_ptr
+
+    @gluon.jit
+    def ds_read_frag(
+        self,
+        operand: gl.constexpr,
+        DS_READ_IDX,
+        tile: gl.constexpr,
+        mini_idx: gl.constexpr,
+        READ_PAYLOAD: gl.constexpr = True,
+        READ_SCALE: gl.constexpr = True,
+        SCALE_READ_IDX=None,
+    ):
+        cfg: gl.constexpr = self.tuning_cfg
+        if require_constexpr(operand == 0):
+            payload_lds_ptr = self.a_payload_lds_ptr
+            scale_lds_ptr = self.a_scale_lds_ptr
+        else:
+            payload_lds_ptr = self.b_payload_lds_ptr
+            scale_lds_ptr = self.b_scale_lds_ptr
+        if require_constexpr(SCALE_READ_IDX is None):
+            SCALE_READ_IDX = DS_READ_IDX
+        if require_constexpr(not READ_PAYLOAD):
+            payload: gl.constexpr = None
+        else:
+            payload = _ds_read(
+                self._payload_slice(
+                    payload_lds_ptr,
+                    DS_READ_IDX,
+                    cfg.num_lds_tiles(operand),
+                    tile,
+                    mini_idx,
+                    1 - operand,
+                    self.func_cfg.pack_divisor(operand),
+                ),
+                cfg.dot_operand_fragment_layout(operand),
+            )
+        if require_constexpr(READ_SCALE and self.func_cfg.has_scale(operand)):
+            gl.static_assert(cfg.scale_via_lds(operand))
+            if require_constexpr(cfg.scale_shuffled(operand)):
+                if require_constexpr(operand == 0):
+                    scale_tile_lds_ptr = self._a_scale_tile(SCALE_READ_IDX, tile)
+                else:
+                    scale_tile_lds_ptr = scale_lds_ptr.index(
+                        SCALE_READ_IDX * cfg.num_lds_tiles(operand) + tile
+                    )
+            if require_constexpr(cfg.scale_packed_ok(operand)):
+                scale_val = _ds_read(
+                    scale_tile_lds_ptr.reinterpret(
+                        gl.int32,
+                        cfg.packed_scale_shape(operand),
+                        cfg.packed_scale_read_layout(operand),
+                    ),
+                    cfg.packed_scale_frag_layout(operand),
+                )
+            elif require_constexpr(cfg.scale_shuffled(operand)):
+                scale_val = _ds_read(
+                    scale_tile_lds_ptr.reinterpret(
+                        gl.uint8,
+                        cfg.scale_shape(operand),
+                        cfg.shuffled_scale_read_layout(operand),
+                    ),
+                    cfg.dot_operand_scale_fragment_layout(operand),
+                )
+            else:
+                scale_val = _ds_read(
+                    self._scale_slice(
+                        scale_lds_ptr,
+                        SCALE_READ_IDX,
+                        cfg.num_lds_tiles(operand),
+                        tile,
+                        mini_idx,
+                    ),
+                    cfg.dot_operand_scale_fragment_layout(operand),
+                )
+        else:
+            scale_val: gl.constexpr = None
+        return payload, scale_val
+
+
+@aggregate
+@strip_annotate
+class _PipelineConst:
+    lds_ptrs: _FrozenLDSManager
+    a_hbm_offs: tl.tuple | tuple
+    b_hbm_offs: tl.tuple | tuple
+    a_scale_hbm_offs: tl.tuple | tuple | gl.constexpr
+    b_scale_hbm_offs: tl.tuple | tuple | gl.constexpr
+    a_scale_stride_k: gl.constexpr
+    b_scale_stride_k: gl.constexpr
+    a_step: gl.constexpr
+    b_step: gl.constexpr
+    s_step: gl.constexpr
+    func_cfg: KernelFuncConfig
+    tuning_cfg: KernelTuningConfig
+
+    @gluon.constexpr_function
+    def __init__(
+        self,
+        lds_ptrs,
+        a_hbm_offs,
+        b_hbm_offs,
+        a_scale_hbm_offs,
+        b_scale_hbm_offs,
+        a_scale_stride_k,
+        b_scale_stride_k,
+        a_step,
+        b_step,
+        s_step,
+        func_cfg,
+        tuning_cfg,
+    ):
+        self.lds_ptrs = lds_ptrs
+        self.a_hbm_offs = a_hbm_offs
+        self.b_hbm_offs = b_hbm_offs
+        self.a_scale_hbm_offs = _opt(a_scale_hbm_offs)
+        self.b_scale_hbm_offs = _opt(b_scale_hbm_offs)
+        self.a_scale_stride_k = gl.constexpr(_v(a_scale_stride_k))
+        self.b_scale_stride_k = gl.constexpr(_v(b_scale_stride_k))
+        self.a_step = gl.constexpr(_v(a_step))
+        self.b_step = gl.constexpr(_v(b_step))
+        self.s_step = gl.constexpr(_v(s_step))
+        self.func_cfg = func_cfg
+        self.tuning_cfg = tuning_cfg
+
+
+@aggregate
+@strip_annotate
+class _PipelinePointers:
+    a_hbm_ptr: gl.tensor
+    b_hbm_ptr: gl.tensor
+    a_scale_hbm_ptr: gl.tensor | gl.constexpr
+    b_scale_hbm_ptr: gl.tensor | gl.constexpr
+
+    @gluon.constexpr_function
+    def __init__(self, a_hbm_ptr, b_hbm_ptr, a_scale_hbm_ptr, b_scale_hbm_ptr):
+        self.a_hbm_ptr = a_hbm_ptr
+        self.b_hbm_ptr = b_hbm_ptr
+        self.a_scale_hbm_ptr = _opt(a_scale_hbm_ptr)
+        self.b_scale_hbm_ptr = _opt(b_scale_hbm_ptr)
+
+
+@aggregate
+@strip_annotate
+class _PipelineRegFragments:
+    a_payload: tl.tuple | tuple
+    a_scale: tl.tuple | tuple
+    b_payload: tl.tuple | tuple
+    b_scale: tl.tuple | tuple
+    acc: tl.tuple | tuple
+
+    @gluon.constexpr_function
+    def __init__(self, a_payload, a_scale, b_payload, b_scale, acc):
+        self.a_payload = a_payload
+        self.a_scale = a_scale
+        self.b_payload = b_payload
+        self.b_scale = b_scale
+        self.acc = acc
+
+
+@gluon.jit
+def _take_reg_pairs(payload, scale, LO: gl.constexpr, N: gl.constexpr):
+    out = ()
+    for i in gl.static_range(N):
+        out = out + (payload[LO + i], scale[LO + i])
+    return out
+
+
+@gluon.jit
+def _make_reg_fragments(a_frags, b_frags, acc):
+    a_payload, a_scale, b_payload, b_scale = (), (), (), ()
+    for i in gl.static_range(len(a_frags) // 2):
+        a_payload = a_payload + (a_frags[2 * i],)
+        a_scale = a_scale + (a_frags[2 * i + 1],)
+    for i in gl.static_range(len(b_frags) // 2):
+        b_payload = b_payload + (b_frags[2 * i],)
+        b_scale = b_scale + (b_frags[2 * i + 1],)
+    return _PipelineRegFragments(a_payload, a_scale, b_payload, b_scale, acc)
+
+
+@gluon.jit
+def _advance_hbm_ptrs(pc, hbm_ptrs, STEPS: gl.constexpr = 1, K_PHASE: gl.constexpr = 0):
+    a_hbm_ptr = hbm_ptrs.a_hbm_ptr + STEPS * pc.a_step
+    b_hbm_ptr = hbm_ptrs.b_hbm_ptr + STEPS * pc.b_step
+    a_scale_hbm_ptr = hbm_ptrs.a_scale_hbm_ptr
+    b_scale_hbm_ptr = hbm_ptrs.b_scale_hbm_ptr
+    if require_constexpr(pc.func_cfg.a_has_scale() and pc.tuning_cfg.scale_via_lds(0)):
+        a_scale_hbm_ptr = (
+            a_scale_hbm_ptr
+            + pc.tuning_cfg.scale_hbm_steps(0, STEPS, K_PHASE)
+            * pc.s_step
+            * pc.a_scale_stride_k
+        )
+    if require_constexpr(pc.func_cfg.b_has_scale() and pc.tuning_cfg.scale_via_lds(1)):
+        b_scale_hbm_ptr = (
+            b_scale_hbm_ptr
+            + pc.tuning_cfg.scale_hbm_steps(1, STEPS, K_PHASE)
+            * pc.s_step
+            * pc.b_scale_stride_k
+        )
+    return _PipelinePointers(
+        a_hbm_ptr,
+        b_hbm_ptr,
+        a_scale_hbm_ptr,
+        b_scale_hbm_ptr,
+    )
 
 
 @gluon.jit
@@ -287,9 +858,7 @@ def _buffer_load_frozen(
         # Payload and its own scale share one commit group; a scale placed elsewhere
         # gets its own below.
         if require_constexpr(
-            A_SC == A_TILE
-            and func_cfg.has_scale(0)
-            and pc.tuning_cfg.scale_via_lds(0)
+            A_SC == A_TILE and func_cfg.has_scale(0) and pc.tuning_cfg.scale_via_lds(0)
         ):
             pc.lds_ptrs.buffer_load_scale(
                 0,
@@ -302,9 +871,7 @@ def _buffer_load_frozen(
             )
         pc.lds_ptrs.commit_buffer_load()
     if require_constexpr(A_SC is not None and A_SC != A_TILE):
-        if require_constexpr(
-            func_cfg.has_scale(0) and pc.tuning_cfg.scale_via_lds(0)
-        ):
+        if require_constexpr(func_cfg.has_scale(0) and pc.tuning_cfg.scale_via_lds(0)):
             pc.lds_ptrs.buffer_load_scale(
                 0,
                 True,
@@ -320,9 +887,7 @@ def _buffer_load_frozen(
             1, True, BUFFER_LOAD_IDX, B_TILE, b_hbm_ptr, pc.b_hbm_offs[B_TILE], 0
         )
         if require_constexpr(
-            B_SC == B_TILE
-            and func_cfg.has_scale(1)
-            and pc.tuning_cfg.scale_via_lds(1)
+            B_SC == B_TILE and func_cfg.has_scale(1) and pc.tuning_cfg.scale_via_lds(1)
         ):
             pc.lds_ptrs.buffer_load_scale(
                 1,
@@ -335,9 +900,7 @@ def _buffer_load_frozen(
             )
         pc.lds_ptrs.commit_buffer_load()
     if require_constexpr(B_SC is not None and B_SC != B_TILE):
-        if require_constexpr(
-            func_cfg.has_scale(1) and pc.tuning_cfg.scale_via_lds(1)
-        ):
+        if require_constexpr(func_cfg.has_scale(1) and pc.tuning_cfg.scale_via_lds(1)):
             pc.lds_ptrs.buffer_load_scale(
                 1,
                 True,
@@ -753,14 +1316,462 @@ def _pipeline_step_frozen(
     ), _make_reg_fragments(a_tail, b_tail, acc)
 
 
-# The driver imports these steps; defer shared helpers until the steps exist.
-from .moe_gemm import (
-    _advance_hbm_ptrs,
-    _make_reg_fragments,
-    _maybe_block_dot,
-    _opt_at,
-    _PipelinePointers,
-    _slot_index,
-    _take_pairs,
-    _take_reg_pairs,
-)
+@gluon.jit
+def _index_frozen(
+    tc,
+    step,
+    kind: gl.constexpr,
+    FILL: gl.constexpr,
+    KI: gl.constexpr,
+    IN_LOOP: gl.constexpr,
+):
+    if require_constexpr(kind % 2 and not tc.func_cfg.has_scale(kind // 2)):
+        out = 0
+    else:
+        depth: gl.constexpr = tc.num_buffers(kind // 2, kind % 2 != 0)
+        advance: gl.constexpr = depth - 1 if FILL else 0
+        if require_constexpr(IN_LOOP and tc.pipeline_unroll() % depth == 0):
+            out = (tc.pipeline_peeled() + KI + 1 + advance) % depth
+        else:
+            tile = step + advance
+            if require_constexpr(tc.pipeline_register_period() == 1):
+                gl.assume(tile >= 0)
+            out = tile % depth
+    return out
+
+
+@gluon.jit
+def _init_buffers_frozen(pc):
+    """Mirror the pre-extraction driver's inert register queues exactly."""
+    tc: gl.constexpr = pc.tuning_cfg
+    a, b, a_scale, b_scale = (), (), (), ()
+    if require_constexpr(not tc.payload_via_lds(0)):
+        for _ in gl.static_range(tc.num_buffers(0) * tc.num_mini_m() * tc.num_mini_k()):
+            a += (
+                gl.zeros(
+                    [
+                        tc.MINI_BLOCK_M,
+                        tc.MINI_BLOCK_K // pc.func_cfg.pack_divisor(0),
+                    ],
+                    pc.func_cfg.operand_elem_ty(0),
+                    tc.dot_operand_fragment_layout(0),
+                ),
+            )
+    if require_constexpr(not tc.payload_via_lds(1)):
+        for _ in gl.static_range(tc.num_buffers(1) * tc.num_mini_n() * tc.num_mini_k()):
+            b += (
+                gl.zeros(
+                    [tc.MINI_BLOCK_K // pc.func_cfg.pack_divisor(1), tc.MINI_BLOCK_N],
+                    pc.func_cfg.operand_elem_ty(1),
+                    tc.dot_operand_fragment_layout(1),
+                ),
+            )
+    if require_constexpr(pc.func_cfg.a_has_scale() and not tc.scale_via_lds(0)):
+        for _ in gl.static_range(
+            tc.num_buffers(0, True) * tc.num_mini_m() * tc.num_mini_k()
+        ):
+            if require_constexpr(tc.scale_packed_k128(0)):
+                a_scale += (
+                    gl.zeros(
+                        tc.packed_scale_shape(0),
+                        gl.int32,
+                        tc.packed_scale_frag_layout(0),
+                    ),
+                )
+            else:
+                a_scale += (
+                    gl.zeros(
+                        [tc.MINI_BLOCK_M, tc.MINI_BLOCK_K // 32],
+                        gl.uint8,
+                        tc.dot_operand_scale_fragment_layout(0),
+                    ),
+                )
+    if require_constexpr(pc.func_cfg.b_has_scale() and not tc.scale_via_lds(1)):
+        for _ in gl.static_range(
+            tc.num_buffers(1, True) * tc.num_mini_n() * tc.num_mini_k()
+        ):
+            if require_constexpr(tc.scale_packed_k128(1)):
+                b_scale += (
+                    gl.zeros(
+                        tc.packed_scale_shape(1),
+                        gl.int32,
+                        tc.packed_scale_frag_layout(1),
+                    ),
+                )
+            else:
+                b_scale += (
+                    gl.zeros(
+                        [tc.MINI_BLOCK_N, tc.MINI_BLOCK_K // 32],
+                        gl.uint8,
+                        tc.dot_operand_scale_fragment_layout(1),
+                    ),
+                )
+    return a, b, a_scale, b_scale
+
+
+@gluon.jit
+def _step_frozen(
+    pc,
+    ptrs,
+    buffers,
+    regs,
+    step,
+    STAGE: gl.constexpr,
+    DRAIN: gl.constexpr = False,
+    KI: gl.constexpr = 0,
+    IN_LOOP: gl.constexpr = False,
+    DOT: gl.constexpr = True,
+    EPILOGUE_GROUPS: gl.constexpr = 0,
+    STATIC_PHASE: gl.constexpr = False,
+):
+    tc: gl.constexpr = pc.tuning_cfg
+    ptrs, regs = _pipeline_step_frozen(
+        pc,
+        ptrs,
+        regs,
+        _index_frozen(tc, step, 0, True, KI, IN_LOOP or STATIC_PHASE),
+        _index_frozen(tc, step, 0, False, KI, IN_LOOP or STATIC_PHASE),
+        tc.pipeline_depth() - 2 - (STAGE if DRAIN else 0),
+        not DRAIN,
+        True,
+        IN_LOOP,
+        DOT,
+        0,
+        1,
+        EPILOGUE_GROUPS,
+    )
+    return ptrs, buffers, regs
+
+
+@gluon.jit
+def _run_frozen_pipeline(pc, ptrs, NUM_K):
+    """Run the frozen prologue and runtime K loop, leaving the drain exposed."""
+    tc: gl.constexpr = pc.tuning_cfg
+    gl.static_assert(
+        tc.num_prefetch_mini() == tc.num_mini_k(),
+        "the frozen pipeline requires VGPR_PREFETCH_K == BLOCK_K",
+    )
+    depth: gl.constexpr = tc.pipeline_depth()
+    unroll: gl.constexpr = tc.pipeline_unroll()
+    peeled: gl.constexpr = tc.pipeline_peeled()
+    main = NUM_K - depth
+    gl.assume(main >= peeled + unroll)
+    remaining = main - peeled
+    countdown: gl.constexpr = (
+        not pc.func_cfg.a_has_scale()
+        and not pc.func_cfg.b_has_scale()
+        and tc.pipeline_register_period() == 1
+    )
+    if require_constexpr(not countdown):
+        unroll_end = remaining // unroll * unroll
+    buffers = _init_buffers_frozen(pc)
+    ptrs = _prologue_frozen(pc, ptrs)
+    acc = ()
+    for ni in gl.static_range(tc.num_mini_n()):
+        for mi in gl.static_range(tc.num_mini_m()):
+            acc += (
+                gl.zeros(
+                    [tc.MINI_BLOCK_M, tc.MINI_BLOCK_N],
+                    pc.func_cfg.mma_acc_dtype,
+                    tc.dot_result_fragment_layout(),
+                ),
+            )
+    regs = _PipelineRegFragments((), (), (), (), acc)
+    ptrs, buffers, regs = _step_frozen(pc, ptrs, buffers, regs, 0, 0, DOT=False)
+    for x in gl.static_range(peeled):
+        ptrs, buffers, regs = _step_frozen(pc, ptrs, buffers, regs, x + 1, x + 1)
+    if require_constexpr(not countdown):
+        for base in tl.range(0, unroll_end, unroll):
+            for u in gl.static_range(unroll):
+                ptrs, buffers, regs = _step_frozen(
+                    pc,
+                    ptrs,
+                    buffers,
+                    regs,
+                    peeled + base + u + 1,
+                    None,
+                    KI=u,
+                    IN_LOOP=True,
+                )
+    else:
+        base = 0
+        left = remaining
+        while left >= unroll:
+            for u in gl.static_range(unroll):
+                ptrs, buffers, regs = _step_frozen(
+                    pc,
+                    ptrs,
+                    buffers,
+                    regs,
+                    peeled + base + u + 1,
+                    None,
+                    KI=u,
+                    IN_LOOP=True,
+                )
+            base += unroll
+            left -= unroll
+        unroll_end = remaining - left
+    if require_constexpr(unroll > 6 and tc.pipeline_register_period() > 1):
+        for u in tl.range(0, remaining - unroll_end):
+            ptrs, buffers, regs = _step_frozen(
+                pc,
+                ptrs,
+                buffers,
+                regs,
+                peeled + unroll_end + u + 1,
+                None,
+            )
+    else:
+        for u in gl.static_range(unroll - 1):
+            if unroll_end + u < remaining:
+                ptrs, buffers, regs = _step_frozen(
+                    pc,
+                    ptrs,
+                    buffers,
+                    regs,
+                    peeled + unroll_end + u + 1,
+                    None,
+                    KI=u,
+                    STATIC_PHASE=True,
+                )
+    return ptrs, buffers, regs
+
+
+@gluon.jit
+def _drain_frozen_pipeline(
+    pc, ptrs, buffers, regs, NUM_K, EPILOGUE_GROUPS: gl.constexpr
+):
+    tc: gl.constexpr = pc.tuning_cfg
+    main = NUM_K - tc.pipeline_depth()
+    period: gl.constexpr = math.lcm(
+        tc.num_buffers(0),
+        tc.num_buffers(1),
+        tc.num_buffers(0, True) if pc.func_cfg.a_has_scale() else 1,
+        tc.num_buffers(1, True) if pc.func_cfg.b_has_scale() else 1,
+        2 if tc.scale_packed_k128(0) or tc.scale_packed_k128(1) else 1,
+    )
+    if require_constexpr(
+        period <= 3
+        and tc.pipeline_unroll() % period == 0
+        and tc.pipeline_register_period() == 1
+        and pc.func_cfg.output_quant is None
+    ):
+        phase = main % period
+        for p in gl.static_range(period):
+            if phase == p:
+                for j in gl.static_range(tc.pipeline_depth() - 1):
+                    ptrs, buffers, regs = _step_frozen(
+                        pc,
+                        ptrs,
+                        buffers,
+                        regs,
+                        main + j + 1,
+                        j,
+                        DRAIN=True,
+                        EPILOGUE_GROUPS=EPILOGUE_GROUPS,
+                        KI=p + j - tc.pipeline_peeled(),
+                        STATIC_PHASE=True,
+                    )
+    else:
+        for j in gl.static_range(tc.pipeline_depth() - 1):
+            ptrs, buffers, regs = _step_frozen(
+                pc,
+                ptrs,
+                buffers,
+                regs,
+                main + j + 1,
+                j,
+                DRAIN=True,
+                EPILOGUE_GROUPS=EPILOGUE_GROUPS,
+            )
+    return regs
+
+
+@gluon.jit
+def _last_mfma_frozen(pc, regs):
+    tc: gl.constexpr = pc.tuning_cfg
+    acc = ()
+    for ni in gl.static_range(tc.num_mini_n()):
+        for mi in gl.static_range(tc.num_mini_m()):
+            acc += (
+                _maybe_block_dot(
+                    _take_reg_pairs(
+                        regs.a_payload,
+                        regs.a_scale,
+                        mi * tc.num_mini_k(),
+                        tc.num_mini_k(),
+                    ),
+                    _take_reg_pairs(
+                        regs.b_payload,
+                        regs.b_scale,
+                        ni * tc.num_mini_k(),
+                        tc.num_mini_k(),
+                    ),
+                    regs.acc[_slot_index(mi, ni, tc.num_mini_m(), tc.num_mini_n())],
+                    tc.num_mini_k(),
+                    pc.func_cfg,
+                    tc,
+                    True,
+                    0,
+                ),
+            )
+    return acc
+
+
+@gluon.jit
+def _moe_gemm_body_frozen(
+    a,
+    b,
+    res,
+    rt,
+    bias_hbm_ptr,
+    stride_bias_e,
+    x_static_scale_hbm_ptr,
+    grid_m,
+    grid_n,
+    func_cfg,
+    tuning_cfg,
+    N: gl.constexpr,
+    K: gl.constexpr,
+    NUM_K,
+):
+    """The complete frozen kernel body, selected once by the entry point."""
+    gl.static_assert(tuning_cfg.FROZEN_STEP)
+    gl.static_assert(tuning_cfg.validate(N, K))
+
+    BK: gl.constexpr = tuning_cfg.BLOCK_K
+    PK_A: gl.constexpr = BK // func_cfg.a_pack_divisor()
+    PK_B: gl.constexpr = BK // func_cfg.b_pack_divisor()
+    SK: gl.constexpr = BK // MX_GROUP
+
+    pid = gl.program_id(0)
+    if require_constexpr(tuning_cfg.TILE_SCHED == _TS_XCD_GROUP_M):
+        unpadded_m = gl.load(rt.expt_offs_sum)
+        if pid >= unpadded_m * grid_n:
+            return
+        pid = remap_xcd(pid, unpadded_m * grid_n, tuning_cfg.NUM_XCDS)
+        pid_m, pid_n = pid_grid(pid, unpadded_m, grid_n, tuning_cfg.GROUP_M)
+    elif require_constexpr(tuning_cfg.TILE_SCHED == _TS_GROUP_M):
+        pid_m, pid_n = pid_grid(pid, grid_m, grid_n, tuning_cfg.GROUP_M)
+    else:
+        pid_m = pid // grid_n
+        pid_n = pid % grid_n
+
+    expt_data = gl.load(rt.expt_block_pid_map + pid_m)
+    if expt_data == -1:
+        return
+    expt_id = expt_data & 0x0000FFFF
+    block_id = expt_data >> 16
+    M_e = gl.load(rt.expt_hist + expt_id)
+    start_m = gl.load(rt.expt_offs_raw + expt_id)
+
+    a_hbm_offs = _a_payload_hbm_offsets(
+        a, rt, block_id, M_e, start_m, func_cfg, tuning_cfg
+    )
+    b_hbm_ptr = b.ptr + expt_id.to(gl.int64) * b.stride_e
+    if require_constexpr(func_cfg.a_has_scale()):
+        a_scale_hbm_ptr = a.scale_ptr
+    else:
+        a_scale_hbm_ptr: gl.constexpr = None
+    if require_constexpr(func_cfg.b_has_scale()):
+        b_scale_hbm_ptr = b.scale_ptr + expt_id.to(gl.int64) * b.scale_stride_e
+    else:
+        b_scale_hbm_ptr: gl.constexpr = None
+
+    b_hbm_offs = _b_payload_hbm_offsets(b, pid_n, N, K, func_cfg, tuning_cfg)
+    if require_constexpr(func_cfg.a_has_scale()):
+        a_scale_hbm_offs = _a_scale_hbm_offsets(
+            a, rt, block_id, M_e, start_m, pid_m, K, func_cfg, tuning_cfg
+        )
+    else:
+        a_scale_hbm_offs: gl.constexpr = None
+    if require_constexpr(func_cfg.b_has_scale()):
+        b_scale_hbm_offs = _b_scale_hbm_offsets(b, pid_n, N, K, func_cfg, tuning_cfg)
+    else:
+        b_scale_hbm_offs: gl.constexpr = None
+
+    lds_ptrs = _FrozenLDSManager.alloc(func_cfg, tuning_cfg)
+
+    a_step: gl.constexpr = PK_A
+    b_step: gl.constexpr = PK_B // 16 * 256 if tuning_cfg.B_PRESHUFFLED else PK_B
+    s_step: gl.constexpr = SK
+    hbm_ptrs = _PipelinePointers(
+        a.ptr,
+        b_hbm_ptr,
+        a_scale_hbm_ptr,
+        b_scale_hbm_ptr,
+    )
+    if require_constexpr(func_cfg.a_has_scale()):
+        a_scale_stride_k: gl.constexpr = a.scale_stride_k
+    else:
+        a_scale_stride_k: gl.constexpr = None
+    if require_constexpr(func_cfg.b_has_scale()):
+        b_scale_stride_k: gl.constexpr = b.scale_stride_k
+    else:
+        b_scale_stride_k: gl.constexpr = None
+    pc = _PipelineConst(
+        lds_ptrs,
+        a_hbm_offs,
+        b_hbm_offs,
+        a_scale_hbm_offs,
+        b_scale_hbm_offs,
+        a_scale_stride_k,
+        b_scale_stride_k,
+        a_step,
+        b_step,
+        s_step,
+        func_cfg,
+        tuning_cfg,
+    )
+
+    hbm_ptrs, buffers, regs = _run_frozen_pipeline(pc, hbm_ptrs, NUM_K)
+    epi = _stage_epilogue_inputs(
+        bias_hbm_ptr,
+        stride_bias_e,
+        rt,
+        expt_id,
+        start_m,
+        block_id,
+        pid_n,
+        N,
+        M_e,
+        func_cfg,
+        tuning_cfg,
+    )
+    regs = _drain_frozen_pipeline(pc, hbm_ptrs, buffers, regs, NUM_K, epi.groups)
+    acc = _last_mfma_frozen(pc, regs)
+
+    if require_constexpr(func_cfg.has_x_static_scale):
+        x_static_scale = gl.load(x_static_scale_hbm_ptr)
+    else:
+        x_static_scale: gl.constexpr = None
+    if require_constexpr(epi.groups > 0):
+        gl.amd.cdna4.async_copy.wait_group(0)
+        gl.barrier()
+
+    y_hbm_ptr = res.ptr + start_m.to(gl.int64) * res.stride_m
+    if require_constexpr(func_cfg.output_quant is not None):
+        ys_hbm_ptr = res.scale_ptr + start_m.to(gl.int64) * res.scale_stride_m
+    else:
+        ys_hbm_ptr: gl.constexpr = None
+    _epilogue_store(
+        acc,
+        y_hbm_ptr,
+        res.stride_m,
+        res.stride_n,
+        ys_hbm_ptr,
+        res.scale_stride_m,
+        res.scale_stride_n,
+        epi.bias_hbm_base,
+        block_id,
+        pid_n,
+        N,
+        M_e,
+        epi.gammas_hbm_ptr,
+        epi.gamma_lds_ptr,
+        epi.bias_lds_ptr,
+        x_static_scale,
+        func_cfg,
+        tuning_cfg,
+        GATE_PRE=False,
+    )
