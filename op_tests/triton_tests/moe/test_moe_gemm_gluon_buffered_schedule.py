@@ -286,17 +286,7 @@ class _Machine:
         return fragments[k]
 
     def ds_read_frag(
-        self,
-        operand,
-        ring,
-        mini,
-        k,
-        pointer,
-        extra,
-        *,
-        READ_PAYLOAD,
-        READ_SCALE,
-        SCALE_READ_IDX
+        self, operand, ring, mini, k, *, READ_PAYLOAD, READ_SCALE, SCALE_READ_IDX
     ):
         payload = self.read(operand * 2, ring, mini, k) if READ_PAYLOAD else None
         scale = (

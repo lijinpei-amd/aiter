@@ -25,6 +25,7 @@ imports lets either module initialize first. JIT resolves the helpers later.
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from ._lang import MX_GROUP_CE as MX_GROUP
 from ._lang import require_constexpr
 from ._lang import unwrap as _v
 from ._schedule import _buffer_load_order, _buffer_load_tile
@@ -359,6 +360,98 @@ def _buffer_load_frozen(
 
 
 @gluon.jit
+def _mini_scale_hbm_offset_frozen(base, step, HAS_SCALE: gl.constexpr):
+    """Advance a direct-register scale offset, or pass the None sentinel through."""
+    if require_constexpr(HAS_SCALE):
+        out = base + step
+    else:
+        out = base
+    return out
+
+
+@gluon.jit
+def _load_scale_register_frozen(
+    pc,
+    operand: gl.constexpr,
+    scale_hbm_ptr,
+    scale_hbm_offs,
+):
+    """Load a frozen-step scale directly from HBM into its MFMA fragment."""
+    tc: gl.constexpr = pc.tuning_cfg
+    gl.static_assert(pc.func_cfg.has_scale(operand))
+    gl.static_assert(not tc.scale_via_lds(operand))
+    cache: gl.constexpr = tc.token_scale_mod if operand == 0 else tc.expert_scale_mod
+    if require_constexpr(tc.scale_shuffled(operand)):
+        # One dword per lane instead of four ubytes: issue at the address-ordered
+        # permutation so the widened load fills registers correctly, then renumber
+        # into the layout the MFMA wants.
+        scale = gl.convert_layout(
+            gl.amd.cdna4.buffer_load(
+                ptr=scale_hbm_ptr,
+                offsets=scale_hbm_offs,
+                cache=cache,
+                contiguity=4,
+            ),
+            tc.dot_operand_scale_fragment_layout(operand),
+        )
+    else:
+        scale = gl.amd.cdna4.buffer_load(
+            ptr=scale_hbm_ptr,
+            offsets=scale_hbm_offs,
+            cache=cache,
+        )
+    return scale
+
+
+@gluon.jit
+def _ds_read_operand_frozen(
+    pc,
+    DS_READ_IDX,
+    tile: gl.constexpr,
+    scale_hbm_ptr,
+    operand: gl.constexpr,
+    READ_PAYLOAD: gl.constexpr = True,
+    READ_SCALE: gl.constexpr = True,
+):
+    """Read one frozen-step operand tile and any direct-register scale fragments."""
+    tc: gl.constexpr = pc.tuning_cfg
+    NUM_MINI: gl.constexpr = tc.num_mini_k()
+    SK_MINI: gl.constexpr = tc.MINI_BLOCK_K // MX_GROUP
+    HAS: gl.constexpr = pc.func_cfg.has_scale(operand)
+    SCALE_VIA_LDS: gl.constexpr = HAS and tc.scale_via_lds(operand)
+    if require_constexpr(operand == 0):
+        scale_hbm_offs = pc.a_scale_hbm_offs
+    else:
+        scale_hbm_offs = pc.b_scale_hbm_offs
+    scale_tile_hbm_offs = _opt_at(scale_hbm_offs, tile, HAS)
+    frags = ()
+    for i in gl.static_range(NUM_MINI):
+        payload, scale = pc.lds_ptrs.ds_read_frag(
+            operand,
+            DS_READ_IDX,
+            tile,
+            i,
+            READ_PAYLOAD,
+            READ_SCALE and SCALE_VIA_LDS,
+        )
+        if require_constexpr(READ_SCALE and HAS and not SCALE_VIA_LDS):
+            scale = _load_scale_register_frozen(
+                pc,
+                operand,
+                scale_hbm_ptr,
+                _mini_scale_hbm_offset_frozen(scale_tile_hbm_offs, i * SK_MINI, HAS),
+            )
+        if require_constexpr(not READ_PAYLOAD):
+            payload = scale
+        if require_constexpr(HAS and READ_SCALE):
+            slot = scale
+        else:
+            slot = payload
+        frags = frags + (payload, slot)
+    return frags
+
+
+@gluon.jit
 def _pipeline_step_frozen(
     pc,
     hbm_ptrs,
@@ -583,7 +676,7 @@ def _pipeline_step_frozen(
                 if require_constexpr(
                     _ds_read_a_tile_frozen(mi, ni, NM, NN) is not None
                 ):
-                    a_cur = a_cur + _ds_read_operand(
+                    a_cur = a_cur + _ds_read_operand_frozen(
                         pc,
                         DS_READ_IDX,
                         _ds_read_a_tile_frozen(mi, ni, NM, NN),
@@ -593,7 +686,7 @@ def _pipeline_step_frozen(
                 if require_constexpr(
                     _ds_read_b_tile_frozen(mi, ni, NM, NN) is not None
                 ):
-                    b_cur = b_cur + _ds_read_operand(
+                    b_cur = b_cur + _ds_read_operand_frozen(
                         pc,
                         DS_READ_IDX,
                         _ds_read_b_tile_frozen(mi, ni, NM, NN),
@@ -663,7 +756,6 @@ def _pipeline_step_frozen(
 # The driver imports these steps; defer shared helpers until the steps exist.
 from .moe_gemm import (
     _advance_hbm_ptrs,
-    _ds_read_operand,
     _make_reg_fragments,
     _maybe_block_dot,
     _opt_at,

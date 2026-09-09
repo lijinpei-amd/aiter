@@ -383,16 +383,13 @@ class LDSManager:
         DS_READ_IDX,
         tile: gl.constexpr,
         mini_idx: gl.constexpr,
-        scale_hbm_ptr,
-        scale_hbm_offs,
         READ_PAYLOAD: gl.constexpr = True,
         READ_SCALE: gl.constexpr = True,
         SCALE_READ_IDX=None,
     ):
-        """Read one A (0) or B (1) mini-M/N, mini-K fragment and its scale.
+        """Read one A (0) or B (1) mini-M/N, mini-K fragment from LDS.
 
-        An absent or disabled component returns None. Frozen steps load scales
-        that bypass LDS directly at the supplied mini-block/mini-K offsets.
+        An absent or disabled component returns None.
         """
         cfg: gl.constexpr = self.tuning_cfg
         if require_constexpr(operand == 0):
@@ -419,9 +416,11 @@ class LDSManager:
                 cfg.dot_operand_fragment_layout(operand),
             )
         if require_constexpr(READ_SCALE and self.func_cfg.has_scale(operand)):
-            if require_constexpr(
-                cfg.scale_shuffled(operand) and cfg.scale_via_lds(operand)
-            ):
+            gl.static_assert(
+                cfg.scale_via_lds(operand),
+                "ds_read_frag only reads LDS-staged scales",
+            )
+            if require_constexpr(cfg.scale_shuffled(operand)):
                 if require_constexpr(operand == 0):
                     scale_tile_lds_ptr = self._a_scale_tile(SCALE_READ_IDX, tile)
                 else:
@@ -430,7 +429,6 @@ class LDSManager:
                     )
             if require_constexpr(
                 cfg.scale_packed_ok(operand)
-                and cfg.scale_via_lds(operand)
                 and not (not cfg.FROZEN_STEP and cfg.num_mini_k() > 1)
             ):
                 # Straight to i32: the dword the shuffle assembled is the operand the
@@ -443,9 +441,7 @@ class LDSManager:
                     ),
                     cfg.packed_scale_frag_layout(operand),
                 )
-            elif require_constexpr(
-                cfg.scale_shuffled(operand) and cfg.scale_via_lds(operand)
-            ):
+            elif require_constexpr(cfg.scale_shuffled(operand)):
                 scale_val = _ds_read(
                     scale_tile_lds_ptr.reinterpret(
                         gl.uint8,
@@ -460,7 +456,7 @@ class LDSManager:
                         [cfg.scale_shape(operand)[0], cfg.MINI_BLOCK_K // MX_GROUP],
                         [0, mini_idx * (cfg.MINI_BLOCK_K // MX_GROUP)],
                     )
-            elif require_constexpr(cfg.scale_via_lds(operand)):
+            else:
                 scale_val = _ds_read(
                     self._scale_slice(
                         scale_lds_ptr,
@@ -471,34 +467,6 @@ class LDSManager:
                     ),
                     cfg.dot_operand_scale_fragment_layout(operand),
                 )
-            else:
-                if require_constexpr(cfg.scale_shuffled(operand)):
-                    # One dword per lane instead of four ubytes: issue at the
-                    # address-ordered permutation so the widened load fills registers
-                    # correctly, then renumber into the layout the MFMA wants.
-                    scale_val = gl.convert_layout(
-                        gl.amd.cdna4.buffer_load(
-                            ptr=scale_hbm_ptr,
-                            offsets=scale_hbm_offs,
-                            cache=(
-                                cfg.token_scale_mod
-                                if operand == 0
-                                else cfg.expert_scale_mod
-                            ),
-                            contiguity=4,
-                        ),
-                        cfg.dot_operand_scale_fragment_layout(operand),
-                    )
-                else:
-                    scale_val = gl.amd.cdna4.buffer_load(
-                        ptr=scale_hbm_ptr,
-                        offsets=scale_hbm_offs,
-                        cache=(
-                            cfg.token_scale_mod
-                            if operand == 0
-                            else cfg.expert_scale_mod
-                        ),
-                    )
         else:
             scale_val: gl.constexpr = None
         return payload, scale_val

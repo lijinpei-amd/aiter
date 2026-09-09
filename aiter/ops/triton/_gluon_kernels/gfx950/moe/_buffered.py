@@ -446,8 +446,6 @@ def _read_tile(
             _index(tc, step, operand * 2, False, KI, IN_LOOP or STATIC_PHASE),
             tile,
             k,
-            ptrs.a_scale_hbm_ptr if operand == 0 else ptrs.b_scale_hbm_ptr,
-            None,
             READ_PAYLOAD=PAYLOAD and not reg_payload,
             READ_SCALE=SCALE and not reg_scale,
             SCALE_READ_IDX=_index(

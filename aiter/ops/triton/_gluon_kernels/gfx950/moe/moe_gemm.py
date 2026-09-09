@@ -177,16 +177,6 @@ def _dot(a, a_scale, b, b_scale, acc, func_cfg, tuning_cfg, K_PHASE: gl.constexp
     return out
 
 
-@gluon.jit
-def _mini_scale_hbm_offset(base, step, HAS_SCALE: gl.constexpr):
-    """Advance a register-path scale offset, or pass the None sentinel through."""
-    if require_constexpr(HAS_SCALE):
-        out = base + step
-    else:
-        out = base
-    return out
-
-
 _NO_SCALE: gl.constexpr = gl.constexpr(None)
 
 
@@ -426,61 +416,6 @@ def _advance_hbm_ptrs(pc, hbm_ptrs, STEPS: gl.constexpr = 1, K_PHASE: gl.constex
         a_scale_hbm_ptr,
         b_scale_hbm_ptr,
     )
-
-
-@gluon.jit
-def _ds_read_operand(
-    pc,
-    DS_READ_IDX,
-    tile: gl.constexpr,
-    scale_hbm_ptr,
-    operand: gl.constexpr,
-    READ_PAYLOAD: gl.constexpr = True,
-    READ_SCALE: gl.constexpr = True,
-):
-    """One operand's fragments for a mini-M/N block, all mini-K, as a flat tuple.
-
-    ``operand`` is 0 for A or 1 for B.
-
-    Two entries per mini-K step -- payload, scale -- let the pipeline carry the
-    fragments across an iteration and hand them to :func:`_maybe_block_dot` one
-    stage later.
-
-    The pair is present even for an operand with no scale: the tuple is loop-carried, so
-    Triton asks every element for its ``.type`` and a ``None`` there aborts codegen. An
-    absent scale therefore parks the payload's own SSA value in the slot -- a duplicate
-    reference costs no register -- and :func:`_maybe_block_dot` puts the ``None`` back from the
-    same compile-time predicate.
-    """
-    tc: gl.constexpr = pc.tuning_cfg
-    NUM_MINI: gl.constexpr = tc.num_mini_k()
-    SK_MINI: gl.constexpr = tc.MINI_BLOCK_K // MX_GROUP
-    HAS: gl.constexpr = pc.func_cfg.has_scale(operand)
-    if require_constexpr(operand == 0):
-        scale_hbm_offs = pc.a_scale_hbm_offs
-    else:
-        scale_hbm_offs = pc.b_scale_hbm_offs
-    scale_tile_hbm_offs = _opt_at(scale_hbm_offs, tile, HAS)
-    frags = ()
-    for i in gl.static_range(NUM_MINI):
-        payload, scale = pc.lds_ptrs.ds_read_frag(
-            operand,
-            DS_READ_IDX,
-            tile,
-            i,
-            scale_hbm_ptr,
-            _mini_scale_hbm_offset(scale_tile_hbm_offs, i * SK_MINI, HAS),
-            READ_PAYLOAD,
-            READ_SCALE,
-        )
-        if require_constexpr(not READ_PAYLOAD):
-            payload = scale
-        if require_constexpr(HAS and READ_SCALE):
-            slot = scale
-        else:
-            slot = payload
-        frags = frags + (payload, slot)
-    return frags
 
 
 @gluon.jit
