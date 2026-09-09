@@ -477,7 +477,7 @@ def get_gluon_config_uncached(
                 out_mini_n = bn
 
         # A 16x16x128 operand that is not preshuffled is staged in LDS as 32-row units
-        # (_config.py::byte_unit_lds_layout), which only describes what a warp reads
+        # (_layout.py::byte_unit_lds_layout), which only describes what a warp reads
         # while the warp owns both 16-row MFMA tiles of the unit -- so validate()
         # requires tiles_per_warp >= 2 on that axis. Raise it here wherever the tile
         # divides; where it does not (BLOCK_M = 16), byte_unit_lds_ok() is False anyway

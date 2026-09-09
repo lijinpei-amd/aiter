@@ -948,7 +948,7 @@ def _audit_buffer_schedule(tc, num_k, epilogue_groups=0):
 def test_independent_buffer_waits_match_copy_history(
     config, monkeypatch, scheme, storage_mask, counts, geometry
 ):
-    from aiter.ops.triton._gluon_kernels.gfx950.moe import _config as config_module
+    from aiter.ops.triton._gluon_kernels.gfx950.moe import _layout as layout_module
 
     config.update(zip(host._COMPONENT_BUFFER_KEYS, counts, strict=True))
     config.update(
@@ -959,7 +959,7 @@ def test_independent_buffer_waits_match_copy_history(
         B_PRESHUFFLED=bool(storage_mask & 1),
     )
     if geometry == "middle_shared_a":
-        monkeypatch.setattr(config_module, "_SCALE_MINI_M_ENV", 128)
+        monkeypatch.setattr(layout_module, "_SCALE_MINI_M_ENV", 128)
         config.update(SCALE_FILL_MID=True, A_SCALE_SORTED_SHUFFLED=True)
     elif geometry == "unequal_tiles":
         config.update(MINI_BLOCK_N=64, SCALE_FILL_MID=True)
