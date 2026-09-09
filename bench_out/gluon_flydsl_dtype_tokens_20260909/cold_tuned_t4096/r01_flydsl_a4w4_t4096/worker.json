@@ -1,0 +1,384 @@
+{
+  "case": "flydsl_a4w4",
+  "case_spec": {
+    "backend": "flydsl",
+    "precision": "a4w4",
+    "output": "mxfp4",
+    "output_quantization_policy": "round_up",
+    "tuning": {
+      "tile_m": 64,
+      "tile_n": 256,
+      "tile_k": 256,
+      "gate_mode": "separated",
+      "xcd_swizzle": 4,
+      "use_nt": false
+    },
+    "env": {},
+    "description": "Token-aware A4W4 FlyDSL: TM32 NT through T256, tuned TM64 xcd4 at T4096",
+    "config_origin": {
+      "path": "bench_out/gluon_flydsl_small_tokens_20260908/cases.json",
+      "case": "flydsl_m32_nt"
+    }
+  },
+  "source": "/raid/jinpli/workspace/home01/jinpli/development/aiter",
+  "shape": {
+    "T": 4096,
+    "N": 4096,
+    "K": 7168,
+    "E": 33,
+    "topk": 8,
+    "block_m": 64
+  },
+  "precision": "a4w4",
+  "backend": "flydsl",
+  "mode": "cold",
+  "pass": true,
+  "device": {
+    "name": "AMD Instinct MI350X",
+    "arch": "gfx950:sramecc+:xnack-",
+    "physical_gpu": "4",
+    "hip_visible_devices": "5",
+    "pci_bus_id": "0000:86:00.0"
+  },
+  "versions": {
+    "python": "3.14.4 (main, Jun 18 2026, 14:25:02) [GCC 15.2.0]",
+    "torch": "2.15.0.dev20260816+rocm7.14",
+    "hip": "7.14.60850",
+    "triton": "3.8.0"
+  },
+  "setup_excluded_from_timing": [
+    "routing",
+    "input quantization",
+    "A-scale sorting",
+    "weight and scale shuffle/preshuffle",
+    "output allocation",
+    "JIT compilation",
+    "launch argument preparation"
+  ],
+  "inputs": {
+    "shape": {
+      "T": 4096,
+      "N": 4096,
+      "K": 7168,
+      "E": 33,
+      "topk": 8
+    },
+    "precision": "a4w4",
+    "seed": 0,
+    "expert_selection_seed": 0,
+    "builder": "bench_moe_gemm_gluon._build(n_active=33)",
+    "input_distribution": "standard-normal BF16 staging tensors; no extra scaling",
+    "topk_sha256": "f312bd4feb0903c69bc0c3ce78f361a3cf58b4a829cfa7effd10408dd9dbe133",
+    "histogram": [
+      993,
+      992,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993
+    ],
+    "raw_offsets_sha256": "920155c013bb265b10c798fde75df54ecaad98271eb329866a755ede97a7e8c2",
+    "gather_sha256": "223983cc513a58a5dcd4b5c4ed835049b3042181372f382e29eb3727c2301188",
+    "x_sha256": "90a2bd9202ea8d3561077a94198906b54215408cd718592ef53b416a682e82dc",
+    "x_scales_sha256": "979e1a44f315b7a6cf4251eaf17978ebdabeebd4ba3c3335471b5974a3f25d53",
+    "w_scales_sha256": "8de8b086ae8bcb77d3ed14e693ffc4cf513b5982029f1e2fd6d978daaaaee54c",
+    "full_weight_payload_sha256": "bb248d56c5d56d0012f1a7d5fafaceab45c1ca2ef8267820411305120a06adb4",
+    "input_dtype": "torch.uint8",
+    "scale_dtype": "torch.uint8",
+    "input_quantization": "group32 E8M0 ceil scale; shared quantized tensors",
+    "unit_scales": false,
+    "weight_layout": "logical E,N,K/2; gate then up; canonical N-axis permutation",
+    "activation": "silu(gate) * up; alpha=1; no clamp; no residual",
+    "output_dtype": "mxfp4_e2m1_e8m0",
+    "bias": false,
+    "gammas": false
+  },
+  "routing_metadata": {
+    "block_m": 64,
+    "native_block_m": 128,
+    "useful_m_blocks": 528,
+    "gluon_grid_m": 544,
+    "useful_rows": 32768,
+    "padded_rows": 33792,
+    "allocated_rows": 34816,
+    "block_pid_map_sha256": "6ffe26858cd15a40b672f912727858bd15e774644cc0dd117e150931273083c5",
+    "padded_offsets_sha256": "5dba72df628b13d07cb29b1cd9ed6845afeef0ca2f4e273794d2d4f066075405"
+  },
+  "kernel": {
+    "config": {
+      "kind": "a4w4",
+      "tile_m": 64,
+      "tile_n": 256,
+      "tile_k": 256,
+      "waves_per_eu": null,
+      "b_nt": 0,
+      "gate_mode": "separated",
+      "use_async_copy": true,
+      "xcd_swizzle": 4,
+      "k_wave": 1,
+      "act": "silu",
+      "alpha": 1.0,
+      "clamp": null,
+      "bias": false,
+      "routing_weights": false,
+      "output": "mxfp4",
+      "output_layout": "sorted",
+      "shape": {
+        "T": 4096,
+        "K": 7168,
+        "N": 4096,
+        "E": 33,
+        "topk": 8
+      },
+      "preprocessing": "setup only; retained compiled callable and prepared arguments",
+      "allocated_routing_blocks": 545,
+      "active_routing_blocks": 528,
+      "native_grid_blocks": 8720,
+      "use_nt": false,
+      "inline_quant": false,
+      "native_m_block_upper_bound": 545,
+      "scale_layout": "native shuffled; logical payload/scale accessor excludes padding"
+    },
+    "output_layout": "sorted",
+    "output_quantization_policy": "round_up",
+    "executable": {
+      "compiled_ir_sha256": "b7fcc2bf01af1eb8f4d5dc1df02675ebb778a537bb4a9e77567ea7246d771fbc",
+      "compiled_ir_bytes": 80060,
+      "binaries": [
+        {
+          "index": 0,
+          "bytes": 30280,
+          "sha256": "04575cb8db580a4817c340c02bc3c0f8fd70986e36be64f24bd89cb3990062ad",
+          "path": "/raid/jinpli/workspace/home01/jinpli/development/aiter/bench_out/gluon_flydsl_dtype_tokens_20260909/cold_tuned_t4096/r01_flydsl_a4w4_t4096/fly_artifact/module0.hsaco"
+        }
+      ],
+      "kernels": [
+        {
+          "name": "gemm1_a4w4_port_h7168_i2048_ne33_bm64_cached_sep_xcd4",
+          "resources": {
+            "agpr_count": 0,
+            "group_segment_fixed_size": 65536,
+            "max_flat_workgroup_size": 256,
+            "private_segment_fixed_size": 0,
+            "sgpr_count": 46,
+            "sgpr_spill_count": 0,
+            "vgpr_count": 224,
+            "vgpr_spill_count": 0,
+            "wavefront_size": 64,
+            "reqd_workgroup_size": [
+              256,
+              1,
+              1
+            ],
+            "workgroup_size_hint": [
+              -1,
+              -1,
+              -1
+            ]
+          },
+          "raw": "{agpr_count = 0 : i64, group_segment_fixed_size = 65536 : i64, max_flat_workgroup_size = 256 : i64, private_segment_fixed_size = 0 : i64, reqd_workgroup_size = array<i32: 256, 1, 1>, sgpr_count = 46 : i64, sgpr_spill_count = 0 : i64, vgpr_count = 224 : i64, vgpr_spill_count = 0 : i64, wavefront_size = 64 : i64, workgroup_size_hint = array<i32: -1, -1, -1>}"
+        }
+      ],
+      "host_entry": "launch_gemm1",
+      "explicit_module_loader": false,
+      "cache_file": "/raid/jinpli/workspace/home01/jinpli/development/aiter/bench_out/gluon_flydsl_dtype_tokens_20260909/cache/flydsl_a4w4_t4096/launch_gemm1_4b507768213ba3a987fb5444481f8ace/18c80f62cddb624b.pkl",
+      "cache_manager_key": "4b507768213ba3a987fb5444481f8ace",
+      "cache_sha256": "4f49904babe8789a1bd43def901da7abc64857dc29f8c6ac6603d2fd9c4e2618",
+      "saved_cache_file": "/raid/jinpli/workspace/home01/jinpli/development/aiter/bench_out/gluon_flydsl_dtype_tokens_20260909/cold_tuned_t4096/r01_flydsl_a4w4_t4096/fly_artifact/cache/launch_gemm1_4b507768213ba3a987fb5444481f8ace/18c80f62cddb624b.pkl",
+      "source_modules": {
+        "flydsl": {
+          "path": "/raid/jinpli/workspace/home01/jinpli/development/venv/01/lib/python3.14/site-packages/flydsl/__init__.py",
+          "sha256": "393fa7a0bf038acb79680fdfd18bc51ca877bce921b45d7a289b05a9751aec57"
+        },
+        "flydsl.compiler.jit_function": {
+          "path": "/raid/jinpli/workspace/home01/jinpli/development/venv/01/lib/python3.14/site-packages/flydsl/compiler/jit_function.py",
+          "sha256": "bf3a82c5b72f00e318374bb020f7a0c8f012176948c8301f787cba0a0974e178"
+        },
+        "flydsl.compiler.jit_executor": {
+          "path": "/raid/jinpli/workspace/home01/jinpli/development/venv/01/lib/python3.14/site-packages/flydsl/compiler/jit_executor.py",
+          "sha256": "2e82d9faf3d55714d651aec97f2be9f9a7372b32f1216aa78b731aaac799463e"
+        },
+        "aiter.ops.flydsl.moe_kernels": {
+          "path": "/raid/jinpli/workspace/home01/jinpli/development/aiter/aiter/ops/flydsl/moe_kernels.py",
+          "sha256": "b9cba059aad779298fae0e3b03ddf028dd77d07058785d409ff29b2457e76fb6"
+        },
+        "aiter.ops.flydsl.kernels.tensor_shim": {
+          "path": "/raid/jinpli/workspace/home01/jinpli/development/aiter/aiter/ops/flydsl/kernels/tensor_shim.py",
+          "sha256": "1b6fe9f728f8818da5e1e9d11d44ba9d8118c92908798ef51f27786a44fba16e"
+        },
+        "aiter.ops.flydsl.mxfp4_gemm1_kernels": {
+          "path": "/raid/jinpli/workspace/home01/jinpli/development/aiter/aiter/ops/flydsl/mxfp4_gemm1_kernels.py",
+          "sha256": "3dfffcc252ec16e90be624e658b8deef605ebc4045a067a4fab93cead8fb1151"
+        },
+        "aiter.ops.flydsl.kernels.mxfp4_gemm1": {
+          "path": "/raid/jinpli/workspace/home01/jinpli/development/aiter/aiter/ops/flydsl/kernels/mxfp4_gemm1.py",
+          "sha256": "464387d2cf5d180fa54464fefe72b8d4cb8880d2ae044f930062a5f738f99c06"
+        },
+        "aiter.ops.flydsl.kernels.mxfp4_gemm_common": {
+          "path": "/raid/jinpli/workspace/home01/jinpli/development/aiter/aiter/ops/flydsl/kernels/mxfp4_gemm_common.py",
+          "sha256": "8972e9d4f3b1611d945ffa4b6d4200b2402e5bd2e4149cd6995b851f0232d33d"
+        },
+        "aiter.ops.moe_mxfp4_aux": {
+          "path": "/raid/jinpli/workspace/home01/jinpli/development/aiter/aiter/ops/moe_mxfp4_aux.py",
+          "sha256": "5a132ed6b59d5a3b363ba709befda12c81dd676a1bc39b2d69ca7afdfe759ed1"
+        },
+        "aiter.ops.shuffle": {
+          "path": "/raid/jinpli/workspace/home01/jinpli/development/aiter/aiter/ops/shuffle.py",
+          "sha256": "4d706f22b232b7cbcd7cb7e98d1245f0cdad3d16d54c630af8798d185e72b036"
+        },
+        "aiter.utility.fp4_utils": {
+          "path": "/raid/jinpli/workspace/home01/jinpli/development/aiter/aiter/utility/fp4_utils.py",
+          "sha256": "6f4ecb4dd9eb22d30653264c851d000ce95b0ec8bc1fb40718b72c96eb3b70eb"
+        }
+      },
+      "flydsl_version": "0.3.0"
+    },
+    "native_padded_rows": 33792,
+    "routing_membership_verified": true,
+    "scale_sort_timing": "setup only; prepared launch arguments captured",
+    "prepared_gemm_dispatches_per_call": 1,
+    "exe_type": "<class 'flydsl.compiler.jit_function.JitFunction'>"
+  },
+  "kernel_pattern": "gemm1_a4w4_port",
+  "routing": {
+    "tile_m": 64,
+    "useful_rows": 32768,
+    "native_padded_rows": 33792,
+    "native_allocated_rows": 34880,
+    "native_allocated_blocks": 545
+  },
+  "saved_executable": {
+    "compiled_ir_sha256": "b7fcc2bf01af1eb8f4d5dc1df02675ebb778a537bb4a9e77567ea7246d771fbc",
+    "compiled_ir_bytes": 80060,
+    "binaries": [
+      {
+        "index": 0,
+        "bytes": 30280,
+        "sha256": "04575cb8db580a4817c340c02bc3c0f8fd70986e36be64f24bd89cb3990062ad",
+        "path": "/raid/jinpli/workspace/home01/jinpli/development/aiter/bench_out/gluon_flydsl_dtype_tokens_20260909/cold_tuned_t4096/r01_flydsl_a4w4_t4096/fly_artifact/module0.hsaco"
+      }
+    ],
+    "kernels": [
+      {
+        "name": "gemm1_a4w4_port_h7168_i2048_ne33_bm64_cached_sep_xcd4",
+        "resources": {
+          "agpr_count": 0,
+          "group_segment_fixed_size": 65536,
+          "max_flat_workgroup_size": 256,
+          "private_segment_fixed_size": 0,
+          "sgpr_count": 46,
+          "sgpr_spill_count": 0,
+          "vgpr_count": 224,
+          "vgpr_spill_count": 0,
+          "wavefront_size": 64,
+          "reqd_workgroup_size": [
+            256,
+            1,
+            1
+          ],
+          "workgroup_size_hint": [
+            -1,
+            -1,
+            -1
+          ]
+        },
+        "raw": "{agpr_count = 0 : i64, group_segment_fixed_size = 65536 : i64, max_flat_workgroup_size = 256 : i64, private_segment_fixed_size = 0 : i64, reqd_workgroup_size = array<i32: 256, 1, 1>, sgpr_count = 46 : i64, sgpr_spill_count = 0 : i64, vgpr_count = 224 : i64, vgpr_spill_count = 0 : i64, wavefront_size = 64 : i64, workgroup_size_hint = array<i32: -1, -1, -1>}"
+      }
+    ],
+    "host_entry": "launch_gemm1",
+    "explicit_module_loader": false,
+    "cache_file": "/raid/jinpli/workspace/home01/jinpli/development/aiter/bench_out/gluon_flydsl_dtype_tokens_20260909/cache/flydsl_a4w4_t4096/launch_gemm1_4b507768213ba3a987fb5444481f8ace/18c80f62cddb624b.pkl",
+    "cache_manager_key": "4b507768213ba3a987fb5444481f8ace",
+    "cache_sha256": "4f49904babe8789a1bd43def901da7abc64857dc29f8c6ac6603d2fd9c4e2618",
+    "saved_cache_file": "/raid/jinpli/workspace/home01/jinpli/development/aiter/bench_out/gluon_flydsl_dtype_tokens_20260909/cold_tuned_t4096/r01_flydsl_a4w4_t4096/fly_artifact/cache/launch_gemm1_4b507768213ba3a987fb5444481f8ace/18c80f62cddb624b.pkl",
+    "source_modules": {
+      "flydsl": {
+        "path": "/raid/jinpli/workspace/home01/jinpli/development/venv/01/lib/python3.14/site-packages/flydsl/__init__.py",
+        "sha256": "393fa7a0bf038acb79680fdfd18bc51ca877bce921b45d7a289b05a9751aec57"
+      },
+      "flydsl.compiler.jit_function": {
+        "path": "/raid/jinpli/workspace/home01/jinpli/development/venv/01/lib/python3.14/site-packages/flydsl/compiler/jit_function.py",
+        "sha256": "bf3a82c5b72f00e318374bb020f7a0c8f012176948c8301f787cba0a0974e178"
+      },
+      "flydsl.compiler.jit_executor": {
+        "path": "/raid/jinpli/workspace/home01/jinpli/development/venv/01/lib/python3.14/site-packages/flydsl/compiler/jit_executor.py",
+        "sha256": "2e82d9faf3d55714d651aec97f2be9f9a7372b32f1216aa78b731aaac799463e"
+      },
+      "aiter.ops.flydsl.moe_kernels": {
+        "path": "/raid/jinpli/workspace/home01/jinpli/development/aiter/aiter/ops/flydsl/moe_kernels.py",
+        "sha256": "b9cba059aad779298fae0e3b03ddf028dd77d07058785d409ff29b2457e76fb6"
+      },
+      "aiter.ops.flydsl.kernels.tensor_shim": {
+        "path": "/raid/jinpli/workspace/home01/jinpli/development/aiter/aiter/ops/flydsl/kernels/tensor_shim.py",
+        "sha256": "1b6fe9f728f8818da5e1e9d11d44ba9d8118c92908798ef51f27786a44fba16e"
+      },
+      "aiter.ops.flydsl.mxfp4_gemm1_kernels": {
+        "path": "/raid/jinpli/workspace/home01/jinpli/development/aiter/aiter/ops/flydsl/mxfp4_gemm1_kernels.py",
+        "sha256": "3dfffcc252ec16e90be624e658b8deef605ebc4045a067a4fab93cead8fb1151"
+      },
+      "aiter.ops.flydsl.kernels.mxfp4_gemm1": {
+        "path": "/raid/jinpli/workspace/home01/jinpli/development/aiter/aiter/ops/flydsl/kernels/mxfp4_gemm1.py",
+        "sha256": "464387d2cf5d180fa54464fefe72b8d4cb8880d2ae044f930062a5f738f99c06"
+      },
+      "aiter.ops.flydsl.kernels.mxfp4_gemm_common": {
+        "path": "/raid/jinpli/workspace/home01/jinpli/development/aiter/aiter/ops/flydsl/kernels/mxfp4_gemm_common.py",
+        "sha256": "8972e9d4f3b1611d945ffa4b6d4200b2402e5bd2e4149cd6995b851f0232d33d"
+      },
+      "aiter.ops.moe_mxfp4_aux": {
+        "path": "/raid/jinpli/workspace/home01/jinpli/development/aiter/aiter/ops/moe_mxfp4_aux.py",
+        "sha256": "5a132ed6b59d5a3b363ba709befda12c81dd676a1bc39b2d69ca7afdfe759ed1"
+      },
+      "aiter.ops.shuffle": {
+        "path": "/raid/jinpli/workspace/home01/jinpli/development/aiter/aiter/ops/shuffle.py",
+        "sha256": "4d706f22b232b7cbcd7cb7e98d1245f0cdad3d16d54c630af8798d185e72b036"
+      },
+      "aiter.utility.fp4_utils": {
+        "path": "/raid/jinpli/workspace/home01/jinpli/development/aiter/aiter/utility/fp4_utils.py",
+        "sha256": "6f4ecb4dd9eb22d30653264c851d000ce95b0ec8bc1fb40718b72c96eb3b70eb"
+      }
+    },
+    "flydsl_version": "0.3.0"
+  },
+  "timing_protocol": {
+    "warmup": 40,
+    "samples": 100,
+    "flush_MiB": 768,
+    "sequence": "flush -> one prepared GEMM1",
+    "scale_sort_timing": "setup only",
+    "timing": "rocprofv3 kernel trace"
+  },
+  "output_hashes": {
+    "components": {
+      "payload": "d68bca2d0b4800cb191206e652ba60203061eb251b2449bda6728c275d6d8229",
+      "scales": "c305d0bde4ad217abbfac6c25895ebc938abf11b9086a36bb794acbb5e5f1f4e"
+    },
+    "combined_sha256": "9767953a104f63db88b2e4fe234fe6eaf412bad868dc5cb9d5ae6481ff8e5323"
+  }
+}

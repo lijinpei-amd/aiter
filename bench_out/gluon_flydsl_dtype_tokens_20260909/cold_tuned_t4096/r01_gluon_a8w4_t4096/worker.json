@@ -1,0 +1,381 @@
+{
+  "case": "gluon_a8w4",
+  "case_spec": {
+    "backend": "gluon",
+    "precision": "a8w4",
+    "output": "bfloat16",
+    "tuning": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 128,
+      "BLOCK_K": 256,
+      "K_UNROLL": 3,
+      "MINI_BLOCK_K": 256,
+      "MINI_BLOCK_M": 64,
+      "MINI_BLOCK_N": 64,
+      "NUM_LDS_BUFFER": 3,
+      "mfma_instr_shape": [
+        16,
+        16,
+        128
+      ],
+      "warps_per_cta": [
+        2,
+        2
+      ],
+      "tiles_per_warp": [
+        2,
+        2
+      ],
+      "k_width": null,
+      "transposed": true,
+      "WAVES_PER_EU": 1,
+      "TILE_SCHED": 2,
+      "GROUP_M": 4,
+      "NUM_XCDS": 8,
+      "token_mod": "",
+      "token_scale_mod": "",
+      "expert_mod": "",
+      "expert_scale_mod": "",
+      "result_mod": "",
+      "result_scale_mod": "",
+      "WARP_PIPELINE": 0,
+      "VGPR_PREFETCH_K": 256,
+      "A_SCALE_SORTED_SHUFFLED": true,
+      "B_SCALE_SHUFFLED": true,
+      "B_PRESHUFFLED": false,
+      "ACT_FAST_RCP": false,
+      "WAIT_COMMIT_SCHEME": 3,
+      "DS_READ_IN_MFMA": 0,
+      "SCHED_MODE": 0,
+      "FROZEN_STEP": false,
+      "SOFF_UNROLL": false,
+      "SCALE_FILL_MID": false
+    },
+    "env": {
+      "TRITON_MEMBAR_DEDUP_BARE": "1"
+    },
+    "reference_configuration": "flydsl_a8_tuning_20260907/final_harness gluon_packed",
+    "description": "Token-aware MXFP8-by-MXFP4 Gluon: BM32/BM64/BM128",
+    "config_origin": {
+      "path": "bench_out/gluon_flydsl_serial_20260907_Fxq0r9/cases.json",
+      "case": "gluon_a8w8"
+    }
+  },
+  "source": "/raid/jinpli/workspace/home01/jinpli/development/aiter",
+  "shape": {
+    "T": 4096,
+    "N": 4096,
+    "K": 7168,
+    "E": 33,
+    "topk": 8,
+    "block_m": 128
+  },
+  "precision": "a8w4",
+  "backend": "gluon",
+  "mode": "cold",
+  "pass": true,
+  "device": {
+    "name": "AMD Instinct MI350X",
+    "arch": "gfx950:sramecc+:xnack-",
+    "physical_gpu": "4",
+    "hip_visible_devices": "5",
+    "pci_bus_id": "0000:86:00.0"
+  },
+  "versions": {
+    "python": "3.14.4 (main, Jun 18 2026, 14:25:02) [GCC 15.2.0]",
+    "torch": "2.15.0.dev20260816+rocm7.14",
+    "hip": "7.14.60850",
+    "triton": "3.8.0"
+  },
+  "setup_excluded_from_timing": [
+    "routing",
+    "input quantization",
+    "A-scale sorting",
+    "weight and scale shuffle/preshuffle",
+    "output allocation",
+    "JIT compilation",
+    "launch argument preparation"
+  ],
+  "inputs": {
+    "shape": {
+      "T": 4096,
+      "N": 4096,
+      "K": 7168,
+      "E": 33,
+      "topk": 8
+    },
+    "precision": "a8w4",
+    "seed": 0,
+    "expert_selection_seed": 0,
+    "builder": "bench_moe_gemm_gluon._build(n_active=33)",
+    "input_distribution": "standard-normal BF16 staging tensors",
+    "topk_sha256": "f312bd4feb0903c69bc0c3ce78f361a3cf58b4a829cfa7effd10408dd9dbe133",
+    "histogram": [
+      993,
+      992,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993
+    ],
+    "raw_offsets_sha256": "920155c013bb265b10c798fde75df54ecaad98271eb329866a755ede97a7e8c2",
+    "gather_sha256": "223983cc513a58a5dcd4b5c4ed835049b3042181372f382e29eb3727c2301188",
+    "x_sha256": "5f30252db1fbcb7b749a88cd7493c0cef6ff5dc1f85ed73354640d45d94eecd2",
+    "x_scales_sha256": "4682b64650a4e439c434141aac65e5de1c73a89d40bc41d0dc3329aad2627e02",
+    "w_scales_sha256": "8de8b086ae8bcb77d3ed14e693ffc4cf513b5982029f1e2fd6d978daaaaee54c",
+    "full_weight_payload_sha256": "bb248d56c5d56d0012f1a7d5fafaceab45c1ca2ef8267820411305120a06adb4",
+    "input_dtype": "torch.float8_e4m3fn",
+    "weight_dtype": "torch.uint8",
+    "scale_dtype": "torch.uint8",
+    "input_quantization": "group32 MXFP8 A and MXFP4 W with E8M0 scales",
+    "unit_scales": false,
+    "weight_layout": "logical E,N,K/2; gate then up; canonical N-axis permutation",
+    "activation": "silu(gate) * up; alpha=1; no clamp; no residual",
+    "output_dtype": "bfloat16",
+    "bias": false,
+    "gammas": false
+  },
+  "routing_metadata": {
+    "block_m": 128,
+    "native_block_m": 128,
+    "useful_m_blocks": 264,
+    "gluon_grid_m": 288,
+    "useful_rows": 32768,
+    "padded_rows": 33792,
+    "allocated_rows": 36864,
+    "block_pid_map_sha256": "401af7d175e29adc7b8de5ff268856fc52e0b61f85873824d1d0844202285413",
+    "padded_offsets_sha256": "951c050d17ffaf77e073c4c7b7b78da9112f328b380f61368ed4165bdd5e0904"
+  },
+  "kernel": {
+    "config": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 128,
+      "BLOCK_K": 256,
+      "K_UNROLL": 3,
+      "MINI_BLOCK_K": 256,
+      "MINI_BLOCK_M": 64,
+      "MINI_BLOCK_N": 64,
+      "NUM_LDS_BUFFER": 3,
+      "mfma_instr_shape": [
+        16,
+        16,
+        128
+      ],
+      "warps_per_cta": [
+        2,
+        2
+      ],
+      "tiles_per_warp": [
+        2,
+        2
+      ],
+      "k_width": null,
+      "transposed": true,
+      "WAVES_PER_EU": 1,
+      "TILE_SCHED": 2,
+      "GROUP_M": 4,
+      "NUM_XCDS": 8,
+      "token_mod": "",
+      "token_scale_mod": "",
+      "expert_mod": "",
+      "expert_scale_mod": "",
+      "result_mod": "",
+      "result_scale_mod": "",
+      "WARP_PIPELINE": 0,
+      "VGPR_PREFETCH_K": 256,
+      "A_SCALE_SORTED_SHUFFLED": true,
+      "B_SCALE_SHUFFLED": true,
+      "B_PRESHUFFLED": false,
+      "ACT_FAST_RCP": false,
+      "WAIT_COMMIT_SCHEME": 3,
+      "DS_READ_IN_MFMA": 0,
+      "SCHED_MODE": 0,
+      "FROZEN_STEP": false,
+      "SOFF_UNROLL": false,
+      "SCALE_FILL_MID": false
+    },
+    "kernel": "_moe_gluon_gemm1",
+    "effective_tuning": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 128,
+      "BLOCK_K": 256,
+      "K_UNROLL": 3,
+      "MINI_BLOCK_K": 256,
+      "MINI_BLOCK_M": 64,
+      "MINI_BLOCK_N": 64,
+      "NUM_LDS_BUFFER": 3,
+      "mfma_instr_shape": [
+        16,
+        16,
+        128
+      ],
+      "warps_per_cta": [
+        2,
+        2
+      ],
+      "tiles_per_warp": [
+        2,
+        2
+      ],
+      "k_width": null,
+      "transposed": true,
+      "WAVES_PER_EU": 1,
+      "TILE_SCHED": 2,
+      "GROUP_M": 4,
+      "NUM_XCDS": 8,
+      "token_mod": "",
+      "token_scale_mod": "",
+      "expert_mod": "",
+      "expert_scale_mod": "",
+      "result_mod": "",
+      "result_scale_mod": "",
+      "WARP_PIPELINE": 0,
+      "VGPR_PREFETCH_K": 256,
+      "A_SCALE_SORTED_SHUFFLED": true,
+      "B_SCALE_SHUFFLED": true,
+      "B_PRESHUFFLED": false,
+      "ACT_FAST_RCP": false,
+      "WAIT_COMMIT_SCHEME": 3,
+      "DS_READ_IN_MFMA": 0,
+      "SCHED_MODE": 0,
+      "FROZEN_STEP": false,
+      "SOFF_UNROLL": false,
+      "SCALE_FILL_MID": false,
+      "B_IN_REG": false,
+      "B_SCALE_IN_REG": false,
+      "A_SCALE_IN_REG": false,
+      "A_NUM_BUFFER": 0,
+      "B_NUM_BUFFER": 0,
+      "A_SCALE_NUM_BUFFER": 0,
+      "B_SCALE_NUM_BUFFER": 0
+    },
+    "func_spec": {
+      "token_dtype_quant": 3,
+      "expert_dtype_quant": 2,
+      "token_online_quant": 3,
+      "expert_online_quant": 2,
+      "mma_acc_dtype": "fp32",
+      "activation": [
+        0,
+        1.0,
+        null,
+        false
+      ],
+      "output_quant": null,
+      "has_bias": false,
+      "has_gammas": false,
+      "has_gather": true,
+      "has_x_static_scale": false,
+      "gate_up_split": true,
+      "epilogue": 0
+    },
+    "launch_metadata": {
+      "allow_flush_denorm": false,
+      "allowed_dot_input_precisions": [
+        "ieee",
+        "bf16x3",
+        "bf16x6"
+      ],
+      "arch": "gfx950",
+      "backend_name": "hip",
+      "debug": false,
+      "default_dot_input_precision": "ieee",
+      "deprecated_fp8_dot_operand_dtypes": [
+        "fp8e4b8",
+        "fp8e5b16"
+      ],
+      "enable_fp_fusion": true,
+      "extern_libs": [
+        [
+          "ocml",
+          "/raid/jinpli/workspace/home01/jinpli/development/triton/python/triton/backends/amd/lib/ocml.bc"
+        ],
+        [
+          "ockl",
+          "/raid/jinpli/workspace/home01/jinpli/development/triton/python/triton/backends/amd/lib/ockl.bc"
+        ]
+      ],
+      "fpsan_homomorphic_casts": false,
+      "global_scratch_align": 1,
+      "global_scratch_size": 0,
+      "hash": "d168fa02b527055286f295d97c6493a444a1deb27c2c0b72d5103c389e7b36e5",
+      "instrumentation_mode": "",
+      "kpack": 1,
+      "launch_cooperative_grid": false,
+      "llvm_fn_attrs": [],
+      "matrix_instr_nonkdim": 0,
+      "max_num_imprecise_acc_default": 0,
+      "name": "_moe_gluon_gemm1",
+      "num_ctas": 1,
+      "num_stages": 2,
+      "num_warps": 4,
+      "profile_scratch_align": 1,
+      "profile_scratch_size": 0,
+      "sanitize_overflow": true,
+      "schedule_hint": "",
+      "shared": 158144,
+      "supported_fp8_dtypes": [
+        "fp8e4b8",
+        "fp8e4nv",
+        "fp8e5",
+        "fp8e5b16"
+      ],
+      "target": "GPUTarget(backend='hip', arch='gfx950', warp_size=64)",
+      "tensordesc_meta": [],
+      "triton_version": "3.8.0",
+      "warp_size": 64,
+      "waves_per_eu": 1
+    },
+    "binary_sha256": "9f21ce6dc25a7c9da9f1c0d20e41d4d84078f9e0fbf993408af82355cd3b338f",
+    "text_sha256": "9b71e51e87445c059ec9bf030464481a5a577e5429047d7b7f03a996a4b2d0c1",
+    "text_bytes": 21248,
+    "saved_executable": "/raid/jinpli/workspace/home01/jinpli/development/aiter/bench_out/gluon_flydsl_dtype_tokens_20260909/cold_tuned_t4096/r01_gluon_a8w4_t4096/gluon_artifact/kernel.hsaco",
+    "output_layout": "dense expert-sorted rows",
+    "output_quantization_policy": null,
+    "scale_sort_timing": "setup only; prepared launch arguments captured",
+    "prepared_gemm_dispatches_per_call": 1,
+    "grid_m": 288
+  },
+  "kernel_pattern": "_moe_gluon_gemm1",
+  "timing_protocol": {
+    "warmup": 40,
+    "samples": 100,
+    "flush_MiB": 768,
+    "sequence": "flush -> one prepared GEMM1",
+    "scale_sort_timing": "setup only",
+    "timing": "rocprofv3 kernel trace"
+  },
+  "output_hashes": {
+    "components": {
+      "output": "2fcf172b4e7f1f9d9995986defea4915fee54744dd3dcc06319f9bf391d63933"
+    },
+    "combined_sha256": "2fcf172b4e7f1f9d9995986defea4915fee54744dd3dcc06319f9bf391d63933"
+  }
+}

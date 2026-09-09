@@ -1,0 +1,62 @@
+{
+  "pass": true,
+  "label": "cold_tuned_t4096",
+  "p99_definition": "nearest rank: sorted[ceil(0.99*n)-1]",
+  "expected_processes": 32,
+  "audited_processes": 32,
+  "audited_trace_csv_files": 32,
+  "audited_fill_gemm_pairs": 4480,
+  "audited_measured_samples": 3200,
+  "validated_cells": 8,
+  "samples_per_cell": 400,
+  "recomputed_summary": {
+    "a16w16_t4096_flydsl_a16w16": {
+      "n": 400,
+      "mean_us": 3453.1512325,
+      "median_us": 3451.7830000000004,
+      "p99_us": 3481.302
+    },
+    "a16w16_t4096_gluon_a16w16": {
+      "n": 400,
+      "mean_us": 2282.2898725,
+      "median_us": 2280.7955,
+      "p99_us": 2328.655
+    },
+    "a4w4_t4096_flydsl_a4w4": {
+      "n": 400,
+      "mean_us": 686.7320225,
+      "median_us": 686.8040000000001,
+      "p99_us": 712.005
+    },
+    "a4w4_t4096_gluon_a4w4": {
+      "n": 400,
+      "mean_us": 612.26839,
+      "median_us": 612.004,
+      "p99_us": 646.764
+    },
+    "a8w4_t4096_flydsl_a8w4": {
+      "n": 400,
+      "mean_us": 954.9341025,
+      "median_us": 953.326,
+      "p99_us": 1012.447
+    },
+    "a8w4_t4096_gluon_a8w4": {
+      "n": 400,
+      "mean_us": 1034.925415,
+      "median_us": 1032.768,
+      "p99_us": 1087.687
+    },
+    "a8w8_t4096_flydsl_a8w8": {
+      "n": 400,
+      "mean_us": 1303.4388425,
+      "median_us": 1301.8885,
+      "p99_us": 1357.889
+    },
+    "a8w8_t4096_gluon_a8w8": {
+      "n": 400,
+      "mean_us": 1182.7814525,
+      "median_us": 1181.8485,
+      "p99_us": 1233.007
+    }
+  }
+}

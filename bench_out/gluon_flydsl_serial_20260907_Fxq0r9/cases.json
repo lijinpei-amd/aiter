@@ -1,0 +1,87 @@
+{
+  "gluon_a4w4": {
+    "backend": "gluon", "precision": "a4w4", "output": "mxfp4",
+    "output_quantization_policy": "even",
+    "tuning": {
+      "BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 256, "K_UNROLL": 3,
+      "MINI_BLOCK_K": 256, "MINI_BLOCK_M": 64, "MINI_BLOCK_N": 128,
+      "NUM_LDS_BUFFER": 3, "mfma_instr_shape": [16, 16, 128],
+      "warps_per_cta": [1, 4], "tiles_per_warp": [2, 2], "k_width": null,
+      "transposed": true, "WAVES_PER_EU": 1, "TILE_SCHED": 2,
+      "GROUP_M": 4, "NUM_XCDS": 8,
+      "token_mod": "", "token_scale_mod": "", "expert_mod": "", "expert_scale_mod": "",
+      "result_mod": "", "result_scale_mod": "", "WARP_PIPELINE": 0,
+      "VGPR_PREFETCH_K": 256, "A_SCALE_SORTED_SHUFFLED": true, "B_SCALE_SHUFFLED": true,
+      "B_PRESHUFFLED": false, "ACT_FAST_RCP": true, "WAIT_COMMIT_SCHEME": 3,
+      "DS_READ_IN_MFMA": 15, "SCHED_MODE": 0, "FROZEN_STEP": false,
+      "SOFF_UNROLL": false, "SCALE_FILL_MID": true
+    },
+    "env": {
+      "AITER_TRITON_MOE_GLUON_SCALE_MINI_BLOCK_M": "128",
+      "TRITON_MEMBAR_DEDUP_BARE": "1",
+      "TRITON_HIP_EXTERNAL_LLC_FLAGS": "-amdgpu-ds-read-agpr -amdgpu-mfma-tied-cd -amdgpu-no-sched-revert -misched-pin-critical-res=HWXDL -amdgpu-force-dynamic-lds-size=161216 -disable-post-ra -amdgpu-sched-strategy=coexec -amdgpu-coexec-no-regpressure"
+    },
+    "reference_configuration": "current best impl geometry; plain SiLU alpha1, no clamp/bias/gammas; fused MXFP4"
+  },
+  "flydsl_a4w4": {
+    "backend": "flydsl", "precision": "a4w4", "output": "mxfp4",
+    "output_quantization_policy": "round_up",
+    "tuning": {"tile_m": 128, "tile_n": 256, "tile_k": 256,
+               "gate_mode": "separated", "xcd_swizzle": 0},
+    "env": {}
+  },
+  "gluon_a8w8": {
+    "backend": "gluon", "precision": "a8w8", "output": "bfloat16",
+    "tuning": {
+      "BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 128, "K_UNROLL": 6,
+      "MINI_BLOCK_K": 128, "MINI_BLOCK_M": 64, "MINI_BLOCK_N": 128,
+      "NUM_LDS_BUFFER": 3, "mfma_instr_shape": [16, 16, 128],
+      "warps_per_cta": [1, 4], "tiles_per_warp": [2, 2], "k_width": null,
+      "transposed": true, "WAVES_PER_EU": 1, "TILE_SCHED": 2,
+      "GROUP_M": 4, "NUM_XCDS": 8,
+      "token_mod": "", "token_scale_mod": "", "expert_mod": "", "expert_scale_mod": "",
+      "result_mod": "", "result_scale_mod": "", "WARP_PIPELINE": 0,
+      "VGPR_PREFETCH_K": 128, "A_SCALE_SORTED_SHUFFLED": true, "B_SCALE_SHUFFLED": true,
+      "B_PRESHUFFLED": false, "ACT_FAST_RCP": false, "WAIT_COMMIT_SCHEME": 3,
+      "DS_READ_IN_MFMA": 0, "SCHED_MODE": 0, "FROZEN_STEP": false,
+      "SOFF_UNROLL": false, "SCALE_FILL_MID": false
+    },
+    "env": {"TRITON_MEMBAR_DEDUP_BARE": "1"},
+    "reference_configuration": "flydsl_a8_tuning_20260907/final_harness gluon_packed"
+  },
+  "flydsl_a8w8": {
+    "backend": "flydsl", "precision": "a8w8", "output": "bfloat16",
+    "tuning": {
+      "tile_m": 128, "tile_n": 128, "tile_k": 256, "waves_per_eu": 2,
+      "b_nt": 2, "gate_mode": "interleave", "use_async_copy": true,
+      "xcd_swizzle": 0, "k_wave": 1
+    },
+    "env": {},
+    "reference_configuration": "flydsl_a8_tuning_20260907/final_harness flydsl_tuned"
+  },
+  "gluon_a16w16": {
+    "backend": "gluon", "precision": "a16w16", "output": "bfloat16",
+    "tuning": {
+      "BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "K_UNROLL": 3,
+      "MINI_BLOCK_K": 64, "MINI_BLOCK_M": 64, "MINI_BLOCK_N": 128,
+      "NUM_LDS_BUFFER": 3, "mfma_instr_shape": [32, 32, 16],
+      "warps_per_cta": [2, 4], "tiles_per_warp": [1, 1], "k_width": null,
+      "transposed": true, "WAVES_PER_EU": 1, "TILE_SCHED": 2,
+      "GROUP_M": 4, "NUM_XCDS": 8,
+      "token_mod": "", "token_scale_mod": "", "expert_mod": "", "expert_scale_mod": "",
+      "result_mod": "", "result_scale_mod": "", "WARP_PIPELINE": 0,
+      "VGPR_PREFETCH_K": 64, "A_SCALE_SORTED_SHUFFLED": false, "B_SCALE_SHUFFLED": false,
+      "B_PRESHUFFLED": false, "ACT_FAST_RCP": false, "WAIT_COMMIT_SCHEME": 3,
+      "DS_READ_IN_MFMA": 0, "SCHED_MODE": 0, "FROZEN_STEP": false,
+      "SOFF_UNROLL": false, "SCALE_FILL_MID": false
+    },
+    "env": {"TRITON_MEMBAR_DEDUP_BARE": "1"},
+    "reference_configuration": "gluon_flydsl_a8a16_20260907 validated gluon_a16w16"
+  },
+  "flydsl_a16w16": {
+    "backend": "flydsl", "precision": "a16w16", "output": "bfloat16",
+    "tuning": {"tile_m": 128, "tile_n": 128, "tile_k": 128, "waves_per_eu": 1},
+    "env": {},
+    "reference_configuration": "gluon_flydsl_a8a16_20260907 validated flydsl_a16w16"
+  }
+}

@@ -1,0 +1,421 @@
+{
+  "gluon_m128": {
+    "backend": "gluon",
+    "precision": "a4w4",
+    "output": "mxfp4",
+    "output_quantization_policy": "even",
+    "tuning": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 256,
+      "BLOCK_K": 256,
+      "K_UNROLL": 3,
+      "MINI_BLOCK_K": 256,
+      "MINI_BLOCK_M": 64,
+      "MINI_BLOCK_N": 128,
+      "NUM_LDS_BUFFER": 3,
+      "mfma_instr_shape": [
+        16,
+        16,
+        128
+      ],
+      "warps_per_cta": [
+        1,
+        4
+      ],
+      "tiles_per_warp": [
+        2,
+        2
+      ],
+      "k_width": null,
+      "transposed": true,
+      "WAVES_PER_EU": 1,
+      "TILE_SCHED": 2,
+      "GROUP_M": 4,
+      "NUM_XCDS": 8,
+      "token_mod": "",
+      "token_scale_mod": "",
+      "expert_mod": "",
+      "expert_scale_mod": "",
+      "result_mod": "",
+      "result_scale_mod": "",
+      "WARP_PIPELINE": 0,
+      "VGPR_PREFETCH_K": 256,
+      "A_SCALE_SORTED_SHUFFLED": true,
+      "B_SCALE_SHUFFLED": true,
+      "B_PRESHUFFLED": false,
+      "ACT_FAST_RCP": true,
+      "WAIT_COMMIT_SCHEME": 3,
+      "DS_READ_IN_MFMA": 15,
+      "SCHED_MODE": 0,
+      "FROZEN_STEP": false,
+      "SOFF_UNROLL": false,
+      "SCALE_FILL_MID": true
+    },
+    "env": {
+      "AITER_TRITON_MOE_GLUON_SCALE_MINI_BLOCK_M": "128",
+      "TRITON_MEMBAR_DEDUP_BARE": "1",
+      "TRITON_HIP_EXTERNAL_LLC_FLAGS": "-amdgpu-ds-read-agpr -amdgpu-mfma-tied-cd -amdgpu-no-sched-revert -misched-pin-critical-res=HWXDL -amdgpu-force-dynamic-lds-size=161216 -disable-post-ra -amdgpu-sched-strategy=coexec -amdgpu-coexec-no-regpressure"
+    },
+    "reference_configuration": "Original four-wave 128-row recipe from the ~615 us comparison; T changed only"
+  },
+  "gluon_m64": {
+    "backend": "gluon",
+    "precision": "a4w4",
+    "output": "mxfp4",
+    "output_quantization_policy": "even",
+    "tuning": {
+      "BLOCK_M": 64,
+      "BLOCK_N": 256,
+      "BLOCK_K": 256,
+      "K_UNROLL": 3,
+      "MINI_BLOCK_K": 256,
+      "MINI_BLOCK_M": 32,
+      "MINI_BLOCK_N": 128,
+      "NUM_LDS_BUFFER": 3,
+      "mfma_instr_shape": [
+        16,
+        16,
+        128
+      ],
+      "warps_per_cta": [
+        1,
+        4
+      ],
+      "tiles_per_warp": [
+        2,
+        2
+      ],
+      "k_width": null,
+      "transposed": true,
+      "WAVES_PER_EU": 1,
+      "TILE_SCHED": 2,
+      "GROUP_M": 4,
+      "NUM_XCDS": 8,
+      "token_mod": "",
+      "token_scale_mod": "",
+      "expert_mod": "",
+      "expert_scale_mod": "",
+      "result_mod": "",
+      "result_scale_mod": "",
+      "WARP_PIPELINE": 0,
+      "VGPR_PREFETCH_K": 256,
+      "A_SCALE_SORTED_SHUFFLED": true,
+      "B_SCALE_SHUFFLED": true,
+      "B_PRESHUFFLED": false,
+      "ACT_FAST_RCP": true,
+      "WAIT_COMMIT_SCHEME": 3,
+      "DS_READ_IN_MFMA": 15,
+      "SCHED_MODE": 0,
+      "FROZEN_STEP": false,
+      "SOFF_UNROLL": false,
+      "SCALE_FILL_MID": true
+    },
+    "env": {
+      "AITER_TRITON_MOE_GLUON_SCALE_MINI_BLOCK_M": "64",
+      "TRITON_MEMBAR_DEDUP_BARE": "1",
+      "TRITON_HIP_EXTERNAL_LLC_FLAGS": "-amdgpu-ds-read-agpr -amdgpu-mfma-tied-cd -amdgpu-no-sched-revert -misched-pin-critical-res=HWXDL -amdgpu-force-dynamic-lds-size=161216 -disable-post-ra -amdgpu-sched-strategy=coexec -amdgpu-coexec-no-regpressure"
+    },
+    "reference_configuration": "Supported four-wave 64-row adaptation; original schedule and buffering"
+  },
+  "gluon_m64_bp": {
+    "backend": "gluon",
+    "precision": "a4w4",
+    "output": "mxfp4",
+    "output_quantization_policy": "even",
+    "tuning": {
+      "BLOCK_M": 64,
+      "BLOCK_N": 256,
+      "BLOCK_K": 256,
+      "K_UNROLL": 3,
+      "MINI_BLOCK_K": 256,
+      "MINI_BLOCK_M": 32,
+      "MINI_BLOCK_N": 128,
+      "NUM_LDS_BUFFER": 3,
+      "mfma_instr_shape": [
+        16,
+        16,
+        128
+      ],
+      "warps_per_cta": [
+        1,
+        4
+      ],
+      "tiles_per_warp": [
+        2,
+        2
+      ],
+      "k_width": null,
+      "transposed": true,
+      "WAVES_PER_EU": 1,
+      "TILE_SCHED": 2,
+      "GROUP_M": 4,
+      "NUM_XCDS": 8,
+      "token_mod": "",
+      "token_scale_mod": "",
+      "expert_mod": "",
+      "expert_scale_mod": "",
+      "result_mod": "",
+      "result_scale_mod": "",
+      "WARP_PIPELINE": 0,
+      "VGPR_PREFETCH_K": 256,
+      "A_SCALE_SORTED_SHUFFLED": true,
+      "B_SCALE_SHUFFLED": true,
+      "B_PRESHUFFLED": true,
+      "ACT_FAST_RCP": true,
+      "WAIT_COMMIT_SCHEME": 3,
+      "DS_READ_IN_MFMA": 15,
+      "SCHED_MODE": 0,
+      "FROZEN_STEP": false,
+      "SOFF_UNROLL": false,
+      "SCALE_FILL_MID": true
+    },
+    "env": {
+      "AITER_TRITON_MOE_GLUON_SCALE_MINI_BLOCK_M": "64",
+      "TRITON_MEMBAR_DEDUP_BARE": "1",
+      "TRITON_HIP_EXTERNAL_LLC_FLAGS": "-amdgpu-ds-read-agpr -amdgpu-mfma-tied-cd -amdgpu-no-sched-revert -misched-pin-critical-res=HWXDL -amdgpu-force-dynamic-lds-size=161216 -disable-post-ra -amdgpu-sched-strategy=coexec -amdgpu-coexec-no-regpressure",
+      "AITER_TRITON_MOE_GLUON_B_PRESHUFFLED": "1"
+    },
+    "reference_configuration": "Supported four-wave 64-row adaptation; original schedule and buffering"
+  },
+  "flydsl_m128": {
+    "backend": "flydsl",
+    "precision": "a4w4",
+    "output": "mxfp4",
+    "output_quantization_policy": "round_up",
+    "tuning": {
+      "tile_m": 128,
+      "tile_n": 256,
+      "tile_k": 256,
+      "gate_mode": "separated",
+      "xcd_swizzle": 0,
+      "use_nt": false
+    },
+    "env": {}
+  },
+  "flydsl_m64": {
+    "backend": "flydsl",
+    "precision": "a4w4",
+    "output": "mxfp4",
+    "output_quantization_policy": "round_up",
+    "tuning": {
+      "tile_m": 64,
+      "tile_n": 256,
+      "tile_k": 256,
+      "gate_mode": "separated",
+      "xcd_swizzle": 0,
+      "use_nt": false
+    },
+    "env": {}
+  },
+  "flydsl_m32": {
+    "backend": "flydsl",
+    "precision": "a4w4",
+    "output": "mxfp4",
+    "output_quantization_policy": "round_up",
+    "tuning": {
+      "tile_m": 32,
+      "tile_n": 256,
+      "tile_k": 256,
+      "gate_mode": "separated",
+      "xcd_swizzle": 0,
+      "use_nt": false
+    },
+    "env": {}
+  },
+  "flydsl_m32_nt": {
+    "backend": "flydsl",
+    "precision": "a4w4",
+    "output": "mxfp4",
+    "output_quantization_policy": "round_up",
+    "tuning": {
+      "tile_m": 32,
+      "tile_n": 256,
+      "tile_k": 256,
+      "gate_mode": "separated",
+      "xcd_swizzle": 0,
+      "use_nt": true
+    },
+    "env": {}
+  },
+  "gluon_m128_nt": {
+    "backend": "gluon",
+    "precision": "a4w4",
+    "output": "mxfp4",
+    "output_quantization_policy": "even",
+    "tuning": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 256,
+      "BLOCK_K": 256,
+      "K_UNROLL": 3,
+      "MINI_BLOCK_K": 256,
+      "MINI_BLOCK_M": 64,
+      "MINI_BLOCK_N": 128,
+      "NUM_LDS_BUFFER": 3,
+      "mfma_instr_shape": [
+        16,
+        16,
+        128
+      ],
+      "warps_per_cta": [
+        1,
+        4
+      ],
+      "tiles_per_warp": [
+        2,
+        2
+      ],
+      "k_width": null,
+      "transposed": true,
+      "WAVES_PER_EU": 1,
+      "TILE_SCHED": 2,
+      "GROUP_M": 4,
+      "NUM_XCDS": 8,
+      "token_mod": "",
+      "token_scale_mod": "",
+      "expert_mod": ".cs",
+      "expert_scale_mod": "",
+      "result_mod": "",
+      "result_scale_mod": "",
+      "WARP_PIPELINE": 0,
+      "VGPR_PREFETCH_K": 256,
+      "A_SCALE_SORTED_SHUFFLED": true,
+      "B_SCALE_SHUFFLED": true,
+      "B_PRESHUFFLED": false,
+      "ACT_FAST_RCP": true,
+      "WAIT_COMMIT_SCHEME": 3,
+      "DS_READ_IN_MFMA": 15,
+      "SCHED_MODE": 0,
+      "FROZEN_STEP": false,
+      "SOFF_UNROLL": false,
+      "SCALE_FILL_MID": true
+    },
+    "env": {
+      "AITER_TRITON_MOE_GLUON_SCALE_MINI_BLOCK_M": "128",
+      "TRITON_MEMBAR_DEDUP_BARE": "1",
+      "TRITON_HIP_EXTERNAL_LLC_FLAGS": "-amdgpu-ds-read-agpr -amdgpu-mfma-tied-cd -amdgpu-no-sched-revert -misched-pin-critical-res=HWXDL -amdgpu-force-dynamic-lds-size=161216 -disable-post-ra -amdgpu-sched-strategy=coexec -amdgpu-coexec-no-regpressure",
+      "TRITON_AMD_NT_ONLY": "1"
+    },
+    "reference_configuration": "Original four-wave 128-row recipe from the ~615 us comparison; T changed only; B-only NT (aux=2) using existing local compiler override, separate cache/process"
+  },
+  "gluon_m64_nt": {
+    "backend": "gluon",
+    "precision": "a4w4",
+    "output": "mxfp4",
+    "output_quantization_policy": "even",
+    "tuning": {
+      "BLOCK_M": 64,
+      "BLOCK_N": 256,
+      "BLOCK_K": 256,
+      "K_UNROLL": 3,
+      "MINI_BLOCK_K": 256,
+      "MINI_BLOCK_M": 32,
+      "MINI_BLOCK_N": 128,
+      "NUM_LDS_BUFFER": 3,
+      "mfma_instr_shape": [
+        16,
+        16,
+        128
+      ],
+      "warps_per_cta": [
+        1,
+        4
+      ],
+      "tiles_per_warp": [
+        2,
+        2
+      ],
+      "k_width": null,
+      "transposed": true,
+      "WAVES_PER_EU": 1,
+      "TILE_SCHED": 2,
+      "GROUP_M": 4,
+      "NUM_XCDS": 8,
+      "token_mod": "",
+      "token_scale_mod": "",
+      "expert_mod": ".cs",
+      "expert_scale_mod": "",
+      "result_mod": "",
+      "result_scale_mod": "",
+      "WARP_PIPELINE": 0,
+      "VGPR_PREFETCH_K": 256,
+      "A_SCALE_SORTED_SHUFFLED": true,
+      "B_SCALE_SHUFFLED": true,
+      "B_PRESHUFFLED": false,
+      "ACT_FAST_RCP": true,
+      "WAIT_COMMIT_SCHEME": 3,
+      "DS_READ_IN_MFMA": 15,
+      "SCHED_MODE": 0,
+      "FROZEN_STEP": false,
+      "SOFF_UNROLL": false,
+      "SCALE_FILL_MID": true
+    },
+    "env": {
+      "AITER_TRITON_MOE_GLUON_SCALE_MINI_BLOCK_M": "64",
+      "TRITON_MEMBAR_DEDUP_BARE": "1",
+      "TRITON_HIP_EXTERNAL_LLC_FLAGS": "-amdgpu-ds-read-agpr -amdgpu-mfma-tied-cd -amdgpu-no-sched-revert -misched-pin-critical-res=HWXDL -amdgpu-force-dynamic-lds-size=161216 -disable-post-ra -amdgpu-sched-strategy=coexec -amdgpu-coexec-no-regpressure",
+      "TRITON_AMD_NT_ONLY": "1"
+    },
+    "reference_configuration": "Supported four-wave 64-row adaptation; original schedule and buffering; B-only NT (aux=2) using existing local compiler override, separate cache/process"
+  },
+  "gluon_m64_bp_nt": {
+    "backend": "gluon",
+    "precision": "a4w4",
+    "output": "mxfp4",
+    "output_quantization_policy": "even",
+    "tuning": {
+      "BLOCK_M": 64,
+      "BLOCK_N": 256,
+      "BLOCK_K": 256,
+      "K_UNROLL": 3,
+      "MINI_BLOCK_K": 256,
+      "MINI_BLOCK_M": 32,
+      "MINI_BLOCK_N": 128,
+      "NUM_LDS_BUFFER": 3,
+      "mfma_instr_shape": [
+        16,
+        16,
+        128
+      ],
+      "warps_per_cta": [
+        1,
+        4
+      ],
+      "tiles_per_warp": [
+        2,
+        2
+      ],
+      "k_width": null,
+      "transposed": true,
+      "WAVES_PER_EU": 1,
+      "TILE_SCHED": 2,
+      "GROUP_M": 4,
+      "NUM_XCDS": 8,
+      "token_mod": "",
+      "token_scale_mod": "",
+      "expert_mod": ".cs",
+      "expert_scale_mod": "",
+      "result_mod": "",
+      "result_scale_mod": "",
+      "WARP_PIPELINE": 0,
+      "VGPR_PREFETCH_K": 256,
+      "A_SCALE_SORTED_SHUFFLED": true,
+      "B_SCALE_SHUFFLED": true,
+      "B_PRESHUFFLED": true,
+      "ACT_FAST_RCP": true,
+      "WAIT_COMMIT_SCHEME": 3,
+      "DS_READ_IN_MFMA": 15,
+      "SCHED_MODE": 0,
+      "FROZEN_STEP": false,
+      "SOFF_UNROLL": false,
+      "SCALE_FILL_MID": true
+    },
+    "env": {
+      "AITER_TRITON_MOE_GLUON_SCALE_MINI_BLOCK_M": "64",
+      "TRITON_MEMBAR_DEDUP_BARE": "1",
+      "TRITON_HIP_EXTERNAL_LLC_FLAGS": "-amdgpu-ds-read-agpr -amdgpu-mfma-tied-cd -amdgpu-no-sched-revert -misched-pin-critical-res=HWXDL -amdgpu-force-dynamic-lds-size=161216 -disable-post-ra -amdgpu-sched-strategy=coexec -amdgpu-coexec-no-regpressure",
+      "AITER_TRITON_MOE_GLUON_B_PRESHUFFLED": "1",
+      "TRITON_AMD_NT_ONLY": "1"
+    },
+    "reference_configuration": "Supported four-wave 64-row adaptation; original schedule and buffering; B-only NT (aux=2) using existing local compiler override, separate cache/process"
+  }
+}

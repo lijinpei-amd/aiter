@@ -1,0 +1,1046 @@
+{
+  "a16w16_t4096_flydsl_a16w16": {
+    "precision": "a16w16",
+    "tokens": 4096,
+    "case": "flydsl_a16w16",
+    "backend": "flydsl",
+    "n": 400,
+    "mean_us": 3453.1512325,
+    "median_us": 3451.7830000000004,
+    "p99_us": 3481.302,
+    "stdev_us": 11.493019414994643,
+    "round_means_us": [
+      3456.1972,
+      3450.0506100000002,
+      3452.31955,
+      3454.03757
+    ],
+    "round_medians_us": [
+      3456.042,
+      3449.242,
+      3449.7830000000004,
+      3454.304
+    ],
+    "round_p99_us": [
+      3481.302,
+      3476.222,
+      3479.224,
+      3479.143
+    ],
+    "tuning": {
+      "tile_m": 128,
+      "tile_n": 128,
+      "tile_k": 128,
+      "waves_per_eu": 1,
+      "b_nt": 2,
+      "gate_mode": "separated",
+      "use_async_copy": true,
+      "xcd_swizzle": 0,
+      "k_wave": 1
+    },
+    "env": {},
+    "effective_tuning": {
+      "kind": "a16w16",
+      "tile_m": 128,
+      "tile_n": 128,
+      "tile_k": 128,
+      "waves_per_eu": 1,
+      "b_nt": 2,
+      "gate_mode": "separated",
+      "use_async_copy": true,
+      "xcd_swizzle": 0,
+      "k_wave": 1,
+      "act": "silu",
+      "alpha": 1.0,
+      "clamp": null,
+      "bias": false,
+      "routing_weights": false,
+      "output": "bf16",
+      "output_layout": "sorted",
+      "shape": {
+        "T": 4096,
+        "K": 7168,
+        "N": 4096,
+        "E": 33,
+        "topk": 8
+      },
+      "preprocessing": "setup only; retained compiled callable and prepared arguments",
+      "allocated_routing_blocks": 289,
+      "active_routing_blocks": 264,
+      "native_grid_blocks": null
+    },
+    "useful_rows": 32768,
+    "padded_rows": 33792,
+    "allocated_rows": 36992,
+    "active_blocks": 264,
+    "output_layout": "sorted",
+    "output_quantization_policy": null,
+    "device": {
+      "name": "AMD Instinct MI350X",
+      "arch": "gfx950:sramecc+:xnack-",
+      "physical_gpu": "4",
+      "hip_visible_devices": "5",
+      "pci_bus_id": "0000:86:00.0"
+    },
+    "versions": {
+      "python": "3.14.4 (main, Jun 18 2026, 14:25:02) [GCC 15.2.0]",
+      "torch": "2.15.0.dev20260816+rocm7.14",
+      "hip": "7.14.60850",
+      "triton": "3.8.0"
+    },
+    "setup_excluded_from_timing": [
+      "routing",
+      "input quantization",
+      "A-scale sorting",
+      "weight and scale shuffle/preshuffle",
+      "output allocation",
+      "JIT compilation",
+      "launch argument preparation"
+    ]
+  },
+  "a16w16_t4096_gluon_a16w16": {
+    "precision": "a16w16",
+    "tokens": 4096,
+    "case": "gluon_a16w16",
+    "backend": "gluon",
+    "n": 400,
+    "mean_us": 2282.2898725,
+    "median_us": 2280.7955,
+    "p99_us": 2328.655,
+    "stdev_us": 19.76642436560653,
+    "round_means_us": [
+      2282.16221,
+      2282.13159,
+      2281.20185,
+      2283.66384
+    ],
+    "round_medians_us": [
+      2281.855,
+      2282.114,
+      2279.235,
+      2279.8559999999998
+    ],
+    "round_p99_us": [
+      2328.535,
+      2323.535,
+      2322.935,
+      2340.857
+    ],
+    "tuning": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 256,
+      "BLOCK_K": 64,
+      "K_UNROLL": 3,
+      "MINI_BLOCK_K": 64,
+      "MINI_BLOCK_M": 64,
+      "MINI_BLOCK_N": 128,
+      "NUM_LDS_BUFFER": 3,
+      "mfma_instr_shape": [
+        32,
+        32,
+        16
+      ],
+      "warps_per_cta": [
+        2,
+        4
+      ],
+      "tiles_per_warp": [
+        1,
+        1
+      ],
+      "k_width": null,
+      "transposed": true,
+      "WAVES_PER_EU": 1,
+      "TILE_SCHED": 2,
+      "GROUP_M": 4,
+      "NUM_XCDS": 8,
+      "token_mod": "",
+      "token_scale_mod": "",
+      "expert_mod": "",
+      "expert_scale_mod": "",
+      "result_mod": "",
+      "result_scale_mod": "",
+      "WARP_PIPELINE": 0,
+      "VGPR_PREFETCH_K": 64,
+      "A_SCALE_SORTED_SHUFFLED": false,
+      "B_SCALE_SHUFFLED": false,
+      "B_PRESHUFFLED": false,
+      "ACT_FAST_RCP": false,
+      "WAIT_COMMIT_SCHEME": 3,
+      "DS_READ_IN_MFMA": 0,
+      "SCHED_MODE": 0,
+      "FROZEN_STEP": false,
+      "SOFF_UNROLL": false,
+      "SCALE_FILL_MID": false
+    },
+    "env": {
+      "TRITON_MEMBAR_DEDUP_BARE": "1"
+    },
+    "effective_tuning": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 256,
+      "BLOCK_K": 64,
+      "K_UNROLL": 3,
+      "MINI_BLOCK_K": 64,
+      "MINI_BLOCK_M": 64,
+      "MINI_BLOCK_N": 128,
+      "NUM_LDS_BUFFER": 3,
+      "mfma_instr_shape": [
+        32,
+        32,
+        16
+      ],
+      "warps_per_cta": [
+        2,
+        4
+      ],
+      "tiles_per_warp": [
+        1,
+        1
+      ],
+      "k_width": null,
+      "transposed": true,
+      "WAVES_PER_EU": 1,
+      "TILE_SCHED": 2,
+      "GROUP_M": 4,
+      "NUM_XCDS": 8,
+      "token_mod": "",
+      "token_scale_mod": "",
+      "expert_mod": "",
+      "expert_scale_mod": "",
+      "result_mod": "",
+      "result_scale_mod": "",
+      "WARP_PIPELINE": 0,
+      "VGPR_PREFETCH_K": 64,
+      "A_SCALE_SORTED_SHUFFLED": false,
+      "B_SCALE_SHUFFLED": false,
+      "B_PRESHUFFLED": false,
+      "ACT_FAST_RCP": false,
+      "WAIT_COMMIT_SCHEME": 3,
+      "DS_READ_IN_MFMA": 0,
+      "SCHED_MODE": 0,
+      "FROZEN_STEP": false,
+      "SOFF_UNROLL": false,
+      "SCALE_FILL_MID": false,
+      "B_IN_REG": false,
+      "B_SCALE_IN_REG": false,
+      "A_SCALE_IN_REG": false,
+      "A_NUM_BUFFER": 0,
+      "B_NUM_BUFFER": 0,
+      "A_SCALE_NUM_BUFFER": 0,
+      "B_SCALE_NUM_BUFFER": 0
+    },
+    "useful_rows": 32768,
+    "padded_rows": 33792,
+    "allocated_rows": 36864,
+    "active_blocks": 264,
+    "output_layout": "dense expert-sorted rows",
+    "output_quantization_policy": null,
+    "device": {
+      "name": "AMD Instinct MI350X",
+      "arch": "gfx950:sramecc+:xnack-",
+      "physical_gpu": "4",
+      "hip_visible_devices": "5",
+      "pci_bus_id": "0000:86:00.0"
+    },
+    "versions": {
+      "python": "3.14.4 (main, Jun 18 2026, 14:25:02) [GCC 15.2.0]",
+      "torch": "2.15.0.dev20260816+rocm7.14",
+      "hip": "7.14.60850",
+      "triton": "3.8.0"
+    },
+    "setup_excluded_from_timing": [
+      "routing",
+      "input quantization",
+      "A-scale sorting",
+      "weight and scale shuffle/preshuffle",
+      "output allocation",
+      "JIT compilation",
+      "launch argument preparation"
+    ]
+  },
+  "a4w4_t4096_flydsl_a4w4": {
+    "precision": "a4w4",
+    "tokens": 4096,
+    "case": "flydsl_a4w4",
+    "backend": "flydsl",
+    "n": 400,
+    "mean_us": 686.7320225,
+    "median_us": 686.8040000000001,
+    "p99_us": 712.005,
+    "stdev_us": 10.915897772148373,
+    "round_means_us": [
+      687.98594,
+      685.5866,
+      686.40501,
+      686.95054
+    ],
+    "round_medians_us": [
+      687.9045000000001,
+      684.8645,
+      687.3644999999999,
+      687.845
+    ],
+    "round_p99_us": [
+      715.005,
+      705.964,
+      704.884,
+      713.325
+    ],
+    "tuning": {
+      "tile_m": 64,
+      "tile_n": 256,
+      "tile_k": 256,
+      "gate_mode": "separated",
+      "xcd_swizzle": 4,
+      "use_nt": false
+    },
+    "env": {},
+    "effective_tuning": {
+      "kind": "a4w4",
+      "tile_m": 64,
+      "tile_n": 256,
+      "tile_k": 256,
+      "waves_per_eu": null,
+      "b_nt": 0,
+      "gate_mode": "separated",
+      "use_async_copy": true,
+      "xcd_swizzle": 4,
+      "k_wave": 1,
+      "act": "silu",
+      "alpha": 1.0,
+      "clamp": null,
+      "bias": false,
+      "routing_weights": false,
+      "output": "mxfp4",
+      "output_layout": "sorted",
+      "shape": {
+        "T": 4096,
+        "K": 7168,
+        "N": 4096,
+        "E": 33,
+        "topk": 8
+      },
+      "preprocessing": "setup only; retained compiled callable and prepared arguments",
+      "allocated_routing_blocks": 545,
+      "active_routing_blocks": 528,
+      "native_grid_blocks": 8720,
+      "use_nt": false,
+      "inline_quant": false,
+      "native_m_block_upper_bound": 545,
+      "scale_layout": "native shuffled; logical payload/scale accessor excludes padding"
+    },
+    "useful_rows": 32768,
+    "padded_rows": 33792,
+    "allocated_rows": 34880,
+    "active_blocks": 528,
+    "output_layout": "sorted",
+    "output_quantization_policy": "round_up",
+    "device": {
+      "name": "AMD Instinct MI350X",
+      "arch": "gfx950:sramecc+:xnack-",
+      "physical_gpu": "4",
+      "hip_visible_devices": "5",
+      "pci_bus_id": "0000:86:00.0"
+    },
+    "versions": {
+      "python": "3.14.4 (main, Jun 18 2026, 14:25:02) [GCC 15.2.0]",
+      "torch": "2.15.0.dev20260816+rocm7.14",
+      "hip": "7.14.60850",
+      "triton": "3.8.0"
+    },
+    "setup_excluded_from_timing": [
+      "routing",
+      "input quantization",
+      "A-scale sorting",
+      "weight and scale shuffle/preshuffle",
+      "output allocation",
+      "JIT compilation",
+      "launch argument preparation"
+    ]
+  },
+  "a4w4_t4096_gluon_a4w4": {
+    "precision": "a4w4",
+    "tokens": 4096,
+    "case": "gluon_a4w4",
+    "backend": "gluon",
+    "n": 400,
+    "mean_us": 612.26839,
+    "median_us": 612.004,
+    "p99_us": 646.764,
+    "stdev_us": 12.199796097800158,
+    "round_means_us": [
+      612.89541,
+      612.7405200000001,
+      611.56486,
+      611.87277
+    ],
+    "round_medians_us": [
+      612.624,
+      612.924,
+      609.5835,
+      611.684
+    ],
+    "round_p99_us": [
+      656.244,
+      645.524,
+      646.764,
+      631.004
+    ],
+    "tuning": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 256,
+      "BLOCK_K": 256,
+      "K_UNROLL": 3,
+      "MINI_BLOCK_K": 256,
+      "MINI_BLOCK_M": 64,
+      "MINI_BLOCK_N": 128,
+      "NUM_LDS_BUFFER": 3,
+      "mfma_instr_shape": [
+        16,
+        16,
+        128
+      ],
+      "warps_per_cta": [
+        1,
+        4
+      ],
+      "tiles_per_warp": [
+        2,
+        2
+      ],
+      "k_width": null,
+      "transposed": true,
+      "WAVES_PER_EU": 1,
+      "TILE_SCHED": 2,
+      "GROUP_M": 4,
+      "NUM_XCDS": 8,
+      "token_mod": "",
+      "token_scale_mod": "",
+      "expert_mod": "",
+      "expert_scale_mod": "",
+      "result_mod": "",
+      "result_scale_mod": "",
+      "WARP_PIPELINE": 0,
+      "VGPR_PREFETCH_K": 256,
+      "A_SCALE_SORTED_SHUFFLED": true,
+      "B_SCALE_SHUFFLED": true,
+      "B_PRESHUFFLED": false,
+      "ACT_FAST_RCP": true,
+      "WAIT_COMMIT_SCHEME": 3,
+      "DS_READ_IN_MFMA": 15,
+      "SCHED_MODE": 0,
+      "FROZEN_STEP": false,
+      "SOFF_UNROLL": false,
+      "SCALE_FILL_MID": true
+    },
+    "env": {
+      "AITER_TRITON_MOE_GLUON_SCALE_MINI_BLOCK_M": "128",
+      "TRITON_MEMBAR_DEDUP_BARE": "1",
+      "TRITON_HIP_EXTERNAL_LLC_FLAGS": "-amdgpu-ds-read-agpr -amdgpu-mfma-tied-cd -amdgpu-no-sched-revert -misched-pin-critical-res=HWXDL -amdgpu-force-dynamic-lds-size=161216 -disable-post-ra -amdgpu-sched-strategy=coexec -amdgpu-coexec-no-regpressure",
+      "AITER_TRITON_MOE_GLUON_B_PRESHUFFLED": "0",
+      "TRITON_AMD_NT_ONLY": "0"
+    },
+    "effective_tuning": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 256,
+      "BLOCK_K": 256,
+      "K_UNROLL": 3,
+      "MINI_BLOCK_K": 256,
+      "MINI_BLOCK_M": 64,
+      "MINI_BLOCK_N": 128,
+      "NUM_LDS_BUFFER": 3,
+      "mfma_instr_shape": [
+        16,
+        16,
+        128
+      ],
+      "warps_per_cta": [
+        1,
+        4
+      ],
+      "tiles_per_warp": [
+        2,
+        2
+      ],
+      "k_width": null,
+      "transposed": true,
+      "WAVES_PER_EU": 1,
+      "TILE_SCHED": 2,
+      "GROUP_M": 4,
+      "NUM_XCDS": 8,
+      "token_mod": "",
+      "token_scale_mod": "",
+      "expert_mod": "",
+      "expert_scale_mod": "",
+      "result_mod": "",
+      "result_scale_mod": "",
+      "WARP_PIPELINE": 0,
+      "VGPR_PREFETCH_K": 256,
+      "A_SCALE_SORTED_SHUFFLED": true,
+      "B_SCALE_SHUFFLED": true,
+      "B_PRESHUFFLED": false,
+      "ACT_FAST_RCP": true,
+      "WAIT_COMMIT_SCHEME": 3,
+      "DS_READ_IN_MFMA": 15,
+      "SCHED_MODE": 0,
+      "FROZEN_STEP": false,
+      "SOFF_UNROLL": false,
+      "SCALE_FILL_MID": true,
+      "B_IN_REG": false,
+      "B_SCALE_IN_REG": false,
+      "A_SCALE_IN_REG": false,
+      "A_NUM_BUFFER": 0,
+      "B_NUM_BUFFER": 0,
+      "A_SCALE_NUM_BUFFER": 0,
+      "B_SCALE_NUM_BUFFER": 0
+    },
+    "useful_rows": 32768,
+    "padded_rows": 33792,
+    "allocated_rows": 36864,
+    "active_blocks": 264,
+    "output_layout": "dense expert-sorted rows",
+    "output_quantization_policy": "even",
+    "device": {
+      "name": "AMD Instinct MI350X",
+      "arch": "gfx950:sramecc+:xnack-",
+      "physical_gpu": "4",
+      "hip_visible_devices": "5",
+      "pci_bus_id": "0000:86:00.0"
+    },
+    "versions": {
+      "python": "3.14.4 (main, Jun 18 2026, 14:25:02) [GCC 15.2.0]",
+      "torch": "2.15.0.dev20260816+rocm7.14",
+      "hip": "7.14.60850",
+      "triton": "3.8.0"
+    },
+    "setup_excluded_from_timing": [
+      "routing",
+      "input quantization",
+      "A-scale sorting",
+      "weight and scale shuffle/preshuffle",
+      "output allocation",
+      "JIT compilation",
+      "launch argument preparation"
+    ]
+  },
+  "a8w4_t4096_flydsl_a8w4": {
+    "precision": "a8w4",
+    "tokens": 4096,
+    "case": "flydsl_a8w4",
+    "backend": "flydsl",
+    "n": 400,
+    "mean_us": 954.9341025,
+    "median_us": 953.326,
+    "p99_us": 1012.447,
+    "stdev_us": 22.446741734982243,
+    "round_means_us": [
+      955.18767,
+      957.16797,
+      955.88482,
+      951.49595
+    ],
+    "round_medians_us": [
+      955.6465000000001,
+      954.546,
+      955.566,
+      949.686
+    ],
+    "round_p99_us": [
+      1007.567,
+      1014.927,
+      1015.767,
+      993.127
+    ],
+    "tuning": {
+      "tile_m": 128,
+      "tile_n": 256,
+      "tile_k": 256,
+      "waves_per_eu": 4,
+      "b_nt": 2,
+      "gate_mode": "interleave",
+      "use_async_copy": true,
+      "xcd_swizzle": 0,
+      "k_wave": 1
+    },
+    "env": {},
+    "effective_tuning": {
+      "kind": "a8w4",
+      "tile_m": 128,
+      "tile_n": 256,
+      "tile_k": 256,
+      "waves_per_eu": 4,
+      "b_nt": 2,
+      "gate_mode": "interleave",
+      "use_async_copy": true,
+      "xcd_swizzle": 0,
+      "k_wave": 1,
+      "act": "silu",
+      "alpha": 1.0,
+      "clamp": null,
+      "bias": false,
+      "routing_weights": false,
+      "output": "bf16",
+      "output_layout": "token_slot",
+      "shape": {
+        "T": 4096,
+        "K": 7168,
+        "N": 4096,
+        "E": 33,
+        "topk": 8
+      },
+      "preprocessing": "setup only; retained compiled callable and prepared arguments",
+      "allocated_routing_blocks": 289,
+      "active_routing_blocks": 264
+    },
+    "useful_rows": 32768,
+    "padded_rows": 33792,
+    "allocated_rows": 36992,
+    "active_blocks": 264,
+    "output_layout": "token_slot",
+    "output_quantization_policy": null,
+    "device": {
+      "name": "AMD Instinct MI350X",
+      "arch": "gfx950:sramecc+:xnack-",
+      "physical_gpu": "4",
+      "hip_visible_devices": "5",
+      "pci_bus_id": "0000:86:00.0"
+    },
+    "versions": {
+      "python": "3.14.4 (main, Jun 18 2026, 14:25:02) [GCC 15.2.0]",
+      "torch": "2.15.0.dev20260816+rocm7.14",
+      "hip": "7.14.60850",
+      "triton": "3.8.0"
+    },
+    "setup_excluded_from_timing": [
+      "routing",
+      "input quantization",
+      "A-scale sorting",
+      "weight and scale shuffle/preshuffle",
+      "output allocation",
+      "JIT compilation",
+      "launch argument preparation"
+    ]
+  },
+  "a8w4_t4096_gluon_a8w4": {
+    "precision": "a8w4",
+    "tokens": 4096,
+    "case": "gluon_a8w4",
+    "backend": "gluon",
+    "n": 400,
+    "mean_us": 1034.925415,
+    "median_us": 1032.768,
+    "p99_us": 1087.687,
+    "stdev_us": 21.641939707493293,
+    "round_means_us": [
+      1033.09543,
+      1037.05846,
+      1032.1704,
+      1037.37737
+    ],
+    "round_medians_us": [
+      1032.2269999999999,
+      1034.327,
+      1029.906,
+      1034.467
+    ],
+    "round_p99_us": [
+      1083.088,
+      1078.807,
+      1079.486,
+      1094.487
+    ],
+    "tuning": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 128,
+      "BLOCK_K": 256,
+      "K_UNROLL": 3,
+      "MINI_BLOCK_K": 256,
+      "MINI_BLOCK_M": 64,
+      "MINI_BLOCK_N": 64,
+      "NUM_LDS_BUFFER": 3,
+      "mfma_instr_shape": [
+        16,
+        16,
+        128
+      ],
+      "warps_per_cta": [
+        2,
+        2
+      ],
+      "tiles_per_warp": [
+        2,
+        2
+      ],
+      "k_width": null,
+      "transposed": true,
+      "WAVES_PER_EU": 1,
+      "TILE_SCHED": 2,
+      "GROUP_M": 4,
+      "NUM_XCDS": 8,
+      "token_mod": "",
+      "token_scale_mod": "",
+      "expert_mod": "",
+      "expert_scale_mod": "",
+      "result_mod": "",
+      "result_scale_mod": "",
+      "WARP_PIPELINE": 0,
+      "VGPR_PREFETCH_K": 256,
+      "A_SCALE_SORTED_SHUFFLED": true,
+      "B_SCALE_SHUFFLED": true,
+      "B_PRESHUFFLED": false,
+      "ACT_FAST_RCP": false,
+      "WAIT_COMMIT_SCHEME": 3,
+      "DS_READ_IN_MFMA": 0,
+      "SCHED_MODE": 0,
+      "FROZEN_STEP": false,
+      "SOFF_UNROLL": false,
+      "SCALE_FILL_MID": false
+    },
+    "env": {
+      "TRITON_MEMBAR_DEDUP_BARE": "1"
+    },
+    "effective_tuning": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 128,
+      "BLOCK_K": 256,
+      "K_UNROLL": 3,
+      "MINI_BLOCK_K": 256,
+      "MINI_BLOCK_M": 64,
+      "MINI_BLOCK_N": 64,
+      "NUM_LDS_BUFFER": 3,
+      "mfma_instr_shape": [
+        16,
+        16,
+        128
+      ],
+      "warps_per_cta": [
+        2,
+        2
+      ],
+      "tiles_per_warp": [
+        2,
+        2
+      ],
+      "k_width": null,
+      "transposed": true,
+      "WAVES_PER_EU": 1,
+      "TILE_SCHED": 2,
+      "GROUP_M": 4,
+      "NUM_XCDS": 8,
+      "token_mod": "",
+      "token_scale_mod": "",
+      "expert_mod": "",
+      "expert_scale_mod": "",
+      "result_mod": "",
+      "result_scale_mod": "",
+      "WARP_PIPELINE": 0,
+      "VGPR_PREFETCH_K": 256,
+      "A_SCALE_SORTED_SHUFFLED": true,
+      "B_SCALE_SHUFFLED": true,
+      "B_PRESHUFFLED": false,
+      "ACT_FAST_RCP": false,
+      "WAIT_COMMIT_SCHEME": 3,
+      "DS_READ_IN_MFMA": 0,
+      "SCHED_MODE": 0,
+      "FROZEN_STEP": false,
+      "SOFF_UNROLL": false,
+      "SCALE_FILL_MID": false,
+      "B_IN_REG": false,
+      "B_SCALE_IN_REG": false,
+      "A_SCALE_IN_REG": false,
+      "A_NUM_BUFFER": 0,
+      "B_NUM_BUFFER": 0,
+      "A_SCALE_NUM_BUFFER": 0,
+      "B_SCALE_NUM_BUFFER": 0
+    },
+    "useful_rows": 32768,
+    "padded_rows": 33792,
+    "allocated_rows": 36864,
+    "active_blocks": 264,
+    "output_layout": "dense expert-sorted rows",
+    "output_quantization_policy": null,
+    "device": {
+      "name": "AMD Instinct MI350X",
+      "arch": "gfx950:sramecc+:xnack-",
+      "physical_gpu": "4",
+      "hip_visible_devices": "5",
+      "pci_bus_id": "0000:86:00.0"
+    },
+    "versions": {
+      "python": "3.14.4 (main, Jun 18 2026, 14:25:02) [GCC 15.2.0]",
+      "torch": "2.15.0.dev20260816+rocm7.14",
+      "hip": "7.14.60850",
+      "triton": "3.8.0"
+    },
+    "setup_excluded_from_timing": [
+      "routing",
+      "input quantization",
+      "A-scale sorting",
+      "weight and scale shuffle/preshuffle",
+      "output allocation",
+      "JIT compilation",
+      "launch argument preparation"
+    ]
+  },
+  "a8w8_t4096_flydsl_a8w8": {
+    "precision": "a8w8",
+    "tokens": 4096,
+    "case": "flydsl_a8w8",
+    "backend": "flydsl",
+    "n": 400,
+    "mean_us": 1303.4388425,
+    "median_us": 1301.8885,
+    "p99_us": 1357.889,
+    "stdev_us": 19.382438060205267,
+    "round_means_us": [
+      1302.94162,
+      1305.54257,
+      1302.35124,
+      1302.91994
+    ],
+    "round_medians_us": [
+      1302.0285,
+      1303.048,
+      1299.588,
+      1299.4295000000002
+    ],
+    "round_p99_us": [
+      1351.049,
+      1362.449,
+      1341.408,
+      1342.289
+    ],
+    "tuning": {
+      "tile_m": 128,
+      "tile_n": 128,
+      "tile_k": 256,
+      "waves_per_eu": 2,
+      "b_nt": 2,
+      "gate_mode": "interleave",
+      "use_async_copy": true,
+      "xcd_swizzle": 0,
+      "k_wave": 1
+    },
+    "env": {},
+    "effective_tuning": {
+      "kind": "a8w8",
+      "tile_m": 128,
+      "tile_n": 128,
+      "tile_k": 256,
+      "waves_per_eu": 2,
+      "b_nt": 2,
+      "gate_mode": "interleave",
+      "use_async_copy": true,
+      "xcd_swizzle": 0,
+      "k_wave": 1,
+      "act": "silu",
+      "alpha": 1.0,
+      "clamp": null,
+      "bias": false,
+      "routing_weights": false,
+      "output": "bf16",
+      "output_layout": "token_slot",
+      "shape": {
+        "T": 4096,
+        "K": 7168,
+        "N": 4096,
+        "E": 33,
+        "topk": 8
+      },
+      "preprocessing": "setup only; retained compiled callable and prepared arguments",
+      "allocated_routing_blocks": 289,
+      "active_routing_blocks": 264,
+      "native_grid_blocks": null
+    },
+    "useful_rows": 32768,
+    "padded_rows": 33792,
+    "allocated_rows": 36992,
+    "active_blocks": 264,
+    "output_layout": "token_slot",
+    "output_quantization_policy": null,
+    "device": {
+      "name": "AMD Instinct MI350X",
+      "arch": "gfx950:sramecc+:xnack-",
+      "physical_gpu": "4",
+      "hip_visible_devices": "5",
+      "pci_bus_id": "0000:86:00.0"
+    },
+    "versions": {
+      "python": "3.14.4 (main, Jun 18 2026, 14:25:02) [GCC 15.2.0]",
+      "torch": "2.15.0.dev20260816+rocm7.14",
+      "hip": "7.14.60850",
+      "triton": "3.8.0"
+    },
+    "setup_excluded_from_timing": [
+      "routing",
+      "input quantization",
+      "A-scale sorting",
+      "weight and scale shuffle/preshuffle",
+      "output allocation",
+      "JIT compilation",
+      "launch argument preparation"
+    ]
+  },
+  "a8w8_t4096_gluon_a8w8": {
+    "precision": "a8w8",
+    "tokens": 4096,
+    "case": "gluon_a8w8",
+    "backend": "gluon",
+    "n": 400,
+    "mean_us": 1182.7814525,
+    "median_us": 1181.8485,
+    "p99_us": 1233.007,
+    "stdev_us": 20.25684267137265,
+    "round_means_us": [
+      1179.84613,
+      1185.93305,
+      1182.16396,
+      1183.18267
+    ],
+    "round_medians_us": [
+      1181.028,
+      1186.2669999999998,
+      1177.688,
+      1182.8085
+    ],
+    "round_p99_us": [
+      1220.048,
+      1231.048,
+      1233.007,
+      1224.208
+    ],
+    "tuning": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 256,
+      "BLOCK_K": 128,
+      "K_UNROLL": 6,
+      "MINI_BLOCK_K": 128,
+      "MINI_BLOCK_M": 64,
+      "MINI_BLOCK_N": 128,
+      "NUM_LDS_BUFFER": 3,
+      "mfma_instr_shape": [
+        16,
+        16,
+        128
+      ],
+      "warps_per_cta": [
+        1,
+        4
+      ],
+      "tiles_per_warp": [
+        2,
+        2
+      ],
+      "k_width": null,
+      "transposed": true,
+      "WAVES_PER_EU": 1,
+      "TILE_SCHED": 2,
+      "GROUP_M": 4,
+      "NUM_XCDS": 8,
+      "token_mod": "",
+      "token_scale_mod": "",
+      "expert_mod": "",
+      "expert_scale_mod": "",
+      "result_mod": "",
+      "result_scale_mod": "",
+      "WARP_PIPELINE": 0,
+      "VGPR_PREFETCH_K": 128,
+      "A_SCALE_SORTED_SHUFFLED": true,
+      "B_SCALE_SHUFFLED": true,
+      "B_PRESHUFFLED": false,
+      "ACT_FAST_RCP": false,
+      "WAIT_COMMIT_SCHEME": 3,
+      "DS_READ_IN_MFMA": 0,
+      "SCHED_MODE": 0,
+      "FROZEN_STEP": false,
+      "SOFF_UNROLL": false,
+      "SCALE_FILL_MID": false
+    },
+    "env": {
+      "TRITON_MEMBAR_DEDUP_BARE": "1"
+    },
+    "effective_tuning": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 256,
+      "BLOCK_K": 128,
+      "K_UNROLL": 6,
+      "MINI_BLOCK_K": 128,
+      "MINI_BLOCK_M": 64,
+      "MINI_BLOCK_N": 128,
+      "NUM_LDS_BUFFER": 3,
+      "mfma_instr_shape": [
+        16,
+        16,
+        128
+      ],
+      "warps_per_cta": [
+        1,
+        4
+      ],
+      "tiles_per_warp": [
+        2,
+        2
+      ],
+      "k_width": null,
+      "transposed": true,
+      "WAVES_PER_EU": 1,
+      "TILE_SCHED": 2,
+      "GROUP_M": 4,
+      "NUM_XCDS": 8,
+      "token_mod": "",
+      "token_scale_mod": "",
+      "expert_mod": "",
+      "expert_scale_mod": "",
+      "result_mod": "",
+      "result_scale_mod": "",
+      "WARP_PIPELINE": 0,
+      "VGPR_PREFETCH_K": 128,
+      "A_SCALE_SORTED_SHUFFLED": true,
+      "B_SCALE_SHUFFLED": true,
+      "B_PRESHUFFLED": false,
+      "ACT_FAST_RCP": false,
+      "WAIT_COMMIT_SCHEME": 3,
+      "DS_READ_IN_MFMA": 0,
+      "SCHED_MODE": 0,
+      "FROZEN_STEP": false,
+      "SOFF_UNROLL": false,
+      "SCALE_FILL_MID": false,
+      "B_IN_REG": false,
+      "B_SCALE_IN_REG": false,
+      "A_SCALE_IN_REG": false,
+      "A_NUM_BUFFER": 0,
+      "B_NUM_BUFFER": 0,
+      "A_SCALE_NUM_BUFFER": 0,
+      "B_SCALE_NUM_BUFFER": 0
+    },
+    "useful_rows": 32768,
+    "padded_rows": 33792,
+    "allocated_rows": 36864,
+    "active_blocks": 264,
+    "output_layout": "dense expert-sorted rows",
+    "output_quantization_policy": null,
+    "device": {
+      "name": "AMD Instinct MI350X",
+      "arch": "gfx950:sramecc+:xnack-",
+      "physical_gpu": "4",
+      "hip_visible_devices": "5",
+      "pci_bus_id": "0000:86:00.0"
+    },
+    "versions": {
+      "python": "3.14.4 (main, Jun 18 2026, 14:25:02) [GCC 15.2.0]",
+      "torch": "2.15.0.dev20260816+rocm7.14",
+      "hip": "7.14.60850",
+      "triton": "3.8.0"
+    },
+    "setup_excluded_from_timing": [
+      "routing",
+      "input quantization",
+      "A-scale sorting",
+      "weight and scale shuffle/preshuffle",
+      "output allocation",
+      "JIT compilation",
+      "launch argument preparation"
+    ]
+  }
+}
