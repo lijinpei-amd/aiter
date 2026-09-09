@@ -124,9 +124,10 @@ class TileSched(IntEnum):
 class WarpPipeline(IntEnum):
     """Which inter-wave ping-pong the K-loop step is built for.
 
-    All modes share the runtime component-pipeline driver. The live step places
-    MFMA and memory work in regions selected by ``_lang.pick_warp_pipeline_stage``;
-    the explicit frozen step retains the reference's manual rendezvous sequence.
+    ``NONE`` and ``COMPILER`` use the live component-pipeline driver. The live step
+    places MFMA and memory work in regions selected by
+    ``_lang.pick_warp_pipeline_stage``; the separate frozen body retains the
+    reference's manual rendezvous sequence.
 
     * ``NONE`` -- no borders. One wave group, the MFMAs and the memory work overlapped
       only by the machine scheduler.
@@ -251,7 +252,7 @@ class TuningSpec(NamedTuple):
     #: :class:`DSReadOperand` mask; each payload and scale may move independently.
     DS_READ_IN_MFMA: int = int(DSReadOperand.NONE)
     SCHED_MODE: int = int(SchedMode.NONE)
-    #: Run the preserved reference step within the common runtime pipeline driver.
+    #: Dispatch to the preserved reference body in ``_frozen.py``.
     FROZEN_STEP: bool = False
     #: Advance HBM pointers per unrolled body and address its steps through soffset.
     SOFF_UNROLL: bool = False

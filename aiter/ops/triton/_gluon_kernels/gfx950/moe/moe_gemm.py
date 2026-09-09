@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Gluon (gfx950 / CDNA4) MoE grouped GEMM kernels.
+"""Live Gluon (gfx950 / CDNA4) MoE grouped GEMM body and helpers.
 
-The entry points in :mod:`._entry` share **one** ``@gluon.jit`` body:
+The entry points in :mod:`._entry` dispatch once between this live body and the
+self-contained reference body in :mod:`._frozen`:
 
 * :func:`_moe_gluon_gemm1` -- gemm1 + fused activation. Gathers tokens according to the
   routing metadata and writes its output contiguously (dense, expert-sorted
@@ -121,11 +122,10 @@ _DK_UPCAST_MFMA: gl.constexpr = gl.constexpr(int(DotKind.UPCAST_MFMA))
 @gluon.constexpr_function
 def _packed_sel(tuning_cfg, idx, k_phase=0):
     """The byte-selector list for a pre-packed scale operand, or None if it is not."""
-    if not tuning_cfg.FROZEN_STEP and tuning_cfg.num_mini_k() > 1:
+    if tuning_cfg.num_mini_k() > 1:
         return None
     if tuning_cfg.scale_packed_ok(idx) and (
-        tuning_cfg.scale_via_lds(idx)
-        or (not tuning_cfg.FROZEN_STEP and tuning_cfg.scale_packed_k128(idx))
+        tuning_cfg.scale_via_lds(idx) or tuning_cfg.scale_packed_k128(idx)
     ):
         return tuning_cfg.scale_packed_sel(idx, k_phase)
     return None
@@ -639,11 +639,7 @@ def _moe_gemm_body(
     # Shallower streams finish their remaining fills during the drain. The final
     # MFMA is separate and consumes only the fragments already in registers.
     # Fuse its activation where supported by the live step.
-    FUSE: gl.constexpr = (
-        not tuning_cfg.FROZEN_STEP
-        and func_cfg.gu_split()
-        and tuning_cfg.num_mini_n() == 2
-    )
+    FUSE: gl.constexpr = func_cfg.gu_split() and tuning_cfg.num_mini_n() == 2
     regs = _drain_buffered_pipeline(pc, hbm_ptrs, buffers, regs, NUM_K, epi.groups)
     if require_constexpr(not FUSE):
         regs = _PipelineRegFragments(
@@ -710,6 +706,6 @@ def _moe_gemm_body(
     )
 
 
-# Imported last: the unified driver calls shared helpers from this module.
-# JIT functions resolve these names at compile time, after both modules have loaded.
+# Imported last: the live driver calls shared helpers from this module. JIT functions
+# resolve these names at compile time, after both modules have loaded.
 from ._buffered import _drain_buffered_pipeline, _last_mfma, _run_buffered_pipeline

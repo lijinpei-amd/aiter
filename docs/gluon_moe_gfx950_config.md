@@ -7,17 +7,18 @@ continues to select the recorded impl and frozen configurations.
 
 The low-level entry points `_moe_gluon_gemm1` and `_moe_gluon_gemm2` and launch
 metadata live in `_entry.py`. Each entry constructs `KernelFuncConfig` and
-`KernelTuningConfig` from the launch specs and passes them directly to
-`_moe_gemm_body` alongside constexpr `N` and `K` and a runtime `NUM_K` scalar.
+`KernelTuningConfig` from the launch specs and dispatches once to the live body in
+`moe_gemm.py` or the self-contained reference body in `_frozen.py`, alongside
+constexpr `N` and `K` and a runtime `NUM_K` scalar.
 The host computes `NUM_K = K // BLOCK_K` and disables specialization of that
 argument. Shape and layout calculations may still use constexpr `K`; the K-loop
 bounds derive from the runtime scalar. The A-scale row stride is constexpr so
 raw rows retain their 4- or 8-byte alignment when they are not 16-byte aligned.
 The host caches the two specs and
-dimensions as four constexpr arguments. `_buffered.py` implements one driver for
+dimensions as four constexpr arguments. `_buffered.py` implements the live driver for
 shared and independent component depths, and `_buffered_schedule.py` computes
-the compile-time issue history and waits. The shared GEMM body remains in
-`moe_gemm.py`.
+the compile-time issue history and waits. `_frozen.py` owns the preserved LDS,
+dot, pipeline-state, loop, drain, and final-MFMA path.
 `_offsets.py` computes A/B HBM offsets and mini-tile
 indices, and `_epilogue.py` owns output activation, quantization, staging, and
 stores. The host launch API is unchanged.
@@ -34,7 +35,7 @@ mismatch before preparing scales or launching the GEMM.
 | --- | --- |
 | `DS_READ_IN_MFMA` | `DSReadOperand` bitmask: `A=1`, `B=2`, `A_SCALE=4`, `B_SCALE=8`. Set bits place the corresponding read in the MFMA region; unset bits place it in the memory region. `ALL=15`. |
 | `SCHED_MODE` | `SchedMode.NONE`, `IGLP_0`, `IGLP_1`, `MFMA_16`, or `MFMA_8`. Hints apply outside compiler warp-pipeline regions. |
-| `FROZEN_STEP` | Select the preserved reference step within the common driver, with an unfused final MFMA. Its existing restrictions on component overrides, register flags and packed K128 scales remain. |
+| `FROZEN_STEP` | Select the preserved reference body in `_frozen.py`, with an unfused final MFMA. Its existing restrictions on component overrides, register flags and packed K128 scales remain. |
 | `SOFF_UNROLL` | Advance HBM pointers once per unrolled body and use scalar offsets within it. With packed K128 scales and odd unroll, use per-fill pointer advances so scale-word phases remain correct. |
 | `SCALE_FILL_MID` | At a 2x2 mini-tile split, fill scales in the middle slots; wait counts use the same setting. |
 | `WAIT_COMMIT_SCHEME` | `PER_OP=1`, `PER_SLOT=2`, `PER_STAGE_WHOLE=3`, or `PER_STAGE_WARP_PIPELINE=4`; see the boundaries below. |
@@ -248,11 +249,12 @@ stages the whole block before its flush. The interleaved activation passes
 alternate packing). Eligible live gate/up split kernels fuse the final activation
 into the MFMA drain.
 
-The frozen step keeps its fixed prologue fence and literal priority instructions
-within the common runtime driver. It retains an unfused final MFMA and its
-existing restrictions. It does not acquire the live step's read-placement or
-scheduling options. Use the complete frozen recipe from the cold benchmark
-wrapper when comparing it with the best impl recipe.
+The frozen body keeps its fixed prologue fence and literal priority instructions,
+its runtime loop and drain, and its original LDS and dot-selection behavior in
+`_frozen.py`. It retains an unfused final MFMA and its existing restrictions. It
+does not acquire the live step's read-placement or scheduling options. Use the
+complete frozen recipe from the cold benchmark wrapper when comparing it with the
+best impl recipe.
 
 The encoded-code comparisons and timing results below describe earlier
 refactors, before the unified runtime loop. The current refactor's source

@@ -545,7 +545,7 @@ def _read_slot(
 
 
 @gluon.jit
-def _step(
+def _step_live(
     pc,
     ptrs,
     buffers,
@@ -557,58 +557,6 @@ def _step(
     IN_LOOP: gl.constexpr = False,
     DOT: gl.constexpr = True,
     EPILOGUE_GROUPS: gl.constexpr = 0,
-    STATIC_PHASE: gl.constexpr = False,
-):
-    tc: gl.constexpr = pc.tuning_cfg
-    if require_constexpr(tc.FROZEN_STEP):
-        # Preserve the explicit reference/manual scheduling mode within the same
-        # driver. Its supported configurations have a single shared LDS depth.
-        ptrs, regs = _pipeline_step_frozen(
-            pc,
-            ptrs,
-            regs,
-            _index(tc, step, 0, True, KI, IN_LOOP or STATIC_PHASE),
-            _index(tc, step, 0, False, KI, IN_LOOP or STATIC_PHASE),
-            tc.pipeline_depth() - 2 - (STAGE if DRAIN else 0),
-            not DRAIN,
-            True,
-            IN_LOOP,
-            DOT,
-            0,
-            1,
-            EPILOGUE_GROUPS,
-        )
-    else:
-        ptrs, buffers, regs = _step_live(
-            pc,
-            ptrs,
-            buffers,
-            regs,
-            step,
-            STAGE,
-            DRAIN,
-            KI,
-            IN_LOOP,
-            DOT,
-            EPILOGUE_GROUPS,
-            STATIC_PHASE,
-        )
-    return ptrs, buffers, regs
-
-
-@gluon.jit
-def _step_live(
-    pc,
-    ptrs,
-    buffers,
-    regs,
-    step,
-    STAGE: gl.constexpr,
-    DRAIN: gl.constexpr,
-    KI: gl.constexpr,
-    IN_LOOP: gl.constexpr,
-    DOT: gl.constexpr,
-    EPILOGUE_GROUPS: gl.constexpr,
     STATIC_PHASE: gl.constexpr = False,
 ):
     tc: gl.constexpr = pc.tuning_cfg
@@ -707,13 +655,16 @@ def _step_live(
     return ptrs, buffers, _make_reg_fragments(a, b, acc)
 
 
+_step = _step_live
+
+
 @gluon.jit
 def _run_buffered_pipeline(pc, ptrs, NUM_K):
     """Run the prologue and MAIN iterations; leave the drain to overlap the epilogue."""
     tc: gl.constexpr = pc.tuning_cfg
     gl.static_assert(
-        tc.FROZEN_STEP or not tc.warp_pipeline_manual(),
-        "the manual pipeline requires FROZEN_STEP",
+        not tc.warp_pipeline_manual(),
+        "the live pipeline requires WARP_PIPELINE=0 or 1",
     )
     gl.static_assert(
         tc.num_prefetch_mini() == tc.num_mini_k(),
@@ -733,16 +684,13 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
     if require_constexpr(not countdown):
         unroll_end = remaining // unroll * unroll
     buffers = _init_buffers(pc)
-    if require_constexpr(tc.FROZEN_STEP):
-        ptrs = _prologue_frozen(pc, ptrs)
-    else:
-        # r = p - (NB_MAX - 1): active streams fill p - NB_DELTA.
-        for r in gl.static_range(1 - depth, 0):
-            for ni in gl.static_range(tc.num_mini_n()):
-                for mi in gl.static_range(tc.num_mini_m()):
-                    buffers = _fill_slot(pc, ptrs, buffers, r, r, False, mi, ni)
-            ptrs = _advance(pc, ptrs, r, r, False)
-            buffers = _rotate_buffers(buffers, tc)
+    # r = p - (NB_MAX - 1): active streams fill p - NB_DELTA.
+    for r in gl.static_range(1 - depth, 0):
+        for ni in gl.static_range(tc.num_mini_n()):
+            for mi in gl.static_range(tc.num_mini_m()):
+                buffers = _fill_slot(pc, ptrs, buffers, r, r, False, mi, ni)
+        ptrs = _advance(pc, ptrs, r, r, False)
+        buffers = _rotate_buffers(buffers, tc)
     acc = ()
     for ni in gl.static_range(tc.num_mini_n()):
         for mi in gl.static_range(tc.num_mini_m()):
@@ -903,8 +851,8 @@ def _last_mfma(pc, regs):
     return acc
 
 
-# JIT resolves these shared helpers after both modules have loaded.
-from .moe_gemm import (  # noqa: I001 -- initialize shared helpers before the frozen module
+# JIT resolves these helpers after ``moe_gemm`` has defined them.
+from .moe_gemm import (
     _make_reg_fragments,
     _maybe_block_dot,
     _merge_ds_read_frags,
@@ -913,5 +861,3 @@ from .moe_gemm import (  # noqa: I001 -- initialize shared helpers before the fr
     _sched_hint,
     _take_reg_pairs,
 )
-
-from ._frozen import _pipeline_step_frozen, _prologue_frozen
