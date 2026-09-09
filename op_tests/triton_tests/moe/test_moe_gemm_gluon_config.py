@@ -379,6 +379,45 @@ def test_lds_depths_do_not_constrain_unroll(config):
     assert _plain(tc.pipeline_unroll()) == 8
 
 
+def test_small_payload_tiles_use_register_rings(config):
+    config.update(
+        BLOCK_M=64,
+        BLOCK_N=64,
+        BLOCK_K=32,
+        MINI_BLOCK_K=32,
+        MINI_BLOCK_M=32,
+        MINI_BLOCK_N=32,
+        VGPR_PREFETCH_K=32,
+        mfma_instr_shape=(16, 16, 16),
+        warps_per_cta=(2, 2),
+        tiles_per_warp=(1, 1),
+        A_NUM_BUFFER=2,
+        B_NUM_BUFFER=3,
+        K_UNROLL=1,
+        WARP_PIPELINE=0,
+    )
+    fc = KernelFuncConfig(
+        *_func_spec()._replace(
+            token_dtype_quant=int(DtypeQuant.BF16),
+            expert_dtype_quant=int(DtypeQuant.BF16),
+            token_online_quant=int(DtypeQuant.BF16),
+            expert_online_quant=int(DtypeQuant.BF16),
+            output_quant=None,
+        )
+    )
+    tc = KernelTuningConfig(fc, *_tuning_spec(config))
+    assert not _plain(tc.payload_via_lds(0))
+    assert not _plain(tc.payload_via_lds(1))
+    assert _plain(tc.pipeline_register_period()) == 6
+    assert _plain(tc.lds_bytes()) == 0
+    assert _plain(tc.validate(64, 512))
+
+    config.update(A_NUM_BUFFER=0, B_NUM_BUFFER=0, FROZEN_STEP=True)
+    frozen = KernelTuningConfig(fc, *_tuning_spec(config))
+    with pytest.raises(AssertionError, match="requires operand 0's payload in LDS"):
+        frozen.validate(64, 512)
+
+
 @pytest.mark.parametrize("register_b", [False, True])
 def test_absent_scales_do_not_participate_in_depth_unroll_or_validation(
     config, register_b

@@ -100,8 +100,8 @@ def _buffer_load_ops(tc, mi, ni):
 def _buffer_load_group_schedule(tc):
     """Committed groups per slot, containing async ``(operand_kind, tile)`` copies.
 
-    Kinds 0/1/2/3 name A payload/A scale/B payload/B scale. Synchronous payload
-    staging and direct scale loads have no async group. Traffic-only experiments
+    Kinds 0/1/2/3 name A payload/A scale/B payload/B scale. Direct-register payload
+    and scale loads have no async group. Traffic-only experiments
     retain their nominal groups even when the LDS manager suppresses a copy.
     """
     NM, NN = tc.num_mini_m(), tc.num_mini_n()

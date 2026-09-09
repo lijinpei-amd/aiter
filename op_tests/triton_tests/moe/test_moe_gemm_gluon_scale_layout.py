@@ -322,25 +322,22 @@ class _CopyRecorder:
             self.lds[key] = value
         return value
 
-    def buffer_load_a_payload(self, *args):
-        self._record(0, *args)
+    def buffer_load_payload(
+        self, operand, VIA_LDS, buffer, tile, pointer, offsets, soffset
+    ):
+        value = self._record(operand * 2, buffer, tile, pointer, offsets, soffset)
+        if not VIA_LDS:
+            return (value,)
 
-    def buffer_load_a_scale(self, *args):
-        self._record(1, *args)
-
-    def buffer_load_b_payload(self, *args):
-        self._record(2, *args)
-
-    def buffer_load_b_scale(self, *args):
-        self._record(3, *args)
-
-    def buffer_load_b_register(self, pointer, offsets, soffset):
-        return (self._record(2, None, offsets, pointer, offsets, soffset),)
-
-    def buffer_load_scale_register(self, operand, pointer, offsets, soffset, K_PHASE):
+    def buffer_load_scale(
+        self, operand, VIA_LDS, buffer, tile, pointer, offsets, soffset, K_PHASE=0
+    ):
         kind = operand * 2 + 1
-        assert K_PHASE == len(self.addresses[kind, offsets]) % 2
-        return (self._record(kind, None, offsets, pointer, offsets, soffset),)
+        if not VIA_LDS:
+            assert K_PHASE == len(self.addresses[kind, tile]) % 2
+        value = self._record(kind, buffer, tile, pointer, offsets, soffset)
+        if not VIA_LDS:
+            return (value,)
 
     def _read(self, kind, tile, slot):
         stage = len(self.reads[kind, tile])
@@ -348,7 +345,7 @@ class _CopyRecorder:
         self.reads[kind, tile].append(stage)
         return self.lds[kind, tile, slot]
 
-    def _read_frag(
+    def ds_read_frag(
         self,
         operand,
         buffer,
@@ -366,12 +363,6 @@ class _CopyRecorder:
             self._read(operand * 2 + 1, tile, SCALE_READ_IDX) if READ_SCALE else None
         )
         return payload, scale
-
-    def ds_read_a_frag(self, *args, **kwargs):
-        return self._read_frag(0, *args, **kwargs)
-
-    def ds_read_b_frag(self, *args, **kwargs):
-        return self._read_frag(1, *args, **kwargs)
 
     def commit_buffer_load(self):
         pass

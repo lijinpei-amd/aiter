@@ -463,26 +463,16 @@ def _ds_read_operand(
     scale_tile_hbm_offs = _opt_at(scale_hbm_offs, tile, HAS)
     frags = ()
     for i in gl.static_range(NUM_MINI):
-        if require_constexpr(operand == 0):
-            payload, scale = pc.lds_ptrs.ds_read_a_frag(
-                DS_READ_IDX,
-                tile,
-                i,
-                scale_hbm_ptr,
-                _mini_scale_hbm_offset(scale_tile_hbm_offs, i * SK_MINI, HAS),
-                READ_PAYLOAD,
-                READ_SCALE,
-            )
-        else:
-            payload, scale = pc.lds_ptrs.ds_read_b_frag(
-                DS_READ_IDX,
-                tile,
-                i,
-                scale_hbm_ptr,
-                _mini_scale_hbm_offset(scale_tile_hbm_offs, i * SK_MINI, HAS),
-                READ_PAYLOAD,
-                READ_SCALE,
-            )
+        payload, scale = pc.lds_ptrs.ds_read_frag(
+            operand,
+            DS_READ_IDX,
+            tile,
+            i,
+            scale_hbm_ptr,
+            _mini_scale_hbm_offset(scale_tile_hbm_offs, i * SK_MINI, HAS),
+            READ_PAYLOAD,
+            READ_SCALE,
+        )
         if require_constexpr(not READ_PAYLOAD):
             payload = scale
         if require_constexpr(HAS and READ_SCALE):

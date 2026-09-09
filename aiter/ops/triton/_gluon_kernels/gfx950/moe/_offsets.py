@@ -134,7 +134,11 @@ def _a_payload_hbm_offsets(a, rt, block_id, M_e, start_m, func_cfg, tuning_cfg):
     MBM: gl.constexpr = tuning_cfg.MINI_BLOCK_M
     NM: gl.constexpr = tuning_cfg.num_mini_m()
     PK_A: gl.constexpr = tuning_cfg.BLOCK_K // func_cfg.a_pack_divisor()
-    cl_a: gl.constexpr = tuning_cfg.dot_operand_copy_layout(0)
+    cl_a: gl.constexpr = (
+        tuning_cfg.dot_operand_copy_layout(0)
+        if tuning_cfg.payload_via_lds(0)
+        else tuning_cfg.dot_operand_fragment_layout(0)
+    )
     a_hbm_offs = ()
     for mi in gl.static_range(NM):
         rows_a = _gather_rows(
@@ -162,10 +166,10 @@ def _b_payload_hbm_offsets(b, pid_n, N, K, func_cfg, tuning_cfg):
     MBN: gl.constexpr = tuning_cfg.MINI_BLOCK_N
     NN: gl.constexpr = tuning_cfg.num_mini_n()
     PK_B: gl.constexpr = tuning_cfg.BLOCK_K // func_cfg.b_pack_divisor()
-    if require_constexpr(tuning_cfg.B_IN_REG):
-        cl_b: gl.constexpr = tuning_cfg.dot_operand_fragment_layout(1)
-    else:
+    if require_constexpr(tuning_cfg.payload_via_lds(1)):
         cl_b: gl.constexpr = tuning_cfg.dot_operand_copy_layout(1)
+    else:
+        cl_b: gl.constexpr = tuning_cfg.dot_operand_fragment_layout(1)
     KB: gl.constexpr = K // func_cfg.b_pack_divisor()
     b_hbm_offs = ()
     for ni in gl.static_range(NN):

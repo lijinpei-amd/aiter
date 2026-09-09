@@ -81,17 +81,30 @@ def _rotate(queue, TILE_COUNT: gl.constexpr):
 def _rotate_buffers(buffers, tc):
     mk: gl.constexpr = tc.num_mini_k()
     return (
-        _rotate(buffers[0], tc.num_mini_n() * mk),
-        _rotate(buffers[1], tc.num_mini_m() * mk),
-        _rotate(buffers[2], tc.num_mini_n() * mk),
+        _rotate(buffers[0], tc.num_mini_m() * mk),
+        _rotate(buffers[1], tc.num_mini_n() * mk),
+        _rotate(buffers[2], tc.num_mini_m() * mk),
+        _rotate(buffers[3], tc.num_mini_n() * mk),
     )
 
 
 @gluon.jit
 def _init_buffers(pc):
     tc: gl.constexpr = pc.tuning_cfg
-    b, a_scale, b_scale = (), (), ()
-    if require_constexpr(tc.B_IN_REG):
+    a, b, a_scale, b_scale = (), (), (), ()
+    if require_constexpr(not tc.payload_via_lds(0)):
+        for _ in gl.static_range(tc.num_buffers(0) * tc.num_mini_m() * tc.num_mini_k()):
+            a += (
+                gl.zeros(
+                    [
+                        tc.MINI_BLOCK_M,
+                        tc.MINI_BLOCK_K // pc.func_cfg.pack_divisor(0),
+                    ],
+                    pc.func_cfg.operand_elem_ty(0),
+                    tc.dot_operand_fragment_layout(0),
+                ),
+            )
+    if require_constexpr(not tc.payload_via_lds(1)):
         for _ in gl.static_range(tc.num_buffers(1) * tc.num_mini_n() * tc.num_mini_k()):
             b += (
                 gl.zeros(
@@ -140,7 +153,7 @@ def _init_buffers(pc):
                         tc.dot_operand_scale_fragment_layout(1),
                     ),
                 )
-    return b, a_scale, b_scale
+    return a, b, a_scale, b_scale
 
 
 @gluon.constexpr_function
@@ -204,21 +217,47 @@ def _fill_slot(
         if offset_step and pc.func_cfg.b_has_scale()
         else 0
     )
-    b, a_scale, b_scale = buffers
+    a, b, a_scale, b_scale = buffers
     phase = _phase(tc, step, KI, IN_LOOP or STATIC_PHASE)
     if require_constexpr(ops[0] is not None and _active(tc, 0, STAGE, DRAIN)):
-        pc.lds_ptrs.buffer_load_a_payload(
-            _index(tc, step, 0, True, KI, IN_LOOP or STATIC_PHASE),
-            ops[0],
-            ptrs.a_hbm_ptr,
-            pc.a_hbm_offs[ops[0]],
-            a_soff,
-        )
-        if require_constexpr(tc.commit_per_op() and tc.payload_via_lds(0)):
-            pc.lds_ptrs.commit_buffer_load()
+        if require_constexpr(tc.payload_via_lds(0)):
+            pc.lds_ptrs.buffer_load_payload(
+                0,
+                True,
+                _index(tc, step, 0, True, KI, IN_LOOP or STATIC_PHASE),
+                ops[0],
+                ptrs.a_hbm_ptr,
+                pc.a_hbm_offs[ops[0]],
+                a_soff,
+            )
+            if require_constexpr(tc.commit_per_op()):
+                pc.lds_ptrs.commit_buffer_load()
+        else:
+            fragments = pc.lds_ptrs.buffer_load_payload(
+                0,
+                False,
+                None,
+                ops[0],
+                ptrs.a_hbm_ptr,
+                pc.a_hbm_offs[ops[0]],
+                a_soff,
+            )
+            a = _replace_tile(
+                a,
+                fragments,
+                (
+                    ((KI if IN_LOOP else 0) + tc.num_buffers(0) - 1)
+                    % tc.num_buffers(0)
+                    * tc.num_mini_m()
+                    + ops[0]
+                )
+                * mk,
+            )
     if require_constexpr(ops[1] is not None and _active(tc, 1, STAGE, DRAIN)):
         if require_constexpr(tc.scale_via_lds(0)):
-            pc.lds_ptrs.buffer_load_a_scale(
+            pc.lds_ptrs.buffer_load_scale(
+                0,
+                True,
                 _index(tc, step, 1, True, KI, IN_LOOP or STATIC_PHASE),
                 ops[1],
                 ptrs.a_scale_hbm_ptr,
@@ -228,8 +267,11 @@ def _fill_slot(
             if require_constexpr(tc.commit_per_op()):
                 pc.lds_ptrs.commit_buffer_load()
         else:
-            fragments = pc.lds_ptrs.buffer_load_scale_register(
+            fragments = pc.lds_ptrs.buffer_load_scale(
                 0,
+                False,
+                None,
+                ops[1],
                 ptrs.a_scale_hbm_ptr,
                 pc.a_scale_hbm_offs[ops[1]],
                 as_soff,
@@ -247,8 +289,12 @@ def _fill_slot(
                 * mk,
             )
     if require_constexpr(ops[2] is not None and _active(tc, 2, STAGE, DRAIN)):
-        if require_constexpr(tc.B_IN_REG):
-            fragments = pc.lds_ptrs.buffer_load_b_register(
+        if require_constexpr(not tc.payload_via_lds(1)):
+            fragments = pc.lds_ptrs.buffer_load_payload(
+                1,
+                False,
+                None,
+                ops[2],
                 ptrs.b_hbm_ptr,
                 pc.b_hbm_offs[ops[2]],
                 b_soff,
@@ -265,18 +311,22 @@ def _fill_slot(
                 * mk,
             )
         else:
-            pc.lds_ptrs.buffer_load_b_payload(
+            pc.lds_ptrs.buffer_load_payload(
+                1,
+                True,
                 _index(tc, step, 2, True, KI, IN_LOOP or STATIC_PHASE),
                 ops[2],
                 ptrs.b_hbm_ptr,
                 pc.b_hbm_offs[ops[2]],
                 b_soff,
             )
-            if require_constexpr(tc.commit_per_op() and tc.payload_via_lds(1)):
+            if require_constexpr(tc.commit_per_op()):
                 pc.lds_ptrs.commit_buffer_load()
     if require_constexpr(ops[3] is not None and _active(tc, 3, STAGE, DRAIN)):
         if require_constexpr(tc.scale_via_lds(1)):
-            pc.lds_ptrs.buffer_load_b_scale(
+            pc.lds_ptrs.buffer_load_scale(
+                1,
+                True,
                 _index(tc, step, 3, True, KI, IN_LOOP or STATIC_PHASE),
                 ops[3],
                 ptrs.b_scale_hbm_ptr,
@@ -286,8 +336,11 @@ def _fill_slot(
             if require_constexpr(tc.commit_per_op()):
                 pc.lds_ptrs.commit_buffer_load()
         else:
-            fragments = pc.lds_ptrs.buffer_load_scale_register(
+            fragments = pc.lds_ptrs.buffer_load_scale(
                 1,
+                False,
+                None,
+                ops[3],
                 ptrs.b_scale_hbm_ptr,
                 pc.b_scale_hbm_offs[ops[3]],
                 bs_soff,
@@ -314,7 +367,7 @@ def _fill_slot(
         )
     ):
         pc.lds_ptrs.commit_buffer_load()
-    return b, a_scale, b_scale
+    return a, b, a_scale, b_scale
 
 
 @gluon.jit
@@ -383,41 +436,36 @@ def _read_tile(
 ):
     tc: gl.constexpr = pc.tuning_cfg
     has_scale: gl.constexpr = pc.func_cfg.has_scale(operand)
-    reg_payload: gl.constexpr = operand == 1 and tc.B_IN_REG
+    reg_payload: gl.constexpr = not tc.payload_via_lds(operand)
     reg_scale: gl.constexpr = has_scale and not tc.scale_via_lds(operand)
     phase = _phase(tc, step, KI, IN_LOOP or STATIC_PHASE)
     frags = ()
     for k in gl.static_range(tc.num_mini_k()):
-        if require_constexpr(operand == 0):
-            payload, scale = pc.lds_ptrs.ds_read_a_frag(
-                _index(tc, step, 0, False, KI, IN_LOOP or STATIC_PHASE),
-                tile,
-                k,
-                ptrs.a_scale_hbm_ptr,
-                None,
-                READ_PAYLOAD=PAYLOAD,
-                READ_SCALE=SCALE and not reg_scale,
-                SCALE_READ_IDX=_index(tc, step, 1, False, KI, IN_LOOP or STATIC_PHASE),
-            )
-        else:
-            payload, scale = pc.lds_ptrs.ds_read_b_frag(
-                _index(tc, step, 2, False, KI, IN_LOOP or STATIC_PHASE),
-                tile,
-                k,
-                ptrs.b_scale_hbm_ptr,
-                None,
-                READ_PAYLOAD=PAYLOAD and not reg_payload,
-                READ_SCALE=SCALE and not reg_scale,
-                SCALE_READ_IDX=_index(tc, step, 3, False, KI, IN_LOOP or STATIC_PHASE),
-            )
+        payload, scale = pc.lds_ptrs.ds_read_frag(
+            operand,
+            _index(tc, step, operand * 2, False, KI, IN_LOOP or STATIC_PHASE),
+            tile,
+            k,
+            ptrs.a_scale_hbm_ptr if operand == 0 else ptrs.b_scale_hbm_ptr,
+            None,
+            READ_PAYLOAD=PAYLOAD and not reg_payload,
+            READ_SCALE=SCALE and not reg_scale,
+            SCALE_READ_IDX=_index(
+                tc, step, operand * 2 + 1, False, KI, IN_LOOP or STATIC_PHASE
+            ),
+        )
         if require_constexpr(PAYLOAD and reg_payload):
-            payload = buffers[0][
-                ((KI % tc.num_buffers(1) if IN_LOOP else 0) * tc.num_mini_n() + tile)
+            payload = buffers[operand][
+                (
+                    (KI % tc.num_buffers(operand) if IN_LOOP else 0)
+                    * (tc.num_mini_m() if operand == 0 else tc.num_mini_n())
+                    + tile
+                )
                 * tc.num_mini_k()
                 + k
             ]
         if require_constexpr(SCALE and reg_scale):
-            scale = buffers[operand + 1][
+            scale = buffers[operand + 2][
                 (
                     (KI % tc.num_buffers(operand, True) if IN_LOOP else 0)
                     * (tc.num_mini_m() if operand == 0 else tc.num_mini_n())
@@ -572,37 +620,33 @@ def _step_live(
     nn: gl.constexpr = tc.num_mini_n()
     mk: gl.constexpr = tc.num_mini_k()
     a, b, acc = (), (), ()
-    if require_constexpr(tc.commit_per_stage()):
-        if require_constexpr(
-            _wait(tc, STAGE, None, DRAIN, EPILOGUE_GROUPS) is not None
-        ):
-            pc.lds_ptrs.wait_buffer_load_groups(
-                _wait(tc, STAGE, None, DRAIN, EPILOGUE_GROUPS)
-            )
-        else:
-            gl.barrier()
+    if require_constexpr(
+        tc.commit_per_stage()
+        and _wait(tc, STAGE, None, DRAIN, EPILOGUE_GROUPS) is not None
+    ):
+        pc.lds_ptrs.wait_buffer_load_groups(
+            _wait(tc, STAGE, None, DRAIN, EPILOGUE_GROUPS)
+        )
     if require_constexpr(tc.SCHED_MODE != 0 and not warp):
         _sched_hint(tc.SCHED_MODE)
     for ni in gl.static_range(nn):
         for mi in gl.static_range(nm):
-            if require_constexpr(not tc.commit_per_stage()):
-                if require_constexpr(
+            if require_constexpr(
+                not tc.commit_per_stage()
+                and _wait(
+                    tc, STAGE, _slot_index(mi, ni, nm, nn), DRAIN, EPILOGUE_GROUPS
+                )
+                is not None
+            ):
+                pc.lds_ptrs.wait_buffer_load_groups(
                     _wait(
-                        tc, STAGE, _slot_index(mi, ni, nm, nn), DRAIN, EPILOGUE_GROUPS
+                        tc,
+                        STAGE,
+                        _slot_index(mi, ni, nm, nn),
+                        DRAIN,
+                        EPILOGUE_GROUPS,
                     )
-                    is not None
-                ):
-                    pc.lds_ptrs.wait_buffer_load_groups(
-                        _wait(
-                            tc,
-                            STAGE,
-                            _slot_index(mi, ni, nm, nn),
-                            DRAIN,
-                            EPILOGUE_GROUPS,
-                        )
-                    )
-                else:
-                    gl.barrier()
+                )
             if require_constexpr(not DOT and mi == 0 and ni == 0):
                 gl.amd.cdna4.sched_barrier(0)
             with region("mem"):
