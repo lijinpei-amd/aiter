@@ -435,7 +435,6 @@ def _ds_read_operand(
     tile: gl.constexpr,
     scale_hbm_ptr,
     operand: gl.constexpr,
-    RELAXED: gl.constexpr = False,
     READ_PAYLOAD: gl.constexpr = True,
     READ_SCALE: gl.constexpr = True,
 ):
@@ -471,7 +470,6 @@ def _ds_read_operand(
                 i,
                 scale_hbm_ptr,
                 _mini_scale_hbm_offset(scale_tile_hbm_offs, i * SK_MINI, HAS),
-                RELAXED,
                 READ_PAYLOAD,
                 READ_SCALE,
             )
@@ -482,7 +480,6 @@ def _ds_read_operand(
                 i,
                 scale_hbm_ptr,
                 _mini_scale_hbm_offset(scale_tile_hbm_offs, i * SK_MINI, HAS),
-                RELAXED,
                 READ_PAYLOAD,
                 READ_SCALE,
             )

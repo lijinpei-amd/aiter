@@ -356,7 +356,6 @@ class _CopyRecorder:
         k,
         _scale_ptr,
         _offsets,
-        RELAXED,
         READ_PAYLOAD,
         READ_SCALE,
         SCALE_READ_IDX,

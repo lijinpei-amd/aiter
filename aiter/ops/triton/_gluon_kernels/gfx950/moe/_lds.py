@@ -3,8 +3,6 @@
 
 """LDS allocation, filling and reading for the gfx950 Gluon MoE GEMMs."""
 
-import os
-
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.language.core import _aggregate as aggregate
@@ -18,58 +16,11 @@ from ._lang import require_constexpr
 
 __all__ = ["LDSManager"]
 
-#: EXPERIMENT ONLY -- replace every E8M0 scale operand with a constant 1.0 (E8M0 bias
-#: 127) instead of reading it. Produces wrong results; it exists to measure the ceiling
-#: of removing the scale path (the 16 ds_read_u8 + 8 v_perm_b32 per pipeline step, and
-#: whatever of the scale global->LDS copy then dies as unreachable).
-_CONST_SCALE: gl.constexpr = gl.constexpr(
-    int(os.environ.get("AITER_TRITON_MOE_GLUON_CONST_SCALE", "0"))
-)
-
-#: EXPERIMENT ONLY -- same, for the payload operands: replace the 16 ds_read_b128 per
-#: pipeline step with a constant. Together with _CONST_SCALE this strips the whole
-#: LDS->register path, leaving only the global->LDS copies and the MFMAs.
-_CONST_AB: gl.constexpr = gl.constexpr(
-    int(os.environ.get("AITER_TRITON_MOE_GLUON_CONST_AB", "0"))
-)
-
-#: EXPERIMENT ONLY -- drop the global->LDS copies while keeping their commit groups, so
-#: the wait/barrier structure is untouched and only the vmem traffic disappears. The
-#: LDS then holds garbage; this exists to price the global side.
-_NO_FILL: gl.constexpr = gl.constexpr(
-    int(os.environ.get("AITER_TRITON_MOE_GLUON_NO_FILL", "0"))
-)
-
-#: EXPERIMENT ONLY -- take the ``load_shared_relaxed`` path for every LDS read, which
-#: tags them ``syncedViaAsyncWait`` so the backend drops the ``lgkmcnt`` drain in front
-#: of each barrier. RACY for this pipeline: step k reads buffer (k+1)%NB and step k+1
-#: refills it, so the drain is exactly what closes that WAR window. Timing only.
-_RELAXED_LDS: gl.constexpr = gl.constexpr(
-    int(os.environ.get("AITER_TRITON_MOE_GLUON_RELAXED_LDS", "0"))
-)
-
-#: EXPERIMENT ONLY -- drop just the E8M0 scale copies, keeping the payload ones. The
-#: scale tile is 8 bytes per row at a K/32 = 224 B row stride, i.e. far below a cache
-#: line, so it is the prime suspect for the L2 request amplification.
-_NO_SCALE_FILL: gl.constexpr = gl.constexpr(
-    int(os.environ.get("AITER_TRITON_MOE_GLUON_NO_SCALE_FILL", "0"))
-)
-
 
 @gluon.jit
-def _ds_read(lds_ptr, layout: gl.constexpr, RELAXED: gl.constexpr = False):
-    """LDS -> register.
-
-    ``load_shared_relaxed`` tags the load ``ttg.amdg.syncedViaAsyncWait`` so the backend
-    skips the waits in front of it. That is only safe while nothing writes the buffer
-    back; this pipeline refills the buffer it has just consumed, so the default here is
-    the plain load and the relaxed form is opt-in.
-    """
-    if require_constexpr(RELAXED or _RELAXED_LDS):
-        out = gl.amd.cdna4.async_copy.load_shared_relaxed(lds_ptr, layout)
-    else:
-        out = lds_ptr.load(layout)
-    return out
+def _ds_read(lds_ptr, layout: gl.constexpr):
+    """LDS -> register after the pipeline's wait and barrier."""
+    return lds_ptr.load(layout)
 
 
 @gluon.jit
@@ -238,17 +189,14 @@ class LDSManager:
         mask is needed here and the store mask alone drops the padded rows.
         """
         cfg: gl.constexpr = self.tuning_cfg
-        if require_constexpr(not _NO_FILL):
-            _buffer_load_to_lds(
-                self.a_payload_lds_ptr.index(
-                    BUFFER_LOAD_IDX * cfg.num_lds_tiles(0) + mi
-                ),
-                a_hbm_ptr,
-                a_hbm_offs,
-                cfg.payload_via_lds(0),
-                cfg.token_mod,
-                SOFF,
-            )
+        _buffer_load_to_lds(
+            self.a_payload_lds_ptr.index(BUFFER_LOAD_IDX * cfg.num_lds_tiles(0) + mi),
+            a_hbm_ptr,
+            a_hbm_offs,
+            cfg.payload_via_lds(0),
+            cfg.token_mod,
+            SOFF,
+        )
 
     @gluon.jit
     def buffer_load_a_scale(
@@ -263,9 +211,7 @@ class LDSManager:
         cfg: gl.constexpr = self.tuning_cfg
         RA: gl.constexpr = cfg.scale_tile_ratio_a() if cfg.scale_shuffled(0) else 1
         if require_constexpr(
-            not _NO_FILL
-            and not _NO_SCALE_FILL
-            and self.func_cfg.has_scale(0)
+            self.func_cfg.has_scale(0)
             and cfg.scale_via_lds(0)
             # Only the first mini block of each scale tile issues the copy; the rest
             # read their slice out of it.
@@ -293,17 +239,14 @@ class LDSManager:
     ):
         """Issue the weight copy for mini-N block ``ni`` of a stage."""
         cfg: gl.constexpr = self.tuning_cfg
-        if require_constexpr(not _NO_FILL):
-            _buffer_load_to_lds(
-                self.b_payload_lds_ptr.index(
-                    BUFFER_LOAD_IDX * cfg.num_lds_tiles(1) + ni
-                ),
-                b_hbm_ptr,
-                b_hbm_offs,
-                cfg.payload_via_lds(1),
-                cfg.expert_mod,
-                SOFF,
-            )
+        _buffer_load_to_lds(
+            self.b_payload_lds_ptr.index(BUFFER_LOAD_IDX * cfg.num_lds_tiles(1) + ni),
+            b_hbm_ptr,
+            b_hbm_offs,
+            cfg.payload_via_lds(1),
+            cfg.expert_mod,
+            SOFF,
+        )
 
     @gluon.jit
     def buffer_load_b_scale(
@@ -316,12 +259,7 @@ class LDSManager:
     ):
         """Issue the weight-scale copy for mini-N block ``ni``, if it owns one."""
         cfg: gl.constexpr = self.tuning_cfg
-        if require_constexpr(
-            not _NO_FILL
-            and not _NO_SCALE_FILL
-            and self.func_cfg.has_scale(1)
-            and cfg.scale_via_lds(1)
-        ):
+        if require_constexpr(self.func_cfg.has_scale(1) and cfg.scale_via_lds(1)):
             _buffer_load_to_lds(
                 self.b_scale_lds_ptr.index(BUFFER_LOAD_IDX * cfg.num_lds_tiles(1) + ni),
                 b_scale_hbm_ptr,
@@ -340,20 +278,12 @@ class LDSManager:
         """
         cfg: gl.constexpr = self.tuning_cfg
         gl.static_assert(cfg.B_IN_REG and cfg.B_PRESHUFFLED)
-        if require_constexpr(_CONST_AB or _NO_FILL):
-            payload = gl.full(
-                cfg.lds_shape(1),
-                1,
-                self.func_cfg.operand_elem_ty(1),
-                layout=cfg.dot_operand_fragment_layout(1),
-            )
-        else:
-            payload = gl.amd.cdna4.buffer_load(
-                ptr=b_hbm_ptr,
-                offsets=b_hbm_offs,
-                cache=cfg.expert_mod,
-                soffset=SOFF,
-            )
+        payload = gl.amd.cdna4.buffer_load(
+            ptr=b_hbm_ptr,
+            offsets=b_hbm_offs,
+            cache=cfg.expert_mod,
+            soffset=SOFF,
+        )
         width: gl.constexpr = cfg.MINI_BLOCK_K // self.func_cfg.pack_divisor(1)
         fragments = ()
         for mini in gl.static_range(cfg.num_mini_k()):
@@ -387,22 +317,7 @@ class LDSManager:
         cache: gl.constexpr = (
             cfg.token_scale_mod if operand == 0 else cfg.expert_scale_mod
         )
-        if require_constexpr(_CONST_SCALE or _NO_FILL or _NO_SCALE_FILL):
-            if require_constexpr(cfg.scale_packed_k128(operand)):
-                scale = gl.full(
-                    cfg.packed_scale_shape(operand),
-                    0x7F7F7F7F,
-                    gl.int32,
-                    layout=cfg.packed_scale_frag_layout(operand),
-                )
-            else:
-                scale = gl.full(
-                    cfg.scale_shape(operand),
-                    127,
-                    gl.uint8,
-                    layout=cfg.dot_operand_scale_fragment_layout(operand),
-                )
-        elif require_constexpr(cfg.scale_packed_k128(operand)):
+        if require_constexpr(cfg.scale_packed_k128(operand)):
             # Both operands must expose the same logical scale factor to the
             # packed MFMA, even when only one of them bypasses LDS.
             scale = gl.amd.cdna4.buffer_load(
@@ -510,7 +425,6 @@ class LDSManager:
         mini_idx: gl.constexpr,
         a_scale_hbm_ptr,
         a_scale_hbm_offs,
-        RELAXED: gl.constexpr = False,
         READ_PAYLOAD: gl.constexpr = True,
         READ_SCALE: gl.constexpr = True,
         SCALE_READ_IDX=None,
@@ -527,13 +441,6 @@ class LDSManager:
             SCALE_READ_IDX = DS_READ_IDX
         if require_constexpr(not READ_PAYLOAD):
             a_val: gl.constexpr = None
-        elif require_constexpr(_CONST_AB):
-            a_val = gl.full(
-                cfg.lds_shape(0),
-                1,
-                self.func_cfg.operand_elem_ty(0),
-                layout=cfg.dot_operand_fragment_layout(0),
-            )
         else:
             a_val = _ds_read(
                 self._payload_slice(
@@ -546,17 +453,9 @@ class LDSManager:
                     self.func_cfg.pack_divisor(0),
                 ),
                 cfg.dot_operand_fragment_layout(0),
-                RELAXED,
             )
         if require_constexpr(READ_SCALE and self.func_cfg.has_scale(0)):
-            if require_constexpr(_CONST_SCALE):
-                a_scale_val = gl.full(
-                    cfg.scale_shape(0),
-                    127,
-                    gl.uint8,
-                    layout=cfg.dot_operand_scale_fragment_layout(0),
-                )
-            elif require_constexpr(
+            if require_constexpr(
                 cfg.scale_packed_ok(0)
                 and cfg.scale_via_lds(0)
                 and not (not cfg.FROZEN_STEP and cfg.num_mini_k() > 1)
@@ -570,7 +469,6 @@ class LDSManager:
                         cfg.packed_scale_read_layout(0),
                     ),
                     cfg.packed_scale_frag_layout(0),
-                    RELAXED,
                 )
             elif require_constexpr(cfg.scale_shuffled(0) and cfg.scale_via_lds(0)):
                 a_scale_val = _ds_read(
@@ -580,11 +478,8 @@ class LDSManager:
                         cfg.shuffled_scale_read_layout(0),
                     ),
                     cfg.dot_operand_scale_fragment_layout(0),
-                    RELAXED,
                 )
-                if require_constexpr(
-                    not cfg.FROZEN_STEP and cfg.num_mini_k() > 1
-                ):
+                if require_constexpr(not cfg.FROZEN_STEP and cfg.num_mini_k() > 1):
                     a_scale_val = gl.amd.slice(
                         a_scale_val,
                         [cfg.MINI_BLOCK_M, cfg.MINI_BLOCK_K // MX_GROUP],
@@ -600,7 +495,6 @@ class LDSManager:
                         mini_idx,
                     ),
                     cfg.dot_operand_scale_fragment_layout(0),
-                    RELAXED,
                 )
             else:
                 if require_constexpr(cfg.scale_shuffled(0)):
@@ -634,7 +528,6 @@ class LDSManager:
         mini_idx: gl.constexpr,
         b_scale_hbm_ptr,
         b_scale_hbm_offs,
-        RELAXED: gl.constexpr = False,
         READ_PAYLOAD: gl.constexpr = True,
         READ_SCALE: gl.constexpr = True,
         SCALE_READ_IDX=None,
@@ -644,13 +537,6 @@ class LDSManager:
             SCALE_READ_IDX = DS_READ_IDX
         if require_constexpr(not READ_PAYLOAD):
             b_val: gl.constexpr = None
-        elif require_constexpr(_CONST_AB):
-            b_val = gl.full(
-                cfg.lds_shape(1),
-                1,
-                self.func_cfg.operand_elem_ty(1),
-                layout=cfg.dot_operand_fragment_layout(1),
-            )
         else:
             b_val = _ds_read(
                 self._payload_slice(
@@ -663,17 +549,9 @@ class LDSManager:
                     self.func_cfg.pack_divisor(1),
                 ),
                 cfg.dot_operand_fragment_layout(1),
-                RELAXED,
             )
         if require_constexpr(READ_SCALE and self.func_cfg.has_scale(1)):
-            if require_constexpr(_CONST_SCALE):
-                b_scale_val = gl.full(
-                    cfg.scale_shape(1),
-                    127,
-                    gl.uint8,
-                    layout=cfg.dot_operand_scale_fragment_layout(1),
-                )
-            elif require_constexpr(
+            if require_constexpr(
                 cfg.scale_packed_ok(1)
                 and cfg.scale_via_lds(1)
                 and not (not cfg.FROZEN_STEP and cfg.num_mini_k() > 1)
@@ -687,7 +565,6 @@ class LDSManager:
                         cfg.packed_scale_read_layout(1),
                     ),
                     cfg.packed_scale_frag_layout(1),
-                    RELAXED,
                 )
             elif require_constexpr(cfg.scale_shuffled(1) and cfg.scale_via_lds(1)):
                 b_scale_val = _ds_read(
@@ -699,11 +576,8 @@ class LDSManager:
                         cfg.shuffled_scale_read_layout(1),
                     ),
                     cfg.dot_operand_scale_fragment_layout(1),
-                    RELAXED,
                 )
-                if require_constexpr(
-                    not cfg.FROZEN_STEP and cfg.num_mini_k() > 1
-                ):
+                if require_constexpr(not cfg.FROZEN_STEP and cfg.num_mini_k() > 1):
                     b_scale_val = gl.amd.slice(
                         b_scale_val,
                         [cfg.MINI_BLOCK_N, cfg.MINI_BLOCK_K // MX_GROUP],
@@ -719,7 +593,6 @@ class LDSManager:
                         mini_idx,
                     ),
                     cfg.dot_operand_scale_fragment_layout(1),
-                    RELAXED,
                 )
             else:
                 if require_constexpr(cfg.scale_shuffled(1)):

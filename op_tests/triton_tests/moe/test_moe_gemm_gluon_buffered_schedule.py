@@ -303,7 +303,6 @@ class _Machine:
         pointer,
         extra,
         *,
-        RELAXED,
         READ_PAYLOAD,
         READ_SCALE,
         SCALE_READ_IDX
