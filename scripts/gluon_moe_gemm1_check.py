@@ -82,7 +82,7 @@ WARPS = 4
 #:
 #: **The Gluon contract is the FROZEN step, not impl.** ``_pipeline_step_frozen`` holds
 #: the best measured schedule, and it is what must not regress while
-#: ``_buffered`` is being refactored. Frozen is NOT insulated from that work:
+#: ``_pipeline`` is being refactored. Frozen is NOT insulated from that work:
 #: it shares the epilogue, ``_ds_read_operand``, ``_maybe_block_dot``, the
 #: LDS helpers, the tuning config and the whole kernel body, so any change to those
 #: shows up here. Only the step itself is pinned.
@@ -188,7 +188,8 @@ def median_of_trace(target, tag, job):
     pat = KERNEL_PAT[target]
     for f in glob.glob(str(job / f"cold_{target}{tag}" / "**" / "*kernel_trace.csv"),
                        recursive=True):
-        rows = [r for r in csv.DictReader(open(f)) if pat in r["Kernel_Name"]]
+        with open(f) as stream:
+            rows = [r for r in csv.DictReader(stream) if pat in r["Kernel_Name"]]
         if not rows:
             continue
         st = next(k for k in rows[0] if "Start" in k)
@@ -493,11 +494,11 @@ def main():
         return 2
 
     print(f"gpu          {a.gpu}")
-    print(f"overrides    " + " ".join(f"{k.split('GLUON_')[-1].split('_LLC')[0]}={v}"
-                                      for k, v in GLUON_OVERRIDES.items()
-                                      if "LLC" not in k))
+    print("overrides    " + " ".join(f"{k.split('GLUON_')[-1].split('_LLC')[0]}={v}"
+                                     for k, v in GLUON_OVERRIDES.items()
+                                     if "LLC" not in k))
     print(f"llc flags    {LLC_FLAGS}")
-    print(f"protocol     cold, 768 MB flush, warmup 40, reps 100, median of last 100")
+    print("protocol     cold, 768 MB flush, warmup 40, reps 100, median of last 100")
     print()
 
     do_perf = a.perf or not a.correctness

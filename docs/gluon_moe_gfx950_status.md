@@ -49,7 +49,7 @@ measured HBM traffic (`TCC_MISS_sum * 128 B`), against ~8 TB/s of peak.
 
 | change | effect |
 |---|---|
-| `expert_scale_mod`: drop `.cg` from weight-scale loads | decode gemm1 130.0 -> 100.9 us; HBM 651 -> 517 MB; L2 hit 16% -> 33% |
+| `expert_scale_cache_modifier`: drop `.cg` from weight-scale loads | decode gemm1 130.0 -> 100.9 us; HBM 651 -> 517 MB; L2 hit 16% -> 33% |
 | `NUM_LDS_BUFFER` 3 -> 2 at `block_m=16` | decode gemm2 57.8 -> 51.2 us; LDS 120,720 -> 80,464 B (1 -> 2 CTA/CU) |
 | warp split derived from the tile instead of hardcoded | 424.6 -> 362.9 us at `BLOCK_M=128` stage 1 |
 | `_pick_warps` N-alignment guard | fixes a hang: an unaligned split made the `mini_n` walk never terminate |

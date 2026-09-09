@@ -8,6 +8,10 @@ import os
 import pytest
 import torch
 
+from aiter.ops.triton._gluon_kernels.gfx950.moe._frozen import (
+    _pipeline_peeled_frozen,
+    _validate_frozen_pipeline,
+)
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import DtypeQuant, WarpPipeline
 from aiter.ops.triton.moe import moe_op_gemm_gluon as host
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import moe_gemm_torch
@@ -105,14 +109,16 @@ def test_same_compiled_entry_honors_runtime_num_k(gated, depth, dtype, monkeypat
     assert case.route.block_m == config["BLOCK_M"]
     tc = host._probe_tuning_config(config, quant, quant)
     full_num_k = case.k // config["BLOCK_K"]
-    minimum = tc.min_num_k()
+    minimum = (
+        tc.pipeline_depth() + _pipeline_peeled_frozen(tc) + tc.pipeline_unroll()
+    )
     # Depth three exercises every specialized drain phase in the same binary.
     short_counts = (minimum + 1,) if depth == 2 else range(minimum, minimum + depth)
     references = {full_num_k: case.expected if gated else case.raw}
     for short_num_k in short_counts:
         short_k = short_num_k * config["BLOCK_K"]
         assert short_num_k < full_num_k
-        assert tc.validate_pipeline(short_k)
+        assert _validate_frozen_pipeline(tc, short_k)
         prefix = moe_gemm_torch(
             x_ref[:, :short_k].float(),
             w_ref[:, :short_k, :].float(),

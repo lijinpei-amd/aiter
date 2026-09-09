@@ -183,7 +183,11 @@ class LDSManager:
         mask is needed: the output store mask drops the padded rows.
         """
         cfg: gl.constexpr = self.tuning_cfg
-        cache: gl.constexpr = cfg.token_mod if operand == 0 else cfg.expert_mod
+        cache: gl.constexpr = (
+            cfg.token_cache_modifier
+            if operand == 0
+            else cfg.expert_cache_modifier
+        )
         if require_constexpr(VIA_LDS):
             if require_constexpr(operand == 0):
                 lds_ptr = self.a_payload_lds_ptr
@@ -240,7 +244,9 @@ class LDSManager:
         """
         cfg: gl.constexpr = self.tuning_cfg
         cache: gl.constexpr = (
-            cfg.token_scale_mod if operand == 0 else cfg.expert_scale_mod
+            cfg.token_scale_cache_modifier
+            if operand == 0
+            else cfg.expert_scale_cache_modifier
         )
         if require_constexpr(VIA_LDS):
             ratio: gl.constexpr = (

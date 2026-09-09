@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 from triton.experimental.gluon import language as gl
 
-from aiter.ops.triton._gluon_kernels.gfx950.moe import _buffered as buffered
+from aiter.ops.triton._gluon_kernels.gfx950.moe import _pipeline as buffered
 from aiter.ops.triton._gluon_kernels.gfx950.moe import moe_gemm as kernel
 from aiter.ops.triton._gluon_kernels.gfx950.moe._config import (
     KernelFuncConfig,
@@ -63,12 +63,12 @@ def _config(dtype=DtypeQuant.MXFP8, fused=True, **overrides):
         "TILE_SCHED": 0,
         "GROUP_M": 1,
         "NUM_XCDS": 8,
-        "token_mod": "",
-        "token_scale_mod": "",
-        "expert_mod": "",
-        "expert_scale_mod": "",
-        "result_mod": "",
-        "result_scale_mod": "",
+        "token_cache_modifier": "",
+        "token_scale_cache_modifier": "",
+        "expert_cache_modifier": "",
+        "expert_scale_cache_modifier": "",
+        "result_cache_modifier": "",
+        "result_scale_cache_modifier": "",
         "WARP_PIPELINE": 0,
         "VGPR_PREFETCH_K": 128,
         "A_SCALE_SORTED_SHUFFLED": True,
@@ -474,7 +474,12 @@ def test_pipeline_phases_and_packed_scale_addresses(
             B_SCALE_IN_REG=registers,
         )
     )
-    minimum = (tc.min_num_k() + 1) // 2 * 2
+    minimum_tiles = (
+        tc.pipeline_depth()
+        + buffered._pipeline_peeled(tc)
+        + tc.pipeline_unroll()
+    )
+    minimum = (minimum_tiles + 1) // 2 * 2
     effective_unroll = tc.pipeline_unroll()
     # Complete K256 scale words constrain NUM_K to even values. Visit the minimum,
     # every reachable remainder, and a longer strip with additional ring wraps.
@@ -485,4 +490,5 @@ def test_pipeline_phases_and_packed_scale_addresses(
     lengths.add(minimum + 2 * effective_unroll)
     for stages in sorted(lengths):
         assert tc.validate(4096, stages * 128)
+        assert buffered._validate_pipeline(tc, stages * 128)
         _run_scalar_pipeline(monkeypatch, tc, stages, fused)

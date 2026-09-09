@@ -16,9 +16,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from aiter.ops.triton._gluon_kernels.gfx950.moe import _buffered as pipeline
+from aiter.ops.triton._gluon_kernels.gfx950.moe import _pipeline as pipeline
 from aiter.ops.triton._gluon_kernels.gfx950.moe import moe_gemm as kernel
-from aiter.ops.triton._gluon_kernels.gfx950.moe._buffered_schedule import (
+from aiter.ops.triton._gluon_kernels.gfx950.moe._pipeline import (
     _pipeline_peeled,
     _wait,
 )
@@ -322,6 +322,7 @@ class _Machine:
 
 def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
     machine = _Machine(tc, num_k)
+    peeled = tc.pipeline_peeled()
     pc = SimpleNamespace(
         tuning_cfg=tc,
         func_cfg=tc,
@@ -383,6 +384,7 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         patch.setattr(pipeline, "_step", step)
         patch.setattr(pipeline, "_fill_slot", fill)
         patch.setattr(pipeline, "_init_buffers", init_buffers)
+        patch.setattr(pipeline, "_pipeline_peeled", lambda _: peeled)
         patch.setattr(pipeline, "_wait", machine.check_wait)
         patch.setattr(pipeline, "_maybe_block_dot", machine.dot)
         patch.setattr(

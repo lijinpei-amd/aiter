@@ -8,11 +8,24 @@ grouped GEMMs.
 from enum import IntEnum, IntFlag
 from typing import NamedTuple
 
-from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from ._lang import const as _c
-from ._lang import unwrap as _unwrap
+from ._lang import (
+    DotKind,
+    DtypeQuant,
+    EpilogueMode,
+    ScaleSwizzle,
+    SchedMode,
+    WaitCommitScheme,
+    WarpPipeline,
+    dq_has_scale,
+    dq_mx_format,
+    dq_pack_divisor,
+    dq_uses_mfma_scaled,
+)
+from ._lang import (
+    const as _c,
+)
 
 __all__ = [
     "ActKind",
@@ -41,45 +54,9 @@ __all__ = [
 ]
 
 
-class DtypeQuant(IntEnum):
-    """Tensor payload dtype together with its quantisation scheme."""
-
-    BF16 = 0  # bf16, no scale
-    FP8_E4M3 = 1  # fp8 e4m3, unit scales (folded into V_MFMA_*_F8F6F4)
-    MXFP4 = 2  # E2M1, 2 per byte packed along K, uint8 E8M0 group 32 along K
-    MXFP8 = 3  # E4M3, uint8 E8M0 group 32 along K
-
-
-class ScaleSwizzle(IntEnum):
-    NONE = 0
-    # TODO name what the swizzle does, not the arch
-    CDNA4_SCALE = 1  # utils/shuffle.py:_shuffle_scale_tile_gfx950 preshuffle
-    # csrc/kernels/mxfp4_moe/moe_aux/moe_sort_scales.cuh, run per call rather than
-    # offline: the token scales are gathered into routing order *and* permuted into the
-    # MFMA scale-fragment order, so a stage's scales are a contiguous slice instead of
-    # BLOCK_M rows of 8 bytes at a K/32 stride. Only meaningful for operand A, and only
-    # for the layout the shuffle was written against -- see
-    # KernelTuningConfig.sorted_shuffled_ok().
-    SORTED_SHUFFLED = 2
-
-
 class ActKind(IntEnum):
     SILU = 0  # alpha == 1.0
     SWIGLU_OAI = 1  # alpha != 1.0
-
-
-class EpilogueMode(IntEnum):
-    """Epilogue arithmetic, including shape-preserving benchmark ablations.
-
-    Both NOP modes keep the gated reduction (gate * up), output quantisation and
-    stores, so they preserve the output shape and traffic. NOP_ACTIVATION omits the
-    activation function; NOP also omits bias and gammas. Operand dequantisation,
-    including a per-tensor activation scale, still applies in every mode.
-    """
-
-    DEFAULT = 0
-    NOP_ACTIVATION = 1
-    NOP = 2
 
 
 class DSReadOperand(IntFlag):
@@ -97,82 +74,10 @@ class DSReadOperand(IntFlag):
     ALL = A | B | A_SCALE | B_SCALE
 
 
-class SchedMode(IntEnum):
-    """Backend scheduling hint for a K stage without compiler warp pipelining."""
-
-    NONE = 0
-    IGLP_0 = 1
-    IGLP_1 = 2
-    MFMA_16 = 3  # 4 x (16 MFMA, 6 LDS reads, 4 VMEM operations)
-    MFMA_8 = 4  # 8 x (8 MFMA, 3 LDS reads, 2 VMEM operations)
-
-
-class DotKind(IntEnum):
-    """Which CDNA4 matrix instruction an operand pair maps onto."""
-
-    MFMA = 0  # bf16 x bf16
-    MFMA_SCALED = 1  # any fp4/fp8 pair, incl. FP8 x FP8 with unit scales
-    UPCAST_MFMA = 2  # bf16 x microscaled: scaled_upcast, then plain mfma
-
-
 class TileSched(IntEnum):
     LINEAR = 0  # plain row-major (pid_m, pid_n), no swizzle
     GROUP_M = 1  # pid_grid GROUP_M blocking, for L2 reuse of the token tile
     XCD_GROUP_M = 2  # remap_xcd first, then GROUP_M blocking
-
-
-class WarpPipeline(IntEnum):
-    """Which inter-wave ping-pong the K-loop step is built for.
-
-    ``NONE`` and ``COMPILER`` use the live component-pipeline driver. The live step
-    places MFMA and memory work in regions selected by
-    ``_lang.pick_warp_pipeline_stage``; the separate frozen body retains the
-    reference's manual rendezvous sequence.
-
-    * ``NONE`` -- no borders. One wave group, the MFMAs and the memory work overlapped
-      only by the machine scheduler.
-    * ``COMPILER`` -- hand the ``mfma``/``mem`` halves to ``TritonAMDGPUWarpPipeline``,
-      which turns the interleave into a two-wave-group ping-pong. Needs
-      ``VGPR_PREFETCH_K == BLOCK_K`` (the slot's MFMAs must not read what the slot loads)
-      and only applies inside the ``tl.range`` body -- a border opened in the peeled step
-      or the drain would still be open when the loop starts, and the pass rejects a loop,
-      and every wait, caught inside a stage.
-    * ``MANUAL`` -- the hand-emitted rendezvous (``cond_barrier`` / ``setprio`` /
-      ``bare_barrier``) instead of the pass. Currently implemented only by
-      ``_pipeline_step_frozen``, so it needs ``FROZEN_STEP=1``; the live step asserts
-      rather than quietly running unpipelined.
-    """
-
-    NONE = 0
-    COMPILER = 1
-    MANUAL = 2
-
-
-class WaitCommitScheme(IntEnum):
-    """Commit granularity and wait placement for the live HBM-to-LDS pipeline.
-
-    * ``PER_OP`` commits each asynchronous copy separately and waits before each
-      slot's LDS reads. Payload and scale copies have separate groups; a shared
-      scale tile contributes only its owner's copy. Direct HBM payload and scale
-      loads into registers contribute no asynchronous group.
-    * ``PER_SLOT`` commits once after each slot, including slots with no copies,
-      and waits before each slot's LDS reads.
-    * ``PER_STAGE_WARP_PIPELINE`` commits once after the last memory region of
-      the K stage, before its final MFMA region.
-    * ``PER_STAGE_WHOLE`` commits once after the whole K stage, including MFMA.
-      Both per-stage modes wait once at the head of each stage that reads LDS.
-      Their commit locations also apply when the compiler warp pipeline is off.
-
-    The shared schedule derives group counts and read dependencies from the same
-    copy ownership used by the emitter. The frozen snapshot keeps its own pinned
-    commit and wait schedule.
-    """
-
-    PER_OP = 1
-    PER_SLOT = 2
-    # Preserve the whole-stage setting used by existing cold-bench recipes.
-    PER_STAGE_WHOLE = 3
-    PER_STAGE_WARP_PIPELINE = 4
 
 
 class FuncSpec(NamedTuple):
@@ -222,12 +127,12 @@ class TuningSpec(NamedTuple):
     TILE_SCHED: int
     GROUP_M: int
     NUM_XCDS: int
-    token_mod: str
-    token_scale_mod: str
-    expert_mod: str
-    expert_scale_mod: str
-    result_mod: str
-    result_scale_mod: str
+    token_cache_modifier: str
+    token_scale_cache_modifier: str
+    expert_cache_modifier: str
+    expert_scale_cache_modifier: str
+    result_cache_modifier: str
+    result_scale_cache_modifier: str
     #: :class:`WarpPipeline` -- which ping-pong the K-loop step is built for. Was a
     #: bool; ``True``/``1`` is still ``COMPILER``, so old configs keep their meaning.
     WARP_PIPELINE: int
@@ -249,8 +154,10 @@ class TuningSpec(NamedTuple):
     #: :class:`WaitCommitScheme` -- how coarsely the global->LDS copies are committed,
     #: and hence how many groups a ``wait_group`` count has to walk past.
     WAIT_COMMIT_SCHEME: int = int(WaitCommitScheme.PER_OP)
-    #: :class:`DSReadOperand` mask; each payload and scale may move independently.
-    DS_READ_IN_MFMA: int = int(DSReadOperand.NONE)
+    DS_READ_A_PAYLOAD_IN_MFMA: bool = False
+    DS_READ_A_SCALE_IN_MFMA: bool = False
+    DS_READ_B_PAYLOAD_IN_MFMA: bool = False
+    DS_READ_B_SCALE_IN_MFMA: bool = False
     SCHED_MODE: int = int(SchedMode.NONE)
     #: Dispatch to the preserved reference body in ``_frozen.py``.
     FROZEN_STEP: bool = False
@@ -282,39 +189,6 @@ class ActivationSpec(NamedTuple):
     alpha: float  # 1.0 (GLM, DSv4) | 1.702 (M3)
     limit: float | None  # None (GLM) | 10.0 (DSv4) | 7.0 (M3)
     add_residual: bool  # False | False | True
-
-
-@gluon.constexpr_function
-def dq_has_scale(dq):
-    return _unwrap(dq) in (int(DtypeQuant.MXFP4), int(DtypeQuant.MXFP8))
-
-
-@gluon.constexpr_function
-def dq_pack_divisor(dq):
-    """Logical elements per stored container along K."""
-    return 2 if _unwrap(dq) == int(DtypeQuant.MXFP4) else 1
-
-
-@gluon.constexpr_function
-def dq_mx_format(dq):
-    """The ``a_format`` / ``b_format`` string ``mfma_scaled`` wants."""
-    dq = _unwrap(dq)
-    if dq == int(DtypeQuant.MXFP4):
-        return "e2m1"
-    if dq in (int(DtypeQuant.MXFP8), int(DtypeQuant.FP8_E4M3)):
-        return "e4m3"
-    return None
-
-
-@gluon.constexpr_function
-def dq_uses_mfma_scaled(dq_a, dq_b):
-    """FP8 x FP8 must still go through ``mfma_scaled`` with ``a_scale=b_scale=None``:
-    only that path reaches the double-rate K=64/128 ``V_MFMA_*_F8F6F4`` pipes; plain
-    ``mfma`` selects the CDNA3-class K=16/32. Only bf16 x bf16 uses plain ``mfma``.
-    """
-    return not (
-        _unwrap(dq_a) == int(DtypeQuant.BF16) and _unwrap(dq_b) == int(DtypeQuant.BF16)
-    )
 
 
 class NonQuantTokenTensor(NamedTuple):

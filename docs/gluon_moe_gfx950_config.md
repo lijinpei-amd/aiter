@@ -15,9 +15,9 @@ argument. Shape and layout calculations may still use constexpr `K`; the K-loop
 bounds derive from the runtime scalar. The A-scale row stride is constexpr so
 raw rows retain their 4- or 8-byte alignment when they are not 16-byte aligned.
 The host caches the two specs and
-dimensions as four constexpr arguments. `_buffered.py` implements the live driver for
-shared and independent component depths, and `_buffered_schedule.py` computes
-the compile-time issue history and waits. `_frozen.py` owns the preserved LDS,
+dimensions as four constexpr arguments. `_pipeline.py` implements the live driver for
+shared and independent component depths together with its compile-time issue history
+and waits. `_frozen.py` owns the preserved LDS,
 dot, pipeline-state, loop, drain, and final-MFMA path.
 `_offsets.py` computes A/B HBM offsets and mini-tile
 indices, and `_epilogue.py` owns output activation, quantization, staging, and
@@ -33,7 +33,7 @@ mismatch before preparing scales or launching the GEMM.
 
 | Field | Values and meaning |
 | --- | --- |
-| `DS_READ_IN_MFMA` | `DSReadOperand` bitmask: `A=1`, `B=2`, `A_SCALE=4`, `B_SCALE=8`. Set bits place the corresponding read in the MFMA region; unset bits place it in the memory region. `ALL=15`. |
+| `DS_READ_A_PAYLOAD_IN_MFMA`, `DS_READ_A_SCALE_IN_MFMA`, `DS_READ_B_PAYLOAD_IN_MFMA`, `DS_READ_B_SCALE_IN_MFMA` | Independent booleans selecting whether each component read belongs to the MFMA region rather than the memory region. Components loaded directly into registers follow the same placement. |
 | `SCHED_MODE` | `SchedMode.NONE`, `IGLP_0`, `IGLP_1`, `MFMA_16`, or `MFMA_8`. Hints apply outside compiler warp-pipeline regions. |
 | `FROZEN_STEP` | Select the preserved reference body in `_frozen.py`, with an unfused final MFMA. Its existing restrictions on component overrides, register flags and packed K128 scales remain. |
 | `SOFF_UNROLL` | Advance HBM pointers once per unrolled body and use scalar offsets within it. With packed K128 scales and odd unroll, use per-fill pointer advances so scale-word phases remain correct. |
@@ -69,15 +69,16 @@ NUM_K >= NB_MAX + PEELED + UNROLL
 This guarantees at least one complete runtime unrolled body. Equal depths need
 only the first peel, giving `NUM_K >= NB_MAX + UNROLL + 1`. `K % BLOCK_K == 0`
 and all layout-specific divisibility rules still apply, including complete K256
-words for packed K128 scales. `KernelTuningConfig.min_num_k()` exposes the
-threshold and `validate_pipeline(K)` applies the resolved-depth and K checks.
+words for packed K128 scales. The selected live or frozen pipeline validator
+applies the resolved-depth and K checks beside `KernelTuningConfig.validate`.
 The launcher checks depths and K divisibility before preparation, then validates
 the complete effective configuration before launch. The final check matters
 when scale preparation succeeds or falls back: moving scales between LDS and
 registers can change `UNROLL`, `PEELED`, and the minimum accepted K.
 
-All seven new fields also accept the `AITER_TRITON_MOE_GLUON_` environment prefix
-used by the benchmark scripts. A config dictionary with `B_PRESHUFFLED=True`
+The component storage, buffer-depth, and read-placement fields also accept the
+`AITER_TRITON_MOE_GLUON_` environment prefix used by the benchmark scripts. A
+config dictionary with `B_PRESHUFFLED=True`
 means the caller supplied weights in the existing 16-column-blocked order;
 `AITER_TRITON_MOE_GLUON_B_PRESHUFFLED=1` instead requests host preparation of raw
 weights. `B_IN_REG` without preshuffled weights raises an error.
@@ -102,29 +103,26 @@ components loaded directly into registers follow the same region selection.
 For example, after obtaining a normal supported tuning dictionary:
 
 ```python
-from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
-    DSReadOperand,
-    EpilogueMode,
-    SchedMode,
-)
+from aiter.ops.triton._gluon_kernels.gfx950.moe._types import EpilogueMode, SchedMode
 
 tuning = dict(tuning)
 tuning.update(
-    DS_READ_IN_MFMA=int(DSReadOperand.A | DSReadOperand.B_SCALE),
+    DS_READ_A_PAYLOAD_IN_MFMA=True,
+    DS_READ_B_SCALE_IN_MFMA=True,
     SCHED_MODE=int(SchedMode.NONE),
 )
 # Pass config=tuning and epilogue=EpilogueMode.DEFAULT to moe_gemm_gluon.
 ```
 
-The legacy `DS_IN_MFMA=1` maps to mask 15. `DS_MOVE=1` maps to mask 5;
-`DS_MOVE>=2` maps to mask 15. An explicit
-`AITER_TRITON_MOE_GLUON_DS_READ_IN_MFMA` takes precedence over both.
+The legacy `DS_IN_MFMA=1` maps all four fields to `True`. `DS_MOVE=1` maps the
+A payload and A scale fields to `True`; `DS_MOVE>=2` maps all four. An explicit
+legacy `AITER_TRITON_MOE_GLUON_DS_READ_IN_MFMA` mask takes precedence over both.
 
 `MANUAL_PP` has been removed from the tuning configuration; its legacy environment
-variable and dictionary key are ignored. The new storage and buffer fields are
-trailing optional fields of `TuningSpec`, so older positional constructions keep
-their meaning. `B_PRESHUFFLED` selects the permuted weight layout for either LDS
-staging or `B_IN_REG` loads.
+variable and dictionary key are ignored. Configuration dictionaries using the old
+cache-modifier names or `DS_READ_IN_MFMA` are translated to the new fields.
+`B_PRESHUFFLED` selects the permuted weight layout for either LDS staging or
+`B_IN_REG` loads.
 
 ## Tuned register/buffer recipes
 
@@ -154,7 +152,7 @@ records the separate T4096/N4096 benchmark near 615 us. The transferred recipes
 regress on that workload; preshuffling B with the original LDS pipeline improves
 its measured latency. The results above apply to the smaller FP32-output workload.
 
-The winning B-register recipes use `expert_mod=".cg"` and effective buffer counts
+The winning B-register recipes use `expert_cache_modifier=".cg"` and effective buffer counts
 `(4,2,3,3)` for MXFP4 and `(3,3,3,3)` for MXFP8/BF16. The measurements used the
 former GCD policy, with unrolls 1, 3, and 3. Replaying these dictionaries now
 applies the register-ring LCM policy above and requires new performance

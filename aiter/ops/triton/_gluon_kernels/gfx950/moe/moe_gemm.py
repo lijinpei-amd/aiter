@@ -517,6 +517,7 @@ def _moe_gemm_body(
     NUM_K,
 ):
     gl.static_assert(tuning_cfg.validate(N, K))
+    gl.static_assert(_validate_pipeline(tuning_cfg, K))
 
     BK: gl.constexpr = tuning_cfg.BLOCK_K
     PK_A: gl.constexpr = BK // func_cfg.a_pack_divisor()
@@ -708,4 +709,9 @@ def _moe_gemm_body(
 
 # Imported last: the live driver calls shared helpers from this module. JIT functions
 # resolve these names at compile time, after both modules have loaded.
-from ._buffered import _drain_buffered_pipeline, _last_mfma, _run_buffered_pipeline
+from ._pipeline import (
+    _drain_buffered_pipeline,
+    _last_mfma,
+    _run_buffered_pipeline,
+    _validate_pipeline,
+)

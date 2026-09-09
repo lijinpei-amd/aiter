@@ -38,13 +38,13 @@ depths' LCM; absent scales and LDS rings do not participate. Resolved active
 depths must be at least two. See the [configuration contract](../../docs/gluon_moe_gfx950_config.md)
 for the exact minimum K and current scheduling rules.
 
-| Dtype | BLOCK_K | MFMA | Warps | Buffer counts | Measured unroll | WARP_PIPELINE | WAIT_COMMIT_SCHEME | DS_READ_IN_MFMA |
-| --- | ---: | --- | --- | --- | ---: | ---: | ---: | ---: |
-| MXFP4 | 256 | 16,16,128 | 1,4 | 4,2,3,3 | 1 | 0 | 3 | 0 |
-| MXFP8 | 128 | 16,16,128 | 1,4 | 3,3,3,3 | 3 | 1 | 3 | 0 |
-| BF16 | 64 | 16,16,32 | 1,4 | 3,3,3,3 | 3 | 1 | 3 | 1 |
+| Dtype | BLOCK_K | MFMA | Warps | Buffer counts | Measured unroll | WARP_PIPELINE | WAIT_COMMIT_SCHEME | DS reads in MFMA |
+| --- | ---: | --- | --- | --- | ---: | ---: | ---: | --- |
+| MXFP4 | 256 | 16,16,128 | 1,4 | 4,2,3,3 | 1 | 0 | 3 | none |
+| MXFP8 | 128 | 16,16,128 | 1,4 | 3,3,3,3 | 3 | 1 | 3 | none |
+| BF16 | 64 | 16,16,32 | 1,4 | 3,3,3,3 | 3 | 1 | 3 | A payload |
 
-All three use `expert_mod=".cg"`, BLOCK_M=128, BLOCK_N=256,
+All three use `expert_cache_modifier=".cg"`, BLOCK_M=128, BLOCK_N=256,
 MINI_BLOCK_M=64, MINI_BLOCK_N=128, and full-stage K prefetching. The complete
 JSON dictionaries also pin scale layout, instruction tiling, and other controls.
 
