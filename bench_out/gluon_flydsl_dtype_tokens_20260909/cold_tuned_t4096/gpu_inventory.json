@@ -1,0 +1,74 @@
+{
+  "0": {
+    "gpu": 0,
+    "bdf": "0000:06:00.0",
+    "uuid": "690075a0-0000-1000-8034-9cd99066212e",
+    "kfd_id": 27295,
+    "node_id": 3,
+    "partition_id": 0,
+    "hip_ordinal": 1
+  },
+  "1": {
+    "gpu": 1,
+    "bdf": "0000:16:00.0",
+    "uuid": "ab0075a0-0000-1000-808d-b57ee2031b32",
+    "kfd_id": 42642,
+    "node_id": 5,
+    "partition_id": 0,
+    "hip_ordinal": 3
+  },
+  "2": {
+    "gpu": 2,
+    "bdf": "0000:66:00.0",
+    "uuid": "e10075a0-0000-1000-8073-b188ded2b182",
+    "kfd_id": 17079,
+    "node_id": 4,
+    "partition_id": 0,
+    "hip_ordinal": 2
+  },
+  "3": {
+    "gpu": 3,
+    "bdf": "0000:76:00.0",
+    "uuid": "7e0075a0-0000-1000-804e-9e67c301dda1",
+    "kfd_id": 36538,
+    "node_id": 2,
+    "partition_id": 0,
+    "hip_ordinal": 0
+  },
+  "4": {
+    "gpu": 4,
+    "bdf": "0000:86:00.0",
+    "uuid": "170075a0-0000-1000-80d5-3df13e2c9fe7",
+    "kfd_id": 51966,
+    "node_id": 7,
+    "partition_id": 0,
+    "hip_ordinal": 5
+  },
+  "5": {
+    "gpu": 5,
+    "bdf": "0000:96:00.0",
+    "uuid": "d90075a0-0000-1000-80f1-c568fe678897",
+    "kfd_id": 1779,
+    "node_id": 9,
+    "partition_id": 0,
+    "hip_ordinal": 7
+  },
+  "6": {
+    "gpu": 6,
+    "bdf": "0000:e6:00.0",
+    "uuid": "850075a0-0000-1000-809f-4d3b540fb039",
+    "kfd_id": 58070,
+    "node_id": 8,
+    "partition_id": 0,
+    "hip_ordinal": 6
+  },
+  "7": {
+    "gpu": 7,
+    "bdf": "0000:f6:00.0",
+    "uuid": "1c0075a0-0000-1000-803e-3acfc6c10917",
+    "kfd_id": 11995,
+    "node_id": 6,
+    "partition_id": 0,
+    "hip_ordinal": 4
+  }
+}

@@ -1,0 +1,372 @@
+{
+  "case": "gluon_a8w8",
+  "case_spec": {
+    "backend": "gluon",
+    "precision": "a8w8",
+    "output": "bfloat16",
+    "tuning": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 256,
+      "BLOCK_K": 128,
+      "K_UNROLL": 6,
+      "MINI_BLOCK_K": 128,
+      "MINI_BLOCK_M": 64,
+      "MINI_BLOCK_N": 128,
+      "NUM_LDS_BUFFER": 3,
+      "mfma_instr_shape": [
+        16,
+        16,
+        128
+      ],
+      "warps_per_cta": [
+        1,
+        4
+      ],
+      "tiles_per_warp": [
+        2,
+        2
+      ],
+      "k_width": null,
+      "transposed": true,
+      "WAVES_PER_EU": 1,
+      "TILE_SCHED": 2,
+      "GROUP_M": 4,
+      "NUM_XCDS": 8,
+      "token_mod": "",
+      "token_scale_mod": "",
+      "expert_mod": "",
+      "expert_scale_mod": "",
+      "result_mod": "",
+      "result_scale_mod": "",
+      "WARP_PIPELINE": 0,
+      "VGPR_PREFETCH_K": 128,
+      "A_SCALE_SORTED_SHUFFLED": true,
+      "B_SCALE_SHUFFLED": true,
+      "B_PRESHUFFLED": false,
+      "ACT_FAST_RCP": false,
+      "WAIT_COMMIT_SCHEME": 3,
+      "DS_READ_IN_MFMA": 0,
+      "SCHED_MODE": 0,
+      "FROZEN_STEP": false,
+      "SOFF_UNROLL": false,
+      "SCALE_FILL_MID": false
+    },
+    "env": {
+      "TRITON_MEMBAR_DEDUP_BARE": "1"
+    },
+    "reference_configuration": "flydsl_a8_tuning_20260907/final_harness gluon_packed",
+    "description": "Token-aware MXFP8 Gluon: BM32/BM64/BM128",
+    "config_origin": {
+      "path": "bench_out/gluon_flydsl_serial_20260907_Fxq0r9/cases.json",
+      "case": "gluon_a8w8"
+    }
+  },
+  "source": "/raid/jinpli/workspace/home01/jinpli/development/aiter",
+  "shape": {
+    "T": 4096,
+    "N": 4096,
+    "K": 7168,
+    "E": 33,
+    "topk": 8,
+    "block_m": 128
+  },
+  "precision": "a8w8",
+  "backend": "gluon",
+  "mode": "cold",
+  "pass": true,
+  "device": {
+    "name": "AMD Instinct MI350X",
+    "arch": "gfx950:sramecc+:xnack-",
+    "physical_gpu": "4",
+    "hip_visible_devices": "5",
+    "pci_bus_id": "0000:86:00.0"
+  },
+  "versions": {
+    "python": "3.14.4 (main, Jun 18 2026, 14:25:02) [GCC 15.2.0]",
+    "torch": "2.15.0.dev20260816+rocm7.14",
+    "hip": "7.14.60850",
+    "triton": "3.8.0"
+  },
+  "setup_excluded_from_timing": [
+    "routing",
+    "input quantization",
+    "A-scale sorting",
+    "weight and scale shuffle/preshuffle",
+    "output allocation",
+    "JIT compilation",
+    "launch argument preparation"
+  ],
+  "inputs": {
+    "shape": {
+      "T": 4096,
+      "N": 4096,
+      "K": 7168,
+      "E": 33,
+      "topk": 8
+    },
+    "precision": "a8w8",
+    "seed": 123,
+    "topk_sha256": "607c2571063ed7df745431e9921f5edf46e2f5a2c6e120973f38bd725d70e92c",
+    "histogram": [
+      993,
+      992,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993,
+      993
+    ],
+    "gather_sha256": "04e47f07f9ab9da2231f8bffee749b10a0885d3a1936e4248a282eefea80d142",
+    "x_sha256": "4d96448c92fa4ed7faf3483aa40b52920fbc5c4b72ffc64a3e51810e35282994",
+    "x_scales_sha256": "ef9c04bf32e3288e0ea9a95d751293355edb75c9a5d826f87eb1391e047bddd5",
+    "w_scales_sha256": "ff8d1120eaf752b44ff951b6960bba6467f87a945b246f8fdf4bc71f1c9062d3",
+    "weight_first_last_65536_elements_sha256": "3b4470a2cffab80559da6673b506d75ac7932ece00625e47123a9ca3fc290e24",
+    "useful_m_blocks": 264,
+    "gluon_grid_m": 288,
+    "weight_layout": "logical E,N,K; gate then up",
+    "activation": "silu(gate) * up",
+    "output_dtype": "bfloat16",
+    "bias": false,
+    "gammas": false,
+    "full_weight_payload_sha256": "969e12018e3080d2fbddbf64486930ea52029fe9cd67e2dfe1b3e709a164af62"
+  },
+  "routing_metadata": {
+    "block_m": 128,
+    "useful_m_blocks": 264,
+    "gluon_grid_m": 288,
+    "useful_rows": 32768,
+    "padded_rows": 33792,
+    "allocated_rows": 36864
+  },
+  "kernel": {
+    "config": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 256,
+      "BLOCK_K": 128,
+      "K_UNROLL": 6,
+      "MINI_BLOCK_K": 128,
+      "MINI_BLOCK_M": 64,
+      "MINI_BLOCK_N": 128,
+      "NUM_LDS_BUFFER": 3,
+      "mfma_instr_shape": [
+        16,
+        16,
+        128
+      ],
+      "warps_per_cta": [
+        1,
+        4
+      ],
+      "tiles_per_warp": [
+        2,
+        2
+      ],
+      "k_width": null,
+      "transposed": true,
+      "WAVES_PER_EU": 1,
+      "TILE_SCHED": 2,
+      "GROUP_M": 4,
+      "NUM_XCDS": 8,
+      "token_mod": "",
+      "token_scale_mod": "",
+      "expert_mod": "",
+      "expert_scale_mod": "",
+      "result_mod": "",
+      "result_scale_mod": "",
+      "WARP_PIPELINE": 0,
+      "VGPR_PREFETCH_K": 128,
+      "A_SCALE_SORTED_SHUFFLED": true,
+      "B_SCALE_SHUFFLED": true,
+      "B_PRESHUFFLED": false,
+      "ACT_FAST_RCP": false,
+      "WAIT_COMMIT_SCHEME": 3,
+      "DS_READ_IN_MFMA": 0,
+      "SCHED_MODE": 0,
+      "FROZEN_STEP": false,
+      "SOFF_UNROLL": false,
+      "SCALE_FILL_MID": false
+    },
+    "kernel": "_moe_gluon_gemm1",
+    "effective_tuning": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 256,
+      "BLOCK_K": 128,
+      "K_UNROLL": 6,
+      "MINI_BLOCK_K": 128,
+      "MINI_BLOCK_M": 64,
+      "MINI_BLOCK_N": 128,
+      "NUM_LDS_BUFFER": 3,
+      "mfma_instr_shape": [
+        16,
+        16,
+        128
+      ],
+      "warps_per_cta": [
+        1,
+        4
+      ],
+      "tiles_per_warp": [
+        2,
+        2
+      ],
+      "k_width": null,
+      "transposed": true,
+      "WAVES_PER_EU": 1,
+      "TILE_SCHED": 2,
+      "GROUP_M": 4,
+      "NUM_XCDS": 8,
+      "token_mod": "",
+      "token_scale_mod": "",
+      "expert_mod": "",
+      "expert_scale_mod": "",
+      "result_mod": "",
+      "result_scale_mod": "",
+      "WARP_PIPELINE": 0,
+      "VGPR_PREFETCH_K": 128,
+      "A_SCALE_SORTED_SHUFFLED": true,
+      "B_SCALE_SHUFFLED": true,
+      "B_PRESHUFFLED": false,
+      "ACT_FAST_RCP": false,
+      "WAIT_COMMIT_SCHEME": 3,
+      "DS_READ_IN_MFMA": 0,
+      "SCHED_MODE": 0,
+      "FROZEN_STEP": false,
+      "SOFF_UNROLL": false,
+      "SCALE_FILL_MID": false,
+      "B_IN_REG": false,
+      "B_SCALE_IN_REG": false,
+      "A_SCALE_IN_REG": false,
+      "A_NUM_BUFFER": 0,
+      "B_NUM_BUFFER": 0,
+      "A_SCALE_NUM_BUFFER": 0,
+      "B_SCALE_NUM_BUFFER": 0
+    },
+    "func_spec": {
+      "token_dtype_quant": 3,
+      "expert_dtype_quant": 3,
+      "token_online_quant": 3,
+      "expert_online_quant": 3,
+      "mma_acc_dtype": "fp32",
+      "activation": [
+        0,
+        1.0,
+        null,
+        false
+      ],
+      "output_quant": null,
+      "has_bias": false,
+      "has_gammas": false,
+      "has_gather": true,
+      "has_x_static_scale": false,
+      "gate_up_split": true,
+      "epilogue": 0
+    },
+    "launch_metadata": {
+      "allow_flush_denorm": false,
+      "allowed_dot_input_precisions": [
+        "ieee",
+        "bf16x3",
+        "bf16x6"
+      ],
+      "arch": "gfx950",
+      "backend_name": "hip",
+      "debug": false,
+      "default_dot_input_precision": "ieee",
+      "deprecated_fp8_dot_operand_dtypes": [
+        "fp8e4b8",
+        "fp8e5b16"
+      ],
+      "enable_fp_fusion": true,
+      "extern_libs": [
+        [
+          "ocml",
+          "/raid/jinpli/workspace/home01/jinpli/development/triton/python/triton/backends/amd/lib/ocml.bc"
+        ],
+        [
+          "ockl",
+          "/raid/jinpli/workspace/home01/jinpli/development/triton/python/triton/backends/amd/lib/ockl.bc"
+        ]
+      ],
+      "fpsan_homomorphic_casts": false,
+      "global_scratch_align": 1,
+      "global_scratch_size": 0,
+      "hash": "94844b9cee7288b92d28f8a36bf39267676ebfa4a66936e70e43034302d7e726",
+      "instrumentation_mode": "",
+      "kpack": 1,
+      "launch_cooperative_grid": false,
+      "llvm_fn_attrs": [],
+      "matrix_instr_nonkdim": 0,
+      "max_num_imprecise_acc_default": 0,
+      "name": "_moe_gluon_gemm1",
+      "num_ctas": 1,
+      "num_stages": 2,
+      "num_warps": 4,
+      "profile_scratch_align": 1,
+      "profile_scratch_size": 0,
+      "sanitize_overflow": true,
+      "schedule_hint": "",
+      "shared": 161216,
+      "supported_fp8_dtypes": [
+        "fp8e4b8",
+        "fp8e4nv",
+        "fp8e5",
+        "fp8e5b16"
+      ],
+      "target": "GPUTarget(backend='hip', arch='gfx950', warp_size=64)",
+      "tensordesc_meta": [],
+      "triton_version": "3.8.0",
+      "warp_size": 64,
+      "waves_per_eu": 1
+    },
+    "binary_sha256": "98cbd1b5df4ec4a5bc02a9f126f946bc0a2827fb047e27b778c7c3cc82e930e4",
+    "text_sha256": "bf495af01dd3550c53ad3483fc55cb48752c3267abbe9521baa9abfb4f096ca8",
+    "text_bytes": 29760,
+    "saved_executable": "/raid/jinpli/workspace/home01/jinpli/development/aiter/bench_out/gluon_flydsl_dtype_tokens_20260909/cold_tuned_t4096/r01_gluon_a8w8_t4096/gluon_artifact/kernel.hsaco",
+    "output_layout": "dense expert-sorted rows",
+    "output_quantization_policy": null,
+    "scale_sort_timing": "setup only; prepared launch arguments captured",
+    "prepared_gemm_dispatches_per_call": 1,
+    "grid_m": 288
+  },
+  "kernel_pattern": "_moe_gluon_gemm1",
+  "timing_protocol": {
+    "warmup": 40,
+    "samples": 100,
+    "flush_MiB": 768,
+    "sequence": "flush -> one prepared GEMM1",
+    "scale_sort_timing": "setup only",
+    "timing": "rocprofv3 kernel trace"
+  },
+  "output_hashes": {
+    "components": {
+      "output": "3a006f6356bca0206a3976a2c0f6da8b106dbe419a5f3cc55ba7f6c6a080159a"
+    },
+    "combined_sha256": "3a006f6356bca0206a3976a2c0f6da8b106dbe419a5f3cc55ba7f6c6a080159a"
+  }
+}

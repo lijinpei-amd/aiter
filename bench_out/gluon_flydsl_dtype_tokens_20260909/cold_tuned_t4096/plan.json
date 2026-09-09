@@ -1,0 +1,849 @@
+{
+  "runs": [
+    {
+      "round": 1,
+      "tokens": 4096,
+      "case": "gluon_a4w4"
+    },
+    {
+      "round": 1,
+      "tokens": 4096,
+      "case": "flydsl_a4w4"
+    },
+    {
+      "round": 1,
+      "tokens": 4096,
+      "case": "gluon_a8w4"
+    },
+    {
+      "round": 1,
+      "tokens": 4096,
+      "case": "flydsl_a8w4"
+    },
+    {
+      "round": 1,
+      "tokens": 4096,
+      "case": "gluon_a8w8"
+    },
+    {
+      "round": 1,
+      "tokens": 4096,
+      "case": "flydsl_a8w8"
+    },
+    {
+      "round": 1,
+      "tokens": 4096,
+      "case": "gluon_a16w16"
+    },
+    {
+      "round": 1,
+      "tokens": 4096,
+      "case": "flydsl_a16w16"
+    },
+    {
+      "round": 2,
+      "tokens": 4096,
+      "case": "flydsl_a16w16"
+    },
+    {
+      "round": 2,
+      "tokens": 4096,
+      "case": "gluon_a16w16"
+    },
+    {
+      "round": 2,
+      "tokens": 4096,
+      "case": "flydsl_a8w8"
+    },
+    {
+      "round": 2,
+      "tokens": 4096,
+      "case": "gluon_a8w8"
+    },
+    {
+      "round": 2,
+      "tokens": 4096,
+      "case": "flydsl_a8w4"
+    },
+    {
+      "round": 2,
+      "tokens": 4096,
+      "case": "gluon_a8w4"
+    },
+    {
+      "round": 2,
+      "tokens": 4096,
+      "case": "flydsl_a4w4"
+    },
+    {
+      "round": 2,
+      "tokens": 4096,
+      "case": "gluon_a4w4"
+    },
+    {
+      "round": 3,
+      "tokens": 4096,
+      "case": "gluon_a4w4"
+    },
+    {
+      "round": 3,
+      "tokens": 4096,
+      "case": "flydsl_a4w4"
+    },
+    {
+      "round": 3,
+      "tokens": 4096,
+      "case": "gluon_a8w4"
+    },
+    {
+      "round": 3,
+      "tokens": 4096,
+      "case": "flydsl_a8w4"
+    },
+    {
+      "round": 3,
+      "tokens": 4096,
+      "case": "gluon_a8w8"
+    },
+    {
+      "round": 3,
+      "tokens": 4096,
+      "case": "flydsl_a8w8"
+    },
+    {
+      "round": 3,
+      "tokens": 4096,
+      "case": "gluon_a16w16"
+    },
+    {
+      "round": 3,
+      "tokens": 4096,
+      "case": "flydsl_a16w16"
+    },
+    {
+      "round": 4,
+      "tokens": 4096,
+      "case": "flydsl_a16w16"
+    },
+    {
+      "round": 4,
+      "tokens": 4096,
+      "case": "gluon_a16w16"
+    },
+    {
+      "round": 4,
+      "tokens": 4096,
+      "case": "flydsl_a8w8"
+    },
+    {
+      "round": 4,
+      "tokens": 4096,
+      "case": "gluon_a8w8"
+    },
+    {
+      "round": 4,
+      "tokens": 4096,
+      "case": "flydsl_a8w4"
+    },
+    {
+      "round": 4,
+      "tokens": 4096,
+      "case": "gluon_a8w4"
+    },
+    {
+      "round": 4,
+      "tokens": 4096,
+      "case": "flydsl_a4w4"
+    },
+    {
+      "round": 4,
+      "tokens": 4096,
+      "case": "gluon_a4w4"
+    }
+  ],
+  "mode": "cold",
+  "rounds": 4,
+  "warmups": 40,
+  "samples": 100,
+  "validation_replays": 16,
+  "validation_label": "validation_tuned_t4096",
+  "flush_MiB": 768,
+  "preparation": "setup only; one captured GEMM launch after each flush",
+  "gpu": 4,
+  "cases": {
+    "gluon_a4w4": {
+      "backend": "gluon",
+      "precision": "a4w4",
+      "output": "mxfp4",
+      "output_quantization_policy": "even",
+      "tuning": {
+        "BLOCK_M": 64,
+        "BLOCK_N": 256,
+        "BLOCK_K": 256,
+        "K_UNROLL": 3,
+        "MINI_BLOCK_K": 256,
+        "MINI_BLOCK_M": 32,
+        "MINI_BLOCK_N": 128,
+        "NUM_LDS_BUFFER": 3,
+        "mfma_instr_shape": [
+          16,
+          16,
+          128
+        ],
+        "warps_per_cta": [
+          1,
+          4
+        ],
+        "tiles_per_warp": [
+          2,
+          2
+        ],
+        "k_width": null,
+        "transposed": true,
+        "WAVES_PER_EU": 1,
+        "TILE_SCHED": 2,
+        "GROUP_M": 4,
+        "NUM_XCDS": 8,
+        "token_mod": "",
+        "token_scale_mod": "",
+        "expert_mod": ".cs",
+        "expert_scale_mod": "",
+        "result_mod": "",
+        "result_scale_mod": "",
+        "WARP_PIPELINE": 0,
+        "VGPR_PREFETCH_K": 256,
+        "A_SCALE_SORTED_SHUFFLED": true,
+        "B_SCALE_SHUFFLED": true,
+        "B_PRESHUFFLED": true,
+        "ACT_FAST_RCP": true,
+        "WAIT_COMMIT_SCHEME": 3,
+        "DS_READ_IN_MFMA": 15,
+        "SCHED_MODE": 0,
+        "FROZEN_STEP": false,
+        "SOFF_UNROLL": false,
+        "SCALE_FILL_MID": true
+      },
+      "env": {
+        "AITER_TRITON_MOE_GLUON_SCALE_MINI_BLOCK_M": "64",
+        "TRITON_MEMBAR_DEDUP_BARE": "1",
+        "TRITON_HIP_EXTERNAL_LLC_FLAGS": "-amdgpu-ds-read-agpr -amdgpu-mfma-tied-cd -amdgpu-no-sched-revert -misched-pin-critical-res=HWXDL -amdgpu-force-dynamic-lds-size=161216 -disable-post-ra -amdgpu-sched-strategy=coexec -amdgpu-coexec-no-regpressure",
+        "AITER_TRITON_MOE_GLUON_B_PRESHUFFLED": "1",
+        "TRITON_AMD_NT_ONLY": "1"
+      },
+      "reference_configuration": "Supported four-wave 64-row adaptation; original schedule and buffering; B-only NT (aux=2) using existing local compiler override, separate cache/process",
+      "description": "Token-aware A4W4 Gluon: BM64 through T256, BM128 for T1024/T4096",
+      "config_origin": {
+        "path": "bench_out/gluon_flydsl_small_tokens_20260908/cases.json",
+        "case": "gluon_m64_bp_nt"
+      }
+    },
+    "flydsl_a4w4": {
+      "backend": "flydsl",
+      "precision": "a4w4",
+      "output": "mxfp4",
+      "output_quantization_policy": "round_up",
+      "tuning": {
+        "tile_m": 32,
+        "tile_n": 256,
+        "tile_k": 256,
+        "gate_mode": "separated",
+        "xcd_swizzle": 0,
+        "use_nt": true
+      },
+      "env": {},
+      "description": "Token-aware A4W4 FlyDSL: TM32 NT through T256, tuned TM64 xcd4 at T4096",
+      "config_origin": {
+        "path": "bench_out/gluon_flydsl_small_tokens_20260908/cases.json",
+        "case": "flydsl_m32_nt"
+      }
+    },
+    "gluon_a8w4": {
+      "backend": "gluon",
+      "precision": "a8w4",
+      "output": "bfloat16",
+      "tuning": {
+        "BLOCK_M": 32,
+        "BLOCK_N": 256,
+        "BLOCK_K": 256,
+        "K_UNROLL": 3,
+        "MINI_BLOCK_K": 256,
+        "MINI_BLOCK_M": 16,
+        "MINI_BLOCK_N": 128,
+        "NUM_LDS_BUFFER": 3,
+        "mfma_instr_shape": [
+          16,
+          16,
+          128
+        ],
+        "warps_per_cta": [
+          1,
+          4
+        ],
+        "tiles_per_warp": [
+          1,
+          1
+        ],
+        "k_width": null,
+        "transposed": true,
+        "WAVES_PER_EU": 1,
+        "TILE_SCHED": 2,
+        "GROUP_M": 4,
+        "NUM_XCDS": 8,
+        "token_mod": "",
+        "token_scale_mod": "",
+        "expert_mod": "",
+        "expert_scale_mod": "",
+        "result_mod": "",
+        "result_scale_mod": "",
+        "WARP_PIPELINE": 0,
+        "VGPR_PREFETCH_K": 256,
+        "A_SCALE_SORTED_SHUFFLED": false,
+        "B_SCALE_SHUFFLED": false,
+        "B_PRESHUFFLED": false,
+        "ACT_FAST_RCP": false,
+        "WAIT_COMMIT_SCHEME": 3,
+        "DS_READ_IN_MFMA": 0,
+        "SCHED_MODE": 0,
+        "FROZEN_STEP": false,
+        "SOFF_UNROLL": false,
+        "SCALE_FILL_MID": false
+      },
+      "env": {
+        "TRITON_MEMBAR_DEDUP_BARE": "1"
+      },
+      "reference_configuration": "flydsl_a8_tuning_20260907/final_harness gluon_packed",
+      "description": "Token-aware MXFP8-by-MXFP4 Gluon: BM32/BM64/BM128",
+      "config_origin": {
+        "path": "bench_out/gluon_flydsl_serial_20260907_Fxq0r9/cases.json",
+        "case": "gluon_a8w8"
+      }
+    },
+    "flydsl_a8w4": {
+      "backend": "flydsl",
+      "precision": "a8w4",
+      "output": "bfloat16",
+      "tuning": {
+        "tile_m": 32,
+        "tile_n": 128,
+        "tile_k": 256,
+        "waves_per_eu": 4,
+        "b_nt": 2,
+        "gate_mode": "interleave",
+        "use_async_copy": true,
+        "xcd_swizzle": 0,
+        "k_wave": 1
+      },
+      "env": {},
+      "reference_configuration": "flydsl_a8_tuning_20260907/final_harness flydsl_tuned",
+      "description": "Token-aware MXFP8-by-MXFP4 FlyDSL: tuned TM128/TN256 at T4096",
+      "config_origin": {
+        "path": "bench_out/gluon_flydsl_serial_20260907_Fxq0r9/cases.json",
+        "case": "flydsl_a8w8"
+      }
+    },
+    "gluon_a8w8": {
+      "backend": "gluon",
+      "precision": "a8w8",
+      "output": "bfloat16",
+      "tuning": {
+        "BLOCK_M": 128,
+        "BLOCK_N": 256,
+        "BLOCK_K": 128,
+        "K_UNROLL": 6,
+        "MINI_BLOCK_K": 128,
+        "MINI_BLOCK_M": 64,
+        "MINI_BLOCK_N": 128,
+        "NUM_LDS_BUFFER": 3,
+        "mfma_instr_shape": [
+          16,
+          16,
+          128
+        ],
+        "warps_per_cta": [
+          1,
+          4
+        ],
+        "tiles_per_warp": [
+          2,
+          2
+        ],
+        "k_width": null,
+        "transposed": true,
+        "WAVES_PER_EU": 1,
+        "TILE_SCHED": 2,
+        "GROUP_M": 4,
+        "NUM_XCDS": 8,
+        "token_mod": "",
+        "token_scale_mod": "",
+        "expert_mod": "",
+        "expert_scale_mod": "",
+        "result_mod": "",
+        "result_scale_mod": "",
+        "WARP_PIPELINE": 0,
+        "VGPR_PREFETCH_K": 128,
+        "A_SCALE_SORTED_SHUFFLED": true,
+        "B_SCALE_SHUFFLED": true,
+        "B_PRESHUFFLED": false,
+        "ACT_FAST_RCP": false,
+        "WAIT_COMMIT_SCHEME": 3,
+        "DS_READ_IN_MFMA": 0,
+        "SCHED_MODE": 0,
+        "FROZEN_STEP": false,
+        "SOFF_UNROLL": false,
+        "SCALE_FILL_MID": false
+      },
+      "env": {
+        "TRITON_MEMBAR_DEDUP_BARE": "1"
+      },
+      "reference_configuration": "flydsl_a8_tuning_20260907/final_harness gluon_packed",
+      "description": "Token-aware MXFP8 Gluon: BM32/BM64/BM128",
+      "config_origin": {
+        "path": "bench_out/gluon_flydsl_serial_20260907_Fxq0r9/cases.json",
+        "case": "gluon_a8w8"
+      }
+    },
+    "flydsl_a8w8": {
+      "backend": "flydsl",
+      "precision": "a8w8",
+      "output": "bfloat16",
+      "tuning": {
+        "tile_m": 128,
+        "tile_n": 128,
+        "tile_k": 256,
+        "waves_per_eu": 2,
+        "b_nt": 2,
+        "gate_mode": "interleave",
+        "use_async_copy": true,
+        "xcd_swizzle": 0,
+        "k_wave": 1
+      },
+      "env": {},
+      "reference_configuration": "flydsl_a8_tuning_20260907/final_harness flydsl_tuned",
+      "description": "Token-aware MXFP8 FlyDSL: exact-shape tuned WPE2 at T4096",
+      "config_origin": {
+        "path": "bench_out/gluon_flydsl_serial_20260907_Fxq0r9/cases.json",
+        "case": "flydsl_a8w8"
+      }
+    },
+    "gluon_a16w16": {
+      "backend": "gluon",
+      "precision": "a16w16",
+      "output": "bfloat16",
+      "tuning": {
+        "BLOCK_M": 128,
+        "BLOCK_N": 256,
+        "BLOCK_K": 64,
+        "K_UNROLL": 3,
+        "MINI_BLOCK_K": 64,
+        "MINI_BLOCK_M": 64,
+        "MINI_BLOCK_N": 128,
+        "NUM_LDS_BUFFER": 3,
+        "mfma_instr_shape": [
+          32,
+          32,
+          16
+        ],
+        "warps_per_cta": [
+          2,
+          4
+        ],
+        "tiles_per_warp": [
+          1,
+          1
+        ],
+        "k_width": null,
+        "transposed": true,
+        "WAVES_PER_EU": 1,
+        "TILE_SCHED": 2,
+        "GROUP_M": 4,
+        "NUM_XCDS": 8,
+        "token_mod": "",
+        "token_scale_mod": "",
+        "expert_mod": "",
+        "expert_scale_mod": "",
+        "result_mod": "",
+        "result_scale_mod": "",
+        "WARP_PIPELINE": 0,
+        "VGPR_PREFETCH_K": 64,
+        "A_SCALE_SORTED_SHUFFLED": false,
+        "B_SCALE_SHUFFLED": false,
+        "B_PRESHUFFLED": false,
+        "ACT_FAST_RCP": false,
+        "WAIT_COMMIT_SCHEME": 3,
+        "DS_READ_IN_MFMA": 0,
+        "SCHED_MODE": 0,
+        "FROZEN_STEP": false,
+        "SOFF_UNROLL": false,
+        "SCALE_FILL_MID": false
+      },
+      "env": {
+        "TRITON_MEMBAR_DEDUP_BARE": "1"
+      },
+      "reference_configuration": "gluon_flydsl_a8a16_20260907 validated gluon_a16w16",
+      "description": "Token-aware BF16 Gluon: BM32/BM64/BM128",
+      "config_origin": {
+        "path": "bench_out/gluon_flydsl_serial_20260907_Fxq0r9/cases.json",
+        "case": "gluon_a16w16"
+      }
+    },
+    "flydsl_a16w16": {
+      "backend": "flydsl",
+      "precision": "a16w16",
+      "output": "bfloat16",
+      "tuning": {
+        "tile_m": 128,
+        "tile_n": 128,
+        "tile_k": 128,
+        "waves_per_eu": 1
+      },
+      "env": {},
+      "reference_configuration": "gluon_flydsl_a8a16_20260907 validated flydsl_a16w16",
+      "description": "Token-aware BF16 FlyDSL: tuned TM128/TN128/TK128 WPE1 at T4096",
+      "config_origin": {
+        "path": "bench_out/gluon_flydsl_serial_20260907_Fxq0r9/cases.json",
+        "case": "flydsl_a16w16"
+      }
+    }
+  },
+  "resolved_cases": {
+    "gluon_a4w4_t4096": {
+      "backend": "gluon",
+      "precision": "a4w4",
+      "output": "mxfp4",
+      "output_quantization_policy": "even",
+      "tuning": {
+        "BLOCK_M": 128,
+        "BLOCK_N": 256,
+        "BLOCK_K": 256,
+        "K_UNROLL": 3,
+        "MINI_BLOCK_K": 256,
+        "MINI_BLOCK_M": 64,
+        "MINI_BLOCK_N": 128,
+        "NUM_LDS_BUFFER": 3,
+        "mfma_instr_shape": [
+          16,
+          16,
+          128
+        ],
+        "warps_per_cta": [
+          1,
+          4
+        ],
+        "tiles_per_warp": [
+          2,
+          2
+        ],
+        "k_width": null,
+        "transposed": true,
+        "WAVES_PER_EU": 1,
+        "TILE_SCHED": 2,
+        "GROUP_M": 4,
+        "NUM_XCDS": 8,
+        "token_mod": "",
+        "token_scale_mod": "",
+        "expert_mod": "",
+        "expert_scale_mod": "",
+        "result_mod": "",
+        "result_scale_mod": "",
+        "WARP_PIPELINE": 0,
+        "VGPR_PREFETCH_K": 256,
+        "A_SCALE_SORTED_SHUFFLED": true,
+        "B_SCALE_SHUFFLED": true,
+        "B_PRESHUFFLED": false,
+        "ACT_FAST_RCP": true,
+        "WAIT_COMMIT_SCHEME": 3,
+        "DS_READ_IN_MFMA": 15,
+        "SCHED_MODE": 0,
+        "FROZEN_STEP": false,
+        "SOFF_UNROLL": false,
+        "SCALE_FILL_MID": true
+      },
+      "env": {
+        "AITER_TRITON_MOE_GLUON_SCALE_MINI_BLOCK_M": "128",
+        "TRITON_MEMBAR_DEDUP_BARE": "1",
+        "TRITON_HIP_EXTERNAL_LLC_FLAGS": "-amdgpu-ds-read-agpr -amdgpu-mfma-tied-cd -amdgpu-no-sched-revert -misched-pin-critical-res=HWXDL -amdgpu-force-dynamic-lds-size=161216 -disable-post-ra -amdgpu-sched-strategy=coexec -amdgpu-coexec-no-regpressure",
+        "AITER_TRITON_MOE_GLUON_B_PRESHUFFLED": "0",
+        "TRITON_AMD_NT_ONLY": "0"
+      },
+      "reference_configuration": "Supported four-wave 64-row adaptation; original schedule and buffering; B-only NT (aux=2) using existing local compiler override, separate cache/process",
+      "description": "Token-aware A4W4 Gluon: BM64 through T256, BM128 for T1024/T4096",
+      "config_origin": {
+        "path": "bench_out/gluon_flydsl_small_tokens_20260908/cases.json",
+        "case": "gluon_m64_bp_nt"
+      }
+    },
+    "flydsl_a4w4_t4096": {
+      "backend": "flydsl",
+      "precision": "a4w4",
+      "output": "mxfp4",
+      "output_quantization_policy": "round_up",
+      "tuning": {
+        "tile_m": 64,
+        "tile_n": 256,
+        "tile_k": 256,
+        "gate_mode": "separated",
+        "xcd_swizzle": 4,
+        "use_nt": false
+      },
+      "env": {},
+      "description": "Token-aware A4W4 FlyDSL: TM32 NT through T256, tuned TM64 xcd4 at T4096",
+      "config_origin": {
+        "path": "bench_out/gluon_flydsl_small_tokens_20260908/cases.json",
+        "case": "flydsl_m32_nt"
+      }
+    },
+    "gluon_a8w4_t4096": {
+      "backend": "gluon",
+      "precision": "a8w4",
+      "output": "bfloat16",
+      "tuning": {
+        "BLOCK_M": 128,
+        "BLOCK_N": 128,
+        "BLOCK_K": 256,
+        "K_UNROLL": 3,
+        "MINI_BLOCK_K": 256,
+        "MINI_BLOCK_M": 64,
+        "MINI_BLOCK_N": 64,
+        "NUM_LDS_BUFFER": 3,
+        "mfma_instr_shape": [
+          16,
+          16,
+          128
+        ],
+        "warps_per_cta": [
+          2,
+          2
+        ],
+        "tiles_per_warp": [
+          2,
+          2
+        ],
+        "k_width": null,
+        "transposed": true,
+        "WAVES_PER_EU": 1,
+        "TILE_SCHED": 2,
+        "GROUP_M": 4,
+        "NUM_XCDS": 8,
+        "token_mod": "",
+        "token_scale_mod": "",
+        "expert_mod": "",
+        "expert_scale_mod": "",
+        "result_mod": "",
+        "result_scale_mod": "",
+        "WARP_PIPELINE": 0,
+        "VGPR_PREFETCH_K": 256,
+        "A_SCALE_SORTED_SHUFFLED": true,
+        "B_SCALE_SHUFFLED": true,
+        "B_PRESHUFFLED": false,
+        "ACT_FAST_RCP": false,
+        "WAIT_COMMIT_SCHEME": 3,
+        "DS_READ_IN_MFMA": 0,
+        "SCHED_MODE": 0,
+        "FROZEN_STEP": false,
+        "SOFF_UNROLL": false,
+        "SCALE_FILL_MID": false
+      },
+      "env": {
+        "TRITON_MEMBAR_DEDUP_BARE": "1"
+      },
+      "reference_configuration": "flydsl_a8_tuning_20260907/final_harness gluon_packed",
+      "description": "Token-aware MXFP8-by-MXFP4 Gluon: BM32/BM64/BM128",
+      "config_origin": {
+        "path": "bench_out/gluon_flydsl_serial_20260907_Fxq0r9/cases.json",
+        "case": "gluon_a8w8"
+      }
+    },
+    "flydsl_a8w4_t4096": {
+      "backend": "flydsl",
+      "precision": "a8w4",
+      "output": "bfloat16",
+      "tuning": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 256,
+        "waves_per_eu": 4,
+        "b_nt": 2,
+        "gate_mode": "interleave",
+        "use_async_copy": true,
+        "xcd_swizzle": 0,
+        "k_wave": 1
+      },
+      "env": {},
+      "reference_configuration": "flydsl_a8_tuning_20260907/final_harness flydsl_tuned",
+      "description": "Token-aware MXFP8-by-MXFP4 FlyDSL: tuned TM128/TN256 at T4096",
+      "config_origin": {
+        "path": "bench_out/gluon_flydsl_serial_20260907_Fxq0r9/cases.json",
+        "case": "flydsl_a8w8"
+      }
+    },
+    "gluon_a8w8_t4096": {
+      "backend": "gluon",
+      "precision": "a8w8",
+      "output": "bfloat16",
+      "tuning": {
+        "BLOCK_M": 128,
+        "BLOCK_N": 256,
+        "BLOCK_K": 128,
+        "K_UNROLL": 6,
+        "MINI_BLOCK_K": 128,
+        "MINI_BLOCK_M": 64,
+        "MINI_BLOCK_N": 128,
+        "NUM_LDS_BUFFER": 3,
+        "mfma_instr_shape": [
+          16,
+          16,
+          128
+        ],
+        "warps_per_cta": [
+          1,
+          4
+        ],
+        "tiles_per_warp": [
+          2,
+          2
+        ],
+        "k_width": null,
+        "transposed": true,
+        "WAVES_PER_EU": 1,
+        "TILE_SCHED": 2,
+        "GROUP_M": 4,
+        "NUM_XCDS": 8,
+        "token_mod": "",
+        "token_scale_mod": "",
+        "expert_mod": "",
+        "expert_scale_mod": "",
+        "result_mod": "",
+        "result_scale_mod": "",
+        "WARP_PIPELINE": 0,
+        "VGPR_PREFETCH_K": 128,
+        "A_SCALE_SORTED_SHUFFLED": true,
+        "B_SCALE_SHUFFLED": true,
+        "B_PRESHUFFLED": false,
+        "ACT_FAST_RCP": false,
+        "WAIT_COMMIT_SCHEME": 3,
+        "DS_READ_IN_MFMA": 0,
+        "SCHED_MODE": 0,
+        "FROZEN_STEP": false,
+        "SOFF_UNROLL": false,
+        "SCALE_FILL_MID": false
+      },
+      "env": {
+        "TRITON_MEMBAR_DEDUP_BARE": "1"
+      },
+      "reference_configuration": "flydsl_a8_tuning_20260907/final_harness gluon_packed",
+      "description": "Token-aware MXFP8 Gluon: BM32/BM64/BM128",
+      "config_origin": {
+        "path": "bench_out/gluon_flydsl_serial_20260907_Fxq0r9/cases.json",
+        "case": "gluon_a8w8"
+      }
+    },
+    "flydsl_a8w8_t4096": {
+      "backend": "flydsl",
+      "precision": "a8w8",
+      "output": "bfloat16",
+      "tuning": {
+        "tile_m": 128,
+        "tile_n": 128,
+        "tile_k": 256,
+        "waves_per_eu": 2,
+        "b_nt": 2,
+        "gate_mode": "interleave",
+        "use_async_copy": true,
+        "xcd_swizzle": 0,
+        "k_wave": 1
+      },
+      "env": {},
+      "reference_configuration": "flydsl_a8_tuning_20260907/final_harness flydsl_tuned",
+      "description": "Token-aware MXFP8 FlyDSL: exact-shape tuned WPE2 at T4096",
+      "config_origin": {
+        "path": "bench_out/gluon_flydsl_serial_20260907_Fxq0r9/cases.json",
+        "case": "flydsl_a8w8"
+      }
+    },
+    "gluon_a16w16_t4096": {
+      "backend": "gluon",
+      "precision": "a16w16",
+      "output": "bfloat16",
+      "tuning": {
+        "BLOCK_M": 128,
+        "BLOCK_N": 256,
+        "BLOCK_K": 64,
+        "K_UNROLL": 3,
+        "MINI_BLOCK_K": 64,
+        "MINI_BLOCK_M": 64,
+        "MINI_BLOCK_N": 128,
+        "NUM_LDS_BUFFER": 3,
+        "mfma_instr_shape": [
+          32,
+          32,
+          16
+        ],
+        "warps_per_cta": [
+          2,
+          4
+        ],
+        "tiles_per_warp": [
+          1,
+          1
+        ],
+        "k_width": null,
+        "transposed": true,
+        "WAVES_PER_EU": 1,
+        "TILE_SCHED": 2,
+        "GROUP_M": 4,
+        "NUM_XCDS": 8,
+        "token_mod": "",
+        "token_scale_mod": "",
+        "expert_mod": "",
+        "expert_scale_mod": "",
+        "result_mod": "",
+        "result_scale_mod": "",
+        "WARP_PIPELINE": 0,
+        "VGPR_PREFETCH_K": 64,
+        "A_SCALE_SORTED_SHUFFLED": false,
+        "B_SCALE_SHUFFLED": false,
+        "B_PRESHUFFLED": false,
+        "ACT_FAST_RCP": false,
+        "WAIT_COMMIT_SCHEME": 3,
+        "DS_READ_IN_MFMA": 0,
+        "SCHED_MODE": 0,
+        "FROZEN_STEP": false,
+        "SOFF_UNROLL": false,
+        "SCALE_FILL_MID": false
+      },
+      "env": {
+        "TRITON_MEMBAR_DEDUP_BARE": "1"
+      },
+      "reference_configuration": "gluon_flydsl_a8a16_20260907 validated gluon_a16w16",
+      "description": "Token-aware BF16 Gluon: BM32/BM64/BM128",
+      "config_origin": {
+        "path": "bench_out/gluon_flydsl_serial_20260907_Fxq0r9/cases.json",
+        "case": "gluon_a16w16"
+      }
+    },
+    "flydsl_a16w16_t4096": {
+      "backend": "flydsl",
+      "precision": "a16w16",
+      "output": "bfloat16",
+      "tuning": {
+        "tile_m": 128,
+        "tile_n": 128,
+        "tile_k": 128,
+        "waves_per_eu": 1,
+        "b_nt": 2,
+        "gate_mode": "separated",
+        "use_async_copy": true,
+        "xcd_swizzle": 0,
+        "k_wave": 1
+      },
+      "env": {},
+      "reference_configuration": "gluon_flydsl_a8a16_20260907 validated flydsl_a16w16",
+      "description": "Token-aware BF16 FlyDSL: tuned TM128/TN128/TK128 WPE1 at T4096",
+      "config_origin": {
+        "path": "bench_out/gluon_flydsl_serial_20260907_Fxq0r9/cases.json",
+        "case": "flydsl_a16w16"
+      }
+    }
+  },
+  "p99_definition": "nearest rank: sorted[ceil(0.99*n)-1]"
+}
