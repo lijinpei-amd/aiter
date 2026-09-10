@@ -145,8 +145,10 @@ def build_gluon(data, tuning, artifact_dir):
     assert func_spec.gate_up_split
     assert (func_spec.output_quant is not None) == quantized_output
     effective = tuning_spec._asdict()
-    for field, requested in tuning.items():
-        assert field in effective, ("requested tuning field was dropped", field)
+    requested_effective = dict(
+        zip(tuning_spec._fields, host._tuning_args(tuning), strict=True)
+    )
+    for field, requested in requested_effective.items():
         actual = effective[field]
         if isinstance(actual, tuple):
             actual = list(actual)

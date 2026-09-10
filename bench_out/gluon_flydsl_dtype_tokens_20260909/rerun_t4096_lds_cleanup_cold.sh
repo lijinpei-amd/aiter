@@ -210,7 +210,31 @@ import run_bench
 
 baseline_provenance = read("provenance.json")
 current_provenance = run_bench.provenance()
-for field in ("harness", "llc_sha256", "libtriton_sha256"):
+baseline_harness = dict(baseline_provenance["harness"])
+current_harness = dict(current_provenance["harness"])
+# HEAD renamed tuning fields while retaining host-side aliases. The worker-only
+# compatibility update normalizes those aliases before checking the captured launch;
+# it does not change case construction, validation, tracing, or the timed loop.
+worker_path = str(script_dir / "worker.py")
+expected_baseline_worker_sha256 = (
+    "29567854fb1a881d41c61c00ce243943673acaa786608a0fa8e960359f3335bd"
+)
+expected_compat_worker_sha256 = (
+    "ae09c32ba13f24e80ebe9121eb2db19f7bf2431766d7db2ad889265ab75b680c"
+)
+baseline_worker_sha256 = baseline_harness.pop(worker_path, None)
+current_worker_sha256 = current_harness.pop(worker_path, None)
+if baseline_worker_sha256 != expected_baseline_worker_sha256:
+    raise SystemExit(
+        "Baseline worker.py differs from the exact archived benchmark version"
+    )
+if current_worker_sha256 != expected_compat_worker_sha256:
+    raise SystemExit(
+        "Current worker.py differs from the exact audited compatibility version"
+    )
+if baseline_harness != current_harness:
+    raise SystemExit("Current benchmark harness (excluding worker.py) differs from baseline")
+for field in ("llc_sha256", "libtriton_sha256"):
     if baseline_provenance[field] != current_provenance[field]:
         raise SystemExit(f"Current {field} differs from the baseline")
 
@@ -309,6 +333,30 @@ def read(path):
     return json.loads(path.read_text())
 
 
+def canonicalize_gluon_tuning(kernel):
+    """Compare legacy and current tuning spellings by their launch semantics."""
+    tuning = kernel["effective_tuning"]
+    aliases = {
+        "token_mod": "token_cache_modifier",
+        "token_scale_mod": "token_scale_cache_modifier",
+        "expert_mod": "expert_cache_modifier",
+        "expert_scale_mod": "expert_scale_cache_modifier",
+        "result_mod": "result_cache_modifier",
+        "result_scale_mod": "result_scale_cache_modifier",
+    }
+    for legacy, canonical in aliases.items():
+        if legacy in tuning:
+            tuning[canonical] = tuning.pop(legacy)
+    if "DS_READ_IN_MFMA" in tuning:
+        mask = int(tuning.pop("DS_READ_IN_MFMA"))
+        tuning.update(
+            DS_READ_A_PAYLOAD_IN_MFMA=bool(mask & 1),
+            DS_READ_B_PAYLOAD_IN_MFMA=bool(mask & 2),
+            DS_READ_A_SCALE_IN_MFMA=bool(mask & 4),
+            DS_READ_B_SCALE_IN_MFMA=bool(mask & 8),
+        )
+
+
 if read(validation_dir / "failures.json") != []:
     raise SystemExit("Current validation contains failures")
 
@@ -336,6 +384,8 @@ for precision in ("a4w4", "a8w4", "a8w8", "a16w16"):
             # change its hash while leaving the executable text byte-identical.
             old_kernel.pop("binary_sha256", None)
             new_kernel.pop("binary_sha256", None)
+            canonicalize_gluon_tuning(old_kernel)
+            canonicalize_gluon_tuning(new_kernel)
         if new_kernel != old_kernel:
             raise SystemExit(f"Effective kernel differs from baseline for {case}")
         summary_key = f"{precision}_t4096_{case}"
