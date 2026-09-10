@@ -24,7 +24,7 @@ def _register_load_copy(
     # Unused staging allocations must disappear from the compiled kernel.
     lds = LDSManager.alloc(tc.func_cfg, tc)
     if SCALE:
-        shape: gl.constexpr = tc.scale_shape_slot(operand)
+        shape: gl.constexpr = tc.scale_lds_shape_slot(operand)
         layout: gl.constexpr = tc.dot_operand_scale_fragment_layout(operand)
         k_dim: gl.constexpr = 1
         width: gl.constexpr = tc.MINI_BLOCK_K // 32
@@ -69,7 +69,11 @@ def test_register_load_does_not_stage_through_lds(operand, scale, mini_k):
         B_SCALE_SHUFFLED=False,
     )
     tc = host._probe_tuning_config(config, DtypeQuant.MXFP4, DtypeQuant.MXFP4)
-    shape = tc.scale_shape_slot(operand) if scale else tc.payload_lds_shape_slot(operand)
+    shape = (
+        tc.scale_lds_shape_slot(operand)
+        if scale
+        else tc.payload_lds_shape_slot(operand)
+    )
     elements = shape[0] * shape[1]
     src = (torch.arange(elements + 16, device="cuda") % 251).to(torch.uint8)
     dst = torch.empty(elements, dtype=torch.uint8, device="cuda")

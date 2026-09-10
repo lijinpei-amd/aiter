@@ -118,7 +118,9 @@ def _stage_epilogue_inputs(
     if require_constexpr(EPI_LDS):
         if require_constexpr(func_cfg.has_gammas):
             g_offs = BM * block_id + gl.arange(
-                0, EPI_T, layout=tuning_cfg.epilogue_gamma_copy_layout()
+                0,
+                EPI_T,
+                layout=tuning_cfg.epilogue_gamma_buffer_load_lds_layout(),
             )
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
                 gamma_lds_ptr, gammas_hbm_ptr, g_offs, mask=g_offs < M_e, other=0.0
@@ -126,7 +128,11 @@ def _stage_epilogue_inputs(
         if require_constexpr(func_cfg.has_bias):
             epi_b_offs = _n_split_offs(
                 pid_n,
-                gl.arange(0, BN, layout=tuning_cfg.epilogue_bias_copy_layout()),
+                gl.arange(
+                    0,
+                    BN,
+                    layout=tuning_cfg.epilogue_bias_buffer_load_lds_layout(),
+                ),
                 N,
                 func_cfg,
                 tuning_cfg,

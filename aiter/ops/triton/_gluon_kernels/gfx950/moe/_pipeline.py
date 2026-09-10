@@ -17,7 +17,7 @@ from triton.experimental.gluon import language as gl
 
 from ._lang import pick_warp_pipeline_stage as pick_stage
 from ._lang import require_constexpr
-from ._layout import _slot_index, accumulator_shape_slot
+from ._layout import _slot_index, accumulator_fragment_shape_slot
 from ._schedule import (
     _buffer_load_pos,
     _buffer_load_tile,
@@ -878,7 +878,7 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
         for mi in gl.static_range(tc.num_m_slots_per_block()):
             acc += (
                 gl.zeros(
-                    accumulator_shape_slot(tc),
+                    accumulator_fragment_shape_slot(tc),
                     pc.func_cfg.mma_acc_dtype,
                     tc.dot_result_fragment_layout(),
                 ),
