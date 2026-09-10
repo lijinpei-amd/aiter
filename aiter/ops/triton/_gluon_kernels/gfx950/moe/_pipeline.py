@@ -17,6 +17,7 @@ from triton.experimental.gluon import language as gl
 
 from ._lang import pick_warp_pipeline_stage as pick_stage
 from ._lang import require_constexpr
+from ._layout import accumulator_shape
 from ._offsets import _slot_index
 from ._schedule import (
     _buffer_load_pos,
@@ -269,10 +270,7 @@ def _init_buffers(pc):
         for _ in gl.static_range(tc.num_buffers(0) * tc.num_mini_m() * tc.num_mini_k()):
             a += (
                 gl.zeros(
-                    [
-                        tc.MINI_BLOCK_M,
-                        tc.MINI_BLOCK_K // pc.func_cfg.pack_divisor(0),
-                    ],
+                    tc.payload_fragment_shape(0),
                     pc.func_cfg.operand_elem_ty(0),
                     tc.dot_operand_fragment_layout(0),
                 ),
@@ -281,7 +279,7 @@ def _init_buffers(pc):
         for _ in gl.static_range(tc.num_buffers(1) * tc.num_mini_n() * tc.num_mini_k()):
             b += (
                 gl.zeros(
-                    [tc.MINI_BLOCK_K // pc.func_cfg.pack_divisor(1), tc.MINI_BLOCK_N],
+                    tc.payload_fragment_shape(1),
                     pc.func_cfg.operand_elem_ty(1),
                     tc.dot_operand_fragment_layout(1),
                 ),
@@ -301,7 +299,7 @@ def _init_buffers(pc):
             else:
                 a_scale += (
                     gl.zeros(
-                        [tc.MINI_BLOCK_M, tc.MINI_BLOCK_K // 32],
+                        tc.scale_fragment_shape(0),
                         gl.uint8,
                         tc.dot_operand_scale_fragment_layout(0),
                     ),
@@ -321,7 +319,7 @@ def _init_buffers(pc):
             else:
                 b_scale += (
                     gl.zeros(
-                        [tc.MINI_BLOCK_N, tc.MINI_BLOCK_K // 32],
+                        tc.scale_fragment_shape(1),
                         gl.uint8,
                         tc.dot_operand_scale_fragment_layout(1),
                     ),
@@ -869,7 +867,7 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
         for mi in gl.static_range(tc.num_mini_m()):
             acc += (
                 gl.zeros(
-                    [tc.MINI_BLOCK_M, tc.MINI_BLOCK_N],
+                    accumulator_shape(tc),
                     pc.func_cfg.mma_acc_dtype,
                     tc.dot_result_fragment_layout(),
                 ),

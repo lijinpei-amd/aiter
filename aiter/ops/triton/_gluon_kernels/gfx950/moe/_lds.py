@@ -10,7 +10,6 @@ from triton.language.core import _aggregate as aggregate
 from aiter.ops.triton.utils.common_utils import strip_annotate
 
 from ._config import KernelFuncConfig, KernelTuningConfig
-from ._lang import MX_GROUP_CE as MX_GROUP
 from ._lang import optional as _opt
 from ._lang import require_constexpr
 
@@ -85,21 +84,13 @@ class LDSManager:
         that is what makes the per-mini-block direct-to-LDS copy as coalesced and as wide
         as the whole-tile copy was.
         """
-        NBA: gl.constexpr = tuning_cfg.num_buffers(0)
-        NBB: gl.constexpr = tuning_cfg.num_buffers(1)
-        NBAS: gl.constexpr = tuning_cfg.num_buffers(0, True)
-        NBBS: gl.constexpr = tuning_cfg.num_buffers(1, True)
-        NMA: gl.constexpr = tuning_cfg.num_lds_tiles(0)
-        NMB: gl.constexpr = tuning_cfg.num_lds_tiles(1)
         a_ty: gl.constexpr = func_cfg.operand_elem_ty(0)
         b_ty: gl.constexpr = func_cfg.operand_elem_ty(1)
-        a_shape: gl.constexpr = tuning_cfg.lds_shape(0)
-        b_shape: gl.constexpr = tuning_cfg.lds_shape(1)
 
         if require_constexpr(tuning_cfg.payload_via_lds(0)):
             a_payload_lds_ptr = gl.allocate_shared_memory(
                 a_ty,
-                [NBA * NMA, a_shape[0], a_shape[1]],
+                tuning_cfg.payload_lds_allocation_shape(0),
                 layout=tuning_cfg.dot_operand_lds_layout(0),
             )
         else:
@@ -107,49 +98,25 @@ class LDSManager:
         if require_constexpr(tuning_cfg.payload_via_lds(1)):
             b_payload_lds_ptr = gl.allocate_shared_memory(
                 b_ty,
-                [NBB * NMB, b_shape[0], b_shape[1]],
+                tuning_cfg.payload_lds_allocation_shape(1),
                 layout=tuning_cfg.dot_operand_lds_layout(1),
             )
         else:
             b_payload_lds_ptr: gl.constexpr = None
         if require_constexpr(func_cfg.has_scale(0) and tuning_cfg.scale_via_lds(0)):
-            as_shape: gl.constexpr = tuning_cfg.scale_shape(0)
-            if require_constexpr(tuning_cfg.scale_shuffled(0)):
-                # Flat: direct-to-LDS on gfx9 cannot scatter, so the staging tile has to
-                # be written coalesced; the fragment view comes back on the read.
-                # A-scale tiles are counted separately from the payload mini blocks:
-                # scale_mini_m() may cover several of them so the copy's stripe count
-                # matches warps_per_cta and no warp is replicated.
-                a_scale_lds_ptr = gl.allocate_shared_memory(
-                    gl.uint8,
-                    [NBAS * tuning_cfg.num_scale_tiles_a()]
-                    + tuning_cfg.scale_flat_shape(0),
-                    layout=tuning_cfg.dot_operand_scale_lds_layout(0),
-                )
-            else:
-                a_scale_lds_ptr = gl.allocate_shared_memory(
-                    gl.uint8,
-                    [NBAS * NMA, as_shape[0], as_shape[1]],
-                    layout=tuning_cfg.dot_operand_scale_lds_layout(0),
-                )
+            a_scale_lds_ptr = gl.allocate_shared_memory(
+                gl.uint8,
+                tuning_cfg.scale_lds_allocation_shape(0),
+                layout=tuning_cfg.dot_operand_scale_lds_layout(0),
+            )
         else:
             a_scale_lds_ptr: gl.constexpr = None
         if require_constexpr(func_cfg.has_scale(1) and tuning_cfg.scale_via_lds(1)):
-            bs_shape: gl.constexpr = tuning_cfg.scale_shape(1)
-            if require_constexpr(tuning_cfg.scale_shuffled(1)):
-                # Flat: direct-to-LDS on gfx9 cannot scatter, so the staging tile has to
-                # be written coalesced; the fragment view comes back on the read.
-                b_scale_lds_ptr = gl.allocate_shared_memory(
-                    gl.uint8,
-                    [NBBS * NMB] + tuning_cfg.scale_flat_shape(1),
-                    layout=tuning_cfg.dot_operand_scale_lds_layout(1),
-                )
-            else:
-                b_scale_lds_ptr = gl.allocate_shared_memory(
-                    gl.uint8,
-                    [NBBS * NMB, bs_shape[0], bs_shape[1]],
-                    layout=tuning_cfg.dot_operand_scale_lds_layout(1),
-                )
+            b_scale_lds_ptr = gl.allocate_shared_memory(
+                gl.uint8,
+                tuning_cfg.scale_lds_allocation_shape(1),
+                layout=tuning_cfg.dot_operand_scale_lds_layout(1),
+            )
         else:
             b_scale_lds_ptr: gl.constexpr = None
 
@@ -204,20 +171,14 @@ class LDSManager:
             payload = gl.amd.cdna4.buffer_load(
                 ptr=hbm_ptr, offsets=hbm_offs, cache=cache, soffset=SOFF
             )
-            width: gl.constexpr = cfg.MINI_BLOCK_K // self.func_cfg.pack_divisor(
-                operand
-            )
             fragments = ()
             for mini in gl.static_range(cfg.num_mini_k()):
                 if require_constexpr(cfg.num_mini_k() > 1):
-                    if require_constexpr(operand == 0):
-                        fragment = gl.amd.slice(
-                            payload, [cfg.MINI_BLOCK_M, width], [0, mini * width]
-                        )
-                    else:
-                        fragment = gl.amd.slice(
-                            payload, [width, cfg.MINI_BLOCK_N], [mini * width, 0]
-                        )
+                    fragment = gl.amd.slice(
+                        payload,
+                        cfg.payload_fragment_shape(operand),
+                        cfg.payload_fragment_offset(operand, mini),
+                    )
                 else:
                     fragment = payload
                 fragments = fragments + (fragment,)
@@ -300,14 +261,13 @@ class LDSManager:
                 scale = gl.amd.cdna4.buffer_load(
                     ptr=hbm_ptr, offsets=hbm_offs, cache=cache, soffset=SOFF
                 )
-            width: gl.constexpr = cfg.MINI_BLOCK_K // MX_GROUP
             fragments = ()
             for mini in gl.static_range(cfg.num_mini_k()):
                 if require_constexpr(cfg.num_mini_k() > 1):
                     fragment = gl.amd.slice(
                         scale,
-                        [cfg.scale_shape(operand)[0], width],
-                        [0, mini * width],
+                        cfg.scale_fragment_shape(operand),
+                        cfg.scale_fragment_offset(mini),
                     )
                 else:
                     fragment = scale
@@ -332,13 +292,13 @@ class LDSManager:
         n_tiles: gl.constexpr,
         tile: gl.constexpr,
         mini_idx: gl.constexpr,
-        k_dim: gl.constexpr,
-        pack: gl.constexpr,
+        operand: gl.constexpr,
     ):
         cfg: gl.constexpr = self.tuning_cfg
         tile_lds_ptr = lds_ptr.index(DS_READ_IDX * n_tiles + tile)
         if require_constexpr(cfg.num_mini_k() > 1):
-            width: gl.constexpr = cfg.MINI_BLOCK_K // pack
+            k_dim: gl.constexpr = 1 - operand
+            width: gl.constexpr = cfg.payload_fragment_shape(operand)[k_dim]
             tile_lds_ptr = tile_lds_ptr.slice(mini_idx * width, width, dim=k_dim)
         return tile_lds_ptr
 
@@ -350,11 +310,12 @@ class LDSManager:
         n_tiles: gl.constexpr,
         tile: gl.constexpr,
         mini_idx: gl.constexpr,
+        operand: gl.constexpr,
     ):
         cfg: gl.constexpr = self.tuning_cfg
         tile_lds_ptr = lds_ptr.index(DS_READ_IDX * n_tiles + tile)
         if require_constexpr(cfg.num_mini_k() > 1):
-            width: gl.constexpr = cfg.MINI_BLOCK_K // MX_GROUP
+            width: gl.constexpr = cfg.scale_fragment_shape(operand)[1]
             tile_lds_ptr = tile_lds_ptr.slice(mini_idx * width, width, dim=1)
         return tile_lds_ptr
 
@@ -372,7 +333,7 @@ class LDSManager:
             DS_READ_IDX * (cfg.num_lds_tiles(0) // RA) + mi // RA
         )
         if require_constexpr(RA > 1):
-            stripes: gl.constexpr = cfg.MINI_BLOCK_M // 32
+            stripes: gl.constexpr = cfg.scale_flat_fragment_shape(0)[0]
             tile_lds_ptr = tile_lds_ptr.slice((mi % RA) * stripes, stripes, dim=0)
         return tile_lds_ptr
 
@@ -410,8 +371,7 @@ class LDSManager:
                     cfg.num_lds_tiles(operand),
                     tile,
                     mini_idx,
-                    1 - operand,
-                    self.func_cfg.pack_divisor(operand),
+                    operand,
                 ),
                 cfg.dot_operand_fragment_layout(operand),
             )
@@ -452,8 +412,8 @@ class LDSManager:
                 if require_constexpr(cfg.num_mini_k() > 1):
                     scale_val = gl.amd.slice(
                         scale_val,
-                        [cfg.scale_shape(operand)[0], cfg.MINI_BLOCK_K // MX_GROUP],
-                        [0, mini_idx * (cfg.MINI_BLOCK_K // MX_GROUP)],
+                        cfg.scale_fragment_shape(operand),
+                        cfg.scale_fragment_offset(mini_idx),
                     )
             else:
                 scale_val = _ds_read(
@@ -463,6 +423,7 @@ class LDSManager:
                         cfg.num_lds_tiles(operand),
                         tile,
                         mini_idx,
+                        operand,
                     ),
                     cfg.dot_operand_scale_fragment_layout(operand),
                 )
