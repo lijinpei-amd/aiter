@@ -77,14 +77,14 @@ from ._epilogue import _epi_bias_tiles, _epilogue_store, _stage_epilogue_inputs
 from ._lang import optional as _opt
 from ._lang import require_constexpr
 from ._lang import unwrap as _v
-from ._lds import LDSManager
-from ._offsets import (
+from ._layout import (
     _a_payload_hbm_offsets,
     _a_scale_hbm_offsets,
     _b_payload_hbm_offsets,
     _b_scale_hbm_offsets,
     _slot_index,
 )
+from ._lds import LDSManager
 from ._types import DotKind, TileSched
 
 _SG_MFMA: gl.constexpr = gl.constexpr(8)
@@ -227,8 +227,8 @@ class _PipelineConst:
     increments. Only :class:`_PipelinePointers` and :class:`_PipelineRegFragments`
     cross the back edge.
 
-    Every offset grid is a *tuple*, one entry per mini block: ``num_mini_m()`` for the A
-    side, ``num_mini_n()`` for the B side. Each entry is laid out for its own mini tile's
+    Every offset grid is a *tuple*, one entry per mini block: ``num_m_slots_per_block()`` for the A
+    side, ``num_n_slots_per_block()`` for the B side. Each entry is laid out for its own mini tile's
     copy layout, which is what keeps every per-mini-block direct-to-LDS copy as wide and
     as coalesced as the whole-tile copy it replaces.
 
@@ -406,7 +406,7 @@ def _merge_ds_read_frags(mem, mfma, tc, operand: gl.constexpr):
         return mem
     else:
         out = ()
-        for i in gl.static_range(tc.num_mini_k()):
+        for i in gl.static_range(tc.num_k_slots_per_tile()):
             if require_constexpr(tc.ds_read_in_mfma(operand)):
                 payload = mfma[2 * i]
             else:
@@ -445,9 +445,9 @@ def _drain_last_fused(
     computed, which is why it takes ``GATE_PRE`` to skip recomputing it.
     """
     tc: gl.constexpr = pc.tuning_cfg
-    NM: gl.constexpr = tc.num_mini_m()
-    NN: gl.constexpr = tc.num_mini_n()
-    PF_MINI: gl.constexpr = tc.num_prefetch_mini()
+    NM: gl.constexpr = tc.num_m_slots_per_block()
+    NN: gl.constexpr = tc.num_n_slots_per_block()
+    PF_MINI: gl.constexpr = tc.num_prefetch_k_slots()
     act: gl.constexpr = func_cfg.act()
     gl.static_assert(func_cfg.gu_split() and NN == 2)
 
@@ -561,7 +561,7 @@ def _moe_gemm_body(
     # per-fill pointer bumps (K is the contiguous axis of every operand)
     a_step: gl.constexpr = tuning_cfg.payload_hbm_step(0)
     b_step: gl.constexpr = tuning_cfg.payload_hbm_step(1)
-    s_step: gl.constexpr = tuning_cfg.scale_stage_k()
+    s_step: gl.constexpr = tuning_cfg.scale_block_k_storage()
 
     hbm_ptrs = _PipelinePointers(
         a.ptr,
@@ -613,7 +613,7 @@ def _moe_gemm_body(
     # Shallower streams finish their remaining fills during the drain. The final
     # MFMA is separate and consumes only the fragments already in registers.
     # Fuse its activation where supported by the live step.
-    FUSE: gl.constexpr = func_cfg.gu_split() and tuning_cfg.num_mini_n() == 2
+    FUSE: gl.constexpr = func_cfg.gu_split() and tuning_cfg.num_n_slots_per_block() == 2
     regs = _drain_buffered_pipeline(pc, hbm_ptrs, buffers, regs, NUM_K, epi.groups)
     if require_constexpr(not FUSE):
         regs = _PipelineRegFragments(

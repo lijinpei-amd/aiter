@@ -550,7 +550,7 @@ class KernelTuningConfig(_KernelTuningLayout):
             f"MANUAL {int(WarpPipeline.MANUAL)}"
         )
         if self.warp_pipeline_enabled():
-            assert self.num_prefetch_mini() == self.num_mini_k(), (
+            assert self.num_prefetch_k_slots() == self.num_k_slots_per_tile(), (
                 f"WARP_PIPELINE needs VGPR_PREFETCH_K == BLOCK_K (got "
                 f"{_v(self.VGPR_PREFETCH_K)} vs {BK}): with a partial window the slot's "
                 "MFMAs depend on the slot's own ds_read and there is no mem stage to "

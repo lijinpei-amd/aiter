@@ -97,10 +97,10 @@ class _Config(_ScheduleConfig):
             self._peeled = _pipeline_peeled(self)
         return self._peeled
 
-    def num_mini_k(self):
+    def num_k_slots_per_tile(self):
         return 1 if self.packed else 2
 
-    num_prefetch_mini = num_mini_k
+    num_prefetch_k_slots = num_k_slots_per_tile
 
     def scale_packed_k128(self, operand):
         return self.packed and self.has_scale(operand)
@@ -187,7 +187,7 @@ class _Machine:
         assert token not in self.loads, "HBM tile loaded more than once"
         self.loads.add(token)
         fragments = tuple(
-            _Fragment(kind, tile, mini, k) for k in range(tc.num_mini_k())
+            _Fragment(kind, tile, mini, k) for k in range(tc.num_k_slots_per_tile())
         )
         if kind % 2 and tc.packed:
             even = tile - tile % 2
@@ -195,7 +195,7 @@ class _Machine:
                 _Packed(
                     _Fragment(kind, even, mini, k), _Fragment(kind, even + 1, mini, k)
                 )
-                for k in range(tc.num_mini_k())
+                for k in range(tc.num_k_slots_per_tile())
             )
         if tc.is_async(kind):
             key = kind, mini, ring
@@ -355,7 +355,7 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         return tuple(
             (
                 (None,)
-                * (tc.depths[kind] * (tc.nm if kind < 2 else tc.nn) * tc.num_mini_k())
+                * (tc.depths[kind] * (tc.nm if kind < 2 else tc.nn) * tc.num_k_slots_per_tile())
                 if kind in tc.active_kinds() and not tc.is_async(kind)
                 else ()
             )

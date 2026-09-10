@@ -24,12 +24,12 @@ def _register_load_copy(
     # Unused staging allocations must disappear from the compiled kernel.
     lds = LDSManager.alloc(tc.func_cfg, tc)
     if SCALE:
-        shape: gl.constexpr = tc.scale_shape(operand)
+        shape: gl.constexpr = tc.scale_shape_slot(operand)
         layout: gl.constexpr = tc.dot_operand_scale_fragment_layout(operand)
         k_dim: gl.constexpr = 1
         width: gl.constexpr = tc.MINI_BLOCK_K // 32
     else:
-        shape: gl.constexpr = tc.lds_shape(operand)
+        shape: gl.constexpr = tc.payload_lds_shape_slot(operand)
         layout: gl.constexpr = tc.dot_operand_fragment_layout(operand)
         k_dim: gl.constexpr = 1 - operand
         width: gl.constexpr = tc.MINI_BLOCK_K // tc.func_cfg.pack_divisor(operand)
@@ -40,7 +40,7 @@ def _register_load_copy(
         fragments = lds.buffer_load_scale(operand, False, None, 0, src, offsets, 16)
     else:
         fragments = lds.buffer_load_payload(operand, False, None, 0, src, offsets, 16)
-    for mini in gl.static_range(tc.num_mini_k()):
+    for mini in gl.static_range(tc.num_k_slots_per_tile()):
         if k_dim == 0:
             fragment_offsets = gl.amd.slice(
                 offsets, [width, shape[1]], [mini * width, 0]
@@ -69,7 +69,7 @@ def test_register_load_does_not_stage_through_lds(operand, scale, mini_k):
         B_SCALE_SHUFFLED=False,
     )
     tc = host._probe_tuning_config(config, DtypeQuant.MXFP4, DtypeQuant.MXFP4)
-    shape = tc.scale_shape(operand) if scale else tc.lds_shape(operand)
+    shape = tc.scale_shape_slot(operand) if scale else tc.payload_lds_shape_slot(operand)
     elements = shape[0] * shape[1]
     src = (torch.arange(elements + 16, device="cuda") % 251).to(torch.uint8)
     dst = torch.empty(elements, dtype=torch.uint8, device="cuda")

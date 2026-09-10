@@ -52,13 +52,13 @@ class _ScheduleConfig:
     def b_has_scale(self):
         return self.scales[1]
 
-    def num_mini_m(self):
+    def num_m_slots_per_block(self):
         return self.nm
 
-    def num_mini_n(self):
+    def num_n_slots_per_block(self):
         return self.nn
 
-    def num_lds_tiles(self, idx):
+    def num_lds_slots_per_block_non_k(self, idx):
         return (self.nm, self.nn)[idx]
 
     def payload_via_lds(self, idx):
@@ -215,7 +215,7 @@ def _trace_emitter(tc, monkeypatch, defer_stage_commit=False):
     tc.pipeline_register_period = lambda: (
         3 if any(tc.has_scale(op) and not tc.scale_via_lds(op) for op in (0, 1)) else 1
     )
-    tc.num_mini_k = lambda: 1
+    tc.num_k_slots_per_tile = lambda: 1
     tc.pipeline_depth = lambda: 3
     tc.operand_elem_ty = lambda operand: SimpleNamespace(primitive_bitwidth=8)
     tc.scale_hbm_steps = lambda operand, steps, phase: steps
@@ -380,7 +380,7 @@ def test_register_only_slots_need_no_cooperative_fence(scheme, monkeypatch):
 
     waits, barriers = [], []
     tc = _config((4, 2), scheme, False, "register-payloads")
-    tc.num_mini_k = lambda: 1
+    tc.num_k_slots_per_tile = lambda: 1
     tc.pipeline_depth = lambda: 3
     tc.warp_pipeline_compiler = lambda: False
     tc.commit_per_stage_warp_pipeline = lambda: (
@@ -443,7 +443,7 @@ def test_pipeline_stage_commit_boundaries(
 
     events = []
     tc = _config((2, 2), scheme, False, "no-scales")
-    tc.num_mini_k = lambda: 1
+    tc.num_k_slots_per_tile = lambda: 1
     tc.pipeline_depth = lambda: 3
     tc.warp_pipeline_compiler = lambda: compiler
     tc.commit_per_stage_warp_pipeline = lambda: (

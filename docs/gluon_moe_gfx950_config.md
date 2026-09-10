@@ -19,9 +19,9 @@ dimensions as four constexpr arguments. `_pipeline.py` implements the live drive
 shared and independent component depths together with its compile-time issue history
 and waits. `_frozen.py` owns the preserved LDS,
 dot, pipeline-state, loop, drain, and final-MFMA path.
-`_offsets.py` computes A/B HBM offsets and mini-tile
-indices, and `_epilogue.py` owns output activation, quantization, staging, and
-stores. The host launch API is unchanged.
+`_layout.py` owns operation shapes, data layouts, A/B HBM offsets, and slot indices;
+`_epilogue.py` owns output activation, quantization, staging, and stores. The host
+launch API is unchanged.
 
 ## Tuning options
 

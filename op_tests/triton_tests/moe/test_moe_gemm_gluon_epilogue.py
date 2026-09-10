@@ -77,7 +77,7 @@ def _epilogue_config(split, num_warps):
 @gluon.jit
 def _staging_bytes(block_id, pid_n, mi, ni, epoch, func, tuning):
     RFL: gl.constexpr = tuning.dot_result_fragment_layout()
-    REDUCTION: gl.constexpr = func.mini_n_reduction()
+    REDUCTION: gl.constexpr = func.n_reduction_slot()
     OUT_N: gl.constexpr = 128 // REDUCTION
     rows = block_id * 128 + mi * 64 + gl.arange(
         0, 64, layout=gl.SliceLayout(1, RFL)
