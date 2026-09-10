@@ -74,7 +74,6 @@ from aiter.ops.triton.utils.common_utils import strip_annotate
 
 from ._config import KernelFuncConfig, KernelTuningConfig
 from ._epilogue import _epi_bias_tiles, _epilogue_store, _stage_epilogue_inputs
-from ._lang import MX_GROUP_CE as MX_GROUP
 from ._lang import optional as _opt
 from ._lang import require_constexpr
 from ._lang import unwrap as _v
@@ -119,32 +118,13 @@ _DK_MFMA_SCALED: gl.constexpr = gl.constexpr(int(DotKind.MFMA_SCALED))
 _DK_UPCAST_MFMA: gl.constexpr = gl.constexpr(int(DotKind.UPCAST_MFMA))
 
 
-@gluon.constexpr_function
-def _packed_sel(tuning_cfg, idx, k_phase=0):
-    """The byte-selector list for a pre-packed scale operand, or None if it is not."""
-    if tuning_cfg.num_mini_k() > 1:
-        return None
-    if tuning_cfg.scale_packed_ok(idx) and (
-        tuning_cfg.scale_via_lds(idx) or tuning_cfg.scale_packed_k128(idx)
-    ):
-        return tuning_cfg.scale_packed_sel(idx, k_phase)
-    return None
-
-
-@gluon.constexpr_function
-def _any_packed(tuning_cfg):
-    return (
-        _packed_sel(tuning_cfg, 0) is not None or _packed_sel(tuning_cfg, 1) is not None
-    )
-
-
 @gluon.jit
 def _dot(a, a_scale, b, b_scale, acc, func_cfg, tuning_cfg, K_PHASE: gl.constexpr = 0):
     """The one matrix instruction, dispatched on the operand pair."""
     kind: gl.constexpr = func_cfg.dot_kind()
-    a_sel: gl.constexpr = _packed_sel(tuning_cfg, 0, K_PHASE)
-    b_sel: gl.constexpr = _packed_sel(tuning_cfg, 1, K_PHASE)
-    any_packed: gl.constexpr = _any_packed(tuning_cfg)
+    a_sel: gl.constexpr = tuning_cfg.mfma_scale_selector(0, K_PHASE)
+    b_sel: gl.constexpr = tuning_cfg.mfma_scale_selector(1, K_PHASE)
+    any_packed: gl.constexpr = tuning_cfg.has_mfma_packed_scale()
     if require_constexpr(kind == _DK_MFMA_SCALED and any_packed):
         # At least one scale tile arrived as pre-packed dwords; the other, if any,
         # takes the ordinary path through the same instruction.
@@ -519,11 +499,6 @@ def _moe_gemm_body(
     gl.static_assert(tuning_cfg.validate(N, K))
     gl.static_assert(_validate_pipeline(tuning_cfg, K))
 
-    BK: gl.constexpr = tuning_cfg.BLOCK_K
-    PK_A: gl.constexpr = BK // func_cfg.a_pack_divisor()
-    PK_B: gl.constexpr = BK // func_cfg.b_pack_divisor()
-    SK: gl.constexpr = BK // MX_GROUP
-
     pid = gl.program_id(0)
     if require_constexpr(tuning_cfg.TILE_SCHED == _TS_XCD_GROUP_M):
         # Drop the padded tiles first so the swizzle is a bijection over real work; a
@@ -584,11 +559,9 @@ def _moe_gemm_body(
     lds_ptrs = LDSManager.alloc(func_cfg, tuning_cfg)
 
     # per-fill pointer bumps (K is the contiguous axis of every operand)
-    a_step: gl.constexpr = PK_A
-    # In the 16-column blocked layout a K stage is (BLOCK_K/2 / 16) runs of 256 B,
-    # so the stage bump is BLOCK_K * 8 rather than the BLOCK_K/2 of a plain tile.
-    b_step: gl.constexpr = PK_B // 16 * 256 if tuning_cfg.B_PRESHUFFLED else PK_B
-    s_step: gl.constexpr = SK
+    a_step: gl.constexpr = tuning_cfg.payload_hbm_step(0)
+    b_step: gl.constexpr = tuning_cfg.payload_hbm_step(1)
+    s_step: gl.constexpr = tuning_cfg.scale_stage_k()
 
     hbm_ptrs = _PipelinePointers(
         a.ptr,

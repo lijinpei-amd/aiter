@@ -6,9 +6,14 @@
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from ._lang import MX_GROUP_CE as MX_GROUP
 from ._lang import require_constexpr
 from ._lang import unwrap as _v
+from ._layout import (
+    _blocked_b_hbm_offsets,
+    _n_start,
+    _shuffled_scale_register_offsets,
+    _shuffled_scale_stage_offsets,
+)
 
 _NO_SCALE: gl.constexpr = gl.constexpr(None)
 
@@ -67,78 +72,13 @@ def _gather_rows(
 
 
 @gluon.jit
-def _n_start(pid_n, ni: gl.constexpr, N, func_cfg, tuning_cfg):
-    """Raw-N index where mini-N block ``ni`` of CTA column ``pid_n`` begins.
-
-    The one place the gate/up packing is expressed. Interleaved, the CTA tile is a
-    contiguous ``BLOCK_N`` run and mini blocks slice it. Split, a CTA owns
-    ``MINI_BLOCK_N`` *emitted* channels and reads each side from its own half of N, so
-    the two mini blocks are ``N/2`` apart -- their tiles land at the same emitted
-    channels, which is what lets the epilogue pair them elementwise.
-
-    Everything downstream of this addresses a plain global ``n``: the 16-column
-    preshuffle in :func:`_blocked_b_hbm_offsets`, both scale shuffles and every LDS tile are
-    unchanged by the choice.
-    """
-    BN: gl.constexpr = tuning_cfg.BLOCK_N
-    MBN: gl.constexpr = tuning_cfg.MINI_BLOCK_N
-    if require_constexpr(func_cfg.gu_split()):
-        out = pid_n * MBN + ni * (N // 2)
-    else:
-        out = pid_n * BN + ni * MBN
-    return out
-
-
-@gluon.jit
-def _n_split_offs(pid_n, i, N, func_cfg, tuning_cfg):
-    """:func:`_n_start` for a whole-BLOCK_N index tensor ``i`` in ``[0, BLOCK_N)``.
-
-    Same mapping, expressed elementwise, for the bias staging copy that addresses the
-    CTA tile as one run. Uniform arithmetic on a loop-invariant tensor is hoisted.
-    """
-    MBN: gl.constexpr = tuning_cfg.MINI_BLOCK_N
-    if require_constexpr(func_cfg.gu_split()):
-        out = pid_n * MBN + (i // MBN) * (N // 2) + i % MBN
-    else:
-        out = pid_n * tuning_cfg.BLOCK_N + i
-    return out
-
-
-@gluon.jit
-def _blocked_b_hbm_offsets(
-    layout: gl.constexpr,
-    PK_B: gl.constexpr,
-    n0,
-    MBN: gl.constexpr,
-    KB,
-):
-    """Byte offsets of one B mini tile in a 16-column-blocked weight tensor.
-
-    ``utils/shuffle.py::shuffle_weight(w, (16, 16))`` moves byte ``(n, k)`` of an expert
-    to ``(n//16)*(KB*16) + (k//16)*256 + (n%16)*16 + k%16``, where ``KB`` is the stored
-    (packed) K extent. ``k`` here is the byte *within the stage*, which is what the
-    caller's per-stage pointer bump of ``PK_B // 16 * 256`` makes correct.
-
-    The copy layout matches the direct-to-LDS tile's ``byte_unit_lds_layout``
-    permutation.
-    """
-    kk = gl.arange(0, PK_B, layout=gl.SliceLayout(1, layout))[:, None]
-    nn = (n0 + gl.arange(0, MBN, layout=gl.SliceLayout(0, layout)))[None, :]
-    return (nn // 16) * (KB * 16) + (kk // 16) * 256 + (nn % 16) * 16 + kk % 16
-
-
-@gluon.jit
 def _a_payload_hbm_offsets(a, rt, block_id, M_e, start_m, func_cfg, tuning_cfg):
     """Gathered A payload offsets, one copy-layout grid per mini-M tile."""
     BM: gl.constexpr = tuning_cfg.BLOCK_M
     MBM: gl.constexpr = tuning_cfg.MINI_BLOCK_M
     NM: gl.constexpr = tuning_cfg.num_mini_m()
-    PK_A: gl.constexpr = tuning_cfg.BLOCK_K // func_cfg.a_pack_divisor()
-    cl_a: gl.constexpr = (
-        tuning_cfg.dot_operand_copy_layout(0)
-        if tuning_cfg.payload_via_lds(0)
-        else tuning_cfg.dot_operand_fragment_layout(0)
-    )
+    PK_A: gl.constexpr = tuning_cfg.payload_stage_k(0)
+    cl_a: gl.constexpr = tuning_cfg.payload_hbm_offset_layout(0)
     a_hbm_offs = ()
     for mi in gl.static_range(NM):
         rows_a = _gather_rows(
@@ -165,11 +105,8 @@ def _b_payload_hbm_offsets(b, pid_n, N, K, func_cfg, tuning_cfg):
     """B payload offsets for plain or preshuffled weights, per mini-N tile."""
     MBN: gl.constexpr = tuning_cfg.MINI_BLOCK_N
     NN: gl.constexpr = tuning_cfg.num_mini_n()
-    PK_B: gl.constexpr = tuning_cfg.BLOCK_K // func_cfg.b_pack_divisor()
-    if require_constexpr(tuning_cfg.payload_via_lds(1)):
-        cl_b: gl.constexpr = tuning_cfg.dot_operand_copy_layout(1)
-    else:
-        cl_b: gl.constexpr = tuning_cfg.dot_operand_fragment_layout(1)
+    PK_B: gl.constexpr = tuning_cfg.payload_stage_k(1)
+    cl_b: gl.constexpr = tuning_cfg.payload_hbm_offset_layout(1)
     KB: gl.constexpr = K // func_cfg.b_pack_divisor()
     b_hbm_offs = ()
     for ni in gl.static_range(NN):
@@ -197,40 +134,6 @@ def _b_payload_hbm_offsets(b, pid_n, N, K, func_cfg, tuning_cfg):
 
 
 @gluon.jit
-def _shuffled_scale_register_offsets(
-    layout: gl.constexpr,
-    nonk0,
-    NONK: gl.constexpr,
-    SK: gl.constexpr,
-    K,
-    PACKED_K128: gl.constexpr = False,
-):
-    """Logical scale grid in the CDNA4_SCALE / SORTED_SHUFFLED byte order.
-
-    Each 32-row stripe stores 256 K values' scales in 256 bytes. Within a
-    dword, non-K +16 advances one byte and K +128 advances two bytes. K128
-    stages load the complete packed word, matching the LDS scale representation.
-    """
-    if require_constexpr(PACKED_K128):
-        rr = gl.arange(0, NONK, layout=gl.SliceLayout(1, layout))[:, None]
-        cc = gl.arange(0, 2, layout=gl.SliceLayout(0, layout))[None, :]
-        word = rr * 2 + cc
-        offsets = (nonk0 // 32 + word // 64) * K + (word % 64) * 4
-    else:
-        nn = nonk0 + gl.arange(0, NONK, layout=gl.SliceLayout(1, layout))[:, None]
-        kk = gl.arange(0, SK, layout=gl.SliceLayout(0, layout))[None, :]
-        offsets = (
-            (nn // 32) * K
-            + (kk // 8) * 256
-            + (kk % 4) * 64
-            + (nn % 16) * 4
-            + ((kk % 8) // 4) * 2
-            + (nn % 32) // 16
-        )
-    return offsets
-
-
-@gluon.jit
 def _a_scale_hbm_offsets(a, rt, block_id, M_e, start_m, pid_m, K, func_cfg, tuning_cfg):
     """Byte offsets of the A scale tiles, one per mini-M block (``None`` if unscaled).
 
@@ -244,15 +147,8 @@ def _a_scale_hbm_offsets(a, rt, block_id, M_e, start_m, pid_m, K, func_cfg, tuni
     BM: gl.constexpr = tuning_cfg.BLOCK_M
     MBM: gl.constexpr = tuning_cfg.MINI_BLOCK_M
     NM: gl.constexpr = tuning_cfg.num_mini_m()
-    SK: gl.constexpr = tuning_cfg.BLOCK_K // MX_GROUP
-    if require_constexpr(tuning_cfg.scale_via_lds(0)):
-        asl: gl.constexpr = tuning_cfg.dot_operand_scale_copy_layout(0)
-    elif require_constexpr(tuning_cfg.scale_packed_k128(0)):
-        asl: gl.constexpr = tuning_cfg.packed_scale_frag_layout(0)
-    elif require_constexpr(tuning_cfg.scale_shuffled(0)):
-        asl: gl.constexpr = tuning_cfg.shuffled_scale_mem_layout(0)
-    else:
-        asl: gl.constexpr = tuning_cfg.dot_operand_scale_fragment_layout(0)
+    SK: gl.constexpr = tuning_cfg.scale_stage_k()
+    asl: gl.constexpr = tuning_cfg.scale_hbm_offset_layout(0)
 
     if require_constexpr(
         tuning_cfg.scale_shuffled(0) and not tuning_cfg.scale_via_lds(0)
@@ -298,12 +194,15 @@ def _a_scale_hbm_offsets(a, rt, block_id, M_e, start_m, pid_m, K, func_cfg, tuni
         SA: gl.constexpr = tuning_cfg.scale_flat_shape(0)
         RA: gl.constexpr = tuning_cfg.scale_tile_ratio_a()
         SMM: gl.constexpr = tuning_cfg.scale_mini_m()
-        sa = gl.arange(0, SA[0], layout=gl.SliceLayout(1, asl))[:, None]
-        ja = gl.arange(0, SA[1], layout=gl.SliceLayout(0, asl))[None, :]
         a_scale_hbm_offs = ()
         for mi in gl.static_range(NM):
             a_scale_hbm_offs = a_scale_hbm_offs + (
-                (pid_m * (BM // 32) + (mi // RA) * (SMM // 32) + sa) * K + ja,
+                _shuffled_scale_stage_offsets(
+                    asl,
+                    pid_m * BM + (mi // RA) * SMM,
+                    SA[0],
+                    K,
+                ),
             )
     else:
         a_scale_hbm_offs = ()
@@ -339,16 +238,8 @@ def _b_scale_hbm_offsets(b, pid_n, N, K, func_cfg, tuning_cfg):
 
     MBN: gl.constexpr = tuning_cfg.MINI_BLOCK_N
     NN: gl.constexpr = tuning_cfg.num_mini_n()
-    SK: gl.constexpr = tuning_cfg.BLOCK_K // MX_GROUP
-    if require_constexpr(tuning_cfg.scale_via_lds(1)):
-        bsl: gl.constexpr = tuning_cfg.dot_operand_scale_copy_layout(1)
-    elif require_constexpr(tuning_cfg.scale_packed_k128(1)):
-        bsl: gl.constexpr = tuning_cfg.packed_scale_frag_layout(1)
-    elif require_constexpr(tuning_cfg.scale_shuffled(1)):
-        # address-ordered, so the widened load fills registers correctly
-        bsl: gl.constexpr = tuning_cfg.shuffled_scale_mem_layout(1)
-    else:
-        bsl: gl.constexpr = tuning_cfg.dot_operand_scale_fragment_layout(1)
+    SK: gl.constexpr = tuning_cfg.scale_stage_k()
+    bsl: gl.constexpr = tuning_cfg.scale_hbm_offset_layout(1)
 
     if require_constexpr(
         tuning_cfg.scale_shuffled(1) and not tuning_cfg.scale_via_lds(1)
@@ -374,12 +265,15 @@ def _b_scale_hbm_offsets(b, pid_n, N, K, func_cfg, tuning_cfg):
         # One tile per mini-N block; stripes are contiguous, so block ni starts
         # ni * (MBN // 32) stripes into this pid_n's run. Same slicing as the A side.
         SB: gl.constexpr = tuning_cfg.scale_flat_shape(1)
-        sb = gl.arange(0, SB[0], layout=gl.SliceLayout(1, bsl))[:, None]
-        jb = gl.arange(0, SB[1], layout=gl.SliceLayout(0, bsl))[None, :]
         b_scale_hbm_offs = ()
         for ni in gl.static_range(NN):
             b_scale_hbm_offs = b_scale_hbm_offs + (
-                (_n_start(pid_n, ni, N, func_cfg, tuning_cfg) // 32 + sb) * K + jb,
+                _shuffled_scale_stage_offsets(
+                    bsl,
+                    _n_start(pid_n, ni, N, func_cfg, tuning_cfg),
+                    SB[0],
+                    K,
+                ),
             )
     else:
         b_scale_hbm_offs = ()
