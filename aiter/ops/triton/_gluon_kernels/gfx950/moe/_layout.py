@@ -262,9 +262,10 @@ def _shuffled_scale_stage_offsets(
     """Flat HBM offsets for shuffled scales starting at logical non-K row ``nonk0``."""
     stripe = gl.arange(0, stripes, layout=gl.SliceLayout(1, layout))[:, None]
     byte = gl.arange(0, scale_mini_k, layout=gl.SliceLayout(0, layout))[None, :]
+    if require_constexpr(not split_extent):
+        return (nonk0 // 32 + stripe) * K + byte
     row = stripe * 32
-    if require_constexpr(split_extent):
-        row = row // split_extent * split_stride + row % split_extent
+    row = row // split_extent * split_stride + row % split_extent
     return ((nonk0 + row) // 32) * K + byte
 
 
@@ -541,6 +542,9 @@ def _b_scale_hbm_offsets(b, pid_n, N, K, func_cfg, tuning_cfg):
     SCALE_N: gl.constexpr = tuning_cfg.scale_mini_block_nonk(1)
     SCALE_K: gl.constexpr = tuning_cfg.scale_mini_block_k(1)
     SCALE_RATIO: gl.constexpr = tuning_cfg.scale_tile_ratio(1)
+    SPLIT_EXTENT: gl.constexpr = (
+        N_SLOT if func_cfg.gu_split() and SCALE_RATIO > 1 else 0
+    )
 
     if require_constexpr(
         tuning_cfg.scale_shuffled(1) and not tuning_cfg.scale_via_lds(1)
@@ -561,7 +565,7 @@ def _b_scale_hbm_offsets(b, pid_n, N, K, func_cfg, tuning_cfg):
                     SCALE_K // 32,
                     K,
                     tuning_cfg.scale_packed_ok(1),
-                    N_SLOT if func_cfg.gu_split() else 0,
+                    SPLIT_EXTENT,
                     N // 2,
                 ),
             )
@@ -589,7 +593,7 @@ def _b_scale_hbm_offsets(b, pid_n, N, K, func_cfg, tuning_cfg):
                     SCALE_FILL_SHAPE[0],
                     K,
                     SCALE_K,
-                    N_SLOT if func_cfg.gu_split() else 0,
+                    SPLIT_EXTENT,
                     N // 2,
                 ),
             )
@@ -1669,8 +1673,10 @@ class _KernelTuningLayout:
             assert K % sk == 0, "K must contain complete SCALE_MINI_BLOCK_K tiles"
             assert self.pipeline_unroll() % self.scale_step_ratio(idx) == 0
             if _v(self.FROZEN_STEP):
-                assert sk == BK and self.scale_tile_ratio(idx) == 1, (
-                    "independent scale mini blocks require the live pipeline"
+                assert BK == 256 and sk == BK and self.scale_tile_ratio(idx) == 1, (
+                    "FROZEN_STEP shuffled scales require BLOCK_K == "
+                    "SCALE_MINI_BLOCK_K == 256 and one scale tile per payload slot; "
+                    "use the live pipeline for independent scale mini blocks"
                 )
 
         # -- the slot is the unit of LDS allocation, of the global->LDS copy, of the

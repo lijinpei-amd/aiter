@@ -86,6 +86,20 @@ def test_invalid_shuffled_scale_minis_are_rejected(field, value):
         _config(**{field: value}).validate(4096, 7168)
 
 
+def test_frozen_shuffled_scales_reject_k_wider_than_256():
+    tc = _config(
+        BLOCK_K=512,
+        MINI_BLOCK_K=128,
+        SCALE_MINI_BLOCK_K=512,
+        VGPR_PREFETCH_K=512,
+        FROZEN_STEP=True,
+    )
+    with pytest.raises(
+        AssertionError, match="BLOCK_K == SCALE_MINI_BLOCK_K == 256"
+    ):
+        tc.validate(4096, 7168)
+
+
 @pytest.mark.parametrize(
     "block_k,mini_k,scale_k",
     [(128, 128, 256), (128, 128, 512), (256, 128, 512), (512, 128, 256)],
