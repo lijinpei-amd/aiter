@@ -215,6 +215,7 @@ class KernelFuncConfig(_KernelFuncShape):
             return gl.float8e4nv
         return gl.uint8
 
+
 @aggregate
 @strip_annotate
 class KernelTuningConfig(_KernelTuningLayout):
@@ -268,6 +269,9 @@ class KernelTuningConfig(_KernelTuningLayout):
     B_NUM_BUFFER: gl.constexpr
     A_SCALE_NUM_BUFFER: gl.constexpr
     B_SCALE_NUM_BUFFER: gl.constexpr
+    SCALE_MINI_BLOCK_M: gl.constexpr
+    SCALE_MINI_BLOCK_N: gl.constexpr
+    SCALE_MINI_BLOCK_K: gl.constexpr
 
     @gluon.constexpr_function
     def __init__(
@@ -318,6 +322,9 @@ class KernelTuningConfig(_KernelTuningLayout):
         B_NUM_BUFFER=0,
         A_SCALE_NUM_BUFFER=0,
         B_SCALE_NUM_BUFFER=0,
+        SCALE_MINI_BLOCK_M=0,
+        SCALE_MINI_BLOCK_N=0,
+        SCALE_MINI_BLOCK_K=0,
     ):
         self.func_cfg = func_cfg
         self.BLOCK_M = gl.constexpr(_v(BLOCK_M))
@@ -354,15 +361,11 @@ class KernelTuningConfig(_KernelTuningLayout):
         self.DS_READ_A_PAYLOAD_IN_MFMA = gl.constexpr(
             bool(_v(DS_READ_A_PAYLOAD_IN_MFMA))
         )
-        self.DS_READ_A_SCALE_IN_MFMA = gl.constexpr(
-            bool(_v(DS_READ_A_SCALE_IN_MFMA))
-        )
+        self.DS_READ_A_SCALE_IN_MFMA = gl.constexpr(bool(_v(DS_READ_A_SCALE_IN_MFMA)))
         self.DS_READ_B_PAYLOAD_IN_MFMA = gl.constexpr(
             bool(_v(DS_READ_B_PAYLOAD_IN_MFMA))
         )
-        self.DS_READ_B_SCALE_IN_MFMA = gl.constexpr(
-            bool(_v(DS_READ_B_SCALE_IN_MFMA))
-        )
+        self.DS_READ_B_SCALE_IN_MFMA = gl.constexpr(bool(_v(DS_READ_B_SCALE_IN_MFMA)))
         self.SCHED_MODE = gl.constexpr(int(_v(SCHED_MODE)))
         self.FROZEN_STEP = gl.constexpr(bool(_v(FROZEN_STEP)))
         self.SOFF_UNROLL = gl.constexpr(bool(_v(SOFF_UNROLL)))
@@ -374,6 +377,9 @@ class KernelTuningConfig(_KernelTuningLayout):
         self.B_NUM_BUFFER = gl.constexpr(int(_v(B_NUM_BUFFER)))
         self.A_SCALE_NUM_BUFFER = gl.constexpr(int(_v(A_SCALE_NUM_BUFFER)))
         self.B_SCALE_NUM_BUFFER = gl.constexpr(int(_v(B_SCALE_NUM_BUFFER)))
+        self.SCALE_MINI_BLOCK_M = gl.constexpr(int(_v(SCALE_MINI_BLOCK_M)))
+        self.SCALE_MINI_BLOCK_N = gl.constexpr(int(_v(SCALE_MINI_BLOCK_N)))
+        self.SCALE_MINI_BLOCK_K = gl.constexpr(int(_v(SCALE_MINI_BLOCK_K)))
 
     @gluon.constexpr_function
     def num_buffers(self, operand, scale=False):
@@ -394,12 +400,19 @@ class KernelTuningConfig(_KernelTuningLayout):
         )
 
     @gluon.constexpr_function
+    def component_span(self, operand, scale=False):
+        """Payload steps covered by one component's prefetch ring."""
+        depth = self.num_buffers(operand, scale)
+        ratio = self.scale_step_ratio(operand) if _v(scale) else 1
+        return (depth - 1) * ratio + 1
+
+    @gluon.constexpr_function
     def pipeline_depth(self):
-        """Largest ring among the components present in the operand dtypes."""
+        """Largest prefetch span, measured in payload steps, of active components."""
         depth = max(self.num_buffers(0), self.num_buffers(1))
         for operand in (0, 1):
             if self.func_cfg.has_scale(operand):
-                depth = max(depth, self.num_buffers(operand, True))
+                depth = max(depth, self.component_span(operand, True))
         return depth
 
     @gluon.constexpr_function
@@ -414,15 +427,20 @@ class KernelTuningConfig(_KernelTuningLayout):
             if not self.payload_via_lds(operand):
                 period = math.lcm(period, self.num_buffers(operand))
             if self.func_cfg.has_scale(operand) and not self.scale_via_lds(operand):
-                period = math.lcm(period, self.num_buffers(operand, True))
+                period = math.lcm(
+                    period,
+                    self.num_buffers(operand, True) * self.scale_step_ratio(operand),
+                )
         return period
 
     @gluon.constexpr_function
     def pipeline_unroll(self):
-        """Smallest register-ring-compatible unroll at least as large as K_UNROLL."""
+        """Smallest unroll covering complete register rings and scale K tiles."""
         requested = _v(self.K_UNROLL)
         assert requested >= 1, "K_UNROLL must be at least 1"
         period = self.pipeline_register_period()
+        for operand in (0, 1):
+            period = math.lcm(period, self.scale_step_ratio(operand))
         return (requested + period - 1) // period * period
 
     @gluon.constexpr_function
@@ -570,9 +588,9 @@ class KernelTuningConfig(_KernelTuningLayout):
                 "handoff is a whole number of mini-K steps"
             )
             assert BK % pk == 0, f"BLOCK_K {BK} % VGPR_PREFETCH_K {pk} != 0"
-            assert (
-                pk % _v(self.MINI_BLOCK_K) == 0
-            ), f"VGPR_PREFETCH_K {pk} % MINI_BLOCK_K {_v(self.MINI_BLOCK_K)} != 0"
+            assert pk % _v(self.MINI_BLOCK_K) == 0, (
+                f"VGPR_PREFETCH_K {pk} % MINI_BLOCK_K {_v(self.MINI_BLOCK_K)} != 0"
+            )
 
         # -- commit-group granularity --
         # Reject unknown schemes before building the shared copy/group schedule.

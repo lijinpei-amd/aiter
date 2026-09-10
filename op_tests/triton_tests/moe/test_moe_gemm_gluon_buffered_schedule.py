@@ -39,7 +39,9 @@ class _Config(_ScheduleConfig):
         read_mask=0,
         middle=False,
         unroll=3,
-        soff=False
+        soff=False,
+        scale_steps=None,
+        scale_tiles=(1, 1),
     ):
         super().__init__(*shape, scheme, middle)
         self.depths = depths  # A, A scale, B, B scale.
@@ -51,6 +53,8 @@ class _Config(_ScheduleConfig):
         self.scale_async = (not bool(register_mask & 2), not bool(register_mask & 4))
         self.B_IN_REG = bool(register_mask & 1)
         self.packed = packed
+        self.scale_steps = scale_steps or ((2, 2) if packed else (1, 1))
+        self.scale_tiles = scale_tiles
         self.read_mask = read_mask
         self.unroll = unroll
         self.SOFF_UNROLL = soff
@@ -58,6 +62,7 @@ class _Config(_ScheduleConfig):
         self.SCHED_MODE = 0
         self.MINI_BLOCK_M = self.MINI_BLOCK_N = 1
         self.MINI_BLOCK_K = 128 if packed else 256
+        self.BLOCK_K = self.MINI_BLOCK_K * self.num_k_slots_per_tile()
         self.mma_acc_dtype = None
         self.output_quant = None
 
@@ -65,7 +70,15 @@ class _Config(_ScheduleConfig):
         return self.depths[operand * 2 + bool(scale)]
 
     def pipeline_depth(self):
-        return max(self.depths[kind] for kind in self.active_kinds())
+        return max(
+            self.component_span(kind // 2, bool(kind % 2))
+            for kind in self.active_kinds()
+        )
+
+    def component_span(self, operand, scale=False):
+        return (self.num_buffers(operand, scale) - 1) * (
+            self.scale_step_ratio(operand) if scale else 1
+        ) + 1
 
     def active_kinds(self):
         return tuple(
@@ -83,13 +96,14 @@ class _Config(_ScheduleConfig):
         return math.lcm(
             *(
                 self.depths[kind]
+                * (self.scale_step_ratio(kind // 2) if kind % 2 else 1)
                 for kind in self.active_kinds()
                 if not self.is_async(kind)
             )
         )
 
     def pipeline_unroll(self):
-        period = self.pipeline_register_period()
+        period = math.lcm(self.pipeline_register_period(), *self.scale_steps)
         return math.ceil(self.unroll / period) * period
 
     def pipeline_peeled(self):
@@ -102,11 +116,23 @@ class _Config(_ScheduleConfig):
 
     num_prefetch_k_slots = num_k_slots_per_tile
 
-    def scale_packed_k128(self, operand):
-        return self.packed and self.has_scale(operand)
+    def scale_step_ratio(self, operand):
+        return self.scale_steps[operand] if self.has_scale(operand) else 1
+
+    def scale_tile_ratio(self, operand):
+        return self.scale_tiles[operand]
+
+    def scale_read_k_slots(self, operand):
+        return self.num_k_slots_per_tile() * self.scale_step_ratio(operand)
+
+    def scale_cache_fragments(self, operand):
+        return self.num_lds_slots_per_block_non_k(operand) * self.scale_read_k_slots(
+            operand
+        )
 
     def scale_hbm_steps(self, operand, steps, phase):
-        return (steps + phase) // 2 * 2 if self.scale_packed_k128(operand) else steps
+        ratio = self.scale_step_ratio(operand)
+        return (steps + phase) // ratio * ratio
 
     def operand_elem_ty(self, operand):
         return SimpleNamespace(primitive_bitwidth=8)
@@ -141,19 +167,6 @@ class _Fragment:
         return self
 
 
-@dataclass(frozen=True)
-class _Packed:
-    low: _Fragment
-    high: _Fragment
-
-    def to(self, dtype):
-        return self
-
-    def __rshift__(self, bits):
-        assert bits in (0, 16)
-        return self.high if bits else self.low
-
-
 def _pointers(a, b, a_scale, b_scale):
     return SimpleNamespace(
         a_hbm_ptr=a, b_hbm_ptr=b, a_scale_hbm_ptr=a_scale, b_scale_hbm_ptr=b_scale
@@ -178,25 +191,23 @@ class _Machine:
         self.lds = {}
         self.steps = []
 
-    def load(self, kind, ring, mini, pointer, phase=0):
+    def load(self, kind, ring, mini, pointer):
         tc = self.tc
-        tile = pointer + phase if kind % 2 and tc.packed else pointer
+        tile = pointer
+        ratio = tc.scale_step_ratio(kind // 2) if kind % 2 else 1
+        nonk = tc.scale_tile_ratio(kind // 2) if kind % 2 else 1
+        mk = tc.num_k_slots_per_tile()
         assert 0 <= tile < self.num_k, "HBM load exceeded the K strip"
-        assert tile == self.current_read + tc.depths[kind] - 1
+        assert tile == self.current_read + (tc.depths[kind] - 1) * ratio
+        assert tile % ratio == 0 and mini % nonk == 0
         token = kind, mini, tile
         assert token not in self.loads, "HBM tile loaded more than once"
         self.loads.add(token)
         fragments = tuple(
-            _Fragment(kind, tile, mini, k) for k in range(tc.num_k_slots_per_tile())
+            _Fragment(kind, tile + k // mk, mini + mn, k % mk)
+            for mn in range(nonk)
+            for k in range(mk * ratio)
         )
-        if kind % 2 and tc.packed:
-            even = tile - tile % 2
-            fragments = tuple(
-                _Packed(
-                    _Fragment(kind, even, mini, k), _Fragment(kind, even + 1, mini, k)
-                )
-                for k in range(tc.num_k_slots_per_tile())
-            )
         if tc.is_async(kind):
             key = kind, mini, ring
             if key in self.lds:
@@ -206,7 +217,7 @@ class _Machine:
                     mini,
                     old,
                 ) in self.reads, "LDS overwritten before its DS read"
-            assert ring == tile % tc.depths[kind]
+            assert ring == tile // ratio % tc.depths[kind]
             self.lds[key] = tile, fragments
             self.pending.append(token)
         return fragments
@@ -218,14 +229,9 @@ class _Machine:
         if not VIA_LDS:
             return fragments
 
-    def buffer_load_scale(
-        self, operand, VIA_LDS, ring, mini, pointer, offset, soff=0, K_PHASE=0
-    ):
+    def buffer_load_scale(self, operand, VIA_LDS, ring, mini, pointer, offset, soff=0):
         kind = operand * 2 + 1
-        phase = (
-            (self.current_read + self.tc.depths[kind] - 1) % 2 if VIA_LDS else K_PHASE
-        )
-        fragments = self.load(kind, ring, mini, pointer + soff, phase)
+        fragments = self.load(kind, ring, mini, pointer + soff)
         if not VIA_LDS:
             return fragments
 
@@ -254,11 +260,16 @@ class _Machine:
                 continue
             for target in (kind, kind + 1):
                 if target in tc.active_kinds() and tc.is_async(target):
+                    if target % 2 and (
+                        self.current_read % tc.scale_step_ratio(target // 2)
+                        or mini % tc.scale_tile_ratio(target // 2)
+                    ):
+                        continue
                     required.add((target, mini, self.current_read))
         return required
 
-    def check_wait(self, tc, stage, slot, drain=False, epilogue_groups=0):
-        actual = _wait(tc, stage, slot, drain, epilogue_groups)
+    def check_wait(self, tc, stage, slot, drain=False, epilogue_groups=0, phase=None):
+        actual = _wait(tc, stage, slot, drain, epilogue_groups, phase)
         required = self.required(slot)
         if required:
             youngest = max(
@@ -286,7 +297,7 @@ class _Machine:
         return fragments[k]
 
     def ds_read_frag(
-        self, operand, ring, mini, k, *, READ_PAYLOAD, READ_SCALE, SCALE_READ_IDX
+        self, operand, ring, mini, k, *, READ_PAYLOAD, READ_SCALE, SCALE_READ_IDX=None
     ):
         payload = self.read(operand * 2, ring, mini, k) if READ_PAYLOAD else None
         scale = (
@@ -296,24 +307,40 @@ class _Machine:
         )
         return payload, scale
 
+    def ds_read_scale(self, operand, ring, mini):
+        kind = operand * 2 + 1
+        token = kind, mini, self.current_read
+        assert token in self.completed, "Scale DS read issued before its copy completed"
+        actual, fragments = self.lds[kind, mini, ring]
+        assert actual == self.current_read
+        self.reads.add(token)
+        return fragments
+
     def dot(self, a, b, accumulator, mk, fc, tc, enabled, phase):
         if not enabled:
             return accumulator
         assert 0 <= accumulator < self.num_k
+        assert phase == accumulator * tc.BLOCK_K // 128 % 2
         for operand, fragments in enumerate((a, b)):
             for k in range(mk):
                 payload, scale = fragments[k * 2 : k * 2 + 2]
                 assert payload.kind == operand * 2 and payload.k == k
-                assert (
-                    payload.tile == accumulator
-                ), "MFMA consumed stale or overwritten registers"
+                assert payload.tile == accumulator, (
+                    "MFMA consumed stale or overwritten registers"
+                )
                 if tc.has_scale(operand):
                     assert scale == _Fragment(
                         operand * 2 + 1, accumulator, payload.mini, k
                     )
                 self.reads.add((payload.kind, payload.mini, accumulator))
                 if tc.has_scale(operand):
-                    self.reads.add((scale.kind, scale.mini, accumulator))
+                    self.reads.add(
+                        (
+                            scale.kind,
+                            scale.mini - scale.mini % tc.scale_tile_ratio(operand),
+                            accumulator - accumulator % tc.scale_step_ratio(operand),
+                        )
+                    )
         token = a[0].mini, b[0].mini, accumulator
         assert token not in self.mfmas, "K tile accumulated twice"
         self.mfmas.add(token)
@@ -336,6 +363,7 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         s_step=1,
         a_scale_stride_k=1,
         b_scale_stride_k=1,
+        num_k=num_k,
     )
     step_fn, fill_fn = pipeline._step.fn, pipeline._fill_slot.fn
 
@@ -355,7 +383,14 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         return tuple(
             (
                 (None,)
-                * (tc.depths[kind] * (tc.nm if kind < 2 else tc.nn) * tc.num_k_slots_per_tile())
+                * (
+                    tc.depths[kind]
+                    * (
+                        tc.scale_cache_fragments(kind // 2)
+                        if kind % 2
+                        else (tc.nm if kind < 2 else tc.nn) * tc.num_k_slots_per_tile()
+                    )
+                )
                 if kind in tc.active_kinds() and not tc.is_async(kind)
                 else ()
             )
@@ -365,19 +400,18 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
     with monkeypatch.context() as patch:
         for name in (
             "_index",
-            "_phase",
             "_replace_tile",
             "_rotate",
             "_rotate_buffers",
             "_advance",
             "_read_tile",
+            "_read_scale_tile",
             "_read_slot",
             "_step_live",
             "_take_reg_pairs",
-            "_merge_ds_read_frags",
+            "_take_operand_pairs",
         ):
             patch.setattr(pipeline, name, getattr(pipeline, name).fn)
-        patch.setattr(pipeline, "_make_reg_fragments", kernel._make_reg_fragments.fn)
         patch.setattr(kernel, "_PipelineRegFragments", _fragments)
         patch.setattr(pipeline, "_PipelineRegFragments", _fragments)
         patch.setattr(pipeline, "_PipelinePointers", _pointers)
@@ -413,8 +447,12 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
     expected = {
         (kind, mini, tile)
         for kind in tc.active_kinds()
-        for mini in range(tc.nm if kind < 2 else tc.nn)
-        for tile in range(num_k)
+        for mini in range(
+            0,
+            tc.nm if kind < 2 else tc.nn,
+            tc.scale_tile_ratio(kind // 2) if kind % 2 else 1,
+        )
+        for tile in range(0, num_k, tc.scale_step_ratio(kind // 2) if kind % 2 else 1)
     }
     assert machine.loads == expected
     assert machine.reads == expected
@@ -453,6 +491,41 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         ((3, 2, 2, 3), 6, {"packed": True, "middle": True, "soff": True}),
         ((3, 3, 3, 3), 6, {"packed": True, "soff": True}),
         ((2, 4, 3, 2), 15, {"packed": True}),
+        (
+            (3, 2, 3, 2),
+            0,
+            {"packed": True, "scale_steps": (4, 4), "scale_tiles": (2, 2)},
+        ),
+        (
+            (2, 2, 2, 2),
+            6,
+            {
+                "packed": True,
+                "scale_steps": (8, 8),
+                "scale_tiles": (2, 2),
+                "soff": True,
+            },
+        ),
+        (
+            (3, 2, 2, 3),
+            4,
+            {
+                "packed": True,
+                "scale_steps": (1, 4),
+                "scale_tiles": (1, 2),
+                "middle": True,
+            },
+        ),
+        (
+            (2, 3, 3, 2),
+            2,
+            {
+                "packed": True,
+                "scale_steps": (4, 1),
+                "scale_tiles": (2, 1),
+                "shape": (4, 2),
+            },
+        ),
     ],
 )
 def test_emitted_unified_pipeline_all_reachable_remainders(
@@ -464,13 +537,11 @@ def test_emitted_unified_pipeline_all_reachable_remainders(
 ):
     tc = _Config(scheme, depths, register_mask, **options)
     minimum = tc.pipeline_depth() + tc.pipeline_peeled() + tc.pipeline_unroll()
-    # Packed K128 scales retain the existing complete-K256-word requirement.
-    quantum = 2 if tc.packed else 1
+    quantum = math.lcm(*tc.scale_steps)
     first = math.ceil(minimum / quantum) * quantum
     for num_k in range(first, first + math.lcm(quantum, tc.pipeline_unroll()), quantum):
         _execute(tc, num_k, monkeypatch)
-    # Re-enter the same static register-ring mapping from another runtime loop
-    # body, including the alternating starting half of an odd packed unroll.
+    # Re-enter the same static register-ring mapping from another runtime loop body.
     _execute(tc, first + 2 * tc.pipeline_unroll(), monkeypatch)
 
 

@@ -42,6 +42,44 @@ def _buffer_load_to_lds(
     )
 
 
+@gluon.jit
+def _scale_fragments(scale, cfg, operand: gl.constexpr):
+    """Split one shuffled scale load in registers, retaining whole packed words."""
+    nonk: gl.constexpr = cfg.scale_mini_block_nonk(operand)
+    sk: gl.constexpr = cfg.scale_mini_block_k(operand)
+    mini: gl.constexpr = cfg.MINI_BLOCK_K
+    packed: gl.constexpr = cfg.scale_packed_ok(operand)
+    fragments = ()
+    for n in gl.static_range(cfg.scale_tile_ratio(operand)):
+        for k in gl.static_range(sk // mini):
+            if require_constexpr(packed):
+                if require_constexpr(
+                    cfg.scale_tile_ratio(operand) == 1 and sk == max(256, mini)
+                ):
+                    fragment = scale
+                else:
+                    # Physical order is stripe, K256 group, lane dword. Splitting
+                    # these axes never unpacks a dword or moves it across lanes.
+                    words = gl.reshape(scale, [nonk // 32, sk // 256, 64])
+                    words = gl.amd.slice(
+                        words,
+                        [cfg.scale_nonk(operand) // 32, max(256, mini) // 256, 64],
+                        [n * cfg.scale_nonk(operand) // 32, k * mini // 256, 0],
+                    )
+                    fragment = gl.convert_layout(
+                        gl.reshape(words, cfg.packed_scale_shape(operand)),
+                        cfg.packed_scale_frag_layout(operand),
+                    )
+            else:
+                fragment = gl.amd.slice(
+                    scale,
+                    cfg.scale_fragment_shape_slot(operand),
+                    [n * cfg.scale_nonk(operand), k * mini // 32],
+                )
+            fragments += (fragment,)
+    return fragments
+
+
 @aggregate
 @strip_annotate
 class LDSManager:
@@ -151,9 +189,7 @@ class LDSManager:
         """
         cfg: gl.constexpr = self.tuning_cfg
         cache: gl.constexpr = (
-            cfg.token_cache_modifier
-            if operand == 0
-            else cfg.expert_cache_modifier
+            cfg.token_cache_modifier if operand == 0 else cfg.expert_cache_modifier
         )
         if require_constexpr(VIA_LDS):
             if require_constexpr(operand == 0):
@@ -161,7 +197,9 @@ class LDSManager:
             else:
                 lds_ptr = self.b_payload_lds_ptr
             _buffer_load_to_lds(
-                lds_ptr.index(BUFFER_LOAD_IDX * cfg.num_lds_slots_per_block_non_k(operand) + tile),
+                lds_ptr.index(
+                    BUFFER_LOAD_IDX * cfg.num_lds_slots_per_block_non_k(operand) + tile
+                ),
                 hbm_ptr,
                 hbm_offs,
                 cache,
@@ -196,25 +234,15 @@ class LDSManager:
         SOFF: gl.constexpr = 0,
         K_PHASE=0,
     ):
-        """Load one A (0) or B (1) scale tile into LDS or return register fragments.
-
-        Only the first A mini block sharing an LDS scale tile issues its copy.
-        Register offsets describe the logical scale grid, including any
-        preshuffle. K128 stages return the complete packed K256 word, matching
-        LDS; the consumer selects its K half after reading the register ring.
-        """
+        """Load scale mini blocks covering one stage, or one wider K scale tile."""
         cfg: gl.constexpr = self.tuning_cfg
         cache: gl.constexpr = (
             cfg.token_scale_cache_modifier
             if operand == 0
             else cfg.expert_scale_cache_modifier
         )
+        ratio: gl.constexpr = cfg.scale_tile_ratio(operand)
         if require_constexpr(VIA_LDS):
-            ratio: gl.constexpr = (
-                cfg.scale_tile_ratio_a()
-                if operand == 0 and cfg.scale_shuffled(0)
-                else 1
-            )
             if require_constexpr(
                 self.func_cfg.has_scale(operand)
                 and cfg.scale_via_lds(operand)
@@ -224,55 +252,147 @@ class LDSManager:
                     lds_ptr = self.a_scale_lds_ptr
                 else:
                     lds_ptr = self.b_scale_lds_ptr
-                _buffer_load_to_lds(
-                    lds_ptr.index(
-                        BUFFER_LOAD_IDX * (cfg.num_lds_slots_per_block_non_k(operand) // ratio)
-                        + tile // ratio
-                    ),
-                    hbm_ptr,
-                    hbm_offs,
-                    cache,
-                    SOFF,
-                )
+                for k in gl.static_range(cfg.scale_load_k_tiles(operand)):
+                    _buffer_load_to_lds(
+                        lds_ptr.index(
+                            (
+                                BUFFER_LOAD_IDX * cfg.num_scale_tiles(operand)
+                                + tile // ratio
+                            )
+                            * cfg.scale_load_k_tiles(operand)
+                            + k
+                        ),
+                        hbm_ptr,
+                        hbm_offs,
+                        cache,
+                        SOFF + k * cfg.scale_mini_block_k(operand),
+                    )
         else:
             gl.static_assert(self.func_cfg.has_scale(operand))
             gl.static_assert(not cfg.scale_via_lds(operand))
-            if require_constexpr(cfg.scale_packed_k128(operand)):
-                # Both operands must expose the same logical scale factor to the
-                # packed MFMA, even when only one of them bypasses LDS.
-                scale = gl.amd.cdna4.buffer_load(
-                    ptr=hbm_ptr.to(gl.pointer_type(gl.int32)),
-                    offsets=hbm_offs // 4,
-                    cache=cache,
-                    soffset=SOFF,
-                )
-            elif require_constexpr(cfg.scale_shuffled(operand)):
-                scale = gl.convert_layout(
-                    gl.amd.cdna4.buffer_load(
-                        ptr=hbm_ptr,
-                        offsets=hbm_offs,
-                        cache=cache,
-                        contiguity=4,
-                        soffset=SOFF,
-                    ),
-                    cfg.dot_operand_scale_fragment_layout(operand),
-                )
+            if require_constexpr(cfg.scale_shuffled(operand)):
+                chunks = ()
+                for k in gl.static_range(cfg.scale_load_k_tiles(operand)):
+                    if require_constexpr(cfg.scale_packed_ok(operand)):
+                        scale = gl.amd.cdna4.buffer_load(
+                            ptr=hbm_ptr.to(gl.pointer_type(gl.int32)),
+                            offsets=hbm_offs // 4,
+                            cache=cache,
+                            soffset=SOFF + k * cfg.scale_mini_block_k(operand),
+                        )
+                    else:
+                        scale = gl.convert_layout(
+                            gl.amd.cdna4.buffer_load(
+                                ptr=hbm_ptr,
+                                offsets=hbm_offs,
+                                cache=cache,
+                                contiguity=4,
+                                soffset=SOFF + k * cfg.scale_mini_block_k(operand),
+                            ),
+                            cfg.scale_load_layout(operand),
+                        )
+                    chunks += (_scale_fragments(scale, cfg, operand),)
+                fragments = ()
+                for n in gl.static_range(ratio):
+                    for k in gl.static_range(cfg.scale_load_k_tiles(operand)):
+                        for mini in gl.static_range(
+                            cfg.scale_mini_block_k(operand) // cfg.MINI_BLOCK_K
+                        ):
+                            fragments += (
+                                chunks[k][
+                                    n
+                                    * (
+                                        cfg.scale_mini_block_k(operand)
+                                        // cfg.MINI_BLOCK_K
+                                    )
+                                    + mini
+                                ],
+                            )
             else:
                 scale = gl.amd.cdna4.buffer_load(
                     ptr=hbm_ptr, offsets=hbm_offs, cache=cache, soffset=SOFF
                 )
-            fragments = ()
-            for mini in gl.static_range(cfg.num_k_slots_per_tile()):
-                if require_constexpr(cfg.num_k_slots_per_tile() > 1):
-                    fragment = gl.amd.slice(
-                        scale,
-                        cfg.scale_fragment_shape_slot(operand),
-                        cfg.scale_fragment_offset_slot(mini),
+                fragments = ()
+                for mini in gl.static_range(cfg.num_k_slots_per_tile()):
+                    if require_constexpr(cfg.num_k_slots_per_tile() > 1):
+                        fragment = gl.amd.slice(
+                            scale,
+                            cfg.scale_fragment_shape_slot(operand),
+                            cfg.scale_fragment_offset_slot(mini),
+                        )
+                    else:
+                        fragment = scale
+                    fragments += (fragment,)
+            return fragments
+
+    @gluon.jit
+    def ds_read_scale(self, operand: gl.constexpr, SCALE_READ_IDX, tile: gl.constexpr):
+        """Read each scale mini block once and retain all of its consumer fragments."""
+        cfg: gl.constexpr = self.tuning_cfg
+        if require_constexpr(operand == 0):
+            lds_ptr = self.a_scale_lds_ptr
+        else:
+            lds_ptr = self.b_scale_lds_ptr
+        if require_constexpr(cfg.scale_shuffled(operand)):
+            chunks = ()
+            for k in gl.static_range(cfg.scale_load_k_tiles(operand)):
+                scale_ptr = lds_ptr.index(
+                    (
+                        SCALE_READ_IDX * cfg.num_scale_tiles(operand)
+                        + tile // cfg.scale_tile_ratio(operand)
+                    )
+                    * cfg.scale_load_k_tiles(operand)
+                    + k
+                )
+                if require_constexpr(cfg.scale_packed_ok(operand)):
+                    scale = _ds_read(
+                        scale_ptr.reinterpret(
+                            gl.int32,
+                            cfg.packed_scale_load_shape(operand),
+                            cfg.packed_scale_read_layout(operand, True),
+                        ),
+                        cfg.packed_scale_load_layout(operand),
                     )
                 else:
-                    fragment = scale
-                fragments = fragments + (fragment,)
-            return fragments
+                    scale = _ds_read(
+                        scale_ptr.reinterpret(
+                            gl.uint8,
+                            cfg.scale_load_shape(operand),
+                            cfg.shuffled_scale_read_layout(operand, True),
+                        ),
+                        cfg.scale_load_layout(operand),
+                    )
+                chunks += (_scale_fragments(scale, cfg, operand),)
+            fragments = ()
+            for n in gl.static_range(cfg.scale_tile_ratio(operand)):
+                for k in gl.static_range(cfg.scale_load_k_tiles(operand)):
+                    for mini in gl.static_range(
+                        cfg.scale_mini_block_k(operand) // cfg.MINI_BLOCK_K
+                    ):
+                        fragments += (
+                            chunks[k][
+                                n
+                                * (cfg.scale_mini_block_k(operand) // cfg.MINI_BLOCK_K)
+                                + mini
+                            ],
+                        )
+        else:
+            fragments = ()
+            for mini in gl.static_range(cfg.num_k_slots_per_tile()):
+                fragments += (
+                    _ds_read(
+                        self._scale_slice(
+                            lds_ptr,
+                            SCALE_READ_IDX,
+                            cfg.num_scale_tiles(operand),
+                            tile,
+                            mini,
+                            operand,
+                        ),
+                        cfg.dot_operand_scale_fragment_layout(operand),
+                    ),
+                )
+        return fragments
 
     @gluon.jit
     def commit_buffer_load(self):
@@ -320,24 +440,6 @@ class LDSManager:
         return tile_lds_ptr
 
     @gluon.jit
-    def _a_scale_tile(self, DS_READ_IDX, mi: gl.constexpr):
-        """Mini block ``mi``'s slice of its A-scale tile, as a flat uint8 descriptor.
-
-        The tile is one 256 B run per 32-row stripe and stripes are contiguous, so a
-        mini block is a contiguous stripe range -- exactly the property that lets the
-        fill tile be wider than the payload mini block.
-        """
-        cfg: gl.constexpr = self.tuning_cfg
-        RA: gl.constexpr = cfg.scale_tile_ratio_a() if cfg.scale_shuffled(0) else 1
-        tile_lds_ptr = self.a_scale_lds_ptr.index(
-            DS_READ_IDX * (cfg.num_lds_slots_per_block_non_k(0) // RA) + mi // RA
-        )
-        if require_constexpr(RA > 1):
-            stripes: gl.constexpr = cfg.scale_flat_fragment_shape(0)[0]
-            tile_lds_ptr = tile_lds_ptr.slice((mi % RA) * stripes, stripes, dim=0)
-        return tile_lds_ptr
-
-    @gluon.jit
     def ds_read_frag(
         self,
         operand: gl.constexpr,
@@ -355,10 +457,8 @@ class LDSManager:
         cfg: gl.constexpr = self.tuning_cfg
         if require_constexpr(operand == 0):
             payload_lds_ptr = self.a_payload_lds_ptr
-            scale_lds_ptr = self.a_scale_lds_ptr
         else:
             payload_lds_ptr = self.b_payload_lds_ptr
-            scale_lds_ptr = self.b_scale_lds_ptr
         if require_constexpr(SCALE_READ_IDX is None):
             SCALE_READ_IDX = DS_READ_IDX
         if require_constexpr(not READ_PAYLOAD):
@@ -380,53 +480,13 @@ class LDSManager:
                 cfg.scale_via_lds(operand),
                 "ds_read_frag only reads LDS-staged scales",
             )
-            if require_constexpr(cfg.scale_shuffled(operand)):
-                if require_constexpr(operand == 0):
-                    scale_tile_lds_ptr = self._a_scale_tile(SCALE_READ_IDX, tile)
-                else:
-                    scale_tile_lds_ptr = scale_lds_ptr.index(
-                        SCALE_READ_IDX * cfg.num_lds_slots_per_block_non_k(operand) + tile
-                    )
-            if require_constexpr(
-                cfg.scale_packed_ok(operand) and not (cfg.num_k_slots_per_tile() > 1)
-            ):
-                # Straight to i32: the dword the shuffle assembled is the operand the
-                # matrix instruction wants, so there is nothing left to do to it.
-                scale_val = _ds_read(
-                    scale_tile_lds_ptr.reinterpret(
-                        gl.int32,
-                        cfg.packed_scale_shape(operand),
-                        cfg.packed_scale_read_layout(operand),
-                    ),
-                    cfg.packed_scale_frag_layout(operand),
-                )
-            elif require_constexpr(cfg.scale_shuffled(operand)):
-                scale_val = _ds_read(
-                    scale_tile_lds_ptr.reinterpret(
-                        gl.uint8,
-                        cfg.scale_lds_shape_slot(operand),
-                        cfg.shuffled_scale_read_layout(operand),
-                    ),
-                    cfg.dot_operand_scale_fragment_layout(operand),
-                )
-                if require_constexpr(cfg.num_k_slots_per_tile() > 1):
-                    scale_val = gl.amd.slice(
-                        scale_val,
-                        cfg.scale_fragment_shape_slot(operand),
-                        cfg.scale_fragment_offset_slot(mini_idx),
-                    )
-            else:
-                scale_val = _ds_read(
-                    self._scale_slice(
-                        scale_lds_ptr,
-                        SCALE_READ_IDX,
-                        cfg.num_lds_slots_per_block_non_k(operand),
-                        tile,
-                        mini_idx,
-                        operand,
-                    ),
-                    cfg.dot_operand_scale_fragment_layout(operand),
-                )
+            ratio: gl.constexpr = cfg.scale_tile_ratio(operand)
+            fragments = self.ds_read_scale(
+                operand, SCALE_READ_IDX, tile // ratio * ratio
+            )
+            scale_val = fragments[
+                (tile % ratio) * cfg.scale_read_k_slots(operand) + mini_idx
+            ]
         else:
             scale_val: gl.constexpr = None
         return payload, scale_val

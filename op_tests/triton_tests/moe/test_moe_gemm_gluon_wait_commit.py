@@ -70,8 +70,29 @@ class _ScheduleConfig:
     def scale_shuffled(self, idx):
         return idx == 0 and self.a_scale_ratio > 1
 
-    def scale_tile_ratio_a(self):
-        return self.a_scale_ratio
+    def scale_tile_ratio(self, idx):
+        return self.a_scale_ratio if idx == 0 else 1
+
+    def num_scale_tiles(self, idx):
+        return self.num_lds_slots_per_block_non_k(idx) // self.scale_tile_ratio(idx)
+
+    def scale_load_k_tiles(self, idx):
+        return 1
+
+    def scale_mini_block_k(self, idx):
+        return 256
+
+    def scale_step_ratio(self, idx):
+        return 1
+
+    def component_span(self, idx, scale=False):
+        return self.num_buffers(idx, scale)
+
+    def scale_read_k_slots(self, idx):
+        return self.num_k_slots_per_tile()
+
+    def scale_cache_fragments(self, idx):
+        return self.num_lds_slots_per_block_non_k(idx) * self.scale_read_k_slots(idx)
 
     def commit_per_op(self):
         return self.WAIT_COMMIT_SCHEME == WaitCommitScheme.PER_OP
@@ -128,8 +149,8 @@ def _reference_slots(tc):
         if not (tc.scales[operand] and tc.scale_async[operand]):
             continue
         owner = tile - tile % tc.a_scale_ratio if operand == 0 else tile
-        reads[slot].add((kind + 1, owner))
         if tile == owner:
+            reads[slot].add((kind + 1, owner))
             scale_slot = (
                 1 + tile if tc.SCALE_FILL_MID and (tc.nm, tc.nn) == (2, 2) else slot
             )
@@ -253,7 +274,6 @@ def _trace_emitter(tc, monkeypatch, defer_stage_commit=False):
     with monkeypatch.context() as patch:
         patch.setattr(_lds, "_buffer_load_to_lds", sink.copy)
         patch.setattr(buffered, "_index", buffered._index.fn)
-        patch.setattr(buffered, "_phase", buffered._phase.fn)
         patch.setattr(buffered, "_replace_tile", buffered._replace_tile.fn)
         patch.setattr(buffered.gl, "static_range", range)
         patch.setattr(buffered.gl, "assume", check_assumption)
@@ -388,6 +408,8 @@ def test_register_only_slots_need_no_cooperative_fence(scheme, monkeypatch):
     )
     tc.commit_per_stage_whole = lambda: scheme == WaitCommitScheme.PER_STAGE_WHOLE
     tc.SCHED_MODE = 0
+    tc.BLOCK_K = 256
+    tc.ds_read_in_mfma = lambda *args: False
     pc = SimpleNamespace(
         tuning_cfg=tc,
         func_cfg=tc,
@@ -400,15 +422,14 @@ def test_register_only_slots_need_no_cooperative_fence(scheme, monkeypatch):
     )
     monkeypatch.setattr(pipeline.gl, "barrier", lambda: barriers.append(True))
     monkeypatch.setattr(pipeline.gl, "static_range", range)
-    monkeypatch.setattr(pipeline, "_read_slot", lambda *args: ((), ()))
+    monkeypatch.setattr(pipeline, "_read_slot", lambda *args: ((), (), (), ()))
     monkeypatch.setattr(
         pipeline, "_fill_slot", lambda pc, ptrs, buffers, *args, **kwargs: buffers
     )
     monkeypatch.setattr(pipeline, "_advance", lambda pc, ptrs, *args: ptrs)
-    monkeypatch.setattr(pipeline, "_rotate_buffers", lambda buffers, tc: buffers)
-    monkeypatch.setattr(pipeline, "_merge_ds_read_frags", lambda *args: ())
-    monkeypatch.setattr(pipeline, "_take_reg_pairs", lambda *args: ())
-    monkeypatch.setattr(pipeline, "_make_reg_fragments", lambda *args: args)
+    monkeypatch.setattr(pipeline, "_rotate_buffers", lambda buffers, *args: buffers)
+    monkeypatch.setattr(pipeline, "_take_operand_pairs", lambda *args: ())
+    monkeypatch.setattr(pipeline, "_PipelineRegFragments", lambda *args: args)
     monkeypatch.setattr(pipeline, "_maybe_block_dot", lambda *args: 0)
     pipeline._step_live.fn(
         pc, None, ((), (), (), ()), regs, 1, None, False, 0, False, True, 0
@@ -451,6 +472,8 @@ def test_pipeline_stage_commit_boundaries(
     )
     tc.commit_per_stage_whole = lambda: scheme == WaitCommitScheme.PER_STAGE_WHOLE
     tc.SCHED_MODE = 0
+    tc.BLOCK_K = 256
+    tc.ds_read_in_mfma = lambda *args: False
     pc = SimpleNamespace(
         func_cfg=tc,
         tuning_cfg=tc,
@@ -483,11 +506,10 @@ def test_pipeline_stage_commit_boundaries(
     monkeypatch.setattr(pipeline.gl.amd.cdna4, "sched_barrier", lambda mask: None)
     monkeypatch.setattr(pipeline, "_wait", lambda *args: 3)
     monkeypatch.setattr(pipeline, "_fill_slot", buffer_load)
-    monkeypatch.setattr(pipeline, "_read_slot", lambda *args: ((), ()))
-    monkeypatch.setattr(pipeline, "_merge_ds_read_frags", lambda *args: ())
-    monkeypatch.setattr(pipeline, "_take_reg_pairs", lambda *args: ())
-    monkeypatch.setattr(pipeline, "_make_reg_fragments", lambda *args: args)
-    monkeypatch.setattr(pipeline, "_rotate_buffers", lambda buffers, tc: buffers)
+    monkeypatch.setattr(pipeline, "_read_slot", lambda *args: ((), (), (), ()))
+    monkeypatch.setattr(pipeline, "_take_operand_pairs", lambda *args: ())
+    monkeypatch.setattr(pipeline, "_PipelineRegFragments", lambda *args: args)
+    monkeypatch.setattr(pipeline, "_rotate_buffers", lambda buffers, *args: buffers)
     monkeypatch.setattr(pipeline, "_advance", lambda pc, ptrs, *args: ptrs)
     monkeypatch.setattr(
         pipeline, "_maybe_block_dot", lambda *args: events.append(("dot",))

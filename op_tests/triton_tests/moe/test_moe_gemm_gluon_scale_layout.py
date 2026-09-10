@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton._gluon_kernels.gfx950.moe import _frozen as frozen
 from aiter.ops.triton._gluon_kernels.gfx950.moe import _pipeline as buffered
 from aiter.ops.triton._gluon_kernels.gfx950.moe import moe_gemm as kernel
 from aiter.ops.triton._gluon_kernels.gfx950.moe._config import (
@@ -182,19 +183,58 @@ def test_packed_words_and_selectors_match_producer(
             )
 
 
+@pytest.mark.parametrize("scale_k", [256, 512, 1024])
+@pytest.mark.parametrize("operand", [0, 1], ids=["A", "B"])
+def test_wide_packed_scale_load_layout_matches_producer(scale_k, operand):
+    tc = _config(
+        BLOCK_N=256,
+        MINI_BLOCK_N=128,
+        warps_per_cta=(1, 4),
+        SCALE_MINI_BLOCK_M=128,
+        SCALE_MINI_BLOCK_N=256,
+        SCALE_MINI_BLOCK_K=scale_k,
+    )
+    nonk = tc.scale_mini_block_nonk(operand)
+    producer = [
+        (stripe * 32 + row + half_row * 16, ku * 8 + group + half_k * 4)
+        for stripe in range(nonk // 32)
+        for ku in range(scale_k // 256)
+        for group in range(4)
+        for row in range(16)
+        for half_k in range(2)
+        for half_row in range(2)
+    ]
+    byte_bases = tc.shuffled_scale_read_layout(operand, True).offset_bases
+    assert [
+        tuple(_coordinate(byte_bases, offset)) for offset in range(len(producer))
+    ] == producer
+    word_bases = tc.packed_scale_read_layout(operand, True).offset_bases
+    physical_word = {
+        tuple(_coordinate(word_bases, offset)): offset
+        for offset in range(len(producer) // 4)
+    }
+    byte_layout = tc.scale_load_layout(operand)
+    word_layout = tc.packed_scale_load_layout(operand)
+    registers = [list(basis) for basis in byte_layout.reg_bases]
+    nonk_bit, k_bit = registers.index([16, 0]), registers.index([0, 4])
+    retained = [bit for bit in range(len(registers)) if bit not in (nonk_bit, k_bit)]
+    for warp, lane, reg in product(
+        range(tc.num_warps()), range(64), range(1 << len(registers))
+    ):
+        selector = ((reg >> nonk_bit) & 1) + 2 * ((reg >> k_bit) & 1)
+        word_reg = sum(((reg >> bit) & 1) << pos for pos, bit in enumerate(retained))
+        word_coord = _thread_coordinate(word_layout, word_reg, lane, warp)
+        assert producer[physical_word[word_coord] * 4 + selector] == _thread_coordinate(
+            byte_layout, reg, lane, warp
+        )
+
+
 @pytest.mark.parametrize(
     "changes,k,diagnostic",
     [
-        ({"A_SCALE_SORTED_SHUFFLED": False}, 7168, "both operands"),
-        ({"B_SCALE_SHUFFLED": False}, 7168, "both operands"),
-        (
-            {"mfma_instr_shape": (32, 32, 64), "tiles_per_warp": (1, 1)},
-            7168,
-            "MFMA 16x16x128",
-        ),
         ({"MINI_BLOCK_K": 64}, 7168, None),
-        ({"FROZEN_STEP": True}, 7168, "live pipeline"),
-        ({}, 384, "complete K256 scale words"),
+        ({"FROZEN_STEP": True}, 7168, None),
+        ({}, 384, "complete"),
     ],
 )
 def test_invalid_packed_k128_configs_are_rejected(changes, k, diagnostic):
@@ -250,6 +290,31 @@ def test_dot_helpers_forward_scale_phase(monkeypatch, block_k, dtype, phase):
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize("phase", [0, 1])
+def test_frozen_dot_helper_advances_scale_phase_per_mini(monkeypatch, phase):
+    tc = _HostView(
+        _config(
+            BLOCK_K=256,
+            MINI_BLOCK_K=128,
+            VGPR_PREFETCH_K=256,
+            FROZEN_STEP=True,
+        )
+    )
+    fc = _HostView(tc.func_cfg)
+    phases = []
+
+    def dot(_a, _a_scale, _b, _b_scale, acc, _fc, _tc, k_phase):
+        phases.append(k_phase)
+        return acc + 1
+
+    monkeypatch.setattr(gl, "static_range", range)
+    monkeypatch.setattr(frozen, "_dot", dot)
+    a = ("A0", "A-scale", "A1", "A-scale")
+    b = ("B0", "B-scale", "B1", "B-scale")
+    assert frozen._maybe_block_dot.fn(a, b, 13, 2, fc, tc, True, phase) == 15
+    assert phases == [phase, 1 - phase]
+
+
 @dataclass
 class _Pointers:
     a_hbm_ptr: int = 0
@@ -286,6 +351,7 @@ class _CopyRecorder:
     """Scalar HBM/LDS model with distinct values for both halves of a scale word."""
 
     def __init__(self, tc, b_step):
+        self.tc = tc
         self.depths = [tc.num_buffers(kind // 2, bool(kind % 2)) for kind in range(4)]
         self.b_step = b_step
         self.addresses = defaultdict(list)
@@ -296,7 +362,8 @@ class _CopyRecorder:
     def _record(self, kind, buffer, tile, pointer, offsets, soffset):
         assert offsets == tile
         history = self.addresses[kind, tile]
-        stage = len(history)
+        ratio = self.tc.scale_step_ratio(kind // 2) if kind % 2 else 1
+        stage = len(history) * ratio
         expected = (
             (stage // 2) * 256
             if kind % 2
@@ -311,10 +378,10 @@ class _CopyRecorder:
         else:
             value = _Payload(stage, kind // 2, tile)
         if buffer is not None:
-            assert buffer == stage % self.depths[kind]
+            assert buffer == stage // ratio % self.depths[kind]
             key = kind, tile, buffer
             if key in self.lds:
-                assert stage - self.depths[kind] in self.reads[kind, tile], (
+                assert stage - self.depths[kind] * ratio in self.reads[kind, tile], (
                     "LDS slot overwritten before its read",
                     key,
                     stage,
@@ -330,18 +397,17 @@ class _CopyRecorder:
             return (value,)
 
     def buffer_load_scale(
-        self, operand, VIA_LDS, buffer, tile, pointer, offsets, soffset, K_PHASE=0
+        self, operand, VIA_LDS, buffer, tile, pointer, offsets, soffset
     ):
         kind = operand * 2 + 1
-        if not VIA_LDS:
-            assert K_PHASE == len(self.addresses[kind, tile]) % 2
         value = self._record(kind, buffer, tile, pointer, offsets, soffset)
         if not VIA_LDS:
-            return (value,)
+            return (value,) * self.tc.scale_read_k_slots(operand)
 
     def _read(self, kind, tile, slot):
-        stage = len(self.reads[kind, tile])
-        assert slot == stage % self.depths[kind]
+        ratio = self.tc.scale_step_ratio(kind // 2) if kind % 2 else 1
+        stage = len(self.reads[kind, tile]) * ratio
+        assert slot == stage // ratio % self.depths[kind]
         self.reads[kind, tile].append(stage)
         return self.lds[kind, tile, slot]
 
@@ -353,7 +419,7 @@ class _CopyRecorder:
         k,
         READ_PAYLOAD,
         READ_SCALE,
-        SCALE_READ_IDX,
+        SCALE_READ_IDX=None,
     ):
         assert k == 0
         payload = self._read(operand * 2, tile, buffer) if READ_PAYLOAD else None
@@ -361,6 +427,10 @@ class _CopyRecorder:
             self._read(operand * 2 + 1, tile, SCALE_READ_IDX) if READ_SCALE else None
         )
         return payload, scale
+
+    def ds_read_scale(self, operand, slot, tile):
+        value = self._read(operand * 2 + 1, tile, slot)
+        return (value,) * self.tc.scale_read_k_slots(operand)
 
     def commit_buffer_load(self):
         pass
@@ -371,13 +441,18 @@ class _CopyRecorder:
     def dot(self, a, b, acc, num_mini, _fc, _tc, enabled, phase):
         if not enabled:
             return acc
-        assert num_mini == 1 and phase == 0
+        assert num_mini == 1
         ap, asc = a
         bp, bsc = b
         history = self.dot_tiles[ap.tile, bp.tile]
         stage = len(history)
+        assert phase == stage % 2
         assert ap.stage == bp.stage == stage
-        assert int(asc) & 0xFFFF == int(bsc) & 0xFFFF == stage + 1
+        assert (
+            (int(asc) >> (phase * 16)) & 0xFFFF
+            == (int(bsc) >> (phase * 16)) & 0xFFFF
+            == stage + 1
+        )
         history.append(stage)
         return acc + 1
 
@@ -400,6 +475,7 @@ def _run_scalar_pipeline(monkeypatch, tc, stages, fused):
         s_step=4,
         a_scale_stride_k=32,
         b_scale_stride_k=32,
+        num_k=stages,
     )
 
     def check_assumption(condition, message=""):
@@ -416,7 +492,6 @@ def _run_scalar_pipeline(monkeypatch, tc, stages, fused):
         patch.setattr(buffered, "pick_stage", lambda _: lambda _name: nullcontext())
         for name in (
             "_index",
-            "_phase",
             "_replace_tile",
             "_rotate",
             "_rotate_buffers",
@@ -424,12 +499,12 @@ def _run_scalar_pipeline(monkeypatch, tc, stages, fused):
             "_fill_slot",
             "_advance",
             "_read_tile",
+            "_read_scale_tile",
             "_read_slot",
             "_step",
             "_step_live",
-            "_make_reg_fragments",
-            "_merge_ds_read_frags",
             "_take_reg_pairs",
+            "_take_operand_pairs",
         ):
             patch.setattr(buffered, name, getattr(buffered, name).fn)
         patch.setattr(buffered, "_PipelinePointers", _Pointers)
@@ -446,7 +521,10 @@ def _run_scalar_pipeline(monkeypatch, tc, stages, fused):
             acc = buffered._last_mfma.fn(pc, final)
     assert acc == (stages,) * 4
     assert set(sink.addresses) == set(product(range(4), range(2)))
-    assert all(len(history) == stages for history in sink.addresses.values())
+    assert all(
+        len(history) == stages // (2 if kind % 2 else 1)
+        for (kind, _tile), history in sink.addresses.items()
+    )
     assert all(history == list(range(stages)) for history in sink.dot_tiles.values())
     assert len(sink.dot_tiles) == 4
 
@@ -475,9 +553,7 @@ def test_pipeline_phases_and_packed_scale_addresses(
         )
     )
     minimum_tiles = (
-        tc.pipeline_depth()
-        + buffered._pipeline_peeled(tc)
-        + tc.pipeline_unroll()
+        tc.pipeline_depth() + buffered._pipeline_peeled(tc) + tc.pipeline_unroll()
     )
     minimum = (minimum_tiles + 1) // 2 * 2
     effective_unroll = tc.pipeline_unroll()
