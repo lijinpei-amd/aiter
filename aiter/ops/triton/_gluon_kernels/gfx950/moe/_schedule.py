@@ -6,7 +6,7 @@
 from triton.experimental import gluon
 
 from ._lang import unwrap as _v
-from ._offsets import _slot_index
+from ._layout import _slot_index
 from ._types import WaitCommitScheme
 
 
@@ -75,7 +75,7 @@ def _scale_buffer_load_tile(mi, ni, NM, NN, want_a, SCALE_FILL_MID=False):
 @gluon.constexpr_function
 def _buffer_load_ops(tc, mi, ni):
     """A payload/scale and B payload/scale tiles, in issue order; None skips a copy."""
-    NM, NN = tc.num_mini_m(), tc.num_mini_n()
+    NM, NN = tc.num_m_slots_per_block(), tc.num_n_slots_per_block()
     pos = _buffer_load_pos(mi, ni, NM, NN)
     ops = []
     for idx in range(2):
@@ -104,7 +104,7 @@ def _buffer_load_group_schedule(tc):
     and scale loads have no async group. Traffic-only experiments
     retain their nominal groups even when the LDS manager suppresses a copy.
     """
-    NM, NN = tc.num_mini_m(), tc.num_mini_n()
+    NM, NN = tc.num_m_slots_per_block(), tc.num_n_slots_per_block()
     scheme = _v(tc.WAIT_COMMIT_SCHEME)
     assert scheme in tuple(int(s) for s in WaitCommitScheme)
     schedule = []
@@ -135,7 +135,7 @@ def _buffer_load_groups(tc):
 @gluon.constexpr_function
 def _buffer_load_wait(tc, mi, ni, STAGES_BETWEEN, DO_BUFFER_LOAD):
     """Number of newer committed groups after this slot's last required copy."""
-    NM, NN = tc.num_mini_m(), tc.num_mini_n()
+    NM, NN = tc.num_m_slots_per_block(), tc.num_n_slots_per_block()
     slot = _slot_index(mi, ni, NM, NN)
     if tc.commit_per_stage():
         return _v(STAGES_BETWEEN) if slot == 0 else None

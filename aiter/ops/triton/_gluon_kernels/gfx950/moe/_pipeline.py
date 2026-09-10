@@ -17,8 +17,7 @@ from triton.experimental.gluon import language as gl
 
 from ._lang import pick_warp_pipeline_stage as pick_stage
 from ._lang import require_constexpr
-from ._layout import accumulator_shape
-from ._offsets import _slot_index
+from ._layout import _slot_index, accumulator_shape_slot
 from ._schedule import (
     _buffer_load_pos,
     _buffer_load_tile,
@@ -31,7 +30,7 @@ from ._schedule import (
 @gluon.constexpr_function
 def _ops(tc, mi, ni):
     """Payload/scale fills owned by a slot, including register destinations."""
-    nm, nn = tc.num_mini_m(), tc.num_mini_n()
+    nm, nn = tc.num_m_slots_per_block(), tc.num_n_slots_per_block()
     pos = _buffer_load_pos(mi, ni, nm, nn)
     ops = []
     for idx in range(2):
@@ -77,8 +76,8 @@ def _async(tc, kind):
 def _groups(tc, stage, drain=False):
     """Committed groups per slot, including explicit empty slot/stage groups."""
     schedule, whole = [], ()
-    for ni in range(tc.num_mini_n()):
-        for mi in range(tc.num_mini_m()):
+    for ni in range(tc.num_n_slots_per_block()):
+        for mi in range(tc.num_m_slots_per_block()):
             ops = tuple(
                 (kind, tile)
                 for kind, tile in enumerate(_ops(tc, mi, ni))
@@ -94,7 +93,7 @@ def _groups(tc, stage, drain=False):
                 whole += ops
                 groups = (
                     (whole,)
-                    if mi == tc.num_mini_m() - 1 and ni == tc.num_mini_n() - 1
+                    if mi == tc.num_m_slots_per_block() - 1 and ni == tc.num_n_slots_per_block() - 1
                     else ()
                 )
             schedule.append(groups)
@@ -110,7 +109,7 @@ def _wait(tc, stage, slot, drain=False, epilogue_groups=0):
     groups commit between stages zero and one. Once a producer is newer than
     those epilogue groups, they no longer contribute to its wait allowance.
     """
-    nm, nn = tc.num_mini_m(), tc.num_mini_n()
+    nm, nn = tc.num_m_slots_per_block(), tc.num_n_slots_per_block()
     r = stage + 1 if drain else tc.pipeline_depth() if stage is None else stage
     required = []
     for ni in range(nn):
@@ -172,7 +171,7 @@ def _pipeline_peeled(tc):
     # At depth three or below, the mandatory first peel covers any warmup.
     if not tc.commit_per_op() or tc.pipeline_depth() <= 3:
         return 1
-    slots = range(tc.num_mini_m() * tc.num_mini_n())
+    slots = range(tc.num_m_slots_per_block() * tc.num_n_slots_per_block())
     steady = tuple(_wait(tc, None, slot) for slot in slots)
     peeled = 1
     for x in range(max(0, tc.pipeline_depth() - 2)):
@@ -253,12 +252,12 @@ def _rotate(queue, TILE_COUNT: gl.constexpr):
 
 @gluon.jit
 def _rotate_buffers(buffers, tc):
-    mk: gl.constexpr = tc.num_mini_k()
+    mk: gl.constexpr = tc.num_k_slots_per_tile()
     return (
-        _rotate(buffers[0], tc.num_mini_m() * mk),
-        _rotate(buffers[1], tc.num_mini_n() * mk),
-        _rotate(buffers[2], tc.num_mini_m() * mk),
-        _rotate(buffers[3], tc.num_mini_n() * mk),
+        _rotate(buffers[0], tc.num_m_slots_per_block() * mk),
+        _rotate(buffers[1], tc.num_n_slots_per_block() * mk),
+        _rotate(buffers[2], tc.num_m_slots_per_block() * mk),
+        _rotate(buffers[3], tc.num_n_slots_per_block() * mk),
     )
 
 
@@ -267,26 +266,34 @@ def _init_buffers(pc):
     tc: gl.constexpr = pc.tuning_cfg
     a, b, a_scale, b_scale = (), (), (), ()
     if require_constexpr(not tc.payload_via_lds(0)):
-        for _ in gl.static_range(tc.num_buffers(0) * tc.num_mini_m() * tc.num_mini_k()):
+        for _ in gl.static_range(
+            tc.num_buffers(0)
+            * tc.num_m_slots_per_block()
+            * tc.num_k_slots_per_tile()
+        ):
             a += (
                 gl.zeros(
-                    tc.payload_fragment_shape(0),
+                    tc.payload_fragment_shape_slot(0),
                     pc.func_cfg.operand_elem_ty(0),
                     tc.dot_operand_fragment_layout(0),
                 ),
             )
     if require_constexpr(not tc.payload_via_lds(1)):
-        for _ in gl.static_range(tc.num_buffers(1) * tc.num_mini_n() * tc.num_mini_k()):
+        for _ in gl.static_range(
+            tc.num_buffers(1)
+            * tc.num_n_slots_per_block()
+            * tc.num_k_slots_per_tile()
+        ):
             b += (
                 gl.zeros(
-                    tc.payload_fragment_shape(1),
+                    tc.payload_fragment_shape_slot(1),
                     pc.func_cfg.operand_elem_ty(1),
                     tc.dot_operand_fragment_layout(1),
                 ),
             )
     if require_constexpr(pc.func_cfg.a_has_scale() and not tc.scale_via_lds(0)):
         for _ in gl.static_range(
-            tc.num_buffers(0, True) * tc.num_mini_m() * tc.num_mini_k()
+            tc.num_buffers(0, True) * tc.num_m_slots_per_block() * tc.num_k_slots_per_tile()
         ):
             if require_constexpr(tc.scale_packed_k128(0)):
                 a_scale += (
@@ -299,14 +306,14 @@ def _init_buffers(pc):
             else:
                 a_scale += (
                     gl.zeros(
-                        tc.scale_fragment_shape(0),
+                        tc.scale_fragment_shape_slot(0),
                         gl.uint8,
                         tc.dot_operand_scale_fragment_layout(0),
                     ),
                 )
     if require_constexpr(pc.func_cfg.b_has_scale() and not tc.scale_via_lds(1)):
         for _ in gl.static_range(
-            tc.num_buffers(1, True) * tc.num_mini_n() * tc.num_mini_k()
+            tc.num_buffers(1, True) * tc.num_n_slots_per_block() * tc.num_k_slots_per_tile()
         ):
             if require_constexpr(tc.scale_packed_k128(1)):
                 b_scale += (
@@ -319,7 +326,7 @@ def _init_buffers(pc):
             else:
                 b_scale += (
                     gl.zeros(
-                        tc.scale_fragment_shape(1),
+                        tc.scale_fragment_shape_slot(1),
                         gl.uint8,
                         tc.dot_operand_scale_fragment_layout(1),
                     ),
@@ -358,7 +365,7 @@ def _fill_slot(
 ):
     tc: gl.constexpr = pc.tuning_cfg
     ops: gl.constexpr = _ops(tc, mi, ni)
-    mk: gl.constexpr = tc.num_mini_k()
+    mk: gl.constexpr = tc.num_k_slots_per_tile()
     offset_step: gl.constexpr = KI if _soff_unroll(tc, IN_LOOP) else 0
     a_soff: gl.constexpr = (
         offset_step
@@ -419,7 +426,7 @@ def _fill_slot(
                 (
                     ((KI if IN_LOOP else 0) + tc.num_buffers(0) - 1)
                     % tc.num_buffers(0)
-                    * tc.num_mini_m()
+                    * tc.num_m_slots_per_block()
                     + ops[0]
                 )
                 * mk,
@@ -454,7 +461,7 @@ def _fill_slot(
                 (
                     ((KI if IN_LOOP else 0) + tc.num_buffers(0, True) - 1)
                     % tc.num_buffers(0, True)
-                    * tc.num_mini_m()
+                    * tc.num_m_slots_per_block()
                     + ops[1]
                 )
                 * mk,
@@ -476,7 +483,7 @@ def _fill_slot(
                 (
                     ((KI if IN_LOOP else 0) + tc.num_buffers(1) - 1)
                     % tc.num_buffers(1)
-                    * tc.num_mini_n()
+                    * tc.num_n_slots_per_block()
                     + ops[2]
                 )
                 * mk,
@@ -523,7 +530,7 @@ def _fill_slot(
                 (
                     ((KI if IN_LOOP else 0) + tc.num_buffers(1, True) - 1)
                     % tc.num_buffers(1, True)
-                    * tc.num_mini_n()
+                    * tc.num_n_slots_per_block()
                     + ops[3]
                 )
                 * mk,
@@ -533,8 +540,8 @@ def _fill_slot(
         or (
             MARK_STAGE
             and tc.commit_per_stage()
-            and mi == tc.num_mini_m() - 1
-            and ni == tc.num_mini_n() - 1
+            and mi == tc.num_m_slots_per_block() - 1
+            and ni == tc.num_n_slots_per_block() - 1
         )
     ):
         pc.lds_ptrs.commit_buffer_load()
@@ -611,7 +618,7 @@ def _read_tile(
     reg_scale: gl.constexpr = has_scale and not tc.scale_via_lds(operand)
     phase = _phase(tc, step, KI, IN_LOOP or STATIC_PHASE)
     frags = ()
-    for k in gl.static_range(tc.num_mini_k()):
+    for k in gl.static_range(tc.num_k_slots_per_tile()):
         payload, scale = pc.lds_ptrs.ds_read_frag(
             operand,
             _index(tc, step, operand * 2, False, KI, IN_LOOP or STATIC_PHASE),
@@ -627,20 +634,20 @@ def _read_tile(
             payload = buffers[operand][
                 (
                     (KI % tc.num_buffers(operand) if IN_LOOP else 0)
-                    * (tc.num_mini_m() if operand == 0 else tc.num_mini_n())
+                    * (tc.num_m_slots_per_block() if operand == 0 else tc.num_n_slots_per_block())
                     + tile
                 )
-                * tc.num_mini_k()
+                * tc.num_k_slots_per_tile()
                 + k
             ]
         if require_constexpr(SCALE and reg_scale):
             scale = buffers[operand + 2][
                 (
                     (KI % tc.num_buffers(operand, True) if IN_LOOP else 0)
-                    * (tc.num_mini_m() if operand == 0 else tc.num_mini_n())
+                    * (tc.num_m_slots_per_block() if operand == 0 else tc.num_n_slots_per_block())
                     + tile
                 )
-                * tc.num_mini_k()
+                * tc.num_k_slots_per_tile()
                 + k
             ]
         if require_constexpr(SCALE and has_scale and tc.scale_packed_k128(operand)):
@@ -669,8 +676,12 @@ def _read_slot(
     STATIC_PHASE: gl.constexpr = False,
 ):
     tc: gl.constexpr = pc.tuning_cfg
-    at: gl.constexpr = _ds_read_a_tile(mi, ni, tc.num_mini_m(), tc.num_mini_n())
-    bt: gl.constexpr = _ds_read_b_tile(mi, ni, tc.num_mini_m(), tc.num_mini_n())
+    at: gl.constexpr = _ds_read_a_tile(
+        mi, ni, tc.num_m_slots_per_block(), tc.num_n_slots_per_block()
+    )
+    bt: gl.constexpr = _ds_read_b_tile(
+        mi, ni, tc.num_m_slots_per_block(), tc.num_n_slots_per_block()
+    )
     a, b = (), ()
     if require_constexpr(
         at is not None
@@ -733,9 +744,9 @@ def _step_live(
     tc: gl.constexpr = pc.tuning_cfg
     warp: gl.constexpr = tc.warp_pipeline_compiler() and IN_LOOP
     region: gl.constexpr = pick_stage(warp)
-    nm: gl.constexpr = tc.num_mini_m()
-    nn: gl.constexpr = tc.num_mini_n()
-    mk: gl.constexpr = tc.num_mini_k()
+    nm: gl.constexpr = tc.num_m_slots_per_block()
+    nn: gl.constexpr = tc.num_n_slots_per_block()
+    mk: gl.constexpr = tc.num_k_slots_per_tile()
     a, b, acc = (), (), ()
     if require_constexpr(
         tc.commit_per_stage()
@@ -838,7 +849,7 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
         "the live pipeline requires WARP_PIPELINE=0 or 1",
     )
     gl.static_assert(
-        tc.num_prefetch_mini() == tc.num_mini_k(),
+        tc.num_prefetch_k_slots() == tc.num_k_slots_per_tile(),
         "the pipeline requires VGPR_PREFETCH_K == BLOCK_K",
     )
     depth: gl.constexpr = tc.pipeline_depth()
@@ -857,17 +868,17 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
     buffers = _init_buffers(pc)
     # r = p - (NB_MAX - 1): active streams fill p - NB_DELTA.
     for r in gl.static_range(1 - depth, 0):
-        for ni in gl.static_range(tc.num_mini_n()):
-            for mi in gl.static_range(tc.num_mini_m()):
+        for ni in gl.static_range(tc.num_n_slots_per_block()):
+            for mi in gl.static_range(tc.num_m_slots_per_block()):
                 buffers = _fill_slot(pc, ptrs, buffers, r, r, False, mi, ni)
         ptrs = _advance(pc, ptrs, r, r, False)
         buffers = _rotate_buffers(buffers, tc)
     acc = ()
-    for ni in gl.static_range(tc.num_mini_n()):
-        for mi in gl.static_range(tc.num_mini_m()):
+    for ni in gl.static_range(tc.num_n_slots_per_block()):
+        for mi in gl.static_range(tc.num_m_slots_per_block()):
             acc += (
                 gl.zeros(
-                    accumulator_shape(tc),
+                    accumulator_shape_slot(tc),
                     pc.func_cfg.mma_acc_dtype,
                     tc.dot_result_fragment_layout(),
                 ),
@@ -995,24 +1006,31 @@ def _drain_buffered_pipeline(
 def _last_mfma(pc, regs):
     tc: gl.constexpr = pc.tuning_cfg
     acc = ()
-    for ni in gl.static_range(tc.num_mini_n()):
-        for mi in gl.static_range(tc.num_mini_m()):
+    for ni in gl.static_range(tc.num_n_slots_per_block()):
+        for mi in gl.static_range(tc.num_m_slots_per_block()):
             acc += (
                 _maybe_block_dot(
                     _take_reg_pairs(
                         regs.a_payload,
                         regs.a_scale,
-                        mi * tc.num_mini_k(),
-                        tc.num_mini_k(),
+                        mi * tc.num_k_slots_per_tile(),
+                        tc.num_k_slots_per_tile(),
                     ),
                     _take_reg_pairs(
                         regs.b_payload,
                         regs.b_scale,
-                        ni * tc.num_mini_k(),
-                        tc.num_mini_k(),
+                        ni * tc.num_k_slots_per_tile(),
+                        tc.num_k_slots_per_tile(),
                     ),
-                    regs.acc[_slot_index(mi, ni, tc.num_mini_m(), tc.num_mini_n())],
-                    tc.num_mini_k(),
+                    regs.acc[
+                        _slot_index(
+                            mi,
+                            ni,
+                            tc.num_m_slots_per_block(),
+                            tc.num_n_slots_per_block(),
+                        )
+                    ],
+                    tc.num_k_slots_per_tile(),
                     pc.func_cfg,
                     tc,
                     True,

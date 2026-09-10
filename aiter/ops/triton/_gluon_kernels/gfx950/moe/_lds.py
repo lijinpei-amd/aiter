@@ -76,7 +76,7 @@ class LDSManager:
         """Static factory -- invoked as ``LDSManager.alloc(...)``, no ``self``.
 
         The leading axis runs over pipeline buffer *and* mini block
-        (``num_mini_m()`` tiles for A, ``num_mini_n()`` for B), flattened as
+        (``num_m_slots_per_block()`` tiles for A, ``num_n_slots_per_block()`` for B), flattened as
         ``buffer_idx * n_tiles + tile``: a shared allocation takes a layout of the tile's own
         rank, so two separate leading axes are not expressible. The mini block is a real
         allocation rather than a slice of one big tile so that each one keeps the padded
@@ -90,7 +90,7 @@ class LDSManager:
         if require_constexpr(tuning_cfg.payload_via_lds(0)):
             a_payload_lds_ptr = gl.allocate_shared_memory(
                 a_ty,
-                tuning_cfg.payload_lds_allocation_shape(0),
+                tuning_cfg.payload_lds_shape_block(0),
                 layout=tuning_cfg.dot_operand_lds_layout(0),
             )
         else:
@@ -98,7 +98,7 @@ class LDSManager:
         if require_constexpr(tuning_cfg.payload_via_lds(1)):
             b_payload_lds_ptr = gl.allocate_shared_memory(
                 b_ty,
-                tuning_cfg.payload_lds_allocation_shape(1),
+                tuning_cfg.payload_lds_shape_block(1),
                 layout=tuning_cfg.dot_operand_lds_layout(1),
             )
         else:
@@ -106,7 +106,7 @@ class LDSManager:
         if require_constexpr(func_cfg.has_scale(0) and tuning_cfg.scale_via_lds(0)):
             a_scale_lds_ptr = gl.allocate_shared_memory(
                 gl.uint8,
-                tuning_cfg.scale_lds_allocation_shape(0),
+                tuning_cfg.scale_lds_shape_block(0),
                 layout=tuning_cfg.dot_operand_scale_lds_layout(0),
             )
         else:
@@ -114,7 +114,7 @@ class LDSManager:
         if require_constexpr(func_cfg.has_scale(1) and tuning_cfg.scale_via_lds(1)):
             b_scale_lds_ptr = gl.allocate_shared_memory(
                 gl.uint8,
-                tuning_cfg.scale_lds_allocation_shape(1),
+                tuning_cfg.scale_lds_shape_block(1),
                 layout=tuning_cfg.dot_operand_scale_lds_layout(1),
             )
         else:
@@ -161,7 +161,7 @@ class LDSManager:
             else:
                 lds_ptr = self.b_payload_lds_ptr
             _buffer_load_to_lds(
-                lds_ptr.index(BUFFER_LOAD_IDX * cfg.num_lds_tiles(operand) + tile),
+                lds_ptr.index(BUFFER_LOAD_IDX * cfg.num_lds_slots_per_block_non_k(operand) + tile),
                 hbm_ptr,
                 hbm_offs,
                 cache,
@@ -172,12 +172,12 @@ class LDSManager:
                 ptr=hbm_ptr, offsets=hbm_offs, cache=cache, soffset=SOFF
             )
             fragments = ()
-            for mini in gl.static_range(cfg.num_mini_k()):
-                if require_constexpr(cfg.num_mini_k() > 1):
+            for mini in gl.static_range(cfg.num_k_slots_per_tile()):
+                if require_constexpr(cfg.num_k_slots_per_tile() > 1):
                     fragment = gl.amd.slice(
                         payload,
-                        cfg.payload_fragment_shape(operand),
-                        cfg.payload_fragment_offset(operand, mini),
+                        cfg.payload_fragment_shape_slot(operand),
+                        cfg.payload_fragment_offset_slot(operand, mini),
                     )
                 else:
                     fragment = payload
@@ -226,7 +226,7 @@ class LDSManager:
                     lds_ptr = self.b_scale_lds_ptr
                 _buffer_load_to_lds(
                     lds_ptr.index(
-                        BUFFER_LOAD_IDX * (cfg.num_lds_tiles(operand) // ratio)
+                        BUFFER_LOAD_IDX * (cfg.num_lds_slots_per_block_non_k(operand) // ratio)
                         + tile // ratio
                     ),
                     hbm_ptr,
@@ -262,12 +262,12 @@ class LDSManager:
                     ptr=hbm_ptr, offsets=hbm_offs, cache=cache, soffset=SOFF
                 )
             fragments = ()
-            for mini in gl.static_range(cfg.num_mini_k()):
-                if require_constexpr(cfg.num_mini_k() > 1):
+            for mini in gl.static_range(cfg.num_k_slots_per_tile()):
+                if require_constexpr(cfg.num_k_slots_per_tile() > 1):
                     fragment = gl.amd.slice(
                         scale,
-                        cfg.scale_fragment_shape(operand),
-                        cfg.scale_fragment_offset(mini),
+                        cfg.scale_fragment_shape_slot(operand),
+                        cfg.scale_fragment_offset_slot(mini),
                     )
                 else:
                     fragment = scale
@@ -296,9 +296,9 @@ class LDSManager:
     ):
         cfg: gl.constexpr = self.tuning_cfg
         tile_lds_ptr = lds_ptr.index(DS_READ_IDX * n_tiles + tile)
-        if require_constexpr(cfg.num_mini_k() > 1):
+        if require_constexpr(cfg.num_k_slots_per_tile() > 1):
             k_dim: gl.constexpr = 1 - operand
-            width: gl.constexpr = cfg.payload_fragment_shape(operand)[k_dim]
+            width: gl.constexpr = cfg.payload_fragment_shape_slot(operand)[k_dim]
             tile_lds_ptr = tile_lds_ptr.slice(mini_idx * width, width, dim=k_dim)
         return tile_lds_ptr
 
@@ -314,8 +314,8 @@ class LDSManager:
     ):
         cfg: gl.constexpr = self.tuning_cfg
         tile_lds_ptr = lds_ptr.index(DS_READ_IDX * n_tiles + tile)
-        if require_constexpr(cfg.num_mini_k() > 1):
-            width: gl.constexpr = cfg.scale_fragment_shape(operand)[1]
+        if require_constexpr(cfg.num_k_slots_per_tile() > 1):
+            width: gl.constexpr = cfg.scale_fragment_shape_slot(operand)[1]
             tile_lds_ptr = tile_lds_ptr.slice(mini_idx * width, width, dim=1)
         return tile_lds_ptr
 
@@ -330,7 +330,7 @@ class LDSManager:
         cfg: gl.constexpr = self.tuning_cfg
         RA: gl.constexpr = cfg.scale_tile_ratio_a() if cfg.scale_shuffled(0) else 1
         tile_lds_ptr = self.a_scale_lds_ptr.index(
-            DS_READ_IDX * (cfg.num_lds_tiles(0) // RA) + mi // RA
+            DS_READ_IDX * (cfg.num_lds_slots_per_block_non_k(0) // RA) + mi // RA
         )
         if require_constexpr(RA > 1):
             stripes: gl.constexpr = cfg.scale_flat_fragment_shape(0)[0]
@@ -368,7 +368,7 @@ class LDSManager:
                 self._payload_slice(
                     payload_lds_ptr,
                     DS_READ_IDX,
-                    cfg.num_lds_tiles(operand),
+                    cfg.num_lds_slots_per_block_non_k(operand),
                     tile,
                     mini_idx,
                     operand,
@@ -385,10 +385,10 @@ class LDSManager:
                     scale_tile_lds_ptr = self._a_scale_tile(SCALE_READ_IDX, tile)
                 else:
                     scale_tile_lds_ptr = scale_lds_ptr.index(
-                        SCALE_READ_IDX * cfg.num_lds_tiles(operand) + tile
+                        SCALE_READ_IDX * cfg.num_lds_slots_per_block_non_k(operand) + tile
                     )
             if require_constexpr(
-                cfg.scale_packed_ok(operand) and not (cfg.num_mini_k() > 1)
+                cfg.scale_packed_ok(operand) and not (cfg.num_k_slots_per_tile() > 1)
             ):
                 # Straight to i32: the dword the shuffle assembled is the operand the
                 # matrix instruction wants, so there is nothing left to do to it.
@@ -404,23 +404,23 @@ class LDSManager:
                 scale_val = _ds_read(
                     scale_tile_lds_ptr.reinterpret(
                         gl.uint8,
-                        cfg.scale_shape(operand),
+                        cfg.scale_shape_slot(operand),
                         cfg.shuffled_scale_read_layout(operand),
                     ),
                     cfg.dot_operand_scale_fragment_layout(operand),
                 )
-                if require_constexpr(cfg.num_mini_k() > 1):
+                if require_constexpr(cfg.num_k_slots_per_tile() > 1):
                     scale_val = gl.amd.slice(
                         scale_val,
-                        cfg.scale_fragment_shape(operand),
-                        cfg.scale_fragment_offset(mini_idx),
+                        cfg.scale_fragment_shape_slot(operand),
+                        cfg.scale_fragment_offset_slot(mini_idx),
                     )
             else:
                 scale_val = _ds_read(
                     self._scale_slice(
                         scale_lds_ptr,
                         SCALE_READ_IDX,
-                        cfg.num_lds_tiles(operand),
+                        cfg.num_lds_slots_per_block_non_k(operand),
                         tile,
                         mini_idx,
                         operand,

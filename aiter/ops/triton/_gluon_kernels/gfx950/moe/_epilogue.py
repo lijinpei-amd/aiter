@@ -19,8 +19,7 @@ from ._lang import MX_GROUP_CE as MX_GROUP
 from ._lang import optional as _opt
 from ._lang import require_constexpr
 from ._lang import unwrap as _v
-from ._layout import _n_split_offs, _n_start
-from ._offsets import _slot_index
+from ._layout import _n_split_offs, _n_start, _slot_index
 from ._quant import mxfp4_quant_gluon
 from ._types import DtypeQuant
 
@@ -155,7 +154,7 @@ def _epi_bias_tiles(bias_lds_ptr, bias_hbm_ptr, pid_n, N, func_cfg, tuning_cfg):
     this really is a prefetch -- unlike gammas, see _epi_gamma_tiles.
     """
     MBN: gl.constexpr = tuning_cfg.MINI_BLOCK_N
-    NN: gl.constexpr = tuning_cfg.num_mini_n()
+    NN: gl.constexpr = tuning_cfg.num_n_slots_per_block()
     RFL: gl.constexpr = tuning_cfg.dot_result_fragment_layout()
     out = ()
     if require_constexpr(func_cfg.has_bias):
@@ -187,7 +186,7 @@ def _epi_gamma_tiles(gamma_lds_ptr, gammas_hbm_ptr, block_id, M_e, func_cfg, tun
     """
     BM: gl.constexpr = tuning_cfg.BLOCK_M
     MBM: gl.constexpr = tuning_cfg.MINI_BLOCK_M
-    NM: gl.constexpr = tuning_cfg.num_mini_m()
+    NM: gl.constexpr = tuning_cfg.num_m_slots_per_block()
     out = ()
     if require_constexpr(func_cfg.has_gammas and gamma_lds_ptr is None):
         for hm in gl.static_range(NM):
@@ -224,7 +223,7 @@ def _epi_stage_flush(
     MBM: gl.constexpr = tuning_cfg.MINI_BLOCK_M
     MBN: gl.constexpr = tuning_cfg.MINI_BLOCK_N
     ARN: gl.constexpr = func_cfg.activation_reduction_n()
-    OUT_MBN: gl.constexpr = tuning_cfg.output_mini_n()
+    OUT_MBN: gl.constexpr = tuning_cfg.output_n_slot()
     P_COLS: gl.constexpr = tuning_cfg.quant_payload_shape(MBM, OUT_MBN)[1]
     S_COLS: gl.constexpr = tuning_cfg.quant_scale_shape(MBM, OUT_MBN)[1]
     PL: gl.constexpr = tuning_cfg.result_store_layout(MBM, P_COLS, 8)
@@ -277,7 +276,7 @@ def _epi_block_flush(
     single pair of stores rather than one per tile.
     """
     BM: gl.constexpr = tuning_cfg.BLOCK_M
-    OUT_MBN: gl.constexpr = tuning_cfg.output_mini_n()
+    OUT_MBN: gl.constexpr = tuning_cfg.output_n_slot()
     P_COLS: gl.constexpr = tuning_cfg.quant_payload_shape(BM, OUT_MBN)[1]
     S_COLS: gl.constexpr = tuning_cfg.quant_scale_shape(BM, OUT_MBN)[1]
     PL: gl.constexpr = tuning_cfg.result_store_layout(BM, P_COLS, 8)
@@ -353,7 +352,7 @@ def _epilogue_one_tile(
     BM: gl.constexpr = tuning_cfg.BLOCK_M
     MBM: gl.constexpr = tuning_cfg.MINI_BLOCK_M
     ARN: gl.constexpr = func_cfg.activation_reduction_n()
-    OUT_MBN: gl.constexpr = tuning_cfg.output_mini_n()
+    OUT_MBN: gl.constexpr = tuning_cfg.output_n_slot()
     P_COLS: gl.constexpr = tuning_cfg.quant_payload_shape(MBM, OUT_MBN)[1]
     S_COLS: gl.constexpr = tuning_cfg.quant_scale_shape(MBM, OUT_MBN)[1]
     act: gl.constexpr = func_cfg.act()
@@ -608,10 +607,10 @@ def _epilogue_store(
     compiler kill each mini accumulator before the next tile's epilogue.
     """
     MBM: gl.constexpr = tuning_cfg.MINI_BLOCK_M
-    OUT_MBN: gl.constexpr = tuning_cfg.output_mini_n()
+    OUT_MBN: gl.constexpr = tuning_cfg.output_n_slot()
 
-    NN: gl.constexpr = tuning_cfg.num_mini_n()
-    NM: gl.constexpr = tuning_cfg.num_mini_m()
+    NN: gl.constexpr = tuning_cfg.num_n_slots_per_block()
+    NM: gl.constexpr = tuning_cfg.num_m_slots_per_block()
 
     # Block-level operand loads. Each is invariant in one of the two
     # walk indices -- bias in mi, gammas in ni -- so the per-tile form below issues

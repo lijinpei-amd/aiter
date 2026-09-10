@@ -718,7 +718,7 @@ def test_epilogue_modes_preserve_output_geometry(config, epilogue):
     func = KernelFuncConfig(*_func_spec(epilogue))
     tc = KernelTuningConfig(func, *_tuning_spec(config))
     assert _plain(func.activation_reduction_n()) == 2
-    assert _plain(func.mini_n_reduction()) == 1
+    assert _plain(func.n_reduction_slot()) == 1
     assert _plain(tc.grid_N(4096)) == 16
     assert _plain(_validate(tc, 4096, 7168))
 
@@ -778,7 +778,7 @@ def _audit_buffer_schedule(tc, num_k, epilogue_groups=0):
     Register queues hold symbolic tile numbers, so every read also checks that
     warmup, rotation, and drain deliver exactly the current K tile.
     """
-    nm, nn = _plain(tc.num_mini_m()), _plain(tc.num_mini_n())
+    nm, nn = _plain(tc.num_m_slots_per_block()), _plain(tc.num_n_slots_per_block())
     nslots = nm * nn
     if (nm, nn) == (2, 2):
         payloads = [(2, 0), (0, 0), (0, 1), (2, 1)]
@@ -959,7 +959,7 @@ def test_independent_buffer_waits_match_copy_history(
         B_PRESHUFFLED=bool(storage_mask & 1),
     )
     if geometry == "middle_shared_a":
-        monkeypatch.setattr(layout_module, "_SCALE_MINI_M_ENV", 128)
+        monkeypatch.setattr(layout_module, "_SCALE_FILL_M_ENV", 128)
         config.update(SCALE_FILL_MID=True, A_SCALE_SORTED_SHUFFLED=True)
     elif geometry == "unequal_tiles":
         config.update(MINI_BLOCK_N=64, SCALE_FILL_MID=True)
