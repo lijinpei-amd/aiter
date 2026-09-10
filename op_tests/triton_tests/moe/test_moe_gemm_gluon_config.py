@@ -138,6 +138,9 @@ def test_a_scale_row_stride_preserves_sub_16_byte_alignment(kernel):
         ("B_NUM_BUFFER", 2),
         ("A_SCALE_NUM_BUFFER", 1),
         ("B_SCALE_NUM_BUFFER", 6),
+        ("SCALE_MINI_BLOCK_M", 128),
+        ("SCALE_MINI_BLOCK_N", 256),
+        ("SCALE_MINI_BLOCK_K", 512),
     ],
 )
 def test_launch_specs_match_kernel_config_field_order(
@@ -468,8 +471,11 @@ def test_register_component_buffer_counts_determine_lcm_unroll(
 ):
     config.update(zip(host._COMPONENT_BUFFER_KEYS, counts, strict=True))
     config.update(
-        K_UNROLL=7, B_IN_REG=True, B_PRESHUFFLED=True,
-        A_SCALE_IN_REG=True, B_SCALE_IN_REG=True,
+        K_UNROLL=7,
+        B_IN_REG=True,
+        B_PRESHUFFLED=True,
+        A_SCALE_IN_REG=True,
+        B_SCALE_IN_REG=True,
     )
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     assert _plain(tc.pipeline_register_period()) == period
@@ -540,9 +546,14 @@ def test_absent_scales_do_not_participate_in_depth_unroll_or_validation(
     config, register_b
 ):
     config.update(
-        A_NUM_BUFFER=3, B_NUM_BUFFER=4, A_SCALE_NUM_BUFFER=-1, B_SCALE_NUM_BUFFER=1,
-        B_IN_REG=register_b, B_PRESHUFFLED=register_b,
-        A_SCALE_IN_REG=True, B_SCALE_IN_REG=True,
+        A_NUM_BUFFER=3,
+        B_NUM_BUFFER=4,
+        A_SCALE_NUM_BUFFER=-1,
+        B_SCALE_NUM_BUFFER=1,
+        B_IN_REG=register_b,
+        B_PRESHUFFLED=register_b,
+        A_SCALE_IN_REG=True,
+        B_SCALE_IN_REG=True,
     )
     fc = KernelFuncConfig(
         *_func_spec()._replace(
@@ -596,9 +607,7 @@ def test_shared_depth_exact_minimum_and_all_unroll_remainders(config, depth, unr
     assert _plain(_pipeline_peeled(tc)) == 1
     minimum = depth + 1 + unroll
     for remainder in range(unroll):
-        assert _plain(
-            _validate(tc, 4096, (minimum + remainder) * config["BLOCK_K"])
-        )
+        assert _plain(_validate(tc, 4096, (minimum + remainder) * config["BLOCK_K"]))
     with pytest.raises(AssertionError, match="NUM_K.*NB_MAX.*PEELED.*UNROLL"):
         host._validate_selected_pipeline(tc, (minimum - 1) * config["BLOCK_K"])
 
@@ -630,9 +639,7 @@ def test_independent_register_scales_allow_mini_k_slicing(config):
 def test_component_buffers_still_require_nonempty_k(config):
     config["A_NUM_BUFFER"] = 2
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
-    with pytest.raises(
-        AssertionError, match="NUM_K.*must be at least"
-    ):
+    with pytest.raises(AssertionError, match="NUM_K.*must be at least"):
         host._validate_selected_pipeline(tc, 0)
 
 
@@ -664,7 +671,7 @@ def test_a_scale_buffer_alias_is_accepted(config, monkeypatch):
 
 
 @pytest.mark.parametrize("independent", [False, True])
-def test_packed_k128_scales_allow_odd_unroll(config, independent):
+def test_shuffled_k128_scales_round_unroll_to_scale_cadence(config, independent):
     config.update(
         BLOCK_K=128,
         MINI_BLOCK_K=128,
@@ -683,7 +690,7 @@ def test_packed_k128_scales_allow_odd_unroll(config, independent):
         )
     )
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    assert _plain(tc.pipeline_unroll()) == 3
+    assert _plain(tc.pipeline_unroll()) == 4
     assert _plain(_validate(tc, 4096, 7168))
     assert host._scale_shuffle_supported(config, 0)
     assert host._scale_shuffle_supported(config, 1)
@@ -799,11 +806,7 @@ def _audit_buffer_schedule(tc, num_k, epilogue_groups=0):
         )
         for kind in range(4)
     ]
-    shared_a = (
-        _plain(tc.scale_tile_ratio_a())
-        if async_kind[1] and _plain(tc.scale_shuffled(0))
-        else 1
-    )
+    shared_a = _plain(tc.scale_tile_ratio(0)) if _plain(tc.scale_shuffled(0)) else 1
     fill_slots = [[] for _ in range(nslots)]
     for slot, (kind, tile) in enumerate(payloads):
         fill_slots[slot].append((kind, tile))
@@ -846,7 +849,8 @@ def _audit_buffer_schedule(tc, num_k, epilogue_groups=0):
             need.append((kind, tile, stage))
             if has_scale[kind // 2]:
                 owner = tile - tile % shared_a if kind == 0 else tile
-                need.append((kind + 1, owner, stage))
+                if tile == owner:
+                    need.append((kind + 1, owner, stage))
         return need
 
     def check_wait(stage, slot):
@@ -860,9 +864,10 @@ def _audit_buffer_schedule(tc, num_k, epilogue_groups=0):
         )
         draining = stage > main
         relative_stage = stage - main - 1 if draining else stage
-        assert buffered_wait(
-            tc, relative_stage, slot, draining, epilogue_groups
-        ) == expected
+        assert (
+            buffered_wait(tc, relative_stage, slot, draining, epilogue_groups)
+            == expected
+        )
         if peeled + 1 <= stage <= main:
             assert buffered_wait(tc, None, slot) == expected
 
@@ -948,8 +953,6 @@ def _audit_buffer_schedule(tc, num_k, epilogue_groups=0):
 def test_independent_buffer_waits_match_copy_history(
     config, monkeypatch, scheme, storage_mask, counts, geometry
 ):
-    from aiter.ops.triton._gluon_kernels.gfx950.moe import _layout as layout_module
-
     config.update(zip(host._COMPONENT_BUFFER_KEYS, counts, strict=True))
     config.update(
         WAIT_COMMIT_SCHEME=int(scheme),
@@ -959,8 +962,9 @@ def test_independent_buffer_waits_match_copy_history(
         B_PRESHUFFLED=bool(storage_mask & 1),
     )
     if geometry == "middle_shared_a":
-        monkeypatch.setattr(layout_module, "_SCALE_FILL_M_ENV", 128)
-        config.update(SCALE_FILL_MID=True, A_SCALE_SORTED_SHUFFLED=True)
+        config.update(
+            SCALE_FILL_MID=True, A_SCALE_SORTED_SHUFFLED=True, SCALE_MINI_BLOCK_M=128
+        )
     elif geometry == "unequal_tiles":
         config.update(MINI_BLOCK_N=64, SCALE_FILL_MID=True)
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))

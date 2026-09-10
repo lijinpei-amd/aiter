@@ -49,10 +49,16 @@ def case():
         # wrong half-dword or attaching a scale to a neighbouring row is visible.
         x_exp = torch.randint(-3, 2, (m, k // 32), device="cuda")
         w_exp = torch.randint(-3, 2, (experts, n, k // 32), device="cuda")
-        x = (0.1 * torch.randn(m, k, device="cuda")
-             * torch.exp2(x_exp.float()).repeat_interleave(32, dim=-1)).bfloat16()
-        w = (0.1 * torch.randn(experts, n, k, device="cuda")
-             * torch.exp2(w_exp.float()).repeat_interleave(32, dim=-1)).bfloat16()
+        x = (
+            0.1
+            * torch.randn(m, k, device="cuda")
+            * torch.exp2(x_exp.float()).repeat_interleave(32, dim=-1)
+        ).bfloat16()
+        w = (
+            0.1
+            * torch.randn(experts, n, k, device="cuda")
+            * torch.exp2(w_exp.float()).repeat_interleave(32, dim=-1)
+        ).bfloat16()
         x, xs = downcast_to_mxfp(x, torch.float8_e4m3fn, axis=-1)
         w, ws = downcast_to_mxfp(w.transpose(1, 2), torch.float8_e4m3fn, axis=1)
         x_ref = upcast_from_mxfp(x, xs, torch.bfloat16, axis=-1).float()
@@ -67,15 +73,31 @@ def case():
             128, n, k, DtypeQuant.MXFP8, DtypeQuant.MXFP8
         )
         cfg.update(
-            BLOCK_N=256, BLOCK_K=128, MINI_BLOCK_M=64, MINI_BLOCK_N=128,
-            MINI_BLOCK_K=128, mfma_instr_shape=(16, 16, 128),
-            warps_per_cta=(1, 4), tiles_per_warp=(2, 2),
-            NUM_LDS_BUFFER=3, K_UNROLL=6, VGPR_PREFETCH_K=128,
-            A_SCALE_SORTED_SHUFFLED=True, B_SCALE_SHUFFLED=True,
+            BLOCK_N=256,
+            BLOCK_K=128,
+            MINI_BLOCK_M=64,
+            MINI_BLOCK_N=128,
+            MINI_BLOCK_K=128,
+            mfma_instr_shape=(16, 16, 128),
+            warps_per_cta=(1, 4),
+            tiles_per_warp=(2, 2),
+            NUM_LDS_BUFFER=3,
+            K_UNROLL=6,
+            VGPR_PREFETCH_K=128,
+            A_SCALE_SORTED_SHUFFLED=True,
+            B_SCALE_SHUFFLED=True,
         )
         yield SimpleNamespace(
-            n=n, k=k, x=x, w=w, xs=xs, ws=ws, route=route, gather=gather,
-            expected=expected, config=cfg,
+            n=n,
+            k=k,
+            x=x,
+            w=w,
+            xs=xs,
+            ws=ws,
+            route=route,
+            gather=gather,
+            expected=expected,
+            config=cfg,
         )
         host._launch_spec.cache_clear()
         host._get_gluon_config_cached.cache_clear()
@@ -89,13 +111,13 @@ def _check(case, monkeypatch, *, config=None, split=True, packed=True, public=Fa
     def capture(kernel, grid, args, *metadata):
         named = dict(zip(kernel.arg_names, args))
         tuning = host._cval(named["CFG_TUNING"])
-        assert (tuning.A_SCALE_SORTED_SHUFFLED, tuning.B_SCALE_SHUFFLED) == (
-            packed, packed
-        )
-        assert tuning.BLOCK_K == 128 and tuning.K_UNROLL == 6
+        shuffled = packed if isinstance(packed, tuple) else (packed, packed)
+        assert (tuning.A_SCALE_SORTED_SHUFFLED, tuning.B_SCALE_SHUFFLED) == shuffled
+        assert tuning.BLOCK_K == (config or case.config)["BLOCK_K"]
+        assert tuning.K_UNROLL == (config or case.config)["K_UNROLL"]
         assert named["a_ptr"] is case.x and named["b_ptr"] is case.w
-        assert (named["a_scale_ptr"] is case.xs) == (not packed)
-        assert (named["b_scale_ptr"] is case.ws) == (not packed)
+        assert (named["a_scale_ptr"] is case.xs) == (not shuffled[0])
+        assert (named["b_scale_ptr"] is case.ws) == (not shuffled[1])
         seen.append(True)
         return original(kernel, grid, args, *metadata)
 
@@ -107,22 +129,52 @@ def _check(case, monkeypatch, *, config=None, split=True, packed=True, public=Fa
         if public:
             assert config is None
             ok = host.try_gluon_grouped_gemm(
-                op_name="packed_mxfp8_scale_test", y=output, x=case.x, w=case.w,
-                x_scales=case.xs, w_scales=case.ws, bias=None, gammas=None,
-                routing_data=case.route, gather_indx=case.gather, scatter_indx=None,
-                N=case.n, K=case.k, apply_swiglu=True, alpha=1.0, limit=None,
-                swiglu_add_residual=False, split_k=1,
+                op_name="packed_mxfp8_scale_test",
+                y=output,
+                x=case.x,
+                w=case.w,
+                x_scales=case.xs,
+                w_scales=case.ws,
+                bias=None,
+                gammas=None,
+                routing_data=case.route,
+                gather_indx=case.gather,
+                scatter_indx=None,
+                N=case.n,
+                K=case.k,
+                apply_swiglu=True,
+                alpha=1.0,
+                limit=None,
+                swiglu_add_residual=False,
+                split_k=1,
             )
             assert ok, "The public stage1 capability check must select Gluon."
         else:
             host.moe_gemm_gluon(
-                output, case.x, case.w, case.xs, case.ws, None, None,
-                case.route, case.gather, None, case.n, case.k, True,
-                1.0, None, False, config=config, gate_up_split=split,
+                output,
+                case.x,
+                case.w,
+                case.xs,
+                case.ws,
+                None,
+                None,
+                case.route,
+                case.gather,
+                None,
+                case.n,
+                case.k,
+                True,
+                1.0,
+                None,
+                False,
+                config=config,
+                gate_up_split=split,
             )
         assert torch.isfinite(output).all()
         if first is None:
-            assert_close(case.expected[split], output[0], description="packed MXFP8 K128")
+            assert_close(
+                case.expected[split], output[0], description="packed MXFP8 K128"
+            )
             first = output.clone()
         else:
             assert torch.equal(first, output)
@@ -130,14 +182,19 @@ def _check(case, monkeypatch, *, config=None, split=True, packed=True, public=Fa
 
 
 @pytest.mark.parametrize("scheme", list(WaitCommitScheme), ids=lambda mode: mode.name)
-@pytest.mark.parametrize("pipeline", [WarpPipeline.NONE, WarpPipeline.COMPILER],
-                         ids=["none", "compiler"])
+@pytest.mark.parametrize(
+    "pipeline", [WarpPipeline.NONE, WarpPipeline.COMPILER], ids=["none", "compiler"]
+)
 @pytest.mark.parametrize("soff_unroll", [False, True], ids=["pointers", "soffsets"])
 def test_packed_mxfp8_scales_across_pipeline_modes(
     case, scheme, pipeline, soff_unroll, monkeypatch
 ):
-    config = dict(case.config, WAIT_COMMIT_SCHEME=int(scheme),
-                  WARP_PIPELINE=int(pipeline), SOFF_UNROLL=soff_unroll)
+    config = dict(
+        case.config,
+        WAIT_COMMIT_SCHEME=int(scheme),
+        WARP_PIPELINE=int(pipeline),
+        SOFF_UNROLL=soff_unroll,
+    )
     _check(case, monkeypatch, config=config)
 
 
@@ -147,7 +204,47 @@ def test_public_mxfp8_gemm1_prepares_default_packed_scales(case, split, monkeypa
 
 
 @pytest.mark.parametrize("unavailable", ["a", "b"])
-def test_public_mxfp8_gemm1_restores_both_raw_scales(case, unavailable, monkeypatch):
+def test_public_mxfp8_gemm1_restores_only_unavailable_raw_scale(
+    case, unavailable, monkeypatch
+):
     helper = "_sorted_shuffle_a_scales" if unavailable == "a" else "_shuffled_b_scales"
     monkeypatch.setattr(host, helper, lambda *_: None)
-    _check(case, monkeypatch, packed=False, public=True)
+    _check(
+        case, monkeypatch, packed=(unavailable != "a", unavailable != "b"), public=True
+    )
+
+
+@pytest.mark.parametrize("scheme", list(WaitCommitScheme), ids=lambda mode: mode.name)
+@pytest.mark.parametrize(
+    "scale_shape,shuffled,registers,depths,split,soff",
+    [
+        ((128, 256, 256), (True, True), False, (3, 3, 3, 3), True, False),
+        ((128, 256, 512), (True, True), False, (2, 3, 2, 3), False, True),
+        ((128, 256, 1024), (True, True), True, (2, 2, 2, 2), True, True),
+        ((128, 256, 512), (True, False), False, (3, 2, 3, 2), True, True),
+        ((128, 256, 512), (False, True), True, (3, 2, 2, 3), False, False),
+        ((1, 1, 1), (False, False), False, (3, 3, 3, 3), True, False),
+    ],
+    ids=["mn", "mnk", "register-k1024", "a-only", "b-only", "raw-ignores"],
+)
+def test_independent_scale_mini_blocks(
+    case, monkeypatch, scheme, scale_shape, shuffled, registers, depths, split, soff
+):
+    """Cover scale cadence, shared M/N tiles, skipped reads, and raw-scale isolation."""
+    config = dict(
+        case.config,
+        SCALE_MINI_BLOCK_M=scale_shape[0],
+        SCALE_MINI_BLOCK_N=scale_shape[1],
+        SCALE_MINI_BLOCK_K=scale_shape[2],
+        A_SCALE_SORTED_SHUFFLED=shuffled[0],
+        B_SCALE_SHUFFLED=shuffled[1],
+        A_SCALE_IN_REG=registers,
+        B_SCALE_IN_REG=registers,
+        A_NUM_BUFFER=depths[0],
+        B_NUM_BUFFER=depths[1],
+        A_SCALE_NUM_BUFFER=depths[2],
+        B_SCALE_NUM_BUFFER=depths[3],
+        WAIT_COMMIT_SCHEME=int(scheme),
+        SOFF_UNROLL=soff,
+    )
+    _check(case, monkeypatch, config=config, packed=shuffled, split=split)

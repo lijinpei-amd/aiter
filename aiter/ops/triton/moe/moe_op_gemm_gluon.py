@@ -80,6 +80,11 @@ _COMPONENT_BUFFER_KEYS = (
     "B_SCALE_NUM_BUFFER",
 )
 _REGISTER_STORAGE_KEYS = ("B_IN_REG", "B_SCALE_IN_REG", "A_SCALE_IN_REG")
+_SCALE_MINI_BLOCK_KEYS = (
+    "SCALE_MINI_BLOCK_M",
+    "SCALE_MINI_BLOCK_N",
+    "SCALE_MINI_BLOCK_K",
+)
 _DS_READ_FIELDS = (
     ("DS_READ_A_PAYLOAD_IN_MFMA", DSReadOperand.A),
     ("DS_READ_A_SCALE_IN_MFMA", DSReadOperand.A_SCALE),
@@ -390,9 +395,9 @@ def get_gluon_config_uncached(
         gran_n = instr[1] * warps[1]
         # Not defensive: if this ever fails the loop below never terminates, and the
         # symptom is a test run that spins at 200% CPU for an hour with no output.
-        assert (
-            bn % gran_n == 0
-        ), f"BLOCK_N {bn} not a multiple of warp N-granularity {gran_n}"
+        assert bn % gran_n == 0, (
+            f"BLOCK_N {bn} not a multiple of warp N-granularity {gran_n}"
+        )
         mini_n = min(bn, gran_n * 2)
         while mini_n % gran_n:
             mini_n += gran_n
@@ -456,11 +461,8 @@ def get_gluon_config_uncached(
             else:
                 out_warps, out_tiles = (4, 1), (2, 1)
             out_bk = 256
-            # Whole-block mini tiles by default: the preshuffled scale tiles are
-            # read whole, so sorted_shuffled_ok()/_shuffled_b_scales() reject a
-            # subdivided config and both shuffles silently switch off. An explicit
-            # override is still honoured -- that is the only way to price warp
-            # pipelining, which needs NM/NN > 1 to have anything to overlap.
+            # Whole-block payload mini tiles by default. Explicit splits let the
+            # pipeline overlap mini tiles; shuffled scales have independent extents.
             out_mini_m = _env_int("AITER_TRITON_MOE_GLUON_MINI_BLOCK_M", block_m)
             out_mini_n = _env_int("AITER_TRITON_MOE_GLUON_MINI_BLOCK_N", bn)
             gm = out_instr[0] * out_warps[0]
@@ -495,12 +497,18 @@ def get_gluon_config_uncached(
             "BLOCK_M": block_m,
             "BLOCK_N": bn,
             "BLOCK_K": out_bk,
-            # LDS indices may vary at runtime. Register rings round this requested
-            # factor up to a multiple of their active depths' least common multiple.
+            # Register rings and shuffled-scale K tiles round this requested
+            # factor up to a multiple of their periods' least common multiple.
             "K_UNROLL": _env_int("AITER_TRITON_MOE_GLUON_K_UNROLL", n_buf),
             "MINI_BLOCK_K": out_bk,
             "MINI_BLOCK_M": out_mini_m,
             "MINI_BLOCK_N": out_mini_n,
+            # Zero inherits the corresponding payload mini extent; shuffled
+            # scales require at least K256, stored as eight E8M0 scale bytes.
+            **{
+                key: _env_int("AITER_TRITON_MOE_GLUON_" + key, 0)
+                for key in _SCALE_MINI_BLOCK_KEYS
+            },
             "NUM_LDS_BUFFER": n_buf,
             # Zero inherits NUM_LDS_BUFFER in the common component pipeline.
             "A_NUM_BUFFER": _env_int("AITER_TRITON_MOE_GLUON_A_NUM_BUFFER", 0),
@@ -965,16 +973,21 @@ def _sorted_token_id_map(expt_data, gather_indx, n_expts_act, block_m, n_blocks,
 def _scale_shuffle_supported(cfg, operand):
     """Whether this operand can consume the packed K256 scale byte order."""
     block_k = int(cfg["BLOCK_K"])
-    if tuple(cfg["mfma_instr_shape"]) != (16, 16, 128) or block_k not in (128, 256):
+    mini_k = int(cfg["MINI_BLOCK_K"])
+    if (
+        tuple(cfg["mfma_instr_shape"]) != (16, 16, 128)
+        or block_k < 128
+        or block_k % 128 != 0
+        or mini_k < 128
+        or mini_k % 128 != 0
+    ):
         return False
+    if cfg.get("FROZEN_STEP", False):
+        return block_k == 256
     if block_k == 128:
-        # Each full dword serves two K128 stages. Both non-K bytes must belong
-        # to this wave; the component pipeline tracks the phase across any unroll.
-        return (
-            int(cfg["MINI_BLOCK_K"]) == 128
-            and not cfg.get("FROZEN_STEP", False)
-            and int(cfg["tiles_per_warp"][operand]) >= 2
-        )
+        # Preserve the K128 stage's dword-load eligibility: both non-K bytes
+        # belong to this wave while the component pipeline retains the next half.
+        return int(cfg["tiles_per_warp"][operand]) >= 2
     return True
 
 
@@ -1289,6 +1302,11 @@ def moe_gemm_gluon(
     :func:`gluon_supported` must have said yes for these tensors first.
     An explicit config's ``BLOCK_M`` must match ``routing_data.block_m`` because
     the routing offsets and block map are built for that geometry.
+    ``scale_mini_block_m``, ``scale_mini_block_n`` and ``scale_mini_block_k``
+    (also accepted in uppercase) set shuffled-scale load extents independently
+    of the payload mini tiles. K counts logical payload elements; its scale
+    storage extent is K / 32. Zero inherits the payload extent, with shuffled
+    scale K at least 256. Unshuffled scales ignore these settings.
 
     ``y_scales`` non-None selects the fused MXFP4 output quant: ``y`` then holds the
     E2M1 payload (``N // ARN // 2`` uint8 columns) and ``y_scales`` the E8M0 exponents,
@@ -1384,16 +1402,6 @@ def moe_gemm_gluon(
             b_scales, b_swizzle = shuf_w, ScaleSwizzle.CDNA4_SCALE
             b_scale_stride_k = 32
     b_shuffled = b_swizzle == ScaleSwizzle.CDNA4_SCALE
-    if int(_cfg["BLOCK_K"]) == 128 and not (a_shuffled and b_shuffled):
-        # The K128 packed MFMA requires matching packed-scale representations on
-        # both operands. An unavailable sorter or a one-sided request uses raw
-        # scales on both sides, with their original pointers and strides.
-        a_scales, a_swizzle = x_scales, ScaleSwizzle.NONE
-        a_scale_stride_m = 0 if x_scales is None else x_scales.stride(0)
-        a_scale_stride_k = 0 if x_scales is None else x_scales.stride(1)
-        b_scales, b_swizzle = w_scales, ScaleSwizzle.NONE
-        b_scale_stride_k = 0 if w_scales is None else w_scales.stride(1)
-        a_shuffled = b_shuffled = False
     if (
         bool(_cfg.get("A_SCALE_SORTED_SHUFFLED", False)) != a_shuffled
         or bool(_cfg.get("B_SCALE_SHUFFLED", False)) != b_shuffled
@@ -1752,6 +1760,16 @@ def _tuning_args(c: dict) -> tuple:
         if canonical and canonical != alias:
             raise ValueError("A_SCALE_NUM_BUFFER and A_SCALE_NUMB_BUFFER disagree")
         c = dict(c, A_SCALE_NUM_BUFFER=alias)
+    for canonical in _SCALE_MINI_BLOCK_KEYS:
+        alias = canonical.lower()
+        value = c.get(canonical, 0)
+        if alias in c:
+            if value and value != c[alias]:
+                raise ValueError(f"{canonical} and {alias} disagree")
+            value = c[alias]
+        if not value:
+            value = _env_int("AITER_TRITON_MOE_GLUON_" + canonical, 0)
+        c = dict(c, **{canonical: value})
     return tuple(
         c[k] if k in c else TuningSpec._field_defaults[k] for k in _TUNING_KEYS
     )

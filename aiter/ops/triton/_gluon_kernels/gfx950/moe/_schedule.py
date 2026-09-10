@@ -85,12 +85,7 @@ def _buffer_load_ops(tc, mi, ni):
             scale_tile = _scale_buffer_load_tile(
                 mi, ni, NM, NN, idx == 0, tc.SCALE_FILL_MID
             )
-            if (
-                idx == 0
-                and scale_tile is not None
-                and tc.scale_shuffled(0)
-                and scale_tile % tc.scale_tile_ratio_a() != 0
-            ):
+            if scale_tile is not None and scale_tile % tc.scale_tile_ratio(idx) != 0:
                 scale_tile = None
         ops.append(scale_tile)
     return tuple(ops)
@@ -149,11 +144,12 @@ def _buffer_load_wait(tc, mi, ni, STAGES_BETWEEN, DO_BUFFER_LOAD):
             continue
         if tc.payload_via_lds(idx):
             required.append((idx * 2, tile))
-        if tc.func_cfg.has_scale(idx) and tc.scale_via_lds(idx):
-            owner = tile
-            if idx == 0 and tc.scale_shuffled(0):
-                owner -= owner % tc.scale_tile_ratio_a()
-            required.append((idx * 2 + 1, owner))
+        if (
+            tc.func_cfg.has_scale(idx)
+            and tc.scale_via_lds(idx)
+            and tile % tc.scale_tile_ratio(idx) == 0
+        ):
+            required.append((idx * 2 + 1, tile))
     if not required:
         return None
     latest = max(

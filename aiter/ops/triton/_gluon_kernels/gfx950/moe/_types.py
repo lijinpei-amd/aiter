@@ -111,8 +111,8 @@ class TuningSpec(NamedTuple):
     BLOCK_M: int
     BLOCK_N: int
     BLOCK_K: int
-    #: Requested unroll factor, rounded up to a multiple of every active register
-    #: ring depth. LDS rings can keep runtime indices and impose no extra factor.
+    #: Requested unroll factor, rounded up for every active register ring and
+    #: shuffled-scale K tile. LDS rings can keep runtime indices.
     K_UNROLL: int
     MINI_BLOCK_K: int
     MINI_BLOCK_M: int
@@ -176,6 +176,12 @@ class TuningSpec(NamedTuple):
     B_NUM_BUFFER: int = 0
     A_SCALE_NUM_BUFFER: int = 0
     B_SCALE_NUM_BUFFER: int = 0
+    #: Independent shuffled-scale load extents. Zero follows the payload mini
+    #: extent, with K at least 256 logical elements (eight stored scale bytes).
+    #: These fields are ignored for operands whose scales are not shuffled.
+    SCALE_MINI_BLOCK_M: int = 0
+    SCALE_MINI_BLOCK_N: int = 0
+    SCALE_MINI_BLOCK_K: int = 0
 
 
 class ActivationSpec(NamedTuple):

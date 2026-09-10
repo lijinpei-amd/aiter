@@ -126,6 +126,26 @@ def _dot(a, a_scale, b, b_scale, acc, func_cfg, tuning_cfg, K_PHASE: gl.constexp
     b_sel: gl.constexpr = tuning_cfg.mfma_scale_selector(1, K_PHASE)
     any_packed: gl.constexpr = tuning_cfg.has_mfma_packed_scale()
     if require_constexpr(kind == _DK_MFMA_SCALED and any_packed):
+        if require_constexpr(not func_cfg.has_scale(0)):
+            a_scale = gl.full(
+                tuning_cfg.scale_fragment_shape_slot(0),
+                127,
+                gl.uint8,
+                gl.amd.cdna4.get_mfma_scale_layout(
+                    tuning_cfg.dot_operand_fragment_layout(0),
+                    tuning_cfg.scale_fragment_shape_slot(0),
+                ),
+            )
+        if require_constexpr(not func_cfg.has_scale(1)):
+            b_scale = gl.full(
+                tuning_cfg.scale_fragment_shape_slot(1),
+                127,
+                gl.uint8,
+                gl.amd.cdna4.get_mfma_scale_layout(
+                    tuning_cfg.dot_operand_fragment_layout(1),
+                    tuning_cfg.scale_fragment_shape_slot(1),
+                ),
+            )
         # At least one scale tile arrived as pre-packed dwords; the other, if any,
         # takes the ordinary path through the same instruction.
         out = gl.amd.cdna4.mfma_scaled_packed(
@@ -213,7 +233,7 @@ def _maybe_block_dot(
                 acc,
                 func_cfg,
                 tuning_cfg,
-                K_PHASE,
+                (K_PHASE + i * tuning_cfg.MINI_BLOCK_K // 128) % 2,
             )
     return acc
 
@@ -254,6 +274,7 @@ class _PipelineConst:
     s_step: gl.constexpr
     func_cfg: KernelFuncConfig
     tuning_cfg: KernelTuningConfig
+    num_k: gl.constexpr
 
     @gluon.constexpr_function
     def __init__(
@@ -270,6 +291,7 @@ class _PipelineConst:
         s_step,
         func_cfg,
         tuning_cfg,
+        num_k,
     ):
         self.lds_ptrs = lds_ptrs
         self.a_hbm_offs = a_hbm_offs
@@ -285,6 +307,7 @@ class _PipelineConst:
         self.s_step = gl.constexpr(_v(s_step))
         self.func_cfg = func_cfg
         self.tuning_cfg = tuning_cfg
+        self.num_k = gl.constexpr(_v(num_k))
 
 
 @aggregate
@@ -427,7 +450,6 @@ def _drain_last_fused(
     x_static_scale,
     func_cfg,
     tuning_cfg,
-    K_PHASE: gl.constexpr = 0,
 ):
     """The final drain step, with the gate half's activation folded into it.
 
@@ -462,7 +484,7 @@ def _drain_last_fused(
                 func_cfg,
                 tc,
                 True,
-                K_PHASE,
+                (pc.num_k - 1) * tc.BLOCK_K // 128 % 2,
             )
             if require_constexpr(ni == 0):
                 # Gate side: everything up to and including the reciprocal, issued here
@@ -592,6 +614,7 @@ def _moe_gemm_body(
         s_step,
         func_cfg,
         tuning_cfg,
+        tuning_cfg.num_k_tiles(K),
     )
 
     hbm_ptrs, buffers, regs = _run_buffered_pipeline(pc, hbm_ptrs, NUM_K)
@@ -647,7 +670,6 @@ def _moe_gemm_body(
             x_static_scale,
             func_cfg,
             tuning_cfg,
-            K_PHASE=0,
         )
     else:
         acc = regs.acc

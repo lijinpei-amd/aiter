@@ -154,7 +154,7 @@ def _maybe_block_dot(
                 acc,
                 func_cfg,
                 tuning_cfg,
-                K_PHASE,
+                (K_PHASE + i * tuning_cfg.MINI_BLOCK_K // 128) % 2,
             )
     return acc
 
@@ -240,7 +240,7 @@ class _FrozenLDSManager:
             if require_constexpr(tuning_cfg.scale_shuffled(0)):
                 a_scale_lds_ptr = gl.allocate_shared_memory(
                     gl.uint8,
-                    [NBAS * tuning_cfg.num_scale_tiles_a()]
+                    [NBAS * tuning_cfg.num_scale_tiles(0)]
                     + tuning_cfg.scale_flat_shape(0),
                     layout=tuning_cfg.dot_operand_scale_lds_layout(0),
                 )
@@ -296,12 +296,12 @@ class _FrozenLDSManager:
         else:
             lds_ptr = self.b_payload_lds_ptr
         cache: gl.constexpr = (
-            cfg.token_cache_modifier
-            if operand == 0
-            else cfg.expert_cache_modifier
+            cfg.token_cache_modifier if operand == 0 else cfg.expert_cache_modifier
         )
         _buffer_load_to_lds(
-            lds_ptr.index(BUFFER_LOAD_IDX * cfg.num_lds_slots_per_block_non_k(operand) + tile),
+            lds_ptr.index(
+                BUFFER_LOAD_IDX * cfg.num_lds_slots_per_block_non_k(operand) + tile
+            ),
             hbm_ptr,
             hbm_offs,
             cache,
@@ -322,9 +322,7 @@ class _FrozenLDSManager:
     ):
         cfg: gl.constexpr = self.tuning_cfg
         gl.static_assert(VIA_LDS)
-        ratio: gl.constexpr = (
-            cfg.scale_tile_ratio_a() if operand == 0 and cfg.scale_shuffled(0) else 1
-        )
+        ratio: gl.constexpr = cfg.scale_tile_ratio(operand)
         if require_constexpr(
             self.func_cfg.has_scale(operand)
             and cfg.scale_via_lds(operand)
@@ -341,7 +339,8 @@ class _FrozenLDSManager:
             )
             _buffer_load_to_lds(
                 lds_ptr.index(
-                    BUFFER_LOAD_IDX * (cfg.num_lds_slots_per_block_non_k(operand) // ratio)
+                    BUFFER_LOAD_IDX
+                    * (cfg.num_lds_slots_per_block_non_k(operand) // ratio)
                     + tile // ratio
                 ),
                 hbm_ptr,
@@ -395,7 +394,7 @@ class _FrozenLDSManager:
     @gluon.jit
     def _a_scale_tile(self, DS_READ_IDX, mi: gl.constexpr):
         cfg: gl.constexpr = self.tuning_cfg
-        RA: gl.constexpr = cfg.scale_tile_ratio_a() if cfg.scale_shuffled(0) else 1
+        RA: gl.constexpr = cfg.scale_tile_ratio(0)
         tile_lds_ptr = self.a_scale_lds_ptr.index(
             DS_READ_IDX * (cfg.num_lds_slots_per_block_non_k(0) // RA) + mi // RA
         )
@@ -446,7 +445,8 @@ class _FrozenLDSManager:
                     scale_tile_lds_ptr = self._a_scale_tile(SCALE_READ_IDX, tile)
                 else:
                     scale_tile_lds_ptr = scale_lds_ptr.index(
-                        SCALE_READ_IDX * cfg.num_lds_slots_per_block_non_k(operand) + tile
+                        SCALE_READ_IDX * cfg.num_lds_slots_per_block_non_k(operand)
+                        + tile
                     )
             if require_constexpr(cfg.scale_packed_ok(operand)):
                 scale_val = _ds_read(
@@ -1380,9 +1380,7 @@ def _init_buffers_frozen(pc):
     a, b, a_scale, b_scale = (), (), (), ()
     if require_constexpr(not tc.payload_via_lds(0)):
         for _ in gl.static_range(
-            tc.num_buffers(0)
-            * tc.num_m_slots_per_block()
-            * tc.num_k_slots_per_tile()
+            tc.num_buffers(0) * tc.num_m_slots_per_block() * tc.num_k_slots_per_tile()
         ):
             a += (
                 gl.zeros(
@@ -1396,9 +1394,7 @@ def _init_buffers_frozen(pc):
             )
     if require_constexpr(not tc.payload_via_lds(1)):
         for _ in gl.static_range(
-            tc.num_buffers(1)
-            * tc.num_n_slots_per_block()
-            * tc.num_k_slots_per_tile()
+            tc.num_buffers(1) * tc.num_n_slots_per_block() * tc.num_k_slots_per_tile()
         ):
             b += (
                 gl.zeros(
@@ -1409,9 +1405,11 @@ def _init_buffers_frozen(pc):
             )
     if require_constexpr(pc.func_cfg.a_has_scale() and not tc.scale_via_lds(0)):
         for _ in gl.static_range(
-            tc.num_buffers(0, True) * tc.num_m_slots_per_block() * tc.num_k_slots_per_tile()
+            tc.num_buffers(0, True)
+            * tc.num_m_slots_per_block()
+            * tc.num_k_slots_per_tile()
         ):
-            if require_constexpr(tc.scale_packed_k128(0)):
+            if require_constexpr(tc.scale_step_ratio(0) > 1):
                 a_scale += (
                     gl.zeros(
                         tc.packed_scale_shape(0),
@@ -1429,9 +1427,11 @@ def _init_buffers_frozen(pc):
                 )
     if require_constexpr(pc.func_cfg.b_has_scale() and not tc.scale_via_lds(1)):
         for _ in gl.static_range(
-            tc.num_buffers(1, True) * tc.num_n_slots_per_block() * tc.num_k_slots_per_tile()
+            tc.num_buffers(1, True)
+            * tc.num_n_slots_per_block()
+            * tc.num_k_slots_per_tile()
         ):
-            if require_constexpr(tc.scale_packed_k128(1)):
+            if require_constexpr(tc.scale_step_ratio(1) > 1):
                 b_scale += (
                     gl.zeros(
                         tc.packed_scale_shape(1),
@@ -1589,7 +1589,8 @@ def _drain_frozen_pipeline(
         tc.num_buffers(1),
         tc.num_buffers(0, True) if pc.func_cfg.a_has_scale() else 1,
         tc.num_buffers(1, True) if pc.func_cfg.b_has_scale() else 1,
-        2 if tc.scale_packed_k128(0) or tc.scale_packed_k128(1) else 1,
+        tc.scale_step_ratio(0),
+        tc.scale_step_ratio(1),
     )
     if require_constexpr(
         period <= 3

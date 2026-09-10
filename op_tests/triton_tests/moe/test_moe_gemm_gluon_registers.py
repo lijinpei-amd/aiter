@@ -415,6 +415,38 @@ def test_k128_register_scale_phase(register_case):
     _assert_register_case(register_case, config)
 
 
+@pytest.mark.parametrize(
+    "block_k,mini_k,scale_k,shuffled",
+    [
+        (256, 128, 256, (False, False)),
+        (256, 128, 512, (True, False)),
+        (512, 128, 256, (True, True)),
+        (512, 256, 256, (False, True)),
+    ],
+    ids=["raw-mini128", "a-scale512", "two-scale-loads", "b-scale256"],
+)
+def test_scale_and_payload_k_load_units_are_independent(
+    register_case, block_k, mini_k, scale_k, shuffled
+):
+    if register_case.dtype == "bf16":
+        pytest.skip("This case exercises microscaled operands.")
+    config = _register_config(register_case.dtype)
+    config.update(
+        BLOCK_K=block_k,
+        MINI_BLOCK_K=mini_k,
+        SCALE_MINI_BLOCK_K=scale_k,
+        SCALE_MINI_BLOCK_M=128,
+        SCALE_MINI_BLOCK_N=256,
+        VGPR_PREFETCH_K=block_k,
+        NUM_LDS_BUFFER=2,
+        K_UNROLL=2,
+        B_IN_REG=True,
+        A_SCALE_SORTED_SHUFFLED=shuffled[0],
+        B_SCALE_SHUFFLED=shuffled[1],
+    )
+    _assert_register_case(register_case, config)
+
+
 @pytest.mark.parametrize("mask", [1, 2, 4, 7], ids=["b", "a_scale", "b_scale", "all"])
 def test_register_operands_with_mini_k_split(register_case, mask):
     if register_case.dtype == "bf16":
