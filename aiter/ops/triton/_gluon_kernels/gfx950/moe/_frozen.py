@@ -236,7 +236,7 @@ class _FrozenLDSManager:
         else:
             b_payload_lds_ptr: gl.constexpr = None
         if require_constexpr(func_cfg.has_scale(0)):
-            as_shape: gl.constexpr = tuning_cfg.scale_shape_slot(0)
+            as_shape: gl.constexpr = tuning_cfg.scale_lds_shape_slot(0)
             if require_constexpr(tuning_cfg.scale_shuffled(0)):
                 a_scale_lds_ptr = gl.allocate_shared_memory(
                     gl.uint8,
@@ -253,7 +253,7 @@ class _FrozenLDSManager:
         else:
             a_scale_lds_ptr: gl.constexpr = None
         if require_constexpr(func_cfg.has_scale(1)):
-            bs_shape: gl.constexpr = tuning_cfg.scale_shape_slot(1)
+            bs_shape: gl.constexpr = tuning_cfg.scale_lds_shape_slot(1)
             if require_constexpr(tuning_cfg.scale_shuffled(1)):
                 b_scale_lds_ptr = gl.allocate_shared_memory(
                     gl.uint8,
@@ -461,7 +461,7 @@ class _FrozenLDSManager:
                 scale_val = _ds_read(
                     scale_tile_lds_ptr.reinterpret(
                         gl.uint8,
-                        cfg.scale_shape_slot(operand),
+                        cfg.scale_lds_shape_slot(operand),
                         cfg.shuffled_scale_read_layout(operand),
                     ),
                     cfg.dot_operand_scale_fragment_layout(operand),

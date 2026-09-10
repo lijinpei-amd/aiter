@@ -404,7 +404,7 @@ class LDSManager:
                 scale_val = _ds_read(
                     scale_tile_lds_ptr.reinterpret(
                         gl.uint8,
-                        cfg.scale_shape_slot(operand),
+                        cfg.scale_lds_shape_slot(operand),
                         cfg.shuffled_scale_read_layout(operand),
                     ),
                     cfg.dot_operand_scale_fragment_layout(operand),

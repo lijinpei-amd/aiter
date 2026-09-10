@@ -32,7 +32,7 @@ __all__ = [
     "_shuffled_scale_register_offsets",
     "_shuffled_scale_stage_offsets",
     "_slot_index",
-    "accumulator_shape_slot",
+    "accumulator_fragment_shape_slot",
     "byte_unit_lds_layout",
     "make_scale_swizzle_check",
 ]
@@ -181,7 +181,7 @@ def byte_unit_lds_layout(shape, nk_dim, elem_bits, unit_rows, preshuffled):
 
 
 @gluon.constexpr_function
-def accumulator_shape_slot(tuning_cfg):
+def accumulator_fragment_shape_slot(tuning_cfg):
     """Shape of one M-slot by N-slot accumulator tile.
 
     This accepts the structural tuning-config interface used by the scalar pipeline
@@ -751,9 +751,9 @@ class _KernelTuningLayout:
         return [nonk, _v(self.MINI_BLOCK_K) // MX_GROUP]
 
     @gluon.constexpr_function
-    def accumulator_shape_slot(self):
+    def accumulator_fragment_shape_slot(self):
         """Shape of one M-slot by N-slot accumulator tile."""
-        return accumulator_shape_slot(self)
+        return accumulator_fragment_shape_slot(self)
 
     @gluon.constexpr_function
     def payload_lds_shape_slot(self, idx):
@@ -777,7 +777,7 @@ class _KernelTuningLayout:
         ]
 
     @gluon.constexpr_function
-    def scale_shape_slot(self, idx):
+    def scale_lds_shape_slot(self, idx):
         """E8M0 shape of one operand slot: [slot non-K extent, BLOCK_K/32]."""
         non_k = _v(self.MINI_BLOCK_M) if _v(idx) == 0 else _v(self.MINI_BLOCK_N)
         return [non_k, self.scale_block_k_storage()]
@@ -802,7 +802,7 @@ class _KernelTuningLayout:
             scale_fill_shape = self.scale_flat_shape(idx)
         else:
             num_scale_fill_tiles_block = self.num_lds_slots_per_block_non_k(idx)
-            scale_fill_shape = self.scale_shape_slot(idx)
+            scale_fill_shape = self.scale_lds_shape_slot(idx)
         return [
             self.num_buffers(idx, True) * num_scale_fill_tiles_block
         ] + scale_fill_shape
@@ -870,7 +870,7 @@ class _KernelTuningLayout:
         """
         if self.scale_in_reg(idx):
             return False
-        shape = self.scale_shape_slot(idx)
+        shape = self.scale_lds_shape_slot(idx)
         if self.scale_shuffled(idx):
             # Fragment-ordered in HBM, so the copy is linear and the LDS tile keeps the
             # same permutation; the read is then a 32-bit ds_read. Staying on LDS also
@@ -1008,7 +1008,7 @@ class _KernelTuningLayout:
         )
 
     @gluon.constexpr_function
-    def dot_operand_copy_layout(self, idx):
+    def dot_operand_buffer_load_lds_layout(self, idx):
         """Register layout of the global->LDS copy offsets for a payload operand."""
         idx = _v(idx)
         shape = self.payload_lds_shape_slot(idx)
@@ -1024,13 +1024,13 @@ class _KernelTuningLayout:
     def payload_hbm_offset_layout(self, idx):
         """Layout used to form one payload tile's global-memory offsets."""
         if self.payload_via_lds(idx):
-            return self.dot_operand_copy_layout(idx)
+            return self.dot_operand_buffer_load_lds_layout(idx)
         return self.dot_operand_fragment_layout(idx)
 
     @gluon.constexpr_function
     def dot_operand_scale_fragment_layout(self, idx):
         idx = _v(idx)
-        shape = self.scale_shape_slot(idx)
+        shape = self.scale_lds_shape_slot(idx)
         return gl.amd.cdna4.get_mfma_scale_layout(
             self.dot_operand_fragment_layout(idx), shape, MX_GROUP
         )
@@ -1088,36 +1088,28 @@ class _KernelTuningLayout:
         return _v(steps)
 
     @gluon.constexpr_function
-    def shuffled_scale_mem_layout(self, idx):
-        """The scale fragment layout, reordered so registers ascend with the address.
-
-        ``get_mfma_scale_layout`` puts the K-group bit before the non-K bit in
-        ``reg_bases``, so a lane's four bytes land in registers in address order
-        0, +2, +1, +3. A widened (contiguity 4) load fills registers ascending, so it
-        has to be issued at this permutation and converted afterwards -- a within-lane
-        register renumber, no cross-lane traffic, because the lane and warp bases are
-        untouched.
-        """
-        frag = self.dot_operand_scale_fragment_layout(idx)
-        lead = [[16, 0], [0, 4]]
-        rest = [list(b) for b in frag.reg_bases if list(b) not in lead]
-        return gl.DistributedLinearLayout(
-            reg_bases=lead + rest,
-            lane_bases=[list(b) for b in frag.lane_bases],
-            warp_bases=[list(b) for b in frag.warp_bases],
-            block_bases=[],
-            shape=list(frag.shape),
-        )
-
-    @gluon.constexpr_function
     def scale_hbm_offset_layout(self, idx):
         """Layout used to form one scale tile's global-memory offsets."""
         if self.scale_via_lds(idx):
-            return self.dot_operand_scale_copy_layout(idx)
+            return self.dot_operand_scale_buffer_load_lds_layout(idx)
         if self.scale_packed_k128(idx):
             return self.packed_scale_frag_layout(idx)
         if self.scale_shuffled(idx):
-            return self.shuffled_scale_mem_layout(idx)
+            # get_mfma_scale_layout puts the K-group bit before the non-K bit in
+            # reg_bases, so a lane's four bytes land in registers in address order
+            # 0, +2, +1, +3. A widened load fills registers in ascending order; issue
+            # it with those two bases swapped, then convert with only a lane-local
+            # register renumber because the lane and warp bases stay unchanged.
+            frag = self.dot_operand_scale_fragment_layout(idx)
+            lead = [[16, 0], [0, 4]]
+            rest = [list(b) for b in frag.reg_bases if list(b) not in lead]
+            return gl.DistributedLinearLayout(
+                reg_bases=lead + rest,
+                lane_bases=[list(b) for b in frag.lane_bases],
+                warp_bases=[list(b) for b in frag.warp_bases],
+                block_bases=[],
+                shape=list(frag.shape),
+            )
         return self.dot_operand_scale_fragment_layout(idx)
 
     @gluon.constexpr_function
@@ -1316,10 +1308,10 @@ class _KernelTuningLayout:
         return gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
 
     @gluon.constexpr_function
-    def dot_operand_scale_copy_layout(self, idx):
+    def dot_operand_scale_buffer_load_lds_layout(self, idx):
         """32-bit-per-lane blocked layout for the scale direct-to-LDS write."""
         idx = _v(idx)
-        shape = self.scale_shape_slot(idx)
+        shape = self.scale_lds_shape_slot(idx)
         if self.scale_shuffled(idx):
             # Flat run, 4 contiguous bytes per lane.
             return gl.BlockedLayout(
@@ -1414,11 +1406,11 @@ class _KernelTuningLayout:
         return gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[0])
 
     @gluon.constexpr_function
-    def epilogue_gamma_copy_layout(self):
+    def epilogue_gamma_buffer_load_lds_layout(self):
         return gl.BlockedLayout([1], [WARP_SIZE], [self.num_warps()], [0])
 
     @gluon.constexpr_function
-    def epilogue_bias_copy_layout(self):
+    def epilogue_bias_buffer_load_lds_layout(self):
         return gl.BlockedLayout(
             [self.epilogue_bias_per_thread()],
             [WARP_SIZE],
@@ -1503,7 +1495,7 @@ class _KernelTuningLayout:
             if fc.has_scale(idx) and (
                 _v(self.FROZEN_STEP) or self.scale_via_lds(idx)
             ):
-                s = self.scale_shape_slot(idx)
+                s = self.scale_lds_shape_slot(idx)
                 scale_k = 8 if self.scale_packed_k128(idx) else s[1]
                 total += (
                     num_slots_block
