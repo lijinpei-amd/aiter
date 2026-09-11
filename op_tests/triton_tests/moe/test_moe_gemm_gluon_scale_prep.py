@@ -179,7 +179,7 @@ def _inputs(k=2560):
         block_pid_map=torch.tensor([0, 1], dtype=torch.int32),
     )
     routing_data = SimpleNamespace(
-        block_m=128, n_expts_act=topk, expt_data=expt_data,
+        block_m=128, n_expts_tot=experts, n_expts_act=topk, expt_data=expt_data,
         n_blocks=lambda *_: experts,
     )
     return SimpleNamespace(

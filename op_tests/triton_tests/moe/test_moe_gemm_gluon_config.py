@@ -54,8 +54,10 @@ def _clean_tuning_environment(monkeypatch):
         if name.startswith("AITER_TRITON_MOE_GLUON_"):
             monkeypatch.delenv(name)
     host._launch_spec.cache_clear()
+    host._get_gluon_config_cached.cache_clear()
     yield
     host._launch_spec.cache_clear()
+    host._get_gluon_config_cached.cache_clear()
 
 
 @pytest.fixture
@@ -239,6 +241,186 @@ def test_cache_modifier_environment_names(
         128, 4096, 7168, DtypeQuant.MXFP4, DtypeQuant.MXFP4
     )
     assert config[field] == ".ca"
+
+
+@pytest.mark.parametrize(
+    "M,n_expts_tot,block_m,expected",
+    [
+        (2048, 33, 64, 1),
+        (2112, 33, 64, 1),
+        (2113, 33, 64, 2),
+        (8192, 33, 128, 2),
+    ],
+)
+def test_expected_m_tiles_per_expert(M, n_expts_tot, block_m, expected):
+    assert host._expected_m_tiles_per_expert(M, n_expts_tot, block_m) == expected
+
+
+@pytest.mark.parametrize(
+    "dq_a,dq_b,apply_swiglu,M,expected",
+    [
+        (DtypeQuant.MXFP8, DtypeQuant.MXFP8, True, 2048, True),
+        (DtypeQuant.MXFP8, DtypeQuant.MXFP8, True, 2113, False),
+        (DtypeQuant.MXFP8, DtypeQuant.MXFP8, False, 2048, False),
+        (DtypeQuant.MXFP8, DtypeQuant.MXFP4, True, 2048, False),
+        (DtypeQuant.MXFP4, DtypeQuant.MXFP4, True, 2048, False),
+    ],
+)
+def test_streaming_expert_payload_is_scoped_to_one_tile_mxfp8_gemm1(
+    dq_a, dq_b, apply_swiglu, M, expected
+):
+    assert (
+        host._stream_mxfp8_gemm1_expert_payload(
+            M, 33, 64, dq_a, dq_b, apply_swiglu
+        )
+        is expected
+    )
+
+
+def test_t256_mxfp8_gemm1_uses_validated_streaming_geometry():
+    config = host._launch_spec(
+        block_m=64,
+        N=4096,
+        K=7168,
+        dq_a=DtypeQuant.MXFP8,
+        dq_b=DtypeQuant.MXFP8,
+        small_grid=False,
+        has_bias=False,
+        has_gammas=False,
+        has_gather=True,
+        has_x_static_scale=False,
+        act=ActivationSpec(int(ActKind.SILU), 1.0, None, False),
+        out_quant=None,
+        config_items=None,
+        stream_expert_payload=True,
+    )[4]
+    expected = {
+        "BLOCK_M": 64,
+        "BLOCK_N": 128,
+        "BLOCK_K": 256,
+        "MINI_BLOCK_M": 32,
+        "MINI_BLOCK_N": 64,
+        "MINI_BLOCK_K": 256,
+        "mfma_instr_shape": (16, 16, 128),
+        "warps_per_cta": (2, 2),
+        "tiles_per_warp": (1, 2),
+        "NUM_LDS_BUFFER": 3,
+        "K_UNROLL": 3,
+        "VGPR_PREFETCH_K": 256,
+        "WAVES_PER_EU": 1,
+        "WAIT_COMMIT_SCHEME": int(WaitCommitScheme.PER_STAGE_WHOLE),
+        "A_SCALE_SORTED_SHUFFLED": True,
+        "B_SCALE_SHUFFLED": True,
+        "B_PRESHUFFLED": False,
+        "B_IN_REG": False,
+        "B_SCALE_IN_REG": False,
+        "A_SCALE_IN_REG": False,
+        "expert_cache_modifier": ".cg",
+    }
+    assert {name: config[name] for name in expected} == expected
+    tuning = host._probe_tuning_config(
+        config, DtypeQuant.MXFP8, DtypeQuant.MXFP8
+    )
+    assert host._cval(tuning.validate(4096, 7168))
+    assert host._cval(host._validate_selected_pipeline(tuning, 7168))
+    assert host._probe_lds_bytes(
+        config, DtypeQuant.MXFP8, DtypeQuant.MXFP8
+    ) <= host.LDS_USABLE_BYTES
+
+    reused = host._default_launch_config(
+        64,
+        4096,
+        7168,
+        DtypeQuant.MXFP8,
+        DtypeQuant.MXFP8,
+        False,
+        True,
+        stream_expert_payload=False,
+    )
+    assert reused["expert_cache_modifier"] == ""
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"stream_expert_payload": False},
+        {"apply_swiglu": False},
+        {"dq_a": DtypeQuant.MXFP4},
+        {"dq_b": DtypeQuant.MXFP4},
+        {"block_m": 32},
+        {"N": 2048},
+        {"K": 6912},
+        {"small_grid": True},
+    ],
+)
+def test_t256_mxfp8_gemm1_geometry_override_is_narrow(overrides):
+    args = {
+        "block_m": 64,
+        "N": 4096,
+        "K": 7168,
+        "dq_a": DtypeQuant.MXFP8,
+        "dq_b": DtypeQuant.MXFP8,
+        "small_grid": False,
+        "apply_swiglu": True,
+        "stream_expert_payload": True,
+    }
+    args.update(overrides)
+    selected = host._default_launch_config(**args)
+    baseline = host.get_gluon_config(
+        args["block_m"],
+        args["N"],
+        args["K"],
+        args["dq_a"],
+        args["dq_b"],
+        args["small_grid"],
+        args["stream_expert_payload"],
+    )
+    assert selected == baseline
+
+
+@pytest.mark.parametrize("suffix", ["EXPERT_CACHE_MODIFIER", "EXPERT_MOD"])
+@pytest.mark.parametrize("override", ["", ".ca"])
+def test_streaming_expert_payload_respects_environment_override(
+    monkeypatch, suffix, override
+):
+    monkeypatch.setenv("AITER_TRITON_MOE_GLUON_" + suffix, override)
+    config = host.get_gluon_config_uncached(
+        64,
+        4096,
+        7168,
+        DtypeQuant.MXFP8,
+        DtypeQuant.MXFP8,
+        False,
+        stream_expert_payload=True,
+    )
+    assert config["expert_cache_modifier"] == override
+
+
+@pytest.mark.parametrize("explicit", ["", ".ca"])
+def test_streaming_expert_payload_respects_explicit_config(explicit):
+    config = host.get_gluon_config_uncached(
+        64, 4096, 7168, DtypeQuant.MXFP8, DtypeQuant.MXFP8
+    )
+    config["expert_cache_modifier"] = explicit
+    selected = host._launch_spec(
+        block_m=64,
+        N=4096,
+        K=7168,
+        dq_a=DtypeQuant.MXFP8,
+        dq_b=DtypeQuant.MXFP8,
+        small_grid=False,
+        has_bias=False,
+        has_gammas=False,
+        has_gather=True,
+        has_x_static_scale=False,
+        act=ActivationSpec(int(ActKind.SILU), 1.0, None, False),
+        out_quant=None,
+        config_items=tuple(
+            sorted((key, host._hashable(value)) for key, value in config.items())
+        ),
+        stream_expert_payload=True,
+    )[4]
+    assert selected == config
 
 
 @pytest.mark.parametrize(

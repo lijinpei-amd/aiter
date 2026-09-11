@@ -307,25 +307,63 @@ def _pipeline_error(cfg_items: tuple, dq_a, dq_b, K):
 
 @cache
 def _get_gluon_config_cached(
-    block_m: int, N: int, K: int, dq_a, dq_b, small_grid: bool
+    block_m: int,
+    N: int,
+    K: int,
+    dq_a,
+    dq_b,
+    small_grid: bool,
+    stream_expert_payload: bool,
 ) -> tuple:
     return tuple(
-        sorted(get_gluon_config_uncached(block_m, N, K, dq_a, dq_b, small_grid).items())
+        sorted(
+            get_gluon_config_uncached(
+                block_m,
+                N,
+                K,
+                dq_a,
+                dq_b,
+                small_grid,
+                stream_expert_payload,
+            ).items()
+        )
     )
 
 
 def get_gluon_config(
-    block_m: int, N: int, K: int, dq_a, dq_b, small_grid: bool = False
+    block_m: int,
+    N: int,
+    K: int,
+    dq_a,
+    dq_b,
+    small_grid: bool = False,
+    stream_expert_payload: bool = False,
 ) -> dict:
     """Cached view of :func:`get_gluon_config_uncached`. The decode path issues one of
     these per launch and the launch path *is* the critical path there."""
-    return dict(_get_gluon_config_cached(block_m, N, K, dq_a, dq_b, bool(small_grid)))
+    return dict(
+        _get_gluon_config_cached(
+            block_m,
+            N,
+            K,
+            dq_a,
+            dq_b,
+            bool(small_grid),
+            bool(stream_expert_payload),
+        )
+    )
 
 
 def get_gluon_config_uncached(
-    block_m: int, N: int, K: int, dq_a, dq_b, small_grid: bool = False
+    block_m: int,
+    N: int,
+    K: int,
+    dq_a,
+    dq_b,
+    small_grid: bool = False,
+    stream_expert_payload: bool = False,
 ) -> dict:
-    """Explicit Python ladder keyed on ``(block_m, N, K, dtypes, small_grid)``.
+    """Explicit Python ladder keyed on shape, dtypes and launch-reuse regime.
 
     ``aiter/ops/triton/configs/gfx950/gluon/moe/`` is empty and the three in-tree config
     mechanisms are mutually incompatible, so this starts as a ladder; a JSON resolver
@@ -544,12 +582,14 @@ def get_gluon_config_uncached(
             "token_scale_cache_modifier": _env_cache_modifier(
                 "TOKEN_SCALE_CACHE_MODIFIER", "", "TOKEN_SCALE_MOD"
             ),
-            # .cg (non-temporal) on the weight payload: at decode every line is read
-            # once, so streaming it keeps it from evicting anything that is reused.
-            # Dropping it costs 10% more HBM traffic.
+            # .cg (non-temporal) on a one-pass weight payload keeps it from evicting
+            # anything that is reused. block_m <= 32 preserves the measured decode
+            # default. stream_expert_payload extends that policy to a host-selected
+            # one-M-tile-per-expert launch (currently only MXFP8 gemm1). Explicit
+            # canonical/legacy environment settings remain authoritative.
             "expert_cache_modifier": _env_cache_modifier(
                 "EXPERT_CACHE_MODIFIER",
-                ".cg" if block_m <= 32 else "",
+                ".cg" if block_m <= 32 or stream_expert_payload else "",
                 "EXPERT_MOD",
             ),
             # ...but NOT on the weight scales. The scale tensor is (E, K/32, N) with K
@@ -662,9 +702,63 @@ def get_gluon_config_uncached(
     return cfg
 
 
-def _default_launch_config(block_m, N, K, dq_a, dq_b, small_grid, apply_swiglu):
+def _default_launch_config(
+    block_m,
+    N,
+    K,
+    dq_a,
+    dq_b,
+    small_grid,
+    apply_swiglu,
+    stream_expert_payload=False,
+):
     """Share automatic stage-specific geometry with the capability check."""
-    c = get_gluon_config(block_m, N, K, dq_a, dq_b, small_grid)
+    c = get_gluon_config(
+        block_m,
+        N,
+        K,
+        dq_a,
+        dq_b,
+        small_grid,
+        stream_expert_payload,
+    )
+    if (
+        not small_grid
+        and stream_expert_payload
+        and apply_swiglu
+        and dq_a == dq_b == DtypeQuant.MXFP8
+        and block_m == 64
+        and N == 4096
+        and K == 7168
+        and not c["FROZEN_STEP"]
+    ):
+        # The balanced T=256, E=33, top-k=8 launch has one M tile per expert.
+        # BN128 doubles its useful CTA count relative to BN256 and removes the
+        # eight-XCD launch tail; this is the measured staged-B winner for that
+        # exact model shape. Keep the override narrow until adjacent shapes are
+        # benchmarked with the same cold-cache protocol.
+        c = dict(
+            c,
+            BLOCK_N=128,
+            BLOCK_K=256,
+            MINI_BLOCK_M=32,
+            MINI_BLOCK_N=64,
+            MINI_BLOCK_K=256,
+            mfma_instr_shape=(16, 16, 128),
+            warps_per_cta=(2, 2),
+            tiles_per_warp=(1, 2),
+            NUM_LDS_BUFFER=3,
+            K_UNROLL=3,
+            VGPR_PREFETCH_K=256,
+            WAVES_PER_EU=_env_int("AITER_TRITON_MOE_GLUON_WAVES_PER_EU", 1),
+            WAIT_COMMIT_SCHEME=_env_int(
+                "AITER_TRITON_MOE_GLUON_WAIT_COMMIT_SCHEME",
+                int(WaitCommitScheme.PER_STAGE_WHOLE),
+            ),
+            A_SCALE_SORTED_SHUFFLED=True,
+            B_SCALE_SHUFFLED=True,
+            B_PRESHUFFLED=False,
+        )
     if (
         apply_swiglu
         and dq_a == dq_b == DtypeQuant.MXFP8
@@ -700,6 +794,36 @@ def _small_grid(routing_data, M, N) -> bool:
     """True when the launch would not fill the machine at the default N tile."""
     grid_m = routing_data.n_blocks(M, routing_data.block_m)
     return grid_m * max(1, N // 128) < 512
+
+
+def _expected_m_tiles_per_expert(M: int, n_expts_tot: int, block_m: int) -> int:
+    """Host-only estimate of B reuse, without synchronizing on the device histogram.
+
+    ``M`` is the routed-row count (tokens times top-k). Dividing its mean per expert by
+    ``block_m`` estimates how many independent M CTAs will traverse each expert's full B
+    matrix. The actual count can differ for skewed routing, but consulting ``expt_hist``
+    would introduce a device-to-host synchronization on every launch.
+    """
+    assert M >= 0 and n_expts_tot > 0 and block_m > 0
+    rows_per_all_expert_tiles = n_expts_tot * block_m
+    return (M + rows_per_all_expert_tiles - 1) // rows_per_all_expert_tiles
+
+
+def _stream_mxfp8_gemm1_expert_payload(
+    M: int, n_expts_tot: int, block_m: int, dq_a, dq_b, apply_swiglu: bool
+) -> bool:
+    """Use streaming B only for the measured one-pass MXFP8 gemm1 regime.
+
+    Keep this narrower than a ``block_m <= 64`` rule: the same block size can have
+    multiple M tiles per expert at a larger routed batch, where B has cross-CTA reuse.
+    Other dtype pairs and gemm2 retain their existing policy until separately measured.
+    """
+    return (
+        apply_swiglu
+        and dq_a == DtypeQuant.MXFP8
+        and dq_b == DtypeQuant.MXFP8
+        and _expected_m_tiles_per_expert(M, n_expts_tot, block_m) <= 1
+    )
 
 
 def gluon_supported(
@@ -773,6 +897,14 @@ def gluon_supported(
         dq_b,
         _small_grid(routing_data, y.shape[1], N),
         apply_swiglu,
+        _stream_mxfp8_gemm1_expert_payload(
+            y.shape[1],
+            routing_data.n_expts_tot,
+            block_m,
+            dq_a,
+            dq_b,
+            apply_swiglu,
+        ),
     )
     if N % cfg["BLOCK_N"] != 0:
         return False, f"N {N} % BLOCK_N {cfg['BLOCK_N']} != 0"
@@ -835,6 +967,7 @@ def _launch_spec(
     config_items,
     gate_up_split=False,
     epilogue=int(EpilogueMode.DEFAULT),
+    stream_expert_payload=False,
 ):
     """Host-side constexpr work, memoised.
 
@@ -847,7 +980,14 @@ def _launch_spec(
         dict(config_items)
         if config_items
         else _default_launch_config(
-            block_m, N, K, dq_a, dq_b, small_grid, act is not None
+            block_m,
+            N,
+            K,
+            dq_a,
+            dq_b,
+            small_grid,
+            act is not None,
+            stream_expert_payload,
         )
     )
     assert c["BLOCK_M"] == block_m, (
@@ -1334,6 +1474,14 @@ def moe_gemm_gluon(
     grid_m = routing_data.n_blocks(y.shape[1], block_m)
     dq_a = infer_dtype_quant(x, x_scales)
     dq_b = infer_dtype_quant(w, w_scales)
+    stream_expert_payload = _stream_mxfp8_gemm1_expert_payload(
+        y.shape[1],
+        routing_data.n_expts_tot,
+        block_m,
+        dq_a,
+        dq_b,
+        apply_swiglu,
+    )
 
     if apply_swiglu:
         act = ActivationSpec(
@@ -1367,6 +1515,7 @@ def moe_gemm_gluon(
             cfg_items,
             gate_up_split,
             epilogue,
+            stream_expert_payload,
         )
 
     grid_n, constexpr_args, num_warps, waves_per_eu, _cfg, _tc = _spec(
