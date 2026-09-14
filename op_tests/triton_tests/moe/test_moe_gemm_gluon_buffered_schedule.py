@@ -190,6 +190,9 @@ class _Machine:
         self.completed = set()
         self.lds = {}
         self.steps = []
+        self.current_in_loop = False
+        self.current_drain = False
+        self.events = []
 
     def load(self, kind, ring, mini, pointer):
         tc = self.tc
@@ -198,11 +201,25 @@ class _Machine:
         nonk = tc.scale_tile_ratio(kind // 2) if kind % 2 else 1
         mk = tc.num_k_slots_per_tile()
         assert 0 <= tile < self.num_k, "HBM load exceeded the K strip"
-        assert tile == self.current_read + (tc.depths[kind] - 1) * ratio
+        lead = (tc.depths[kind] - 1) * ratio
+        if kind == 2 and not tc.is_async(kind):
+            lead -= 1
+        assert tile == self.current_read + lead
         assert tile % ratio == 0 and mini % nonk == 0
         token = kind, mini, tile
         assert token not in self.loads, "HBM tile loaded more than once"
         self.loads.add(token)
+        self.events.append(
+            (
+                self.current_read,
+                self.current_in_loop,
+                self.current_drain,
+                "load",
+                kind,
+                tile,
+                mini,
+            )
+        )
         fragments = tuple(
             _Fragment(kind, tile + k // mk, mini + mn, k % mk)
             for mn in range(nonk)
@@ -319,6 +336,17 @@ class _Machine:
     def dot(self, a, b, accumulator, mk, fc, tc, enabled, phase):
         if not enabled:
             return accumulator
+        self.events.append(
+            (
+                self.current_read,
+                self.current_in_loop,
+                self.current_drain,
+                "mfma",
+                None,
+                accumulator,
+                None,
+            )
+        )
         assert 0 <= accumulator < self.num_k
         assert phase == accumulator * tc.BLOCK_K // 128 % 2
         for operand, fragments in enumerate((a, b)):
@@ -369,15 +397,34 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
 
     def step(*args, **kwargs):
         machine.current_read = args[4]
-        machine.steps.append((args[4], kwargs.get("IN_LOOP", False)))
+        machine.current_in_loop = kwargs.get("IN_LOOP", False)
+        machine.current_drain = kwargs.get("DRAIN", False)
+        machine.steps.append((args[4], machine.current_in_loop))
         return step_fn(*args, **kwargs)
 
     def fill(*args, **kwargs):
         machine.current_read = args[3]
+        machine.current_in_loop = kwargs.get(
+            "IN_LOOP", args[9] if len(args) > 9 else False
+        )
+        machine.current_drain = kwargs.get("DRAIN", args[5] if len(args) > 5 else False)
         return fill_fn(*args, **kwargs)
 
     def check_assumption(value):
         assert value
+
+    def sched_barrier(mask):
+        machine.events.append(
+            (
+                machine.current_read,
+                machine.current_in_loop,
+                machine.current_drain,
+                "sched_barrier",
+                None,
+                mask,
+                None,
+            )
+        )
 
     def init_buffers(pc):
         return tuple(
@@ -430,7 +477,7 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         patch.setattr(pipeline.gl, "assume", check_assumption)
         patch.setattr(pipeline.gl, "zeros", lambda *args, **kwargs: 0)
         patch.setattr(pipeline.gl, "barrier", lambda: None)
-        patch.setattr(pipeline.gl.amd.cdna4, "sched_barrier", lambda mask: None)
+        patch.setattr(pipeline.gl.amd.cdna4, "sched_barrier", sched_barrier)
         pointers, buffers, regs = pipeline._run_buffered_pipeline.fn(
             pc, _pointers(0, 0, 0, 0), num_k
         )
@@ -465,6 +512,7 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
     assert [read for read, in_loop in machine.steps] == list(range(num_k))
     assert any(in_loop for read, in_loop in machine.steps)
     assert not machine.pending
+    return machine
 
 
 @pytest.mark.parametrize(
@@ -543,6 +591,143 @@ def test_emitted_unified_pipeline_all_reachable_remainders(
         _execute(tc, num_k, monkeypatch)
     # Re-enter the same static register-ring mapping from another runtime loop body.
     _execute(tc, first + 2 * tc.pipeline_unroll(), monkeypatch)
+
+
+def _sched_barrier_stream(machine):
+    return [
+        (event_read, in_loop, drain, value)
+        for event_read, in_loop, drain, op, kind, value, mini in machine.events
+        if op == "sched_barrier"
+    ]
+
+
+def _assert_direct_b_stage_barriers(machine):
+    in_loop_reads = [read for read, in_loop in machine.steps if in_loop]
+    assert _sched_barrier_stream(machine) == [
+        (0, False, False, 0),  # Existing seed barrier for DOT=False.
+        *((read, True, False, 0) for read in in_loop_reads),
+    ]
+    return in_loop_reads
+
+
+@pytest.mark.parametrize("soff", [False, True], ids=["pointer-step", "soffset-unroll"])
+def test_direct_b3_fills_k_plus_2_while_mfma_consumes_k(soff, monkeypatch):
+    tc = _Config(
+        WaitCommitScheme.PER_STAGE_WHOLE,
+        (3, 3, 3, 3),
+        1,  # Direct-register B payload; the machine records it as kind 2.
+        scales=False,
+        soff=soff,
+    )
+    # Exercise one non-loop remainder stage as well as the steady loop and drain.
+    num_k = tc.pipeline_depth() + tc.pipeline_peeled() + tc.pipeline_unroll() + 1
+    machine = _execute(tc, num_k, monkeypatch)
+
+    in_loop_reads = _assert_direct_b_stage_barriers(machine)
+    assert len(in_loop_reads) == tc.pipeline_unroll() == 3
+    for read in in_loop_reads:
+        assert [
+            op
+            for event_read, in_loop, drain, op, kind, tile, mini in machine.events
+            if in_loop and not drain and event_read == read
+        ][-1] == "sched_barrier"
+        mfma_tiles = [
+            tile
+            for event_read, in_loop, drain, op, kind, tile, mini in machine.events
+            if in_loop and not drain and event_read == read and op == "mfma"
+        ]
+        assert mfma_tiles == [read - 1] * (tc.nm * tc.nn)
+
+        loads = [
+            (kind, tile, mini)
+            for event_read, in_loop, drain, op, kind, tile, mini in machine.events
+            if in_loop and not drain and event_read == read and op == "load"
+        ]
+        assert {(tile, mini) for kind, tile, mini in loads if kind == 0} == {
+            (read + 2, mi) for mi in range(tc.nm)
+        }
+        assert {(tile, mini) for kind, tile, mini in loads if kind == 2} == {
+            (read + 1, ni) for ni in range(tc.nn)
+        }
+
+    drain_b_loads = {
+        (event_read, tile, mini)
+        for event_read, in_loop, drain, op, kind, tile, mini in machine.events
+        if drain and op == "load" and kind == 2
+    }
+    assert drain_b_loads == {(num_k - 2, num_k - 1, ni) for ni in range(tc.nn)}
+
+
+@pytest.mark.parametrize("soff", [False, True], ids=["pointer-step", "soffset-unroll"])
+def test_direct_b2_fills_k_plus_1_while_mfma_consumes_k(soff, monkeypatch):
+    tc = _Config(
+        WaitCommitScheme.PER_STAGE_WHOLE,
+        (3, 3, 2, 3),
+        1,
+        scales=False,
+        soff=soff,
+    )
+    # Exercise one non-loop remainder stage as well as the steady loop and drain.
+    num_k = tc.pipeline_depth() + tc.pipeline_peeled() + tc.pipeline_unroll() + 1
+    machine = _execute(tc, num_k, monkeypatch)
+
+    assert {
+        (event_read, tile, mini)
+        for event_read, in_loop, drain, op, kind, tile, mini in machine.events
+        if event_read < 0 and op == "load" and kind == 2
+    } == set()
+    assert {
+        (tile, mini)
+        for event_read, in_loop, drain, op, kind, tile, mini in machine.events
+        if event_read == 0 and op == "load" and kind == 2
+    } == {(0, ni) for ni in range(tc.nn)}
+
+    in_loop_reads = _assert_direct_b_stage_barriers(machine)
+    assert len(in_loop_reads) == tc.pipeline_unroll() == 4
+    for read in in_loop_reads:
+        assert [
+            op
+            for event_read, in_loop, drain, op, kind, tile, mini in machine.events
+            if in_loop and not drain and event_read == read
+        ][-1] == "sched_barrier"
+        mfma_tiles = [
+            tile
+            for event_read, in_loop, drain, op, kind, tile, mini in machine.events
+            if in_loop and not drain and event_read == read and op == "mfma"
+        ]
+        assert mfma_tiles == [read - 1] * (tc.nm * tc.nn)
+        assert {
+            (tile, mini)
+            for event_read, in_loop, drain, op, kind, tile, mini in machine.events
+            if in_loop
+            and not drain
+            and event_read == read
+            and op == "load"
+            and kind == 2
+        } == {(read, ni) for ni in range(tc.nn)}
+
+    drain_b_loads = {
+        (event_read, tile, mini)
+        for event_read, in_loop, drain, op, kind, tile, mini in machine.events
+        if drain and op == "load" and kind == 2
+    }
+    assert drain_b_loads == {
+        (read, read, ni) for read in range(num_k - 2, num_k) for ni in range(tc.nn)
+    }
+
+
+def test_lds_b_has_only_the_existing_seed_sched_barrier(monkeypatch):
+    tc = _Config(
+        WaitCommitScheme.PER_STAGE_WHOLE,
+        (3, 3, 3, 3),
+        0,
+        scales=False,
+    )
+    num_k = tc.pipeline_depth() + tc.pipeline_peeled() + tc.pipeline_unroll() + 1
+    machine = _execute(tc, num_k, monkeypatch)
+
+    assert any(in_loop for read, in_loop in machine.steps)
+    assert _sched_barrier_stream(machine) == [(0, False, False, 0)]
 
 
 @pytest.mark.parametrize(

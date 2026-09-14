@@ -3,11 +3,13 @@
 
 """One payload/scale pipeline for shared and independent buffer depths.
 
-A step named r reads payload tile r and accumulates tile r - 1. Payloads fill
-r + NB - 1; a scale tile spanning R steps fills r + (NB - 1) * R every R steps.
-The driver peels the seed and first MFMAs, then uses runtime main-loop bounds.
-Register rings keep fixed SSA slots throughout each complete unrolled body;
-only the finite prologue, remainder and drain rotate the logical queues.
+A step named r reads payload tile r and accumulates tile r - 1. LDS payloads
+fill r + NB - 1. Direct-register B fills r + NB - 2, equivalently B[k + NB - 1]
+while MFMA consumes B[k], because it has no intervening DS-read stage. A scale
+tile spanning R steps fills r + (NB - 1) * R every R steps. The driver peels the
+seed and first MFMAs, then uses runtime main-loop bounds. Register rings keep
+fixed SSA slots throughout each complete unrolled body; only the finite
+prologue, remainder and drain rotate the logical queues.
 """
 
 import math
@@ -46,6 +48,30 @@ def _ops(tc, mi, ni):
 
 
 @gluon.constexpr_function
+def _fill_span(tc, kind):
+    """Number of read stages between startup and the final fill.
+
+    Direct B has ``NB`` physical banks but only an ``NB - 1`` stage producer
+    span: while MFMA consumes B[k], HBM fills B[k + NB - 1]. LDS payloads
+    retain the extra copy/read stage.
+    """
+    span = tc.component_span(kind // 2, bool(kind % 2))
+    if kind == 2 and not tc.payload_via_lds(1):
+        span -= 1
+    return span
+
+
+@gluon.constexpr_function
+def _read_payload_after_fill(tc, operand):
+    """Whether this step's payload registers are selected after its HBM fill."""
+    return tc.ds_read_in_mfma(operand) or (
+        operand == 1
+        and not tc.payload_via_lds(operand)
+        and tc.num_buffers(operand) == 2
+    )
+
+
+@gluon.constexpr_function
 def _active(tc, kind, stage, drain=False):
     """Whether a component fills at this compile-time relative stage.
 
@@ -55,7 +81,7 @@ def _active(tc, kind, stage, drain=False):
     """
     if kind % 2 and not tc.func_cfg.has_scale(kind // 2):
         return False
-    depth = tc.component_span(kind // 2, bool(kind % 2))
+    depth = _fill_span(tc, kind)
     if drain:
         return stage < tc.pipeline_depth() - depth
     return stage is None or stage + depth - 1 >= 0
@@ -478,7 +504,7 @@ def _fill_slot(
                 b,
                 fragments,
                 (
-                    ((KI if IN_LOOP else 0) + tc.num_buffers(1) - 1)
+                    ((KI if IN_LOOP else 0) + _fill_span(tc, 2) - 1)
                     % tc.num_buffers(1)
                     * tc.num_n_slots_per_block()
                     + ops[2]
@@ -684,7 +710,7 @@ def _read_slot(
         mi, ni, tc.num_m_slots_per_block(), tc.num_n_slots_per_block()
     )
     a, b, a_scale, b_scale = (), (), (), ()
-    if require_constexpr(at is not None and tc.ds_read_in_mfma(0) == MFMA):
+    if require_constexpr(at is not None and _read_payload_after_fill(tc, 0) == MFMA):
         a = _read_tile(
             pc,
             buffers,
@@ -703,7 +729,7 @@ def _read_slot(
         and tc.ds_read_in_mfma(0, True) == MFMA
     ):
         a_scale = _read_scale_tile(pc, buffers, step, at, 0, KI, IN_LOOP, STATIC_PHASE)
-    if require_constexpr(bt is not None and tc.ds_read_in_mfma(1) == MFMA):
+    if require_constexpr(bt is not None and _read_payload_after_fill(tc, 1) == MFMA):
         b = _read_tile(
             pc,
             buffers,
@@ -900,11 +926,13 @@ def _step_live(
             ):
                 with region("commit"):
                     pc.lds_ptrs.commit_buffer_load()
-            a += af if tc.ds_read_in_mfma(0) else am
-            b += bf if tc.ds_read_in_mfma(1) else bm
+            a += af if _read_payload_after_fill(tc, 0) else am
+            b += bf if _read_payload_after_fill(tc, 1) else bm
             a_scale += asf if tc.ds_read_in_mfma(0, True) else asm
             b_scale += bsf if tc.ds_read_in_mfma(1, True) else bsm
             acc += (value,)
+    if require_constexpr(IN_LOOP and not tc.payload_via_lds(1)):
+        gl.amd.cdna4.sched_barrier(0)
     if require_constexpr(not IN_LOOP):
         buffers = _rotate_buffers(buffers, tc, PHASE)
     if require_constexpr(not pc.func_cfg.a_has_scale()):
