@@ -1032,27 +1032,8 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
                 B_SCALE_LOAD=(peeled + u + 1) % tc.scale_step_ratio(1) == 0,
                 PHASE=peeled + u + 1,
             )
-    if require_constexpr(
-        unroll > 6
-        and tc.pipeline_register_period() > 1
-        and tc.scale_step_ratio(0) == 1
-        and tc.scale_step_ratio(1) == 1
-    ):
-        # Long register-ring unrolls need a single remainder loop: a chain of
-        # guarded tuple updates constrains allocation in the main body and spills
-        # its address vectors. The ring rotates only in this remainder loop.
-        for u in tl.range(0, remaining - unroll_end):
-            ptrs, buffers, regs = _step(
-                pc,
-                ptrs,
-                buffers,
-                regs,
-                peeled + unroll_end + u + 1,
-                None,
-            )
-    else:
-        # Short bodies benefit from static remainder expansion and constant LDS
-        # indices; a second loop instead lengthens their register lifetimes.
+    if require_constexpr(tc.UNROLL_EPILOGUE):
+        # Static expansion keeps short remainders and their LDS indices constant.
         for u in gl.static_range(unroll - 1):
             if unroll_end + u < remaining:
                 ptrs, buffers, regs = _step(
@@ -1068,6 +1049,18 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
                     B_SCALE_LOAD=(peeled + u + 1) % tc.scale_step_ratio(1) == 0,
                     PHASE=peeled + u + 1,
                 )
+    else:
+        # A single runtime remainder loop avoids the register pressure of a chain
+        # of guarded tuple updates. The ring rotates only in this remainder loop.
+        for u in tl.range(0, remaining - unroll_end):
+            ptrs, buffers, regs = _step(
+                pc,
+                ptrs,
+                buffers,
+                regs,
+                peeled + unroll_end + u + 1,
+                None,
+            )
     return ptrs, buffers, regs
 
 

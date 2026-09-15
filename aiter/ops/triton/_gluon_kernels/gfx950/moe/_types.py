@@ -182,6 +182,8 @@ class TuningSpec(NamedTuple):
     SCALE_MINI_BLOCK_M: int = 0
     SCALE_MINI_BLOCK_N: int = 0
     SCALE_MINI_BLOCK_K: int = 0
+    #: Statically expand the finite main-loop remainder after complete unrolled bodies.
+    UNROLL_EPILOGUE: bool = True
 
 
 class ActivationSpec(NamedTuple):

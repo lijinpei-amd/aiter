@@ -43,6 +43,7 @@ class _Config(_ScheduleConfig):
         read_mask=0,
         middle=False,
         unroll=3,
+        unroll_epilogue=True,
         soff=False,
         scale_steps=None,
         scale_tiles=(1, 1),
@@ -61,6 +62,7 @@ class _Config(_ScheduleConfig):
         self.scale_tiles = scale_tiles
         self.read_mask = read_mask
         self.K_UNROLL = unroll
+        self.UNROLL_EPILOGUE = unroll_epilogue
         self.SOFF_UNROLL = soff
         self.FROZEN_STEP = False
         self.SCHED_MODE = 0
@@ -371,6 +373,7 @@ class _Machine:
 
 def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
     machine = _Machine(tc, num_k)
+    machine.runtime_ranges = []
     peeled = tc.pipeline_peeled()
     pc = SimpleNamespace(
         tuning_cfg=tc,
@@ -420,6 +423,10 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
             )
         )
 
+    def runtime_range(*args):
+        machine.runtime_ranges.append(args)
+        return range(*args)
+
     def init_buffers(pc):
         return tuple(
             (
@@ -466,7 +473,7 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
             pipeline, "pick_stage", lambda enabled: lambda name: nullcontext()
         )
         patch.setattr(pipeline.gl, "static_range", range)
-        patch.setattr(pipeline.tl, "range", range)
+        patch.setattr(pipeline.tl, "range", runtime_range)
         patch.setattr(pipeline.gl, "static_assert", lambda value, message: None)
         patch.setattr(pipeline.gl, "assume", check_assumption)
         patch.setattr(pipeline.gl, "zeros", lambda *args, **kwargs: 0)
@@ -507,6 +514,24 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
     assert any(in_loop for read, in_loop in machine.steps)
     assert not machine.pending
     return machine
+
+
+@pytest.mark.parametrize(
+    "unroll_epilogue,has_runtime_tail", [(True, False), (False, True)]
+)
+def test_unroll_epilogue_selects_remainder_loop(
+    unroll_epilogue, has_runtime_tail, monkeypatch
+):
+    tc = _Config(
+        WaitCommitScheme.PER_STAGE_WHOLE,
+        (3, 1, 3, 1),
+        0,
+        scales=False,
+        unroll_epilogue=unroll_epilogue,
+    )
+    num_k = pipeline_depth(tc) + tc.pipeline_peeled() + pipeline_unroll(tc) + 1
+    machine = _execute(tc, num_k, monkeypatch)
+    assert any(len(args) == 2 for args in machine.runtime_ranges) is has_runtime_tail
 
 
 @pytest.mark.parametrize(
