@@ -10,8 +10,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from aiter.ops.triton._gluon_kernels.gfx950.moe._pipeline import _pipeline_peeled
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
+    _pipeline_peeled,
     pipeline_depth,
     pipeline_unroll,
 )
