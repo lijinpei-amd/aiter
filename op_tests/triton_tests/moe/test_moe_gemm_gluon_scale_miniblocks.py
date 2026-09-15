@@ -122,7 +122,7 @@ def test_scale_load_cadence_sets_buffer_span_and_unroll(
     )
     ratio = math.ceil(scale_k / block_k)
     for operand, depth in enumerate((2, 3)):
-        assert tc.component_span(operand, True) == (depth - 1) * ratio + 1
+        assert tc.buffer_live_span(operand, True) == (depth - 1) * ratio + 1
         assert tc.scale_load_k_tiles(operand) == max(1, block_k // scale_k)
         assert tc.scale_read_k_slots(operand) == max(block_k, scale_k) // mini_k
     period = math.lcm(3, 2 * ratio, 3 * ratio)

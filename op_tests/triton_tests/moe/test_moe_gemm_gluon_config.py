@@ -18,21 +18,19 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._entry import (
     _moe_gluon_gemm2,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import constexpr_fields
-from aiter.ops.triton._gluon_kernels.gfx950.moe._pipeline import (
+from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
     _groups as buffered_groups,
 )
-from aiter.ops.triton._gluon_kernels.gfx950.moe._pipeline import (
+from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
     _ops as buffered_ops,
 )
-from aiter.ops.triton._gluon_kernels.gfx950.moe._pipeline import (
-    _pipeline_peeled,
-)
-from aiter.ops.triton._gluon_kernels.gfx950.moe._pipeline import (
-    _wait as buffered_wait,
-)
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
+    _pipeline_peeled,
     pipeline_depth,
     pipeline_unroll,
+)
+from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
+    _wait as buffered_wait,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     ActivationSpec,

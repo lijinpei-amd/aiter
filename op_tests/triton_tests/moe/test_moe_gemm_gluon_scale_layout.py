@@ -23,6 +23,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._config import (
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import unwrap
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
+    _pipeline_peeled,
     pipeline_depth,
     pipeline_unroll,
 )
@@ -557,7 +558,7 @@ def test_pipeline_phases_and_packed_scale_addresses(
         )
     )
     minimum_tiles = (
-        pipeline_depth(tc) + buffered._pipeline_peeled(tc) + pipeline_unroll(tc)
+        pipeline_depth(tc) + _pipeline_peeled(tc) + pipeline_unroll(tc)
     )
     minimum = (minimum_tiles + 1) // 2 * 2
     effective_unroll = pipeline_unroll(tc)

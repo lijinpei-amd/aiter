@@ -403,8 +403,8 @@ class KernelTuningConfig(_KernelTuningLayout):
         )
 
     @gluon.constexpr_function
-    def component_span(self, operand, scale=False):
-        """Payload steps covered by one component's prefetch ring."""
+    def buffer_live_span(self, operand, scale=False):
+        """num of k-stage from lds/reg buffer is loaded to its use"""
         depth = self.num_buffers(operand, scale)
         ratio = self.scale_step_ratio(operand) if _v(scale) else 1
         return (depth - 1) * ratio + 1

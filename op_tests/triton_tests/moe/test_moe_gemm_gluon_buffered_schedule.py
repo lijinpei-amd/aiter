@@ -18,11 +18,9 @@ import pytest
 
 from aiter.ops.triton._gluon_kernels.gfx950.moe import _pipeline as pipeline
 from aiter.ops.triton._gluon_kernels.gfx950.moe import moe_gemm as kernel
-from aiter.ops.triton._gluon_kernels.gfx950.moe._pipeline import (
+from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
     _pipeline_peeled,
     _wait,
-)
-from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
     pipeline_depth,
     pipeline_unroll,
 )
@@ -75,7 +73,7 @@ class _Config(_ScheduleConfig):
     def num_buffers(self, operand, scale=False):
         return self.depths[operand * 2 + bool(scale)]
 
-    def component_span(self, operand, scale=False):
+    def buffer_live_span(self, operand, scale=False):
         return (self.num_buffers(operand, scale) - 1) * (
             self.scale_step_ratio(operand) if scale else 1
         ) + 1

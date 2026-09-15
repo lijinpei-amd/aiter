@@ -86,7 +86,7 @@ class _ScheduleConfig:
     def scale_step_ratio(self, idx):
         return 1
 
-    def component_span(self, idx, scale=False):
+    def buffer_live_span(self, idx, scale=False):
         return self.num_buffers(idx, scale)
 
     def num_buffers(self, idx, scale=False):
