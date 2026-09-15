@@ -633,10 +633,7 @@ def test_register_storage_options_are_independent(config, storage_mask):
     if not storage_mask & 4:
         expected += bm * bk // 32 * 2
     assert _plain(tc.lds_bytes()) == expected
-    expected_unroll = math.lcm(
-        3 if storage_mask & 3 else 1, 2 if storage_mask & 4 else 1
-    )
-    assert _plain(tc.pipeline_unroll()) == expected_unroll
+    assert _plain(tc.pipeline_unroll()) == 6
     assert _plain(_validate(tc, 4096, 7168))
     minimum = tc.pipeline_depth() + _pipeline_peeled(tc) + tc.pipeline_unroll()
     assert _plain(_validate(tc, 4096, bk * _plain(minimum)))
@@ -646,9 +643,13 @@ def test_register_storage_options_are_independent(config, storage_mask):
 
 @pytest.mark.parametrize(
     "counts,period,expected",
-    [((6, 4, 2, 8), 8, 8), ((4, 4, 2, 2), 4, 8), ((0, 4, 0, 6), 12, 12)],
+    [
+        ((6, 4, 2, 8), 8, 168),
+        ((4, 4, 2, 2), 4, 28),
+        ((0, 4, 0, 6), 12, 84),
+    ],
 )
-def test_register_component_buffer_counts_determine_lcm_unroll(
+def test_all_component_buffer_counts_determine_lcm_unroll(
     config, counts, period, expected
 ):
     config.update(zip(host._COMPONENT_BUFFER_KEYS, counts, strict=True))
@@ -671,17 +672,17 @@ def test_register_component_buffer_counts_determine_lcm_unroll(
     assert _plain(tc.pipeline_depth()) == max(resolved)
 
 
-def test_lds_depths_do_not_constrain_unroll(config):
+def test_lds_depths_constrain_unroll(config):
     config["K_UNROLL"] = 7
     fc = KernelFuncConfig(*_func_spec())
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    assert _plain(tc.pipeline_unroll()) == 7
+    assert _plain(tc.pipeline_unroll()) == 21
     config.update(A_NUM_BUFFER=2, B_NUM_BUFFER=4, A_SCALE_NUM_BUFFER=2)
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    assert _plain(tc.pipeline_unroll()) == 7
+    assert _plain(tc.pipeline_unroll()) == 84
     config["A_SCALE_IN_REG"] = True
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    assert _plain(tc.pipeline_unroll()) == 8
+    assert _plain(tc.pipeline_unroll()) == 84
 
 
 def test_small_payload_tiles_use_register_rings(config):
@@ -747,7 +748,7 @@ def test_absent_scales_do_not_participate_in_depth_unroll_or_validation(
     )
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
     assert _plain(tc.pipeline_depth()) == 4
-    assert _plain(tc.pipeline_unroll()) == (4 if register_b else 3)
+    assert _plain(tc.pipeline_unroll()) == 12
     assert _plain(host._validate_selected_pipeline(tc, 7168))
 
 
@@ -787,8 +788,10 @@ def test_shared_depth_exact_minimum_and_all_unroll_remainders(config, depth, unr
     config.update(NUM_LDS_BUFFER=depth, K_UNROLL=unroll)
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     assert _plain(_pipeline_peeled(tc)) == 1
-    minimum = depth + 1 + unroll
-    for remainder in range(unroll):
+    effective_unroll = _plain(tc.pipeline_unroll())
+    assert effective_unroll == math.lcm(depth, unroll)
+    minimum = depth + 1 + effective_unroll
+    for remainder in range(effective_unroll):
         assert _plain(_validate(tc, 4096, (minimum + remainder) * config["BLOCK_K"]))
     with pytest.raises(AssertionError, match="NUM_K.*NB_MAX.*PEELED.*UNROLL"):
         host._validate_selected_pipeline(tc, (minimum - 1) * config["BLOCK_K"])
@@ -853,7 +856,7 @@ def test_a_scale_buffer_alias_is_accepted(config, monkeypatch):
 
 
 @pytest.mark.parametrize("independent", [False, True])
-def test_shuffled_k128_scales_round_unroll_to_scale_cadence(config, independent):
+def test_shuffled_k128_scales_constrain_lcm_unroll(config, independent):
     config.update(
         BLOCK_K=128,
         MINI_BLOCK_K=128,
@@ -872,7 +875,7 @@ def test_shuffled_k128_scales_round_unroll_to_scale_cadence(config, independent)
         )
     )
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    assert _plain(tc.pipeline_unroll()) == 4
+    assert _plain(tc.pipeline_unroll()) == 6
     assert _plain(_validate(tc, 4096, 7168))
     assert host._scale_shuffle_supported(config, 0)
     assert host._scale_shuffle_supported(config, 1)
