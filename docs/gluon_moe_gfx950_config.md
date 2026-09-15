@@ -43,17 +43,17 @@ mismatch before preparing scales or launching the GEMM.
 | `A_SCALE_IN_REG`, `B_SCALE_IN_REG` | Load the selected scale component directly into registers. Both options are independent of each other and of `B_IN_REG`; neither requires preshuffled B payload. Defaults to `False`. |
 | `A_NUM_BUFFER`, `B_NUM_BUFFER` | Number of pipeline buffers for each payload component. Omitted or zero values inherit `NUM_LDS_BUFFER`; each resolved active depth must be at least 2. |
 | `A_SCALE_NUM_BUFFER`, `B_SCALE_NUM_BUFFER` | Number of buffers for each active scale component, independent of the payload counts and at least 2 after inheritance. Absent scales do not participate in validation or scheduling. `A_SCALE_NUMB_BUFFER` is accepted as a dictionary/environment alias for `A_SCALE_NUM_BUFFER`. |
-| `K_UNROLL` | Requested main-loop unroll, at least 1. The effective unroll is rounded up to the next multiple of all active register-ring depths' least common multiple. |
+| `K_UNROLL` | Requested main-loop unroll, at least 1. The effective unroll is the least common multiple of this request and every active payload/scale ring period. |
 
-The same component driver runs whether depths are inherited or explicit. LDS
-indices may vary at runtime, so LDS-only components do not constrain unrolling.
-Register tuples use static ring indices in each unrolled body; its length must
-return every register ring to its initial slot. If the active register depths
-are 2 and 3, their period is 6: requested `K_UNROLL=4` becomes `UNROLL=6`, and
-requested `K_UNROLL=7` becomes `UNROLL=12`. With all active components in LDS,
-`UNROLL=K_UNROLL`. Scale components that fall back to register loads because of
-their layout also participate; absent scales never do. `FROZEN_STEP` retains
-its existing rejection of explicit component-depth and register-storage options.
+The same component driver runs whether depths are inherited or explicit. Every
+active LDS or register payload ring contributes its resolved buffer depth. A scale
+ring advances once per scale K tile, so it contributes
+`scale_buffer_depth * scale_step_ratio`; the scale cadence also participates
+directly. This returns every ring and scale phase to its initial state at the end
+of a complete unrolled body. For example, active depths 2 and 3 have period 6:
+requested `K_UNROLL=4` becomes `UNROLL=12`, and requested `K_UNROLL=7` becomes
+`UNROLL=42`. Absent scales never participate. `FROZEN_STEP` retains its existing
+rejection of explicit component-depth and register-storage options.
 
 Let `NB_MAX` be the largest resolved active depth and `PEELED` the number of
 initial main iterations needed before invariant steady-state waits. The first

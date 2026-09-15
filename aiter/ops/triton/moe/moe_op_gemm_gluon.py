@@ -535,8 +535,8 @@ def get_gluon_config_uncached(
             "BLOCK_M": block_m,
             "BLOCK_N": bn,
             "BLOCK_K": out_bk,
-            # Register rings and shuffled-scale K tiles round this requested
-            # factor up to a multiple of their periods' least common multiple.
+            # The effective factor is the LCM of this request, every active
+            # payload/scale buffer period and the shuffled-scale K cadence.
             "K_UNROLL": _env_int("AITER_TRITON_MOE_GLUON_K_UNROLL", n_buf),
             "MINI_BLOCK_K": out_bk,
             "MINI_BLOCK_M": out_mini_m,

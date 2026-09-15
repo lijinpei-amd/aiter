@@ -435,13 +435,23 @@ class KernelTuningConfig(_KernelTuningLayout):
 
     @gluon.constexpr_function
     def pipeline_unroll(self):
-        """Smallest unroll covering complete register rings and scale K tiles."""
+        """LCM of the requested unroll and every active component ring period.
+
+        Payload rings advance every step. Scale rings advance once per scale K tile,
+        so their period in payload steps is their depth times the scale step ratio.
+        Including LDS rings keeps every complete body at a fixed ring phase as well as
+        satisfying the static-index requirement of register tuples.
+        """
         requested = _v(self.K_UNROLL)
         assert requested >= 1, "K_UNROLL must be at least 1"
-        period = self.pipeline_register_period()
+        period = requested
         for operand in (0, 1):
-            period = math.lcm(period, self.scale_step_ratio(operand))
-        return (requested + period - 1) // period * period
+            period = math.lcm(period, self.num_buffers(operand))
+            if self.func_cfg.has_scale(operand):
+                scale_depth = self.num_buffers(operand, True)
+                scale_ratio = self.scale_step_ratio(operand)
+                period = math.lcm(period, scale_depth * scale_ratio)
+        return period
 
     @gluon.constexpr_function
     def validate_buffer_counts(self):

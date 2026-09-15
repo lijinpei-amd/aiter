@@ -103,8 +103,11 @@ class _Config(_ScheduleConfig):
         )
 
     def pipeline_unroll(self):
-        period = math.lcm(self.pipeline_register_period(), *self.scale_steps)
-        return math.ceil(self.unroll / period) * period
+        periods = [self.unroll]
+        for kind in self.active_kinds():
+            ratio = self.scale_step_ratio(kind // 2) if kind % 2 else 1
+            periods.append(self.depths[kind] * ratio)
+        return math.lcm(*periods)
 
     def pipeline_peeled(self):
         if not hasattr(self, "_peeled"):
@@ -683,7 +686,7 @@ def test_direct_b2_fills_k_plus_1_while_mfma_consumes_k(soff, monkeypatch):
     } == {(0, ni) for ni in range(tc.nn)}
 
     in_loop_reads = _assert_direct_b_stage_barriers(machine)
-    assert len(in_loop_reads) == tc.pipeline_unroll() == 4
+    assert len(in_loop_reads) == tc.pipeline_unroll() == 6
     for read in in_loop_reads:
         assert [
             op

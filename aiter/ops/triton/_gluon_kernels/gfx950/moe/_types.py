@@ -111,8 +111,8 @@ class TuningSpec(NamedTuple):
     BLOCK_M: int
     BLOCK_N: int
     BLOCK_K: int
-    #: Requested unroll factor, rounded up for every active register ring and
-    #: shuffled-scale K tile. LDS rings can keep runtime indices.
+    #: Requested unroll factor. The effective factor is its LCM with every active
+    #: LDS/register ring period and shuffled-scale K cadence.
     K_UNROLL: int
     MINI_BLOCK_K: int
     MINI_BLOCK_M: int
