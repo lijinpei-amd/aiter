@@ -34,6 +34,7 @@ class _ScheduleConfig:
     payload_async: tuple = (True, True)
     a_scale_ratio: int = 1
     SOFF_UNROLL: bool = False
+    K_UNROLL: int = 1
     token_cache_modifier: str = ""
     token_scale_cache_modifier: str = ""
     expert_cache_modifier: str = ""
@@ -87,6 +88,9 @@ class _ScheduleConfig:
 
     def component_span(self, idx, scale=False):
         return self.num_buffers(idx, scale)
+
+    def num_buffers(self, idx, scale=False):
+        return 3
 
     def scale_read_k_slots(self, idx):
         return self.num_k_slots_per_tile()
@@ -231,13 +235,11 @@ class _LDSRecorder:
 def _trace_emitter(tc, monkeypatch, defer_stage_commit=False):
     tc.B_IN_REG = False
     tc.num_buffers = lambda operand, scale=False: 3
-    tc.pipeline_depth = lambda: 3
     tc.pipeline_peeled = lambda: 1
     tc.pipeline_register_period = lambda: (
         3 if any(tc.has_scale(op) and not tc.scale_via_lds(op) for op in (0, 1)) else 1
     )
     tc.num_k_slots_per_tile = lambda: 1
-    tc.pipeline_depth = lambda: 3
     tc.operand_elem_ty = lambda operand: SimpleNamespace(primitive_bitwidth=8)
     tc.scale_hbm_steps = lambda operand, steps, phase: steps
     sink = _LDSRecorder(tc)
@@ -401,7 +403,6 @@ def test_register_only_slots_need_no_cooperative_fence(scheme, monkeypatch):
     waits, barriers = [], []
     tc = _config((4, 2), scheme, False, "register-payloads")
     tc.num_k_slots_per_tile = lambda: 1
-    tc.pipeline_depth = lambda: 3
     tc.warp_pipeline_compiler = lambda: False
     tc.commit_per_stage_warp_pipeline = lambda: (
         scheme == WaitCommitScheme.PER_STAGE_WARP_PIPELINE
@@ -465,7 +466,6 @@ def test_pipeline_stage_commit_boundaries(
     events = []
     tc = _config((2, 2), scheme, False, "no-scales")
     tc.num_k_slots_per_tile = lambda: 1
-    tc.pipeline_depth = lambda: 3
     tc.warp_pipeline_compiler = lambda: compiler
     tc.commit_per_stage_warp_pipeline = lambda: (
         scheme == WaitCommitScheme.PER_STAGE_WARP_PIPELINE

@@ -3,11 +3,44 @@
 
 """Copy ownership and commit/wait accounting for the Gluon MoE pipeline."""
 
+import math
+
 from triton.experimental import gluon
 
 from ._lang import unwrap as _v
 from ._layout import _slot_index
 from ._types import WaitCommitScheme
+
+
+@gluon.constexpr_function
+def pipeline_depth(tc):
+    """Largest prefetch span, measured in payload steps, of active components."""
+    depth = max(tc.num_buffers(0), tc.num_buffers(1))
+    for operand in (0, 1):
+        if tc.func_cfg.has_scale(operand):
+            depth = max(depth, tc.component_span(operand, True))
+    return depth
+
+
+@gluon.constexpr_function
+def pipeline_unroll(tc):
+    """LCM of the requested unroll and every active component ring period.
+
+    Payload rings advance every step. Scale rings advance once per scale K tile,
+    so their period in payload steps is their depth times the scale step ratio.
+    Including LDS rings keeps every complete body at a fixed ring phase as well as
+    satisfying the static-index requirement of register tuples.
+    """
+    requested = _v(tc.K_UNROLL)
+    assert requested >= 1, "K_UNROLL must be at least 1"
+    period = requested
+    for operand in (0, 1):
+        period = math.lcm(period, tc.num_buffers(operand))
+        if tc.func_cfg.has_scale(operand):
+            scale_depth = tc.num_buffers(operand, True)
+            scale_ratio = tc.scale_step_ratio(operand)
+            period = math.lcm(period, scale_depth * scale_ratio)
+    return period
 
 
 @gluon.constexpr_function

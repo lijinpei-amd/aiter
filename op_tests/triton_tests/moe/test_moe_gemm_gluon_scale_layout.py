@@ -22,6 +22,10 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._config import (
     KernelTuningConfig,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import unwrap
+from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
+    pipeline_depth,
+    pipeline_unroll,
+)
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     ActivationSpec,
     ActKind,
@@ -553,10 +557,10 @@ def test_pipeline_phases_and_packed_scale_addresses(
         )
     )
     minimum_tiles = (
-        tc.pipeline_depth() + buffered._pipeline_peeled(tc) + tc.pipeline_unroll()
+        pipeline_depth(tc) + buffered._pipeline_peeled(tc) + pipeline_unroll(tc)
     )
     minimum = (minimum_tiles + 1) // 2 * 2
-    effective_unroll = tc.pipeline_unroll()
+    effective_unroll = pipeline_unroll(tc)
     # Complete K256 scale words constrain NUM_K to even values. Visit the minimum,
     # every reachable remainder, and a longer strip with additional ring wraps.
     lengths = {
