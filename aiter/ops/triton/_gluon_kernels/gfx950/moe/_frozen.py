@@ -1498,13 +1498,7 @@ def _run_frozen_pipeline(pc, ptrs, NUM_K):
     main = NUM_K - depth
     gl.assume(main >= peeled + unroll)
     remaining = main - peeled
-    countdown: gl.constexpr = (
-        not pc.func_cfg.a_has_scale()
-        and not pc.func_cfg.b_has_scale()
-        and tc.pipeline_register_period() == 1
-    )
-    if require_constexpr(not countdown):
-        unroll_end = remaining // unroll * unroll
+    unroll_end = remaining // unroll * unroll
     buffers = _init_buffers_frozen(pc)
     ptrs = _prologue_frozen(pc, ptrs)
     acc = ()
@@ -1521,37 +1515,18 @@ def _run_frozen_pipeline(pc, ptrs, NUM_K):
     ptrs, buffers, regs = _step_frozen(pc, ptrs, buffers, regs, 0, 0, DOT=False)
     for x in gl.static_range(peeled):
         ptrs, buffers, regs = _step_frozen(pc, ptrs, buffers, regs, x + 1, x + 1)
-    if require_constexpr(not countdown):
-        for base in tl.range(0, unroll_end, unroll):
-            for u in gl.static_range(unroll):
-                ptrs, buffers, regs = _step_frozen(
-                    pc,
-                    ptrs,
-                    buffers,
-                    regs,
-                    peeled + base + u + 1,
-                    None,
-                    KI=u,
-                    IN_LOOP=True,
-                )
-    else:
-        base = 0
-        left = remaining
-        while left >= unroll:
-            for u in gl.static_range(unroll):
-                ptrs, buffers, regs = _step_frozen(
-                    pc,
-                    ptrs,
-                    buffers,
-                    regs,
-                    peeled + base + u + 1,
-                    None,
-                    KI=u,
-                    IN_LOOP=True,
-                )
-            base += unroll
-            left -= unroll
-        unroll_end = remaining - left
+    for base in tl.range(0, unroll_end, unroll):
+        for u in gl.static_range(unroll):
+            ptrs, buffers, regs = _step_frozen(
+                pc,
+                ptrs,
+                buffers,
+                regs,
+                peeled + base + u + 1,
+                None,
+                KI=u,
+                IN_LOOP=True,
+            )
     if require_constexpr(unroll > 6 and tc.pipeline_register_period() > 1):
         for u in tl.range(0, remaining - unroll_end):
             ptrs, buffers, regs = _step_frozen(

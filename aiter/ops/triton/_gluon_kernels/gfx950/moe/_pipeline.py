@@ -963,13 +963,7 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
     main = NUM_K - depth
     gl.assume(main >= peeled + unroll)
     remaining = main - peeled
-    countdown: gl.constexpr = (
-        not pc.func_cfg.a_has_scale()
-        and not pc.func_cfg.b_has_scale()
-        and tc.pipeline_register_period() == 1
-    )
-    if require_constexpr(not countdown):
-        unroll_end = remaining // unroll * unroll
+    unroll_end = remaining // unroll * unroll
     buffers = _init_buffers(pc)
     # r = p - (NB_MAX - 1): active streams fill p - NB_DELTA.
     for r in gl.static_range(1 - depth, 0):
@@ -1021,44 +1015,21 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
             B_SCALE_LOAD=(x + 1) % tc.scale_step_ratio(1) == 0,
             PHASE=x + 1,
         )
-    # Payload-only LDS bodies benefit from removing the live rounded bound.
-    if require_constexpr(not countdown):
-        for base in tl.range(0, unroll_end, unroll):
-            for u in gl.static_range(unroll):
-                ptrs, buffers, regs = _step(
-                    pc,
-                    ptrs,
-                    buffers,
-                    regs,
-                    peeled + base + u + 1,
-                    None,
-                    KI=u,
-                    IN_LOOP=True,
-                    A_SCALE_LOAD=(peeled + u + 1) % tc.scale_step_ratio(0) == 0,
-                    B_SCALE_LOAD=(peeled + u + 1) % tc.scale_step_ratio(1) == 0,
-                    PHASE=peeled + u + 1,
-                )
-    else:
-        base = 0
-        left = remaining
-        while left >= unroll:
-            for u in gl.static_range(unroll):
-                ptrs, buffers, regs = _step(
-                    pc,
-                    ptrs,
-                    buffers,
-                    regs,
-                    peeled + base + u + 1,
-                    None,
-                    KI=u,
-                    IN_LOOP=True,
-                    A_SCALE_LOAD=(peeled + u + 1) % tc.scale_step_ratio(0) == 0,
-                    B_SCALE_LOAD=(peeled + u + 1) % tc.scale_step_ratio(1) == 0,
-                    PHASE=peeled + u + 1,
-                )
-            base += unroll
-            left -= unroll
-        unroll_end = remaining - left
+    for base in tl.range(0, unroll_end, unroll):
+        for u in gl.static_range(unroll):
+            ptrs, buffers, regs = _step(
+                pc,
+                ptrs,
+                buffers,
+                regs,
+                peeled + base + u + 1,
+                None,
+                KI=u,
+                IN_LOOP=True,
+                A_SCALE_LOAD=(peeled + u + 1) % tc.scale_step_ratio(0) == 0,
+                B_SCALE_LOAD=(peeled + u + 1) % tc.scale_step_ratio(1) == 0,
+                PHASE=peeled + u + 1,
+            )
     if require_constexpr(
         unroll > 6
         and tc.pipeline_register_period() > 1
