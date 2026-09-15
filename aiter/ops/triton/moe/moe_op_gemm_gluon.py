@@ -647,6 +647,7 @@ def get_gluon_config_uncached(
             "SCALE_FILL_MID": bool(
                 _env_int("AITER_TRITON_MOE_GLUON_SCALE_FILL_MID", 0)
             ),
+            "UNROLL_EPILOGUE": True,
             # Read stage N's fragments one stage before their MFMA consumes them. Costs
             # one BLOCK_K tile of live registers and one stage of global prefetch depth
             # (the fill is waited on at stage s+NB-1 rather than s+NB), so it wants

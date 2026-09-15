@@ -137,6 +137,7 @@ def test_a_scale_row_stride_preserves_sub_16_byte_alignment(kernel):
         ("FROZEN_STEP", True),
         ("SOFF_UNROLL", True),
         ("SCALE_FILL_MID", True),
+        ("UNROLL_EPILOGUE", False),
         ("B_IN_REG", True),
         ("B_SCALE_IN_REG", True),
         ("A_SCALE_IN_REG", True),
@@ -592,6 +593,18 @@ def test_legacy_schedule_settings_reach_the_tuning_spec(monkeypatch):
     ) == (SchedMode.MFMA_8, True, True, True)
 
 
+def test_unroll_epilogue_environment_control_is_removed(monkeypatch):
+    baseline = host.get_gluon_config_uncached(
+        128, 4096, 7168, DtypeQuant.MXFP4, DtypeQuant.MXFP4
+    )
+    monkeypatch.setenv("AITER_TRITON_MOE_GLUON_UNROLL_EPILOGUE", "0")
+    actual = host.get_gluon_config_uncached(
+        128, 4096, 7168, DtypeQuant.MXFP4, DtypeQuant.MXFP4
+    )
+    assert actual == baseline
+    assert actual["UNROLL_EPILOGUE"] is True
+
+
 @pytest.mark.parametrize("field", ["MANUAL_PP"])
 def test_removed_controls_do_not_change_tuning(config, monkeypatch, field):
     baseline = host.get_gluon_config_uncached(
@@ -883,6 +896,28 @@ def test_shuffled_k128_scales_constrain_lcm_unroll(config, independent):
     assert _plain(_validate(tc, 4096, 7168))
     assert host._scale_shuffle_supported(config, 0)
     assert host._scale_shuffle_supported(config, 1)
+
+
+def test_runtime_epilogue_rejects_multistep_scale_cadence(config):
+    config.update(
+        BLOCK_K=128,
+        MINI_BLOCK_K=128,
+        VGPR_PREFETCH_K=128,
+        A_SCALE_SORTED_SHUFFLED=True,
+        B_SCALE_SHUFFLED=True,
+        UNROLL_EPILOGUE=False,
+    )
+    fc = KernelFuncConfig(
+        *_func_spec()._replace(
+            token_dtype_quant=int(DtypeQuant.MXFP8),
+            expert_dtype_quant=int(DtypeQuant.MXFP8),
+            token_online_quant=int(DtypeQuant.MXFP8),
+            expert_online_quant=int(DtypeQuant.MXFP8),
+        )
+    )
+    tc = KernelTuningConfig(fc, *_tuning_spec(config))
+    with pytest.raises(AssertionError, match="UNROLL_EPILOGUE=False"):
+        _validate(tc, 4096, 7168)
 
 
 @pytest.mark.parametrize("output_quant", [None, int(DtypeQuant.MXFP4)])

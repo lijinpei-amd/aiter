@@ -38,6 +38,7 @@ mismatch before preparing scales or launching the GEMM.
 | `FROZEN_STEP` | Select the preserved reference body in `_frozen.py`, with an unfused final MFMA. Its existing restrictions on component overrides, register flags and packed K128 scales remain. |
 | `SOFF_UNROLL` | Advance HBM pointers once per unrolled body and use scalar offsets within it. With packed K128 scales and odd unroll, use per-fill pointer advances so scale-word phases remain correct. |
 | `SCALE_FILL_MID` | At a 2x2 mini-tile split, fill scales in the middle slots; wait counts use the same setting. |
+| `UNROLL_EPILOGUE` | Statically expand the live pipeline's finite main-loop remainder. Disable it to use a runtime remainder loop and reduce register pressure; the runtime loop requires every active scale to advance once per payload step. Defaults to `True`. |
 | `WAIT_COMMIT_SCHEME` | `PER_OP=1`, `PER_SLOT=2`, `PER_STAGE_WHOLE=3`, or `PER_STAGE_WARP_PIPELINE=4`; see the boundaries below. |
 | `B_IN_REG` | Load the B payload into registers with `buffer_load` at its normal global-load slot, bypassing LDS staging. Requires `B_PRESHUFFLED=True`. Defaults to `False`. |
 | `A_SCALE_IN_REG`, `B_SCALE_IN_REG` | Load the selected scale component directly into registers. Both options are independent of each other and of `B_IN_REG`; neither requires preshuffled B payload. Defaults to `False`. |

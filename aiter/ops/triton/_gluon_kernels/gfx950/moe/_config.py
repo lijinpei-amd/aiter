@@ -272,6 +272,7 @@ class KernelTuningConfig(_KernelTuningLayout):
     SCALE_MINI_BLOCK_M: gl.constexpr
     SCALE_MINI_BLOCK_N: gl.constexpr
     SCALE_MINI_BLOCK_K: gl.constexpr
+    UNROLL_EPILOGUE: gl.constexpr
 
     @gluon.constexpr_function
     def __init__(
@@ -325,6 +326,7 @@ class KernelTuningConfig(_KernelTuningLayout):
         SCALE_MINI_BLOCK_M=0,
         SCALE_MINI_BLOCK_N=0,
         SCALE_MINI_BLOCK_K=0,
+        UNROLL_EPILOGUE=True,
     ):
         self.func_cfg = func_cfg
         self.BLOCK_M = gl.constexpr(_v(BLOCK_M))
@@ -380,6 +382,7 @@ class KernelTuningConfig(_KernelTuningLayout):
         self.SCALE_MINI_BLOCK_M = gl.constexpr(int(_v(SCALE_MINI_BLOCK_M)))
         self.SCALE_MINI_BLOCK_N = gl.constexpr(int(_v(SCALE_MINI_BLOCK_N)))
         self.SCALE_MINI_BLOCK_K = gl.constexpr(int(_v(SCALE_MINI_BLOCK_K)))
+        self.UNROLL_EPILOGUE = gl.constexpr(bool(_v(UNROLL_EPILOGUE)))
 
     @gluon.constexpr_function
     def num_buffers(self, operand, scale=False):
@@ -531,6 +534,13 @@ class KernelTuningConfig(_KernelTuningLayout):
             int(SchedMode.MFMA_8),
         ), f"SCHED_MODE {_v(self.SCHED_MODE)} is not a SchedMode"
         self.validate_layout(N, K)
+
+        if not _v(self.UNROLL_EPILOGUE):
+            for idx in (0, 1):
+                assert not fc.has_scale(idx) or self.scale_step_ratio(idx) == 1, (
+                    "UNROLL_EPILOGUE=False requires every active scale to advance "
+                    "once per payload step"
+                )
 
         # -- warp pipelining (the inter-wave ping-pong) --
         # A slot's MFMAs are handed to TritonAMDGPUWarpPipeline as the `mfma` stage and
