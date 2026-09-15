@@ -1643,8 +1643,7 @@ class _KernelTuningLayout:
                     f"BLOCK_K ({BK}) requires operand {idx}'s scales in LDS"
                 )
 
-        # -- the constexpr rotating buffer index only folds if this holds --
-        assert self.pipeline_unroll() >= 1, "K_UNROLL must be at least 1"
+        # -- shuffled scale geometry --
         for idx in (0, 1):
             if not self.scale_shuffled(idx):
                 continue
@@ -1671,7 +1670,6 @@ class _KernelTuningLayout:
                 "BLOCK_K and SCALE_MINI_BLOCK_K must divide one another"
             )
             assert K % sk == 0, "K must contain complete SCALE_MINI_BLOCK_K tiles"
-            assert self.pipeline_unroll() % self.scale_step_ratio(idx) == 0
             if _v(self.FROZEN_STEP):
                 assert BK == 256 and sk == BK and self.scale_tile_ratio(idx) == 1, (
                     "FROZEN_STEP shuffled scales require BLOCK_K == "

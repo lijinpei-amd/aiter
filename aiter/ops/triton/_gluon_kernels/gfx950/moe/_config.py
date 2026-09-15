@@ -407,15 +407,6 @@ class KernelTuningConfig(_KernelTuningLayout):
         return (depth - 1) * ratio + 1
 
     @gluon.constexpr_function
-    def pipeline_depth(self):
-        """Largest prefetch span, measured in payload steps, of active components."""
-        depth = max(self.num_buffers(0), self.num_buffers(1))
-        for operand in (0, 1):
-            if self.func_cfg.has_scale(operand):
-                depth = max(depth, self.component_span(operand, True))
-        return depth
-
-    @gluon.constexpr_function
     def pipeline_register_period(self):
         """LCM of the active register rings; absent scales have no ring.
 
@@ -431,26 +422,6 @@ class KernelTuningConfig(_KernelTuningLayout):
                     period,
                     self.num_buffers(operand, True) * self.scale_step_ratio(operand),
                 )
-        return period
-
-    @gluon.constexpr_function
-    def pipeline_unroll(self):
-        """LCM of the requested unroll and every active component ring period.
-
-        Payload rings advance every step. Scale rings advance once per scale K tile,
-        so their period in payload steps is their depth times the scale step ratio.
-        Including LDS rings keeps every complete body at a fixed ring phase as well as
-        satisfying the static-index requirement of register tuples.
-        """
-        requested = _v(self.K_UNROLL)
-        assert requested >= 1, "K_UNROLL must be at least 1"
-        period = requested
-        for operand in (0, 1):
-            period = math.lcm(period, self.num_buffers(operand))
-            if self.func_cfg.has_scale(operand):
-                scale_depth = self.num_buffers(operand, True)
-                scale_ratio = self.scale_step_ratio(operand)
-                period = math.lcm(period, scale_depth * scale_ratio)
         return period
 
     @gluon.constexpr_function

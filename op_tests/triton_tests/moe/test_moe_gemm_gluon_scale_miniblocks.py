@@ -7,6 +7,7 @@ import math
 
 import pytest
 
+from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import pipeline_unroll
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import DtypeQuant
 from aiter.ops.triton.moe import moe_op_gemm_gluon as host
 from op_tests.triton_tests.moe.test_moe_gemm_gluon_scale_layout import _config
@@ -125,4 +126,4 @@ def test_scale_load_cadence_sets_buffer_span_and_unroll(
         assert tc.scale_load_k_tiles(operand) == max(1, block_k // scale_k)
         assert tc.scale_read_k_slots(operand) == max(block_k, scale_k) // mini_k
     period = math.lcm(3, 2 * ratio, 3 * ratio)
-    assert tc.pipeline_unroll() == period
+    assert pipeline_unroll(tc) == period

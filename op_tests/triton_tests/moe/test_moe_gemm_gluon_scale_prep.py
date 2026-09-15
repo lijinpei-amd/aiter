@@ -10,6 +10,10 @@ import pytest
 import torch
 
 from aiter.ops.triton._gluon_kernels.gfx950.moe._pipeline import _pipeline_peeled
+from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
+    pipeline_depth,
+    pipeline_unroll,
+)
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     ActivationSpec,
     ActKind,
@@ -267,19 +271,16 @@ def test_minimum_uses_resolved_scale_storage_after_preparation(
         DtypeQuant.MXFP8, DtypeQuant.MXFP8,
     )
     assert (
-        raw_tc.pipeline_depth()
-        + _pipeline_peeled(raw_tc)
-        + raw_tc.pipeline_unroll()
-        == 9
+        pipeline_depth(raw_tc) + _pipeline_peeled(raw_tc) + pipeline_unroll(raw_tc) == 9
     )
     packed_tc = host._probe_tuning_config(
         dict(cfg, A_SCALE_SORTED_SHUFFLED=True, B_SCALE_SHUFFLED=True),
         DtypeQuant.MXFP8, DtypeQuant.MXFP8,
     )
     assert (
-        packed_tc.pipeline_depth()
+        pipeline_depth(packed_tc)
         + _pipeline_peeled(packed_tc)
-        + packed_tc.pipeline_unroll()
+        + pipeline_unroll(packed_tc)
         == 6
     )
     monkeypatch.setenv("AITER_TRITON_MOE_GLUON_SORTED_SCALES", "1")

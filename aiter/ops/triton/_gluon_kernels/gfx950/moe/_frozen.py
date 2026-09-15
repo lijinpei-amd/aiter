@@ -45,7 +45,12 @@ from ._layout import (
     _b_scale_hbm_offsets,
     _slot_index,
 )
-from ._schedule import _buffer_load_order, _buffer_load_tile
+from ._schedule import (
+    _buffer_load_order,
+    _buffer_load_tile,
+    pipeline_depth,
+    pipeline_unroll,
+)
 from ._types import DotKind, TileSched
 
 _TS_XCD_GROUP_M: gl.constexpr = gl.constexpr(int(TileSched.XCD_GROUP_M))
@@ -1339,9 +1344,9 @@ def _validate_frozen_pipeline(tc, K):
     """Validate the frozen driver's rings and runtime-loop lower bound."""
     tc.validate_buffer_counts()
     num_k = tc.num_k_tiles(K)
-    depth = tc.pipeline_depth()
+    depth = pipeline_depth(tc)
     peeled = _pipeline_peeled_frozen(tc)
-    unroll = tc.pipeline_unroll()
+    unroll = pipeline_unroll(tc)
     assert num_k >= depth + peeled + unroll, (
         f"NUM_K ({num_k}) must be at least NB_MAX ({depth}) + PEELED ({peeled}) "
         f"+ UNROLL ({unroll}) = {depth + peeled + unroll}"
@@ -1363,7 +1368,7 @@ def _index_frozen(
     else:
         depth: gl.constexpr = tc.num_buffers(kind // 2, kind % 2 != 0)
         advance: gl.constexpr = depth - 1 if FILL else 0
-        if require_constexpr(IN_LOOP and tc.pipeline_unroll() % depth == 0):
+        if require_constexpr(IN_LOOP and pipeline_unroll(tc) % depth == 0):
             out = (_pipeline_peeled_frozen(tc) + KI + 1 + advance) % depth
         else:
             tile = step + advance
@@ -1472,7 +1477,7 @@ def _step_frozen(
         regs,
         _index_frozen(tc, step, 0, True, KI, IN_LOOP or STATIC_PHASE),
         _index_frozen(tc, step, 0, False, KI, IN_LOOP or STATIC_PHASE),
-        tc.pipeline_depth() - 2 - (STAGE if DRAIN else 0),
+        pipeline_depth(tc) - 2 - (STAGE if DRAIN else 0),
         not DRAIN,
         True,
         IN_LOOP,
@@ -1492,8 +1497,8 @@ def _run_frozen_pipeline(pc, ptrs, NUM_K):
         tc.num_prefetch_k_slots() == tc.num_k_slots_per_tile(),
         "the frozen pipeline requires VGPR_PREFETCH_K == BLOCK_K",
     )
-    depth: gl.constexpr = tc.pipeline_depth()
-    unroll: gl.constexpr = tc.pipeline_unroll()
+    depth: gl.constexpr = pipeline_depth(tc)
+    unroll: gl.constexpr = pipeline_unroll(tc)
     peeled: gl.constexpr = _pipeline_peeled_frozen(tc)
     main = NUM_K - depth
     gl.assume(main >= peeled + unroll)
@@ -1558,7 +1563,7 @@ def _drain_frozen_pipeline(
     pc, ptrs, buffers, regs, NUM_K, EPILOGUE_GROUPS: gl.constexpr
 ):
     tc: gl.constexpr = pc.tuning_cfg
-    main = NUM_K - tc.pipeline_depth()
+    main = NUM_K - pipeline_depth(tc)
     period: gl.constexpr = math.lcm(
         tc.num_buffers(0),
         tc.num_buffers(1),
@@ -1569,14 +1574,14 @@ def _drain_frozen_pipeline(
     )
     if require_constexpr(
         period <= 3
-        and tc.pipeline_unroll() % period == 0
+        and pipeline_unroll(tc) % period == 0
         and tc.pipeline_register_period() == 1
         and pc.func_cfg.output_quant is None
     ):
         phase = main % period
         for p in gl.static_range(period):
             if phase == p:
-                for j in gl.static_range(tc.pipeline_depth() - 1):
+                for j in gl.static_range(pipeline_depth(tc) - 1):
                     ptrs, buffers, regs = _step_frozen(
                         pc,
                         ptrs,
@@ -1590,7 +1595,7 @@ def _drain_frozen_pipeline(
                         STATIC_PHASE=True,
                     )
     else:
-        for j in gl.static_range(tc.pipeline_depth() - 1):
+        for j in gl.static_range(pipeline_depth(tc) - 1):
             ptrs, buffers, regs = _step_frozen(
                 pc,
                 ptrs,

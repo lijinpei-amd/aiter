@@ -27,6 +27,8 @@ from ._schedule import (
     _ds_read_a_tile,
     _ds_read_b_tile,
     _scale_buffer_load_tile,
+    pipeline_depth,
+    pipeline_unroll,
 )
 
 
@@ -83,7 +85,7 @@ def _active(tc, kind, stage, drain=False):
         return False
     depth = _fill_span(tc, kind)
     if drain:
-        return stage < tc.pipeline_depth() - depth
+        return stage < pipeline_depth(tc) - depth
     return stage is None or stage + depth - 1 >= 0
 
 
@@ -135,7 +137,7 @@ def _wait(tc, stage, slot, drain=False, epilogue_groups=0, phase=None):
     ``phase`` retains the absolute scale cadence when stages use a local origin.
     """
     nm, nn = tc.num_m_slots_per_block(), tc.num_n_slots_per_block()
-    r = stage + 1 if drain else tc.pipeline_depth() if stage is None else stage
+    r = stage + 1 if drain else pipeline_depth(tc) if stage is None else stage
     phase = r if phase is None else phase
     required = []
     for ni in range(nn):
@@ -165,7 +167,7 @@ def _wait(tc, stage, slot, drain=False, epilogue_groups=0, phase=None):
         return None
 
     timeline = []
-    for s in range(r - tc.pipeline_depth() + 1, r + 1):
+    for s in range(r - pipeline_depth(tc) + 1, r + 1):
         if drain:
             schedule = (
                 _groups(tc, s - 1, True, phase + s - r)
@@ -201,11 +203,11 @@ def _pipeline_peeled(tc):
     # These schemes commit even empty prologue slots/stages. Their group
     # distances already match the steady state when a component first reads.
     # At depth three or below, the mandatory first peel covers any warmup.
-    if not tc.commit_per_op() or tc.pipeline_depth() <= 3:
+    if not tc.commit_per_op() or pipeline_depth(tc) <= 3:
         return 1
     slots = range(tc.num_m_slots_per_block() * tc.num_n_slots_per_block())
     peeled = 1
-    for x in range(max(0, tc.pipeline_depth() - 2)):
+    for x in range(max(0, pipeline_depth(tc) - 2)):
         steady = tuple(_wait(tc, None, slot, phase=x + 1) for slot in slots)
         if tuple(_wait(tc, x + 1, slot) for slot in slots) != steady:
             peeled = x + 1
@@ -217,9 +219,9 @@ def _validate_pipeline(tc, K):
     """Validate the live component rings and runtime-loop lower bound."""
     tc.validate_buffer_counts()
     num_k = tc.num_k_tiles(K)
-    depth = tc.pipeline_depth()
+    depth = pipeline_depth(tc)
     peeled = _pipeline_peeled(tc)
-    unroll = tc.pipeline_unroll()
+    unroll = pipeline_unroll(tc)
     assert num_k >= depth + peeled + unroll, (
         f"NUM_K ({num_k}) must be at least NB_MAX ({depth}) + PEELED ({peeled}) "
         f"+ UNROLL ({unroll}) = {depth + peeled + unroll}"
@@ -242,7 +244,7 @@ def _index(
         depth: gl.constexpr = tc.num_buffers(kind // 2, kind % 2 != 0)
         ratio: gl.constexpr = tc.scale_step_ratio(kind // 2) if kind % 2 else 1
         advance: gl.constexpr = depth - 1 if FILL else 0
-        if require_constexpr(IN_LOOP and tc.pipeline_unroll() % (depth * ratio) == 0):
+        if require_constexpr(IN_LOOP and pipeline_unroll(tc) % (depth * ratio) == 0):
             out = ((_pipeline_peeled(tc) + KI + 1) // ratio + advance) % depth
         else:
             tile = step // ratio + advance
@@ -588,9 +590,9 @@ def _advance(
         ptrs.a_scale_hbm_ptr,
         ptrs.b_scale_hbm_ptr,
     )
-    steps: gl.constexpr = tc.pipeline_unroll() if _soff_unroll(tc, IN_LOOP) else 1
+    steps: gl.constexpr = pipeline_unroll(tc) if _soff_unroll(tc, IN_LOOP) else 1
     if require_constexpr(
-        not _soff_unroll(tc, IN_LOOP) or KI + 1 == tc.pipeline_unroll()
+        not _soff_unroll(tc, IN_LOOP) or KI + 1 == pipeline_unroll(tc)
     ):
         if require_constexpr(_active(tc, 0, STAGE, DRAIN)):
             a += steps * pc.a_step
@@ -957,8 +959,8 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
         tc.num_prefetch_k_slots() == tc.num_k_slots_per_tile(),
         "the pipeline requires VGPR_PREFETCH_K == BLOCK_K",
     )
-    depth: gl.constexpr = tc.pipeline_depth()
-    unroll: gl.constexpr = tc.pipeline_unroll()
+    depth: gl.constexpr = pipeline_depth(tc)
+    unroll: gl.constexpr = pipeline_unroll(tc)
     peeled: gl.constexpr = _pipeline_peeled(tc)
     main = NUM_K - depth
     gl.assume(main >= peeled + unroll)
@@ -1074,7 +1076,7 @@ def _drain_buffered_pipeline(
     pc, ptrs, buffers, regs, NUM_K, EPILOGUE_GROUPS: gl.constexpr
 ):
     tc: gl.constexpr = pc.tuning_cfg
-    main = NUM_K - tc.pipeline_depth()
+    main = NUM_K - pipeline_depth(tc)
     period: gl.constexpr = math.lcm(
         tc.num_buffers(0),
         tc.num_buffers(1),
@@ -1093,14 +1095,14 @@ def _drain_buffered_pipeline(
     # epilogues need the smaller dynamic drain to avoid allocation pressure.
     if require_constexpr(
         period <= 3
-        and tc.pipeline_unroll() % period == 0
+        and pipeline_unroll(tc) % period == 0
         and tc.pipeline_register_period() == 1
         and pc.func_cfg.output_quant is None
     ):
         phase = main % period
         for p in gl.static_range(period):
             if phase == p:
-                for j in gl.static_range(tc.pipeline_depth() - 1):
+                for j in gl.static_range(pipeline_depth(tc) - 1):
                     ptrs, buffers, regs = _step(
                         pc,
                         ptrs,
@@ -1112,16 +1114,16 @@ def _drain_buffered_pipeline(
                         EPILOGUE_GROUPS=EPILOGUE_GROUPS,
                         KI=p + j - _pipeline_peeled(tc),
                         STATIC_PHASE=True,
-                        A_SCALE_LOAD=(pc.num_k - tc.pipeline_depth() + j + 1)
+                        A_SCALE_LOAD=(pc.num_k - pipeline_depth(tc) + j + 1)
                         % tc.scale_step_ratio(0)
                         == 0,
-                        B_SCALE_LOAD=(pc.num_k - tc.pipeline_depth() + j + 1)
+                        B_SCALE_LOAD=(pc.num_k - pipeline_depth(tc) + j + 1)
                         % tc.scale_step_ratio(1)
                         == 0,
-                        PHASE=pc.num_k - tc.pipeline_depth() + j + 1,
+                        PHASE=pc.num_k - pipeline_depth(tc) + j + 1,
                     )
     else:
-        for j in gl.static_range(tc.pipeline_depth() - 1):
+        for j in gl.static_range(pipeline_depth(tc) - 1):
             ptrs, buffers, regs = _step(
                 pc,
                 ptrs,
@@ -1131,13 +1133,13 @@ def _drain_buffered_pipeline(
                 j,
                 DRAIN=True,
                 EPILOGUE_GROUPS=EPILOGUE_GROUPS,
-                A_SCALE_LOAD=(pc.num_k - tc.pipeline_depth() + j + 1)
+                A_SCALE_LOAD=(pc.num_k - pipeline_depth(tc) + j + 1)
                 % tc.scale_step_ratio(0)
                 == 0,
-                B_SCALE_LOAD=(pc.num_k - tc.pipeline_depth() + j + 1)
+                B_SCALE_LOAD=(pc.num_k - pipeline_depth(tc) + j + 1)
                 % tc.scale_step_ratio(1)
                 == 0,
-                PHASE=pc.num_k - tc.pipeline_depth() + j + 1,
+                PHASE=pc.num_k - pipeline_depth(tc) + j + 1,
             )
     a_scale, b_scale = (), ()
     for tile in gl.static_range(tc.num_m_slots_per_block()):

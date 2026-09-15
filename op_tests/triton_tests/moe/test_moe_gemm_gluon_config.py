@@ -30,6 +30,10 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._pipeline import (
 from aiter.ops.triton._gluon_kernels.gfx950.moe._pipeline import (
     _wait as buffered_wait,
 )
+from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
+    pipeline_depth,
+    pipeline_unroll,
+)
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     ActivationSpec,
     ActKind,
@@ -633,9 +637,9 @@ def test_register_storage_options_are_independent(config, storage_mask):
     if not storage_mask & 4:
         expected += bm * bk // 32 * 2
     assert _plain(tc.lds_bytes()) == expected
-    assert _plain(tc.pipeline_unroll()) == 6
+    assert _plain(pipeline_unroll(tc)) == 6
     assert _plain(_validate(tc, 4096, 7168))
-    minimum = tc.pipeline_depth() + _pipeline_peeled(tc) + tc.pipeline_unroll()
+    minimum = pipeline_depth(tc) + _pipeline_peeled(tc) + pipeline_unroll(tc)
     assert _plain(_validate(tc, 4096, bk * _plain(minimum)))
     with pytest.raises(AssertionError, match="NUM_K"):
         host._validate_selected_pipeline(tc, bk)
@@ -662,27 +666,27 @@ def test_all_component_buffer_counts_determine_lcm_unroll(
     )
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     assert _plain(tc.pipeline_register_period()) == period
-    assert _plain(tc.pipeline_unroll()) == expected
+    assert _plain(pipeline_unroll(tc)) == expected
     resolved = [count or config["NUM_LDS_BUFFER"] for count in counts]
     assert [
         _plain(tc.num_buffers(operand, scale))
         for scale in (False, True)
         for operand in (0, 1)
     ] == resolved
-    assert _plain(tc.pipeline_depth()) == max(resolved)
+    assert _plain(pipeline_depth(tc)) == max(resolved)
 
 
 def test_lds_depths_constrain_unroll(config):
     config["K_UNROLL"] = 7
     fc = KernelFuncConfig(*_func_spec())
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    assert _plain(tc.pipeline_unroll()) == 21
+    assert _plain(pipeline_unroll(tc)) == 21
     config.update(A_NUM_BUFFER=2, B_NUM_BUFFER=4, A_SCALE_NUM_BUFFER=2)
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    assert _plain(tc.pipeline_unroll()) == 84
+    assert _plain(pipeline_unroll(tc)) == 84
     config["A_SCALE_IN_REG"] = True
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    assert _plain(tc.pipeline_unroll()) == 84
+    assert _plain(pipeline_unroll(tc)) == 84
 
 
 def test_small_payload_tiles_use_register_rings(config):
@@ -747,8 +751,8 @@ def test_absent_scales_do_not_participate_in_depth_unroll_or_validation(
         )
     )
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    assert _plain(tc.pipeline_depth()) == 4
-    assert _plain(tc.pipeline_unroll()) == 12
+    assert _plain(pipeline_depth(tc)) == 4
+    assert _plain(pipeline_unroll(tc)) == 12
     assert _plain(host._validate_selected_pipeline(tc, 7168))
 
 
@@ -788,7 +792,7 @@ def test_shared_depth_exact_minimum_and_all_unroll_remainders(config, depth, unr
     config.update(NUM_LDS_BUFFER=depth, K_UNROLL=unroll)
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     assert _plain(_pipeline_peeled(tc)) == 1
-    effective_unroll = _plain(tc.pipeline_unroll())
+    effective_unroll = _plain(pipeline_unroll(tc))
     assert effective_unroll == math.lcm(depth, unroll)
     minimum = depth + 1 + effective_unroll
     for remainder in range(effective_unroll):
@@ -875,7 +879,7 @@ def test_shuffled_k128_scales_constrain_lcm_unroll(config, independent):
         )
     )
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    assert _plain(tc.pipeline_unroll()) == 6
+    assert _plain(pipeline_unroll(tc)) == 6
     assert _plain(_validate(tc, 4096, 7168))
     assert host._scale_shuffle_supported(config, 0)
     assert host._scale_shuffle_supported(config, 1)
@@ -1016,10 +1020,10 @@ def _audit_buffer_schedule(tc, num_k, epilogue_groups=0):
         for kind, tile in ops
         if not async_kind[kind]
     }
-    depth = _plain(tc.pipeline_depth())
+    depth = _plain(pipeline_depth(tc))
     main = num_k - depth
     peeled = _plain(_pipeline_peeled(tc))
-    assert num_k >= depth + peeled + _plain(tc.pipeline_unroll())
+    assert num_k >= depth + peeled + _plain(pipeline_unroll(tc))
     scheme = _plain(tc.WAIT_COMMIT_SCHEME)
     per_stage = scheme in (
         WaitCommitScheme.PER_STAGE_WHOLE,
@@ -1153,7 +1157,7 @@ def test_independent_buffer_waits_match_copy_history(
     elif geometry == "unequal_tiles":
         config.update(MINI_BLOCK_N=64, SCALE_FILL_MID=True)
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
-    minimum = tc.pipeline_depth() + _pipeline_peeled(tc) + tc.pipeline_unroll()
+    minimum = pipeline_depth(tc) + _pipeline_peeled(tc) + pipeline_unroll(tc)
     # Both strips contain warmup, a runtime main body and a complete drain. The
     # second commits output-epilogue copies before shallow queues finish filling.
     _audit_buffer_schedule(tc, minimum)
@@ -1177,6 +1181,6 @@ def test_independent_buffer_schedule_without_scales(config, scheme, register_b, 
         )
     )
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    minimum = tc.pipeline_depth() + _pipeline_peeled(tc) + tc.pipeline_unroll()
+    minimum = pipeline_depth(tc) + _pipeline_peeled(tc) + pipeline_unroll(tc)
     _audit_buffer_schedule(tc, minimum)
     _audit_buffer_schedule(tc, minimum + 3, epilogue_groups=2)

@@ -22,6 +22,10 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._pipeline import (
     _pipeline_peeled,
     _wait,
 )
+from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
+    pipeline_depth,
+    pipeline_unroll,
+)
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import WaitCommitScheme
 from op_tests.triton_tests.moe.test_moe_gemm_gluon_wait_commit import _ScheduleConfig
 
@@ -56,7 +60,7 @@ class _Config(_ScheduleConfig):
         self.scale_steps = scale_steps or ((2, 2) if packed else (1, 1))
         self.scale_tiles = scale_tiles
         self.read_mask = read_mask
-        self.unroll = unroll
+        self.K_UNROLL = unroll
         self.SOFF_UNROLL = soff
         self.FROZEN_STEP = False
         self.SCHED_MODE = 0
@@ -68,12 +72,6 @@ class _Config(_ScheduleConfig):
 
     def num_buffers(self, operand, scale=False):
         return self.depths[operand * 2 + bool(scale)]
-
-    def pipeline_depth(self):
-        return max(
-            self.component_span(kind // 2, bool(kind % 2))
-            for kind in self.active_kinds()
-        )
 
     def component_span(self, operand, scale=False):
         return (self.num_buffers(operand, scale) - 1) * (
@@ -101,13 +99,6 @@ class _Config(_ScheduleConfig):
                 if not self.is_async(kind)
             )
         )
-
-    def pipeline_unroll(self):
-        periods = [self.unroll]
-        for kind in self.active_kinds():
-            ratio = self.scale_step_ratio(kind // 2) if kind % 2 else 1
-            periods.append(self.depths[kind] * ratio)
-        return math.lcm(*periods)
 
     def pipeline_peeled(self):
         if not hasattr(self, "_peeled"):
@@ -484,7 +475,7 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         pointers, buffers, regs = pipeline._run_buffered_pipeline.fn(
             pc, _pointers(0, 0, 0, 0), num_k
         )
-        main = num_k - tc.pipeline_depth()
+        main = num_k - pipeline_depth(tc)
         assert regs.acc == (main,) * (tc.nm * tc.nn)
         for _ in range(epilogue_groups):
             machine.commit_buffer_load()
@@ -587,13 +578,13 @@ def test_emitted_unified_pipeline_all_reachable_remainders(
     monkeypatch,
 ):
     tc = _Config(scheme, depths, register_mask, **options)
-    minimum = tc.pipeline_depth() + tc.pipeline_peeled() + tc.pipeline_unroll()
+    minimum = pipeline_depth(tc) + tc.pipeline_peeled() + pipeline_unroll(tc)
     quantum = math.lcm(*tc.scale_steps)
     first = math.ceil(minimum / quantum) * quantum
-    for num_k in range(first, first + math.lcm(quantum, tc.pipeline_unroll()), quantum):
+    for num_k in range(first, first + math.lcm(quantum, pipeline_unroll(tc)), quantum):
         _execute(tc, num_k, monkeypatch)
     # Re-enter the same static register-ring mapping from another runtime loop body.
-    _execute(tc, first + 2 * tc.pipeline_unroll(), monkeypatch)
+    _execute(tc, first + 2 * pipeline_unroll(tc), monkeypatch)
 
 
 def _sched_barrier_stream(machine):
@@ -623,11 +614,11 @@ def test_direct_b3_fills_k_plus_2_while_mfma_consumes_k(soff, monkeypatch):
         soff=soff,
     )
     # Exercise one non-loop remainder stage as well as the steady loop and drain.
-    num_k = tc.pipeline_depth() + tc.pipeline_peeled() + tc.pipeline_unroll() + 1
+    num_k = pipeline_depth(tc) + tc.pipeline_peeled() + pipeline_unroll(tc) + 1
     machine = _execute(tc, num_k, monkeypatch)
 
     in_loop_reads = _assert_direct_b_stage_barriers(machine)
-    assert len(in_loop_reads) == tc.pipeline_unroll() == 3
+    assert len(in_loop_reads) == pipeline_unroll(tc) == 3
     for read in in_loop_reads:
         assert [
             op
@@ -671,7 +662,7 @@ def test_direct_b2_fills_k_plus_1_while_mfma_consumes_k(soff, monkeypatch):
         soff=soff,
     )
     # Exercise one non-loop remainder stage as well as the steady loop and drain.
-    num_k = tc.pipeline_depth() + tc.pipeline_peeled() + tc.pipeline_unroll() + 1
+    num_k = pipeline_depth(tc) + tc.pipeline_peeled() + pipeline_unroll(tc) + 1
     machine = _execute(tc, num_k, monkeypatch)
 
     assert {
@@ -686,7 +677,7 @@ def test_direct_b2_fills_k_plus_1_while_mfma_consumes_k(soff, monkeypatch):
     } == {(0, ni) for ni in range(tc.nn)}
 
     in_loop_reads = _assert_direct_b_stage_barriers(machine)
-    assert len(in_loop_reads) == tc.pipeline_unroll() == 6
+    assert len(in_loop_reads) == pipeline_unroll(tc) == 6
     for read in in_loop_reads:
         assert [
             op
@@ -726,7 +717,7 @@ def test_lds_b_has_only_the_existing_seed_sched_barrier(monkeypatch):
         0,
         scales=False,
     )
-    num_k = tc.pipeline_depth() + tc.pipeline_peeled() + tc.pipeline_unroll() + 1
+    num_k = pipeline_depth(tc) + tc.pipeline_peeled() + pipeline_unroll(tc) + 1
     machine = _execute(tc, num_k, monkeypatch)
 
     assert any(in_loop for read, in_loop in machine.steps)
@@ -743,7 +734,7 @@ def test_peeled_wait_prefix_is_minimal(scheme, register_mask):
     steady = tuple(_wait(tc, None, slot) for slot in slots)
     waits = [
         tuple(_wait(tc, x + 1, slot) for slot in slots)
-        for x in range(tc.pipeline_depth() * 2)
+        for x in range(pipeline_depth(tc) * 2)
     ]
     last_changed = max(
         (x for x, vector in enumerate(waits) if vector != steady), default=-1
@@ -792,7 +783,7 @@ def test_absent_scale_ring_indices_ignore_invalid_unused_depths(scale_depths):
         tuple((key, host._hashable(value)) for key, value in config.items()),
     )[-1]
     assert tc.validate(512, 960)
-    assert tc.pipeline_depth() == 2
+    assert pipeline_depth(tc) == 2
     assert tc.pipeline_register_period() == 1
     for kind in (1, 3):
         for in_loop in (False, True):
