@@ -19,15 +19,23 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._entry import (
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import constexpr_fields
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
+    A_PAYLOAD,
+    A_SCALE,
+    B_PAYLOAD,
+    B_SCALE,
+    COMPONENTS,
+    SCALE,
+    A,
+    B,
+    _pipeline_peeled,
+    pipeline_depth,
+    pipeline_unroll,
+)
+from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
     _groups as buffered_groups,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
     _ops as buffered_ops,
-)
-from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
-    _pipeline_peeled,
-    pipeline_depth,
-    pipeline_unroll,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
     _wait as buffered_wait,
@@ -1010,48 +1018,69 @@ def _audit_buffer_schedule(tc, num_k, epilogue_groups=0):
     nm, nn = _plain(tc.num_m_slots_per_block()), _plain(tc.num_n_slots_per_block())
     nslots = nm * nn
     if (nm, nn) == (2, 2):
-        payloads = [(2, 0), (0, 0), (0, 1), (2, 1)]
+        payloads = [
+            (B_PAYLOAD, 0),
+            (A_PAYLOAD, 0),
+            (A_PAYLOAD, 1),
+            (B_PAYLOAD, 1),
+        ]
     else:
         payloads = []
         for tile in range(max(nm, nn)):
             if tile < nm:
-                payloads.append((0, tile))
+                payloads.append((A_PAYLOAD, tile))
             if tile < nn:
-                payloads.append((2, tile))
-    depths = [_plain(tc.num_buffers(kind // 2, bool(kind % 2))) for kind in range(4)]
-    has_scale = [_plain(tc.func_cfg.has_scale(operand)) for operand in (0, 1)]
-    async_kind = [
-        (
-            _plain(tc.scale_via_lds(kind // 2))
-            if kind % 2
-            else _plain(tc.payload_via_lds(kind // 2))
+                payloads.append((B_PAYLOAD, tile))
+    depths = {}
+    async_component = {}
+    for component in COMPONENTS:
+        operand, is_scale = component
+        depths[component] = _plain(tc.num_buffers(operand, is_scale))
+        async_component[component] = _plain(
+            tc.scale_via_lds(operand) if is_scale else tc.payload_via_lds(operand)
         )
-        for kind in range(4)
-    ]
-    shared_a = _plain(tc.scale_tile_ratio(0)) if _plain(tc.scale_shuffled(0)) else 1
+    has_scale = {operand: _plain(tc.func_cfg.has_scale(operand)) for operand in (A, B)}
+    shared_a = (
+        _plain(tc.scale_ratio_non_k_slot(A)) if _plain(tc.scale_shuffled(A)) else 1
+    )
     fill_slots = [[] for _ in range(nslots)]
-    for slot, (kind, tile) in enumerate(payloads):
-        fill_slots[slot].append((kind, tile))
-        if not has_scale[kind // 2] or (kind == 0 and tile % shared_a):
+    for slot, (component, tile) in enumerate(payloads):
+        operand, is_scale = component
+        assert not is_scale
+        fill_slots[slot].append((component, tile))
+        if not has_scale[operand] or (operand == A and tile % shared_a):
             continue
         scale_slot = (
             tile + 1 if (nm, nn) == (2, 2) and _plain(tc.SCALE_FILL_MID) else slot
         )
-        fill_slots[scale_slot].append((kind + 1, tile))
-    fill_slots = [tuple(sorted(ops)) for ops in fill_slots]
+        fill_slots[scale_slot].append(((operand, SCALE), tile))
+    component_rank = {
+        A_PAYLOAD: 0,
+        A_SCALE: 1,
+        B_PAYLOAD: 2,
+        B_SCALE: 3,
+    }
+    fill_slots = [
+        tuple(sorted(ops, key=lambda copy: component_rank[copy[0]]))
+        for ops in fill_slots
+    ]
     for slot, expected in enumerate(fill_slots):
         actual = buffered_ops(tc, slot % nm, slot // nm)
         assert (
-            tuple((kind, tile) for kind, tile in enumerate(actual) if tile is not None)
+            tuple(
+                (component, tile)
+                for component, tile in zip(COMPONENTS, actual)
+                if tile is not None
+            )
             == expected
         )
 
     committed, group_for_copy, issued, lds = [], {}, set(), {}
     queues = {
-        (kind, tile): [None] * depths[kind]
+        (component, tile): [None] * depths[component]
         for ops in fill_slots
-        for kind, tile in ops
-        if not async_kind[kind]
+        for component, tile in ops
+        if not async_component[component]
     }
     depth = _plain(pipeline_depth(tc))
     main = num_k - depth
@@ -1065,20 +1094,20 @@ def _audit_buffer_schedule(tc, num_k, epilogue_groups=0):
 
     def required_copies(stage, slot):
         need = []
-        for pos, (kind, tile) in enumerate(payloads):
+        for pos, (component, tile) in enumerate(payloads):
             if slot is not None and pos != slot:
                 continue
-            need.append((kind, tile, stage))
-            if has_scale[kind // 2]:
-                owner = tile - tile % shared_a if kind == 0 else tile
+            operand, is_scale = component
+            assert not is_scale
+            need.append((component, tile, stage))
+            if has_scale[operand]:
+                owner = tile - tile % shared_a if operand == A else tile
                 if tile == owner:
-                    need.append((kind + 1, owner, stage))
+                    need.append(((operand, SCALE), owner, stage))
         return need
 
     def check_wait(stage, slot):
-        required = [
-            copy for copy in required_copies(stage, slot) if async_kind[copy[0]]
-        ]
+        required = [copy for copy in required_copies(stage, slot) if async_component[copy[0]]]
         expected = (
             len(committed) - 1 - max(group_for_copy[copy] for copy in required)
             if required
@@ -1098,14 +1127,14 @@ def _audit_buffer_schedule(tc, num_k, epilogue_groups=0):
         expected_groups = []
         stage_copies = [
             tuple(
-                (kind, tile, stage + depths[kind] - 1)
-                for kind, tile in ops
-                if 0 <= stage + depths[kind] - 1 < num_k
+                (component, tile, stage + depths[component] - 1)
+                for component, tile in ops
+                if 0 <= stage + depths[component] - 1 < num_k
             )
             for ops in fill_slots
         ]
         for slot, copies in enumerate(stage_copies):
-            asynchronous = tuple(copy for copy in copies if async_kind[copy[0]])
+            asynchronous = tuple(copy for copy in copies if async_component[copy[0]])
             if scheme == WaitCommitScheme.PER_OP:
                 groups = tuple((copy,) for copy in asynchronous)
             elif scheme == WaitCommitScheme.PER_SLOT:
@@ -1125,14 +1154,14 @@ def _audit_buffer_schedule(tc, num_k, epilogue_groups=0):
         def fill_slot(
             slot, copies_by_slot=stage_copies, groups_by_slot=expected_groups
         ):
-            for kind, tile, target in copies_by_slot[slot]:
-                copy = (kind, tile, target)
+            for component, tile, target in copies_by_slot[slot]:
+                copy = (component, tile, target)
                 assert copy not in issued, "a K tile was loaded twice"
                 issued.add(copy)
-                if async_kind[kind]:
-                    lds[kind, tile, target % depths[kind]] = target
+                if async_component[component]:
+                    lds[component, tile, target % depths[component]] = target
                 else:
-                    queues[kind, tile][-1] = target
+                    queues[component, tile][-1] = target
             for group in groups_by_slot[slot]:
                 for copy in group:
                     group_for_copy[copy] = len(committed)
@@ -1147,20 +1176,22 @@ def _audit_buffer_schedule(tc, num_k, epilogue_groups=0):
             for slot in range(nslots):
                 if not per_stage:
                     check_wait(stage, slot)
-                for kind, tile, target in required_copies(stage, slot):
-                    if async_kind[kind]:
-                        assert lds[kind, tile, target % depths[kind]] == target
+                for component, tile, target in required_copies(stage, slot):
+                    if async_component[component]:
+                        assert (
+                            lds[component, tile, target % depths[component]] == target
+                        )
                     else:
-                        assert queues[kind, tile][0] == target
+                        assert queues[component, tile][0] == target
                 fill_slot(slot)
         for key, queue in queues.items():
             queues[key] = queue[1:] + queue[:1]
         if stage == main:
             committed.extend(() for _ in range(epilogue_groups))
     expected_loads = {
-        (kind, tile, target)
+        (component, tile, target)
         for ops in fill_slots
-        for kind, tile in ops
+        for component, tile in ops
         for target in range(num_k)
     }
     assert issued == expected_loads

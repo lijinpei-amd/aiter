@@ -23,6 +23,10 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._config import (
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import unwrap
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
+    B_PAYLOAD,
+    COMPONENTS,
+    PAYLOAD,
+    SCALE,
     _pipeline_peeled,
     pipeline_depth,
     pipeline_unroll,
@@ -357,64 +361,69 @@ class _CopyRecorder:
 
     def __init__(self, tc, b_step):
         self.tc = tc
-        self.depths = [tc.num_buffers(kind // 2, bool(kind % 2)) for kind in range(4)]
+        self.depths = {
+            component: tc.num_buffers(*component) for component in COMPONENTS
+        }
         self.b_step = b_step
         self.addresses = defaultdict(list)
         self.reads = defaultdict(list)
         self.lds = {}
         self.dot_tiles = defaultdict(list)
 
-    def _record(self, kind, buffer, tile, pointer, offsets, soffset):
+    def _record(self, component, buffer, tile, pointer, offsets, soffset):
         assert offsets == tile
-        history = self.addresses[kind, tile]
-        ratio = self.tc.scale_step_ratio(kind // 2) if kind % 2 else 1
+        operand, is_scale = component
+        history = self.addresses[component, tile]
+        ratio = self.tc.scale_ratio_k_step(operand) if is_scale else 1
         stage = len(history) * ratio
         expected = (
             (stage // 2) * 256
-            if kind % 2
-            else stage * (self.b_step if kind == 2 else 128)
+            if is_scale
+            else stage * (self.b_step if component == B_PAYLOAD else 128)
         )
         address = unwrap(pointer + soffset)
-        assert address == expected, (kind, tile, stage, address, expected)
+        assert address == expected, (component, tile, stage, address, expected)
         history.append(address)
-        if kind % 2:
+        if is_scale:
             even = stage // 2 * 2
             value = _ScaleWord((even + 1) | ((even + 2) << 16))
         else:
-            value = _Payload(stage, kind // 2, tile)
+            value = _Payload(stage, operand, tile)
         if buffer is not None:
-            assert buffer == stage // ratio % self.depths[kind]
-            key = kind, tile, buffer
+            assert buffer == stage // ratio % self.depths[component]
+            key = component, tile, buffer
             if key in self.lds:
-                assert stage - self.depths[kind] * ratio in self.reads[kind, tile], (
-                    "LDS slot overwritten before its read",
-                    key,
-                    stage,
-                )
+                assert (
+                    stage - self.depths[component] * ratio
+                    in self.reads[component, tile]
+                ), ("LDS slot overwritten before its read", key, stage)
             self.lds[key] = value
         return value
 
     def buffer_load_payload(
         self, operand, VIA_LDS, buffer, tile, pointer, offsets, soffset
     ):
-        value = self._record(operand * 2, buffer, tile, pointer, offsets, soffset)
+        value = self._record(
+            (operand, PAYLOAD), buffer, tile, pointer, offsets, soffset
+        )
         if not VIA_LDS:
             return (value,)
 
     def buffer_load_scale(
         self, operand, VIA_LDS, buffer, tile, pointer, offsets, soffset
     ):
-        kind = operand * 2 + 1
-        value = self._record(kind, buffer, tile, pointer, offsets, soffset)
+        component = (operand, SCALE)
+        value = self._record(component, buffer, tile, pointer, offsets, soffset)
         if not VIA_LDS:
             return (value,) * self.tc.scale_read_k_slots(operand)
 
-    def _read(self, kind, tile, slot):
-        ratio = self.tc.scale_step_ratio(kind // 2) if kind % 2 else 1
-        stage = len(self.reads[kind, tile]) * ratio
-        assert slot == stage // ratio % self.depths[kind]
-        self.reads[kind, tile].append(stage)
-        return self.lds[kind, tile, slot]
+    def _read(self, component, tile, slot):
+        operand, is_scale = component
+        ratio = self.tc.scale_ratio_k_step(operand) if is_scale else 1
+        stage = len(self.reads[component, tile]) * ratio
+        assert slot == stage // ratio % self.depths[component]
+        self.reads[component, tile].append(stage)
+        return self.lds[component, tile, slot]
 
     def ds_read_frag(
         self,
@@ -427,14 +436,14 @@ class _CopyRecorder:
         SCALE_READ_IDX=None,
     ):
         assert k == 0
-        payload = self._read(operand * 2, tile, buffer) if READ_PAYLOAD else None
+        payload = self._read((operand, PAYLOAD), tile, buffer) if READ_PAYLOAD else None
         scale = (
-            self._read(operand * 2 + 1, tile, SCALE_READ_IDX) if READ_SCALE else None
+            self._read((operand, SCALE), tile, SCALE_READ_IDX) if READ_SCALE else None
         )
         return payload, scale
 
     def ds_read_scale(self, operand, slot, tile):
-        value = self._read(operand * 2 + 1, tile, slot)
+        value = self._read((operand, SCALE), tile, slot)
         return (value,) * self.tc.scale_read_k_slots(operand)
 
     def commit_buffer_load(self):
@@ -525,10 +534,10 @@ def _run_scalar_pipeline(monkeypatch, tc, stages, fused):
         else:
             acc = buffered._last_mfma.fn(pc, final)
     assert acc == (stages,) * 4
-    assert set(sink.addresses) == set(product(range(4), range(2)))
+    assert set(sink.addresses) == set(product(COMPONENTS, range(2)))
     assert all(
-        len(history) == stages // (2 if kind % 2 else 1)
-        for (kind, _tile), history in sink.addresses.items()
+        len(history) == stages // (2 if component[1] else 1)
+        for (component, _tile), history in sink.addresses.items()
     )
     assert all(history == list(range(stages)) for history in sink.dot_tiles.values())
     assert len(sink.dot_tiles) == 4

@@ -50,11 +50,11 @@ def _scale_fragments(scale, cfg, operand: gl.constexpr):
     mini: gl.constexpr = cfg.MINI_BLOCK_K
     packed: gl.constexpr = cfg.scale_packed_ok(operand)
     fragments = ()
-    for n in gl.static_range(cfg.scale_tile_ratio(operand)):
+    for n in gl.static_range(cfg.scale_ratio_non_k_slot(operand)):
         for k in gl.static_range(sk // mini):
             if require_constexpr(packed):
                 if require_constexpr(
-                    cfg.scale_tile_ratio(operand) == 1 and sk == max(256, mini)
+                    cfg.scale_ratio_non_k_slot(operand) == 1 and sk == max(256, mini)
                 ):
                     fragment = scale
                 else:
@@ -241,7 +241,7 @@ class LDSManager:
             if operand == 0
             else cfg.expert_scale_cache_modifier
         )
-        ratio: gl.constexpr = cfg.scale_tile_ratio(operand)
+        ratio: gl.constexpr = cfg.scale_ratio_non_k_slot(operand)
         if require_constexpr(VIA_LDS):
             if require_constexpr(
                 self.func_cfg.has_scale(operand)
@@ -339,7 +339,7 @@ class LDSManager:
                 scale_ptr = lds_ptr.index(
                     (
                         SCALE_READ_IDX * cfg.num_scale_tiles(operand)
-                        + tile // cfg.scale_tile_ratio(operand)
+                        + tile // cfg.scale_ratio_non_k_slot(operand)
                     )
                     * cfg.scale_load_k_tiles(operand)
                     + k
@@ -364,7 +364,7 @@ class LDSManager:
                     )
                 chunks += (_scale_fragments(scale, cfg, operand),)
             fragments = ()
-            for n in gl.static_range(cfg.scale_tile_ratio(operand)):
+            for n in gl.static_range(cfg.scale_ratio_non_k_slot(operand)):
                 for k in gl.static_range(cfg.scale_load_k_tiles(operand)):
                     for mini in gl.static_range(
                         cfg.scale_mini_block_k(operand) // cfg.MINI_BLOCK_K
@@ -480,7 +480,7 @@ class LDSManager:
                 cfg.scale_via_lds(operand),
                 "ds_read_frag only reads LDS-staged scales",
             )
-            ratio: gl.constexpr = cfg.scale_tile_ratio(operand)
+            ratio: gl.constexpr = cfg.scale_ratio_non_k_slot(operand)
             fragments = self.ds_read_scale(
                 operand, SCALE_READ_IDX, tile // ratio * ratio
             )

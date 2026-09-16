@@ -327,7 +327,7 @@ class _FrozenLDSManager:
     ):
         cfg: gl.constexpr = self.tuning_cfg
         gl.static_assert(VIA_LDS)
-        ratio: gl.constexpr = cfg.scale_tile_ratio(operand)
+        ratio: gl.constexpr = cfg.scale_ratio_non_k_slot(operand)
         if require_constexpr(
             self.func_cfg.has_scale(operand)
             and cfg.scale_via_lds(operand)
@@ -399,7 +399,7 @@ class _FrozenLDSManager:
     @gluon.jit
     def _a_scale_tile(self, DS_READ_IDX, mi: gl.constexpr):
         cfg: gl.constexpr = self.tuning_cfg
-        RA: gl.constexpr = cfg.scale_tile_ratio(0)
+        RA: gl.constexpr = cfg.scale_ratio_non_k_slot(0)
         tile_lds_ptr = self.a_scale_lds_ptr.index(
             DS_READ_IDX * (cfg.num_lds_slots_per_block_non_k(0) // RA) + mi // RA
         )
@@ -1414,7 +1414,7 @@ def _init_buffers_frozen(pc):
             * tc.num_m_slots_per_block()
             * tc.num_k_slots_per_tile()
         ):
-            if require_constexpr(tc.scale_step_ratio(0) > 1):
+            if require_constexpr(tc.scale_ratio_k_step(0) > 1):
                 a_scale += (
                     gl.zeros(
                         tc.packed_scale_shape(0),
@@ -1436,7 +1436,7 @@ def _init_buffers_frozen(pc):
             * tc.num_n_slots_per_block()
             * tc.num_k_slots_per_tile()
         ):
-            if require_constexpr(tc.scale_step_ratio(1) > 1):
+            if require_constexpr(tc.scale_ratio_k_step(1) > 1):
                 b_scale += (
                     gl.zeros(
                         tc.packed_scale_shape(1),
@@ -1569,8 +1569,8 @@ def _drain_frozen_pipeline(
         tc.num_buffers(1),
         tc.num_buffers(0, True) if pc.func_cfg.a_has_scale() else 1,
         tc.num_buffers(1, True) if pc.func_cfg.b_has_scale() else 1,
-        tc.scale_step_ratio(0),
-        tc.scale_step_ratio(1),
+        tc.scale_ratio_k_step(0),
+        tc.scale_ratio_k_step(1),
     )
     if require_constexpr(
         period <= 3

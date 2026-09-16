@@ -49,7 +49,7 @@ mismatch before preparing scales or launching the GEMM.
 The same component driver runs whether depths are inherited or explicit. Every
 active LDS or register payload ring contributes its resolved buffer depth. A scale
 ring advances once per scale K tile, so it contributes
-`scale_buffer_depth * scale_step_ratio`; the scale cadence also participates
+`scale_buffer_depth * scale_ratio_k_step`; the scale K-step ratio also participates
 directly. This returns every ring and scale phase to its initial state at the end
 of a complete unrolled body. For example, active depths 2 and 3 have period 6:
 requested `K_UNROLL=4` becomes `UNROLL=12`, and requested `K_UNROLL=7` becomes
