@@ -60,7 +60,6 @@ def _config(dtype=DtypeQuant.MXFP8, fused=True, **overrides):
         "BLOCK_N": 128,
         "BLOCK_K": 128,
         "K_UNROLL": 6,
-        "MINI_BLOCK_K": 128,
         "MINI_BLOCK_M": 64,
         "MINI_BLOCK_N": 64,
         "NUM_LDS_BUFFER": 3,
@@ -136,7 +135,6 @@ def test_packed_words_and_selectors_match_producer(
     tc = _config(
         dtype,
         BLOCK_K=block_k,
-        MINI_BLOCK_K=block_k,
         VGPR_PREFETCH_K=block_k,
         BLOCK_M=mini_m * 2,
         BLOCK_N=mini_n * 2,
@@ -241,7 +239,7 @@ def test_wide_packed_scale_load_layout_matches_producer(scale_k, operand):
 @pytest.mark.parametrize(
     "changes,k,diagnostic",
     [
-        ({"MINI_BLOCK_K": 64}, 7168, None),
+        ({"BLOCK_K": 64, "VGPR_PREFETCH_K": 64}, 7168, None),
         ({"FROZEN_STEP": True}, 7168, None),
         ({}, 384, "complete"),
     ],
@@ -274,7 +272,6 @@ def test_dot_helpers_forward_scale_phase(monkeypatch, block_k, dtype, phase):
         _config(
             dtype,
             BLOCK_K=block_k,
-            MINI_BLOCK_K=block_k,
             VGPR_PREFETCH_K=block_k,
         )
     )
@@ -300,11 +297,10 @@ def test_dot_helpers_forward_scale_phase(monkeypatch, block_k, dtype, phase):
 
 
 @pytest.mark.parametrize("phase", [0, 1])
-def test_frozen_dot_helper_advances_scale_phase_per_mini(monkeypatch, phase):
+def test_frozen_dot_helper_forwards_scale_phase(monkeypatch, phase):
     tc = _HostView(
         _config(
             BLOCK_K=256,
-            MINI_BLOCK_K=128,
             VGPR_PREFETCH_K=256,
             FROZEN_STEP=True,
         )
@@ -318,10 +314,10 @@ def test_frozen_dot_helper_advances_scale_phase_per_mini(monkeypatch, phase):
 
     monkeypatch.setattr(gl, "static_range", range)
     monkeypatch.setattr(frozen, "_dot", dot)
-    a = ("A0", "A-scale", "A1", "A-scale")
-    b = ("B0", "B-scale", "B1", "B-scale")
-    assert frozen._maybe_block_dot.fn(a, b, 13, 2, fc, tc, True, phase) == 15
-    assert phases == [phase, 1 - phase]
+    a = ("A", "A-scale")
+    b = ("B", "B-scale")
+    assert frozen._maybe_block_dot.fn(a, b, 13, 1, fc, tc, True, phase) == 14
+    assert phases == [phase]
 
 
 @dataclass

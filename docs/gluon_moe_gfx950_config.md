@@ -210,7 +210,8 @@ The K loop carries two aggregates plus the component register rings:
   HBM pointers and one scale HBM pointer per operand, shared by the mutually
   exclusive LDS-staging and direct-register scale paths.
 - `_PipelineRegFragments` contains separate A/B payload and scale tuples and the
-  MFMA accumulators. Operand tuples run by mini block, then mini-K step;
+  MFMA accumulators. Operand tuples run by non-K mini block, with one whole-`BLOCK_K`
+  payload fragment per stage;
   accumulators follow the N-outer, M-inner slot traversal.
 
 `_PipelineConst.lds_ptrs` holds the `LDSManager` descriptors, named

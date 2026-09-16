@@ -35,7 +35,8 @@ Reported rocprofv3 durations include GEMM only; preprocessing, cache flushing,
 and host overhead are excluded. This setup cache is benchmark-specific and
 does not introduce library caching of changing activation scales.
 
-The shared recipe uses BM128/BN256/BK256, mini-M64/mini-N128/mini-K256,
+The shared recipe uses BM128/BN256/BK256 with one whole-BK256 payload fragment,
+mini-M64/mini-N128,
 MFMA(16,16,128), warps(1,4), tiles(2,2), full-stage K prefetching, and shuffled
 A/B scales with scale mini-M128. It retains legacy three-buffer/unroll-3
 scheduling, `WARP_PIPELINE=0`, `WAIT_COMMIT_SCHEME=3`, and all four

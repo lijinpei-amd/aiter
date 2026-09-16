@@ -31,14 +31,12 @@ def _register_config(dtype):
     if dtype == "mxfp8":
         config.update(
             BLOCK_K=128,
-            MINI_BLOCK_K=128,
             VGPR_PREFETCH_K=128,
             K_UNROLL=6,
         )
     elif dtype == "bf16":
         config.update(
             BLOCK_K=64,
-            MINI_BLOCK_K=64,
             VGPR_PREFETCH_K=64,
             mfma_instr_shape=(32, 32, 16),
             warps_per_cta=(2, 4),
@@ -289,7 +287,6 @@ def test_small_a_payload_uses_register_ring(monkeypatch):
     config = _register_config("bf16")
     config.update(
         BLOCK_K=32,
-        MINI_BLOCK_K=32,
         MINI_BLOCK_M=16,
         MINI_BLOCK_N=128,
         VGPR_PREFETCH_K=32,
@@ -322,7 +319,6 @@ def test_small_b_payload_uses_register_ring_without_preshuffle(monkeypatch):
     config.update(
         BLOCK_N=32,
         BLOCK_K=32,
-        MINI_BLOCK_K=32,
         MINI_BLOCK_M=64,
         MINI_BLOCK_N=16,
         VGPR_PREFETCH_K=32,
@@ -357,7 +353,6 @@ def test_small_a_and_b_payloads_share_register_pipeline(monkeypatch):
     config.update(
         BLOCK_N=64,
         BLOCK_K=32,
-        MINI_BLOCK_K=32,
         MINI_BLOCK_M=32,
         MINI_BLOCK_N=32,
         VGPR_PREFETCH_K=32,
@@ -406,7 +401,6 @@ def test_k128_register_scale_phase(register_case):
     config = _register_config(register_case.dtype)
     config.update(
         BLOCK_K=128,
-        MINI_BLOCK_K=128,
         VGPR_PREFETCH_K=128,
         B_IN_REG=True,
         A_SCALE_IN_REG=True,
@@ -420,24 +414,23 @@ def test_k128_register_scale_phase(register_case):
 
 
 @pytest.mark.parametrize(
-    "block_k,mini_k,scale_k,shuffled",
+    "block_k,scale_k,shuffled",
     [
-        (256, 128, 256, (False, False)),
-        (256, 128, 512, (True, False)),
-        (512, 128, 256, (True, True)),
-        (512, 256, 256, (False, True)),
+        (256, 256, (False, False)),
+        (256, 512, (True, False)),
+        (512, 512, (True, True)),
+        (512, 1024, (False, True)),
     ],
-    ids=["raw-mini128", "a-scale512", "two-scale-loads", "b-scale256"],
+    ids=["raw-k256", "a-scale512", "both-scale512", "b-scale1024"],
 )
 def test_scale_and_payload_k_load_units_are_independent(
-    register_case, block_k, mini_k, scale_k, shuffled
+    register_case, block_k, scale_k, shuffled
 ):
     if register_case.dtype == "bf16":
         pytest.skip("This case exercises microscaled operands.")
     config = _register_config(register_case.dtype)
     config.update(
         BLOCK_K=block_k,
-        MINI_BLOCK_K=mini_k,
         SCALE_MINI_BLOCK_K=scale_k,
         SCALE_MINI_BLOCK_M=128,
         SCALE_MINI_BLOCK_N=256,
@@ -452,15 +445,14 @@ def test_scale_and_payload_k_load_units_are_independent(
 
 
 @pytest.mark.parametrize("mask", [1, 2, 4, 7], ids=["b", "a_scale", "b_scale", "all"])
-def test_register_operands_with_mini_k_split(register_case, mask):
+def test_register_operands_cover_whole_block_k(register_case, mask):
     if register_case.dtype == "bf16":
-        pytest.skip("This case covers microscaled K256 stages split into K128 tiles.")
+        pytest.skip("This case covers microscaled K256 stages.")
     config = _register_config(register_case.dtype)
     config.update(
         BLOCK_N=128,
         MINI_BLOCK_N=64,
         BLOCK_K=256,
-        MINI_BLOCK_K=128,
         VGPR_PREFETCH_K=256,
         warps_per_cta=(2, 2),
         B_IN_REG=bool(mask & 1),

@@ -159,7 +159,7 @@ def _maybe_block_dot(
                 acc,
                 func_cfg,
                 tuning_cfg,
-                (K_PHASE + i * tuning_cfg.MINI_BLOCK_K // 128) % 2,
+                (K_PHASE + i * tuning_cfg.BLOCK_K // 128) % 2,
             )
     return acc
 
@@ -376,7 +376,7 @@ class _FrozenLDSManager:
         cfg: gl.constexpr = self.tuning_cfg
         tile_lds_ptr = lds_ptr.index(DS_READ_IDX * n_tiles + tile)
         if require_constexpr(cfg.num_k_slots_per_tile() > 1):
-            width: gl.constexpr = cfg.MINI_BLOCK_K // pack
+            width: gl.constexpr = cfg.BLOCK_K // pack
             tile_lds_ptr = tile_lds_ptr.slice(mini_idx * width, width, dim=k_dim)
         return tile_lds_ptr
 
@@ -392,7 +392,7 @@ class _FrozenLDSManager:
         cfg: gl.constexpr = self.tuning_cfg
         tile_lds_ptr = lds_ptr.index(DS_READ_IDX * n_tiles + tile)
         if require_constexpr(cfg.num_k_slots_per_tile() > 1):
-            width: gl.constexpr = cfg.MINI_BLOCK_K // MX_GROUP
+            width: gl.constexpr = cfg.BLOCK_K // MX_GROUP
             tile_lds_ptr = tile_lds_ptr.slice(mini_idx * width, width, dim=1)
         return tile_lds_ptr
 
@@ -996,7 +996,7 @@ def _ds_read_operand_frozen(
     """Read one frozen-step operand tile and any direct-register scale fragments."""
     tc: gl.constexpr = pc.tuning_cfg
     NUM_MINI: gl.constexpr = tc.num_k_slots_per_tile()
-    SK_MINI: gl.constexpr = tc.MINI_BLOCK_K // MX_GROUP
+    SK_MINI: gl.constexpr = tc.BLOCK_K // MX_GROUP
     HAS: gl.constexpr = pc.func_cfg.has_scale(operand)
     SCALE_VIA_LDS: gl.constexpr = HAS and tc.scale_via_lds(operand)
     if require_constexpr(operand == 0):
@@ -1391,7 +1391,7 @@ def _init_buffers_frozen(pc):
                 gl.zeros(
                     [
                         tc.MINI_BLOCK_M,
-                        tc.MINI_BLOCK_K // pc.func_cfg.pack_divisor(0),
+                        tc.BLOCK_K // pc.func_cfg.pack_divisor(0),
                     ],
                     pc.func_cfg.operand_elem_ty(0),
                     tc.dot_operand_fragment_layout(0),
@@ -1403,7 +1403,7 @@ def _init_buffers_frozen(pc):
         ):
             b += (
                 gl.zeros(
-                    [tc.MINI_BLOCK_K // pc.func_cfg.pack_divisor(1), tc.MINI_BLOCK_N],
+                    [tc.BLOCK_K // pc.func_cfg.pack_divisor(1), tc.MINI_BLOCK_N],
                     pc.func_cfg.operand_elem_ty(1),
                     tc.dot_operand_fragment_layout(1),
                 ),
@@ -1425,7 +1425,7 @@ def _init_buffers_frozen(pc):
             else:
                 a_scale += (
                     gl.zeros(
-                        [tc.MINI_BLOCK_M, tc.MINI_BLOCK_K // 32],
+                        [tc.MINI_BLOCK_M, tc.BLOCK_K // 32],
                         gl.uint8,
                         tc.dot_operand_scale_fragment_layout(0),
                     ),
@@ -1447,7 +1447,7 @@ def _init_buffers_frozen(pc):
             else:
                 b_scale += (
                     gl.zeros(
-                        [tc.MINI_BLOCK_N, tc.MINI_BLOCK_K // 32],
+                        [tc.MINI_BLOCK_N, tc.BLOCK_K // 32],
                         gl.uint8,
                         tc.dot_operand_scale_fragment_layout(1),
                     ),

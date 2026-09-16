@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Direct register loads must preserve every mini-K fragment without using LDS."""
+"""Direct register loads must preserve a whole K tile without using LDS."""
 
 import re
 
@@ -26,13 +26,9 @@ def _register_load_copy(
     if SCALE:
         shape: gl.constexpr = tc.scale_lds_shape_slot(operand)
         layout: gl.constexpr = tc.dot_operand_scale_fragment_layout(operand)
-        k_dim: gl.constexpr = 1
-        width: gl.constexpr = tc.MINI_BLOCK_K // 32
     else:
         shape: gl.constexpr = tc.payload_lds_shape_slot(operand)
         layout: gl.constexpr = tc.dot_operand_fragment_layout(operand)
-        k_dim: gl.constexpr = 1 - operand
-        width: gl.constexpr = tc.MINI_BLOCK_K // tc.func_cfg.pack_divisor(operand)
     rows = gl.arange(0, shape[0], layout=gl.SliceLayout(1, layout))
     cols = gl.arange(0, shape[1], layout=gl.SliceLayout(0, layout))
     offsets = rows[:, None] * shape[1] + cols[None, :]
@@ -40,27 +36,19 @@ def _register_load_copy(
         fragments = lds.buffer_load_scale(operand, False, None, 0, src, offsets, 16)
     else:
         fragments = lds.buffer_load_payload(operand, False, None, 0, src, offsets, 16)
-    for mini in gl.static_range(tc.num_k_slots_per_tile()):
-        if k_dim == 0:
-            fragment_offsets = gl.amd.slice(
-                offsets, [width, shape[1]], [mini * width, 0]
-            )
-        else:
-            fragment_offsets = gl.amd.slice(
-                offsets, [shape[0], width], [0, mini * width]
-            )
-        gl.store(dst + fragment_offsets, fragments[mini])
+    gl.store(dst + offsets, fragments[0])
 
 
 @pytest.mark.parametrize("operand", [0, 1], ids=["a", "b"])
 @pytest.mark.parametrize("scale", [False, True], ids=["payload", "scale"])
-@pytest.mark.parametrize("mini_k", [128, 256])
-def test_register_load_does_not_stage_through_lds(operand, scale, mini_k):
+@pytest.mark.parametrize("block_k", [128, 256])
+def test_register_load_does_not_stage_through_lds(operand, scale, block_k):
     if get_arch() != "gfx950":
         pytest.skip("Gluon MoE kernels are gfx950 only.")
     config = dict(
         _register_config("mxfp4"),
-        MINI_BLOCK_K=mini_k,
+        BLOCK_K=block_k,
+        VGPR_PREFETCH_K=block_k,
         B_IN_REG=True,
         B_PRESHUFFLED=True,
         A_SCALE_IN_REG=True,

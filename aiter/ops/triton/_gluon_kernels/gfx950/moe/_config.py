@@ -42,7 +42,6 @@ LDS_CAP_BYTES = _layout.LDS_CAP_BYTES
 LDS_EPILOGUE_RESERVE_BYTES = _layout.LDS_EPILOGUE_RESERVE_BYTES
 LDS_USABLE_BYTES = _layout.LDS_USABLE_BYTES
 byte_unit_lds_layout = _layout.byte_unit_lds_layout
-make_scale_swizzle_check = _layout.make_scale_swizzle_check
 
 
 @aggregate
@@ -228,7 +227,6 @@ class KernelTuningConfig(_KernelTuningLayout):
     BLOCK_N: gl.constexpr
     BLOCK_K: gl.constexpr
     K_UNROLL: gl.constexpr
-    MINI_BLOCK_K: gl.constexpr
     MINI_BLOCK_M: gl.constexpr
     MINI_BLOCK_N: gl.constexpr
     NUM_LDS_BUFFER: gl.constexpr
@@ -282,7 +280,6 @@ class KernelTuningConfig(_KernelTuningLayout):
         BLOCK_N,
         BLOCK_K,
         K_UNROLL,
-        MINI_BLOCK_K,
         MINI_BLOCK_M,
         MINI_BLOCK_N,
         NUM_LDS_BUFFER,
@@ -333,7 +330,6 @@ class KernelTuningConfig(_KernelTuningLayout):
         self.BLOCK_N = gl.constexpr(_v(BLOCK_N))
         self.BLOCK_K = gl.constexpr(_v(BLOCK_K))
         self.K_UNROLL = gl.constexpr(_v(K_UNROLL))
-        self.MINI_BLOCK_K = gl.constexpr(_v(MINI_BLOCK_K))
         self.MINI_BLOCK_M = gl.constexpr(_v(MINI_BLOCK_M))
         self.MINI_BLOCK_N = gl.constexpr(_v(MINI_BLOCK_N))
         self.NUM_LDS_BUFFER = gl.constexpr(_v(NUM_LDS_BUFFER))
@@ -567,21 +563,14 @@ class KernelTuningConfig(_KernelTuningLayout):
             )
 
         # -- register prefetch depth --
-        # VGPR_PREFETCH_K is how much of a BLOCK_K stage is read into registers one step
-        # before its MFMAs consume it. BLOCK_K carries the whole stage, 0 carries none,
-        # and the ds_read still moves a full stage either way -- only the register
-        # handoff changes, which is why the buffer arithmetic above does not mention it.
+        # The live and frozen drivers both carry the complete BLOCK_K stage in
+        # registers from the preceding step. There is no partial or disabled handoff
+        # after removing the payload K split.
         pk = _v(self.VGPR_PREFETCH_K)
-        if pk:
-            assert pk <= BK, f"VGPR_PREFETCH_K {pk} > BLOCK_K {BK}"
-            assert pk >= _v(self.MINI_BLOCK_K), (
-                f"VGPR_PREFETCH_K {pk} < MINI_BLOCK_K {_v(self.MINI_BLOCK_K)}: the "
-                "handoff is a whole number of mini-K steps"
-            )
-            assert BK % pk == 0, f"BLOCK_K {BK} % VGPR_PREFETCH_K {pk} != 0"
-            assert pk % _v(self.MINI_BLOCK_K) == 0, (
-                f"VGPR_PREFETCH_K {pk} % MINI_BLOCK_K {_v(self.MINI_BLOCK_K)} != 0"
-            )
+        assert pk == BK, (
+            f"VGPR_PREFETCH_K must equal BLOCK_K (got {pk} vs {BK}): "
+            "the pipeline carries one whole payload K stage"
+        )
 
         # -- commit-group granularity --
         # Reject unknown schemes before building the shared copy/group schedule.

@@ -184,16 +184,17 @@ def test_launch_specs_match_kernel_config_field_order(
 def test_trailing_fields_and_older_config_dict_keep_defaults(config):
     func = FuncSpec(*_func_spec()[:12])
     assert func.epilogue == EpilogueMode.DEFAULT
-    old_config = {name: config[name] for name in TuningSpec._fields[:30]}
+    legacy_len = TuningSpec._fields.index("DS_READ_A_PAYLOAD_IN_MFMA")
+    old_config = {name: config[name] for name in TuningSpec._fields[:legacy_len]}
     tuning = _tuning_spec(old_config)
-    assert tuning == TuningSpec(*tuning[:30])
-    assert tuning[30:] == tuple(
-        TuningSpec._field_defaults[name] for name in TuningSpec._fields[30:]
+    assert tuning == TuningSpec(*tuning[:legacy_len])
+    assert tuning[legacy_len:] == tuple(
+        TuningSpec._field_defaults[name] for name in TuningSpec._fields[legacy_len:]
     )
     fc = KernelFuncConfig(*func[:12])
-    tc = KernelTuningConfig(fc, *tuning[:30])
+    tc = KernelTuningConfig(fc, *tuning[:legacy_len])
     assert _plain(fc.epilogue) == EpilogueMode.DEFAULT
-    for name in TuningSpec._fields[30:]:
+    for name in TuningSpec._fields[legacy_len:]:
         assert _plain(getattr(tc, name)) == getattr(tuning, name)
     assert _plain(_validate(tc, 4096, 7168))
 
@@ -311,7 +312,6 @@ def test_t256_mxfp8_gemm1_uses_validated_streaming_geometry():
         "BLOCK_K": 256,
         "MINI_BLOCK_M": 32,
         "MINI_BLOCK_N": 64,
-        "MINI_BLOCK_K": 256,
         "mfma_instr_shape": (16, 16, 128),
         "warps_per_cta": (2, 2),
         "tiles_per_warp": (1, 2),
@@ -611,7 +611,7 @@ def test_unroll_epilogue_environment_control_is_removed(monkeypatch):
     assert actual["UNROLL_EPILOGUE"] is True
 
 
-@pytest.mark.parametrize("field", ["MANUAL_PP"])
+@pytest.mark.parametrize("field", ["MANUAL_PP", "MINI_BLOCK_K"])
 def test_removed_controls_do_not_change_tuning(config, monkeypatch, field):
     baseline = host.get_gluon_config_uncached(
         128, 4096, 7168, DtypeQuant.MXFP4, DtypeQuant.MXFP4
@@ -713,7 +713,6 @@ def test_small_payload_tiles_use_register_rings(config):
         BLOCK_M=64,
         BLOCK_N=64,
         BLOCK_K=32,
-        MINI_BLOCK_K=32,
         MINI_BLOCK_M=32,
         MINI_BLOCK_N=32,
         VGPR_PREFETCH_K=32,
@@ -838,10 +837,18 @@ def test_register_weights_require_preshuffle(config):
         tc.validate(4096, 7168)
 
 
-def test_independent_register_scales_allow_mini_k_slicing(config):
-    config.update(MINI_BLOCK_K=128, A_SCALE_IN_REG=True, B_SCALE_IN_REG=True)
+def test_independent_register_scales_are_supported(config):
+    config.update(A_SCALE_IN_REG=True, B_SCALE_IN_REG=True)
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     assert _plain(_validate(tc, 4096, 7168))
+
+
+@pytest.mark.parametrize("prefetch", [0, 128])
+def test_partial_register_prefetch_is_rejected(config, prefetch):
+    config["VGPR_PREFETCH_K"] = prefetch
+    tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
+    with pytest.raises(AssertionError, match="VGPR_PREFETCH_K must equal BLOCK_K"):
+        _validate(tc, 4096, 7168)
 
 
 def test_component_buffers_still_require_nonempty_k(config):
@@ -882,7 +889,6 @@ def test_a_scale_buffer_alias_is_accepted(config, monkeypatch):
 def test_shuffled_k128_scales_constrain_lcm_unroll(config, independent):
     config.update(
         BLOCK_K=128,
-        MINI_BLOCK_K=128,
         VGPR_PREFETCH_K=128,
         K_UNROLL=3,
         A_NUM_BUFFER=3 if independent else 0,
@@ -907,7 +913,6 @@ def test_shuffled_k128_scales_constrain_lcm_unroll(config, independent):
 def test_runtime_epilogue_rejects_multistep_scale_cadence(config):
     config.update(
         BLOCK_K=128,
-        MINI_BLOCK_K=128,
         VGPR_PREFETCH_K=128,
         A_SCALE_SORTED_SHUFFLED=True,
         B_SCALE_SHUFFLED=True,

@@ -192,7 +192,7 @@ def _opt_at(t, i: gl.constexpr, PRESENT: gl.constexpr):
 
 @gluon.jit
 def _take_pairs(frags, LO: gl.constexpr, N: gl.constexpr):
-    """Mini-K steps ``[LO, LO+N)`` of a one-operand fragment tuple, as a fresh tuple.
+    """K fragments ``[LO, LO+N)`` of a one-operand tuple, as a fresh tuple.
 
     Built element-wise rather than sliced: a loop-carried tuple arrives as a
     ``tl.tuple``, which indexes but does not slice.
@@ -208,15 +208,15 @@ def _maybe_block_dot(
     a_frags,
     b_frags,
     acc,
-    N_MINI: gl.constexpr,
+    N_FRAGS: gl.constexpr,
     func_cfg,
     tuning_cfg,
     DO_MFMA: gl.constexpr,
     K_PHASE: gl.constexpr = 0,
 ):
-    """Accumulate ``N_MINI`` mini-K steps when this stage emits MFMA."""
+    """Accumulate ``N_FRAGS`` whole-stage K fragments when this stage emits MFMA."""
     if require_constexpr(DO_MFMA):
-        for i in gl.static_range(N_MINI):
+        for i in gl.static_range(N_FRAGS):
             if require_constexpr(func_cfg.has_scale(0)):
                 a_s = a_frags[2 * i + 1]
             else:
@@ -233,7 +233,7 @@ def _maybe_block_dot(
                 acc,
                 func_cfg,
                 tuning_cfg,
-                (K_PHASE + i * tuning_cfg.MINI_BLOCK_K // 128) % 2,
+                (K_PHASE + i * tuning_cfg.BLOCK_K // 128) % 2,
             )
     return acc
 
@@ -353,7 +353,7 @@ class _PipelinePointers:
 class _PipelineRegFragments:
     """Prefetched A/B payloads and scales, plus one accumulator per (ni, mi) slot.
 
-    Operand tuples are ordered by non-K mini block, then mini-K step. An unscaled
+    Operand tuples are ordered by non-K mini block, then whole-stage K fragment. An unscaled
     operand aliases its payload in the scale tuple; _maybe_block_dot ignores that slot.
     """
 
@@ -469,7 +469,7 @@ def _drain_last_fused(
     tc: gl.constexpr = pc.tuning_cfg
     NM: gl.constexpr = tc.num_m_slots_per_block()
     NN: gl.constexpr = tc.num_n_slots_per_block()
-    PF_MINI: gl.constexpr = tc.num_prefetch_k_slots()
+    PF_FRAGS: gl.constexpr = tc.num_prefetch_k_slots()
     act: gl.constexpr = func_cfg.act()
     gl.static_assert(func_cfg.gu_split() and NN == 2)
 
@@ -477,10 +477,10 @@ def _drain_last_fused(
     for ni in gl.static_range(NN):
         for mi in gl.static_range(NM):
             slot_acc = _maybe_block_dot(
-                _take_reg_pairs(regs.a_payload, regs.a_scale, mi * PF_MINI, PF_MINI),
-                _take_reg_pairs(regs.b_payload, regs.b_scale, ni * PF_MINI, PF_MINI),
+                _take_reg_pairs(regs.a_payload, regs.a_scale, mi * PF_FRAGS, PF_FRAGS),
+                _take_reg_pairs(regs.b_payload, regs.b_scale, ni * PF_FRAGS, PF_FRAGS),
                 regs.acc[_slot_index(mi, ni, NM, NN)],
-                PF_MINI,
+                PF_FRAGS,
                 func_cfg,
                 tc,
                 True,

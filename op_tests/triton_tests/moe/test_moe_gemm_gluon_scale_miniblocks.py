@@ -58,6 +58,13 @@ def test_scale_mini_blocks_only_change_the_shuffled_operand(shuffled):
     assert tc.validate(4096, 7168)
 
 
+@pytest.mark.parametrize("block_k", [128, 256, 512])
+def test_shuffled_scale_k_defaults_to_at_least_k256(block_k):
+    tc = _config(BLOCK_K=block_k, VGPR_PREFETCH_K=block_k)
+    expected = max(256, block_k)
+    assert tc.scale_mini_block_k(0) == tc.scale_mini_block_k(1) == expected
+
+
 def test_invalid_unused_scale_minis_are_ignored():
     tc = _config(
         A_SCALE_SORTED_SHUFFLED=False,
@@ -87,10 +94,19 @@ def test_invalid_shuffled_scale_minis_are_rejected(field, value):
         _config(**{field: value}).validate(4096, 7168)
 
 
+def test_shuffled_scale_k_cannot_be_narrower_than_payload_k():
+    tc = _config(
+        BLOCK_K=512,
+        SCALE_MINI_BLOCK_K=256,
+        VGPR_PREFETCH_K=512,
+    )
+    with pytest.raises(AssertionError):
+        tc.validate(4096, 7168)
+
+
 def test_frozen_shuffled_scales_reject_k_wider_than_256():
     tc = _config(
         BLOCK_K=512,
-        MINI_BLOCK_K=128,
         SCALE_MINI_BLOCK_K=512,
         VGPR_PREFETCH_K=512,
         FROZEN_STEP=True,
@@ -102,16 +118,22 @@ def test_frozen_shuffled_scales_reject_k_wider_than_256():
 
 
 @pytest.mark.parametrize(
-    "block_k,mini_k,scale_k",
-    [(128, 128, 256), (128, 128, 512), (256, 128, 512), (512, 128, 256)],
+    "block_k,scale_k",
+    [
+        (128, 256),
+        (128, 512),
+        (256, 256),
+        (256, 512),
+        (512, 512),
+        (512, 1024),
+    ],
 )
 @pytest.mark.parametrize("register_scales", [False, True])
-def test_scale_load_cadence_sets_buffer_span_and_unroll(
-    block_k, mini_k, scale_k, register_scales
+def test_scale_k_step_ratio_sets_buffer_span_and_unroll(
+    block_k, scale_k, register_scales
 ):
     tc = _config(
         BLOCK_K=block_k,
-        MINI_BLOCK_K=mini_k,
         SCALE_MINI_BLOCK_K=scale_k,
         VGPR_PREFETCH_K=block_k,
         K_UNROLL=3,
@@ -120,10 +142,10 @@ def test_scale_load_cadence_sets_buffer_span_and_unroll(
         A_SCALE_IN_REG=register_scales,
         B_SCALE_IN_REG=register_scales,
     )
-    ratio = math.ceil(scale_k / block_k)
+    ratio = scale_k // block_k
     for operand, depth in enumerate((2, 3)):
         assert tc.buffer_live_span(operand, True) == (depth - 1) * ratio + 1
-        assert tc.scale_load_k_tiles(operand) == max(1, block_k // scale_k)
-        assert tc.scale_read_k_slots(operand) == max(block_k, scale_k) // mini_k
+        assert tc.scale_ratio_k_step(operand) == ratio
+        assert tc.scale_read_k_slots(operand) == ratio
     period = math.lcm(3, 2 * ratio, 3 * ratio)
     assert pipeline_unroll(tc) == period

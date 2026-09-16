@@ -48,7 +48,6 @@ def _epilogue_config(split, num_warps):
         BLOCK_N=256,
         BLOCK_K=256,
         K_UNROLL=1,
-        MINI_BLOCK_K=256,
         MINI_BLOCK_M=64,
         MINI_BLOCK_N=128,
         NUM_LDS_BUFFER=2,
@@ -68,7 +67,7 @@ def _epilogue_config(split, num_warps):
         result_cache_modifier="",
         result_scale_cache_modifier="",
         WARP_PIPELINE=0,
-        VGPR_PREFETCH_K=0,
+        VGPR_PREFETCH_K=256,
         ACT_FAST_RCP=True,
     )
     return gl.constexpr(func), gl.constexpr(tuning)

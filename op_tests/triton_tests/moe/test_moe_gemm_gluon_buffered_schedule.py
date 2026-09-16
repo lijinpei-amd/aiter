@@ -74,8 +74,7 @@ class _Config(_ScheduleConfig):
         self.FROZEN_STEP = False
         self.SCHED_MODE = 0
         self.MINI_BLOCK_M = self.MINI_BLOCK_N = 1
-        self.MINI_BLOCK_K = 128 if packed else 256
-        self.BLOCK_K = self.MINI_BLOCK_K * self.num_k_slots_per_tile()
+        self.BLOCK_K = 128 if packed else 256
         self.mma_acc_dtype = None
         self.output_quant = None
 
@@ -116,7 +115,7 @@ class _Config(_ScheduleConfig):
         return self._peeled
 
     def num_k_slots_per_tile(self):
-        return 1 if self.packed else 2
+        return 1
 
     num_prefetch_k_slots = num_k_slots_per_tile
 

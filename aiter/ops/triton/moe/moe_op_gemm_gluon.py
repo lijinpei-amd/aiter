@@ -499,8 +499,8 @@ def get_gluon_config_uncached(
             else:
                 out_warps, out_tiles = (4, 1), (2, 1)
             out_bk = 256
-            # Whole-block payload mini tiles by default. Explicit splits let the
-            # pipeline overlap mini tiles; shuffled scales have independent extents.
+            # Each payload stage carries one whole BLOCK_K fragment. M/N can still be
+            # split into pipeline slots, while shuffled scales have independent extents.
             out_mini_m = _env_int("AITER_TRITON_MOE_GLUON_MINI_BLOCK_M", block_m)
             out_mini_n = _env_int("AITER_TRITON_MOE_GLUON_MINI_BLOCK_N", bn)
             gm = out_instr[0] * out_warps[0]
@@ -538,11 +538,11 @@ def get_gluon_config_uncached(
             # The effective factor is the LCM of this request, every active
             # payload/scale buffer period and the shuffled-scale K cadence.
             "K_UNROLL": _env_int("AITER_TRITON_MOE_GLUON_K_UNROLL", n_buf),
-            "MINI_BLOCK_K": out_bk,
             "MINI_BLOCK_M": out_mini_m,
             "MINI_BLOCK_N": out_mini_n,
-            # Zero inherits the corresponding payload mini extent; shuffled
-            # scales require at least K256, stored as eight E8M0 scale bytes.
+            # Zero inherits the corresponding payload M/N extent. Shuffled scale K
+            # defaults to max(256, BLOCK_K); an override must be at least that wide
+            # and an integer multiple of BLOCK_K.
             **{
                 key: _env_int("AITER_TRITON_MOE_GLUON_" + key, 0)
                 for key in _SCALE_MINI_BLOCK_KEYS
@@ -648,30 +648,18 @@ def get_gluon_config_uncached(
                 _env_int("AITER_TRITON_MOE_GLUON_SCALE_FILL_MID", 0)
             ),
             "UNROLL_EPILOGUE": True,
-            # Read stage N's fragments one stage before their MFMA consumes them. Costs
-            # one BLOCK_K tile of live registers and one stage of global prefetch depth
-            # (the fill is waited on at stage s+NB-1 rather than s+NB), so it wants
-            # NUM_LDS_BUFFER >= 3 to break even on the global side. 0 is off; a nonzero
-            # m turns it on and sets the wait to wait_group(NB - m), so 1 is the minimal
-            # wait and higher m over-waits. Over-waiting only loses: at NB=3 with relaxed
-            # loads, T=4096 stage 1 measured 1005.6 us at m=2 (vmcnt(8), one stage
-            # outstanding) against 1090.9 us at m=3, where the wait folds to vmcnt(0) and
-            # drains every global load three times per loop body.
-            # How much of a BLOCK_K stage is read into registers one step before
-            # its MFMAs consume it. BLOCK_K (the default) carries the whole stage
-            # so a ds_read and its MFMA sit a stage apart and never meet lgkmcnt;
-            # 0 reads and consumes in the same step. Intermediate values only
-            # become reachable once MINI_BLOCK_K < BLOCK_K.
+            # Read the complete BLOCK_K payload stage into registers one pipeline step
+            # before its MFMAs consume it. The live and frozen drivers require this
+            # whole-stage handoff; there is no disabled or partial K-prefetch mode.
             "VGPR_PREFETCH_K": _env_int("AITER_TRITON_MOE_GLUON_VGPR_PREFETCH_K", bk),
         }
 
     # Which axis to give up first when the tile does not fit.
     #
-    # With microscaled operands, keep BLOCK_K >= 256: below that the E8M0 scale tiles
-    # drop under the width a coalesced direct-to-LDS write needs, which puts a
-    # register-path global load back inside the K loop and makes every wait_group
-    # conservative (measured 0.6x of the Triton kernel on MXFP8 prefill). So narrow N
-    # first and accept the loss of arithmetic intensity.
+    # With microscaled operands, keep the payload K tile wide when possible. The
+    # shuffled scale tile independently defaults to max(256, BLOCK_K), so a narrower
+    # payload stage retains and reuses a coalesced wider scale load. Narrow N first and
+    # accept the loss of arithmetic intensity before shortening that payload stream.
     #
     # With no scales at all (bf16 x bf16) that argument does not exist, and narrowing N
     # is pure loss -- it was picking BLOCK_N=64 where BLOCK_N=128 with a shorter K fits
@@ -744,7 +732,6 @@ def _default_launch_config(
             BLOCK_K=256,
             MINI_BLOCK_M=32,
             MINI_BLOCK_N=64,
-            MINI_BLOCK_K=256,
             mfma_instr_shape=(16, 16, 128),
             warps_per_cta=(2, 2),
             tiles_per_warp=(1, 2),
@@ -778,7 +765,6 @@ def _default_launch_config(
             BLOCK_K=128,
             MINI_BLOCK_M=64,
             MINI_BLOCK_N=128,
-            MINI_BLOCK_K=128,
             mfma_instr_shape=(16, 16, 128),
             warps_per_cta=(1, 4),
             tiles_per_warp=(2, 2),
@@ -1114,17 +1100,25 @@ def _sorted_token_id_map(expt_data, gather_indx, n_expts_act, block_m, n_blocks,
 def _scale_shuffle_supported(cfg, operand):
     """Whether this operand can consume the packed K256 scale byte order."""
     block_k = int(cfg["BLOCK_K"])
-    mini_k = int(cfg["MINI_BLOCK_K"])
+    configured_scale_k = cfg.get("SCALE_MINI_BLOCK_K", 0)
+    if "scale_mini_block_k" in cfg:
+        configured_scale_k = cfg["scale_mini_block_k"]
+    if not configured_scale_k:
+        configured_scale_k = _env_int(
+            "AITER_TRITON_MOE_GLUON_SCALE_MINI_BLOCK_K", 0
+        )
+    scale_k = int(configured_scale_k) or max(256, block_k)
     if (
         tuple(cfg["mfma_instr_shape"]) != (16, 16, 128)
         or block_k < 128
         or block_k % 128 != 0
-        or mini_k < 128
-        or mini_k % 128 != 0
+        or scale_k < max(256, block_k)
+        or scale_k % block_k != 0
+        or (scale_k & (scale_k - 1)) != 0
     ):
         return False
     if cfg.get("FROZEN_STEP", False):
-        return block_k == 256
+        return block_k == scale_k == 256
     if block_k == 128:
         # Preserve the K128 stage's dword-load eligibility: both non-K bytes
         # belong to this wave while the component pipeline retains the next half.
@@ -1148,8 +1142,8 @@ def _sorted_shuffle_a_scales(x_scales, routing_data, gather_indx, K, cfg):
         return None
     block_m = int(cfg["BLOCK_M"])
     # Mirrors KernelTuningConfig.sorted_shuffled_ok(): the permutation is carried by the
-    # LDS tile's layout. K128 payload stages consume alternate halves of the same
-    # K256 scale dwords, so their host-side permutation and allocation are identical.
+    # LDS tile's layout. A shuffled scale load covers an integer number of BLOCK_K
+    # payload steps; K128 therefore retains each packed K256 group for two steps.
     if (
         not _scale_shuffle_supported(cfg, 0)
         or x_scales.ndim != 2
@@ -1445,9 +1439,11 @@ def moe_gemm_gluon(
     the routing offsets and block map are built for that geometry.
     ``scale_mini_block_m``, ``scale_mini_block_n`` and ``scale_mini_block_k``
     (also accepted in uppercase) set shuffled-scale load extents independently
-    of the payload mini tiles. K counts logical payload elements; its scale
-    storage extent is K / 32. Zero inherits the payload extent, with shuffled
-    scale K at least 256. Unshuffled scales ignore these settings.
+    of the payload slots. K counts logical payload elements; its scale storage
+    extent is K / 32. Zero inherits the payload M/N extent, while shuffled scale
+    K defaults to ``max(256, BLOCK_K)``. An explicit scale K must be a power-of-two
+    multiple of ``BLOCK_K``, at least that wide, and divide total K. Unshuffled
+    scales ignore these settings.
 
     ``y_scales`` non-None selects the fused MXFP4 output quant: ``y`` then holds the
     E2M1 payload (``N // ARN // 2`` uint8 columns) and ``y_scales`` the E8M0 exponents,
@@ -1538,8 +1534,8 @@ def moe_gemm_gluon(
         if shuffled is not None:
             a_scales, a_swizzle = shuffled, ScaleSwizzle.SORTED_SHUFFLED
             # The gather and the row stride are baked into the buffer; all the kernel
-            # still needs is the packed K stride: eight scales span 256 bytes.
-            # A K128 kernel reuses that scale tile over two payload stages.
+            # still needs is the packed K stride: eight scales span 256 bytes. A scale
+            # load wider than BLOCK_K is retained for its scale-K/BLOCK_K payload steps.
             a_scale_stride_m, a_scale_stride_k = 0, 32
     a_shuffled = a_swizzle == ScaleSwizzle.SORTED_SHUFFLED
     b_scales, b_swizzle = w_scales, ScaleSwizzle.NONE
