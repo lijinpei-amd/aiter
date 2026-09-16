@@ -4,9 +4,9 @@
 """Re-run the tuned gfx950 Gluon MoE GEMM1 configuration: perf and correctness.
 
 The host launcher translates this script's environment variables into kernel tuning
-configuration. ``BEST`` records the tuned recipe, including ``WAIT_COMMIT_SCHEME``
-and ``TRITON_MEMBAR_DEDUP_BARE``, so measurements can be reproduced. The frozen
-reference owns its fixed rendezvous schedule.
+configuration. ``BEST`` records the tuned recipe, including ``WAIT_COMMIT_SCHEME``,
+so measurements can be reproduced. The frozen reference owns its fixed rendezvous
+schedule.
 
 Perf is measured the way the reported numbers were: ``rocprofv3 --kernel-trace`` over a
 saturating back-to-back launch loop, median of the dispatch durations with the warmup
@@ -19,9 +19,8 @@ itself under the profiler rather than calling ``torch.cuda.Event``.
     python scripts/gluon_moe_gemm1_best.py --warps 8 --perf
     python scripts/gluon_moe_gemm1_best.py --correctness --gpu 4
 
-Requires the local ``TRITON_MEMBAR_DEDUP_BARE`` patch to Triton's Membar.cpp; without it
-that flag is ignored and the kernel keeps a duplicate barrier per pipeline slot. The
-script checks for it and warns rather than silently reporting a slower number.
+``TRITON_MEMBAR_DEDUP_BARE`` is intentionally left unset. Fresh-cache assembly checks
+show that enabling it does not change the tuned kernels.
 """
 
 import argparse
@@ -69,7 +68,6 @@ BEST = {
     # read slot. The cold-bench impl arm overrides this with PER_STAGE_WHOLE (3); the
     # frozen arm keeps its private snapshot's commit/wait schedule.
     "AITER_TRITON_MOE_GLUON_WAIT_COMMIT_SCHEME": "1",
-    "TRITON_MEMBAR_DEDUP_BARE": "1",
 }
 
 #: 8 waves is warps (2, 4); 4 waves is warps (1, 4). Same tile shape either way.
@@ -156,17 +154,6 @@ def check_ds_agpr_llc():
     except (OSError, subprocess.SubprocessError):
         return "unusable"
     return "ok" if "amdgpu-ds-read-agpr" in out else "unpatched"
-
-
-def check_membar_patch():
-    """The DEDUP_BARE flag lives in a Triton source patch, not in this repo."""
-    src = os.environ.get("TRITON_SRC_DIR")
-    candidates = [Path(src) if src else None, Path.home() / "development/triton"]
-    for root in candidates:
-        membar = root / "lib/Analysis/Membar.cpp" if root else None
-        if membar and membar.exists():
-            return "TRITON_MEMBAR_DEDUP_BARE" in membar.read_text()
-    return None  # could not tell
 
 
 # --------------------------------------------------------------------------- workload
@@ -461,20 +448,6 @@ def main(argv=None):
     do_perf = args.perf or not args.correctness
     do_corr = args.correctness or not args.perf
     geometries = [8, 4] if args.warps == "both" else [int(args.warps)]
-
-    patched = check_membar_patch()
-    if patched is False:
-        print(
-            "WARNING: Triton lacks the TRITON_MEMBAR_DEDUP_BARE patch; that flag is "
-            "ignored and perf will be slower than the recorded number.",
-            file=sys.stderr,
-        )
-    elif patched is None:
-        print(
-            "NOTE: could not locate the Triton source to verify the "
-            "TRITON_MEMBAR_DEDUP_BARE patch (set TRITON_SRC_DIR).",
-            file=sys.stderr,
-        )
 
     if any("TRITON_HIP_EXTERNAL_LLC" in v for g in geometries for v in PER_WARPS[g]):
         state = check_ds_agpr_llc()

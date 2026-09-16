@@ -21,8 +21,8 @@ repeatedly on this kernel, which is why --ab interleaves rather than running one
 after the other.
 
 Requires the patched llc (out-of-tree ``-amdgpu-ds-read-agpr`` /
-``-amdgpu-mfma-tied-cd`` / ``-misched-pin-critical-res``) and the Triton
-``TRITON_MEMBAR_DEDUP_BARE`` patch; both are checked and reported, not assumed.
+``-amdgpu-mfma-tied-cd`` / ``-misched-pin-critical-res``); it is checked and
+reported, not assumed. ``TRITON_MEMBAR_DEDUP_BARE`` remains unset.
 """
 
 import argparse
@@ -87,12 +87,6 @@ def provenance(llc):
                   file=sys.stderr)
     else:
         print("             MISSING -- build llvm-project first", file=sys.stderr)
-    for name, path, needle in (
-        ("triton membar", Path.home() / "development/triton/lib/Analysis/Membar.cpp",
-         "TRITON_MEMBAR_DEDUP_BARE"),
-    ):
-        ok = path.exists() and needle in path.read_text()
-        print(f"{name:12s} {'patched' if ok else 'NOT PATCHED (perf will be worse)'}")
     print(f"llc flags    {LLC_FLAGS}")
     print("overrides    " + " ".join(f"{k.split('GLUON_')[-1]}={v}"
                                      for k, v in OVERRIDES.items()))
