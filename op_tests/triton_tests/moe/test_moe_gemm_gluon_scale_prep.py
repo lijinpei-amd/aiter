@@ -266,7 +266,9 @@ def test_short_strips_are_rejected_before_launch(k, monkeypatch):
     monkeypatch.setattr(host, "_sorted_shuffle_a_scales", lambda *_: None)
     monkeypatch.setattr(host, "_shuffled_b_scales", lambda *_: None)
     monkeypatch.setattr(host, "_fast_launch", unexpected_launch)
-    with pytest.raises(AssertionError, match="NUM_K.*NB_MAX.*PEELED.*UNROLL"):
+    with pytest.raises(
+        AssertionError, match="NUM_K.*PIPELINE_DEPTH.*PEELED.*UNROLL"
+    ):
         host.moe_gemm_gluon(
             case.y, case.x, case.w, case.xs, case.ws, None, None,
             case.routing_data, case.gather, None, case.n, case.k,

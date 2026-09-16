@@ -44,8 +44,8 @@ def _validate_pipeline(tc, K):
     peeled = _pipeline_peeled(tc)
     unroll = pipeline_unroll(tc)
     assert num_k >= depth + peeled + unroll, (
-        f"NUM_K ({num_k}) must be at least NB_MAX ({depth}) + PEELED ({peeled}) "
-        f"+ UNROLL ({unroll}) = {depth + peeled + unroll}"
+        f"NUM_K ({num_k}) must be at least PIPELINE_DEPTH ({depth}) "
+        f"+ PEELED ({peeled}) + UNROLL ({unroll}) = {depth + peeled + unroll}"
     )
     return True
 
@@ -792,7 +792,8 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
     remaining = main - peeled
     unroll_end = remaining // unroll * unroll
     buffers = _init_buffers(pc)
-    # r = p - (NB_MAX - 1): active streams fill p - NB_DELTA.
+    # The relative prologue stage starts at 1 - PIPELINE_DEPTH; each component
+    # begins filling when that stage reaches 1 - its own fill span.
     for r in gl.static_range(1 - depth, 0):
         for ni in gl.static_range(tc.num_n_slots_per_block()):
             for mi in gl.static_range(tc.num_m_slots_per_block()):
