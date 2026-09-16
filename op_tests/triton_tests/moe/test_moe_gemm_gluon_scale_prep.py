@@ -51,8 +51,7 @@ def _spec(**overrides):
 
 
 def _config(block_k=128):
-    config = dict(_spec()[4], BLOCK_K=block_k, MINI_BLOCK_K=block_k,
-                  VGPR_PREFETCH_K=block_k)
+    config = dict(_spec()[4], BLOCK_K=block_k, VGPR_PREFETCH_K=block_k)
     if block_k == 256:
         config.update(BLOCK_N=128, MINI_BLOCK_N=64, NUM_LDS_BUFFER=2,
                       warps_per_cta=(2, 2))
@@ -65,8 +64,8 @@ def test_mxfp8_gemm1_default_uses_paired_k128_scales(split):
     cfg = spec[4]
     assert tuple(cfg[name] for name in (
         "BLOCK_M", "BLOCK_N", "BLOCK_K", "MINI_BLOCK_M", "MINI_BLOCK_N",
-        "MINI_BLOCK_K", "NUM_LDS_BUFFER", "K_UNROLL", "VGPR_PREFETCH_K",
-    )) == (128, 256, 128, 64, 128, 128, 3, 6, 128)
+        "NUM_LDS_BUFFER", "K_UNROLL", "VGPR_PREFETCH_K",
+    )) == (128, 256, 128, 64, 128, 3, 6, 128)
     assert cfg["mfma_instr_shape"] == (16, 16, 128)
     assert cfg["warps_per_cta"] == (1, 4)
     assert cfg["tiles_per_warp"] == (2, 2)
@@ -134,13 +133,29 @@ def test_explicit_and_frozen_configs_keep_their_geometry(monkeypatch):
 
 
 @pytest.mark.parametrize("field,value", [
-    ("MINI_BLOCK_K", 64), ("FROZEN_STEP", True),
+    ("BLOCK_K", 64), ("FROZEN_STEP", True),
     ("mfma_instr_shape", (32, 32, 64)),
 ])
 def test_incompatible_k128_geometry_refuses_scale_preparation(field, value):
     cfg = dict(_config(), **{field: value})
     assert not host._scale_shuffle_supported(cfg, 0)
     assert not host._scale_shuffle_supported(cfg, 1)
+
+
+@pytest.mark.parametrize(
+    "block_k,scale_k,expected",
+    [
+        (256, 512, True),
+        (512, 0, True),
+        (512, 256, False),
+        (256, 384, False),
+    ],
+)
+def test_scale_shuffle_requires_valid_scale_k(block_k, scale_k, expected):
+    cfg = _config(block_k)
+    cfg["SCALE_MINI_BLOCK_K"] = scale_k
+    assert host._scale_shuffle_supported(cfg, 0) is expected
+    assert host._scale_shuffle_supported(cfg, 1) is expected
 
 
 @pytest.mark.parametrize("operand", [0, 1])

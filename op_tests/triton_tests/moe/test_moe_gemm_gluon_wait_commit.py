@@ -87,9 +87,6 @@ class _ScheduleConfig:
             idx
         )
 
-    def scale_load_k_tiles(self, idx):
-        return 1
-
     def scale_mini_block_k(self, idx):
         return 256
 
@@ -103,7 +100,7 @@ class _ScheduleConfig:
         return 3
 
     def scale_read_k_slots(self, idx):
-        return self.num_k_slots_per_tile()
+        return self.scale_ratio_k_step(idx)
 
     def scale_cache_fragments(self, idx):
         return self.num_lds_slots_per_block_non_k(idx) * self.scale_read_k_slots(idx)

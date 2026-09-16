@@ -8,7 +8,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from triton.compiler.errors import CompilationError, CompileTimeAssertionFailure
 
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     EpilogueMode,
@@ -31,7 +30,6 @@ def _config(mask=0, pipeline=WarpPipeline.NONE):
         BLOCK_N=256,
         BLOCK_K=256,
         K_UNROLL=3,
-        MINI_BLOCK_K=256,
         MINI_BLOCK_M=64,
         MINI_BLOCK_N=128,
         NUM_LDS_BUFFER=3,
@@ -294,34 +292,10 @@ def test_direct_scale_loads_do_not_add_async_groups(case, scheme, pipeline):
     config = _config(mask=9, pipeline=pipeline)
     # Four E8M0 entries per row force both scales onto the direct register path.
     config.update(
-        BLOCK_K=128, MINI_BLOCK_K=128, VGPR_PREFETCH_K=128,
+        BLOCK_K=128, VGPR_PREFETCH_K=128,
         WAIT_COMMIT_SCHEME=int(scheme),
     )
     _assert_repeated_output(case, config, f"direct A/B scales, {scheme.name}, {pipeline.name}")
-
-
-@pytest.mark.parametrize("scheme", list(WaitCommitScheme), ids=lambda scheme: scheme.name)
-@pytest.mark.parametrize(
-    "pipeline", [WarpPipeline.NONE, WarpPipeline.COMPILER], ids=["none", "compiler"]
-)
-def test_multiple_mini_k_reads_share_one_stage_wait_plan(case, scheme, pipeline):
-    config = _config(mask=9, pipeline=pipeline)
-    config.update(MINI_BLOCK_K=128, WAIT_COMMIT_SCHEME=int(scheme))
-    _assert_repeated_output(case, config, f"two mini-K fragments, {scheme.name}, {pipeline.name}")
-
-
-def test_partial_register_prefetch_is_rejected(case):
-    config = _config()
-    config.update(MINI_BLOCK_K=128, VGPR_PREFETCH_K=128)
-    output = torch.empty_like(case.baseline)
-    with pytest.raises(CompilationError) as error:
-        _launch(case, output, config=config)
-    # Triton wraps an assertion from a nested JIT function in CompilationError.
-    cause = error.value
-    while cause is not None and not isinstance(cause, CompileTimeAssertionFailure):
-        cause = cause.__cause__ or cause.__context__
-    assert isinstance(cause, CompileTimeAssertionFailure), str(error.value)
-    assert "pipeline requires VGPR_PREFETCH_K == BLOCK_K" in str(cause)
 
 
 @pytest.mark.parametrize("split", [False, True], ids=["interleaved", "split"])

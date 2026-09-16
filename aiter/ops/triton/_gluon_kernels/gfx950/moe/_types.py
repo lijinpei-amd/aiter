@@ -114,7 +114,6 @@ class TuningSpec(NamedTuple):
     #: Requested unroll factor. The effective factor is its LCM with every active
     #: LDS/register ring period and shuffled-scale K cadence.
     K_UNROLL: int
-    MINI_BLOCK_K: int
     MINI_BLOCK_M: int
     MINI_BLOCK_N: int
     NUM_LDS_BUFFER: int
@@ -176,8 +175,10 @@ class TuningSpec(NamedTuple):
     B_NUM_BUFFER: int = 0
     A_SCALE_NUM_BUFFER: int = 0
     B_SCALE_NUM_BUFFER: int = 0
-    #: Independent shuffled-scale load extents. Zero follows the payload mini
+    #: Independent shuffled-scale load extents. Zero follows the payload slot
     #: extent, with K at least 256 logical elements (eight stored scale bytes).
+    #: A configured K extent must be a power-of-two multiple of BLOCK_K that divides
+    #: total K, so one physical scale load covers complete payload K steps.
     #: These fields are ignored for operands whose scales are not shuffled.
     SCALE_MINI_BLOCK_M: int = 0
     SCALE_MINI_BLOCK_N: int = 0

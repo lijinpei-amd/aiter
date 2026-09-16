@@ -194,7 +194,9 @@ non-obvious one:
   extent.
 - **Scales**: `(E, N, K/32)` uint8, strides carried explicitly. If `scale_swizzle == CDNA4_SCALE`
   the physical layout is the preshuffled one from `aiter/ops/triton/utils/shuffle.py:196-198`, which
-  is not contiguous in the naive sense and **forces `BLOCK_K >= 256`**.
+  is not contiguous in the naive sense. Its effective scale K extent is at least
+  `max(256, BLOCK_K)` and must be divisible by `BLOCK_K`; a wider scale tile is retained across the
+  corresponding number of payload K steps.
 - **Per-expert re-basing is mandatory.** Buffer ops carry a 32-bit offset (2 GB window); V4-Pro's
   stacked gemm1 weight is ~8.5 GB. Re-base `ptr` per expert on the host (any single expert is 22 MB
   and fits), or select the 64-bit `gl.load` fallback via a `USE_BUFFER_LOAD: gl.constexpr` as in
@@ -286,11 +288,12 @@ class KernelTuningConfig:
     BLOCK_K: gl.constexpr
     # unroll factor of the OUTER (inter-BLOCK_K) k-loop; see "The K loop"
     K_UNROLL: gl.constexpr
-    # Within BLOCK_K, run an unrolled loop, each iter of which issues MINI_BLOCK_K amount of
-    # lds-load + mma
-    MINI_BLOCK_K: gl.constexpr
-    # Prefetch amount of the MINI_BLOCK_K loop
-    MINI_PREFETCH_K: gl.constexpr
+    # Each pipeline step carries one whole BLOCK_K payload K fragment, and register
+    # prefetch retains that complete fragment for the following step.
+    VGPR_PREFETCH_K: gl.constexpr
+    # Shuffled-scale K load extent in logical payload elements. Zero means
+    # max(256, BLOCK_K); an explicit value is at least that wide and divisible by BLOCK_K.
+    SCALE_MINI_BLOCK_K: gl.constexpr
     # tiling of BLOCK_M / BLOCK_N for the final streaming write of results
     MINI_BLOCK_M: gl.constexpr
     MINI_BLOCK_N: gl.constexpr
@@ -382,8 +385,9 @@ class in the repo to copy. Constraints:
 
 #### The K loop
 
-`K_UNROLL` unrolls the **outer, inter-`BLOCK_K`** loop; `MINI_BLOCK_K` is the inner static unroll
-*within* one `BLOCK_K`. They are orthogonal. The loop is a four-part decomposition:
+`K_UNROLL` unrolls the **outer, inter-`BLOCK_K`** loop. Each pipeline step carries one whole
+`BLOCK_K` payload K fragment; there is no separately tunable inner payload-K tile. The loop is a
+four-part decomposition:
 
 ```python
 prologue                                # pipeline fill: NUM_LDS_BUFFER-1 stages, no mma
@@ -393,6 +397,12 @@ for k in range(..., ..., 1):            # remainder (0 .. K_UNROLL-1 iterations)
     ...
 epilogue                                # NUM_LDS_BUFFER-1 mma-only iterations, no fill
 ```
+
+Shuffled scales retain an independent, possibly wider K extent. Let
+`SCALE_K = SCALE_MINI_BLOCK_K or max(256, BLOCK_K)`. Validation requires
+`SCALE_K >= max(256, BLOCK_K)`, a power-of-two `SCALE_K`, `SCALE_K % BLOCK_K == 0`, and
+`K % SCALE_K == 0`; one scale load is retained for `SCALE_K / BLOCK_K` payload steps, and
+the current step selects its corresponding K phase.
 
 - **No divisibility requirement** between `cdiv(K, BLOCK_K)` and `K_UNROLL` — the step-1 loop
   absorbs the remainder, so `K_UNROLL` is a free knob.
@@ -407,10 +417,12 @@ epilogue                                # NUM_LDS_BUFFER-1 mma-only iterations, 
 - The step-1 remainder loop and the drain epilogue run at an arbitrary buffer phase and therefore
   use a dynamic `.index()`. That is fine; they are off the critical path, and the alternative
   (`gl.static_range(K_UNROLL)` with an exit predicate) is pure code bloat.
-- `MINI_PREFETCH_K > 0` needs the *next* stage's buffer index statically, so it implies
-  `K_UNROLL >= 2`.
-- Cost to bound: the fully unrolled body is `K_UNROLL × (BLOCK_K / MINI_BLOCK_K)` mma groups. That
-  is the I-cache and live-range pressure knob — budget it against the VGPR target below.
+- `VGPR_PREFETCH_K == BLOCK_K` retains the next stage's single whole-K fragment in registers;
+  there is no partial K-fragment prefetch setting.
+- Cost to bound: the fully unrolled body contains `K_UNROLL` whole-`BLOCK_K` payload groups. The
+  backend's `BLOCK_K / mfma_k` instruction expansion is fixed by the selected block and MFMA shape,
+  not by another tuning knob. Budget the resulting I-cache and live ranges against the VGPR target
+  below.
 - The M-axis mask is a separate matter: the ragged last block of each expert needs operand-A masking
   in **every** body, unrolled or not.
 
@@ -420,9 +432,11 @@ body, no `EVEN_K` constexpr, and no K-mask computed anywhere — the same treatm
 gets (see "Edge cases"). The wrapper must fall back to the Triton kernel rather than mis-compute if
 a caller ever presents a non-divisible K.
 
-The assert is satisfiable for every in-scope shape: stage-1 `K = H ∈ {4096, 6144, 7168}` and stage-2
-`K = I ∈ {2048, 3072}` are all multiples of 1024, so any `BLOCK_K ∈ {128, 256, 512}` divides them —
-and `CDNA4_SCALE` already forces `BLOCK_K >= 256`.
+The assert is satisfiable for every in-scope shape: stage-1 `K = H ∈ {4096, 6144, 7168}` and
+stage-2 `K = I ∈ {2048, 3072}` are all multiples of 1024, so any
+`BLOCK_K ∈ {128, 256, 512}` divides them.
+`CDNA4_SCALE` may retain a K256-or-wider scale load across multiple payload steps, so it does not
+require the payload `BLOCK_K` itself to be at least 256.
 
 This removes the fill/consume masking hazard rather than solving it, but the **drain still has to
 exist**. Under an `NUM_LDS_BUFFER`-deep pipeline the fill for a K-tile is issued `NUM_LDS_BUFFER-1`
@@ -432,11 +446,11 @@ mma-only epilogue that issues **no fill at all** — that, not masking, is what 
 because the over-read lands in the next expert's weights and is multiplied by an accumulator that is
 never stored. Assert the fill count equals `cdiv(K, BLOCK_K)` in the constexpr layer.
 
-Divisibility lattice for the rest: `BLOCK_K % MINI_BLOCK_K == 0`; `MINI_BLOCK_K % mfma_k == 0`
-(`mfma_k` = 64 or 128 for the CDNA4 scaled f8f6f4 pipes, 16/32 for bf16);
-`MINI_PREFETCH_K < BLOCK_K / MINI_BLOCK_K`;
-`MINI_PRESTORE_MN <= NUM_MINI_BLOCK_M * NUM_MINI_BLOCK_N`; and `BLOCK_K >= 256` whenever
-`scale_swizzle == CDNA4_SCALE`.
+Divisibility lattice for the rest: `BLOCK_K % mfma_k == 0` (`mfma_k` = 64 or 128 for the CDNA4
+scaled f8f6f4 pipes, 16/32 for bf16); `VGPR_PREFETCH_K == BLOCK_K` because the pipeline carries
+one whole payload stage; `MINI_PRESTORE_MN <= NUM_MINI_BLOCK_M * NUM_MINI_BLOCK_N`; and, whenever
+`scale_swizzle == CDNA4_SCALE`, the effective `SCALE_K` is a power of two, is at least
+`max(256, BLOCK_K)`, divides total `K`, and is divisible by `BLOCK_K`.
 
 #### Resource budgets
 
@@ -452,14 +466,14 @@ NUM_LDS_BUFFER * (A + A_scale + B + B_scale) + out_buf + out_scale_buf <= 163840
 Worked example, BLOCK_M=128 / BLOCK_N=256 / BLOCK_K=256 MXFP4: A = 16 KiB, A_scale = 1 KiB,
 B = 32 KiB, B_scale = 2 KiB → **51 KiB per stage**, so 3 buffers already take 153 KiB. A *full-tile*
 `out_buf` would be another 64 KiB bf16 / 128 KiB fp32 and does not fit — which is exactly why the
-mini-blocks exist. At MINI_BLOCK_M=128, MINI_BLOCK_N=32 emitted, fp32, `out_buf` is 16 KiB and fits
-with `NUM_LDS_BUFFER=2`. `pick_gemm_num_stages(..., use_async_padding=True)`
+M/N mini-blocks exist. At MINI_BLOCK_M=128, MINI_BLOCK_N=32 emitted, fp32, `out_buf` is 16 KiB and
+fits with `NUM_LDS_BUFFER=2`. `pick_gemm_num_stages(..., use_async_padding=True)`
 (`aiter/ops/triton/utils/gemm_config_utils.py:294`) already does this arithmetic and can be reused.
 
 **VGPR** — nothing in the design is register-costed today, yet three knobs are register knobs. The
 fp32 accumulator alone is `BLOCK_M * BLOCK_N / (NUM_WARPS * 64)` VGPR/lane = 64 at
-128×256 with 8 warps, 128 at BLOCK_N=512. `MINI_PREFETCH_K` holds a tuple of dot-operand fragments
-live across the mini-K loop on top of that, and `WAVES_PER_EU = 2` is only reachable at ≤256 VGPR.
+128×256 with 8 warps, 128 at BLOCK_N=512. `VGPR_PREFETCH_K == BLOCK_K` keeps one whole
+payload-stage fragment live on top of that, and `WAVES_PER_EU = 2` is only reachable at ≤256 VGPR.
 State a target VGPR/lane and waves/EU per regime, and note that `MINI_PRESTORE_MN` exists precisely
 to drain accumulator registers early so the next tile can start.
 
@@ -482,13 +496,15 @@ per operand:
   arrives M/N-packed, and should not be reached for the four models in scope.
 - **E8M0 scales**: `get_mfma_scale_layout` gives each lane K-scale elements strided by 2 (32×32) or
   4 (16×16). Read straight from an identity LDS tile that is one `ds_read_u8` per element. Worse,
-  a `[BLOCK_N, BLOCK_K/32]` uint8 tile needs `BLOCK_K >= 512` for 16 B/lane, drops to the 32-bit
+  a raw `[BLOCK_N, BLOCK_K/32]` uint8 tile needs `BLOCK_K >= 512` for 16 B/lane, drops to the 32-bit
   path at `BLOCK_K ∈ {128, 256}`, and at `BLOCK_K = 64` **cannot be lowered at all** — CDNA4's
   direct-to-LDS path supports only 128-bit or 32-bit per lane. Resolution: consume the existing
-  `CDNA4_SCALE` preshuffle (`utils/shuffle.py:196-198` + `unswizzle_mx_scale_cdna4`), which keeps the
-  direct-to-LDS write coalesced and moves the reordering into a free descriptor reshape/permute, at
-  the cost of `BLOCK_K >= 256`. Alternative if the preshuffle is not adopted: hoist the full-K scale
-  strip for the tile into LDS once (`BLOCK_N * K / 32` bytes) and accept `ds_read_u8`.
+  `CDNA4_SCALE` preshuffle (`utils/shuffle.py:196-198` + `unswizzle_mx_scale_cdna4`). Its effective
+  scale K defaults to `max(256, BLOCK_K)` (or an explicit wider multiple of `BLOCK_K`), preserving
+  the coalesced write and moving reordering into a free descriptor reshape/permute. When the scale
+  tile is wider than `BLOCK_K`, retain it for `SCALE_K / BLOCK_K` payload steps and select the
+  appropriate phase. Alternative if the preshuffle is not adopted: hoist the full-K scale strip for
+  the tile into LDS once (`BLOCK_N * K / 32` bytes) and accept `ds_read_u8`.
 
 Note the ordering hazard: on CDNA4 `buffer_load_to_shared` completes **in order with ordinary
 `load` / `store` / `buffer_load` / `buffer_store`**. Any register-path global access inside the
@@ -507,8 +523,8 @@ failing** — a silent fall back from 128-bit to 32-bit direct-to-LDS, or an ins
   **absence** of `ds_bpermute` / `v_permlane` inside the K-loop, mirroring upstream
   `python/test/gluon/test_core.py:1622-1655`.
 
-You may need the syntax of Tuples — the fixed-length array of values — to implement the static
-unroll of mini `BLOCK_K` and to hold the prefetched fragments.
+You may need the syntax of Tuples — the fixed-length array of values — to hold the one-`BLOCK_K`
+payload fragment and any wider shuffled-scale fragments retained across payload steps.
 
 ### LDS Management
 
@@ -538,14 +554,14 @@ class LDSManager:
         return LDSManager(...)
 
     @gluon.jit
-    def load_a_frag(self, idx, mini_idx: gl.constexpr):
-        # idx is the buffer index (runtime), mini_idx the constexpr mini-BLOCK_K index
+    def load_a_frag(self, idx):
+        # idx is the buffer index (runtime); the payload fragment covers one BLOCK_K stage
         ...
         # a_scale_val is None when the token dtype carries no scale
         return a_val, a_scale_val
 
     @gluon.jit
-    def load_b_frag(self, idx, mini_idx: gl.constexpr):
+    def load_b_frag(self, idx):
         ...
         return b_val, b_scale_val
 

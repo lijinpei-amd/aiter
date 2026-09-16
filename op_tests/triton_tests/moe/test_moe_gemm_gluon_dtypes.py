@@ -164,7 +164,7 @@ def test_bf16_pipeline_wait_commit(scheme, pipeline, monkeypatch):
     w = (torch.randn((experts, n, k), device="cuda") * 0.1).bfloat16().transpose(1, 2)
     config = _config(pipeline=pipeline)
     config.update(
-        BLOCK_K=64, MINI_BLOCK_K=64, VGPR_PREFETCH_K=64,
+        BLOCK_K=64, VGPR_PREFETCH_K=64,
         mfma_instr_shape=(32, 32, 16), warps_per_cta=(2, 4), tiles_per_warp=(1, 1),
         SCALE_FILL_MID=False, WAIT_COMMIT_SCHEME=int(scheme),
     )

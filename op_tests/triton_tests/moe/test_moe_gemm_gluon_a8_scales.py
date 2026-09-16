@@ -77,7 +77,6 @@ def case():
             BLOCK_K=128,
             MINI_BLOCK_M=64,
             MINI_BLOCK_N=128,
-            MINI_BLOCK_K=128,
             mfma_instr_shape=(16, 16, 128),
             warps_per_cta=(1, 4),
             tiles_per_warp=(2, 2),
