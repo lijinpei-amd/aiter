@@ -19,6 +19,15 @@ import pytest
 from aiter.ops.triton._gluon_kernels.gfx950.moe import _pipeline as pipeline
 from aiter.ops.triton._gluon_kernels.gfx950.moe import moe_gemm as kernel
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
+    A_PAYLOAD,
+    A_SCALE,
+    B_PAYLOAD,
+    B_SCALE,
+    COMPONENTS,
+    OPERANDS,
+    PAYLOAD,
+    SCALE,
+    A,
     _pipeline_peeled,
     _wait,
     pipeline_depth,
@@ -47,7 +56,7 @@ class _Config(_ScheduleConfig):
         scale_tiles=(1, 1),
     ):
         super().__init__(*shape, scheme, middle)
-        self.depths = depths  # A, A scale, B, B scale.
+        self.depths = dict(zip(COMPONENTS, depths, strict=True))
         self.scales = (scales, scales)
         self.payload_async = (
             not bool(register_mask & 8),
@@ -71,32 +80,33 @@ class _Config(_ScheduleConfig):
         self.output_quant = None
 
     def num_buffers(self, operand, scale=False):
-        return self.depths[operand * 2 + bool(scale)]
+        return self.depths[(operand, bool(scale))]
 
     def buffer_live_span(self, operand, scale=False):
         return (self.num_buffers(operand, scale) - 1) * (
-            self.scale_step_ratio(operand) if scale else 1
+            self.scale_ratio_k_step(operand) if scale else 1
         ) + 1
 
-    def active_kinds(self):
+    def active_components(self):
         return tuple(
-            kind for kind in range(4) if not kind % 2 or self.has_scale(kind // 2)
+            component
+            for component in COMPONENTS
+            if not component[1] or self.has_scale(component[0])
         )
 
-    def is_async(self, kind):
+    def component_via_lds(self, component):
+        operand, is_scale = component
         return (
-            self.scale_via_lds(kind // 2)
-            if kind % 2
-            else self.payload_via_lds(kind // 2)
+            self.scale_via_lds(operand) if is_scale else self.payload_via_lds(operand)
         )
 
     def pipeline_register_period(self):
         return math.lcm(
             *(
-                self.depths[kind]
-                * (self.scale_step_ratio(kind // 2) if kind % 2 else 1)
-                for kind in self.active_kinds()
-                if not self.is_async(kind)
+                self.depths[component]
+                * (self.scale_ratio_k_step(component[0]) if component[1] else 1)
+                for component in self.active_components()
+                if not self.component_via_lds(component)
             )
         )
 
@@ -110,14 +120,14 @@ class _Config(_ScheduleConfig):
 
     num_prefetch_k_slots = num_k_slots_per_tile
 
-    def scale_step_ratio(self, operand):
+    def scale_ratio_k_step(self, operand):
         return self.scale_steps[operand] if self.has_scale(operand) else 1
 
-    def scale_tile_ratio(self, operand):
+    def scale_ratio_non_k_slot(self, operand):
         return self.scale_tiles[operand]
 
     def scale_read_k_slots(self, operand):
-        return self.num_k_slots_per_tile() * self.scale_step_ratio(operand)
+        return self.num_k_slots_per_tile() * self.scale_ratio_k_step(operand)
 
     def scale_cache_fragments(self, operand):
         return self.num_lds_slots_per_block_non_k(operand) * self.scale_read_k_slots(
@@ -125,7 +135,7 @@ class _Config(_ScheduleConfig):
         )
 
     def scale_hbm_steps(self, operand, steps, phase):
-        ratio = self.scale_step_ratio(operand)
+        ratio = self.scale_ratio_k_step(operand)
         return (steps + phase) // ratio * ratio
 
     def operand_elem_ty(self, operand):
@@ -152,7 +162,7 @@ class _Config(_ScheduleConfig):
 
 @dataclass(frozen=True)
 class _Fragment:
-    kind: int
+    component: tuple[int, bool]
     tile: int
     mini: int
     k: int
@@ -188,19 +198,20 @@ class _Machine:
         self.current_drain = False
         self.events = []
 
-    def load(self, kind, ring, mini, pointer):
+    def load(self, component, ring, mini, pointer):
         tc = self.tc
+        operand, is_scale = component
         tile = pointer
-        ratio = tc.scale_step_ratio(kind // 2) if kind % 2 else 1
-        nonk = tc.scale_tile_ratio(kind // 2) if kind % 2 else 1
+        ratio = tc.scale_ratio_k_step(operand) if is_scale else 1
+        nonk = tc.scale_ratio_non_k_slot(operand) if is_scale else 1
         mk = tc.num_k_slots_per_tile()
         assert 0 <= tile < self.num_k, "HBM load exceeded the K strip"
-        lead = (tc.depths[kind] - 1) * ratio
-        if kind == 2 and not tc.is_async(kind):
+        lead = (tc.depths[component] - 1) * ratio
+        if component == B_PAYLOAD and not tc.component_via_lds(component):
             lead -= 1
         assert tile == self.current_read + lead
         assert tile % ratio == 0 and mini % nonk == 0
-        token = kind, mini, tile
+        token = component, mini, tile
         assert token not in self.loads, "HBM tile loaded more than once"
         self.loads.add(token)
         self.events.append(
@@ -209,26 +220,26 @@ class _Machine:
                 self.current_in_loop,
                 self.current_drain,
                 "load",
-                kind,
+                component,
                 tile,
                 mini,
             )
         )
         fragments = tuple(
-            _Fragment(kind, tile + k // mk, mini + mn, k % mk)
+            _Fragment(component, tile + k // mk, mini + mn, k % mk)
             for mn in range(nonk)
             for k in range(mk * ratio)
         )
-        if tc.is_async(kind):
-            key = kind, mini, ring
+        if tc.component_via_lds(component):
+            key = component, mini, ring
             if key in self.lds:
                 old = self.lds[key][0]
                 assert (
-                    kind,
+                    component,
                     mini,
                     old,
                 ) in self.reads, "LDS overwritten before its DS read"
-            assert ring == tile // ratio % tc.depths[kind]
+            assert ring == tile // ratio % tc.depths[component]
             self.lds[key] = tile, fragments
             self.pending.append(token)
         return fragments
@@ -236,13 +247,12 @@ class _Machine:
     def buffer_load_payload(
         self, operand, VIA_LDS, ring, mini, pointer, offset, soff=0
     ):
-        fragments = self.load(operand * 2, ring, mini, pointer + soff)
+        fragments = self.load((operand, PAYLOAD), ring, mini, pointer + soff)
         if not VIA_LDS:
             return fragments
 
     def buffer_load_scale(self, operand, VIA_LDS, ring, mini, pointer, offset, soff=0):
-        kind = operand * 2 + 1
-        fragments = self.load(kind, ring, mini, pointer + soff)
+        fragments = self.load((operand, SCALE), ring, mini, pointer + soff)
         if not VIA_LDS:
             return fragments
 
@@ -259,24 +269,34 @@ class _Machine:
     def required(self, slot):
         tc = self.tc
         if (tc.nm, tc.nn) == (2, 2):
-            payloads = [(2, 0), (0, 0), (0, 1), (2, 1)]
+            payloads = [
+                (B_PAYLOAD, 0),
+                (A_PAYLOAD, 0),
+                (A_PAYLOAD, 1),
+                (B_PAYLOAD, 1),
+            ]
         else:
-            payloads = sorted(
-                [(0, i) for i in range(tc.nm)] + [(2, i) for i in range(tc.nn)],
-                key=lambda token: (token[1], token[0]),
-            )
+            payloads = []
+            for tile in range(max(tc.nm, tc.nn)):
+                if tile < tc.nm:
+                    payloads.append((A_PAYLOAD, tile))
+                if tile < tc.nn:
+                    payloads.append((B_PAYLOAD, tile))
         required = set()
-        for pos, (kind, mini) in enumerate(payloads):
+        for pos, (payload_component, mini) in enumerate(payloads):
             if slot is not None and slot != pos:
                 continue
-            for target in (kind, kind + 1):
-                if target in tc.active_kinds() and tc.is_async(target):
-                    if target % 2 and (
-                        self.current_read % tc.scale_step_ratio(target // 2)
-                        or mini % tc.scale_tile_ratio(target // 2)
+            operand, _ = payload_component
+            for component in ((operand, PAYLOAD), (operand, SCALE)):
+                if component in tc.active_components() and tc.component_via_lds(
+                    component
+                ):
+                    if component[1] and (
+                        self.current_read % tc.scale_ratio_k_step(operand)
+                        or mini % tc.scale_ratio_non_k_slot(operand)
                     ):
                         continue
-                    required.add((target, mini, self.current_read))
+                    required.add((component, mini, self.current_read))
         return required
 
     def check_wait(self, tc, stage, slot, drain=False, epilogue_groups=0, phase=None):
@@ -299,10 +319,10 @@ class _Machine:
             assert actual is None
         return actual
 
-    def read(self, kind, ring, mini, k):
-        token = kind, mini, self.current_read
+    def read(self, component, ring, mini, k):
+        token = component, mini, self.current_read
         assert token in self.completed, "DS read issued before its async copy completed"
-        actual, fragments = self.lds[kind, mini, ring]
+        actual, fragments = self.lds[component, mini, ring]
         assert actual == self.current_read
         self.reads.add(token)
         return fragments[k]
@@ -310,19 +330,19 @@ class _Machine:
     def ds_read_frag(
         self, operand, ring, mini, k, *, READ_PAYLOAD, READ_SCALE, SCALE_READ_IDX=None
     ):
-        payload = self.read(operand * 2, ring, mini, k) if READ_PAYLOAD else None
+        payload = self.read((operand, PAYLOAD), ring, mini, k) if READ_PAYLOAD else None
         scale = (
-            self.read(operand * 2 + 1, SCALE_READ_IDX, mini, k)
+            self.read((operand, SCALE), SCALE_READ_IDX, mini, k)
             if READ_SCALE and self.tc.has_scale(operand)
             else None
         )
         return payload, scale
 
     def ds_read_scale(self, operand, ring, mini):
-        kind = operand * 2 + 1
-        token = kind, mini, self.current_read
+        component = (operand, SCALE)
+        token = component, mini, self.current_read
         assert token in self.completed, "Scale DS read issued before its copy completed"
-        actual, fragments = self.lds[kind, mini, ring]
+        actual, fragments = self.lds[component, mini, ring]
         assert actual == self.current_read
         self.reads.add(token)
         return fragments
@@ -343,24 +363,25 @@ class _Machine:
         )
         assert 0 <= accumulator < self.num_k
         assert phase == accumulator * tc.BLOCK_K // 128 % 2
-        for operand, fragments in enumerate((a, b)):
+        for operand, fragments in zip(OPERANDS, (a, b)):
             for k in range(mk):
                 payload, scale = fragments[k * 2 : k * 2 + 2]
-                assert payload.kind == operand * 2 and payload.k == k
+                assert payload.component == (operand, PAYLOAD) and payload.k == k
                 assert payload.tile == accumulator, (
                     "MFMA consumed stale or overwritten registers"
                 )
                 if tc.has_scale(operand):
                     assert scale == _Fragment(
-                        operand * 2 + 1, accumulator, payload.mini, k
+                        (operand, SCALE), accumulator, payload.mini, k
                     )
-                self.reads.add((payload.kind, payload.mini, accumulator))
+                self.reads.add((payload.component, payload.mini, accumulator))
                 if tc.has_scale(operand):
                     self.reads.add(
                         (
-                            scale.kind,
-                            scale.mini - scale.mini % tc.scale_tile_ratio(operand),
-                            accumulator - accumulator % tc.scale_step_ratio(operand),
+                            scale.component,
+                            scale.mini
+                            - scale.mini % tc.scale_ratio_non_k_slot(operand),
+                            accumulator - accumulator % tc.scale_ratio_k_step(operand),
                         )
                     )
         token = a[0].mini, b[0].mini, accumulator
@@ -430,17 +451,19 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
             (
                 (None,)
                 * (
-                    tc.depths[kind]
+                    tc.depths[component]
                     * (
-                        tc.scale_cache_fragments(kind // 2)
-                        if kind % 2
-                        else (tc.nm if kind < 2 else tc.nn) * tc.num_k_slots_per_tile()
+                        tc.scale_cache_fragments(component[0])
+                        if component[1]
+                        else (tc.nm if component[0] == A else tc.nn)
+                        * tc.num_k_slots_per_tile()
                     )
                 )
-                if kind in tc.active_kinds() and not tc.is_async(kind)
+                if component in tc.active_components()
+                and not tc.component_via_lds(component)
                 else ()
             )
-            for kind in (0, 2, 1, 3)
+            for component in (A_PAYLOAD, B_PAYLOAD, A_SCALE, B_SCALE)
         )
 
     with monkeypatch.context() as patch:
@@ -491,14 +514,18 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         assert pipeline._last_mfma.fn(pc, regs) == (num_k,) * (tc.nm * tc.nn)
 
     expected = {
-        (kind, mini, tile)
-        for kind in tc.active_kinds()
+        (component, mini, tile)
+        for component in tc.active_components()
         for mini in range(
             0,
-            tc.nm if kind < 2 else tc.nn,
-            tc.scale_tile_ratio(kind // 2) if kind % 2 else 1,
+            tc.nm if component[0] == A else tc.nn,
+            tc.scale_ratio_non_k_slot(component[0]) if component[1] else 1,
         )
-        for tile in range(0, num_k, tc.scale_step_ratio(kind // 2) if kind % 2 else 1)
+        for tile in range(
+            0,
+            num_k,
+            tc.scale_ratio_k_step(component[0]) if component[1] else 1,
+        )
     }
     assert machine.loads == expected
     assert machine.reads == expected
@@ -613,7 +640,7 @@ def test_emitted_unified_pipeline_all_reachable_remainders(
 def _sched_barrier_stream(machine):
     return [
         (event_read, in_loop, drain, value)
-        for event_read, in_loop, drain, op, kind, value, mini in machine.events
+        for event_read, in_loop, drain, op, component, value, mini in machine.events
         if op == "sched_barrier"
     ]
 
@@ -632,7 +659,7 @@ def test_direct_b3_fills_k_plus_2_while_mfma_consumes_k(soff, monkeypatch):
     tc = _Config(
         WaitCommitScheme.PER_STAGE_WHOLE,
         (3, 3, 3, 3),
-        1,  # Direct-register B payload; the machine records it as kind 2.
+        1,  # Direct-register B payload.
         scales=False,
         soff=soff,
     )
@@ -645,32 +672,32 @@ def test_direct_b3_fills_k_plus_2_while_mfma_consumes_k(soff, monkeypatch):
     for read in in_loop_reads:
         assert [
             op
-            for event_read, in_loop, drain, op, kind, tile, mini in machine.events
+            for event_read, in_loop, drain, op, component, tile, mini in machine.events
             if in_loop and not drain and event_read == read
         ][-1] == "sched_barrier"
         mfma_tiles = [
             tile
-            for event_read, in_loop, drain, op, kind, tile, mini in machine.events
+            for event_read, in_loop, drain, op, component, tile, mini in machine.events
             if in_loop and not drain and event_read == read and op == "mfma"
         ]
         assert mfma_tiles == [read - 1] * (tc.nm * tc.nn)
 
         loads = [
-            (kind, tile, mini)
-            for event_read, in_loop, drain, op, kind, tile, mini in machine.events
+            (component, tile, mini)
+            for event_read, in_loop, drain, op, component, tile, mini in machine.events
             if in_loop and not drain and event_read == read and op == "load"
         ]
-        assert {(tile, mini) for kind, tile, mini in loads if kind == 0} == {
-            (read + 2, mi) for mi in range(tc.nm)
-        }
-        assert {(tile, mini) for kind, tile, mini in loads if kind == 2} == {
-            (read + 1, ni) for ni in range(tc.nn)
-        }
+        assert {
+            (tile, mini) for component, tile, mini in loads if component == A_PAYLOAD
+        } == {(read + 2, mi) for mi in range(tc.nm)}
+        assert {
+            (tile, mini) for component, tile, mini in loads if component == B_PAYLOAD
+        } == {(read + 1, ni) for ni in range(tc.nn)}
 
     drain_b_loads = {
         (event_read, tile, mini)
-        for event_read, in_loop, drain, op, kind, tile, mini in machine.events
-        if drain and op == "load" and kind == 2
+        for event_read, in_loop, drain, op, component, tile, mini in machine.events
+        if drain and op == "load" and component == B_PAYLOAD
     }
     assert drain_b_loads == {(num_k - 2, num_k - 1, ni) for ni in range(tc.nn)}
 
@@ -690,13 +717,13 @@ def test_direct_b2_fills_k_plus_1_while_mfma_consumes_k(soff, monkeypatch):
 
     assert {
         (event_read, tile, mini)
-        for event_read, in_loop, drain, op, kind, tile, mini in machine.events
-        if event_read < 0 and op == "load" and kind == 2
+        for event_read, in_loop, drain, op, component, tile, mini in machine.events
+        if event_read < 0 and op == "load" and component == B_PAYLOAD
     } == set()
     assert {
         (tile, mini)
-        for event_read, in_loop, drain, op, kind, tile, mini in machine.events
-        if event_read == 0 and op == "load" and kind == 2
+        for event_read, in_loop, drain, op, component, tile, mini in machine.events
+        if event_read == 0 and op == "load" and component == B_PAYLOAD
     } == {(0, ni) for ni in range(tc.nn)}
 
     in_loop_reads = _assert_direct_b_stage_barriers(machine)
@@ -704,29 +731,29 @@ def test_direct_b2_fills_k_plus_1_while_mfma_consumes_k(soff, monkeypatch):
     for read in in_loop_reads:
         assert [
             op
-            for event_read, in_loop, drain, op, kind, tile, mini in machine.events
+            for event_read, in_loop, drain, op, component, tile, mini in machine.events
             if in_loop and not drain and event_read == read
         ][-1] == "sched_barrier"
         mfma_tiles = [
             tile
-            for event_read, in_loop, drain, op, kind, tile, mini in machine.events
+            for event_read, in_loop, drain, op, component, tile, mini in machine.events
             if in_loop and not drain and event_read == read and op == "mfma"
         ]
         assert mfma_tiles == [read - 1] * (tc.nm * tc.nn)
         assert {
             (tile, mini)
-            for event_read, in_loop, drain, op, kind, tile, mini in machine.events
+            for event_read, in_loop, drain, op, component, tile, mini in machine.events
             if in_loop
             and not drain
             and event_read == read
             and op == "load"
-            and kind == 2
+            and component == B_PAYLOAD
         } == {(read, ni) for ni in range(tc.nn)}
 
     drain_b_loads = {
         (event_read, tile, mini)
-        for event_read, in_loop, drain, op, kind, tile, mini in machine.events
-        if drain and op == "load" and kind == 2
+        for event_read, in_loop, drain, op, component, tile, mini in machine.events
+        if drain and op == "load" and component == B_PAYLOAD
     }
     assert drain_b_loads == {
         (read, read, ni) for read in range(num_k - 2, num_k) for ni in range(tc.nn)
@@ -808,7 +835,7 @@ def test_absent_scale_ring_indices_ignore_invalid_unused_depths(scale_depths):
     assert tc.validate(512, 960)
     assert pipeline_depth(tc) == 2
     assert tc.pipeline_register_period() == 1
-    for kind in (1, 3):
+    for component in (A_SCALE, B_SCALE):
         for in_loop in (False, True):
             for fill in (False, True):
-                assert pipeline._index.fn(tc, 7, kind, fill, 1, in_loop) == 0
+                assert pipeline._index.fn(tc, 7, component, fill, 1, in_loop) == 0

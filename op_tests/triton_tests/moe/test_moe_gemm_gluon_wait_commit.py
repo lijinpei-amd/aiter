@@ -13,6 +13,14 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe import _lds
 from aiter.ops.triton._gluon_kernels.gfx950.moe import _pipeline as buffered
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import unwrap
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
+    A_PAYLOAD,
+    A_SCALE,
+    B_PAYLOAD,
+    B_SCALE,
+    COMPONENTS,
+    PAYLOAD,
+    SCALE,
+    A,
     _buffer_load_group_schedule,
     _buffer_load_groups,
     _buffer_load_ops,
@@ -71,11 +79,13 @@ class _ScheduleConfig:
     def scale_shuffled(self, idx):
         return idx == 0 and self.a_scale_ratio > 1
 
-    def scale_tile_ratio(self, idx):
+    def scale_ratio_non_k_slot(self, idx):
         return self.a_scale_ratio if idx == 0 else 1
 
     def num_scale_tiles(self, idx):
-        return self.num_lds_slots_per_block_non_k(idx) // self.scale_tile_ratio(idx)
+        return self.num_lds_slots_per_block_non_k(idx) // self.scale_ratio_non_k_slot(
+            idx
+        )
 
     def scale_load_k_tiles(self, idx):
         return 1
@@ -83,7 +93,7 @@ class _ScheduleConfig:
     def scale_mini_block_k(self, idx):
         return 256
 
-    def scale_step_ratio(self, idx):
+    def scale_ratio_k_step(self, idx):
         return 1
 
     def buffer_live_span(self, idx, scale=False):
@@ -137,37 +147,55 @@ def _config(shape, scheme, middle, traffic):
 def _reference_slots(tc):
     # State the copy order independently of production's slot/group helpers.
     if (tc.nm, tc.nn) == (2, 2):
-        payloads = [(2, 0), (0, 0), (0, 1), (2, 1)]
+        payloads = [
+            (B_PAYLOAD, 0),
+            (A_PAYLOAD, 0),
+            (A_PAYLOAD, 1),
+            (B_PAYLOAD, 1),
+        ]
     else:
-        payloads = sorted(
-            [(0, tile) for tile in range(tc.nm)] + [(2, tile) for tile in range(tc.nn)],
-            key=lambda copy: (copy[1], copy[0]),
-        )
+        payloads = []
+        for tile in range(max(tc.nm, tc.nn)):
+            if tile < tc.nm:
+                payloads.append((A_PAYLOAD, tile))
+            if tile < tc.nn:
+                payloads.append((B_PAYLOAD, tile))
     copies = [[] for _ in range(tc.nm * tc.nn)]
     reads = [set() for _ in copies]
-    for slot, (kind, tile) in enumerate(payloads):
-        operand = kind // 2
-        copies[slot].append((kind, tile))
+    for slot, (component, tile) in enumerate(payloads):
+        operand, is_scale = component
+        assert not is_scale
+        copies[slot].append((component, tile))
         if tc.payload_async[operand]:
-            reads[slot].add((kind, tile))
+            reads[slot].add((component, tile))
         if not (tc.scales[operand] and tc.scale_async[operand]):
             continue
-        owner = tile - tile % tc.a_scale_ratio if operand == 0 else tile
+        owner = tile - tile % tc.a_scale_ratio if operand == A else tile
+        scale_component = (operand, SCALE)
         if tile == owner:
-            reads[slot].add((kind + 1, owner))
+            reads[slot].add((scale_component, owner))
             scale_slot = (
                 1 + tile if tc.SCALE_FILL_MID and (tc.nm, tc.nn) == (2, 2) else slot
             )
-            copies[scale_slot].append((kind + 1, tile))
-    # Within a slot the four copy kinds issue in A, A-scale, B, B-scale order.
-    return [tuple(sorted(slot)) for slot in copies], reads
+            copies[scale_slot].append((scale_component, tile))
+    # Within a slot, components issue in A, A-scale, B, B-scale order.
+    component_rank = {
+        A_PAYLOAD: 0,
+        A_SCALE: 1,
+        B_PAYLOAD: 2,
+        B_SCALE: 3,
+    }
+    ordered = [tuple(sorted(slot, key=lambda copy: component_rank[copy[0]])) for slot in copies]
+    return ordered, reads
 
 
 def _reference_groups(tc, copies):
-    asynchronous = [
-        tuple(copy for copy in slot if copy[0] % 2 or tc.payload_async[copy[0] // 2])
-        for slot in copies
-    ]
+    def is_async(copy):
+        component, _ = copy
+        operand, is_scale = component
+        return tc.scale_async[operand] if is_scale else tc.payload_async[operand]
+
+    asynchronous = [tuple(copy for copy in slot if is_async(copy)) for slot in copies]
     if tc.WAIT_COMMIT_SCHEME == WaitCommitScheme.PER_OP:
         return tuple(tuple((copy,) for copy in slot) for slot in asynchronous)
     if tc.WAIT_COMMIT_SCHEME == WaitCommitScheme.PER_SLOT:
@@ -178,14 +206,15 @@ def _reference_groups(tc, copies):
 
 
 class _Descriptor:
-    def __init__(self, kind, tc):
-        self.kind = kind
-        self.ratio = tc.a_scale_ratio if kind == 1 else 1
-        self.tiles = (tc.nm if kind < 2 else tc.nn) // self.ratio
+    def __init__(self, component, tc):
+        self.component = component
+        operand, _ = component
+        self.ratio = tc.a_scale_ratio if component == A_SCALE else 1
+        self.tiles = (tc.nm if operand == A else tc.nn) // self.ratio
 
     def index(self, index):
         stage, tile = divmod(unwrap(index), self.tiles)
-        return stage, self.kind, tile * self.ratio
+        return stage, self.component, tile * self.ratio
 
 
 class _LDSRecorder:
@@ -193,10 +222,10 @@ class _LDSRecorder:
 
     def __init__(self, tc):
         self.func_cfg = self.tuning_cfg = tc
-        self.a_payload_lds_ptr = _Descriptor(0, tc)
-        self.a_scale_lds_ptr = _Descriptor(1, tc)
-        self.b_payload_lds_ptr = _Descriptor(2, tc)
-        self.b_scale_lds_ptr = _Descriptor(3, tc)
+        self.a_payload_lds_ptr = _Descriptor(A_PAYLOAD, tc)
+        self.a_scale_lds_ptr = _Descriptor(A_SCALE, tc)
+        self.b_payload_lds_ptr = _Descriptor(B_PAYLOAD, tc)
+        self.b_scale_lds_ptr = _Descriptor(B_SCALE, tc)
         self.slot = 0
         self.pending = []
         self.copies = [[] for _ in range(tc.nm * tc.nn)]
@@ -209,7 +238,7 @@ class _LDSRecorder:
             )
         else:
             # A direct-register load is issued but owns no LDS async-copy group.
-            self.copies[self.slot].append((operand * 2, tile))
+            self.copies[self.slot].append(((operand, PAYLOAD), tile))
             return (0,)
 
     def buffer_load_scale(self, operand, VIA_LDS, *args, **kwargs):
@@ -222,10 +251,10 @@ class _LDSRecorder:
             return (0,)
 
     def copy(self, descriptor, base, offsets, modifier, soffset):
-        stage, kind, tile = descriptor
+        stage, component, tile = descriptor
         assert stage == 2, "The emitter must index the requested LDS stage."
-        self.copies[self.slot].append((kind, tile))
-        self.pending.append((kind, tile))
+        self.copies[self.slot].append((component, tile))
+        self.pending.append((component, tile))
 
     def commit_buffer_load(self):
         self.groups[self.slot].append(tuple(self.pending))
@@ -336,7 +365,9 @@ def test_emitted_groups_and_waits_retire_required_copies(
     assert _buffer_load_groups(tc) == flat
     for slot, operations in enumerate(copies):
         actual = _buffer_load_ops(tc, slot % tc.nm, slot // tc.nm)
-        assert actual == tuple(dict(operations).get(kind) for kind in range(4))
+        assert actual == tuple(
+            dict(operations).get(component) for component in COMPONENTS
+        )
 
     # The oracle is a literal FIFO of committed groups, with unique stage-tagged
     # copy tokens. It never uses production's group-count or wait-count formula.
@@ -344,7 +375,7 @@ def test_emitted_groups_and_waits_retire_required_copies(
         for filling in (False, True):
             for slack in (0, 1, 2):
                 queue = [
-                    {(stage, kind, tile) for kind, tile in group}
+                    {(stage, component, tile) for component, tile in group}
                     for stage in range(between + 1)
                     for group in flat
                 ]
@@ -352,7 +383,7 @@ def test_emitted_groups_and_waits_retire_required_copies(
                 committed = list(queue)
                 completed = set()
                 for slot, required in enumerate(reads):
-                    target = {(0, kind, tile) for kind, tile in required}
+                    target = {(0, component, tile) for component, tile in required}
                     wait = _buffer_load_wait(
                         tc, slot % tc.nm, slot // tc.nm, between, filling
                     )
@@ -375,7 +406,10 @@ def test_emitted_groups_and_waits_retire_required_copies(
                     assert target <= completed, (slot, required, wait, queue)
                     if filling:
                         for group in expected[slot]:
-                            issued = {(between + 1, kind, tile) for kind, tile in group}
+                            issued = {
+                                (between + 1, component, tile)
+                                for component, tile in group
+                            }
                             queue.append(issued)
                             committed.append(issued)
 

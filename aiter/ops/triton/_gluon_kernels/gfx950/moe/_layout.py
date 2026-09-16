@@ -444,7 +444,7 @@ def _a_scale_hbm_offsets(a, rt, block_id, M_e, start_m, pid_m, K, func_cfg, tuni
     layout_a_scale_slot: gl.constexpr = tuning_cfg.scale_hbm_offset_layout(0)
     SCALE_M: gl.constexpr = tuning_cfg.scale_mini_block_nonk(0)
     SCALE_K: gl.constexpr = tuning_cfg.scale_mini_block_k(0)
-    SCALE_RATIO: gl.constexpr = tuning_cfg.scale_tile_ratio(0)
+    SCALE_RATIO: gl.constexpr = tuning_cfg.scale_ratio_non_k_slot(0)
 
     if require_constexpr(
         tuning_cfg.scale_shuffled(0) and not tuning_cfg.scale_via_lds(0)
@@ -541,7 +541,7 @@ def _b_scale_hbm_offsets(b, pid_n, N, K, func_cfg, tuning_cfg):
     layout_b_scale_slot: gl.constexpr = tuning_cfg.scale_hbm_offset_layout(1)
     SCALE_N: gl.constexpr = tuning_cfg.scale_mini_block_nonk(1)
     SCALE_K: gl.constexpr = tuning_cfg.scale_mini_block_k(1)
-    SCALE_RATIO: gl.constexpr = tuning_cfg.scale_tile_ratio(1)
+    SCALE_RATIO: gl.constexpr = tuning_cfg.scale_ratio_non_k_slot(1)
     SPLIT_EXTENT: gl.constexpr = (
         N_SLOT if func_cfg.gu_split() and SCALE_RATIO > 1 else 0
     )
@@ -1109,19 +1109,21 @@ class _KernelTuningLayout:
         return _v(self.SCALE_MINI_BLOCK_K) or max(256, _v(self.MINI_BLOCK_K))
 
     @gluon.constexpr_function
-    def scale_step_ratio(self, idx):
-        """Payload stages covered by one shuffled scale load."""
+    def scale_ratio_k_step(self, idx):
+        """Number of payload K steps covered by one scale load."""
         bk = _v(self.BLOCK_K)
         return (self.scale_mini_block_k(idx) + bk - 1) // bk
 
     @gluon.constexpr_function
-    def scale_tile_ratio(self, idx):
-        """Payload non-K tiles covered by one scale load."""
+    def scale_ratio_non_k_slot(self, idx):
+        """Number of payload non-K slots covered by one scale load."""
         return self.scale_mini_block_nonk(idx) // self.scale_nonk(idx)
 
     @gluon.constexpr_function
     def num_scale_tiles(self, idx):
-        return self.num_lds_slots_per_block_non_k(idx) // self.scale_tile_ratio(idx)
+        return self.num_lds_slots_per_block_non_k(idx) // self.scale_ratio_non_k_slot(
+            idx
+        )
 
     @gluon.constexpr_function
     def scale_load_k_tiles(self, idx):
@@ -1146,7 +1148,7 @@ class _KernelTuningLayout:
     @gluon.constexpr_function
     def scale_hbm_steps(self, idx, steps, phase=0):
         """Scale pointer displacement in units of one payload stage's scale stride."""
-        ratio = self.scale_step_ratio(idx)
+        ratio = self.scale_ratio_k_step(idx)
         return ((_v(phase) + _v(steps)) // ratio) * ratio
 
     @gluon.constexpr_function
@@ -1671,7 +1673,9 @@ class _KernelTuningLayout:
             )
             assert K % sk == 0, "K must contain complete SCALE_MINI_BLOCK_K tiles"
             if _v(self.FROZEN_STEP):
-                assert BK == 256 and sk == BK and self.scale_tile_ratio(idx) == 1, (
+                assert (
+                    BK == 256 and sk == BK and self.scale_ratio_non_k_slot(idx) == 1
+                ), (
                     "FROZEN_STEP shuffled scales require BLOCK_K == "
                     "SCALE_MINI_BLOCK_K == 256 and one scale tile per payload slot; "
                     "use the live pipeline for independent scale mini blocks"

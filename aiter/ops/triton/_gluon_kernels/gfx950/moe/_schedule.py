@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Copy ownership and commit/wait accounting for the Gluon MoE pipeline."""
+"""Copy ownership and commit/wait accounting for the Gluon MoE pipeline.
+
+Components use ``(operand, is_scale)`` identities throughout the live schedule.
+"""
 
 import math
 
@@ -11,12 +14,26 @@ from ._lang import unwrap as _v
 from ._layout import _slot_index
 from ._types import WaitCommitScheme
 
+A = 0
+B = 1
+PAYLOAD = False
+SCALE = True
+
+A_PAYLOAD = (A, PAYLOAD)
+A_SCALE = (A, SCALE)
+B_PAYLOAD = (B, PAYLOAD)
+B_SCALE = (B, SCALE)
+
+OPERANDS = (A, B)
+# Explicit issue order; PER_OP wait counts depend on this ordering.
+COMPONENTS = (A_PAYLOAD, A_SCALE, B_PAYLOAD, B_SCALE)
+
 
 @gluon.constexpr_function
 def pipeline_depth(tc):
     """Largest prefetch span, measured in payload steps, of active components."""
-    depth = max(tc.buffer_live_span(0), tc.buffer_live_span(1))
-    for operand in (0, 1):
+    depth = max(tc.buffer_live_span(A), tc.buffer_live_span(B))
+    for operand in OPERANDS:
         if tc.func_cfg.has_scale(operand):
             depth = max(depth, tc.buffer_live_span(operand, True))
     return depth
@@ -27,18 +44,18 @@ def pipeline_unroll(tc):
     """LCM of the requested unroll and every active component ring period.
 
     Payload rings advance every step. Scale rings advance once per scale K tile,
-    so their period in payload steps is their depth times the scale step ratio.
+    so their period in payload steps is their depth times the scale K-step ratio.
     Including LDS rings keeps every complete body at a fixed ring phase as well as
     satisfying the static-index requirement of register tuples.
     """
     requested = _v(tc.K_UNROLL)
     assert requested >= 1, "K_UNROLL must be at least 1"
     period = requested
-    for operand in (0, 1):
+    for operand in OPERANDS:
         period = math.lcm(period, tc.num_buffers(operand))
         if tc.func_cfg.has_scale(operand):
             scale_depth = tc.num_buffers(operand, True)
-            scale_ratio = tc.scale_step_ratio(operand)
+            scale_ratio = tc.scale_ratio_k_step(operand)
             period = math.lcm(period, scale_depth * scale_ratio)
     return period
 
@@ -130,31 +147,34 @@ def _scale_buffer_load_tile(mi, ni, NM, NN, want_a, SCALE_FILL_MID=False):
 
 @gluon.constexpr_function
 def _ops(tc, mi, ni):
-    """Payload/scale fills owned by a slot, including register destinations."""
+    """Tiles in ``COMPONENTS`` order, including direct-register destinations."""
     nm, nn = tc.num_m_slots_per_block(), tc.num_n_slots_per_block()
     pos = _buffer_load_pos(mi, ni, nm, nn)
     ops = []
-    for idx in range(2):
-        ops.append(_buffer_load_tile(pos, nm, nn, idx == 0))
+    for operand in OPERANDS:
+        ops.append(_buffer_load_tile(pos, nm, nn, operand == A))
         tile = None
-        if tc.func_cfg.has_scale(idx):
-            tile = _scale_buffer_load_tile(mi, ni, nm, nn, idx == 0, tc.SCALE_FILL_MID)
-            if tile is not None and tile % tc.scale_tile_ratio(idx) != 0:
+        if tc.func_cfg.has_scale(operand):
+            tile = _scale_buffer_load_tile(
+                mi, ni, nm, nn, operand == A, tc.SCALE_FILL_MID
+            )
+            if tile is not None and tile % tc.scale_ratio_non_k_slot(operand) != 0:
                 tile = None
         ops.append(tile)
     return tuple(ops)
 
 
 @gluon.constexpr_function
-def _fill_span(tc, kind):
+def _fill_span(tc, component):
     """Number of read stages between startup and the final fill.
 
     Direct B has ``NB`` physical banks but only an ``NB - 1`` stage producer
     span: while MFMA consumes B[k], HBM fills B[k + NB - 1]. LDS payloads
     retain the extra copy/read stage.
     """
-    span = tc.buffer_live_span(kind // 2, bool(kind % 2))
-    if kind == 2 and not tc.payload_via_lds(1):
+    operand, is_scale = component[0], component[1]
+    span = tc.buffer_live_span(operand, is_scale)
+    if operand == B and not is_scale and not tc.payload_via_lds(B):
         span -= 1
     return span
 
@@ -163,32 +183,41 @@ def _fill_span(tc, kind):
 def _read_payload_after_fill(tc, operand):
     """Whether this step's payload registers are selected after its HBM fill."""
     return tc.ds_read_in_mfma(operand) or (
-        operand == 1
+        operand == B
         and not tc.payload_via_lds(operand)
         and tc.num_buffers(operand) == 2
     )
 
 
 @gluon.constexpr_function
-def _active(tc, kind, stage, drain=False):
+def _active(tc, component, stage, drain=False):
     """Whether a component fills at this compile-time relative stage.
 
     ``None`` denotes a main-loop stage. Before the drain, ``stage`` is the
     absolute read stage and gates only staggered prologue startup. In the
     drain it is the zero-based drain iteration, independent of runtime K.
     """
-    if kind % 2 and not tc.func_cfg.has_scale(kind // 2):
+    operand, is_scale = component[0], component[1]
+    if is_scale and not tc.func_cfg.has_scale(operand):
         return False
-    depth = _fill_span(tc, kind)
+    depth = _fill_span(tc, component)
     if drain:
         return stage < pipeline_depth(tc) - depth
     return stage is None or stage + depth - 1 >= 0
 
 
 @gluon.constexpr_function
-def _async(tc, kind):
+def _async(tc, component):
     """Direct-register loads own no LDS async-copy group."""
-    return tc.scale_via_lds(kind // 2) if kind % 2 else tc.payload_via_lds(kind // 2)
+    operand, is_scale = component[0], component[1]
+    return tc.scale_via_lds(operand) if is_scale else tc.payload_via_lds(operand)
+
+
+@gluon.constexpr_function
+def _loads_at_phase(tc, component, phase):
+    """Whether a component issues a load at this K-step phase."""
+    operand, is_scale = component[0], component[1]
+    return not is_scale or phase % tc.scale_ratio_k_step(operand) == 0
 
 
 @gluon.constexpr_function
@@ -199,12 +228,12 @@ def _groups(tc, stage, drain=False, phase=None):
     for ni in range(tc.num_n_slots_per_block()):
         for mi in range(tc.num_m_slots_per_block()):
             ops = tuple(
-                (kind, tile)
-                for kind, tile in enumerate(_ops(tc, mi, ni))
+                (component, tile)
+                for component, tile in zip(COMPONENTS, _ops(tc, mi, ni))
                 if tile is not None
-                and _active(tc, kind, stage, drain)
-                and _async(tc, kind)
-                and (not kind % 2 or phase % tc.scale_step_ratio(kind // 2) == 0)
+                and _active(tc, component, stage, drain)
+                and _async(tc, component)
+                and _loads_at_phase(tc, component, phase)
             )
             if tc.commit_per_op():
                 groups = tuple((op,) for op in ops)
@@ -230,7 +259,8 @@ def _wait(tc, stage, slot, drain=False, epilogue_groups=0, phase=None):
     The drain uses a local origin: its first read is stage one, and epilogue
     groups commit between stages zero and one. Once a producer is newer than
     those epilogue groups, they no longer contribute to its wait allowance.
-    ``phase`` retains the absolute scale cadence when stages use a local origin.
+    ``phase`` preserves the absolute payload-step phase used to apply each scale's
+    K-step ratio when stages use a local origin.
     """
     nm, nn = tc.num_m_slots_per_block(), tc.num_n_slots_per_block()
     r = stage + 1 if drain else pipeline_depth(tc) if stage is None else stage
@@ -240,26 +270,28 @@ def _wait(tc, stage, slot, drain=False, epilogue_groups=0, phase=None):
         for mi in range(nm):
             if slot is not None and _slot_index(mi, ni, nm, nn) != slot:
                 continue
-            for idx in range(2):
+            for operand in OPERANDS:
                 tile = (
                     _ds_read_a_tile(mi, ni, nm, nn)
-                    if idx == 0
+                    if operand == A
                     else _ds_read_b_tile(mi, ni, nm, nn)
                 )
                 if tile is None:
                     continue
-                if tc.payload_via_lds(idx):
-                    required.append((r - tc.num_buffers(idx) + 1, idx * 2, tile))
+                if tc.payload_via_lds(operand):
+                    required.append(
+                        (r - tc.num_buffers(operand) + 1, (operand, PAYLOAD), tile)
+                    )
                 if (
-                    tc.func_cfg.has_scale(idx)
-                    and tc.scale_via_lds(idx)
-                    and phase % tc.scale_step_ratio(idx) == 0
-                    and tile % tc.scale_tile_ratio(idx) == 0
+                    tc.func_cfg.has_scale(operand)
+                    and tc.scale_via_lds(operand)
+                    and phase % tc.scale_ratio_k_step(operand) == 0
+                    and tile % tc.scale_ratio_non_k_slot(operand) == 0
                 ):
                     required.append(
                         (
-                            r - tc.buffer_live_span(idx, True) + 1,
-                            idx * 2 + 1,
+                            r - tc.buffer_live_span(operand, True) + 1,
+                            (operand, SCALE),
                             tile,
                         )
                     )
@@ -280,7 +312,8 @@ def _wait(tc, stage, slot, drain=False, epilogue_groups=0, phase=None):
             if s == r and (slot is None or pos >= slot):
                 break
             timeline.extend(
-                tuple((s, kind, tile) for kind, tile in group) for group in groups
+                tuple((s, component, tile) for component, tile in group)
+                for group in groups
             )
         if drain and s == 0:
             timeline.extend(() for _ in range(epilogue_groups))
@@ -293,18 +326,21 @@ def _wait(tc, stage, slot, drain=False, epilogue_groups=0, phase=None):
 
 @gluon.constexpr_function
 def _buffer_load_ops(tc, mi, ni):
-    """A payload/scale and B payload/scale tiles, in issue order; None skips a copy."""
+    """Candidate tiles in ``COMPONENTS`` issue order; ``None`` skips a copy."""
     NM, NN = tc.num_m_slots_per_block(), tc.num_n_slots_per_block()
     pos = _buffer_load_pos(mi, ni, NM, NN)
     ops = []
-    for idx in range(2):
-        ops.append(_buffer_load_tile(pos, NM, NN, idx == 0))
+    for operand in OPERANDS:
+        ops.append(_buffer_load_tile(pos, NM, NN, operand == A))
         scale_tile = None
-        if tc.func_cfg.has_scale(idx) and tc.scale_via_lds(idx):
+        if tc.func_cfg.has_scale(operand) and tc.scale_via_lds(operand):
             scale_tile = _scale_buffer_load_tile(
-                mi, ni, NM, NN, idx == 0, tc.SCALE_FILL_MID
+                mi, ni, NM, NN, operand == A, tc.SCALE_FILL_MID
             )
-            if scale_tile is not None and scale_tile % tc.scale_tile_ratio(idx) != 0:
+            if (
+                scale_tile is not None
+                and scale_tile % tc.scale_ratio_non_k_slot(operand) != 0
+            ):
                 scale_tile = None
         ops.append(scale_tile)
     return tuple(ops)
@@ -312,11 +348,11 @@ def _buffer_load_ops(tc, mi, ni):
 
 @gluon.constexpr_function
 def _buffer_load_group_schedule(tc):
-    """Committed groups per slot, containing async ``(operand_kind, tile)`` copies.
+    """Committed groups per slot, containing async ``(component, tile)`` copies.
 
-    Kinds 0/1/2/3 name A payload/A scale/B payload/B scale. Direct-register payload
-    and scale loads have no async group. Traffic-only experiments
-    retain their nominal groups even when the LDS manager suppresses a copy.
+    Direct-register payload and scale loads have no async group. Traffic-only
+    experiments retain their nominal groups even when the LDS manager suppresses a
+    copy.
     """
     NM, NN = tc.num_m_slots_per_block(), tc.num_n_slots_per_block()
     scheme = _v(tc.WAIT_COMMIT_SCHEME)
@@ -326,9 +362,9 @@ def _buffer_load_group_schedule(tc):
     for ni in range(NN):
         for mi in range(NM):
             ops = tuple(
-                (kind, tile)
-                for kind, tile in enumerate(_buffer_load_ops(tc, mi, ni))
-                if tile is not None and (kind % 2 or tc.payload_via_lds(kind // 2))
+                (component, tile)
+                for component, tile in zip(COMPONENTS, _buffer_load_ops(tc, mi, ni))
+                if tile is not None and _async(tc, component)
             )
             if scheme == int(WaitCommitScheme.PER_OP):
                 groups = tuple((op,) for op in ops)
@@ -357,18 +393,18 @@ def _buffer_load_wait(tc, mi, ni, STAGES_BETWEEN, DO_BUFFER_LOAD):
     schedule = _buffer_load_group_schedule(tc)
     groups = tuple(group for entry in schedule for group in entry)
     required = []
-    for idx in range(2):
-        tile = _buffer_load_tile(_buffer_load_pos(mi, ni, NM, NN), NM, NN, idx == 0)
+    for operand in OPERANDS:
+        tile = _buffer_load_tile(_buffer_load_pos(mi, ni, NM, NN), NM, NN, operand == A)
         if tile is None:
             continue
-        if tc.payload_via_lds(idx):
-            required.append((idx * 2, tile))
+        if tc.payload_via_lds(operand):
+            required.append(((operand, PAYLOAD), tile))
         if (
-            tc.func_cfg.has_scale(idx)
-            and tc.scale_via_lds(idx)
-            and tile % tc.scale_tile_ratio(idx) == 0
+            tc.func_cfg.has_scale(operand)
+            and tc.scale_via_lds(operand)
+            and tile % tc.scale_ratio_non_k_slot(operand) == 0
         ):
-            required.append((idx * 2 + 1, tile))
+            required.append(((operand, SCALE), tile))
     if not required:
         return None
     latest = max(

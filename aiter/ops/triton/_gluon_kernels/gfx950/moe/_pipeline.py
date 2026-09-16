@@ -54,16 +54,18 @@ def _validate_pipeline(tc, K):
 def _index(
     tc,
     step,
-    kind: gl.constexpr,
+    component: gl.constexpr,
     FILL: gl.constexpr,
     KI: gl.constexpr,
     IN_LOOP: gl.constexpr,
 ):
-    if require_constexpr(kind % 2 and not tc.func_cfg.has_scale(kind // 2)):
+    operand: gl.constexpr = component[0]
+    is_scale: gl.constexpr = component[1]
+    if require_constexpr(is_scale and not tc.func_cfg.has_scale(operand)):
         out = 0
     else:
-        depth: gl.constexpr = tc.num_buffers(kind // 2, kind % 2 != 0)
-        ratio: gl.constexpr = tc.scale_step_ratio(kind // 2) if kind % 2 else 1
+        depth: gl.constexpr = tc.num_buffers(operand, is_scale)
+        ratio: gl.constexpr = tc.scale_ratio_k_step(operand) if is_scale else 1
         advance: gl.constexpr = depth - 1 if FILL else 0
         if require_constexpr(IN_LOOP and pipeline_unroll(tc) % (depth * ratio) == 0):
             out = ((_pipeline_peeled(tc) + KI + 1) // ratio + advance) % depth
@@ -100,11 +102,11 @@ def _rotate(queue, TILE_COUNT: gl.constexpr):
 @gluon.jit
 def _rotate_buffers(buffers, tc, PHASE: gl.constexpr = 0):
     mk: gl.constexpr = tc.num_k_slots_per_tile()
-    if require_constexpr((PHASE + 1) % tc.scale_step_ratio(0) == 0):
+    if require_constexpr((PHASE + 1) % tc.scale_ratio_k_step(0) == 0):
         a_scale = _rotate(buffers[2], tc.scale_cache_fragments(0))
     else:
         a_scale = buffers[2]
-    if require_constexpr((PHASE + 1) % tc.scale_step_ratio(1) == 0):
+    if require_constexpr((PHASE + 1) % tc.scale_ratio_k_step(1) == 0):
         b_scale = _rotate(buffers[3], tc.scale_cache_fragments(1))
     else:
         b_scale = buffers[3]
@@ -189,14 +191,14 @@ def _soff_unroll(tc, in_loop):
 @gluon.constexpr_function
 def _scale_soff_steps(tc, operand, offset_step):
     """Advance from the next scale fill at the beginning of an unrolled body."""
-    ratio = tc.scale_step_ratio(operand)
+    ratio = tc.scale_ratio_k_step(operand)
     start = _pipeline_peeled(tc) + 1
     return ((start + offset_step) // ratio - (start + ratio - 1) // ratio) * ratio
 
 
 @gluon.constexpr_function
 def _scale_register_index(tc, operand, ki, in_loop, fill=False):
-    ratio = tc.scale_step_ratio(operand)
+    ratio = tc.scale_ratio_k_step(operand)
     start = _pipeline_peeled(tc) + 1
     advance = (start + ki) // ratio - start // ratio if in_loop else 0
     return (
@@ -246,12 +248,12 @@ def _fill_slot(
         else 0
     )
     a, b, a_scale, b_scale = buffers
-    if require_constexpr(ops[0] is not None and _active(tc, 0, STAGE, DRAIN)):
+    if require_constexpr(ops[0] is not None and _active(tc, (0, False), STAGE, DRAIN)):
         if require_constexpr(tc.payload_via_lds(0)):
             pc.lds_ptrs.buffer_load_payload(
                 0,
                 True,
-                _index(tc, step, 0, True, KI, IN_LOOP or STATIC_PHASE),
+                _index(tc, step, (0, False), True, KI, IN_LOOP or STATIC_PHASE),
                 ops[0],
                 ptrs.a_hbm_ptr,
                 pc.a_hbm_offs[ops[0]],
@@ -281,13 +283,13 @@ def _fill_slot(
                 * mk,
             )
     if require_constexpr(
-        A_SCALE_LOAD and ops[1] is not None and _active(tc, 1, STAGE, DRAIN)
+        A_SCALE_LOAD and ops[1] is not None and _active(tc, (0, True), STAGE, DRAIN)
     ):
         if require_constexpr(tc.scale_via_lds(0)):
             pc.lds_ptrs.buffer_load_scale(
                 0,
                 True,
-                _index(tc, step, 1, True, KI, IN_LOOP or STATIC_PHASE),
+                _index(tc, step, (0, True), True, KI, IN_LOOP or STATIC_PHASE),
                 ops[1],
                 ptrs.a_scale_hbm_ptr,
                 pc.a_scale_hbm_offs[ops[1]],
@@ -312,7 +314,7 @@ def _fill_slot(
                 * tc.scale_cache_fragments(0)
                 + ops[1] * tc.scale_read_k_slots(0),
             )
-    if require_constexpr(ops[2] is not None and _active(tc, 2, STAGE, DRAIN)):
+    if require_constexpr(ops[2] is not None and _active(tc, (1, False), STAGE, DRAIN)):
         if require_constexpr(not tc.payload_via_lds(1)):
             fragments = pc.lds_ptrs.buffer_load_payload(
                 1,
@@ -327,7 +329,7 @@ def _fill_slot(
                 b,
                 fragments,
                 (
-                    ((KI if IN_LOOP else 0) + _fill_span(tc, 2) - 1)
+                    ((KI if IN_LOOP else 0) + _fill_span(tc, (1, False)) - 1)
                     % tc.num_buffers(1)
                     * tc.num_n_slots_per_block()
                     + ops[2]
@@ -338,7 +340,7 @@ def _fill_slot(
             pc.lds_ptrs.buffer_load_payload(
                 1,
                 True,
-                _index(tc, step, 2, True, KI, IN_LOOP or STATIC_PHASE),
+                _index(tc, step, (1, False), True, KI, IN_LOOP or STATIC_PHASE),
                 ops[2],
                 ptrs.b_hbm_ptr,
                 pc.b_hbm_offs[ops[2]],
@@ -347,13 +349,13 @@ def _fill_slot(
             if require_constexpr(tc.commit_per_op()):
                 pc.lds_ptrs.commit_buffer_load()
     if require_constexpr(
-        B_SCALE_LOAD and ops[3] is not None and _active(tc, 3, STAGE, DRAIN)
+        B_SCALE_LOAD and ops[3] is not None and _active(tc, (1, True), STAGE, DRAIN)
     ):
         if require_constexpr(tc.scale_via_lds(1)):
             pc.lds_ptrs.buffer_load_scale(
                 1,
                 True,
-                _index(tc, step, 3, True, KI, IN_LOOP or STATIC_PHASE),
+                _index(tc, step, (1, True), True, KI, IN_LOOP or STATIC_PHASE),
                 ops[3],
                 ptrs.b_scale_hbm_ptr,
                 pc.b_scale_hbm_offs[ops[3]],
@@ -415,23 +417,25 @@ def _advance(
     if require_constexpr(
         not _soff_unroll(tc, IN_LOOP) or KI + 1 == pipeline_unroll(tc)
     ):
-        if require_constexpr(_active(tc, 0, STAGE, DRAIN)):
+        if require_constexpr(_active(tc, (0, False), STAGE, DRAIN)):
             a += steps * pc.a_step
-        if require_constexpr(_active(tc, 2, STAGE, DRAIN)):
+        if require_constexpr(_active(tc, (1, False), STAGE, DRAIN)):
             b += steps * pc.b_step
         if require_constexpr(
-            _active(tc, 1, STAGE, DRAIN) and (_soff_unroll(tc, IN_LOOP) or A_SCALE_LOAD)
+            _active(tc, (0, True), STAGE, DRAIN)
+            and (_soff_unroll(tc, IN_LOOP) or A_SCALE_LOAD)
         ):
             a_scale += (
-                (steps if _soff_unroll(tc, IN_LOOP) else tc.scale_step_ratio(0))
+                (steps if _soff_unroll(tc, IN_LOOP) else tc.scale_ratio_k_step(0))
                 * pc.s_step
                 * pc.a_scale_stride_k
             )
         if require_constexpr(
-            _active(tc, 3, STAGE, DRAIN) and (_soff_unroll(tc, IN_LOOP) or B_SCALE_LOAD)
+            _active(tc, (1, True), STAGE, DRAIN)
+            and (_soff_unroll(tc, IN_LOOP) or B_SCALE_LOAD)
         ):
             b_scale += (
-                (steps if _soff_unroll(tc, IN_LOOP) else tc.scale_step_ratio(1))
+                (steps if _soff_unroll(tc, IN_LOOP) else tc.scale_ratio_k_step(1))
                 * pc.s_step
                 * pc.b_scale_stride_k
             )
@@ -455,7 +459,7 @@ def _read_tile(
     for k in gl.static_range(tc.num_k_slots_per_tile()):
         payload, _ = pc.lds_ptrs.ds_read_frag(
             operand,
-            _index(tc, step, operand * 2, False, KI, IN_LOOP or STATIC_PHASE),
+            _index(tc, step, (operand, False), False, KI, IN_LOOP or STATIC_PHASE),
             tile,
             k,
             READ_PAYLOAD=not reg_payload,
@@ -495,7 +499,7 @@ def _read_scale_tile(
     if require_constexpr(tc.scale_via_lds(operand)):
         fragments = pc.lds_ptrs.ds_read_scale(
             operand,
-            _index(tc, step, operand * 2 + 1, False, KI, IN_LOOP or STATIC_PHASE),
+            _index(tc, step, (operand, True), False, KI, IN_LOOP or STATIC_PHASE),
             tile,
         )
     else:
@@ -504,7 +508,7 @@ def _read_scale_tile(
         ) * tc.scale_cache_fragments(operand) + tile * tc.scale_read_k_slots(operand)
         fragments = ()
         for k in gl.static_range(
-            tc.scale_tile_ratio(operand) * tc.scale_read_k_slots(operand)
+            tc.scale_ratio_non_k_slot(operand) * tc.scale_read_k_slots(operand)
         ):
             fragments += (buffers[operand + 2][offset + k],)
     return fragments
@@ -547,7 +551,7 @@ def _read_slot(
     if require_constexpr(
         A_SCALE_LOAD
         and at is not None
-        and at % tc.scale_tile_ratio(0) == 0
+        and at % tc.scale_ratio_non_k_slot(0) == 0
         and pc.func_cfg.a_has_scale()
         and tc.ds_read_in_mfma(0, True) == MFMA
     ):
@@ -566,7 +570,7 @@ def _read_slot(
     if require_constexpr(
         B_SCALE_LOAD
         and bt is not None
-        and bt % tc.scale_tile_ratio(1) == 0
+        and bt % tc.scale_ratio_non_k_slot(1) == 0
         and pc.func_cfg.b_has_scale()
         and tc.ds_read_in_mfma(1, True) == MFMA
     ):
@@ -585,7 +589,7 @@ def _take_operand_pairs(
                 payload[tile * tc.num_k_slots_per_tile() + k],
                 scale[
                     tile * tc.scale_read_k_slots(operand)
-                    + PHASE % tc.scale_step_ratio(operand) * tc.num_k_slots_per_tile()
+                    + PHASE % tc.scale_ratio_k_step(operand) * tc.num_k_slots_per_tile()
                     + k
                 ],
             )
@@ -801,8 +805,8 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
                     False,
                     mi,
                     ni,
-                    A_SCALE_LOAD=r % tc.scale_step_ratio(0) == 0,
-                    B_SCALE_LOAD=r % tc.scale_step_ratio(1) == 0,
+                    A_SCALE_LOAD=r % tc.scale_ratio_k_step(0) == 0,
+                    B_SCALE_LOAD=r % tc.scale_ratio_k_step(1) == 0,
                 )
         ptrs = _advance(
             pc,
@@ -810,8 +814,8 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
             r,
             r,
             False,
-            A_SCALE_LOAD=r % tc.scale_step_ratio(0) == 0,
-            B_SCALE_LOAD=r % tc.scale_step_ratio(1) == 0,
+            A_SCALE_LOAD=r % tc.scale_ratio_k_step(0) == 0,
+            B_SCALE_LOAD=r % tc.scale_ratio_k_step(1) == 0,
         )
         buffers = _rotate_buffers(buffers, tc, r)
     acc = ()
@@ -834,8 +838,8 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
             regs,
             x + 1,
             x + 1,
-            A_SCALE_LOAD=(x + 1) % tc.scale_step_ratio(0) == 0,
-            B_SCALE_LOAD=(x + 1) % tc.scale_step_ratio(1) == 0,
+            A_SCALE_LOAD=(x + 1) % tc.scale_ratio_k_step(0) == 0,
+            B_SCALE_LOAD=(x + 1) % tc.scale_ratio_k_step(1) == 0,
             PHASE=x + 1,
         )
     for base in tl.range(0, unroll_end, unroll):
@@ -849,8 +853,8 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
                 None,
                 KI=u,
                 IN_LOOP=True,
-                A_SCALE_LOAD=(peeled + u + 1) % tc.scale_step_ratio(0) == 0,
-                B_SCALE_LOAD=(peeled + u + 1) % tc.scale_step_ratio(1) == 0,
+                A_SCALE_LOAD=(peeled + u + 1) % tc.scale_ratio_k_step(0) == 0,
+                B_SCALE_LOAD=(peeled + u + 1) % tc.scale_ratio_k_step(1) == 0,
                 PHASE=peeled + u + 1,
             )
     if require_constexpr(tc.UNROLL_EPILOGUE):
@@ -866,8 +870,8 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
                     None,
                     KI=u,
                     STATIC_PHASE=True,
-                    A_SCALE_LOAD=(peeled + u + 1) % tc.scale_step_ratio(0) == 0,
-                    B_SCALE_LOAD=(peeled + u + 1) % tc.scale_step_ratio(1) == 0,
+                    A_SCALE_LOAD=(peeled + u + 1) % tc.scale_ratio_k_step(0) == 0,
+                    B_SCALE_LOAD=(peeled + u + 1) % tc.scale_ratio_k_step(1) == 0,
                     PHASE=peeled + u + 1,
                 )
     else:
@@ -895,12 +899,12 @@ def _drain_buffered_pipeline(
         tc.num_buffers(0),
         tc.num_buffers(1),
         (
-            tc.num_buffers(0, True) * tc.scale_step_ratio(0)
+            tc.num_buffers(0, True) * tc.scale_ratio_k_step(0)
             if pc.func_cfg.a_has_scale()
             else 1
         ),
         (
-            tc.num_buffers(1, True) * tc.scale_step_ratio(1)
+            tc.num_buffers(1, True) * tc.scale_ratio_k_step(1)
             if pc.func_cfg.b_has_scale()
             else 1
         ),
@@ -929,10 +933,10 @@ def _drain_buffered_pipeline(
                         KI=p + j - _pipeline_peeled(tc),
                         STATIC_PHASE=True,
                         A_SCALE_LOAD=(pc.num_k - pipeline_depth(tc) + j + 1)
-                        % tc.scale_step_ratio(0)
+                        % tc.scale_ratio_k_step(0)
                         == 0,
                         B_SCALE_LOAD=(pc.num_k - pipeline_depth(tc) + j + 1)
-                        % tc.scale_step_ratio(1)
+                        % tc.scale_ratio_k_step(1)
                         == 0,
                         PHASE=pc.num_k - pipeline_depth(tc) + j + 1,
                     )
@@ -948,10 +952,10 @@ def _drain_buffered_pipeline(
                 DRAIN=True,
                 EPILOGUE_GROUPS=EPILOGUE_GROUPS,
                 A_SCALE_LOAD=(pc.num_k - pipeline_depth(tc) + j + 1)
-                % tc.scale_step_ratio(0)
+                % tc.scale_ratio_k_step(0)
                 == 0,
                 B_SCALE_LOAD=(pc.num_k - pipeline_depth(tc) + j + 1)
-                % tc.scale_step_ratio(1)
+                % tc.scale_ratio_k_step(1)
                 == 0,
                 PHASE=pc.num_k - pipeline_depth(tc) + j + 1,
             )

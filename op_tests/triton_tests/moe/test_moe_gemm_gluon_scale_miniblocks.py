@@ -53,8 +53,8 @@ def test_scale_mini_blocks_only_change_the_shuffled_operand(shuffled):
     for operand in range(2):
         assert tc.scale_mini_block_nonk(operand) == (128 if shuffled[operand] else 64)
         assert tc.scale_mini_block_k(operand) == (512 if shuffled[operand] else 128)
-        assert tc.scale_step_ratio(operand) == (4 if shuffled[operand] else 1)
-        assert tc.scale_tile_ratio(operand) == (2 if shuffled[operand] else 1)
+        assert tc.scale_ratio_k_step(operand) == (4 if shuffled[operand] else 1)
+        assert tc.scale_ratio_non_k_slot(operand) == (2 if shuffled[operand] else 1)
     assert tc.validate(4096, 7168)
 
 

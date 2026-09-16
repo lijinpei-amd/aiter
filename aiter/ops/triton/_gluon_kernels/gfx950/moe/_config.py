@@ -406,7 +406,7 @@ class KernelTuningConfig(_KernelTuningLayout):
     def buffer_live_span(self, operand, scale=False):
         """num of k-stage from lds/reg buffer is loaded to its use"""
         depth = self.num_buffers(operand, scale)
-        ratio = self.scale_step_ratio(operand) if _v(scale) else 1
+        ratio = self.scale_ratio_k_step(operand) if _v(scale) else 1
         return (depth - 1) * ratio + 1
 
     @gluon.constexpr_function
@@ -423,7 +423,7 @@ class KernelTuningConfig(_KernelTuningLayout):
             if self.func_cfg.has_scale(operand) and not self.scale_via_lds(operand):
                 period = math.lcm(
                     period,
-                    self.num_buffers(operand, True) * self.scale_step_ratio(operand),
+                    self.num_buffers(operand, True) * self.scale_ratio_k_step(operand),
                 )
         return period
 
@@ -537,7 +537,7 @@ class KernelTuningConfig(_KernelTuningLayout):
 
         if not _v(self.UNROLL_EPILOGUE):
             for idx in (0, 1):
-                assert not fc.has_scale(idx) or self.scale_step_ratio(idx) == 1, (
+                assert not fc.has_scale(idx) or self.scale_ratio_k_step(idx) == 1, (
                     "UNROLL_EPILOGUE=False requires every active scale to advance "
                     "once per payload step"
                 )
