@@ -197,7 +197,6 @@ def environment(case, tokens, gpu, specs):
         TRITON_CACHE_DIR=str(cache),
         FLYDSL_RUNTIME_CACHE_DIR=str(cache),
         FLYDSL_GPU_ARCH="gfx950",
-        TRITON_MEMBAR_DEDUP_BARE="1",
         TRITON_HIP_EXTERNAL_LLC=str(common.LLC),
         TRITON_HIP_EXTERNAL_LLC_FLAGS=common.LLC_FLAGS,
     )
