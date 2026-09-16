@@ -40,7 +40,7 @@ mismatch before preparing scales or launching the GEMM.
 | `SCALE_FILL_MID` | At a 2x2 mini-tile split, fill scales in the middle slots; wait counts use the same setting. |
 | `UNROLL_EPILOGUE` | Statically expand the live pipeline's finite main-loop remainder. Disable it to use a runtime remainder loop and reduce register pressure; the runtime loop requires every active scale to advance once per payload step. Defaults to `True`. |
 | `WAIT_COMMIT_SCHEME` | `PER_OP=1`, `PER_SLOT=2`, `PER_STAGE_WHOLE=3`, or `PER_STAGE_WARP_PIPELINE=4`; see the boundaries below. |
-| `B_IN_REG` | Load the B payload into registers with `buffer_load` at its normal global-load slot, bypassing LDS staging. Requires `B_PRESHUFFLED=True`. Defaults to `False`. |
+| `B_IN_REG` | Explicitly load the B payload into registers with `buffer_load` at its normal global-load slot, bypassing LDS staging. This explicit request requires `B_PRESHUFFLED=True`; an automatic register fallback for a small B tile does not. Defaults to `False`. |
 | `A_SCALE_IN_REG`, `B_SCALE_IN_REG` | Load the selected scale component directly into registers. Both options are independent of each other and of `B_IN_REG`; neither requires preshuffled B payload. Defaults to `False`. |
 | `A_NUM_BUFFER`, `B_NUM_BUFFER` | Number of pipeline buffers for each payload component. Omitted or zero values inherit `NUM_LDS_BUFFER`; each resolved active depth must be at least 2. |
 | `A_SCALE_NUM_BUFFER`, `B_SCALE_NUM_BUFFER` | Number of buffers for each active scale component, independent of the payload counts and at least 2 after inheritance. Absent scales do not participate in validation or scheduling. `A_SCALE_NUMB_BUFFER` is accepted as a dictionary/environment alias for `A_SCALE_NUM_BUFFER`. |
@@ -56,9 +56,20 @@ requested `K_UNROLL=4` becomes `UNROLL=12`, and requested `K_UNROLL=7` becomes
 `UNROLL=42`. Absent scales never participate. `FROZEN_STEP` retains its existing
 rejection of explicit component-depth and register-storage options.
 
-Let `PIPELINE_DEPTH` be the largest inclusive live span, measured in payload K
-steps, among active components. A payload with resolved ring depth `D` has live
-span `D`; a scale with K-Step ratio `R` has live span `(D - 1) * R + 1`.
+Pipeline code queries placement through `component_via_lds((operand, is_scale))`
+and its complement `component_in_reg(...)`. These are resolved physical-placement
+queries: they include explicit register flags and automatic layout fallbacks for
+small A/B payload or scale tiles. They do not encode whether a scale exists, so
+callers separately gate scale components with the operand format's `has_scale`
+predicate. The lower-level `payload_via_lds()` and `scale_via_lds()` accessors remain
+useful to layout and frozen-path code.
+
+Let `PIPELINE_DEPTH` be the largest baseline inclusive live span `L`, measured in
+payload K steps, among present components. For ring depth `D` and K-Step ratio `R`
+(`R=1` for payloads), `L = (D - 1) * R + 1`. An LDS-backed component has actual
+fill span `F=L`; every direct-register component has `F=L-1`. `PIPELINE_DEPTH`
+remains `max(L)`, while prologue/drain activity and producer-to-selection timing use
+`F`.
 `PEELED` is the number of initial main iterations needed before invariant
 steady-state waits. The first MFMA is always peeled, so `PEELED >= 1`; staggered
 warmup may require more. The host and device use the same issue-history helper
@@ -85,7 +96,9 @@ The component storage, buffer-depth, and read-placement fields also accept the
 config dictionary with `B_PRESHUFFLED=True`
 means the caller supplied weights in the existing 16-column-blocked order;
 `AITER_TRITON_MOE_GLUON_B_PRESHUFFLED=1` instead requests host preparation of raw
-weights. `B_IN_REG` without preshuffled weights raises an error.
+weights. Only an explicit `B_IN_REG=True` request without preshuffled weights raises
+an error. A B payload that resolves to registers automatically because its tile is
+too small for a legal LDS copy remains valid with ordinary, unshuffled weights.
 
 `PER_STAGE_WARP_PIPELINE` commits inside the last memory region in the K stage,
 after its memory work and before the final MFMA region. `PER_STAGE_WHOLE` commits
@@ -100,7 +113,10 @@ Per-stage schemes wait before the `ni`/`mi` slot walk; `PER_OP` and `PER_SLOT`
 wait before each slot's LDS reads. Wait counts follow each component's producer
 and the actual committed groups, including empty slot/stage groups during the
 prologue and drain. Direct-register loads own no LDS async-copy groups. Their
-register dependencies provide VMEM completion before use.
+register dependencies provide VMEM completion before use. A direct scale producer
+uses residue `(1-F) % R`, while selection remains on residue zero; this shifts its
+load one payload step later than the corresponding LDS producer without changing
+the scale block consumed by MFMA.
 
 Payload and scale placement are independent. Missing components emit no reads;
 components loaded directly into registers follow the same region selection.
@@ -184,6 +200,11 @@ own physical ring depth `D`, K-Step ratio `R`, LDS ring or register queue, and
 HBM pointer. B register loads occupy the same logical fill slot as B LDS copies.
 Scale register loads also use their configured fill slots, including
 `SCALE_FILL_MID`.
+
+Selection of a direct-register ring entry occurs `F-1` steps after its producer and
+MFMA consumes it on the following step. At the minimum `D=2`, `R=1` case, production
+and selection share a step; the producer is emitted first even when the configured
+read region would otherwise precede its fill slot.
 
 The prologue has `PIPELINE_DEPTH - 1` fill-only stages. A component with actual
 fill span `F = _fill_span(component)` begins after `PIPELINE_DEPTH - F` leading

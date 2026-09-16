@@ -12,8 +12,14 @@ from aiter.ops.triton.utils.common_utils import strip_annotate
 from ._config import KernelFuncConfig, KernelTuningConfig
 from ._lang import optional as _opt
 from ._lang import require_constexpr
+from ._types import A_PAYLOAD, A_SCALE, B_PAYLOAD, B_SCALE
 
 __all__ = ["LDSManager"]
+
+_A_PAYLOAD: gl.constexpr = gl.constexpr(A_PAYLOAD)
+_A_SCALE: gl.constexpr = gl.constexpr(A_SCALE)
+_B_PAYLOAD: gl.constexpr = gl.constexpr(B_PAYLOAD)
+_B_SCALE: gl.constexpr = gl.constexpr(B_SCALE)
 
 
 @gluon.jit
@@ -125,7 +131,7 @@ class LDSManager:
         a_ty: gl.constexpr = func_cfg.operand_elem_ty(0)
         b_ty: gl.constexpr = func_cfg.operand_elem_ty(1)
 
-        if require_constexpr(tuning_cfg.payload_via_lds(0)):
+        if require_constexpr(tuning_cfg.component_via_lds(_A_PAYLOAD)):
             a_payload_lds_ptr = gl.allocate_shared_memory(
                 a_ty,
                 tuning_cfg.payload_lds_shape_block(0),
@@ -133,7 +139,7 @@ class LDSManager:
             )
         else:
             a_payload_lds_ptr: gl.constexpr = None
-        if require_constexpr(tuning_cfg.payload_via_lds(1)):
+        if require_constexpr(tuning_cfg.component_via_lds(_B_PAYLOAD)):
             b_payload_lds_ptr = gl.allocate_shared_memory(
                 b_ty,
                 tuning_cfg.payload_lds_shape_block(1),
@@ -141,7 +147,9 @@ class LDSManager:
             )
         else:
             b_payload_lds_ptr: gl.constexpr = None
-        if require_constexpr(func_cfg.has_scale(0) and tuning_cfg.scale_via_lds(0)):
+        if require_constexpr(
+            func_cfg.has_scale(0) and tuning_cfg.component_via_lds(_A_SCALE)
+        ):
             a_scale_lds_ptr = gl.allocate_shared_memory(
                 gl.uint8,
                 tuning_cfg.scale_lds_shape_block(0),
@@ -149,7 +157,9 @@ class LDSManager:
             )
         else:
             a_scale_lds_ptr: gl.constexpr = None
-        if require_constexpr(func_cfg.has_scale(1) and tuning_cfg.scale_via_lds(1)):
+        if require_constexpr(
+            func_cfg.has_scale(1) and tuning_cfg.component_via_lds(_B_SCALE)
+        ):
             b_scale_lds_ptr = gl.allocate_shared_memory(
                 gl.uint8,
                 tuning_cfg.scale_lds_shape_block(1),
@@ -234,7 +244,7 @@ class LDSManager:
         if require_constexpr(VIA_LDS):
             if require_constexpr(
                 self.func_cfg.has_scale(operand)
-                and cfg.scale_via_lds(operand)
+                and cfg.component_via_lds((operand, True))
                 and tile % ratio == 0
             ):
                 if require_constexpr(operand == 0):
@@ -252,7 +262,7 @@ class LDSManager:
                 )
         else:
             gl.static_assert(self.func_cfg.has_scale(operand))
-            gl.static_assert(not cfg.scale_via_lds(operand))
+            gl.static_assert(not cfg.component_via_lds((operand, True)))
             if require_constexpr(cfg.scale_shuffled(operand)):
                 if require_constexpr(cfg.scale_packed_ok(operand)):
                     scale = gl.amd.cdna4.buffer_load(
@@ -400,7 +410,7 @@ class LDSManager:
             )
         if require_constexpr(READ_SCALE and self.func_cfg.has_scale(operand)):
             gl.static_assert(
-                cfg.scale_via_lds(operand),
+                cfg.component_via_lds((operand, True)),
                 "ds_read_frag only reads LDS-staged scales",
             )
             ratio: gl.constexpr = cfg.scale_ratio_non_k_slot(operand)

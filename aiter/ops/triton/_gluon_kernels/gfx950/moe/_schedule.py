@@ -12,30 +12,78 @@ from triton.experimental import gluon
 
 from ._lang import unwrap as _v
 from ._layout import _slot_index
-from ._types import WaitCommitScheme
+from ._types import (
+    A_PAYLOAD,
+    A_SCALE,
+    B_PAYLOAD,
+    B_SCALE,
+    COMPONENTS,
+    OPERANDS,
+    PAYLOAD,
+    SCALE,
+    A,
+    B,
+    WaitCommitScheme,
+)
 
-A = 0
-B = 1
-PAYLOAD = False
-SCALE = True
+__all__ = [
+    "A_PAYLOAD",
+    "A_SCALE",
+    "B_PAYLOAD",
+    "B_SCALE",
+    "COMPONENTS",
+    "OPERANDS",
+    "PAYLOAD",
+    "SCALE",
+    "A",
+    "B",
+]
 
-A_PAYLOAD = (A, PAYLOAD)
-A_SCALE = (A, SCALE)
-B_PAYLOAD = (B, PAYLOAD)
-B_SCALE = (B, SCALE)
 
-OPERANDS = (A, B)
-# Explicit issue order; PER_OP wait counts depend on this ordering.
-COMPONENTS = (A_PAYLOAD, A_SCALE, B_PAYLOAD, B_SCALE)
+@gluon.constexpr_function
+def _present(tc, component):
+    """Whether a component exists for this operand-format pair."""
+    operand, is_scale = component[0], component[1]
+    return not _v(is_scale) or tc.func_cfg.has_scale(operand)
+
+
+@gluon.constexpr_function
+def _component_depth(tc, component):
+    operand, is_scale = component[0], component[1]
+    return tc.num_buffers(operand, is_scale)
+
+
+@gluon.constexpr_function
+def _component_ratio(tc, component):
+    operand, is_scale = component[0], component[1]
+    return tc.scale_ratio_k_step(operand) if _v(is_scale) else 1
+
+
+@gluon.constexpr_function
+def _live_span(tc, component):
+    """Baseline inclusive lifetime ``L(c)`` in payload K steps."""
+    return (_component_depth(tc, component) - 1) * _component_ratio(tc, component) + 1
+
+
+@gluon.constexpr_function
+def _via_lds(tc, component):
+    """Resolved placement for one payload or scale component."""
+    return tc.component_via_lds(component)
+
+
+@gluon.constexpr_function
+def _in_reg(tc, component):
+    """Resolved direct-register placement for one present component."""
+    return tc.component_in_reg(component)
 
 
 @gluon.constexpr_function
 def pipeline_depth(tc):
     """Largest prefetch span, measured in payload steps, of active components."""
-    depth = max(tc.buffer_live_span(A), tc.buffer_live_span(B))
-    for operand in OPERANDS:
-        if tc.func_cfg.has_scale(operand):
-            depth = max(depth, tc.buffer_live_span(operand, True))
+    depth = 0
+    for component in COMPONENTS:
+        if _present(tc, component):
+            depth = max(depth, _live_span(tc, component))
     return depth
 
 
@@ -51,12 +99,12 @@ def pipeline_unroll(tc):
     requested = _v(tc.K_UNROLL)
     assert requested >= 1, "K_UNROLL must be at least 1"
     period = requested
-    for operand in OPERANDS:
-        period = math.lcm(period, tc.num_buffers(operand))
-        if tc.func_cfg.has_scale(operand):
-            scale_depth = tc.num_buffers(operand, True)
-            scale_ratio = tc.scale_ratio_k_step(operand)
-            period = math.lcm(period, scale_depth * scale_ratio)
+    for component in COMPONENTS:
+        if _present(tc, component):
+            period = math.lcm(
+                period,
+                _component_depth(tc, component) * _component_ratio(tc, component),
+            )
     return period
 
 
@@ -146,6 +194,66 @@ def _scale_buffer_load_tile(mi, ni, NM, NN, want_a, SCALE_FILL_MID=False):
 
 
 @gluon.constexpr_function
+def _component_fill_slot(tc, component, tile):
+    """Flattened slot that owns one component/non-K-tile producer."""
+    operand, is_scale = component[0], component[1]
+    nm, nn = tc.num_m_slots_per_block(), tc.num_n_slots_per_block()
+    if _v(is_scale):
+        return _scale_buffer_load_slot(
+            operand == A, tile, nm, nn, tc.SCALE_FILL_MID
+        )
+    return _payload_buffer_load_slot(operand == A, tile, nm, nn)
+
+
+@gluon.constexpr_function
+def _component_nominal_read_slot(tc, component, tile):
+    """Payload-owned slot at which a component would normally be selected."""
+    operand = component[0]
+    return _payload_buffer_load_slot(
+        operand == A,
+        tile,
+        tc.num_m_slots_per_block(),
+        tc.num_n_slots_per_block(),
+    )
+
+
+@gluon.constexpr_function
+def _component_read_slot(tc, component, tile):
+    """Legal selection slot after accounting for a same-step register producer."""
+    nominal = _component_nominal_read_slot(tc, component, tile)
+    if _in_reg(tc, component) and _fill_span(tc, component) == 1:
+        producer = _component_fill_slot(tc, component, tile)
+        if producer > nominal:
+            return producer
+    return nominal
+
+
+@gluon.constexpr_function
+def _component_read_tile(tc, component, mi, ni):
+    """Non-K tile selected in this slot, or ``None`` when this component is idle."""
+    if not _present(tc, component):
+        return None
+    operand, is_scale = component[0], component[1]
+    count = (
+        tc.num_m_slots_per_block()
+        if operand == A
+        else tc.num_n_slots_per_block()
+    )
+    slot = _slot_index(
+        mi,
+        ni,
+        tc.num_m_slots_per_block(),
+        tc.num_n_slots_per_block(),
+    )
+    for tile in range(count):
+        if _v(is_scale) and tile % tc.scale_ratio_non_k_slot(operand) != 0:
+            continue
+        if _component_read_slot(tc, component, tile) == slot:
+            return tile
+    return None
+
+
+@gluon.constexpr_function
 def _ops(tc, mi, ni):
     """Tiles in ``COMPONENTS`` order, including direct-register destinations."""
     nm, nn = tc.num_m_slots_per_block(), tc.num_n_slots_per_block()
@@ -154,7 +262,7 @@ def _ops(tc, mi, ni):
     for operand in OPERANDS:
         ops.append(_buffer_load_tile(pos, nm, nn, operand == A))
         tile = None
-        if tc.func_cfg.has_scale(operand):
+        if _present(tc, (operand, SCALE)):
             tile = _scale_buffer_load_tile(
                 mi, ni, nm, nn, operand == A, tc.SCALE_FILL_MID
             )
@@ -166,27 +274,23 @@ def _ops(tc, mi, ni):
 
 @gluon.constexpr_function
 def _fill_span(tc, component):
-    """Number of read stages between startup and the final fill.
-
-    Direct B has ``NB`` physical banks but only an ``NB - 1`` stage producer
-    span: while MFMA consumes B[k], HBM fills B[k + NB - 1]. LDS payloads
-    retain the extra copy/read stage.
-    """
-    operand, is_scale = component[0], component[1]
-    span = tc.buffer_live_span(operand, is_scale)
-    if operand == B and not is_scale and not tc.payload_via_lds(B):
+    """Actual inclusive producer-to-selection span ``F(c)`` in payload steps."""
+    span = _live_span(tc, component)
+    if _in_reg(tc, component):
         span -= 1
     return span
 
 
 @gluon.constexpr_function
-def _read_payload_after_fill(tc, operand):
-    """Whether this step's payload registers are selected after its HBM fill."""
-    return tc.ds_read_in_mfma(operand) or (
-        operand == B
-        and not tc.payload_via_lds(operand)
-        and tc.num_buffers(operand) == 2
-    )
+def _read_in_mfma(tc, component, tile):
+    """Effective read region, including mandatory same-step fill ordering."""
+    operand, is_scale = component[0], component[1]
+    configured = tc.ds_read_in_mfma(operand, is_scale)
+    if not _in_reg(tc, component) or _fill_span(tc, component) != 1:
+        return configured
+    return configured or _component_read_slot(
+        tc, component, tile
+    ) == _component_fill_slot(tc, component, tile)
 
 
 @gluon.constexpr_function
@@ -197,27 +301,41 @@ def _active(tc, component, stage, drain=False):
     absolute read stage and gates only staggered prologue startup. In the
     drain it is the zero-based drain iteration, independent of runtime K.
     """
-    operand, is_scale = component[0], component[1]
-    if is_scale and not tc.func_cfg.has_scale(operand):
+    if not _present(tc, component):
         return False
-    depth = _fill_span(tc, component)
+    span = _fill_span(tc, component)
     if drain:
-        return stage < pipeline_depth(tc) - depth
-    return stage is None or stage + depth - 1 >= 0
+        return stage < pipeline_depth(tc) - span
+    return stage is None or stage + span - 1 >= 0
 
 
 @gluon.constexpr_function
-def _async(tc, component):
-    """Direct-register loads own no LDS async-copy group."""
-    operand, is_scale = component[0], component[1]
-    return tc.scale_via_lds(operand) if is_scale else tc.payload_via_lds(operand)
+def _producer_phase(tc, component):
+    """Payload-step residue on which this component issues its producer load."""
+    return (1 - _fill_span(tc, component)) % _component_ratio(tc, component)
 
 
 @gluon.constexpr_function
 def _loads_at_phase(tc, component, phase):
     """Whether a component issues a load at this K-step phase."""
-    operand, is_scale = component[0], component[1]
-    return not is_scale or phase % tc.scale_ratio_k_step(operand) == 0
+    return _present(tc, component) and (
+        phase % _component_ratio(tc, component) == _producer_phase(tc, component)
+    )
+
+
+@gluon.constexpr_function
+def _reads_at_phase(tc, component, phase):
+    """Whether this step selects a new value for the component."""
+    return _present(tc, component) and phase % _component_ratio(tc, component) == 0
+
+
+@gluon.constexpr_function
+def _has_register_component(tc):
+    """Whether any present live component uses a direct-register ring."""
+    for component in COMPONENTS:
+        if _present(tc, component) and _in_reg(tc, component):
+            return True
+    return False
 
 
 @gluon.constexpr_function
@@ -232,7 +350,7 @@ def _groups(tc, stage, drain=False, phase=None):
                 for component, tile in zip(COMPONENTS, _ops(tc, mi, ni))
                 if tile is not None
                 and _active(tc, component, stage, drain)
-                and _async(tc, component)
+                and _via_lds(tc, component)
                 and _loads_at_phase(tc, component, phase)
             )
             if tc.commit_per_op():
@@ -270,28 +388,17 @@ def _wait(tc, stage, slot, drain=False, epilogue_groups=0, phase=None):
         for mi in range(nm):
             if slot is not None and _slot_index(mi, ni, nm, nn) != slot:
                 continue
-            for operand in OPERANDS:
-                tile = (
-                    _ds_read_a_tile(mi, ni, nm, nn)
-                    if operand == A
-                    else _ds_read_b_tile(mi, ni, nm, nn)
-                )
+            for component in COMPONENTS:
+                tile = _component_read_tile(tc, component, mi, ni)
                 if tile is None:
                     continue
-                if tc.payload_via_lds(operand):
-                    required.append(
-                        (r - tc.num_buffers(operand) + 1, (operand, PAYLOAD), tile)
-                    )
-                if (
-                    tc.func_cfg.has_scale(operand)
-                    and tc.scale_via_lds(operand)
-                    and phase % tc.scale_ratio_k_step(operand) == 0
-                    and tile % tc.scale_ratio_non_k_slot(operand) == 0
+                if _via_lds(tc, component) and _reads_at_phase(
+                    tc, component, phase
                 ):
                     required.append(
                         (
-                            r - tc.buffer_live_span(operand, True) + 1,
-                            (operand, SCALE),
+                            r - _fill_span(tc, component) + 1,
+                            component,
                             tile,
                         )
                     )
@@ -333,7 +440,7 @@ def _buffer_load_ops(tc, mi, ni):
     for operand in OPERANDS:
         ops.append(_buffer_load_tile(pos, NM, NN, operand == A))
         scale_tile = None
-        if tc.func_cfg.has_scale(operand) and tc.scale_via_lds(operand):
+        if _present(tc, (operand, SCALE)) and _via_lds(tc, (operand, SCALE)):
             scale_tile = _scale_buffer_load_tile(
                 mi, ni, NM, NN, operand == A, tc.SCALE_FILL_MID
             )
@@ -364,7 +471,7 @@ def _buffer_load_group_schedule(tc):
             ops = tuple(
                 (component, tile)
                 for component, tile in zip(COMPONENTS, _buffer_load_ops(tc, mi, ni))
-                if tile is not None and _async(tc, component)
+                if tile is not None and _via_lds(tc, component)
             )
             if scheme == int(WaitCommitScheme.PER_OP):
                 groups = tuple((op,) for op in ops)
@@ -393,18 +500,12 @@ def _buffer_load_wait(tc, mi, ni, STAGES_BETWEEN, DO_BUFFER_LOAD):
     schedule = _buffer_load_group_schedule(tc)
     groups = tuple(group for entry in schedule for group in entry)
     required = []
-    for operand in OPERANDS:
-        tile = _buffer_load_tile(_buffer_load_pos(mi, ni, NM, NN), NM, NN, operand == A)
+    for component in COMPONENTS:
+        tile = _component_read_tile(tc, component, mi, ni)
         if tile is None:
             continue
-        if tc.payload_via_lds(operand):
-            required.append(((operand, PAYLOAD), tile))
-        if (
-            tc.func_cfg.has_scale(operand)
-            and tc.scale_via_lds(operand)
-            and tile % tc.scale_ratio_non_k_slot(operand) == 0
-        ):
-            required.append(((operand, SCALE), tile))
+        if _via_lds(tc, component):
+            required.append((component, tile))
     if not required:
         return None
     latest = max(

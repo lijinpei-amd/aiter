@@ -893,6 +893,29 @@ class _KernelTuningLayout:
         return shape[0] * shape[1] >= WARP_SIZE * vec * self.num_warps()
 
     @gluon.constexpr_function
+    def component_via_lds(self, component):
+        """Resolved LDS placement for ``(operand, is_scale)``.
+
+        The component-level result includes both explicit register requests and
+        automatic layout fallbacks.  Keep the payload/scale accessors above as the
+        narrow layout-policy implementations and use this method wherever pipeline
+        behavior depends on the resolved placement.
+        """
+        component = _v(component)
+        operand, is_scale = _v(component[0]), bool(_v(component[1]))
+        assert operand in (0, 1), "component operand must be 0 (A) or 1 (B)"
+        return (
+            self.scale_via_lds(operand)
+            if is_scale
+            else self.payload_via_lds(operand)
+        )
+
+    @gluon.constexpr_function
+    def component_in_reg(self, component):
+        """Resolved register placement; callers separately gate absent scales."""
+        return not self.component_via_lds(component)
+
+    @gluon.constexpr_function
     def dot_result_fragment_layout(self):
         """AMDMFMALayout for dot / scaled-dot results in register.
 

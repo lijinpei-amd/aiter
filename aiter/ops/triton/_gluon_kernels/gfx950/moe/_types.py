@@ -28,8 +28,18 @@ from ._lang import (
 )
 
 __all__ = [
+    "A_PAYLOAD",
+    "A_SCALE",
+    "B_PAYLOAD",
+    "B_SCALE",
+    "COMPONENTS",
+    "OPERANDS",
+    "PAYLOAD",
+    "SCALE",
+    "A",
     "ActKind",
     "ActivationSpec",
+    "B",
     "DSReadOperand",
     "DotKind",
     "DtypeQuant",
@@ -52,6 +62,22 @@ __all__ = [
     "dq_pack_divisor",
     "dq_uses_mfma_scaled",
 ]
+
+
+A = 0
+B = 1
+PAYLOAD = False
+SCALE = True
+
+A_PAYLOAD = (A, PAYLOAD)
+A_SCALE = (A, SCALE)
+B_PAYLOAD = (B, PAYLOAD)
+B_SCALE = (B, SCALE)
+
+OPERANDS = (A, B)
+# Canonical component order. The live schedule also uses this as its copy issue
+# order, so changing it requires updating PER_OP wait-count expectations.
+COMPONENTS = (A_PAYLOAD, A_SCALE, B_PAYLOAD, B_SCALE)
 
 
 class ActKind(IntEnum):
@@ -164,9 +190,11 @@ class TuningSpec(NamedTuple):
     SOFF_UNROLL: bool = False
     #: At a 2x2 mini-tile split, fill scales in the two middle slots.
     SCALE_FILL_MID: bool = False
-    #: Load preshuffled B directly into registers at its global-load slot.
+    #: Force preshuffled B directly into registers at its global-load slot. Either
+    #: payload may also resolve to registers automatically when its LDS copy is illegal.
     B_IN_REG: bool = False
-    #: Scale storage is independent of B payload storage and of the other scale.
+    #: Force direct-register scale storage independently for each operand. A scale may
+    #: also resolve to registers automatically when its LDS copy is not legal.
     B_SCALE_IN_REG: bool = False
     A_SCALE_IN_REG: bool = False
     #: Per-component ring depths. Zero inherits NUM_LDS_BUFFER; every active

@@ -11,6 +11,8 @@ import pytest
 import torch
 
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
+    A_PAYLOAD,
+    B_PAYLOAD,
     _pipeline_peeled,
     pipeline_depth,
     pipeline_unroll,
@@ -296,8 +298,8 @@ def test_small_a_payload_uses_register_ring(monkeypatch):
         K_UNROLL=3,
     )
     tc = host._probe_tuning_config(config, DtypeQuant.BF16, DtypeQuant.BF16)
-    assert not host._cval(tc.payload_via_lds(0))
-    assert host._cval(tc.payload_via_lds(1))
+    assert host._cval(tc.component_in_reg(A_PAYLOAD))
+    assert host._cval(tc.component_via_lds(B_PAYLOAD))
 
     kernel = _launch_register_case(case, config)
     torch.testing.assert_close(case.output[0], case.expected, rtol=3e-4, atol=3e-5)
@@ -330,8 +332,8 @@ def test_small_b_payload_uses_register_ring_without_preshuffle(monkeypatch):
         B_PRESHUFFLED=False,
     )
     tc = host._probe_tuning_config(config, DtypeQuant.BF16, DtypeQuant.BF16)
-    assert host._cval(tc.payload_via_lds(0))
-    assert not host._cval(tc.payload_via_lds(1))
+    assert host._cval(tc.component_via_lds(A_PAYLOAD))
+    assert host._cval(tc.component_in_reg(B_PAYLOAD))
 
     kernel = _launch_register_case(case, config)
     torch.testing.assert_close(case.output[0], case.expected, rtol=3e-4, atol=3e-5)
@@ -364,8 +366,8 @@ def test_small_a_and_b_payloads_share_register_pipeline(monkeypatch):
         B_PRESHUFFLED=False,
     )
     tc = host._probe_tuning_config(config, DtypeQuant.BF16, DtypeQuant.BF16)
-    assert not host._cval(tc.payload_via_lds(0))
-    assert not host._cval(tc.payload_via_lds(1))
+    assert host._cval(tc.component_in_reg(A_PAYLOAD))
+    assert host._cval(tc.component_in_reg(B_PAYLOAD))
 
     kernel = _launch_register_case(case, config)
     torch.testing.assert_close(case.output[0], case.expected, rtol=3e-4, atol=3e-5)
