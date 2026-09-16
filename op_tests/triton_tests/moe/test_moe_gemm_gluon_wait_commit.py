@@ -21,6 +21,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
     PAYLOAD,
     SCALE,
     A,
+    B,
     _buffer_load_group_schedule,
     _buffer_load_groups,
     _buffer_load_ops,
@@ -75,6 +76,17 @@ class _ScheduleConfig:
 
     def scale_via_lds(self, idx):
         return self.scale_async[idx]
+
+    def component_via_lds(self, component):
+        operand, is_scale = component
+        return (
+            self.scale_via_lds(operand)
+            if is_scale
+            else self.payload_via_lds(operand)
+        )
+
+    def component_in_reg(self, component):
+        return not self.component_via_lds(component)
 
     def scale_shuffled(self, idx):
         return idx == 0 and self.a_scale_ratio > 1
@@ -163,12 +175,14 @@ def _reference_slots(tc):
         operand, is_scale = component
         assert not is_scale
         copies[slot].append((component, tile))
-        if tc.payload_async[operand]:
+        if tc.component_via_lds(component):
             reads[slot].add((component, tile))
-        if not (tc.scales[operand] and tc.scale_async[operand]):
+        scale_component = (operand, SCALE)
+        if not (
+            tc.has_scale(operand) and tc.component_via_lds(scale_component)
+        ):
             continue
         owner = tile - tile % tc.a_scale_ratio if operand == A else tile
-        scale_component = (operand, SCALE)
         if tile == owner:
             reads[slot].add((scale_component, owner))
             scale_slot = (
@@ -189,8 +203,7 @@ def _reference_slots(tc):
 def _reference_groups(tc, copies):
     def is_async(copy):
         component, _ = copy
-        operand, is_scale = component
-        return tc.scale_async[operand] if is_scale else tc.payload_async[operand]
+        return tc.component_via_lds(component)
 
     asynchronous = [tuple(copy for copy in slot if is_async(copy)) for slot in copies]
     if tc.WAIT_COMMIT_SCHEME == WaitCommitScheme.PER_OP:
@@ -263,7 +276,13 @@ def _trace_emitter(tc, monkeypatch, defer_stage_commit=False):
     tc.num_buffers = lambda operand, scale=False: 3
     tc.pipeline_peeled = lambda: 1
     tc.pipeline_register_period = lambda: (
-        3 if any(tc.has_scale(op) and not tc.scale_via_lds(op) for op in (0, 1)) else 1
+        3
+        if any(
+            (not component[1] or tc.has_scale(component[0]))
+            and tc.component_in_reg(component)
+            for component in COMPONENTS
+        )
+        else 1
     )
     tc.num_k_slots_per_tile = lambda: 1
     tc.operand_elem_ty = lambda operand: SimpleNamespace(primitive_bitwidth=8)
@@ -290,10 +309,14 @@ def _trace_emitter(tc, monkeypatch, defer_stage_commit=False):
         b_scale_hbm_ptr=4,
     )
     buffers = (
-        (0,) * (3 * tc.nm) if not tc.payload_via_lds(0) else (),
-        (0,) * (3 * tc.nn) if not tc.payload_via_lds(1) else (),
-        (0,) * (3 * tc.nm),
-        (0,) * (3 * tc.nn),
+        (0,) * (3 * tc.nm) if tc.component_in_reg(A_PAYLOAD) else (),
+        (0,) * (3 * tc.nn) if tc.component_in_reg(B_PAYLOAD) else (),
+        (0,) * (3 * tc.nm)
+        if tc.has_scale(A) and tc.component_in_reg(A_SCALE)
+        else (),
+        (0,) * (3 * tc.nn)
+        if tc.has_scale(B) and tc.component_in_reg(B_SCALE)
+        else (),
     )
 
     def check_assumption(value):

@@ -644,6 +644,16 @@ def test_register_storage_options_are_independent(config, storage_mask):
     assert _plain(tc.payload_via_lds(1)) is not bool(storage_mask & 1)
     assert _plain(tc.scale_via_lds(0)) is not bool(storage_mask & 4)
     assert _plain(tc.scale_via_lds(1)) is not bool(storage_mask & 2)
+    expected_via_lds = {
+        A_PAYLOAD: True,
+        A_SCALE: not bool(storage_mask & 4),
+        B_PAYLOAD: not bool(storage_mask & 1),
+        B_SCALE: not bool(storage_mask & 2),
+    }
+    for component in COMPONENTS:
+        via_lds = expected_via_lds[component]
+        assert _plain(tc.component_via_lds(component)) is via_lds
+        assert _plain(tc.component_in_reg(component)) is not via_lds
     # Full-block byte counts make a shared scale fill tile and mini-tile splitting
     # irrelevant to the allocation budget. Register storage removes only its own
     # allocation; every remaining component uses its individual ring depth.
@@ -734,8 +744,12 @@ def test_small_payload_tiles_use_register_rings(config):
         )
     )
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    assert not _plain(tc.payload_via_lds(0))
-    assert not _plain(tc.payload_via_lds(1))
+    assert _plain(tc.component_in_reg(A_PAYLOAD))
+    assert _plain(tc.component_in_reg(B_PAYLOAD))
+    assert not _plain(tc.component_via_lds(A_PAYLOAD))
+    assert not _plain(tc.component_via_lds(B_PAYLOAD))
+    assert not config["B_IN_REG"]
+    assert not config["B_PRESHUFFLED"]
     assert _plain(tc.pipeline_register_period()) == 6
     assert _plain(tc.lds_bytes()) == 0
     assert _plain(_validate(tc, 64, 512))
@@ -769,6 +783,15 @@ def test_absent_scales_do_not_participate_in_depth_unroll_or_validation(
         )
     )
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
+    # Placement accessors describe physical policy only. The absent scale streams
+    # are still gated by the function configuration at every scheduling caller.
+    assert _plain(tc.component_in_reg(A_SCALE))
+    assert _plain(tc.component_in_reg(B_SCALE))
+    for ni in range(tc.num_n_slots_per_block()):
+        for mi in range(tc.num_m_slots_per_block()):
+            ops = buffered_ops(tc, mi, ni)
+            assert ops[COMPONENTS.index(A_SCALE)] is None
+            assert ops[COMPONENTS.index(B_SCALE)] is None
     assert _plain(pipeline_depth(tc)) == 4
     assert _plain(pipeline_unroll(tc)) == 12
     assert _plain(host._validate_selected_pipeline(tc, 7168))
@@ -842,6 +865,10 @@ def test_register_weights_require_preshuffle(config):
 def test_independent_register_scales_are_supported(config):
     config.update(A_SCALE_IN_REG=True, B_SCALE_IN_REG=True)
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
+    assert _plain(tc.component_in_reg(A_SCALE))
+    assert _plain(tc.component_in_reg(B_SCALE))
+    assert _plain(tc.component_via_lds(A_PAYLOAD))
+    assert _plain(tc.component_via_lds(B_PAYLOAD))
     assert _plain(_validate(tc, 4096, 7168))
 
 
@@ -1018,9 +1045,10 @@ def _audit_buffer_schedule(tc, num_k, epilogue_groups=0):
     """Compare group waits with a complete chronological copy/read simulation.
 
     The oracle records absolute K tiles and group sequence numbers. It does not
-    use the producer-stage arithmetic or truncated timeline used by _wait.
-    Register queues hold symbolic tile numbers, so every read also checks that
-    warmup, rotation, and drain deliver exactly the current K tile.
+    use the producer-stage arithmetic or truncated timeline used by _wait. It
+    verifies direct-register selection against the independent producer history;
+    the buffered-pipeline oracle separately checks exact ring-bank contents and
+    overwrite safety.
     """
     nm, nn = _plain(tc.num_m_slots_per_block()), _plain(tc.num_n_slots_per_block())
     nslots = nm * nn
@@ -1038,24 +1066,31 @@ def _audit_buffer_schedule(tc, num_k, epilogue_groups=0):
                 payloads.append((A_PAYLOAD, tile))
             if tile < nn:
                 payloads.append((B_PAYLOAD, tile))
-    depths = {}
-    async_component = {}
+    has_scale = {operand: _plain(tc.func_cfg.has_scale(operand)) for operand in (A, B)}
+    depths, ratios, via_lds, fill_spans, producer_phases = {}, {}, {}, {}, {}
     for component in COMPONENTS:
         operand, is_scale = component
         depths[component] = _plain(tc.num_buffers(operand, is_scale))
-        async_component[component] = _plain(
-            tc.scale_via_lds(operand) if is_scale else tc.payload_via_lds(operand)
+        ratios[component] = (
+            _plain(tc.scale_ratio_k_step(operand)) if is_scale else 1
         )
-    has_scale = {operand: _plain(tc.func_cfg.has_scale(operand)) for operand in (A, B)}
-    shared_a = (
-        _plain(tc.scale_ratio_non_k_slot(A)) if _plain(tc.scale_shuffled(A)) else 1
-    )
+        via_lds[component] = _plain(tc.component_via_lds(component))
+        live_span = (depths[component] - 1) * ratios[component] + 1
+        fill_spans[component] = live_span - int(not via_lds[component])
+        producer_phases[component] = (1 - fill_spans[component]) % ratios[component]
+    non_k_ratios = {
+        operand: _plain(tc.scale_ratio_non_k_slot(operand)) for operand in (A, B)
+    }
+    payload_slots = {
+        (component, tile): slot
+        for slot, (component, tile) in enumerate(payloads)
+    }
     fill_slots = [[] for _ in range(nslots)]
     for slot, (component, tile) in enumerate(payloads):
         operand, is_scale = component
         assert not is_scale
         fill_slots[slot].append((component, tile))
-        if not has_scale[operand] or (operand == A and tile % shared_a):
+        if not has_scale[operand] or tile % non_k_ratios[operand]:
             continue
         scale_slot = (
             tile + 1 if (nm, nn) == (2, 2) and _plain(tc.SCALE_FILL_MID) else slot
@@ -1071,6 +1106,18 @@ def _audit_buffer_schedule(tc, num_k, epilogue_groups=0):
         tuple(sorted(ops, key=lambda copy: component_rank[copy[0]]))
         for ops in fill_slots
     ]
+    fill_slot_for = {
+        copy: slot for slot, copies in enumerate(fill_slots) for copy in copies
+    }
+    read_slots = [[] for _ in range(nslots)]
+    for copy, fill_slot in fill_slot_for.items():
+        component, tile = copy
+        nominal = payload_slots[((component[0], False), tile)]
+        read_slot = nominal
+        if not via_lds[component] and fill_spans[component] == 1:
+            read_slot = max(read_slot, fill_slot)
+        assert all(existing[0] != component for existing in read_slots[read_slot])
+        read_slots[read_slot].append(copy)
     for slot, expected in enumerate(fill_slots):
         actual = buffered_ops(tc, slot % nm, slot // nm)
         assert (
@@ -1082,13 +1129,7 @@ def _audit_buffer_schedule(tc, num_k, epilogue_groups=0):
             == expected
         )
 
-    committed, group_for_copy, issued, lds = [], {}, set(), {}
-    queues = {
-        (component, tile): [None] * depths[component]
-        for ops in fill_slots
-        for component, tile in ops
-        if not async_component[component]
-    }
+    committed, group_for_copy, issued, consumed, lds = [], {}, set(), set(), {}
     depth = _plain(pipeline_depth(tc))
     main = num_k - depth
     peeled = _plain(_pipeline_peeled(tc))
@@ -1101,20 +1142,15 @@ def _audit_buffer_schedule(tc, num_k, epilogue_groups=0):
 
     def required_copies(stage, slot):
         need = []
-        for pos, (component, tile) in enumerate(payloads):
-            if slot is not None and pos != slot:
-                continue
-            operand, is_scale = component
-            assert not is_scale
-            need.append((component, tile, stage))
-            if has_scale[operand]:
-                owner = tile - tile % shared_a if operand == A else tile
-                if tile == owner:
-                    need.append(((operand, SCALE), owner, stage))
+        slots = range(nslots) if slot is None else (slot,)
+        for read_slot in slots:
+            for component, tile in read_slots[read_slot]:
+                if stage % ratios[component] == 0:
+                    need.append((component, tile, stage))
         return need
 
     def check_wait(stage, slot):
-        required = [copy for copy in required_copies(stage, slot) if async_component[copy[0]]]
+        required = [copy for copy in required_copies(stage, slot) if via_lds[copy[0]]]
         expected = (
             len(committed) - 1 - max(group_for_copy[copy] for copy in required)
             if required
@@ -1123,25 +1159,28 @@ def _audit_buffer_schedule(tc, num_k, epilogue_groups=0):
         draining = stage > main
         relative_stage = stage - main - 1 if draining else stage
         assert (
-            buffered_wait(tc, relative_stage, slot, draining, epilogue_groups)
+            buffered_wait(
+                tc, relative_stage, slot, draining, epilogue_groups, phase=stage
+            )
             == expected
         )
         if peeled + 1 <= stage <= main:
-            assert buffered_wait(tc, None, slot) == expected
+            assert buffered_wait(tc, None, slot, phase=stage) == expected
 
     for stage in range(1 - depth, num_k):
         pending_stage = []
         expected_groups = []
         stage_copies = [
             tuple(
-                (component, tile, stage + depths[component] - 1)
+                (component, tile, stage + fill_spans[component] - 1)
                 for component, tile in ops
-                if 0 <= stage + depths[component] - 1 < num_k
+                if stage % ratios[component] == producer_phases[component]
+                and 0 <= stage + fill_spans[component] - 1 < num_k
             )
             for ops in fill_slots
         ]
         for slot, copies in enumerate(stage_copies):
-            asynchronous = tuple(copy for copy in copies if async_component[copy[0]])
+            asynchronous = tuple(copy for copy in copies if via_lds[copy[0]])
             if scheme == WaitCommitScheme.PER_OP:
                 groups = tuple((copy,) for copy in asynchronous)
             elif scheme == WaitCommitScheme.PER_SLOT:
@@ -1152,7 +1191,7 @@ def _audit_buffer_schedule(tc, num_k, epilogue_groups=0):
             expected_groups.append(groups)
         draining = stage > main
         relative_stage = stage - main - 1 if draining else stage
-        actual_groups = buffered_groups(tc, relative_stage, draining)
+        actual_groups = buffered_groups(tc, relative_stage, draining, phase=stage)
         assert actual_groups == tuple(
             tuple(tuple(copy[:2] for copy in group) for group in groups)
             for groups in expected_groups
@@ -1165,14 +1204,35 @@ def _audit_buffer_schedule(tc, num_k, epilogue_groups=0):
                 copy = (component, tile, target)
                 assert copy not in issued, "a K tile was loaded twice"
                 issued.add(copy)
-                if async_component[component]:
-                    lds[component, tile, target % depths[component]] = target
-                else:
-                    queues[component, tile][-1] = target
+                if via_lds[component]:
+                    ring = target // ratios[component] % depths[component]
+                    key = component, tile, ring
+                    if key in lds:
+                        assert (component, tile, lds[key]) in consumed
+                    lds[key] = target
             for group in groups_by_slot[slot]:
                 for copy in group:
                     group_for_copy[copy] = len(committed)
                 committed.append(group)
+
+        def read_slot(slot, after_fill, read_stage=stage):
+            for component, tile in read_slots[slot]:
+                if read_stage % ratios[component]:
+                    continue
+                same_slot_fill = (
+                    not via_lds[component]
+                    and fill_spans[component] == 1
+                    and fill_slot_for[component, tile] == slot
+                )
+                if same_slot_fill != after_fill:
+                    continue
+                copy = component, tile, read_stage
+                if via_lds[component]:
+                    ring = read_stage // ratios[component] % depths[component]
+                    assert lds[component, tile, ring] == read_stage
+                else:
+                    assert copy in issued, "register selected before its producer"
+                consumed.add(copy)
 
         if stage < 0:
             for slot in range(nslots):
@@ -1183,25 +1243,19 @@ def _audit_buffer_schedule(tc, num_k, epilogue_groups=0):
             for slot in range(nslots):
                 if not per_stage:
                     check_wait(stage, slot)
-                for component, tile, target in required_copies(stage, slot):
-                    if async_component[component]:
-                        assert (
-                            lds[component, tile, target % depths[component]] == target
-                        )
-                    else:
-                        assert queues[component, tile][0] == target
+                read_slot(slot, False)
                 fill_slot(slot)
-        for key, queue in queues.items():
-            queues[key] = queue[1:] + queue[:1]
+                read_slot(slot, True)
         if stage == main:
             committed.extend(() for _ in range(epilogue_groups))
     expected_loads = {
         (component, tile, target)
         for ops in fill_slots
         for component, tile in ops
-        for target in range(num_k)
+        for target in range(0, num_k, ratios[component])
     }
     assert issued == expected_loads
+    assert consumed == expected_loads
 
 
 @pytest.mark.parametrize("scheme", list(WaitCommitScheme))

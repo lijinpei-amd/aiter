@@ -34,6 +34,7 @@ from ._lang import (
     unwrap as _v,
 )
 from ._layout import _KernelFuncShape, _KernelTuningLayout
+from ._types import COMPONENTS
 
 __all__ = ["KernelFuncConfig", "KernelTuningConfig"]
 
@@ -413,13 +414,14 @@ class KernelTuningConfig(_KernelTuningLayout):
         the main loop, so an unrolled body must return each ring to its first slot.
         """
         period = 1
-        for operand in (0, 1):
-            if not self.payload_via_lds(operand):
-                period = math.lcm(period, self.num_buffers(operand))
-            if self.func_cfg.has_scale(operand) and not self.scale_via_lds(operand):
+        for component in COMPONENTS:
+            operand, is_scale = component
+            if is_scale and not self.func_cfg.has_scale(operand):
+                continue
+            if self.component_in_reg(component):
+                ratio = self.scale_ratio_k_step(operand) if is_scale else 1
                 period = math.lcm(
-                    period,
-                    self.num_buffers(operand, True) * self.scale_ratio_k_step(operand),
+                    period, self.num_buffers(operand, is_scale) * ratio
                 )
         return period
 

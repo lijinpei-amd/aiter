@@ -85,8 +85,10 @@ from ._layout import (
     _slot_index,
 )
 from ._lds import LDSManager
-from ._types import DotKind, TileSched
+from ._types import A_SCALE, B_SCALE, DotKind, TileSched
 
+_A_SCALE: gl.constexpr = gl.constexpr(A_SCALE)
+_B_SCALE: gl.constexpr = gl.constexpr(B_SCALE)
 _SG_MFMA: gl.constexpr = gl.constexpr(8)
 _SG_DS_READ: gl.constexpr = gl.constexpr(256)
 _SG_VMEM: gl.constexpr = gl.constexpr(16)
@@ -399,14 +401,18 @@ def _advance_hbm_ptrs(pc, hbm_ptrs, STEPS: gl.constexpr = 1, K_PHASE: gl.constex
     b_hbm_ptr = hbm_ptrs.b_hbm_ptr + STEPS * pc.b_step
     a_scale_hbm_ptr = hbm_ptrs.a_scale_hbm_ptr
     b_scale_hbm_ptr = hbm_ptrs.b_scale_hbm_ptr
-    if require_constexpr(pc.func_cfg.a_has_scale() and pc.tuning_cfg.scale_via_lds(0)):
+    if require_constexpr(
+        pc.func_cfg.a_has_scale() and pc.tuning_cfg.component_via_lds(_A_SCALE)
+    ):
         a_scale_hbm_ptr = (
             a_scale_hbm_ptr
             + pc.tuning_cfg.scale_hbm_steps(0, STEPS, K_PHASE)
             * pc.s_step
             * pc.a_scale_stride_k
         )
-    if require_constexpr(pc.func_cfg.b_has_scale() and pc.tuning_cfg.scale_via_lds(1)):
+    if require_constexpr(
+        pc.func_cfg.b_has_scale() and pc.tuning_cfg.component_via_lds(_B_SCALE)
+    ):
         b_scale_hbm_ptr = (
             b_scale_hbm_ptr
             + pc.tuning_cfg.scale_hbm_steps(1, STEPS, K_PHASE)

@@ -54,6 +54,7 @@ class _Config(_ScheduleConfig):
         soff=False,
         scale_steps=None,
         scale_tiles=(1, 1),
+        compiler_pipeline=False,
     ):
         super().__init__(*shape, scheme, middle)
         self.depths = dict(zip(COMPONENTS, depths, strict=True))
@@ -67,6 +68,7 @@ class _Config(_ScheduleConfig):
         self.packed = packed
         self.scale_steps = scale_steps or ((2, 2) if packed else (1, 1))
         self.scale_tiles = scale_tiles
+        self.compiler_pipeline = compiler_pipeline
         self.read_mask = read_mask
         self.K_UNROLL = unroll
         self.UNROLL_EPILOGUE = unroll_epilogue
@@ -98,6 +100,9 @@ class _Config(_ScheduleConfig):
         return (
             self.scale_via_lds(operand) if is_scale else self.payload_via_lds(operand)
         )
+
+    def component_in_reg(self, component):
+        return not self.component_via_lds(component)
 
     def pipeline_register_period(self):
         return math.lcm(
@@ -144,7 +149,7 @@ class _Config(_ScheduleConfig):
         return bool(self.read_mask & (1 << (operand + 2 * scale)))
 
     def warp_pipeline_compiler(self):
-        return True
+        return self.compiler_pipeline
 
     def warp_pipeline_manual(self):
         return False
@@ -205,9 +210,9 @@ class _Machine:
         nonk = tc.scale_ratio_non_k_slot(operand) if is_scale else 1
         mk = tc.num_k_slots_per_tile()
         assert 0 <= tile < self.num_k, "HBM load exceeded the K strip"
-        lead = (tc.depths[component] - 1) * ratio
-        if component == B_PAYLOAD and not tc.component_via_lds(component):
-            lead -= 1
+        live_span = (tc.depths[component] - 1) * ratio + 1
+        fill_span = live_span - int(tc.component_in_reg(component))
+        lead = fill_span - 1
         assert tile == self.current_read + lead
         assert tile % ratio == 0 and mini % nonk == 0
         token = component, mini, tile
@@ -409,6 +414,8 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         num_k=num_k,
     )
     step_fn, fill_fn = pipeline._step.fn, pipeline._fill_slot.fn
+    read_tile_fn = pipeline._read_tile.fn
+    read_scale_tile_fn = pipeline._read_scale_tile.fn
 
     def step(*args, **kwargs):
         machine.current_read = args[4]
@@ -424,6 +431,40 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         )
         machine.current_drain = kwargs.get("DRAIN", args[5] if len(args) > 5 else False)
         return fill_fn(*args, **kwargs)
+
+    def read_tile(*args, **kwargs):
+        component = (args[4], PAYLOAD)
+        if tc.component_in_reg(component):
+            machine.events.append(
+                (
+                    machine.current_read,
+                    machine.current_in_loop,
+                    machine.current_drain,
+                    "select",
+                    component,
+                    machine.current_read,
+                    args[3],
+                )
+            )
+        return read_tile_fn(*args, **kwargs)
+
+    def read_scale_tile(*args, **kwargs):
+        operand = args[4]
+        component = (operand, SCALE)
+        if tc.component_in_reg(component):
+            ratio = tc.scale_ratio_k_step(operand)
+            machine.events.append(
+                (
+                    machine.current_read,
+                    machine.current_in_loop,
+                    machine.current_drain,
+                    "select",
+                    component,
+                    machine.current_read - machine.current_read % ratio,
+                    args[3],
+                )
+            )
+        return read_scale_tile_fn(*args, **kwargs)
 
     def check_assumption(value):
         assert value
@@ -485,6 +526,8 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         patch.setattr(pipeline, "_PipelinePointers", _pointers)
         patch.setattr(pipeline, "_step", step)
         patch.setattr(pipeline, "_fill_slot", fill)
+        patch.setattr(pipeline, "_read_tile", read_tile)
+        patch.setattr(pipeline, "_read_scale_tile", read_scale_tile)
         patch.setattr(pipeline, "_init_buffers", init_buffers)
         patch.setattr(pipeline, "_pipeline_peeled", lambda _: peeled)
         patch.setattr(pipeline, "_wait", machine.check_wait)
@@ -653,6 +696,111 @@ def _assert_direct_b_stage_barriers(machine):
     return in_loop_reads
 
 
+@pytest.mark.parametrize(
+    "component,register_mask",
+    [
+        (A_PAYLOAD, 8),
+        (A_SCALE, 2),
+        (B_PAYLOAD, 1),
+        (B_SCALE, 4),
+    ],
+    ids=["a-payload", "a-scale", "b-payload", "b-scale"],
+)
+def test_depth_two_direct_component_selects_after_same_step_fill(
+    component, register_mask, monkeypatch
+):
+    depths = [3, 3, 3, 3]
+    depths[COMPONENTS.index(component)] = 2
+    tc = _Config(
+        WaitCommitScheme.PER_STAGE_WHOLE,
+        tuple(depths),
+        register_mask,
+        unroll=2,
+    )
+    num_k = pipeline_depth(tc) + tc.pipeline_peeled() + pipeline_unroll(tc) + 1
+    machine = _execute(tc, num_k, monkeypatch)
+
+    selections = [
+        (pos, event)
+        for pos, event in enumerate(machine.events)
+        if event[3] == "select" and event[4] == component
+    ]
+    assert selections
+    for select_pos, selection in selections:
+        event_read, _, _, _, _, tile, mini = selection
+        matching_loads = [
+            pos
+            for pos, event in enumerate(machine.events[:select_pos])
+            if event[0] == event_read
+            and event[3] == "load"
+            and event[4:] == (component, tile, mini)
+        ]
+        assert matching_loads, "F=1 direct selection must follow its same-step fill"
+
+
+@pytest.mark.parametrize("read_mask", [0, 8], ids=["configured-mem", "configured-mfma"])
+def test_middle_direct_b_scale_defers_tile_zero_and_preserves_order(
+    read_mask, monkeypatch
+):
+    tc = _Config(
+        WaitCommitScheme.PER_STAGE_WHOLE,
+        (3, 3, 3, 2),
+        4,
+        middle=True,
+        read_mask=read_mask,
+    )
+    num_k = pipeline_depth(tc) + tc.pipeline_peeled() + pipeline_unroll(tc) + 1
+    machine = _execute(tc, num_k, monkeypatch)
+
+    for event_read in range(num_k):
+        events = [
+            (pos, event)
+            for pos, event in enumerate(machine.events)
+            if event[0] == event_read and event[4] == B_SCALE
+        ]
+        selections = [(pos, event) for pos, event in events if event[3] == "select"]
+        assert [event[6] for _, event in selections] == [0, 1]
+        tile_zero_load = next(
+            pos
+            for pos, event in events
+            if event[3] == "load" and event[5:] == (event_read, 0)
+        )
+        assert tile_zero_load < selections[0][0]
+
+
+@pytest.mark.parametrize("component,register_mask", [(A_SCALE, 2), (B_SCALE, 4)])
+@pytest.mark.parametrize("ratio", [2, 4])
+def test_direct_scale_producer_phase_and_soffset_stream_match(
+    component, register_mask, ratio, monkeypatch
+):
+    machines = []
+    for soff in (False, True):
+        tc = _Config(
+            WaitCommitScheme.PER_STAGE_WHOLE,
+            (2, 2, 2, 2),
+            register_mask,
+            packed=True,
+            scale_steps=(ratio, ratio),
+            unroll=2,
+            soff=soff,
+        )
+        minimum = pipeline_depth(tc) + tc.pipeline_peeled() + pipeline_unroll(tc)
+        num_k = math.ceil(minimum / ratio) * ratio
+        machines.append(_execute(tc, num_k, monkeypatch))
+
+    load_streams = []
+    for machine in machines:
+        loads = [
+            (event_read, in_loop, drain, tile, mini)
+            for event_read, in_loop, drain, op, loaded, tile, mini in machine.events
+            if op == "load" and loaded == component
+        ]
+        assert loads
+        assert {event_read % ratio for event_read, *_ in loads} == {1 % ratio}
+        load_streams.append(loads)
+    assert load_streams[0] == load_streams[1]
+
+
 @pytest.mark.parametrize("soff", [False, True], ids=["pointer-step", "soffset-unroll"])
 def test_direct_b3_fills_k_plus_2_while_mfma_consumes_k(soff, monkeypatch):
     tc = _Config(
@@ -770,6 +918,20 @@ def test_lds_b_has_only_the_existing_seed_sched_barrier(monkeypatch):
     machine = _execute(tc, num_k, monkeypatch)
 
     assert any(in_loop for read, in_loop in machine.steps)
+    assert _sched_barrier_stream(machine) == [(0, False, False, 0)]
+
+
+def test_compiler_pipeline_owns_register_stage_ordering(monkeypatch):
+    tc = _Config(
+        WaitCommitScheme.PER_STAGE_WHOLE,
+        (3, 3, 3, 3),
+        4,
+        compiler_pipeline=True,
+    )
+    num_k = pipeline_depth(tc) + tc.pipeline_peeled() + pipeline_unroll(tc) + 1
+    machine = _execute(tc, num_k, monkeypatch)
+
+    assert any(in_loop for _, in_loop in machine.steps)
     assert _sched_barrier_stream(machine) == [(0, False, False, 0)]
 
 
