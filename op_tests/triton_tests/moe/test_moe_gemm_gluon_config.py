@@ -815,7 +815,9 @@ def test_shared_depth_exact_minimum_and_all_unroll_remainders(config, depth, unr
     minimum = depth + 1 + effective_unroll
     for remainder in range(effective_unroll):
         assert _plain(_validate(tc, 4096, (minimum + remainder) * config["BLOCK_K"]))
-    with pytest.raises(AssertionError, match="NUM_K.*NB_MAX.*PEELED.*UNROLL"):
+    with pytest.raises(
+        AssertionError, match="NUM_K.*PIPELINE_DEPTH.*PEELED.*UNROLL"
+    ):
         host._validate_selected_pipeline(tc, (minimum - 1) * config["BLOCK_K"])
 
 

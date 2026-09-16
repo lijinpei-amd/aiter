@@ -665,7 +665,9 @@ def test_minimum_k_and_every_reachable_unroll_remainder(dtype, schedule, monkeyp
         dtype, m=257, n=512, k=below * config["BLOCK_K"], experts=4, topk=2
     )
     assert case.route.block_m == config["BLOCK_M"]
-    with pytest.raises(AssertionError, match="NUM_K.*NB_MAX.*PEELED.*UNROLL"):
+    with pytest.raises(
+        AssertionError, match="NUM_K.*PIPELINE_DEPTH.*PEELED.*UNROLL"
+    ):
         _launch_register_case(case, config)
 
 

@@ -56,25 +56,28 @@ requested `K_UNROLL=4` becomes `UNROLL=12`, and requested `K_UNROLL=7` becomes
 `UNROLL=42`. Absent scales never participate. `FROZEN_STEP` retains its existing
 rejection of explicit component-depth and register-storage options.
 
-Let `NB_MAX` be the largest resolved active depth and `PEELED` the number of
-initial main iterations needed before invariant steady-state waits. The first
-MFMA is always peeled, so `PEELED >= 1`; unequal-depth warmup may require more.
-The host and device use the same issue-history helper to determine this value.
-The exact host requirement is:
+Let `PIPELINE_DEPTH` be the largest inclusive live span, measured in payload K
+steps, among active components. A payload with resolved ring depth `D` has live
+span `D`; a scale with K-Step ratio `R` has live span `(D - 1) * R + 1`.
+`PEELED` is the number of initial main iterations needed before invariant
+steady-state waits. The first MFMA is always peeled, so `PEELED >= 1`; staggered
+warmup may require more. The host and device use the same issue-history helper
+to determine this value. The exact host requirement is:
 
 ```text
 NUM_K = K / BLOCK_K
-NUM_K >= NB_MAX + PEELED + UNROLL
+NUM_K >= PIPELINE_DEPTH + PEELED + UNROLL
 ```
 
-This guarantees at least one complete runtime unrolled body. Equal depths need
-only the first peel, giving `NUM_K >= NB_MAX + UNROLL + 1`. `K % BLOCK_K == 0`
-and all layout-specific divisibility rules still apply, including complete K256
-words for packed K128 scales. The selected live or frozen pipeline validator
-applies the resolved-depth and K checks beside `KernelTuningConfig.validate`.
-The launcher checks depths and K divisibility before preparation, then validates
-the complete effective configuration before launch. The final check matters
-when scale preparation succeeds or falls back: moving scales between LDS and
+This guarantees at least one complete runtime unrolled body. Configurations that
+need only the mandatory first peel have
+`NUM_K >= PIPELINE_DEPTH + UNROLL + 1`. `K % BLOCK_K == 0` and all
+layout-specific divisibility rules still apply, including complete K256 words
+for packed K128 scales. The selected live or frozen pipeline validator applies
+the resolved-depth and K checks beside `KernelTuningConfig.validate`. The
+launcher checks depths and K divisibility before preparation, then validates the
+complete effective configuration before launch. The final check matters when
+scale preparation succeeds or falls back: moving scales between LDS and
 registers can change `UNROLL`, `PEELED`, and the minimum accepted K.
 
 The component storage, buffer-depth, and read-placement fields also accept the
@@ -177,15 +180,18 @@ machine-code hashes and resource metadata for all three dtypes.
 ## Pipeline state
 
 The driver takes invariant data in `_PipelineConst`. Each active stream has its
-own depth `NB`, LDS ring or register queue, and HBM pointer. B register loads
-occupy the same logical fill slot as B LDS copies. Scale register loads also use
-their configured fill slots, including `SCALE_FILL_MID`.
+own physical ring depth `D`, K-Step ratio `R`, LDS ring or register queue, and
+HBM pointer. B register loads occupy the same logical fill slot as B LDS copies.
+Scale register loads also use their configured fill slots, including
+`SCALE_FILL_MID`.
 
-The prologue has `NB_MAX - 1` fill-only stages. A component starts at
-`NB_DELTA = NB_MAX - NB`, loading tiles 0 through `NB - 2`. A seed stage then
-reads tile 0 and loads tile `NB - 1`, without an MFMA. Each logical main
-iteration `x` accumulates tile `x`, reads tile `x + 1`, and loads tile `x + NB`
-for each stream. `MAIN = NUM_K - NB_MAX` remains a runtime value.
+The prologue has `PIPELINE_DEPTH - 1` fill-only stages. A component with actual
+fill span `F = _fill_span(component)` begins after `PIPELINE_DEPTH - F` leading
+stages and fills only at the stages selected by `R`. A seed stage then reads
+payload step 0 and performs the phase-due fills, without an MFMA. Each logical
+main iteration accumulates the current payload step, reads the next one, and
+issues each component's next ring fill when its K-Step phase is due.
+`MAIN = NUM_K - PIPELINE_DEPTH` remains a runtime value.
 
 After the peeled iterations, the driver executes complete statically unrolled
 bodies up to the runtime bound. Short bodies use statically expanded guarded
@@ -196,13 +202,14 @@ the finite prologue, remainder and drain rotate their logical queues. Packed
 K128 scale words retain both halves until the read selects the current half.
 Ring and packed-scale phases continue across every phase boundary.
 
-The pipeline drain has `NB_MAX` MFMAs. Drain iteration `j` continues a
-component's fill only while `j < NB_DELTA`, so every active stream loads exactly
-`NUM_K` tiles. The first `NB_MAX - 1` drain iterations still read the next tile;
-the separate final MFMA consumes the prefetched operands without another read
-or fill. Eligible output epilogues fuse with that last MFMA; other paths execute
-it once before the output epilogue. Epilogue input copies overlap the drain and
-participate in its group history.
+The pipeline drain has `PIPELINE_DEPTH` MFMAs. Drain iteration `j` continues a
+component's fill only while
+`j < PIPELINE_DEPTH - _fill_span(component)`, so each stream covers exactly
+`NUM_K` payload steps. The first `PIPELINE_DEPTH - 1` drain iterations still
+read the next operands; the separate final MFMA consumes the prefetched operands
+without another read or fill. Eligible output epilogues fuse with that last
+MFMA; other paths execute it once before the output epilogue. Epilogue input
+copies overlap the drain and participate in its group history.
 
 The K loop carries two aggregates plus the component register rings:
 

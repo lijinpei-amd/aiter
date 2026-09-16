@@ -65,9 +65,9 @@ def _pipeline_peeled(tc):
     """Smallest initial main prefix after which every wait is invariant.
 
     The first MFMA is always peeled to retain its visible zero accumulator.
-    With every active depth at least two, read stage ``NB_MAX - 2`` already
-    has an entirely full producer history. Checking the finite prefix also
-    handles configurations where shared groups hide some staggered fills.
+    By read stage ``pipeline_depth(tc) - 2``, every active component has an
+    entirely full producer history. Checking the finite prefix also handles
+    configurations where shared groups hide some staggered fills.
     """
     # These schemes commit even empty prologue slots/stages. Their group
     # distances already match the steady state when a component first reads.
