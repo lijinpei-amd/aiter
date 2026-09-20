@@ -386,7 +386,15 @@ def test_t256_mxfp8_gemm1_geometry_override_is_narrow(overrides):
         args["small_grid"],
         args["stream_expert_payload"],
     )
-    assert selected == baseline
+    if overrides == {"block_m": 32}:
+        # block_m 32 is the small-token regime and now carries its own measured
+        # override, so it does not fall back to the bare ladder. What matters here is
+        # that it is not wearing the T=256 geometry.
+        assert selected != baseline
+        assert (selected["BLOCK_K"], selected["MINI_BLOCK_M"]) != (256, 32)
+        assert selected["BLOCK_M"] == 32
+    else:
+        assert selected == baseline
 
 
 @pytest.mark.parametrize("suffix", ["EXPERT_CACHE_MODIFIER", "EXPERT_MOD"])
@@ -450,7 +458,9 @@ def test_commit_scheme_counts_real_payload_and_scale_groups(
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     assert _plain(tc.scale_via_lds(0)) and _plain(tc.scale_via_lds(1))
     assert sum(len(slot) for slot in buffered_groups(tc, None)) == groups
-    assert _plain(tc.wait_at_stage_head()) is stage_head
+    # commit_per_stage is the predicate the emitter actually branches on; the
+    # wait_at_stage_head alias it used to go through had no production caller.
+    assert _plain(tc.commit_per_stage()) is stage_head
 
 
 @pytest.mark.parametrize("has_scales", [False, True])
