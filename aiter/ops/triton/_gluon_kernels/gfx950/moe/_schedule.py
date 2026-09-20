@@ -221,12 +221,28 @@ def _payload_fill_slots(NM, NN):
     The resolved form of :func:`_buffer_load_order`. Ownership is a mapping from a
     component's non-K tile to a slot, not a position lookup into a shared list --
     which is what lets several components own copies in the same slot.
+
+    Two policies. With both axes split, the interleaved order (and its 2x2 special
+    case) assigns one payload copy per slot, which is what the tuned kernels were
+    measured with and must not move.
+
+    With a degenerate axis there are fewer slots than copies -- ``NM + NN`` copies
+    into ``NM * NN`` slots -- so one slot has to own both operands. Fall back to
+    axis-major, ``A(t)`` at ``(mi=t, ni=0)`` and ``B(t)`` at ``(mi=0, ni=t)``, which
+    is total and injective per component for any ``NM, NN >= 1``. Applying it to a
+    split tile would reassign that tile's copies, so it is restricted to the case
+    the interleave cannot express.
     """
     NM, NN = _v(NM), _v(NN)
-    order = _buffer_load_order(NM, NN)
+    if NM > 1 and NN > 1:
+        order = _buffer_load_order(NM, NN)
+        return (
+            tuple(order.index((1, tile)) for tile in range(NM)),
+            tuple(order.index((0, tile)) for tile in range(NN)),
+        )
     return (
-        tuple(order.index((1, tile)) for tile in range(NM)),
-        tuple(order.index((0, tile)) for tile in range(NN)),
+        tuple(_slot_index(tile, 0, NM, NN) for tile in range(NM)),
+        tuple(_slot_index(0, tile, NM, NN) for tile in range(NN)),
     )
 
 

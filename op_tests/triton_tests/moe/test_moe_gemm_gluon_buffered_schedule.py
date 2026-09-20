@@ -975,6 +975,33 @@ def test_peeled_wait_prefix_is_minimal(scheme, register_mask, extra):
     assert all(x < tc.pipeline_peeled() for x in differs)
 
 
+@pytest.mark.parametrize("nn", [1, 2, 3, 4])
+@pytest.mark.parametrize("nm", [1, 2, 3, 4])
+@pytest.mark.parametrize("middle", [False, True])
+def test_every_payload_tile_is_filled_exactly_once(nm, nn, middle):
+    """Fill ownership must be a total, injective map from tiles to slots.
+
+    A stage needs `NM + NN` payload copies and has `NM * NN` slots. While a slot
+    could own only one copy, that held only for `NM, NN >= 2`; below it a copy was
+    assigned a slot index that does not exist and was silently never issued, so the
+    kernel read whichever stale value the ring still held.
+    """
+    tc = _Config(WaitCommitScheme.PER_OP, (3, 3, 3, 3), 0, shape=(nm, nn),
+                 middle=middle)
+    assert schedule._fill_slots_valid(tc), "ownership is not a valid mapping"
+    for component in COMPONENTS:
+        tiles = nm if component[0] == A else nn
+        owners = [
+            tile
+            for slot in range(nm * nn)
+            for tile in (schedule._candidate_ops(tc, slot)[COMPONENTS.index(component)],)
+            if tile is not None
+        ]
+        ratio = tc.scale_ratio_non_k_slot(component[0]) if component[1] else 1
+        expected = [t for t in range(tiles) if t % ratio == 0]
+        assert sorted(owners) == expected, (component, owners, expected)
+
+
 def _schedule_fingerprint(tc):
     """Everything the emitter folds to constants, for one configuration."""
     nm, nn = tc.nm, tc.nn
