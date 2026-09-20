@@ -11,6 +11,7 @@ from typing import NamedTuple
 
 from triton.experimental import gluon
 
+from . import _schedule_cache
 from ._lang import unwrap as _v
 from ._layout import _slot_index
 from ._types import (
@@ -631,13 +632,30 @@ def _wait(tc, stage, slot, drain=False, epilogue_groups=0, phase=None):
     """
     read_step = _read_step(tc, stage, drain)
     phase = read_step if phase is None else phase
+    # Memoized on the resolved input surface rather than the configuration object.
+    # This is the most expensive constexpr in the kernel -- it walks pipeline_depth
+    # steps of commit groups -- and the emitter asks for it once per slot per step,
+    # which repeats across the unrolled body.
+    key = (
+        schedule_spec(tc), stage, slot, bool(drain), _v(epilogue_groups), phase
+    )
+    if key in _schedule_cache.WAIT:
+        return _schedule_cache.WAIT[key]
     required = _required_producers(tc, read_step, slot, phase)
     if not required:
-        return None
-    committed = _committed_before(
-        tc, stage, read_step, slot, drain, epilogue_groups, phase
-    )
-    return _wait_count(committed, required)
+        count = None
+    else:
+        committed = _committed_before(
+            tc, stage, read_step, slot, drain, epilogue_groups, phase
+        )
+        count = _wait_count(committed, required)
+    if len(_schedule_cache.WAIT) < _schedule_cache.LIMIT:
+        # Subscript assignment only. Any callable reachable from a traced body is
+        # rejected by Triton's dependency finder -- including `WAIT.clear` -- so the
+        # table stops growing at the bound instead of evicting, and `clear()` is for
+        # callers outside tracing.
+        _schedule_cache.WAIT[key] = count
+    return count
 
 
 @gluon.constexpr_function

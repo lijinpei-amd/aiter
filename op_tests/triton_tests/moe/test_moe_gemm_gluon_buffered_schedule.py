@@ -1022,6 +1022,37 @@ def _schedule_fingerprint(tc):
     return tuple(out)
 
 
+def test_wait_memo_never_serves_a_stale_answer():
+    """Mutating a configuration must change the answer, not hit a stale entry.
+
+    The memo keys on the resolved input surface, rebuilt from accessor results on
+    every call, so a configuration mutated in place -- which the test doubles do --
+    produces a different key rather than reusing the old value. Keying on the
+    configuration object instead would fail exactly here.
+    """
+    from aiter.ops.triton._gluon_kernels.gfx950.moe import _schedule_cache
+
+    _schedule_cache.clear()
+    tc = _Config(WaitCommitScheme.PER_OP, (3, 3, 3, 3), 0)
+    slots = range(tc.nm * tc.nn)
+    probe = lambda: tuple(_wait(tc, 3, s) for s in slots)  # noqa: E731
+
+    cold = probe()
+    warm = probe()
+    assert cold == warm and _schedule_cache.WAIT, "second call should have been served"
+
+    # Same object, different placement: the answer must move with it.
+    tc.scale_async = (False, False)
+    mutated = probe()
+    assert mutated != cold, "a mutated configuration returned its old schedule"
+
+    # And recomputing from scratch agrees with what the memo just returned.
+    _schedule_cache.clear()
+    assert probe() == mutated
+    tc.scale_async = (True, True)
+    assert probe() == cold
+
+
 def test_schedule_spec_is_a_sound_memo_key():
     """Equal specs imply equal schedules -- the property a memo key must have.
 
