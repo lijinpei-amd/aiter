@@ -439,19 +439,43 @@ def _read_in_mfma(tc, component, tile):
 
 
 @gluon.constexpr_function
-def _active(tc, component, stage, drain=False):
-    """Whether a component fills at this compile-time relative stage.
+def _fills_during_startup(tc, component, step):
+    """Whether a component has begun filling by this absolute payload step.
 
-    ``None`` denotes a main-loop stage. Before the drain, ``stage`` is the
-    absolute read stage and gates only staggered prologue startup. In the
-    drain it is the zero-based drain iteration, independent of runtime K.
+    Prologue filling starts at ``1 - F(c)``, so a component with a shorter fill span
+    starts later: it does not need its value as early. ``step=None`` is steady state,
+    where every present component fills.
     """
     if not _present(tc, component):
         return False
-    span = _fill_span(tc, component)
+    return step is None or step + _fill_span(tc, component) - 1 >= 0
+
+
+@gluon.constexpr_function
+def _fills_during_drain(tc, component, iteration):
+    """Whether a component still fills at this zero-based drain iteration.
+
+    Filling continues while ``j < D - F(c)``. A component whose values live the full
+    pipeline depth has nothing left to fetch once the drain starts; a shallower one
+    keeps going, which is why the drain is not idle.
+    """
+    if not _present(tc, component):
+        return False
+    return iteration < pipeline_depth(tc) - _fill_span(tc, component)
+
+
+@gluon.constexpr_function
+def _active(tc, component, stage, drain=False):
+    """Whether a component fills here, dispatching on the caller's region.
+
+    The two regimes use different origins -- an absolute payload step before the
+    drain, a zero-based iteration within it -- so they are separate predicates and
+    this only chooses between them. See :func:`_read_step` for the same split on the
+    read side.
+    """
     if drain:
-        return stage < pipeline_depth(tc) - span
-    return stage is None or stage + span - 1 >= 0
+        return _fills_during_drain(tc, component, stage)
+    return _fills_during_startup(tc, component, stage)
 
 
 @gluon.constexpr_function
