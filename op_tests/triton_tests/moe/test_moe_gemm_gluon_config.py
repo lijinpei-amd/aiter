@@ -1146,13 +1146,17 @@ def _audit_buffer_schedule(tc, num_k, epilogue_groups=0):
         for read_slot in slots:
             for component, tile in read_slots[read_slot]:
                 if stage % ratios[component] == 0:
-                    need.append((component, tile, stage))
+                    need.append(
+                        (stage - fill_spans[component] + 1, component, tile)
+                    )
         return need
 
     def check_wait(stage, slot):
-        required = [copy for copy in required_copies(stage, slot) if via_lds[copy[0]]]
+        required = [
+            token for token in required_copies(stage, slot) if via_lds[token[1]]
+        ]
         expected = (
-            len(committed) - 1 - max(group_for_copy[copy] for copy in required)
+            len(committed) - 1 - max(group_for_copy[token] for token in required)
             if required
             else None
         )
@@ -1172,7 +1176,7 @@ def _audit_buffer_schedule(tc, num_k, epilogue_groups=0):
         expected_groups = []
         stage_copies = [
             tuple(
-                (component, tile, stage + fill_spans[component] - 1)
+                (stage, component, tile)
                 for component, tile in ops
                 if stage % ratios[component] == producer_phases[component]
                 and 0 <= stage + fill_spans[component] - 1 < num_k
@@ -1180,7 +1184,7 @@ def _audit_buffer_schedule(tc, num_k, epilogue_groups=0):
             for ops in fill_slots
         ]
         for slot, copies in enumerate(stage_copies):
-            asynchronous = tuple(copy for copy in copies if via_lds[copy[0]])
+            asynchronous = tuple(token for token in copies if via_lds[token[1]])
             if scheme == WaitCommitScheme.PER_OP:
                 groups = tuple((copy,) for copy in asynchronous)
             elif scheme == WaitCommitScheme.PER_SLOT:
@@ -1193,26 +1197,36 @@ def _audit_buffer_schedule(tc, num_k, epilogue_groups=0):
         relative_stage = stage - main - 1 if draining else stage
         actual_groups = buffered_groups(tc, relative_stage, draining, phase=stage)
         assert actual_groups == tuple(
-            tuple(tuple(copy[:2] for copy in group) for group in groups)
+            tuple(tuple(token[1:] for token in group) for group in groups)
             for groups in expected_groups
         )
 
         def fill_slot(
             slot, copies_by_slot=stage_copies, groups_by_slot=expected_groups
         ):
-            for component, tile, target in copies_by_slot[slot]:
-                copy = (component, tile, target)
-                assert copy not in issued, "a K tile was loaded twice"
-                issued.add(copy)
+            for token in copies_by_slot[slot]:
+                producer, component, tile = token
+                # The ring slot is named by the step that consumes the value, so
+                # it has to be derived from the producer, not carried in the token.
+                target = producer + fill_spans[component] - 1
+                assert token not in issued, "a K tile was loaded twice"
+                issued.add(token)
                 if via_lds[component]:
                     ring = target // ratios[component] % depths[component]
                     key = component, tile, ring
                     if key in lds:
-                        assert (component, tile, lds[key]) in consumed
+                        # The previous occupant of this ring slot must already
+                        # have been read; name it by its producer, as `consumed`
+                        # does, not by the step that consumed it.
+                        assert (
+                            lds[key] - fill_spans[component] + 1,
+                            component,
+                            tile,
+                        ) in consumed
                     lds[key] = target
             for group in groups_by_slot[slot]:
-                for copy in group:
-                    group_for_copy[copy] = len(committed)
+                for token in group:
+                    group_for_copy[token] = len(committed)
                 committed.append(group)
 
         def read_slot(slot, after_fill, read_stage=stage):
@@ -1226,13 +1240,13 @@ def _audit_buffer_schedule(tc, num_k, epilogue_groups=0):
                 )
                 if same_slot_fill != after_fill:
                     continue
-                copy = component, tile, read_stage
+                token = (read_stage - fill_spans[component] + 1, component, tile)
                 if via_lds[component]:
                     ring = read_stage // ratios[component] % depths[component]
                     assert lds[component, tile, ring] == read_stage
                 else:
-                    assert copy in issued, "register selected before its producer"
-                consumed.add(copy)
+                    assert token in issued, "register selected before its producer"
+                consumed.add(token)
 
         if stage < 0:
             for slot in range(nslots):
@@ -1249,7 +1263,7 @@ def _audit_buffer_schedule(tc, num_k, epilogue_groups=0):
         if stage == main:
             committed.extend(() for _ in range(epilogue_groups))
     expected_loads = {
-        (component, tile, target)
+        (target - fill_spans[component] + 1, component, tile)
         for ops in fill_slots
         for component, tile in ops
         for target in range(0, num_k, ratios[component])
