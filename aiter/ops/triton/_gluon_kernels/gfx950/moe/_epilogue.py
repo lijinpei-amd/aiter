@@ -74,11 +74,17 @@ def _stage_epilogue_inputs(
     else:
         gammas_hbm_ptr: gl.constexpr = None
 
-    # Stage the epilogue's two vectors in LDS, allocated and filled together here rather
-    # than in the prologue: the drain issues no fills of its own, so these copies have its
-    # whole run of MFMAs to themselves and are done well before the epilogue's
-    # wait_group(0). Keeping the allocation next to its one use also lets the shared-memory
-    # allocator see that these buffers never overlap the K-loop's.
+    # Stage the epilogue's two vectors in LDS, allocated and filled together here
+    # rather than in the prologue: they then have the drain's run of MFMAs to overlap
+    # with and are done well before the epilogue's wait_group(0). Keeping the
+    # allocation next to its one use also lets the shared-memory allocator see that
+    # these buffers never overlap the K-loop's.
+    #
+    # The drain is not idle, despite what this comment used to claim. Any component
+    # whose fill span is shorter than the pipeline depth keeps filling through drain
+    # iteration `pipeline_depth - fill_span` (see _schedule._active). It happens to
+    # issue nothing in the tuned configuration, where every span equals the depth,
+    # but that is a property of that configuration and not of the drain.
     #
     # Both tiles are flat: `.index()` drops the leading axis but keeps the layout's rank,
     # so a [rows, mini] tile cannot be viewed as one mini block. `.slice(start, length)`
@@ -108,10 +114,12 @@ def _stage_epilogue_inputs(
     else:
         bias_lds_ptr: gl.constexpr = None
 
-    # They are committed as one group, which is newer than every pipeline group still in
-    # flight. That inflates the outstanding count every drain wait is measured against,
-    # so each step is handed WAIT_SLACK=EPI_GROUPS and its wait_group count comes out
-    # numerically the same as before.
+    # They are committed as one group, which the drain's wait accounting places at its
+    # exact FIFO position: after the last main-loop step, before the first drain
+    # iteration. It therefore lengthens the distance only for reads whose newest
+    # required producer is older than it -- in practice the first drain iteration or
+    # two -- and not for the rest. Passing a blanket slack to every drain step, as the
+    # frozen path still does via WAIT_SLACK, would over-wait the later ones.
     EPI_GROUPS: gl.constexpr = (
         1 if EPI_LDS and (func_cfg.has_gammas or func_cfg.has_bias) else 0
     )
@@ -141,9 +149,10 @@ def _stage_epilogue_inputs(
                 bias_lds_ptr, bias_hbm_base, epi_b_offs
             )
         if require_constexpr(func_cfg.has_gammas or func_cfg.has_bias):
-            # EPI_LDS is only a layout-feasibility flag, so it can be set with neither
-            # vector present -- nothing was issued then, and an empty commit group would
-            # still count against every drain wait.
+            # EPI_LDS is only a layout-feasibility flag, so it can be set with
+            # neither vector present. Nothing was issued then, and an empty group
+            # would still occupy a FIFO position and lengthen the drain waits that
+            # sit behind it.
             gl.amd.cdna4.async_copy.commit_group()
     return _EpilogueInputs(
         bias_hbm_base, gammas_hbm_ptr, gamma_lds_ptr, bias_lds_ptr, EPI_GROUPS
