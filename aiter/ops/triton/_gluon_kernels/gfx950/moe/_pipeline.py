@@ -40,6 +40,8 @@ from ._schedule import (
     _producer_phase,
     _read_in_mfma,
     _reads_at_phase,
+    _slot_waits,
+    _stage_wait,
     _via_lds,
     _wait,
     pipeline_depth,
@@ -694,38 +696,19 @@ def _step_live(
     a, b, acc = (), (), ()
     a_scale = () if _reads_at_phase(tc, _A_SCALE, PHASE) else regs.a_scale
     b_scale = () if _reads_at_phase(tc, _B_SCALE, PHASE) else regs.b_scale
-    if require_constexpr(
-        tc.commit_per_stage()
-        and _wait(tc, STAGE, None, DRAIN, EPILOGUE_GROUPS, PHASE) is not None
-    ):
-        pc.lds_ptrs.wait_buffer_load_groups(
-            _wait(tc, STAGE, None, DRAIN, EPILOGUE_GROUPS, PHASE)
-        )
+    stage_wait: gl.constexpr = _stage_wait(tc, STAGE, DRAIN, EPILOGUE_GROUPS, PHASE)
+    slot_waits: gl.constexpr = _slot_waits(tc, STAGE, DRAIN, EPILOGUE_GROUPS, PHASE)
+    if require_constexpr(stage_wait is not None):
+        pc.lds_ptrs.wait_buffer_load_groups(stage_wait)
     if require_constexpr(tc.SCHED_MODE != 0 and not warp):
         _sched_hint(tc.SCHED_MODE)
     for ni in gl.static_range(nn):
         for mi in gl.static_range(nm):
             if require_constexpr(
-                not tc.commit_per_stage()
-                and _wait(
-                    tc,
-                    STAGE,
-                    _slot_index(mi, ni, nm, nn),
-                    DRAIN,
-                    EPILOGUE_GROUPS,
-                    PHASE,
-                )
-                is not None
+                slot_waits[_slot_index(mi, ni, nm, nn)] is not None
             ):
                 pc.lds_ptrs.wait_buffer_load_groups(
-                    _wait(
-                        tc,
-                        STAGE,
-                        _slot_index(mi, ni, nm, nn),
-                        DRAIN,
-                        EPILOGUE_GROUPS,
-                        PHASE,
-                    )
+                    slot_waits[_slot_index(mi, ni, nm, nn)]
                 )
             if require_constexpr(not DOT and mi == 0 and ni == 0):
                 gl.amd.cdna4.sched_barrier(0)

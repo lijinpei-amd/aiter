@@ -11,6 +11,7 @@ import pytest
 
 from aiter.ops.triton._gluon_kernels.gfx950.moe import _lds
 from aiter.ops.triton._gluon_kernels.gfx950.moe import _pipeline as buffered
+from aiter.ops.triton._gluon_kernels.gfx950.moe import _schedule as schedule
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import unwrap
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
     A_PAYLOAD,
@@ -22,10 +23,9 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
     SCALE,
     A,
     B,
-    _buffer_load_group_schedule,
-    _buffer_load_groups,
-    _buffer_load_ops,
-    _buffer_load_wait,
+    _groups,
+    _ops,
+    _via_lds,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import WaitCommitScheme
 
@@ -380,58 +380,31 @@ def test_emitted_groups_and_waits_retire_required_copies(
     emitted_copies, emitted_groups = _trace_emitter(tc, monkeypatch)
     assert emitted_copies == tuple(copies)
     assert emitted_groups == expected
-    assert _buffer_load_group_schedule(tc) == expected
-    flat = tuple(group for slot in expected for group in slot)
-    assert _buffer_load_groups(tc) == flat
+    # Tie the *live* model to the traced emitter, not a parallel one. `_groups` is
+    # stage- and phase-aware; queried at a steady-state step every component is active,
+    # which is the situation this reference describes.
+    assert _groups(tc, None) == expected
     for slot, operations in enumerate(copies):
-        actual = _buffer_load_ops(tc, slot % tc.nm, slot // tc.nm)
-        assert actual == tuple(
+        mi, ni = slot % tc.nm, slot // tc.nm
+        # `_ops` keeps direct-register destinations because the schedule still owns
+        # them; only scales are dropped from the async view, since a register scale
+        # has no commit group while a register payload still occupies its slot.
+        nominal = tuple(
+            tile
+            if (not component[1] or tile is None or _via_lds(tc, component))
+            else None
+            for component, tile in zip(COMPONENTS, _ops(tc, mi, ni))
+        )
+        assert nominal == tuple(
             dict(operations).get(component) for component in COMPONENTS
         )
 
-    # The oracle is a literal FIFO of committed groups, with unique stage-tagged
-    # copy tokens. It never uses production's group-count or wait-count formula.
-    for between in (0, 1, 2):
-        for filling in (False, True):
-            for slack in (0, 1, 2):
-                queue = [
-                    {(stage, component, tile) for component, tile in group}
-                    for stage in range(between + 1)
-                    for group in flat
-                ]
-                queue.extend({("epilogue", index)} for index in range(slack))
-                committed = list(queue)
-                completed = set()
-                for slot, required in enumerate(reads):
-                    target = {(0, component, tile) for component, tile in required}
-                    wait = _buffer_load_wait(
-                        tc, slot % tc.nm, slot // tc.nm, between, filling
-                    )
-                    if wait is not None:
-                        wait += slack
-                        if tc.commit_per_stage():
-                            assert slot == 0
-                            assert wait == between + slack
-                        else:
-                            # Any larger count could leave the last required copy
-                            # pending; any smaller one unnecessarily drains newer work.
-                            newest_required = max(
-                                i for i, group in enumerate(committed) if group & target
-                            )
-                            assert wait == len(committed[newest_required + 1 :])
-                        while len(queue) > wait:
-                            completed.update(queue.pop(0))
-                    elif not tc.commit_per_stage():
-                        assert not target
-                    assert target <= completed, (slot, required, wait, queue)
-                    if filling:
-                        for group in expected[slot]:
-                            issued = {
-                                (between + 1, component, tile)
-                                for component, tile in group
-                            }
-                            queue.append(issued)
-                            committed.append(issued)
+    # The live `_wait` is not re-derived here. It is covered end to end by two
+    # independent FIFO oracles that model every pipeline region rather than a
+    # nominal steady-state stage: `_Machine.check_wait` in
+    # test_moe_gemm_gluon_buffered_schedule.py, which drives the real emitter, and
+    # `_audit_buffer_schedule` in test_moe_gemm_gluon_config.py. This test's job is
+    # the ownership/grouping half of the contract, above.
 
 
 @pytest.mark.parametrize(
@@ -558,7 +531,9 @@ def test_pipeline_stage_commit_boundaries(
     monkeypatch.setattr(pipeline, "pick_stage", pick_stage)
     monkeypatch.setattr(pipeline.gl, "static_range", range)
     monkeypatch.setattr(pipeline.gl.amd.cdna4, "sched_barrier", lambda mask: None)
-    monkeypatch.setattr(pipeline, "_wait", lambda *args: 3)
+    # Patch the one authoritative formula: the emitter reaches it through the
+    # scheme-guarded _stage_wait/_slot_waits wrappers, not by name.
+    monkeypatch.setattr(schedule, "_wait", lambda *args, **kw: 3)
     monkeypatch.setattr(pipeline, "_fill_slot", buffer_load)
     monkeypatch.setattr(pipeline, "_read_slot", lambda *args: ((), (), (), ()))
     monkeypatch.setattr(pipeline, "_take_operand_pairs", lambda *args: ())
