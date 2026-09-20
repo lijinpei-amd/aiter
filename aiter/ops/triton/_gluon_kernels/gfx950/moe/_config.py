@@ -400,13 +400,6 @@ class KernelTuningConfig(_KernelTuningLayout):
         )
 
     @gluon.constexpr_function
-    def buffer_live_span(self, operand, scale=False):
-        """num of k-stage from lds/reg buffer is loaded to its use"""
-        depth = self.num_buffers(operand, scale)
-        ratio = self.scale_ratio_k_step(operand) if _v(scale) else 1
-        return (depth - 1) * ratio + 1
-
-    @gluon.constexpr_function
     def pipeline_register_period(self):
         """LCM of the active register rings; absent scales have no ring.
 
@@ -506,11 +499,6 @@ class KernelTuningConfig(_KernelTuningLayout):
     @gluon.constexpr_function
     def commit_per_stage_whole(self):
         return _v(self.WAIT_COMMIT_SCHEME) == int(WaitCommitScheme.PER_STAGE_WHOLE)
-
-    @gluon.constexpr_function
-    def wait_at_stage_head(self):
-        """Both per-stage modes wait once at the head; other modes wait per read slot."""
-        return self.commit_per_stage()
 
     @gluon.constexpr_function
     def validate(self, N, K):

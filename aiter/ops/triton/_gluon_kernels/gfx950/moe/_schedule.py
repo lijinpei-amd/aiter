@@ -167,16 +167,6 @@ def _buffer_load_tile(pos, NM, NN, want_a):
 
 
 @gluon.constexpr_function
-def _ds_read_a_tile(mi, ni, NM, NN):
-    return _buffer_load_tile(_buffer_load_pos(mi, ni, NM, NN), NM, NN, True)
-
-
-@gluon.constexpr_function
-def _ds_read_b_tile(mi, ni, NM, NN):
-    return _buffer_load_tile(_buffer_load_pos(mi, ni, NM, NN), NM, NN, False)
-
-
-@gluon.constexpr_function
 def _scale_buffer_load_slot(is_a, tile, NM, NN, SCALE_FILL_MID=False):
     """A scale can be copied in a different slot from its payload."""
     if _v(SCALE_FILL_MID) and _v(NM) == 2 and _v(NN) == 2:
@@ -432,86 +422,34 @@ def _wait(tc, stage, slot, drain=False, epilogue_groups=0, phase=None):
 
 
 @gluon.constexpr_function
-def _buffer_load_ops(tc, mi, ni):
-    """Candidate tiles in ``COMPONENTS`` issue order; ``None`` skips a copy."""
-    NM, NN = tc.num_m_slots_per_block(), tc.num_n_slots_per_block()
-    pos = _buffer_load_pos(mi, ni, NM, NN)
-    ops = []
-    for operand in OPERANDS:
-        ops.append(_buffer_load_tile(pos, NM, NN, operand == A))
-        scale_tile = None
-        if _present(tc, (operand, SCALE)) and _via_lds(tc, (operand, SCALE)):
-            scale_tile = _scale_buffer_load_tile(
-                mi, ni, NM, NN, operand == A, tc.SCALE_FILL_MID
-            )
-            if (
-                scale_tile is not None
-                and scale_tile % tc.scale_ratio_non_k_slot(operand) != 0
-            ):
-                scale_tile = None
-        ops.append(scale_tile)
-    return tuple(ops)
+def _stage_wait(tc, stage, drain=False, epilogue_groups=0, phase=None):
+    """Wait count for the stage head, or ``None`` when this scheme waits per slot.
 
-
-@gluon.constexpr_function
-def _buffer_load_group_schedule(tc):
-    """Committed groups per slot, containing async ``(component, tile)`` copies.
-
-    Direct-register payload and scale loads have no async group. Traffic-only
-    experiments retain their nominal groups even when the LDS manager suppresses a
-    copy.
+    Returning ``None`` for the inapplicable scheme keeps the emitter to one evaluation
+    per site: the caller binds this once and tests it, instead of calling ``_wait``
+    again inside the guard it just passed. ``_wait`` is the single most expensive
+    constexpr in the kernel, so the duplicate mattered.
     """
-    NM, NN = tc.num_m_slots_per_block(), tc.num_n_slots_per_block()
-    scheme = _v(tc.WAIT_COMMIT_SCHEME)
-    assert scheme in tuple(int(s) for s in WaitCommitScheme)
-    schedule = []
-    stage_ops = ()
-    for ni in range(NN):
-        for mi in range(NM):
-            ops = tuple(
-                (component, tile)
-                for component, tile in zip(COMPONENTS, _buffer_load_ops(tc, mi, ni))
-                if tile is not None and _via_lds(tc, component)
-            )
-            if scheme == int(WaitCommitScheme.PER_OP):
-                groups = tuple((op,) for op in ops)
-            elif scheme == int(WaitCommitScheme.PER_SLOT):
-                groups = (ops,)  # Empty tail slots still commit a group.
-            else:
-                stage_ops += ops
-                groups = (stage_ops,) if mi == NM - 1 and ni == NN - 1 else ()
-            schedule.append(groups)
-    return tuple(schedule)
-
-
-@gluon.constexpr_function
-def _buffer_load_groups(tc):
-    return tuple(group for slot in _buffer_load_group_schedule(tc) for group in slot)
-
-
-@gluon.constexpr_function
-def _buffer_load_wait(tc, mi, ni, STAGES_BETWEEN, DO_BUFFER_LOAD):
-    """Number of newer committed groups after this slot's last required copy."""
-    NM, NN = tc.num_m_slots_per_block(), tc.num_n_slots_per_block()
-    slot = _slot_index(mi, ni, NM, NN)
-    if tc.commit_per_stage():
-        return _v(STAGES_BETWEEN) if slot == 0 else None
-
-    schedule = _buffer_load_group_schedule(tc)
-    groups = tuple(group for entry in schedule for group in entry)
-    required = []
-    for component in COMPONENTS:
-        tile = _component_read_tile(tc, component, mi, ni)
-        if tile is None:
-            continue
-        if _via_lds(tc, component):
-            required.append((component, tile))
-    if not required:
+    if not tc.commit_per_stage():
         return None
-    latest = max(
-        i for i, group in enumerate(groups) if any(op in group for op in required)
+    return _wait(tc, stage, None, drain, epilogue_groups, phase)
+
+
+@gluon.constexpr_function
+def _slot_waits(tc, stage, drain=False, epilogue_groups=0, phase=None):
+    """Per-slot wait counts for one step, indexed by ``_slot_index``.
+
+    A whole vector rather than one query per slot: Gluon refuses a ``gl.constexpr``
+    bound inside a ``static_range`` body ("constexpr cannot be reassigned"), so the
+    emitter cannot hold a per-slot count in a local. Returning the vector lets it bind
+    once at step scope and index, which evaluates ``_wait`` exactly once per slot
+    instead of twice.
+    """
+    slots = tc.num_m_slots_per_block() * tc.num_n_slots_per_block()
+    if tc.commit_per_stage():
+        # Full length, all ``None``: the emitter then has one uniform test per slot
+        # rather than a separate "is this scheme per-slot at all" guard.
+        return (None,) * slots
+    return tuple(
+        _wait(tc, stage, slot, drain, epilogue_groups, phase) for slot in range(slots)
     )
-    prefix = sum(len(entry) for entry in schedule[:slot]) if _v(DO_BUFFER_LOAD) else 0
-    # The suffix comprises the target stage's remaining groups, full newer stages,
-    # and the groups already committed while walking this stage's slots.
-    return (_v(STAGES_BETWEEN) + 1) * len(groups) - 1 - latest + prefix
