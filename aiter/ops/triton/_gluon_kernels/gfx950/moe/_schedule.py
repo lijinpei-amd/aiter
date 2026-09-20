@@ -514,20 +514,32 @@ def _groups(tc, stage, drain=False, phase=None):
 
 
 @gluon.constexpr_function
-def _wait(tc, stage, slot, drain=False, epilogue_groups=0, phase=None):
-    """Count groups newer than the youngest producer required by this read.
+def _read_step(tc, stage, drain):
+    """Absolute payload step this wait point reads at.
 
-    For a stage commit, ``slot=None`` waits for all operands at the stage head.
-    The drain uses a local origin: its first read is stage one, and epilogue
-    groups commit between stages zero and one. Once a producer is newer than
-    those epilogue groups, they no longer contribute to its wait allowance.
-    ``phase`` preserves the absolute payload-step phase used to apply each scale's
-    K-step ratio when stages use a local origin.
+    Three coordinates arrive here. ``None`` is steady state, where only the phase
+    matters, so any step late enough for every component to be active will do and
+    ``pipeline_depth`` is the cheapest such. An integer is an absolute startup step.
+    In the drain it is the zero-based drain iteration, whose first read is step one.
+    """
+    if drain:
+        return stage + 1
+    return pipeline_depth(tc) if stage is None else stage
+
+
+@gluon.constexpr_function
+def _required_producers(tc, read_step, slot, phase):
+    """Producer tokens the LDS reads at this point demand.
+
+    ``(producer_step, component, non_k_tile)``. The step is part of the identity
+    because the same copy repeats every ring period, so naming the component and tile
+    alone would match a different iteration's value.
+
+    Direct-register components are absent by construction: they have no commit group,
+    and the compiler tracks their VMEM dependency itself.
     """
     nm, nn = tc.num_m_slots_per_block(), tc.num_n_slots_per_block()
-    r = stage + 1 if drain else pipeline_depth(tc) if stage is None else stage
-    phase = r if phase is None else phase
-    required = []
+    out = []
     for ni in range(nn):
         for mi in range(nm):
             if slot is not None and _slot_index(mi, ni, nm, nn) != slot:
@@ -536,43 +548,96 @@ def _wait(tc, stage, slot, drain=False, epilogue_groups=0, phase=None):
                 tile = _component_read_tile(tc, component, mi, ni)
                 if tile is None:
                     continue
-                if _via_lds(tc, component) and _reads_at_phase(
-                    tc, component, phase
-                ):
-                    required.append(
-                        (
-                            r - _fill_span(tc, component) + 1,
-                            component,
-                            tile,
-                        )
+                if _via_lds(tc, component) and _reads_at_phase(tc, component, phase):
+                    out.append(
+                        (read_step - _fill_span(tc, component) + 1, component, tile)
                     )
-    if not required:
-        return None
+    return tuple(out)
 
-    timeline = []
-    for s in range(r - pipeline_depth(tc) + 1, r + 1):
+
+@gluon.constexpr_function
+def _committed_before(tc, stage, read_step, slot, drain, epilogue_groups, phase):
+    """Commit groups issued before this wait point, oldest first.
+
+    Empty entries are meaningful: a per-slot or per-stage scheme commits even when a
+    slot issued nothing, and an output-epilogue group carries no pipeline producer at
+    all. Both occupy a FIFO position, so both shift the distance to a required group.
+
+    The window starts at ``read_step - pipeline_depth + 1``. That is sufficient and
+    tight: a required producer sits at ``read_step - F(c) + 1`` with ``F(c) = L(c)``
+    for LDS components, and ``L(c) <= pipeline_depth`` by definition, with equality
+    reachable. Truncating older history is free regardless, since the returned count
+    depends only on the suffix after the newest required group.
+    """
+    out = []
+    for step in range(read_step - pipeline_depth(tc) + 1, read_step + 1):
+        step_phase = phase + step - read_step
         if drain:
             schedule = (
-                _groups(tc, s - 1, True, phase + s - r)
-                if s > 0
-                else _groups(tc, None, phase=phase + s - r)
+                _groups(tc, step - 1, True, step_phase)
+                if step > 0
+                else _groups(tc, None, phase=step_phase)
             )
         else:
-            schedule = _groups(tc, None if stage is None else s, phase=phase + s - r)
+            schedule = _groups(
+                tc, None if stage is None else step, phase=step_phase
+            )
         for pos, groups in enumerate(schedule):
-            if s == r and (slot is None or pos >= slot):
+            # This step's own slots from `slot` onward commit after the wait.
+            if step == read_step and (slot is None or pos >= slot):
                 break
-            timeline.extend(
-                tuple((s, component, tile) for component, tile in group)
+            out.extend(
+                tuple((step, component, tile) for component, tile in group)
                 for group in groups
             )
-        if drain and s == 0:
-            timeline.extend(() for _ in range(epilogue_groups))
+        if drain and step == 0:
+            # The epilogue commits between the last main step and the first drain
+            # iteration, so it lands here and nowhere else.
+            out.extend(() for _ in range(epilogue_groups))
+    return tuple(out)
 
+
+@gluon.constexpr_function
+def _wait_count(committed, required):
+    """Groups left outstanding after retiring the newest required producer.
+
+    ``wait_group(n)`` blocks until at most ``n`` groups remain outstanding, so with
+    ``j`` the newest index holding anything required, ``len - j - 1`` retires through
+    ``j`` and no further. One more would leave ``j`` in flight; one fewer would drain
+    newer work for nothing.
+
+    Sound even though retirement is measured against the outstanding set rather than
+    this timeline: retirement is oldest-first, so outstanding is always a suffix of
+    committed. If ``j`` is still in flight the suffix reaches it; if an earlier wait
+    already retired it the instruction is a no-op.
+    """
+    for token in required:
+        assert sum(token in group for group in committed) == 1, (
+            f"required producer {token} must be committed exactly once before its "
+            f"read; found {sum(token in group for group in committed)}"
+        )
     latest = max(
-        i for i, group in enumerate(timeline) if any(op in group for op in required)
+        i for i, group in enumerate(committed) if any(t in group for t in required)
     )
-    return len(timeline) - latest - 1
+    return len(committed) - latest - 1
+
+
+@gluon.constexpr_function
+def _wait(tc, stage, slot, drain=False, epilogue_groups=0, phase=None):
+    """Immediate for the ``wait_group`` before this read, or ``None`` for no wait.
+
+    Four independent steps: where we are, what the reads demand, what has committed,
+    how far back the newest demand sits.
+    """
+    read_step = _read_step(tc, stage, drain)
+    phase = read_step if phase is None else phase
+    required = _required_producers(tc, read_step, slot, phase)
+    if not required:
+        return None
+    committed = _committed_before(
+        tc, stage, read_step, slot, drain, epilogue_groups, phase
+    )
+    return _wait_count(committed, required)
 
 
 @gluon.constexpr_function
