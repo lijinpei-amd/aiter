@@ -8,13 +8,14 @@ import os
 import pytest
 import torch
 
+from aiter.ops.triton._gluon_kernels.gfx950.moe import _schedule
 from aiter.ops.triton._gluon_kernels.gfx950.moe._frozen import (
+    _buffer_load_order_frozen,
+    _buffer_load_tile_frozen,
     _pipeline_peeled_frozen,
     _validate_frozen_pipeline,
-)
-from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
-    pipeline_depth,
-    pipeline_unroll,
+    pipeline_depth_frozen,
+    pipeline_unroll_frozen,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import DtypeQuant, WarpPipeline
 from aiter.ops.triton.moe import moe_op_gemm_gluon as host
@@ -26,6 +27,35 @@ from op_tests.triton_tests.moe.test_moe_gemm_gluon_registers import (
     _launch_register_case,
     _register_config,
 )
+
+
+@pytest.mark.parametrize("dtype", ["mxfp4", "bf16", "mxfp8"])
+def test_vendored_frozen_helpers_match_the_live_schedule(dtype):
+    """``_frozen.py`` owns private copies of the schedule helpers it used to import.
+
+    That is deliberate: the frozen body is a verbatim snapshot whose acceptance test is
+    identical assembly, so it must not move when the live scheduling model is
+    refactored. The coupling belongs here, as a drift detector, rather than in the
+    source as an import -- if a live refactor is *supposed* to change these values, this
+    is the test that says so out loud.
+    """
+    if get_arch() != "gfx950":
+        pytest.skip("Gluon MoE kernels are gfx950 only.")
+    quant = {"mxfp4": DtypeQuant.MXFP4, "bf16": DtypeQuant.BF16,
+             "mxfp8": DtypeQuant.MXFP8}[dtype]
+    tc = host._probe_tuning_config(_register_config(dtype), quant, quant)
+    assert pipeline_depth_frozen(tc) == _schedule.pipeline_depth(tc)
+    assert pipeline_unroll_frozen(tc) == _schedule.pipeline_unroll(tc)
+    for nm in range(1, 5):
+        for nn in range(1, 5):
+            assert _buffer_load_order_frozen(nm, nn) == _schedule._buffer_load_order(
+                nm, nn
+            ), (nm, nn)
+            for pos in range(nm + nn):
+                for want_a in (False, True):
+                    assert _buffer_load_tile_frozen(
+                        pos, nm, nn, want_a
+                    ) == _schedule._buffer_load_tile(pos, nm, nn, want_a), (nm, nn, pos)
 
 
 @pytest.fixture(scope="module", params=["mxfp4", "bf16"])
@@ -113,7 +143,7 @@ def test_same_compiled_entry_honors_runtime_num_k(gated, depth, dtype, monkeypat
     assert case.route.block_m == config["BLOCK_M"]
     tc = host._probe_tuning_config(config, quant, quant)
     full_num_k = case.k // config["BLOCK_K"]
-    minimum = pipeline_depth(tc) + _pipeline_peeled_frozen(tc) + pipeline_unroll(tc)
+    minimum = pipeline_depth_frozen(tc) + _pipeline_peeled_frozen(tc) + pipeline_unroll_frozen(tc)
     # Depth three exercises every specialized drain phase in the same binary.
     short_counts = (minimum + 1,) if depth == 2 else range(minimum, minimum + depth)
     references = {full_num_k: case.expected if gated else case.raw}
