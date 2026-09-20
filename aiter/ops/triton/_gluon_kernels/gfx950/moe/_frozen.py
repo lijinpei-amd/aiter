@@ -45,13 +45,96 @@ from ._layout import (
     _b_scale_hbm_offsets,
     _slot_index,
 )
-from ._schedule import (
-    _buffer_load_order,
-    _buffer_load_tile,
-    pipeline_depth,
-    pipeline_unroll,
-)
-from ._types import DotKind, TileSched
+from ._types import COMPONENTS, DotKind, TileSched
+
+
+# --- vendored schedule helpers ------------------------------------------------
+# Private twins of the ``_schedule.py`` helpers this snapshot used to import. The
+# frozen body is a verbatim copy of the best measured kernel whose acceptance test is
+# *identical assembly*, so it must not move when the live scheduling model is
+# refactored. Importing from ``_schedule`` made that impossible to guarantee: any
+# change to the live fill order, the live depth/unroll signatures, or the live
+# ownership representation silently reshaped the frozen schedule too.
+#
+# These read only tuning accessors that are part of the stable config surface --
+# ``num_buffers``, ``scale_ratio_k_step``, ``func_cfg.has_scale``, ``K_UNROLL`` -- plus
+# ``COMPONENTS``. ``test_moe_gemm_gluon_frozen.py`` asserts each twin still agrees with
+# its live counterpart, so drift is caught in the tests rather than prevented by a
+# source dependency.
+# ------------------------------------------------------------------------------
+@gluon.constexpr_function
+def _present_frozen(tc, component):
+    operand, is_scale = component[0], component[1]
+    return not _v(is_scale) or tc.func_cfg.has_scale(operand)
+
+
+@gluon.constexpr_function
+def _component_depth_frozen(tc, component):
+    return tc.num_buffers(component[0], component[1])
+
+
+@gluon.constexpr_function
+def _component_ratio_frozen(tc, component):
+    operand, is_scale = component[0], component[1]
+    return tc.scale_ratio_k_step(operand) if _v(is_scale) else 1
+
+
+@gluon.constexpr_function
+def _live_span_frozen(tc, component):
+    """Baseline inclusive lifetime ``L(c)`` in payload K steps."""
+    return (
+        _component_depth_frozen(tc, component) - 1
+    ) * _component_ratio_frozen(tc, component) + 1
+
+
+@gluon.constexpr_function
+def pipeline_depth_frozen(tc):
+    """Largest prefetch span, measured in payload steps, of active components."""
+    depth = 0
+    for component in COMPONENTS:
+        if _present_frozen(tc, component):
+            depth = max(depth, _live_span_frozen(tc, component))
+    return depth
+
+
+@gluon.constexpr_function
+def pipeline_unroll_frozen(tc):
+    """LCM of the requested unroll and every active component ring period."""
+    requested = _v(tc.K_UNROLL)
+    assert requested >= 1, "K_UNROLL must be at least 1"
+    period = requested
+    for component in COMPONENTS:
+        if _present_frozen(tc, component):
+            period = math.lcm(
+                period,
+                _component_depth_frozen(tc, component)
+                * _component_ratio_frozen(tc, component),
+            )
+    return period
+
+
+@gluon.constexpr_function
+def _buffer_load_order_frozen(NM, NN):
+    """Payload copies as ``(is_a, tile)`` in slot order."""
+    NM, NN = _v(NM), _v(NN)
+    if NM == 2 and NN == 2:
+        return [(0, 0), (1, 0), (1, 1), (0, 1)]
+    out = []
+    for i in range(max(NM, NN)):
+        if i < NM:
+            out.append((1, i))
+        if i < NN:
+            out.append((0, i))
+    return out
+
+
+@gluon.constexpr_function
+def _buffer_load_tile_frozen(pos, NM, NN, want_a):
+    pos = _v(pos)
+    if pos is None:
+        return None
+    is_a, tile = _buffer_load_order_frozen(NM, NN)[pos]
+    return tile if bool(is_a) == bool(_v(want_a)) else None
 
 _TS_XCD_GROUP_M: gl.constexpr = gl.constexpr(int(TileSched.XCD_GROUP_M))
 _TS_GROUP_M: gl.constexpr = gl.constexpr(int(TileSched.GROUP_M))
@@ -663,7 +746,7 @@ def _prologue_frozen(pc, hbm_ptrs):
 def _buffer_load_group_pos_frozen(is_a, i, NM, NN):
     """Position of one mini-block fill's commit group inside its stage."""
     is_a, i = _v(is_a), _v(i)
-    order = _buffer_load_order(NM, NN)
+    order = _buffer_load_order_frozen(NM, NN)
     return order.index((1 if is_a else 0, i))
 
 
@@ -686,20 +769,20 @@ def _ds_read_a_tile_frozen(mi, ni, NM, NN):
     """Operand-A mini block slot ``(mi, ni)`` reads out of LDS, or None.
 
     Even: the same one-per-slot assignment the fills use, so a slot's fill and its read
-    name the *same* position in :func:`_buffer_load_order`. Its wait then works out to
+    name the *same* position in :func:`_buffer_load_order_frozen`. Its wait then works out to
     ``G - 1 - s + STAGES_BETWEEN * G + s`` -- the ``s`` cancels and every slot waits on
     the same constant, which is exactly the uniform ``wait_group`` the reference kernel
     uses. Legacy: A(mi) at ``ni == 0``, which bunches both reads onto slot (0, 0).
     """
     mi, ni, NM, NN = _v(mi), _v(ni), _v(NM), _v(NN)
-    return _buffer_load_tile(_buffer_load_pos_frozen(mi, ni, NM, NN), NM, NN, True)
+    return _buffer_load_tile_frozen(_buffer_load_pos_frozen(mi, ni, NM, NN), NM, NN, True)
 
 
 @gluon.constexpr_function
 def _ds_read_b_tile_frozen(mi, ni, NM, NN):
     """Operand-B mini block slot ``(mi, ni)`` reads out of LDS, or None."""
     mi, ni, NM, NN = _v(mi), _v(ni), _v(NM), _v(NN)
-    return _buffer_load_tile(_buffer_load_pos_frozen(mi, ni, NM, NN), NM, NN, False)
+    return _buffer_load_tile_frozen(_buffer_load_pos_frozen(mi, ni, NM, NN), NM, NN, False)
 
 
 @gluon.constexpr_function
@@ -719,7 +802,7 @@ def _scale_buffer_load_slot_frozen(is_a, tile, NM, NN):
 
 @gluon.constexpr_function
 def _buffer_load_pos_frozen(mi, ni, NM, NN):
-    """Which fill (position in :func:`_buffer_load_order`) slot ``(mi, ni)`` issues, or None.
+    """Which fill (position in :func:`_buffer_load_order_frozen`) slot ``(mi, ni)`` issues, or None.
 
     Even: one fill per slot, in flat slot order -- exactly the tutorial's layout, where
     each of the four ``mfma``/``mem`` region pairs moves one tile and commits one group.
@@ -852,10 +935,10 @@ def _buffer_load_frozen(
     NM: gl.constexpr = pc.tuning_cfg.num_m_slots_per_block()
     NN: gl.constexpr = pc.tuning_cfg.num_n_slots_per_block()
     # Under the even schedule the slot owns at most one fill, named by its position in
-    # _buffer_load_order; under the legacy one the (ni == 0) / (mi == 0) predicates below pick.
+    # _buffer_load_order_frozen; under the legacy one the (ni == 0) / (mi == 0) predicates below pick.
     POS: gl.constexpr = _buffer_load_pos_frozen(mi, ni, NM, NN)
-    A_TILE: gl.constexpr = _buffer_load_tile(POS, NM, NN, True)
-    B_TILE: gl.constexpr = _buffer_load_tile(POS, NM, NN, False)
+    A_TILE: gl.constexpr = _buffer_load_tile_frozen(POS, NM, NN, True)
+    B_TILE: gl.constexpr = _buffer_load_tile_frozen(POS, NM, NN, False)
     # Scale copies may be placed on a different slot than their payload.
     A_SC: gl.constexpr = _scale_buffer_load_tile_frozen(mi, ni, NM, NN, True)
     B_SC: gl.constexpr = _scale_buffer_load_tile_frozen(mi, ni, NM, NN, False)
@@ -1344,9 +1427,9 @@ def _validate_frozen_pipeline(tc, K):
     """Validate the frozen driver's rings and runtime-loop lower bound."""
     tc.validate_buffer_counts()
     num_k = tc.num_k_tiles(K)
-    depth = pipeline_depth(tc)
+    depth = pipeline_depth_frozen(tc)
     peeled = _pipeline_peeled_frozen(tc)
-    unroll = pipeline_unroll(tc)
+    unroll = pipeline_unroll_frozen(tc)
     assert num_k >= depth + peeled + unroll, (
         f"NUM_K ({num_k}) must be at least NB_MAX ({depth}) + PEELED ({peeled}) "
         f"+ UNROLL ({unroll}) = {depth + peeled + unroll}"
@@ -1368,7 +1451,7 @@ def _index_frozen(
     else:
         depth: gl.constexpr = tc.num_buffers(kind // 2, kind % 2 != 0)
         advance: gl.constexpr = depth - 1 if FILL else 0
-        if require_constexpr(IN_LOOP and pipeline_unroll(tc) % depth == 0):
+        if require_constexpr(IN_LOOP and pipeline_unroll_frozen(tc) % depth == 0):
             out = (_pipeline_peeled_frozen(tc) + KI + 1 + advance) % depth
         else:
             tile = step + advance
@@ -1477,7 +1560,7 @@ def _step_frozen(
         regs,
         _index_frozen(tc, step, 0, True, KI, IN_LOOP or STATIC_PHASE),
         _index_frozen(tc, step, 0, False, KI, IN_LOOP or STATIC_PHASE),
-        pipeline_depth(tc) - 2 - (STAGE if DRAIN else 0),
+        pipeline_depth_frozen(tc) - 2 - (STAGE if DRAIN else 0),
         not DRAIN,
         True,
         IN_LOOP,
@@ -1497,8 +1580,8 @@ def _run_frozen_pipeline(pc, ptrs, NUM_K):
         tc.num_prefetch_k_slots() == tc.num_k_slots_per_tile(),
         "the frozen pipeline requires VGPR_PREFETCH_K == BLOCK_K",
     )
-    depth: gl.constexpr = pipeline_depth(tc)
-    unroll: gl.constexpr = pipeline_unroll(tc)
+    depth: gl.constexpr = pipeline_depth_frozen(tc)
+    unroll: gl.constexpr = pipeline_unroll_frozen(tc)
     peeled: gl.constexpr = _pipeline_peeled_frozen(tc)
     main = NUM_K - depth
     gl.assume(main >= peeled + unroll)
@@ -1563,7 +1646,7 @@ def _drain_frozen_pipeline(
     pc, ptrs, buffers, regs, NUM_K, EPILOGUE_GROUPS: gl.constexpr
 ):
     tc: gl.constexpr = pc.tuning_cfg
-    main = NUM_K - pipeline_depth(tc)
+    main = NUM_K - pipeline_depth_frozen(tc)
     period: gl.constexpr = math.lcm(
         tc.num_buffers(0),
         tc.num_buffers(1),
@@ -1574,14 +1657,14 @@ def _drain_frozen_pipeline(
     )
     if require_constexpr(
         period <= 3
-        and pipeline_unroll(tc) % period == 0
+        and pipeline_unroll_frozen(tc) % period == 0
         and tc.pipeline_register_period() == 1
         and pc.func_cfg.output_quant is None
     ):
         phase = main % period
         for p in gl.static_range(period):
             if phase == p:
-                for j in gl.static_range(pipeline_depth(tc) - 1):
+                for j in gl.static_range(pipeline_depth_frozen(tc) - 1):
                     ptrs, buffers, regs = _step_frozen(
                         pc,
                         ptrs,
@@ -1595,7 +1678,7 @@ def _drain_frozen_pipeline(
                         STATIC_PHASE=True,
                     )
     else:
-        for j in gl.static_range(pipeline_depth(tc) - 1):
+        for j in gl.static_range(pipeline_depth_frozen(tc) - 1):
             ptrs, buffers, regs = _step_frozen(
                 pc,
                 ptrs,
