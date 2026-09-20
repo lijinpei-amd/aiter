@@ -748,6 +748,49 @@ def _default_launch_config(
             B_PRESHUFFLED=False,
         )
     if (
+        not small_grid
+        and apply_swiglu
+        and dq_a == DtypeQuant.MXFP8
+        and dq_b in (DtypeQuant.MXFP4, DtypeQuant.MXFP8)
+        and block_m == 32
+        and N == 4096
+        and K == 7168
+        and not c["FROZEN_STEP"]
+    ):
+        # T<=64 with E=33, top-k=8 touches every expert, so gemm1 streams the whole
+        # weight tensor whatever the token count and the kernel is limited by how much
+        # of that stream it keeps in flight -- not by MFMA and not by the HBM roof
+        # (3.9 TB/s is about half of peak here).
+        #
+        # Two things buy the bandwidth back, measured cold against a paired FlyDSL
+        # control (bench_out/a8_smallt_20260920, 4 rounds x 100 samples):
+        #
+        #   a8w4 T16  200.4 -> 132.8 us   a8w4 T64  206.5 -> 138.8 us
+        #   a8w8 T16  280.1 -> 232.9 us   a8w8 T64  287.6 -> 242.1 us
+        #
+        # FlyDSL on the same shapes is 132.1/133.6 and 241.5/242.5, so this is parity
+        # rather than a partial recovery. The `.cg` hint on the expert stream is most
+        # of it and comes from the block_m <= 32 rule above; what is set here is the
+        # geometry that hint needs -- and, decisively, MINI_BLOCK_M/N at the warp
+        # granularity rather than the whole tile. Leaving them at the tile gives one
+        # slot per axis, which gate/up split refuses outright, so these shapes fell
+        # back to the Triton kernel and none of the tuning above ever ran.
+        c = dict(
+            c,
+            BLOCK_N=128,
+            # a8w4 halves the weight bytes per K step, so it can afford twice the K
+            # depth inside the same LDS budget; a8w8 cannot.
+            BLOCK_K=512 if dq_b == DtypeQuant.MXFP4 else 256,
+            MINI_BLOCK_M=16,
+            MINI_BLOCK_N=64,
+            mfma_instr_shape=(16, 16, 128),
+            warps_per_cta=(1, 4),
+            tiles_per_warp=(1, 1),
+            NUM_LDS_BUFFER=3,
+            K_UNROLL=3,
+            VGPR_PREFETCH_K=512 if dq_b == DtypeQuant.MXFP4 else 256,
+        )
+    if (
         apply_swiglu
         and dq_a == dq_b == DtypeQuant.MXFP8
         and block_m == 128
