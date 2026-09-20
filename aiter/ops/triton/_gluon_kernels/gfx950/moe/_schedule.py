@@ -475,6 +475,31 @@ def _reads_at_phase(tc, component, phase):
 
 
 @gluon.constexpr_function
+def _issued_tiles(tc, mi, ni, stage, drain=False, phase=0):
+    """Tiles this slot issues at this step, ``COMPONENTS``-aligned; ``None`` for none.
+
+    :func:`_ops` says what the slot *owns*; this applies the step-local filters on top
+    -- staggered startup and drain shutdown, and the scale K-step phase. One query
+    instead of the same three-term predicate repeated per component, and the emitter
+    and the commit-group model now read the same answer rather than two copies of the
+    same conjunction that could drift apart.
+
+    Direct-register destinations are kept. They are part of the step schedule; only
+    the async-group view drops them, which it does by filtering this on placement.
+    """
+    return tuple(
+        tile
+        if (
+            tile is not None
+            and _active(tc, component, stage, drain)
+            and _loads_at_phase(tc, component, phase)
+        )
+        else None
+        for component, tile in zip(COMPONENTS, _ops(tc, mi, ni))
+    )
+
+
+@gluon.constexpr_function
 def _has_register_component(tc):
     """Whether any present live component uses a direct-register ring."""
     for component in COMPONENTS:
@@ -490,13 +515,15 @@ def _groups(tc, stage, drain=False, phase=None):
     phase = stage if phase is None and stage is not None else phase or 0
     for ni in range(tc.num_n_slots_per_block()):
         for mi in range(tc.num_m_slots_per_block()):
+            # The async view of what this slot issues: the same step schedule the
+            # emitter fills from, minus the direct-register copies, which have no
+            # commit group.
             ops = tuple(
                 (component, tile)
-                for component, tile in zip(COMPONENTS, _ops(tc, mi, ni))
-                if tile is not None
-                and _active(tc, component, stage, drain)
-                and _via_lds(tc, component)
-                and _loads_at_phase(tc, component, phase)
+                for component, tile in zip(
+                    COMPONENTS, _issued_tiles(tc, mi, ni, stage, drain, phase)
+                )
+                if tile is not None and _via_lds(tc, component)
             )
             if tc.commit_per_op():
                 groups = tuple((op,) for op in ops)
