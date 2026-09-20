@@ -894,6 +894,12 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
 def _drain_buffered_pipeline(
     pc, ptrs, buffers, regs, NUM_K, EPILOGUE_GROUPS: gl.constexpr
 ):
+    # Precondition: NUM_K == tuning_cfg.num_k_tiles(K). The drain's region selection
+    # uses the runtime NUM_K while its absolute scale phase comes from the constexpr
+    # pc.num_k, so the two must name the same strip. Every production launch passes
+    # K // BLOCK_K for NUM_K, which satisfies it. It matters only for a scale K-step
+    # ratio above one or BLOCK_K == 128, where the phase selects which scale block or
+    # which half of a packed word the MFMA consumes.
     tc: gl.constexpr = pc.tuning_cfg
     main = NUM_K - pipeline_depth(tc)
     period: gl.constexpr = ring_restoration_period(tc)
