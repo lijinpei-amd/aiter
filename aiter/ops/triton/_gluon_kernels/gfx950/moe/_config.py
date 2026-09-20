@@ -403,8 +403,11 @@ class KernelTuningConfig(_KernelTuningLayout):
     def pipeline_register_period(self):
         """LCM of the active register rings; absent scales have no ring.
 
-        LDS slots may use runtime indices. Register tuples need static indices in
-        the main loop, so an unrolled body must return each ring to its first slot.
+        ``_schedule.ring_restoration_period`` over direct-register components only.
+        Separate because the two have different consumers: LDS slots may use runtime
+        indices, while register tuples need static ones in the main loop, so only the
+        register rings have to return to slot zero for a body to be unrollable. Kept
+        here rather than beside its sibling to avoid an import cycle.
         """
         period = 1
         for component in COMPONENTS:
