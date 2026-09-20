@@ -39,6 +39,8 @@ __all__ = [
     "A",
     "B",
     "ScheduleSpec",
+    "async_pattern_period",
+    "ring_restoration_period",
     "schedule_spec",
 ]
 
@@ -156,17 +158,19 @@ def pipeline_depth(tc):
 
 
 @gluon.constexpr_function
-def pipeline_unroll(tc):
-    """LCM of the requested unroll and every active component ring period.
+def ring_restoration_period(tc):
+    """Payload steps after which every present component ring is back at slot zero.
 
-    Payload rings advance every step. Scale rings advance once per scale K tile,
-    so their period in payload steps is their depth times the scale K-step ratio.
-    Including LDS rings keeps every complete body at a fixed ring phase as well as
-    satisfying the static-index requirement of register tuples.
+    A component's ring period is its depth times its scale K-step ratio, not its live
+    span ``(D - 1) * R + 1``: the span says when a value is consumed, the period says
+    when the ring repeats.
+
+    Distinct from three neighbours it is easy to conflate with. The requested unroll
+    (``K_UNROLL``) is a tuning knob. The effective unroll is this LCM'd with that knob.
+    The register-only period (``pipeline_register_period``) counts the same quantity
+    over direct-register rings alone, because only those need a static index.
     """
-    requested = _v(tc.K_UNROLL)
-    assert requested >= 1, "K_UNROLL must be at least 1"
-    period = requested
+    period = 1
     for component in COMPONENTS:
         if _present(tc, component):
             period = math.lcm(
@@ -174,6 +178,35 @@ def pipeline_unroll(tc):
                 _component_depth(tc, component) * _component_ratio(tc, component),
             )
     return period
+
+
+@gluon.constexpr_function
+def async_pattern_period(tc):
+    """Payload steps after which the issued async-copy pattern repeats.
+
+    The LCM of the scale K-step ratios over present LDS-backed components; payload
+    components contribute one. Shorter than the ring restoration period, because
+    which copies issue depends only on the K-step phase, not on which ring slot they
+    land in. Direct-register components do not participate -- they issue no async
+    copy -- so this is the period of the commit-group pattern specifically.
+    """
+    period = 1
+    for component in COMPONENTS:
+        if _present(tc, component) and _via_lds(tc, component):
+            period = math.lcm(period, _component_ratio(tc, component))
+    return period
+
+
+@gluon.constexpr_function
+def pipeline_unroll(tc):
+    """Requested unroll, widened to a whole number of every component ring period.
+
+    Including LDS rings keeps every complete body at a fixed ring phase as well as
+    satisfying the static-index requirement of register tuples.
+    """
+    requested = _v(tc.K_UNROLL)
+    assert requested >= 1, "K_UNROLL must be at least 1"
+    return math.lcm(requested, ring_restoration_period(tc))
 
 
 @gluon.constexpr_function

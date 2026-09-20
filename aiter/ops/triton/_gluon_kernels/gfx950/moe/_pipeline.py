@@ -11,8 +11,6 @@ rings keep fixed SSA slots throughout each complete unrolled body; only the
 finite prologue, remainder, and drain rotate the logical queues.
 """
 
-import math
-
 import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
@@ -46,6 +44,7 @@ from ._schedule import (
     _wait,
     pipeline_depth,
     pipeline_unroll,
+    ring_restoration_period,
 )
 
 _A_PAYLOAD: gl.constexpr = gl.constexpr(A_PAYLOAD)
@@ -935,20 +934,7 @@ def _drain_buffered_pipeline(
 ):
     tc: gl.constexpr = pc.tuning_cfg
     main = NUM_K - pipeline_depth(tc)
-    period: gl.constexpr = math.lcm(
-        tc.num_buffers(0),
-        tc.num_buffers(1),
-        (
-            tc.num_buffers(0, True) * tc.scale_ratio_k_step(0)
-            if pc.func_cfg.a_has_scale()
-            else 1
-        ),
-        (
-            tc.num_buffers(1, True) * tc.scale_ratio_k_step(1)
-            if pc.func_cfg.b_has_scale()
-            else 1
-        ),
-    )
+    period: gl.constexpr = ring_restoration_period(tc)
     # Keep short LDS rings in immediate offsets; live queues and quantized
     # epilogues need the smaller dynamic drain to avoid allocation pressure.
     if require_constexpr(
