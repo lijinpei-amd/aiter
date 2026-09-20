@@ -215,64 +215,104 @@ def _buffer_load_order(NM, NN):
 
 
 @gluon.constexpr_function
+def _payload_fill_slots(NM, NN):
+    """Slot that owns each payload tile, as ``(A tiles, B tiles)``.
+
+    The resolved form of :func:`_buffer_load_order`. Ownership is a mapping from a
+    component's non-K tile to a slot, not a position lookup into a shared list --
+    which is what lets several components own copies in the same slot.
+    """
+    NM, NN = _v(NM), _v(NN)
+    order = _buffer_load_order(NM, NN)
+    return (
+        tuple(order.index((1, tile)) for tile in range(NM)),
+        tuple(order.index((0, tile)) for tile in range(NN)),
+    )
+
+
+@gluon.constexpr_function
+def _component_fill_slots(tc, component):
+    """Slot that owns each non-K tile of one component.
+
+    ``SCALE_FILL_MID`` is consumed here and nowhere else: downstream ownership,
+    grouping, dependency and emission all read the resolved mapping. Note it is
+    guarded to the 2x2 split, so on any other geometry it is inert -- a rectangular
+    tile that sets it is not testing anything.
+    """
+    nm, nn = _v(tc.num_m_slots_per_block()), _v(tc.num_n_slots_per_block())
+    a_slots, b_slots = _payload_fill_slots(nm, nn)
+    if _v(component[1]) and _v(tc.SCALE_FILL_MID) and nm == 2 and nn == 2:
+        return (1, 2)
+    return a_slots if _v(component[0]) == A else b_slots
+
+
+@gluon.constexpr_function
+def _fill_slots_valid(tc):
+    """Every mapped slot exists, and no component owns two tiles in one slot.
+
+    The second half is what keeps the flat ``_ops()`` transport representable: it
+    carries one optional tile per component, so a component may own at most one tile
+    per slot. Different components sharing a slot is fine and expected.
+    """
+    slots = _v(tc.num_m_slots_per_block()) * _v(tc.num_n_slots_per_block())
+    for component in COMPONENTS:
+        mapping = _component_fill_slots(tc, component)
+        expected = (
+            _v(tc.num_m_slots_per_block())
+            if _v(component[0]) == A
+            else _v(tc.num_n_slots_per_block())
+        )
+        if len(mapping) != expected:
+            return False
+        if any(slot < 0 or slot >= slots for slot in mapping):
+            return False
+        if len(set(mapping)) != len(mapping):
+            return False
+    return True
+
+
+@gluon.constexpr_function
 def _payload_buffer_load_slot(is_a, tile, NM, NN):
-    return _buffer_load_order(NM, NN).index((int(bool(_v(is_a))), _v(tile)))
-
-
-@gluon.constexpr_function
-def _buffer_load_pos(mi, ni, NM, NN):
-    s = _slot_index(mi, ni, NM, NN)
-    return s if s < _v(NM) + _v(NN) else None
-
-
-@gluon.constexpr_function
-def _buffer_load_tile(pos, NM, NN, want_a):
-    pos = _v(pos)
-    if pos is None:
-        return None
-    is_a, tile = _buffer_load_order(NM, NN)[pos]
-    return tile if bool(is_a) == bool(_v(want_a)) else None
-
-
-@gluon.constexpr_function
-def _scale_buffer_load_slot(is_a, tile, NM, NN, SCALE_FILL_MID=False):
-    """A scale can be copied in a different slot from its payload."""
-    if _v(SCALE_FILL_MID) and _v(NM) == 2 and _v(NN) == 2:
-        return 1 + _v(tile)
-    return _payload_buffer_load_slot(is_a, tile, NM, NN)
-
-
-@gluon.constexpr_function
-def _scale_buffer_load_tile(mi, ni, NM, NN, want_a, SCALE_FILL_MID=False):
-    s = _slot_index(mi, ni, NM, NN)
-    for tile in range(_v(NM) if _v(want_a) else _v(NN)):
-        if _scale_buffer_load_slot(want_a, tile, NM, NN, SCALE_FILL_MID) == s:
-            return tile
-    return None
+    a_slots, b_slots = _payload_fill_slots(NM, NN)
+    return (a_slots if bool(_v(is_a)) else b_slots)[_v(tile)]
 
 
 @gluon.constexpr_function
 def _component_fill_slot(tc, component, tile):
     """Flattened slot that owns one component/non-K-tile producer."""
-    operand, is_scale = component[0], component[1]
-    nm, nn = tc.num_m_slots_per_block(), tc.num_n_slots_per_block()
-    if _v(is_scale):
-        return _scale_buffer_load_slot(
-            operand == A, tile, nm, nn, tc.SCALE_FILL_MID
-        )
-    return _payload_buffer_load_slot(operand == A, tile, nm, nn)
+    return _component_fill_slots(tc, component)[_v(tile)]
+
+
+@gluon.constexpr_function
+def _candidate_ops(tc, slot):
+    """Tiles this slot owns, in ``COMPONENTS`` order; ``None`` where it owns none.
+
+    The single inversion of the fill mappings, and the only per-slot ownership view.
+    Scale tiles covered by a wider earlier load are filtered out here rather than
+    being absent from the mapping, so the mappings stay indexed by logical payload
+    tile.
+    """
+    out = []
+    for component in COMPONENTS:
+        tile = None
+        if _present(tc, component):
+            ratio = (
+                _v(tc.scale_ratio_non_k_slot(_v(component[0])))
+                if _v(component[1])
+                else 1
+            )
+            for candidate, owner in enumerate(_component_fill_slots(tc, component)):
+                if owner == _v(slot) and candidate % ratio == 0:
+                    tile = candidate
+                    break
+        out.append(tile)
+    return tuple(out)
 
 
 @gluon.constexpr_function
 def _component_nominal_read_slot(tc, component, tile):
     """Payload-owned slot at which a component would normally be selected."""
-    operand = component[0]
-    return _payload_buffer_load_slot(
-        operand == A,
-        tile,
-        tc.num_m_slots_per_block(),
-        tc.num_n_slots_per_block(),
-    )
+    return _component_fill_slots(tc, (component[0], PAYLOAD))[_v(tile)]
 
 
 @gluon.constexpr_function
@@ -313,21 +353,18 @@ def _component_read_tile(tc, component, mi, ni):
 
 @gluon.constexpr_function
 def _ops(tc, mi, ni):
-    """Tiles in ``COMPONENTS`` order, including direct-register destinations."""
-    nm, nn = tc.num_m_slots_per_block(), tc.num_n_slots_per_block()
-    pos = _buffer_load_pos(mi, ni, nm, nn)
-    ops = []
-    for operand in OPERANDS:
-        ops.append(_buffer_load_tile(pos, nm, nn, operand == A))
-        tile = None
-        if _present(tc, (operand, SCALE)):
-            tile = _scale_buffer_load_tile(
-                mi, ni, nm, nn, operand == A, tc.SCALE_FILL_MID
-            )
-            if tile is not None and tile % tc.scale_ratio_non_k_slot(operand) != 0:
-                tile = None
-        ops.append(tile)
-    return tuple(ops)
+    """Tiles in ``COMPONENTS`` order, including direct-register destinations.
+
+    The flat four-element transport across the constexpr-to-JIT boundary -- nested
+    tuples do not survive it. A view over :func:`_candidate_ops`, not a second
+    ownership model.
+    """
+    return _candidate_ops(
+        tc,
+        _slot_index(
+            mi, ni, tc.num_m_slots_per_block(), tc.num_n_slots_per_block()
+        ),
+    )
 
 
 @gluon.constexpr_function

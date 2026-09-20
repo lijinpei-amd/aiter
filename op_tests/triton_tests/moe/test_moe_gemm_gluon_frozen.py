@@ -51,11 +51,18 @@ def test_vendored_frozen_helpers_match_the_live_schedule(dtype):
             assert _buffer_load_order_frozen(nm, nn) == _schedule._buffer_load_order(
                 nm, nn
             ), (nm, nn)
-            for pos in range(nm + nn):
-                for want_a in (False, True):
-                    assert _buffer_load_tile_frozen(
-                        pos, nm, nn, want_a
-                    ) == _schedule._buffer_load_tile(pos, nm, nn, want_a), (nm, nn, pos)
+            # The live side resolved ownership into per-component mappings, so
+            # there is no live positional tile view left to compare against.
+            # Check the frozen twin against its own order instead, which is what
+            # it is a transcription of.
+            order = _buffer_load_order_frozen(nm, nn)
+            for pos, (is_a, tile) in enumerate(order):
+                assert _buffer_load_tile_frozen(pos, nm, nn, True) == (
+                    tile if is_a else None
+                ), (nm, nn, pos)
+                assert _buffer_load_tile_frozen(pos, nm, nn, False) == (
+                    None if is_a else tile
+                ), (nm, nn, pos)
 
 
 @pytest.fixture(scope="module", params=["mxfp4", "bf16"])
