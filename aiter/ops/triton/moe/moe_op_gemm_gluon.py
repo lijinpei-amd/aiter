@@ -40,7 +40,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._frozen import (
     _validate_frozen_pipeline,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._pipeline import (
-    _validate_pipeline as _validate_live_pipeline,
+    validate_pipeline as _validate_live_pipeline,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     ActivationSpec,

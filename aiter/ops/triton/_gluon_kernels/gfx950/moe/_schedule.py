@@ -607,3 +607,47 @@ def _slot_waits(tc, stage, drain=False, epilogue_groups=0, phase=None):
     return tuple(
         _wait(tc, stage, slot, drain, epilogue_groups, phase) for slot in range(slots)
     )
+
+
+@gluon.constexpr_function
+def validate_pipeline(tc, K):
+    """Validate the live component rings and runtime-loop lower bound."""
+    tc.validate_buffer_counts()
+    num_k = tc.num_k_tiles(K)
+    depth = pipeline_depth(tc)
+    peeled = _pipeline_peeled(tc)
+    unroll = pipeline_unroll(tc)
+    assert num_k >= depth + peeled + unroll, (
+        f"NUM_K ({num_k}) must be at least PIPELINE_DEPTH ({depth}) "
+        f"+ PEELED ({peeled}) + UNROLL ({unroll}) = {depth + peeled + unroll}"
+    )
+    return True
+
+
+@gluon.constexpr_function
+def _scale_soff_steps(tc, component, offset_step):
+    """Advance from the first scale producer in an unrolled body."""
+    ratio = _component_ratio(tc, component)
+    start = _pipeline_peeled(tc) + 1
+    producer_phase = _producer_phase(tc, component)
+    first_producer = (start - producer_phase + ratio - 1) // ratio
+    producer = (start + offset_step - producer_phase) // ratio
+    return (producer - first_producer) * ratio
+
+
+@gluon.constexpr_function
+def _register_index(tc, component, phase, ki, in_loop, fill=False):
+    """Static register-bank index derived from producer-to-selection timing."""
+    if not _present(tc, component):
+        return 0
+    ratio = _component_ratio(tc, component)
+    if in_loop:
+        origin = _pipeline_peeled(tc) + 1
+        current = origin + ki
+    else:
+        # Finite regions rotate their tuples after each step, so logical bank zero
+        # always denotes the value selected at ``phase``.
+        origin = phase
+        current = phase
+    target = current + (_fill_span(tc, component) - 1 if fill else 0)
+    return (target // ratio - origin // ratio) % _component_depth(tc, component)

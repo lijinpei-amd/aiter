@@ -30,7 +30,6 @@ from ._schedule import (
     _fill_span,
     _has_register_component,
     _in_reg,
-    _live_span,
     _loads_at_phase,
     _ops,
     _pipeline_peeled,
@@ -38,6 +37,8 @@ from ._schedule import (
     _producer_phase,
     _read_in_mfma,
     _reads_at_phase,
+    _register_index,
+    _scale_soff_steps,
     _slot_waits,
     _stage_wait,
     _via_lds,
@@ -45,27 +46,13 @@ from ._schedule import (
     pipeline_depth,
     pipeline_unroll,
     ring_restoration_period,
+    validate_pipeline,
 )
 
 _A_PAYLOAD: gl.constexpr = gl.constexpr(A_PAYLOAD)
 _A_SCALE: gl.constexpr = gl.constexpr(A_SCALE)
 _B_PAYLOAD: gl.constexpr = gl.constexpr(B_PAYLOAD)
 _B_SCALE: gl.constexpr = gl.constexpr(B_SCALE)
-
-
-@gluon.constexpr_function
-def _validate_pipeline(tc, K):
-    """Validate the live component rings and runtime-loop lower bound."""
-    tc.validate_buffer_counts()
-    num_k = tc.num_k_tiles(K)
-    depth = pipeline_depth(tc)
-    peeled = _pipeline_peeled(tc)
-    unroll = pipeline_unroll(tc)
-    assert num_k >= depth + peeled + unroll, (
-        f"NUM_K ({num_k}) must be at least PIPELINE_DEPTH ({depth}) "
-        f"+ PEELED ({peeled}) + UNROLL ({unroll}) = {depth + peeled + unroll}"
-    )
-    return True
 
 
 @gluon.jit
@@ -82,7 +69,11 @@ def _index(
     else:
         depth: gl.constexpr = _component_depth(tc, component)
         ratio: gl.constexpr = _component_ratio(tc, component)
-        advance: gl.constexpr = _live_span(tc, component) - 1 if FILL else 0
+        # _fill_span, not _live_span: they differ only for a direct-register
+        # component, and FILL is only ever set from the LDS branches where the
+        # two agree. Spelling it this way means the ring index stays right if a
+        # register component is ever routed through here.
+        advance: gl.constexpr = _fill_span(tc, component) - 1 if FILL else 0
         if require_constexpr(IN_LOOP and pipeline_unroll(tc) % (depth * ratio) == 0):
             out = ((_pipeline_peeled(tc) + KI + 1 + advance) // ratio) % depth
         else:
@@ -202,35 +193,6 @@ def _init_buffers(pc):
 @gluon.constexpr_function
 def _soff_unroll(tc, in_loop):
     return in_loop and tc.SOFF_UNROLL
-
-
-@gluon.constexpr_function
-def _scale_soff_steps(tc, component, offset_step):
-    """Advance from the first scale producer in an unrolled body."""
-    ratio = _component_ratio(tc, component)
-    start = _pipeline_peeled(tc) + 1
-    producer_phase = _producer_phase(tc, component)
-    first_producer = (start - producer_phase + ratio - 1) // ratio
-    producer = (start + offset_step - producer_phase) // ratio
-    return (producer - first_producer) * ratio
-
-
-@gluon.constexpr_function
-def _register_index(tc, component, phase, ki, in_loop, fill=False):
-    """Static register-bank index derived from producer-to-selection timing."""
-    if not _present(tc, component):
-        return 0
-    ratio = _component_ratio(tc, component)
-    if in_loop:
-        origin = _pipeline_peeled(tc) + 1
-        current = origin + ki
-    else:
-        # Finite regions rotate their tuples after each step, so logical bank zero
-        # always denotes the value selected at ``phase``.
-        origin = phase
-        current = phase
-    target = current + (_fill_span(tc, component) - 1 if fill else 0)
-    return (target // ratio - origin // ratio) % _component_depth(tc, component)
 
 
 @gluon.jit

@@ -16,6 +16,7 @@ from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton._gluon_kernels.gfx950.moe import _frozen as frozen
 from aiter.ops.triton._gluon_kernels.gfx950.moe import _pipeline as buffered
+from aiter.ops.triton._gluon_kernels.gfx950.moe import _schedule as schedule
 from aiter.ops.triton._gluon_kernels.gfx950.moe import moe_gemm as kernel
 from aiter.ops.triton._gluon_kernels.gfx950.moe._config import (
     KernelFuncConfig,
@@ -576,5 +577,5 @@ def test_pipeline_phases_and_packed_scale_addresses(
     lengths.add(minimum + 2 * effective_unroll)
     for stages in sorted(lengths):
         assert tc.validate(4096, stages * 128)
-        assert buffered._validate_pipeline(tc, stages * 128)
+        assert schedule.validate_pipeline(tc, stages * 128)
         _run_scalar_pipeline(monkeypatch, tc, stages, fused)

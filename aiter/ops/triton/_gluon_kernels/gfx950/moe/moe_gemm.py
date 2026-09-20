@@ -85,6 +85,7 @@ from ._layout import (
     _slot_index,
 )
 from ._lds import LDSManager
+from ._schedule import validate_pipeline
 from ._types import A_SCALE, B_SCALE, DotKind, TileSched
 
 _A_SCALE: gl.constexpr = gl.constexpr(A_SCALE)
@@ -525,7 +526,7 @@ def _moe_gemm_body(
     NUM_K,
 ):
     gl.static_assert(tuning_cfg.validate(N, K))
-    gl.static_assert(_validate_pipeline(tuning_cfg, K))
+    gl.static_assert(validate_pipeline(tuning_cfg, K))
 
     pid = gl.program_id(0)
     if require_constexpr(tuning_cfg.TILE_SCHED == _TS_XCD_GROUP_M):
@@ -714,5 +715,4 @@ from ._pipeline import (
     _drain_buffered_pipeline,
     _last_mfma,
     _run_buffered_pipeline,
-    _validate_pipeline,
 )
