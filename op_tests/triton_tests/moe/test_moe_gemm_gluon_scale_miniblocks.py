@@ -7,7 +7,10 @@ import math
 
 import pytest
 
-from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import pipeline_unroll
+from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
+    _live_span,
+    pipeline_unroll,
+)
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import DtypeQuant
 from aiter.ops.triton.moe import moe_op_gemm_gluon as host
 from op_tests.triton_tests.moe.test_moe_gemm_gluon_scale_layout import _config
@@ -94,6 +97,25 @@ def test_invalid_shuffled_scale_minis_are_rejected(field, value):
         _config(**{field: value}).validate(4096, 7168)
 
 
+@pytest.mark.parametrize("K", [7168 + 128, 3584 + 128, 1792 + 128])
+def test_shuffled_scale_k_must_divide_total_k(K):
+    """One scale load has to cover whole payload K steps *and* tile K exactly.
+
+    The other three `S_K` rules (at least `max(256, BLOCK_K)`, a power of two, a
+    multiple of `BLOCK_K`) are shape-local and already covered. This one couples the
+    scale geometry to the runtime K extent: a `S_K` that divides `BLOCK_K` cleanly but
+    not `K` leaves a short final scale load with no payload steps to cover.
+    """
+    tc = _config(SCALE_MINI_BLOCK_K=256)
+    assert K % 256 != 0, "pick a K the scale extent cannot tile"
+    with pytest.raises(
+        AssertionError, match="K must contain complete SCALE_MINI_BLOCK_K tiles"
+    ):
+        tc.validate(4096, K)
+    # The same configuration is legal as soon as K is a whole number of scale loads.
+    tc.validate(4096, K + 256 - (K % 256))
+
+
 def test_shuffled_scale_k_cannot_be_narrower_than_payload_k():
     tc = _config(
         BLOCK_K=512,
@@ -144,7 +166,7 @@ def test_scale_k_step_ratio_sets_buffer_span_and_unroll(
     )
     ratio = scale_k // block_k
     for operand, depth in enumerate((2, 3)):
-        assert tc.buffer_live_span(operand, True) == (depth - 1) * ratio + 1
+        assert _live_span(tc, (operand, True)) == (depth - 1) * ratio + 1
         assert tc.scale_ratio_k_step(operand) == ratio
         assert tc.scale_read_k_slots(operand) == ratio
     period = math.lcm(3, 2 * ratio, 3 * ratio)

@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 
 from aiter.ops.triton._gluon_kernels.gfx950.moe import _pipeline as pipeline
+from aiter.ops.triton._gluon_kernels.gfx950.moe import _schedule as schedule
 from aiter.ops.triton._gluon_kernels.gfx950.moe import moe_gemm as kernel
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
     A_PAYLOAD,
@@ -530,7 +531,10 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         patch.setattr(pipeline, "_read_scale_tile", read_scale_tile)
         patch.setattr(pipeline, "_init_buffers", init_buffers)
         patch.setattr(pipeline, "_pipeline_peeled", lambda _: peeled)
-        patch.setattr(pipeline, "_wait", machine.check_wait)
+        # Patch the one authoritative formula, not a caller: the emitter reaches it
+        # through the scheme-guarded _stage_wait/_slot_wait wrappers, so patching
+        # the _pipeline binding would silently stop intercepting.
+        patch.setattr(schedule, "_wait", machine.check_wait)
         patch.setattr(pipeline, "_maybe_block_dot", machine.dot)
         patch.setattr(
             pipeline, "pick_stage", lambda enabled: lambda name: nullcontext()
@@ -939,19 +943,74 @@ def test_compiler_pipeline_owns_register_stage_ordering(monkeypatch):
     "scheme", list(WaitCommitScheme), ids=lambda scheme: scheme.name
 )
 @pytest.mark.parametrize("register_mask", range(16))
-def test_peeled_wait_prefix_is_minimal(scheme, register_mask):
-    tc = _Config(scheme, (2, 4, 6, 3), register_mask, middle=True)
+@pytest.mark.parametrize(
+    "extra",
+    [{}, {"packed": True}, {"packed": True, "scale_steps": (2, 4)},
+     {"scale_steps": (4, 1)}],
+    ids=["R1", "R2", "R2R4", "R4R1"],
+)
+def test_peeled_wait_prefix_is_minimal(scheme, register_mask, extra):
+    """The peel must cover every startup stage whose wait differs from steady state.
+
+    Compared *at the same payload-step phase*, which is what production does
+    (`_schedule._pipeline_peeled` passes `phase=x + 1`). Pinning the steady vector to
+    one phase instead is a different, much weaker criterion: with a scale K-step ratio
+    above one the phases interleave, and a phase-fixed comparison reports a peel far
+    larger than the schedule actually needs.
+    """
+    tc = _Config(scheme, (2, 4, 6, 3), register_mask, middle=True, **extra)
     slots = (None,) if tc.commit_per_stage() else range(tc.nm * tc.nn)
-    steady = tuple(_wait(tc, None, slot) for slot in slots)
-    waits = [
-        tuple(_wait(tc, x + 1, slot) for slot in slots)
+
+    def vector(stage, phase):
+        return tuple(_wait(tc, stage, slot, phase=phase) for slot in slots)
+
+    # Startup stage x + 1 runs at phase x + 1; its steady-state counterpart is the
+    # same phase, not a fixed one.
+    differs = [
+        x
         for x in range(pipeline_depth(tc) * 2)
+        if vector(x + 1, None) != vector(None, x + 1)
     ]
-    last_changed = max(
-        (x for x, vector in enumerate(waits) if vector != steady), default=-1
-    )
-    assert tc.pipeline_peeled() == max(1, last_changed + 1)
-    assert all(vector == steady for vector in waits[tc.pipeline_peeled() :])
+    assert tc.pipeline_peeled() == max(1, (max(differs) + 1) if differs else 0)
+    assert all(x < tc.pipeline_peeled() for x in differs)
+
+
+@pytest.mark.parametrize("shape", [(2, 2), (2, 3), (3, 2), (2, 4), (4, 2)])
+def test_scale_fill_mid_moves_only_the_scale_fill_slots(shape):
+    """`SCALE_FILL_MID` is a fill-ownership knob and nothing else.
+
+    It must not disturb payload ownership, the logical read bindings, or the
+    configured DS-read region. It is also inert outside the guarded 2x2 split, which
+    is easy to forget when reading a config that sets it on a rectangular tile.
+    """
+    off = _Config(WaitCommitScheme.PER_OP, (3, 3, 3, 3), 0, shape=shape, middle=False)
+    on = _Config(WaitCommitScheme.PER_OP, (3, 3, 3, 3), 0, shape=shape, middle=True)
+    nm, nn = shape
+    for component in (A_PAYLOAD, B_PAYLOAD):
+        tiles = range(nm if component[0] == A else nn)
+        assert [schedule._component_fill_slot(off, component, t) for t in tiles] == [
+            schedule._component_fill_slot(on, component, t) for t in tiles
+        ], component
+    for component in COMPONENTS:
+        tiles = range(nm if component[0] == A else nn)
+        assert [
+            schedule._component_nominal_read_slot(off, component, t) for t in tiles
+        ] == [
+            schedule._component_nominal_read_slot(on, component, t) for t in tiles
+        ], component
+        assert off.ds_read_in_mfma(*component) == on.ds_read_in_mfma(*component)
+
+    scale_off = [schedule._component_fill_slot(off, A_SCALE, t) for t in range(nm)]
+    scale_on = [schedule._component_fill_slot(on, A_SCALE, t) for t in range(nm)]
+    b_off = [schedule._component_fill_slot(off, B_SCALE, t) for t in range(nn)]
+    b_on = [schedule._component_fill_slot(on, B_SCALE, t) for t in range(nn)]
+    if shape == (2, 2):
+        # The guarded case: A scale already owns the middle slots, so only B moves.
+        assert scale_off == scale_on == [1, 2]
+        assert b_off == [0, 3] and b_on == [1, 2]
+    else:
+        # Outside 2x2 the flag is inert -- a config that sets it here tests nothing.
+        assert scale_off == scale_on and b_off == b_on
 
 
 def test_epilogue_groups_stop_adding_slack_after_a_drain_producer():
