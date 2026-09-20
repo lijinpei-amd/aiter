@@ -1664,18 +1664,18 @@ class _KernelTuningLayout:
         #    non-divisible values are illegal, not merely wasteful --
         assert BM % _v(self.MINI_BLOCK_M) == 0
         assert BN % _v(self.MINI_BLOCK_N) == 0
-        # The fill schedule gives each slot of the NM x NN walk one slot copy, so
-        # a stage needs at least as many slots as it has copies: NM * NN >= NM + NN,
-        # which for integers means both axes split. The unsplit fallback that used to
-        # cover NM == 1 / NN == 1 (fill A(mi) at ni == 0, B(ni) at mi == 0) is gone.
-        # gluon_supported() checks this first so such a tile falls back gracefully;
-        # reaching here means it was constructed some other way.
-        assert self.num_m_slots_per_block() > 1 and self.num_n_slots_per_block() > 1, (
-            f"the fill schedule needs both axes split (got num_m_slots_per_block "
-            f"{self.num_m_slots_per_block()}, num_n_slots_per_block "
-            f"{self.num_n_slots_per_block()}): lower "
-            f"MINI_BLOCK_M ({_v(self.MINI_BLOCK_M)} vs BLOCK_M {BM}) and MINI_BLOCK_N "
-            f"({_v(self.MINI_BLOCK_N)} vs BLOCK_N {BN})"
+        # Fill ownership is a mapping from each component's non-K tile to a slot, so
+        # what it has to satisfy is that every mapped slot exists and no component
+        # owns two of its own tiles in one slot -- the flat _ops() transport carries
+        # one optional tile per component. Different components sharing a slot is
+        # fine, which is what lets a single-slot stage own both operands.
+        from ._schedule import _fill_slots_valid
+
+        assert _fill_slots_valid(self), (
+            f"fill ownership is not a valid mapping for num_m_slots_per_block "
+            f"{self.num_m_slots_per_block()} x num_n_slots_per_block "
+            f"{self.num_n_slots_per_block()} (MINI_BLOCK_M {_v(self.MINI_BLOCK_M)} vs "
+            f"BLOCK_M {BM}, MINI_BLOCK_N {_v(self.MINI_BLOCK_N)} vs BLOCK_N {BN})"
         )
         assert _v(self.MINI_BLOCK_M) % (instr[0] * warps[0] * tiles[0]) == 0, (
             f"MINI_BLOCK_M {_v(self.MINI_BLOCK_M)} must be a multiple of "

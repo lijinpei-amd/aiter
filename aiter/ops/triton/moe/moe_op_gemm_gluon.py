@@ -831,6 +831,7 @@ def gluon_supported(
     K: int,
     w_static_scale=None,
     apply_swiglu: bool = False,
+    gate_up_split: bool = False,
 ) -> tuple[bool, str]:
     """The capability predicate. Returns ``(ok, reason)``; ``reason`` is logged when
     the call falls back to the Triton kernel."""
@@ -905,19 +906,30 @@ def gluon_supported(
     )
     if pipeline_error is not None:
         return False, pipeline_error
-    # The fill schedule hands each slot of the NM x NN walk one mini-block copy, so it
-    # needs at least as many slots as copies -- both axes split. Refused here rather
-    # than in validate() so a tile that cannot split falls back instead of failing the
-    # compile; validate() asserts the same thing as the in-kernel backstop.
-    if (
-        cfg["BLOCK_M"] // cfg["MINI_BLOCK_M"] < 2
-        or cfg["BLOCK_N"] // cfg["MINI_BLOCK_N"] < 2
-    ):
-        return False, (
-            f"the fill schedule needs both axes split: BLOCK_M {cfg['BLOCK_M']} / "
-            f"MINI_BLOCK_M {cfg['MINI_BLOCK_M']} and BLOCK_N {cfg['BLOCK_N']} / "
-            f"MINI_BLOCK_N {cfg['MINI_BLOCK_N']} must each give at least 2 mini blocks"
-        )
+    # Fill ownership no longer requires both axes split: a single-slot stage owns both
+    # operands' copies, since the slot schedule maps each component's tile to a slot
+    # rather than handing each slot one copy. validate() asserts the mapping invariant
+    # itself as the in-kernel backstop.
+    #
+    # gate/up split is a separate matter, and a real one: it packs the two operand
+    # sides as the two halves of N, so an N slot has to be exactly one side. Refused
+    # here rather than in validate() so a tile that cannot carry it falls back instead
+    # of failing the compile -- validate() asserts the same thing as the backstop.
+    # Until the fill-ownership restriction was lifted this was unreachable, because
+    # every tile that fails it also failed the both-axes-split rule.
+    if gate_up_split and apply_swiglu:
+        n_slots = cfg["BLOCK_N"] // cfg["MINI_BLOCK_N"]
+        if n_slots != 2:
+            return False, (
+                f"gate_up_split needs exactly two N slots, one per operand side: "
+                f"BLOCK_N {cfg['BLOCK_N']} / MINI_BLOCK_N {cfg['MINI_BLOCK_N']} "
+                f"= {n_slots}"
+            )
+        if N % 2 or (N // 2) % cfg["MINI_BLOCK_N"]:
+            return False, (
+                f"gate_up_split needs each half of N ({N}) to be a whole number of "
+                f"MINI_BLOCK_N ({cfg['MINI_BLOCK_N']}) blocks"
+            )
     if _probe_lds_bytes(cfg, dq_a, dq_b) > LDS_USABLE_BYTES:
         return False, "no tile of this shape fits the LDS budget"
     if (dq_a == DtypeQuant.MXFP4 or dq_b == DtypeQuant.MXFP4) and K % 64 != 0:

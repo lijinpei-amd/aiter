@@ -576,6 +576,8 @@ def test_gemm1_gate_up_split_matches_interleaved(
         out_quant=None,
         N=n,
         K=k,
+        apply_swiglu=True,
+        gate_up_split=True,
     )
     if not ok:
         pytest.skip(f"shape not on the Gluon path: {why}")
