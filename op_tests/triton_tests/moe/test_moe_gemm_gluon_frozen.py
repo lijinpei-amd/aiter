@@ -8,7 +8,7 @@ import os
 import pytest
 import torch
 
-from aiter.ops.triton._gluon_kernels.gfx950.moe import _schedule
+from aiter.ops.triton._gluon_kernels.gfx950.moe import _frozen, _layout, _schedule
 from aiter.ops.triton._gluon_kernels.gfx950.moe._frozen import (
     _buffer_load_order_frozen,
     _buffer_load_tile_frozen,
@@ -45,6 +45,17 @@ def test_vendored_frozen_helpers_match_the_live_schedule(dtype):
              "mxfp8": DtypeQuant.MXFP8}[dtype]
     tc = host._probe_tuning_config(_register_config(dtype), quant, quant)
     assert pipeline_depth_frozen(tc) == _schedule.pipeline_depth(tc)
+
+    # The vendored layout twins must still agree with the live ones. _slot_index is
+    # the only one callable without device tensors; the offset builders need a live
+    # trace, and the bitwise-determinism tests below are what cover those.
+    for nm in range(1, 5):
+        for nn in range(1, 5):
+            for mi in range(nm):
+                for ni in range(nn):
+                    assert _frozen._slot_index_frozen(
+                        mi, ni, nm, nn
+                    ) == _layout._slot_index(mi, ni, nm, nn), (mi, ni, nm, nn)
     assert pipeline_unroll_frozen(tc) == _schedule.pipeline_unroll(tc)
     for nm in range(1, 5):
         for nn in range(1, 5):
