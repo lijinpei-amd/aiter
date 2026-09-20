@@ -38,13 +38,6 @@ from ._lang import MX_GROUP_CE as MX_GROUP
 from ._lang import optional as _opt
 from ._lang import require_constexpr
 from ._lang import unwrap as _v
-from ._layout import (
-    _a_payload_hbm_offsets,
-    _a_scale_hbm_offsets,
-    _b_payload_hbm_offsets,
-    _b_scale_hbm_offsets,
-    _slot_index,
-)
 from ._types import COMPONENTS, DotKind, TileSched
 
 
@@ -142,6 +135,485 @@ _DK_MFMA: gl.constexpr = gl.constexpr(int(DotKind.MFMA))
 _DK_MFMA_SCALED: gl.constexpr = gl.constexpr(int(DotKind.MFMA_SCALED))
 _DK_UPCAST_MFMA: gl.constexpr = gl.constexpr(int(DotKind.UPCAST_MFMA))
 _NO_SCALE: gl.constexpr = gl.constexpr(None)
+
+
+# --- vendored layout helpers --------------------------------------------------
+# The HBM offset math this snapshot addresses its operands with, copied from
+# _layout.py for the same reason as the schedule helpers above: the frozen body's
+# acceptance test is identical assembly, so nothing it depends on may move
+# underneath it.
+#
+# This is not hypothetical. a1c975cbf changed exactly this area -- it reworked the
+# shuffled-scale address expression and added the frozen rejection for wider scale
+# tiles -- and that is why the frozen arm no longer compiles under the benchmarked
+# flag set. Sharing the live helpers is what let a live change reach in here.
+#
+# The tuning-configuration *methods* these call (num_m_slots_per_block,
+# scale_hbm_offset_layout, ...) stay shared. They cannot be vendored, since the host
+# constructs the aggregate, and they are the stable accessor surface rather than the
+# part that churns. test_moe_gemm_gluon_frozen.py asserts these twins still agree
+# with their live counterparts.
+# ------------------------------------------------------------------------------
+
+@gluon.constexpr_function
+def _slot_index_frozen(
+    m_slot_idx,
+    n_slot_idx,
+    num_m_slots_per_block,
+    num_n_slots_per_block,
+):
+    """Position of one M/N slot pair in the N-outer, M-inner traversal.
+
+    This one number is the slot's place in three orderings at once -- the visitation
+    order of the slot loop, the index of its accumulator in the carried tuple, and
+    (under the even schedule) the position of its fill in
+    :func:`_buffer_load_order`. They have to agree, which is why they all come from
+    here.
+
+    Down the M axis first, so with two slots on each axis the four slots are visited
+    ``(0,0), (1,0), (0,1), (1,1)`` -- the region order of the reference kernel in
+    gfx950-gluon-tutorials .../a16w16/v8_sliceMN, whose four DOTs are
+    ``(A_top, B_left), (A_bot, B_left), (A_top, B_right), (A_bot, B_right)``.
+
+    With one slot on either axis this is the identity on the old row-major order, so
+    only a genuinely 2-D slot split sees any change.
+    """
+    m_slot_idx, n_slot_idx, num_m_slots_per_block, num_n_slots_per_block = (
+        _v(m_slot_idx),
+        _v(n_slot_idx),
+        _v(num_m_slots_per_block),
+        _v(num_n_slots_per_block),
+    )
+    return n_slot_idx * num_m_slots_per_block + m_slot_idx
+
+
+@gluon.jit
+def _gather_rows_frozen(
+    rt,
+    block_id,
+    M_e,
+    start_m,
+    layout: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    ROW_OFFSET_SLOT: gl.constexpr,
+    M_SLOT: gl.constexpr,
+    HAS_GATHER: gl.constexpr,
+):
+    """Resolve the row indices for one M slot through the gather table.
+
+    TODO: stage the table in LDS instead. One block-M-wide ``buffer_load_to_shared``
+    issued next to the routing scalars, committed there, with the ``wait_group`` and the
+    LDS read deferred to just before ``pc`` is built, would replace
+    ``num_m_slots_per_block()`` register loads per consumer and hide the fetch behind
+    the whole B-side address computation -- today the scheduler parks
+    ``s_waitcnt vmcnt(0)`` ~9 instructions after the load, so the latency is fully
+    exposed. It also serves both consumers (payload and scale offsets) from one fetch
+    instead of one per layout.
+
+    Attempted and reverted: on gfx950 the direct-to-LDS lowering refuses it for *this*
+    table, and the op then survives to LLVM as an unconverted
+    ``builtin.unrealized_conversion_cast``. ``canLoadDirectToLDS`` (AMD Utility.cpp)
+    wants ``contig * elemBits`` in {32, 128} -- CDNA4 disables 8/16-bit direct-to-LDS --
+    so a uint16 table must pack two entries per lane, and
+    ``getContiguity(ptr, offset)`` then demands both a 4-byte-aligned *scalar base* and
+    offset contiguity >= 2. The base is ``gather_indx + start_m`` with ``start_m`` a raw
+    prefix sum (odd about half the time), and any mask or ``minimum`` clamp on the
+    offsets collapses the contiguity. Measured: int32 lowers with a bare, clamped *or*
+    masked range; uint16 lowers only with a bare range off a provably aligned base.
+
+    The way in is a 32-bit, block-aligned table -- which ``_sorted_token_id_map`` in
+    moe_op_gemm_gluon.py already builds (int32, padded to ``block_m``,
+    ``// n_expts_act`` applied, memoised on ``expt_data``) for the sorted-scales path.
+    Reading rows from it at ``pid_m * block_m`` makes alignment and contiguity trivial
+    and keeps the mask; the cost is building it for configs that do not already.
+    """
+    offsets_slot = (
+        BLOCK_M * block_id + ROW_OFFSET_SLOT + gl.arange(0, M_SLOT, layout=layout)
+    )
+    live_slot = offsets_slot < M_e
+    if require_constexpr(HAS_GATHER):
+        # gather_indx is uint16 when n_gates <= 65535, else int32; it indexes gates, so
+        # divide by n_expts_act to get the token row.
+        rows_slot = (
+            gl.load(
+                rt.gather_indx + start_m + offsets_slot,
+                mask=live_slot,
+                other=0,
+            )
+            // rt.n_expts_act
+        )
+    else:
+        rows_slot = start_m + gl.where(live_slot, offsets_slot, 0)
+    return rows_slot.to(gl.int32)
+
+
+@gluon.jit
+def _n_start_frozen(pid_n, n_slot_idx: gl.constexpr, N, func_cfg, tuning_cfg):
+    """Raw-N start of slot ``n_slot_idx`` under interleaved or split gate/up packing.
+
+    Interleaved tiles are contiguous. Split tiles cover the same emitted channels but
+    read gate and up from separate halves of N.
+    """
+    if require_constexpr(func_cfg.gu_split()):
+        out = pid_n * tuning_cfg.MINI_BLOCK_N + n_slot_idx * (N // 2)
+    else:
+        out = pid_n * tuning_cfg.BLOCK_N + n_slot_idx * tuning_cfg.MINI_BLOCK_N
+    return out
+
+
+@gluon.jit
+def _blocked_b_hbm_offsets_frozen(
+    layout: gl.constexpr,
+    payload_block_k_storage: gl.constexpr,
+    n0,
+    n_slot: gl.constexpr,
+    stored_k,
+):
+    """Byte offsets for a B tile in the 16-column-blocked HBM layout.
+
+    ``utils/shuffle.py::shuffle_weight(w, (16, 16))`` maps logical ``(n, k)``
+    to ``(n//16)*(stored_k*16) + (k//16)*256 + (n%16)*16 + k%16``. Keeping
+    this physical-layout transform beside the layout that consumes it prevents
+    the HBM and LDS permutations from drifting apart.
+    """
+    kk = gl.arange(0, payload_block_k_storage, layout=gl.SliceLayout(1, layout))[
+        :, None
+    ]
+    nn = (n0 + gl.arange(0, n_slot, layout=gl.SliceLayout(0, layout)))[None, :]
+    return (nn // 16) * (stored_k * 16) + (kk // 16) * 256 + (nn % 16) * 16 + kk % 16
+
+
+@gluon.jit
+def _shuffled_scale_stage_offsets_frozen(
+    layout: gl.constexpr,
+    nonk0,
+    stripes: gl.constexpr,
+    K,
+    scale_mini_k: gl.constexpr = 256,
+    split_extent: gl.constexpr = 0,
+    split_stride=0,
+):
+    """Flat HBM offsets for shuffled scales starting at logical non-K row ``nonk0``."""
+    stripe = gl.arange(0, stripes, layout=gl.SliceLayout(1, layout))[:, None]
+    byte = gl.arange(0, scale_mini_k, layout=gl.SliceLayout(0, layout))[None, :]
+    if require_constexpr(not split_extent):
+        return (nonk0 // 32 + stripe) * K + byte
+    row = stripe * 32
+    row = row // split_extent * split_stride + row % split_extent
+    return ((nonk0 + row) // 32) * K + byte
+
+
+@gluon.jit
+def _shuffled_scale_register_offsets_frozen(
+    layout: gl.constexpr,
+    nonk0,
+    nonk: gl.constexpr,
+    scale_block_k_storage: gl.constexpr,
+    K,
+    packed: gl.constexpr = False,
+    split_extent: gl.constexpr = 0,
+    split_stride=0,
+):
+    """HBM offsets for CDNA4_SCALE / SORTED_SHUFFLED scale storage.
+
+    Each 32-row stripe stores 256 K values' scales in 256 bytes. Within a
+    dword, non-K +16 advances one byte and K +128 advances two bytes. K128
+    stages load the complete packed word, matching the LDS representation.
+    """
+    if require_constexpr(packed):
+        rr = gl.arange(0, nonk, layout=gl.SliceLayout(1, layout))[:, None]
+        width: gl.constexpr = scale_block_k_storage // 4
+        cc = gl.arange(0, width, layout=gl.SliceLayout(0, layout))[None, :]
+        word = rr * width + cc
+        stripe_dwords: gl.constexpr = scale_block_k_storage * 8
+        row = (word // stripe_dwords) * 32
+        if require_constexpr(split_extent):
+            row = row // split_extent * split_stride + row % split_extent
+        offsets = ((nonk0 + row) // 32) * K + (word % stripe_dwords) * 4
+    else:
+        nn = gl.arange(0, nonk, layout=gl.SliceLayout(1, layout))[:, None]
+        if require_constexpr(split_extent):
+            nn = nn // split_extent * split_stride + nn % split_extent
+        nn += nonk0
+        kk = gl.arange(0, scale_block_k_storage, layout=gl.SliceLayout(0, layout))[
+            None, :
+        ]
+        offsets = (
+            (nn // 32) * K
+            + (kk // 8) * 256
+            + (kk % 4) * 64
+            + (nn % 16) * 4
+            + ((kk % 8) // 4) * 2
+            + (nn % 32) // 16
+        )
+    return offsets
+
+
+@gluon.jit
+def _a_payload_hbm_offsets_frozen(a, rt, block_id, M_e, start_m, func_cfg, tuning_cfg):
+    """Gathered A payload offsets, one copy-layout grid per M slot."""
+    M_BLOCK: gl.constexpr = tuning_cfg.BLOCK_M
+    M_SLOT: gl.constexpr = tuning_cfg.MINI_BLOCK_M
+    NUM_M_SLOTS_PER_BLOCK: gl.constexpr = tuning_cfg.num_m_slots_per_block()
+    PAYLOAD_BLOCK_K_STORAGE: gl.constexpr = tuning_cfg.payload_block_k_storage(0)
+    layout_a_slot: gl.constexpr = tuning_cfg.payload_hbm_offset_layout(0)
+    a_hbm_offsets_block = ()
+    for m_slot_idx in gl.static_range(NUM_M_SLOTS_PER_BLOCK):
+        rows_a_slot = _gather_rows_frozen(
+            rt,
+            block_id,
+            M_e,
+            start_m,
+            gl.SliceLayout(1, layout_a_slot),
+            M_BLOCK,
+            m_slot_idx * M_SLOT,
+            M_SLOT,
+            func_cfg.has_gather,
+        )
+        a_hbm_offsets_block = a_hbm_offsets_block + (
+            rows_a_slot[:, None] * a.stride_m
+            + gl.arange(
+                0,
+                PAYLOAD_BLOCK_K_STORAGE,
+                layout=gl.SliceLayout(0, layout_a_slot),
+            )[None, :],
+        )
+
+    return a_hbm_offsets_block
+
+
+@gluon.jit
+def _b_payload_hbm_offsets_frozen(b, pid_n, N, K, func_cfg, tuning_cfg):
+    """B payload offsets for plain or preshuffled weights, one grid per N slot."""
+    N_SLOT: gl.constexpr = tuning_cfg.MINI_BLOCK_N
+    NUM_N_SLOTS_PER_BLOCK: gl.constexpr = tuning_cfg.num_n_slots_per_block()
+    PAYLOAD_BLOCK_K_STORAGE: gl.constexpr = tuning_cfg.payload_block_k_storage(1)
+    layout_b_slot: gl.constexpr = tuning_cfg.payload_hbm_offset_layout(1)
+    K_STORAGE: gl.constexpr = K // func_cfg.b_pack_divisor()
+    b_hbm_offsets_block = ()
+    for n_slot_idx in gl.static_range(NUM_N_SLOTS_PER_BLOCK):
+        if require_constexpr(tuning_cfg.B_PRESHUFFLED):
+            b_hbm_offsets_block = b_hbm_offsets_block + (
+                _blocked_b_hbm_offsets_frozen(
+                    layout_b_slot,
+                    PAYLOAD_BLOCK_K_STORAGE,
+                    _n_start_frozen(pid_n, n_slot_idx, N, func_cfg, tuning_cfg),
+                    N_SLOT,
+                    K_STORAGE,
+                ),
+            )
+        else:
+            b_hbm_offsets_block = b_hbm_offsets_block + (
+                gl.arange(
+                    0,
+                    PAYLOAD_BLOCK_K_STORAGE,
+                    layout=gl.SliceLayout(1, layout_b_slot),
+                )[:, None]
+                * b.stride_k
+                + (
+                    _n_start_frozen(pid_n, n_slot_idx, N, func_cfg, tuning_cfg)
+                    + gl.arange(0, N_SLOT, layout=gl.SliceLayout(0, layout_b_slot))
+                )[None, :]
+                * b.stride_n,
+            )
+
+    return b_hbm_offsets_block
+
+
+@gluon.jit
+def _a_scale_hbm_offsets_frozen(a, rt, block_id, M_e, start_m, pid_m, K, func_cfg, tuning_cfg):
+    """Byte offsets of the A-scale grids, one per M slot (``None`` if unscaled).
+
+    Two shapes, picked by ``A_SCALE_SORTED_SHUFFLED``: a flat run into the
+    moe_sort_scales pre-pass output, or a gathered
+    ``[M_SLOT, SCALE_BLOCK_K_STORAGE]`` grid
+    over the raw ``(M, K/32)`` tensor. The caller sees a tuple indexed by M slot.
+    """
+    if require_constexpr(not func_cfg.a_has_scale()):
+        return _NO_SCALE
+
+    M_BLOCK: gl.constexpr = tuning_cfg.BLOCK_M
+    M_SLOT: gl.constexpr = tuning_cfg.MINI_BLOCK_M
+    NUM_M_SLOTS_PER_BLOCK: gl.constexpr = tuning_cfg.num_m_slots_per_block()
+    SCALE_BLOCK_K_STORAGE: gl.constexpr = tuning_cfg.scale_block_k_storage()
+    layout_a_scale_slot: gl.constexpr = tuning_cfg.scale_hbm_offset_layout(0)
+    SCALE_M: gl.constexpr = tuning_cfg.scale_mini_block_nonk(0)
+    SCALE_K: gl.constexpr = tuning_cfg.scale_mini_block_k(0)
+    SCALE_RATIO: gl.constexpr = tuning_cfg.scale_ratio_non_k_slot(0)
+
+    if require_constexpr(
+        tuning_cfg.scale_shuffled(0) and not tuning_cfg.scale_via_lds(0)
+    ):
+        a_scale_hbm_offsets_block = ()
+        for m_slot_idx in gl.static_range(NUM_M_SLOTS_PER_BLOCK):
+            a_scale_hbm_offsets_block = a_scale_hbm_offsets_block + (
+                _shuffled_scale_register_offsets_frozen(
+                    layout_a_scale_slot,
+                    pid_m * M_BLOCK + (m_slot_idx // SCALE_RATIO) * SCALE_M,
+                    SCALE_M,
+                    SCALE_K // 32,
+                    K,
+                    tuning_cfg.scale_packed_ok(0),
+                ),
+            )
+    elif require_constexpr(tuning_cfg.A_SCALE_SORTED_SHUFFLED):
+        # moe_sort_scales has already applied the gather and the fragment permute,
+        # so there is no table lookup and no per-row stride here: the tile is one
+        # contiguous run and `layout_a_scale_slot` (the fragment layout) already
+        # places each lane on the byte it needs. A K256 scale group spans 256 B per
+        # row stripe; K128 payload stages reuse the same group before advancing the
+        # pointer.
+        gl.static_assert(
+            tuning_cfg.sorted_shuffled_ok(),
+            "A_SCALE_SORTED_SHUFFLED requires MFMA 16x16x128 "
+            "and whole 32-row A stripes",
+        )
+        # The shuffle indexes the *padded* row space -- expert e starts at
+        # token_offs_pad[e] whole blocks -- while start_m is the raw offset and is
+        # not block-aligned. token_offs_pad[e] + block_id is exactly pid_m, which
+        # block_pid_map is built to enumerate, so the chunk index is free here.
+        #
+        # The staging copy is flat: a stage's tile is one 256 B run per 32-row
+        # stripe, and consecutive stripes are one whole K sweep apart. Keeping the
+        # copy 1-D is what lets it vectorise -- in the [M_BLOCK, SK] view a lane's four
+        # bytes straddle both axes and nothing can widen the access.
+        # One tile per M slot. The tile is a whole number of 32-row stripes and
+        # stripes are contiguous, so slot m_slot_idx is just the run starting
+        # m_slot_idx * (M_SLOT // 32) stripes into this pid_m's chunk.
+        # Slots sharing a scale mini block get the same base
+        # offsets; only the owner actually issues the copy.
+        SCALE_FILL_SHAPE: gl.constexpr = tuning_cfg.scale_flat_shape(0)
+        a_scale_hbm_offsets_block = ()
+        for m_slot_idx in gl.static_range(NUM_M_SLOTS_PER_BLOCK):
+            a_scale_hbm_offsets_block = a_scale_hbm_offsets_block + (
+                _shuffled_scale_stage_offsets_frozen(
+                    layout_a_scale_slot,
+                    pid_m * M_BLOCK + (m_slot_idx // SCALE_RATIO) * SCALE_M,
+                    SCALE_FILL_SHAPE[0],
+                    K,
+                    SCALE_K,
+                ),
+            )
+    else:
+        a_scale_hbm_offsets_block = ()
+        for m_slot_idx in gl.static_range(NUM_M_SLOTS_PER_BLOCK):
+            rows_a_scale_slot = _gather_rows_frozen(
+                rt,
+                block_id,
+                M_e,
+                start_m,
+                gl.SliceLayout(1, layout_a_scale_slot),
+                M_BLOCK,
+                m_slot_idx * M_SLOT,
+                M_SLOT,
+                func_cfg.has_gather,
+            )
+            a_scale_hbm_offsets_block = a_scale_hbm_offsets_block + (
+                rows_a_scale_slot[:, None] * a.scale_stride_m
+                + gl.arange(
+                    0,
+                    SCALE_BLOCK_K_STORAGE,
+                    layout=gl.SliceLayout(0, layout_a_scale_slot),
+                )[None, :]
+                * a.scale_stride_k,
+            )
+    return a_scale_hbm_offsets_block
+
+
+@gluon.jit
+def _b_scale_hbm_offsets_frozen(b, pid_n, N, K, func_cfg, tuning_cfg):
+    """Byte offsets of the B-scale grids, one per N slot (``None`` if unscaled).
+
+    Either a flat CDNA4_SCALE preshuffle run for staging or the raw ``(K/32, N)``
+    grid. The caller receives a tuple indexed by N slot.
+    """
+    if require_constexpr(not func_cfg.b_has_scale()):
+        return _NO_SCALE
+
+    N_SLOT: gl.constexpr = tuning_cfg.MINI_BLOCK_N
+    NUM_N_SLOTS_PER_BLOCK: gl.constexpr = tuning_cfg.num_n_slots_per_block()
+    SCALE_BLOCK_K_STORAGE: gl.constexpr = tuning_cfg.scale_block_k_storage()
+    layout_b_scale_slot: gl.constexpr = tuning_cfg.scale_hbm_offset_layout(1)
+    SCALE_N: gl.constexpr = tuning_cfg.scale_mini_block_nonk(1)
+    SCALE_K: gl.constexpr = tuning_cfg.scale_mini_block_k(1)
+    SCALE_RATIO: gl.constexpr = tuning_cfg.scale_ratio_non_k_slot(1)
+    SPLIT_EXTENT: gl.constexpr = (
+        N_SLOT if func_cfg.gu_split() and SCALE_RATIO > 1 else 0
+    )
+
+    if require_constexpr(
+        tuning_cfg.scale_shuffled(1) and not tuning_cfg.scale_via_lds(1)
+    ):
+        b_scale_hbm_offsets_block = ()
+        for n_slot_idx in gl.static_range(NUM_N_SLOTS_PER_BLOCK):
+            b_scale_hbm_offsets_block = b_scale_hbm_offsets_block + (
+                _shuffled_scale_register_offsets_frozen(
+                    layout_b_scale_slot,
+                    _n_start_frozen(
+                        pid_n,
+                        n_slot_idx // SCALE_RATIO * SCALE_RATIO,
+                        N,
+                        func_cfg,
+                        tuning_cfg,
+                    ),
+                    SCALE_N,
+                    SCALE_K // 32,
+                    K,
+                    tuning_cfg.scale_packed_ok(1),
+                    SPLIT_EXTENT,
+                    N // 2,
+                ),
+            )
+    elif require_constexpr(tuning_cfg.B_SCALE_SHUFFLED):
+        # utils/shuffle.py::shuffle_scale_moe (CDNA4_SCALE) has already permuted the
+        # weight scales into MFMA fragment order: per expert the tile is
+        # (N/32, K) bytes, and within a 32-row stripe lane L of a stage reads the
+        # dword at stage*256 + L*4. Same shape as the A-side shuffle, but done
+        # offline -- the weights are static, so this costs nothing at run time.
+        # One tile per N slot; stripes are contiguous, so slot n_slot_idx starts
+        # n_slot_idx * (N_SLOT // 32) stripes into this pid_n's run.
+        SCALE_FILL_SHAPE: gl.constexpr = tuning_cfg.scale_flat_shape(1)
+        b_scale_hbm_offsets_block = ()
+        for n_slot_idx in gl.static_range(NUM_N_SLOTS_PER_BLOCK):
+            b_scale_hbm_offsets_block = b_scale_hbm_offsets_block + (
+                _shuffled_scale_stage_offsets_frozen(
+                    layout_b_scale_slot,
+                    _n_start_frozen(
+                        pid_n,
+                        n_slot_idx // SCALE_RATIO * SCALE_RATIO,
+                        N,
+                        func_cfg,
+                        tuning_cfg,
+                    ),
+                    SCALE_FILL_SHAPE[0],
+                    K,
+                    SCALE_K,
+                    SPLIT_EXTENT,
+                    N // 2,
+                ),
+            )
+    else:
+        b_scale_hbm_offsets_block = ()
+        for n_slot_idx in gl.static_range(NUM_N_SLOTS_PER_BLOCK):
+            b_scale_hbm_offsets_block = b_scale_hbm_offsets_block + (
+                (
+                    _n_start_frozen(pid_n, n_slot_idx, N, func_cfg, tuning_cfg)
+                    + gl.arange(
+                        0,
+                        N_SLOT,
+                        layout=gl.SliceLayout(1, layout_b_scale_slot),
+                    )
+                )[:, None]
+                * b.scale_stride_n
+                + gl.arange(
+                    0,
+                    SCALE_BLOCK_K_STORAGE,
+                    layout=gl.SliceLayout(0, layout_b_scale_slot),
+                )[None, :]
+                * b.scale_stride_k,
+            )
+    return b_scale_hbm_offsets_block
+
 
 
 @gluon.constexpr_function
@@ -761,7 +1233,7 @@ def _buffer_loads_before_frozen(mi, ni, NM, NN, ANY):
     mi, ni, NM, NN = _v(mi), _v(ni), _v(NM), _v(NN)
     if not _v(ANY):
         return 0
-    return min(_slot_index(mi, ni, NM, NN), NM + NN)
+    return min(_slot_index_frozen(mi, ni, NM, NN), NM + NN)
 
 
 @gluon.constexpr_function
@@ -810,7 +1282,7 @@ def _buffer_load_pos_frozen(mi, ni, NM, NN):
     with two fills and leaves every slot off the first row and column with none.
     """
     mi, ni, NM, NN = _v(mi), _v(ni), _v(NM), _v(NN)
-    s = _slot_index(mi, ni, NM, NN)
+    s = _slot_index_frozen(mi, ni, NM, NN)
     return s if s < NM + NN else None
 
 
@@ -822,7 +1294,7 @@ def _scale_buffer_load_tile_frozen(mi, ni, NM, NN, want_a):
     group has to be emitted either way, because _buffer_load_wait counts G = NM + NN groups
     per stage. buffer_load_scale drops the redundant *copy* and leaves the group empty.
     """
-    s = _slot_index(mi, ni, NM, NN)
+    s = _slot_index_frozen(mi, ni, NM, NN)
     n = NM if _v(want_a) else NN
     for t in range(_v(n)):
         if _scale_buffer_load_slot_frozen(_v(want_a), t, NM, NN) == s:
@@ -896,7 +1368,7 @@ def _stage_buffer_load_wait_group_frozen(
     WAIT: gl.constexpr = _stage_buffer_load_wait_frozen(
         NM, NN, STAGES_BETWEEN, ANY_BUFFER_LOAD
     )
-    if require_constexpr(_slot_index(mi, ni, NM, NN) == 0 and WAIT is not None):
+    if require_constexpr(_slot_index_frozen(mi, ni, NM, NN) == 0 and WAIT is not None):
         lds_ptrs.wait_buffer_load_groups(WAIT + WAIT_SLACK)
 
 
@@ -1260,7 +1732,7 @@ def _pipeline_step_frozen(
             # _MPP_PIN_WAIT = 1: the leading sched_barrier of the rendezvous sits
             # here, before the wait, rather than next to the barrier itself.
             # _MPP_BARRIER_STRIDE = 4, inlined as the % 4 below.
-            if require_constexpr(MPP and _slot_index(mi, ni, NM, NN) % 4 == 0):
+            if require_constexpr(MPP and _slot_index_frozen(mi, ni, NM, NN) % 4 == 0):
                 gl.amd.cdna4.sched_barrier(0)
             # _STAGE_WAIT = 1, so the per-slot wait form never applied.
             if require_constexpr(DO_DS_READ):
@@ -1299,12 +1771,12 @@ def _pipeline_step_frozen(
                 # separate it from other waves' reads of that slot -- a WAR race that
                 # shows up as nondeterministic wrong results. This is the same
                 # bracketing emitClusterBarrier uses.
-                if require_constexpr(_slot_index(mi, ni, NM, NN) % 4 == 0):
+                if require_constexpr(_slot_index_frozen(mi, ni, NM, NN) % 4 == 0):
                     # _MPP_PIN_WAIT = 1 put the leading sched_barrier before the
                     # wait instead, so only the trailing one is emitted here.
                     # _MPP_NO_FENCE = 0 and _MPP_ALL_FENCED = 0: the stage head is
                     # the one fenced barrier, the rest are bare.
-                    if require_constexpr(_slot_index(mi, ni, NM, NN) == 0):
+                    if require_constexpr(_slot_index_frozen(mi, ni, NM, NN) == 0):
                         gl.barrier()
                     else:
                         gl.amd.cdna4.bare_barrier()
@@ -1329,7 +1801,7 @@ def _pipeline_step_frozen(
             slot_acc = _maybe_block_dot(
                 dot_a,
                 dot_b,
-                regs.acc[_slot_index(mi, ni, NM, NN)],
+                regs.acc[_slot_index_frozen(mi, ni, NM, NN)],
                 PF_MINI,
                 func_cfg,
                 tc,
@@ -1713,7 +2185,7 @@ def _last_mfma_frozen(pc, regs):
                         tc.num_k_slots_per_tile(),
                     ),
                     regs.acc[
-                        _slot_index(
+                        _slot_index_frozen(
                             mi,
                             ni,
                             tc.num_m_slots_per_block(),
@@ -1778,7 +2250,7 @@ def _moe_gemm_body_frozen(
     M_e = gl.load(rt.expt_hist + expt_id)
     start_m = gl.load(rt.expt_offs_raw + expt_id)
 
-    a_hbm_offs = _a_payload_hbm_offsets(
+    a_hbm_offs = _a_payload_hbm_offsets_frozen(
         a, rt, block_id, M_e, start_m, func_cfg, tuning_cfg
     )
     b_hbm_ptr = b.ptr + expt_id.to(gl.int64) * b.stride_e
@@ -1791,15 +2263,15 @@ def _moe_gemm_body_frozen(
     else:
         b_scale_hbm_ptr: gl.constexpr = None
 
-    b_hbm_offs = _b_payload_hbm_offsets(b, pid_n, N, K, func_cfg, tuning_cfg)
+    b_hbm_offs = _b_payload_hbm_offsets_frozen(b, pid_n, N, K, func_cfg, tuning_cfg)
     if require_constexpr(func_cfg.a_has_scale()):
-        a_scale_hbm_offs = _a_scale_hbm_offsets(
+        a_scale_hbm_offs = _a_scale_hbm_offsets_frozen(
             a, rt, block_id, M_e, start_m, pid_m, K, func_cfg, tuning_cfg
         )
     else:
         a_scale_hbm_offs: gl.constexpr = None
     if require_constexpr(func_cfg.b_has_scale()):
-        b_scale_hbm_offs = _b_scale_hbm_offsets(b, pid_n, N, K, func_cfg, tuning_cfg)
+        b_scale_hbm_offs = _b_scale_hbm_offsets_frozen(b, pid_n, N, K, func_cfg, tuning_cfg)
     else:
         b_scale_hbm_offs: gl.constexpr = None
 
