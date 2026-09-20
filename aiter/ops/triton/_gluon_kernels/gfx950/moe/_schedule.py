@@ -7,6 +7,7 @@ Components use ``(operand, is_scale)`` identities throughout the live schedule.
 """
 
 import math
+from typing import NamedTuple
 
 from triton.experimental import gluon
 
@@ -37,7 +38,74 @@ __all__ = [
     "SCALE",
     "A",
     "B",
+    "ScheduleSpec",
+    "schedule_spec",
 ]
+
+
+class ScheduleSpec(NamedTuple):
+    """Every configuration value the schedule model reads, resolved and hashable.
+
+    The model's whole input surface, in one place. Two uses:
+
+    * it states what the schedule actually depends on. Anything not here cannot
+      change the schedule, which is what lets a caller reason about whether a tuning
+      change can move the emitted code;
+    * it is a sound memo key. The tuning aggregate is not: Triton builds it with
+      ``eq_default=False``, so it hashes by identity and a single compile constructs
+      hundreds of distinct objects for one value, and three of its fields are
+      ``gl.constexpr(list)`` and unhashable outright.
+
+    Built from accessor *results*, never from raw fields, because the placement
+    accessors fold in automatic fallbacks and because test doubles mutate their
+    inputs after construction.
+    """
+
+    nm: int
+    nn: int
+    #: ``(per_op, per_slot, per_stage)`` -- the three granularities the model branches
+    #: on, rather than the four-valued scheme, since the two per-stage schemes differ
+    #: only in where the emitter puts the commit.
+    commit: tuple
+    scale_fill_mid: bool
+    k_unroll: int
+    present: tuple
+    depth: tuple
+    ratio_k: tuple
+    via_lds: tuple
+    ds_read_in_mfma: tuple
+    #: Per operand, not per component: only scales share across non-K slots.
+    ratio_non_k: tuple
+
+
+@gluon.constexpr_function
+def schedule_spec(tc):
+    """Resolve the schedule model's input surface from a tuning configuration."""
+    present = tuple(_present(tc, c) for c in COMPONENTS)
+    via_lds = tuple(bool(_v(tc.component_via_lds(c))) for c in COMPONENTS)
+    for c, lds in zip(COMPONENTS, via_lds):
+        assert bool(_v(tc.component_in_reg(c))) is not lds, (
+            f"component_in_reg must be the complement of component_via_lds for {c}"
+        )
+    return ScheduleSpec(
+        nm=_v(tc.num_m_slots_per_block()),
+        nn=_v(tc.num_n_slots_per_block()),
+        commit=(
+            bool(_v(tc.commit_per_op())),
+            bool(_v(tc.commit_per_slot())),
+            bool(_v(tc.commit_per_stage())),
+        ),
+        scale_fill_mid=bool(_v(tc.SCALE_FILL_MID)),
+        k_unroll=_v(tc.K_UNROLL),
+        present=present,
+        depth=tuple(_v(tc.num_buffers(c[0], c[1])) for c in COMPONENTS),
+        ratio_k=tuple(_component_ratio(tc, c) for c in COMPONENTS),
+        via_lds=via_lds,
+        ds_read_in_mfma=tuple(
+            bool(_v(tc.ds_read_in_mfma(c[0], c[1]))) for c in COMPONENTS
+        ),
+        ratio_non_k=tuple(_v(tc.scale_ratio_non_k_slot(o)) for o in OPERANDS),
+    )
 
 
 @gluon.constexpr_function

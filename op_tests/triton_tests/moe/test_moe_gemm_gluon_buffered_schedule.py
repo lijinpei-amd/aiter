@@ -975,6 +975,66 @@ def test_peeled_wait_prefix_is_minimal(scheme, register_mask, extra):
     assert all(x < tc.pipeline_peeled() for x in differs)
 
 
+def _schedule_fingerprint(tc):
+    """Everything the emitter folds to constants, for one configuration."""
+    nm, nn = tc.nm, tc.nn
+    depth = pipeline_depth(tc)
+    out = [depth, pipeline_unroll(tc), _pipeline_peeled(tc)]
+    for ni in range(nn):
+        for mi in range(nm):
+            out.append(schedule._ops(tc, mi, ni))
+            out.append(
+                tuple(schedule._component_read_tile(tc, c, mi, ni) for c in COMPONENTS)
+            )
+    for stage in range(1 - depth, depth + 2):
+        out.append(schedule._groups(tc, stage))
+    out.append(schedule._groups(tc, None))
+    for stage in range(depth + 2):
+        out.append(tuple(_wait(tc, stage, s) for s in range(nm * nn)))
+        out.append(_wait(tc, stage, None))
+    return tuple(out)
+
+
+def test_schedule_spec_is_a_sound_memo_key():
+    """Equal specs imply equal schedules -- the property a memo key must have.
+
+    Only this direction matters. A spec finer than the schedule it keys is safe: the
+    worst it costs is recomputing a result that was already known, and it is expected
+    here because some inputs are inert for some geometries (SCALE_FILL_MID outside
+    the guarded 2x2 split, the depth of an absent scale). A spec *coarser* than the
+    schedule would hand back a wrong answer, which is what this pins down.
+    """
+    configs = []
+    for scheme in WaitCommitScheme:
+        for depths in ((3, 3, 3, 3), (2, 4, 3, 2)):
+            for register_mask in (0, 4, 15):
+                for shape in ((2, 2), (4, 2)):
+                    for middle in (False, True):
+                        for scales in (True, False):
+                            configs.append(
+                                _Config(
+                                    scheme,
+                                    depths,
+                                    register_mask,
+                                    shape=shape,
+                                    middle=middle,
+                                    scales=scales,
+                                )
+                            )
+    seen = {}
+    for tc in configs:
+        spec = schedule.schedule_spec(tc)
+        fingerprint = _schedule_fingerprint(tc)
+        assert hash(spec) is not None
+        if spec in seen:
+            assert seen[spec] == fingerprint, (
+                "two configurations share a spec but not a schedule; the spec is "
+                "missing an input the model reads"
+            )
+        seen[spec] = fingerprint
+    assert len(seen) > 100, "the matrix must actually exercise distinct specs"
+
+
 @pytest.mark.parametrize("shape", [(2, 2), (2, 3), (3, 2), (2, 4), (4, 2)])
 def test_scale_fill_mid_moves_only_the_scale_fill_slots(shape):
     """`SCALE_FILL_MID` is a fill-ownership knob and nothing else.
