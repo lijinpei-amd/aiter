@@ -31,7 +31,7 @@ from ._schedule import (
     _has_register_component,
     _in_reg,
     _loads_at_phase,
-    _ops,
+    _issued_tiles,
     _pipeline_peeled,
     _present,
     _producer_phase,
@@ -212,7 +212,10 @@ def _fill_slot(
     PHASE: gl.constexpr = 0,
 ):
     tc: gl.constexpr = pc.tuning_cfg
-    ops: gl.constexpr = _ops(tc, mi, ni)
+    # One query for what this slot issues this step. The four branches below
+    # stay separate because they perform different JIT-visible pointer and
+    # tuple operations, but they no longer each restate the gate.
+    ops: gl.constexpr = _issued_tiles(tc, mi, ni, STAGE, DRAIN, PHASE)
     mk: gl.constexpr = tc.num_k_slots_per_tile()
     offset_step: gl.constexpr = KI if _soff_unroll(tc, IN_LOOP) else 0
     a_soff: gl.constexpr = (
@@ -240,11 +243,7 @@ def _fill_slot(
         else 0
     )
     a, b, a_scale, b_scale = buffers
-    if require_constexpr(
-        ops[0] is not None
-        and _active(tc, _A_PAYLOAD, STAGE, DRAIN)
-        and _loads_at_phase(tc, _A_PAYLOAD, PHASE)
-    ):
+    if require_constexpr(ops[0] is not None):
         if require_constexpr(_via_lds(tc, _A_PAYLOAD)):
             pc.lds_ptrs.buffer_load_payload(
                 0,
@@ -277,11 +276,7 @@ def _fill_slot(
                 )
                 * mk,
             )
-    if require_constexpr(
-        ops[1] is not None
-        and _active(tc, _A_SCALE, STAGE, DRAIN)
-        and _loads_at_phase(tc, _A_SCALE, PHASE)
-    ):
+    if require_constexpr(ops[1] is not None):
         if require_constexpr(_via_lds(tc, _A_SCALE)):
             pc.lds_ptrs.buffer_load_scale(
                 0,
@@ -311,11 +306,7 @@ def _fill_slot(
                 * tc.scale_cache_fragments(0)
                 + ops[1] * tc.scale_read_k_slots(0),
             )
-    if require_constexpr(
-        ops[2] is not None
-        and _active(tc, _B_PAYLOAD, STAGE, DRAIN)
-        and _loads_at_phase(tc, _B_PAYLOAD, PHASE)
-    ):
+    if require_constexpr(ops[2] is not None):
         if require_constexpr(_in_reg(tc, _B_PAYLOAD)):
             fragments = pc.lds_ptrs.buffer_load_payload(
                 1,
@@ -348,11 +339,7 @@ def _fill_slot(
             )
             if require_constexpr(tc.commit_per_op()):
                 pc.lds_ptrs.commit_buffer_load()
-    if require_constexpr(
-        ops[3] is not None
-        and _active(tc, _B_SCALE, STAGE, DRAIN)
-        and _loads_at_phase(tc, _B_SCALE, PHASE)
-    ):
+    if require_constexpr(ops[3] is not None):
         if require_constexpr(_via_lds(tc, _B_SCALE)):
             pc.lds_ptrs.buffer_load_scale(
                 1,
