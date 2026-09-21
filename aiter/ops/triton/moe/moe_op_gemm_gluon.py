@@ -880,6 +880,75 @@ def _default_launch_config(
             B_PRESHUFFLED=True,
             B_IN_REG=True,
         )
+    if (
+        apply_swiglu
+        and dq_b == DtypeQuant.MXFP4
+        # MXFP8 activations at block_m 128 are handled above, with B in registers.
+        and (block_m == 64 or (block_m == 128 and dq_a == DtypeQuant.MXFP4))
+        and N % 256 == 0
+        and K % 256 == 0
+        and not c["FROZEN_STEP"]
+    ):
+        # The automatic geometry for MXFP4 at these block sizes is the 32x32x64 MFMA
+        # with one warp tile per slot, which is both much slower than the tuned
+        # 16x16x128 shape and -- because the warp split then spans the whole N tile --
+        # impossible to cut into the two N slots a gate/up-split caller needs. Those
+        # are the same defect: MINI_BLOCK is not splittable *because* the geometry is
+        # wrong. Measured on H7168-I2048-E33-k8, tuned vs the automatic geometry with
+        # its MINI_BLOCK split so it can run at all:
+        #
+        #   T=1024   199.4 vs 277.1 us      T=4096   604.7 vs 897.8 us
+        #
+        # bench_out/gluon_larget_a4bf16_20260921. Splitting MINI_BLOCK on the
+        # automatic geometry is nearly free on its own (+0.9% / +0.5%, bit-identical
+        # output, bench_out/mini_block_split_20260921) -- it simply is not the tile
+        # worth running.
+        c = dict(
+            c,
+            BLOCK_N=256,
+            BLOCK_K=256,
+            MINI_BLOCK_M=block_m // 2,
+            MINI_BLOCK_N=128,
+            mfma_instr_shape=(16, 16, 128),
+            warps_per_cta=(1, 4),
+            tiles_per_warp=(2, 2),
+            NUM_LDS_BUFFER=3,
+            K_UNROLL=3,
+            VGPR_PREFETCH_K=256,
+            WAVES_PER_EU=1,
+            WAIT_COMMIT_SCHEME=int(WaitCommitScheme.PER_STAGE_WHOLE),
+            A_SCALE_SORTED_SHUFFLED=True,
+            B_SCALE_SHUFFLED=True,
+        )
+    if (
+        apply_swiglu
+        and dq_a == dq_b == DtypeQuant.BF16
+        and block_m in (64, 128)
+        and N % 256 == 0
+        and K % 64 == 0
+        and not c["FROZEN_STEP"]
+    ):
+        # Same defect for BF16, and worse: the automatic tile is BLOCK_N 64 with the
+        # warps split (4, 2), so N is exactly one warp granularity wide and no
+        # MINI_BLOCK split exists at all. The tuned tile is four times wider in N with
+        # a shallow K stage. Measured: T=1024 680.2 vs 723.7 us for the automatic
+        # geometry, T=4096 2193.5 vs 2252.7 us, T=256 436.0 vs 513.2 us
+        # (bench_out/gluon_larget_a4bf16_20260921, gluon_bm64_cg_20260921).
+        c = dict(
+            c,
+            BLOCK_N=256,
+            BLOCK_K=64,
+            MINI_BLOCK_M=block_m // 2,
+            MINI_BLOCK_N=128,
+            mfma_instr_shape=(32, 32, 16),
+            warps_per_cta=(2, 4) if block_m == 128 else (1, 4),
+            tiles_per_warp=(1, 1),
+            NUM_LDS_BUFFER=3,
+            K_UNROLL=3,
+            VGPR_PREFETCH_K=64,
+            WAVES_PER_EU=1,
+            WAIT_COMMIT_SCHEME=int(WaitCommitScheme.PER_STAGE_WHOLE),
+        )
     return c
 
 
