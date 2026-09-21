@@ -582,31 +582,31 @@ def get_gluon_config_uncached(
             "token_scale_cache_modifier": _env_cache_modifier(
                 "TOKEN_SCALE_CACHE_MODIFIER", "", "TOKEN_SCALE_MOD"
             ),
-            # .cg (non-temporal) on a one-pass weight payload keeps it from evicting
-            # anything that is reused. block_m <= 32 preserves the measured decode
-            # default. stream_expert_payload extends that policy to a host-selected
-            # one-M-tile-per-expert launch (currently only MXFP8 gemm1). Explicit
-            # canonical/legacy environment settings remain authoritative.
+            # .cg (non-temporal) on the weight payload, unconditionally. The hint used
+            # to be gated on block_m <= 32, on the theory that it suits a one-pass
+            # payload and that the larger block_m of prefill reads each expert's
+            # weights from several M tiles, so retaining them should pay.
             #
-            # block_m 128 is the prefill end, where an expert's weights are read by
-            # several M tiles rather than one, so the hint was left off on the theory
-            # that the payload is no longer one-pass. Measured, it is still worth
-            # having: on H7168-I2048-E33-k8 with MXFP8 activations, .cg alone is
-            # -11.3% (MXFP4 W) and -8.2% (MXFP8 W) at T=1024, and -2.7% at T=4096
-            # for MXFP8 W. 514 MB of weights do not survive in cache between M tiles
-            # anyway, so retaining them only displaces the tokens and scales that do.
-            # bench_out/gluon_larget_20260921. MXFP4/BF16 activations are unmeasured
-            # at block_m >= 64 and keep the old policy.
+            # It does not. The payload is 514 MB on H7168-I2048-E33-k8 -- far past any
+            # cache -- so it cannot survive between the M tiles that read it, and
+            # retaining it only displaces the tokens and scales that do. Measured on
+            # that shape across 10 tuned geometries that lacked the hint, every one
+            # improved and none regressed:
+            #
+            #   block_m 64  (T=256):   MXFP8xMXFP4 -19.2%,  BF16 -15.0%
+            #   block_m 128 (T=1024):  MXFP4xMXFP4 -15.6%,  MXFP8xMXFP4 -11.3%,
+            #                          MXFP8xMXFP8  -8.2%,  BF16  -6.0%
+            #   block_m 128 (T=4096):  MXFP8xMXFP8  -2.7%,  BF16  -2.6%,
+            #                          MXFP8xMXFP4  -0.9%,  MXFP4xMXFP4 -0.3%
+            #
+            # The two geometries that already carried a hint moved -0.07% and +0.02%,
+            # which is the drift floor of that harness. bench_out/gluon_bm64_cg_20260921,
+            # gluon_larget_20260921, gluon_larget_a4bf16_20260921.
+            #
+            # stream_expert_payload and block_m no longer select anything here; explicit
+            # canonical/legacy environment settings remain authoritative.
             "expert_cache_modifier": _env_cache_modifier(
-                "EXPERT_CACHE_MODIFIER",
-                (
-                    ".cg"
-                    if block_m <= 32
-                    or stream_expert_payload
-                    or (dq_a == DtypeQuant.MXFP8 and block_m >= 128)
-                    else ""
-                ),
-                "EXPERT_MOD",
+                "EXPERT_CACHE_MODIFIER", ".cg", "EXPERT_MOD"
             ),
             # ...but NOT on the weight scales. The scale tensor is (E, K/32, N) with K
             # contiguous, so one 128 B line holds 128 consecutive K-scales for a single
