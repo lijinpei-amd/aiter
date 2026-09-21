@@ -833,6 +833,53 @@ def _default_launch_config(
             A_SCALE_SORTED_SHUFFLED=True,
             B_SCALE_SHUFFLED=True,
         )
+    if (
+        apply_swiglu
+        and dq_a == DtypeQuant.MXFP8
+        and dq_b == DtypeQuant.MXFP4
+        and block_m == 128
+        and N % 256 == 0
+        and K % 256 == 0
+        and (K // dq_pack_divisor(dq_b)) % 16 == 0
+        and not c["FROZEN_STEP"]
+    ):
+        # The N tile that wins here is 256, and it does not fit while B is staged:
+        # a three-deep B ring at BLOCK_N 256 needs 205,824 B against 159,744 B of
+        # usable LDS. Holding B in registers removes that ring entirely, which is
+        # what pays for the wider tile -- 1022.5 -> 948.0 us at T=4096 on
+        # H7168-I2048-E33-k8, against 1013.2 for the same BLOCK_N 128 geometry once
+        # it has the weight hint (-6.4%). At T=1024 the two are level (275.7 vs
+        # 276.5), so this tile is chosen for the prefill end and costs nothing at
+        # the other. bench_out/gluon_larget_20260921.
+        #
+        # B_IN_REG needs preshuffled weights, so the launch path repacks W once and
+        # caches it on the tensor. That is a second copy of the weights resident for
+        # the lifetime of the model -- the reason this is not the default everywhere.
+        # The divisibility terms above are exactly _preshuffled_b's preconditions, so
+        # a config that asks for registers is always one it can serve.
+        #
+        # Splitting MINI_BLOCK to 64x128 also gives this shape two N slots, so unlike
+        # every other block_m 64/128 cell it does not fall off the Gluon path for a
+        # gate/up-split caller.
+        c = dict(
+            c,
+            BLOCK_N=256,
+            BLOCK_K=256,
+            MINI_BLOCK_M=64,
+            MINI_BLOCK_N=128,
+            mfma_instr_shape=(16, 16, 128),
+            warps_per_cta=(1, 4),
+            tiles_per_warp=(4, 2),
+            NUM_LDS_BUFFER=3,
+            K_UNROLL=3,
+            VGPR_PREFETCH_K=256,
+            WAVES_PER_EU=1,
+            WAIT_COMMIT_SCHEME=int(WaitCommitScheme.PER_STAGE_WHOLE),
+            A_SCALE_SORTED_SHUFFLED=True,
+            B_SCALE_SHUFFLED=True,
+            B_PRESHUFFLED=True,
+            B_IN_REG=True,
+        )
     return c
 
 
@@ -1646,7 +1693,13 @@ def moe_gemm_gluon(
         a_swizzle,
     )
     w_payload = w
-    if _env_int("AITER_TRITON_MOE_GLUON_B_PRESHUFFLED", 0):
+    # A direct-register B tile is read through the operand fragment layout, which is
+    # only coalesced on a preshuffled weight, so a config that asks for registers is
+    # asking for the repack too -- it is not a separate opt-in. The repack is cached
+    # on the weight tensor, so it costs one pass per model rather than one per launch.
+    if _env_int("AITER_TRITON_MOE_GLUON_B_PRESHUFFLED", 0) or _cfg.get(
+        "B_IN_REG", False
+    ):
         shuf_b = _preshuffled_b(w, _cfg, N, K, dq_b)
         if shuf_b is not None:
             w_payload = shuf_b
