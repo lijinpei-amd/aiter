@@ -400,6 +400,12 @@ def test_t256_mxfp8_gemm1_geometry_override_is_narrow(overrides):
         assert selected != baseline
         assert (selected["BLOCK_K"], selected["MINI_BLOCK_M"]) != (256, 32)
         assert selected["BLOCK_M"] == 32
+    elif overrides == {"dq_b": DtypeQuant.MXFP4}:
+        # MXFP4 weights at block_m 64 also carry their own measured override now. The
+        # point of this case is still that it does not inherit the MXFP8 one: that
+        # tile is BLOCK_N 128 with MINI_BLOCK_N 64, this one is 256 with 128.
+        assert selected != baseline
+        assert (selected["BLOCK_N"], selected["MINI_BLOCK_N"]) == (256, 128)
     else:
         assert selected == baseline
 
