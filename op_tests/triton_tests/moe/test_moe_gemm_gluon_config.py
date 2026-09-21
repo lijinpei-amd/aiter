@@ -348,7 +348,14 @@ def test_t256_mxfp8_gemm1_uses_validated_streaming_geometry():
         True,
         stream_expert_payload=False,
     )
-    assert reused["expert_cache_modifier"] == ""
+    # stream_expert_payload selects the geometry, and only the geometry. The weight
+    # hint used to be part of what it toggled; it is now unconditional, because it
+    # measured as a win at every block size rather than only the streaming one.
+    assert reused["expert_cache_modifier"] == ".cg"
+    assert (reused["MINI_BLOCK_N"], reused["warps_per_cta"]) != (
+        expected["MINI_BLOCK_N"],
+        expected["warps_per_cta"],
+    )
 
 
 @pytest.mark.parametrize(
