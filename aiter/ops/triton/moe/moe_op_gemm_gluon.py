@@ -587,9 +587,25 @@ def get_gluon_config_uncached(
             # default. stream_expert_payload extends that policy to a host-selected
             # one-M-tile-per-expert launch (currently only MXFP8 gemm1). Explicit
             # canonical/legacy environment settings remain authoritative.
+            #
+            # block_m 128 is the prefill end, where an expert's weights are read by
+            # several M tiles rather than one, so the hint was left off on the theory
+            # that the payload is no longer one-pass. Measured, it is still worth
+            # having: on H7168-I2048-E33-k8 with MXFP8 activations, .cg alone is
+            # -11.3% (MXFP4 W) and -8.2% (MXFP8 W) at T=1024, and -2.7% at T=4096
+            # for MXFP8 W. 514 MB of weights do not survive in cache between M tiles
+            # anyway, so retaining them only displaces the tokens and scales that do.
+            # bench_out/gluon_larget_20260921. MXFP4/BF16 activations are unmeasured
+            # at block_m >= 64 and keep the old policy.
             "expert_cache_modifier": _env_cache_modifier(
                 "EXPERT_CACHE_MODIFIER",
-                ".cg" if block_m <= 32 or stream_expert_payload else "",
+                (
+                    ".cg"
+                    if block_m <= 32
+                    or stream_expert_payload
+                    or (dq_a == DtypeQuant.MXFP8 and block_m >= 128)
+                    else ""
+                ),
                 "EXPERT_MOD",
             ),
             # ...but NOT on the weight scales. The scale tensor is (E, K/32, N) with K
