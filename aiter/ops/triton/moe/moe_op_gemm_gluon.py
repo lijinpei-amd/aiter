@@ -615,8 +615,24 @@ def get_gluon_config_uncached(
             # survive in L2; marking it non-temporal turns all 8 touches into separate
             # HBM fetches. Measured on H7168-I2048-E33-k8 T=32 stage 1: 651 -> 517 MB of
             # HBM reads, L2 hit 16% -> 33%, 122.6 -> 96.9 us.
+            # That holds for MXFP8 weights, and it is why this stays empty for them.
+            # It does not hold for MXFP4 weights: the payload is half the bytes, so the
+            # scale stream is twice the share of the weight traffic, and the L2 it
+            # occupies costs more than its own reuse returns. Measured on
+            # H7168-I2048-E33-k8, 400 cold samples per cell, `.cg` on the scales:
+            #
+            #   MXFP4 x MXFP4  -21.7% -21.4% -17.3% -1.7% -0.3%  (T=16..4096)
+            #   MXFP8 x MXFP4   -4.3%  -4.2% -11.8% -1.0% -0.1%
+            #
+            # All ten improved. BF16 weights, which have no scale tensor at all, moved
+            # -0.04%..+0.40% across the same sweep, which is that harness's floor and
+            # the null control for it. MXFP8 weights are left alone because they are
+            # genuinely mixed there: +3.1%/+3.2% at T=16/64 against -10.7% at T=256.
+            # bench_out/gluon_scale_hint_20260923.
             "expert_scale_cache_modifier": _env_cache_modifier(
-                "EXPERT_SCALE_CACHE_MODIFIER", "", "EXPERT_SCALE_MOD"
+                "EXPERT_SCALE_CACHE_MODIFIER",
+                ".cg" if dq_b == DtypeQuant.MXFP4 else "",
+                "EXPERT_SCALE_MOD",
             ),
             "result_cache_modifier": _env_cache_modifier(
                 "RESULT_CACHE_MODIFIER", "", "RESULT_MOD"
