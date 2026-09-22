@@ -415,10 +415,10 @@ def _epilogue_one_tile(
         gl.static_assert(out.shape[1] == OUT_MBN)
     elif require_constexpr(func_cfg.has_activation() and func_cfg.epilogue != 0):
         # Ablation: the same reshape/split reduction _swiglu does, minus exp2/rcp/clip.
-        gelu, linear = tl.split(
+        gate, linear = tl.split(
             tl.reshape(sub, (sub.shape[0], sub.shape[1] // 2, 2))
         )
-        out = gelu * linear
+        out = gate * linear
         gl.static_assert(out.shape[1] == OUT_MBN)
     elif require_constexpr(func_cfg.has_activation()):
         out = _swiglu(

@@ -39,7 +39,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._entry import (
 from aiter.ops.triton._gluon_kernels.gfx950.moe._frozen import (
     _validate_frozen_pipeline,
 )
-from aiter.ops.triton._gluon_kernels.gfx950.moe._pipeline import (
+from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
     validate_pipeline as _validate_live_pipeline,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
@@ -110,6 +110,11 @@ def _hashable(v):
     return tuple(v) if isinstance(v, list) else v
 
 
+def _cfg_key(cfg: dict) -> tuple:
+    """A config dict as the hashable, order-independent key every memo here uses."""
+    return tuple(sorted((k, _hashable(v)) for k, v in cfg.items()))
+
+
 def _cval(v):
     """Take the value out of a ``gl.constexpr`` a config method handed back."""
     return v.value if hasattr(v, "value") else v
@@ -157,6 +162,20 @@ def _mfma_instr(dq_a, dq_b, nonk: int):
 def _env_int(name: str, default: int) -> int:
     v = os.environ.get(name)
     return default if v is None else int(v)
+
+
+def _mini_block_override(name: str, default: int, block: int, warp_gran: int) -> int:
+    """A MINI_BLOCK_M/N environment override, ignored unless it tiles the CTA block.
+
+    MINI_BLOCK splits the LDS staging area, the global->LDS copy and the accumulator,
+    not just the epilogue, so an override that is not a whole number of warp tiles
+    dividing the block would be rejected by ``validate()`` -- fall back rather than
+    fail the launch.
+    """
+    value = _env_int("AITER_TRITON_MOE_GLUON_" + name, default)
+    if 0 < value <= block and block % value == 0 and value % warp_gran == 0:
+        return value
+    return default
 
 
 def _env_cache_modifier(name: str, default: str, legacy_name: str) -> str:
@@ -254,7 +273,7 @@ def _probe_lds_bytes(cfg: dict, dq_a, dq_b) -> int:
     inside ``gluon_supported`` on *every* launch -- at decode that is the critical path
     and it doubled the host issue time before it was cached."""
     return _probe_lds_bytes_cached(
-        tuple(sorted((k, _hashable(v)) for k, v in cfg.items())), dq_a, dq_b
+        _cfg_key(cfg), dq_a, dq_b
     )
 
 
@@ -430,28 +449,22 @@ def get_gluon_config_uncached(
 
     def _build(bn, bk, n_buf):
         warps = _pick_warps(block_m, bn, num_warps, instr)
-        gran_n = instr[1] * warps[1]
+        # Named apart from the enclosing `gran_n`, which is the coarsest granularity
+        # any warp split could need and is what the BLOCK_N shrink walk steps by.
+        warp_gran_n = instr[1] * warps[1]
+        warp_gran_m = instr[0] * warps[0]
         # Not defensive: if this ever fails the loop below never terminates, and the
         # symptom is a test run that spins at 200% CPU for an hour with no output.
-        assert bn % gran_n == 0, (
-            f"BLOCK_N {bn} not a multiple of warp N-granularity {gran_n}"
+        assert bn % warp_gran_n == 0, (
+            f"BLOCK_N {bn} not a multiple of warp N-granularity {warp_gran_n}"
         )
-        mini_n = min(bn, gran_n * 2)
-        while mini_n % gran_n:
-            mini_n += gran_n
-        # MINI_BLOCK_M/N now also split the LDS staging area, the global->LDS copy and
-        # the accumulator, so a sweep over them is a real pipeline experiment, not just
-        # an epilogue one. The override is only honoured when it divides the CTA tile
-        # and is a whole number of warp tiles -- validate() would reject anything else.
-        gran_m = instr[0] * warps[0]
-        mini_m = _env_int("AITER_TRITON_MOE_GLUON_MINI_BLOCK_M", block_m)
-        if not (
-            0 < mini_m <= block_m and block_m % mini_m == 0 and mini_m % gran_m == 0
-        ):
-            mini_m = block_m
-        mini_n_env = _env_int("AITER_TRITON_MOE_GLUON_MINI_BLOCK_N", mini_n)
-        if 0 < mini_n_env <= bn and bn % mini_n_env == 0 and mini_n_env % gran_n == 0:
-            mini_n = mini_n_env
+        mini_n = min(bn, warp_gran_n * 2)
+        while mini_n % warp_gran_n:
+            mini_n += warp_gran_n
+        mini_m = _mini_block_override(
+            "MINI_BLOCK_M", block_m, block_m, warp_gran_m
+        )
+        mini_n = _mini_block_override("MINI_BLOCK_N", mini_n, bn, warp_gran_n)
         out_instr, out_warps, out_tiles = instr, warps, (1, 1)
         out_bk, out_mini_m, out_mini_n = bk, mini_m, mini_n
         if _env_int("AITER_TRITON_MOE_GLUON_FLY", 0) and block_m == 128:
@@ -501,20 +514,15 @@ def get_gluon_config_uncached(
             out_bk = 256
             # Each payload stage carries one whole BLOCK_K fragment. M/N can still be
             # split into pipeline slots, while shuffled scales have independent extents.
-            out_mini_m = _env_int("AITER_TRITON_MOE_GLUON_MINI_BLOCK_M", block_m)
-            out_mini_n = _env_int("AITER_TRITON_MOE_GLUON_MINI_BLOCK_N", bn)
-            gm = out_instr[0] * out_warps[0]
-            gn = out_instr[1] * out_warps[1] * out_tiles[1]
-            if not (
-                0 < out_mini_m <= block_m
-                and block_m % out_mini_m == 0
-                and out_mini_m % gm == 0
-            ):
-                out_mini_m = block_m
-            if not (
-                0 < out_mini_n <= bn and bn % out_mini_n == 0 and out_mini_n % gn == 0
-            ):
-                out_mini_n = bn
+            out_mini_m = _mini_block_override(
+                "MINI_BLOCK_M", block_m, block_m, out_instr[0] * out_warps[0]
+            )
+            out_mini_n = _mini_block_override(
+                "MINI_BLOCK_N",
+                bn,
+                bn,
+                out_instr[1] * out_warps[1] * out_tiles[1],
+            )
 
         # A 16x16x128 operand that is not preshuffled is staged in LDS as 32-row units
         # (_layout.py::byte_unit_lds_layout), which only describes what a warp reads
@@ -756,6 +764,10 @@ def _default_launch_config(
         small_grid,
         stream_expert_payload,
     )
+    if c["FROZEN_STEP"]:
+        # The frozen body is a pinned snapshot whose acceptance test is identical
+        # assembly, so none of the measured geometry overrides below may reshape it.
+        return c
     if (
         not small_grid
         and stream_expert_payload
@@ -764,7 +776,6 @@ def _default_launch_config(
         and block_m == 64
         and N == 4096
         and K == 7168
-        and not c["FROZEN_STEP"]
     ):
         # The balanced T=256, E=33, top-k=8 launch has one M tile per expert.
         # BN128 doubles its useful CTA count relative to BN256 and removes the
@@ -800,7 +811,6 @@ def _default_launch_config(
         and block_m == 32
         and N == 4096
         and K == 7168
-        and not c["FROZEN_STEP"]
     ):
         # T<=64 with E=33, top-k=8 touches every expert, so gemm1 streams the whole
         # weight tensor whatever the token count and the kernel is limited by how much
@@ -842,7 +852,6 @@ def _default_launch_config(
         and N % 256 == 0
         and K % 256 == 0
         and K // 128 >= 10
-        and not c["FROZEN_STEP"]
     ):
         # FP8 K128 has the same payload byte tiles as FP4 K256. The scale
         # preshuffle still packs K256, with consecutive payload stages selecting
@@ -870,7 +879,6 @@ def _default_launch_config(
         and N % 256 == 0
         and K % 256 == 0
         and (K // dq_pack_divisor(dq_b)) % 16 == 0
-        and not c["FROZEN_STEP"]
     ):
         # The N tile that wins here is 256, and it does not fit while B is staged:
         # a three-deep B ring at BLOCK_N 256 needs 205,824 B against 159,744 B of
@@ -916,7 +924,6 @@ def _default_launch_config(
         and (block_m == 64 or (block_m == 128 and dq_a == DtypeQuant.MXFP4))
         and N % 256 == 0
         and K % 256 == 0
-        and not c["FROZEN_STEP"]
     ):
         # The automatic geometry for MXFP4 at these block sizes is the 32x32x64 MFMA
         # with one warp tile per slot, which is both much slower than the tuned
@@ -955,7 +962,6 @@ def _default_launch_config(
         and block_m in (64, 128)
         and N % 256 == 0
         and K % 64 == 0
-        and not c["FROZEN_STEP"]
     ):
         # Same defect for BF16, and worse: the automatic tile is BLOCK_N 64 with the
         # warps split (4, 2), so N is exactly one warp granularity wide and no
@@ -1103,7 +1109,7 @@ def gluon_supported(
     if K % cfg["BLOCK_K"] != 0:
         return False, f"K {K} % BLOCK_K {cfg['BLOCK_K']} != 0"
     pipeline_error = _pipeline_error(
-        tuple(sorted((key, _hashable(value)) for key, value in cfg.items())),
+        _cfg_key(cfg),
         dq_a,
         dq_b,
         K,
@@ -1221,8 +1227,7 @@ def _launch_spec(
     # complete effective configuration once preparation has resolved its layouts.
     tuning_cfg_host.validate_buffer_counts()
     tuning_cfg_host.num_k_tiles(K)
-    grid_n = tuning_cfg_host.grid_N(N)
-    grid_n = grid_n.value if hasattr(grid_n, "value") else grid_n
+    grid_n = _cval(tuning_cfg_host.grid_N(N))
     # Keep each spec in one constexpr so launch specialization sees four leaves.
     constexpr_args = (
         gl.constexpr(func_spec),
@@ -1732,7 +1737,7 @@ def moe_gemm_gluon(
         )
 
     grid_n, constexpr_args, num_warps, waves_per_eu, _cfg, _tc = _spec(
-        tuple(sorted((k, _hashable(v)) for k, v in config.items())) if config else None
+        _cfg_key(config) if config else None
     )
 
     # Tuning flags request preparation of the public raw scale inputs. Only pass an
@@ -1772,7 +1777,7 @@ def moe_gemm_gluon(
             _cfg, A_SCALE_SORTED_SHUFFLED=a_shuffled, B_SCALE_SHUFFLED=b_shuffled
         )
         grid_n, constexpr_args, num_warps, waves_per_eu, _cfg, _tc = _spec(
-            tuple(sorted((k, _hashable(v)) for k, v in _cfg.items()))
+            _cfg_key(_cfg)
         )
 
     # The Quant* tuples carry the scale pointer and strides unconditionally; when the
@@ -1803,7 +1808,7 @@ def moe_gemm_gluon(
             w_payload = shuf_b
             _cfg = dict(_cfg, B_PRESHUFFLED=True)
             grid_n, constexpr_args, num_warps, waves_per_eu, _cfg, _tc = _spec(
-                tuple(sorted((k, _hashable(v)) for k, v in _cfg.items()))
+                _cfg_key(_cfg)
             )
     if _cfg.get("B_IN_REG", False) and not _cfg.get("B_PRESHUFFLED", False):
         raise ValueError("B_IN_REG requires B_PRESHUFFLED weights")

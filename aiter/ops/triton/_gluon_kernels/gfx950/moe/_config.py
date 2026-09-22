@@ -16,7 +16,6 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.language.core import _aggregate as aggregate
 
-from . import _layout
 from ._lang import (
     DotKind,
     DtypeQuant,
@@ -33,16 +32,11 @@ from ._lang import (
 from ._lang import (
     unwrap as _v,
 )
-from ._layout import _KernelFuncShape, _KernelTuningLayout
+from ._layout import LDS_USABLE_BYTES, _KernelFuncShape, _KernelTuningLayout
 from ._types import COMPONENTS
 
-__all__ = ["KernelFuncConfig", "KernelTuningConfig"]
-
-# Compatibility aliases for callers that imported these before the extraction.
-LDS_CAP_BYTES = _layout.LDS_CAP_BYTES
-LDS_EPILOGUE_RESERVE_BYTES = _layout.LDS_EPILOGUE_RESERVE_BYTES
-LDS_USABLE_BYTES = _layout.LDS_USABLE_BYTES
-byte_unit_lds_layout = _layout.byte_unit_lds_layout
+#: Re-exported for the host wrapper, which sizes candidate tiles against it.
+__all__ = ["LDS_USABLE_BYTES", "KernelFuncConfig", "KernelTuningConfig"]
 
 
 @aggregate

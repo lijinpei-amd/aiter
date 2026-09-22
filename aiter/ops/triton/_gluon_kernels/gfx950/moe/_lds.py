@@ -325,14 +325,7 @@ class LDSManager:
         else:
             fragments = (
                 _ds_read(
-                    self._scale_slice(
-                        lds_ptr,
-                        SCALE_READ_IDX,
-                        cfg.num_scale_tiles(operand),
-                        tile,
-                        0,
-                        operand,
-                    ),
+                    lds_ptr.index(SCALE_READ_IDX * cfg.num_scale_tiles(operand) + tile),
                     cfg.dot_operand_scale_fragment_layout(operand),
                 ),
             )
@@ -347,30 +340,6 @@ class LDSManager:
     def wait_buffer_load_groups(self, num_group: gl.constexpr):
         """Block until at most ``num_group`` commit groups remain outstanding."""
         gl.amd.cdna4.async_copy.wait_group(num_group)
-
-    @gluon.jit
-    def _payload_slice(
-        self,
-        lds_ptr,
-        DS_READ_IDX,
-        n_tiles: gl.constexpr,
-        tile: gl.constexpr,
-        mini_idx: gl.constexpr,
-        operand: gl.constexpr,
-    ):
-        return lds_ptr.index(DS_READ_IDX * n_tiles + tile)
-
-    @gluon.jit
-    def _scale_slice(
-        self,
-        lds_ptr,
-        DS_READ_IDX,
-        n_tiles: gl.constexpr,
-        tile: gl.constexpr,
-        mini_idx: gl.constexpr,
-        operand: gl.constexpr,
-    ):
-        return lds_ptr.index(DS_READ_IDX * n_tiles + tile)
 
     @gluon.jit
     def ds_read_frag(
@@ -398,13 +367,8 @@ class LDSManager:
             payload: gl.constexpr = None
         else:
             payload = _ds_read(
-                self._payload_slice(
-                    payload_lds_ptr,
-                    DS_READ_IDX,
-                    cfg.num_lds_slots_per_block_non_k(operand),
-                    tile,
-                    mini_idx,
-                    operand,
+                payload_lds_ptr.index(
+                    DS_READ_IDX * cfg.num_lds_slots_per_block_non_k(operand) + tile
                 ),
                 cfg.dot_operand_fragment_layout(operand),
             )
