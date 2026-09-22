@@ -645,7 +645,20 @@ def get_gluon_config_uncached(
             "A_SCALE_IN_REG": bool(
                 _env_int("AITER_TRITON_MOE_GLUON_A_SCALE_IN_REG", 0)
             ),
-            "ACT_FAST_RCP": bool(_env_int("AITER_TRITON_MOE_GLUON_ACT_FAST_RCP", 0)),
+            # SwiGLU's reciprocal via v_rcp_f32 rather than the IEEE divide, which
+            # lowers to v_div_scale_f32 plus a Newton refinement. ~1 ulp of relative
+            # error against a result stored as BF16, whose own quantum is ~2^-8, so it
+            # cannot move the stored value except on a tie; the FlyDSL port this is
+            # measured against uses rocdl.rcp for the same reason
+            # (_triton_kernels/moe/activations.py:58-66).
+            #
+            # Default on: measured a win in all 12 cells swept, none regressed --
+            # MXFP4 -2.8%/-3.5% at T=1024/4096, MXFP8xMXFP4 -0.9%/-2.5%/-1.8% and
+            # MXFP8xMXFP8 -0.6%/-1.8%/-1.9% at T=256/1024/4096, BF16 -0.5%/-0.9%/-0.9%.
+            # bench_out/gluon_flydsl_final_20260922/{coldk,coldrcp}. It was previously
+            # reachable only through the environment, and only the hand-pinned MXFP4
+            # cases set it -- which is why those benchmarked ~3% faster than the ladder.
+            "ACT_FAST_RCP": bool(_env_int("AITER_TRITON_MOE_GLUON_ACT_FAST_RCP", 1)),
             # PER_OP (1) commits each async copy; PER_SLOT (2) commits each slot.
             # Both wait before each read slot. PER_STAGE (3) commits the whole K
             # stage and waits once at the read stage's head. Counts and copy ownership
