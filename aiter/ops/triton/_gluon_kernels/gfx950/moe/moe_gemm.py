@@ -184,29 +184,6 @@ _NO_SCALE: gl.constexpr = gl.constexpr(None)
 
 
 @gluon.jit
-def _opt_at(t, i: gl.constexpr, PRESENT: gl.constexpr):
-    """Index a per-mini-block tuple, or pass the absent-scale sentinel through."""
-    if require_constexpr(PRESENT):
-        out = t[i]
-    else:
-        out = _NO_SCALE
-    return out
-
-
-@gluon.jit
-def _take_pairs(frags, LO: gl.constexpr, N: gl.constexpr):
-    """K fragments ``[LO, LO+N)`` of a one-operand tuple, as a fresh tuple.
-
-    Built element-wise rather than sliced: a loop-carried tuple arrives as a
-    ``tl.tuple``, which indexes but does not slice.
-    """
-    out = ()
-    for i in gl.static_range(N):
-        out = out + (frags[2 * (LO + i)], frags[2 * (LO + i) + 1])
-    return out
-
-
-@gluon.jit
 def _maybe_block_dot(
     a_frags,
     b_frags,
@@ -384,18 +361,6 @@ def _take_reg_pairs(payload, scale, LO: gl.constexpr, N: gl.constexpr):
 
 
 @gluon.jit
-def _make_reg_fragments(a_frags, b_frags, acc):
-    a_payload, a_scale, b_payload, b_scale = (), (), (), ()
-    for i in gl.static_range(len(a_frags) // 2):
-        a_payload = a_payload + (a_frags[2 * i],)
-        a_scale = a_scale + (a_frags[2 * i + 1],)
-    for i in gl.static_range(len(b_frags) // 2):
-        b_payload = b_payload + (b_frags[2 * i],)
-        b_scale = b_scale + (b_frags[2 * i + 1],)
-    return _PipelineRegFragments(a_payload, a_scale, b_payload, b_scale, acc)
-
-
-@gluon.jit
 def _advance_hbm_ptrs(pc, hbm_ptrs, STEPS: gl.constexpr = 1, K_PHASE: gl.constexpr = 0):
     """Advance payload and LDS-staged scale sources after their buffer loads."""
     a_hbm_ptr = hbm_ptrs.a_hbm_ptr + STEPS * pc.a_step
@@ -426,27 +391,6 @@ def _advance_hbm_ptrs(pc, hbm_ptrs, STEPS: gl.constexpr = 1, K_PHASE: gl.constex
         a_scale_hbm_ptr,
         b_scale_hbm_ptr,
     )
-
-
-@gluon.jit
-def _merge_ds_read_frags(mem, mfma, tc, operand: gl.constexpr):
-    if require_constexpr(len(mem) == 0):
-        return mfma
-    elif require_constexpr(len(mfma) == 0):
-        return mem
-    else:
-        out = ()
-        for i in gl.static_range(tc.num_k_slots_per_tile()):
-            if require_constexpr(tc.ds_read_in_mfma(operand)):
-                payload = mfma[2 * i]
-            else:
-                payload = mem[2 * i]
-            if require_constexpr(tc.ds_read_in_mfma(operand, scale=True)):
-                scale = mfma[2 * i + 1]
-            else:
-                scale = mem[2 * i + 1]
-            out = out + (payload, scale)
-        return out
 
 
 @gluon.jit

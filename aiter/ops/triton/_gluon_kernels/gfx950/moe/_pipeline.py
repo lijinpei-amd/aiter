@@ -30,11 +30,10 @@ from ._schedule import (
     _fill_span,
     _has_register_component,
     _in_reg,
-    _loads_at_phase,
     _issued_tiles,
+    _loads_at_phase,
     _pipeline_peeled,
     _present,
-    _producer_phase,
     _read_in_mfma,
     _reads_at_phase,
     _register_index,
@@ -42,11 +41,9 @@ from ._schedule import (
     _slot_waits,
     _stage_wait,
     _via_lds,
-    _wait,
     pipeline_depth,
     pipeline_unroll,
     ring_restoration_period,
-    validate_pipeline,
 )
 
 _A_PAYLOAD: gl.constexpr = gl.constexpr(A_PAYLOAD)

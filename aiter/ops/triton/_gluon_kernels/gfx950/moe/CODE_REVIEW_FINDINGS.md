@@ -5,6 +5,12 @@
 - Scope: implementation files in `aiter/ops/triton/_gluon_kernels/gfx950/moe/`
   only
 
+**Stale references.** The file:line citations below are against the reviewed commit and
+have not been rebased. In particular `_offsets.py` no longer exists: its offset builders
+(`_a_payload_hbm_offsets`, `_b_payload_hbm_offsets`, `_a_scale_hbm_offsets`,
+`_b_scale_hbm_offsets`, `_gather_rows`) now live in `_layout.py`. Locate a finding by
+symbol name, not by line.
+
 This report records findings for later triage; it does not implement the suggested
 changes. No correctness or determinism failure was confirmed for the currently
 validated production configurations. Reachability matters: several findings require

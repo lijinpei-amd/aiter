@@ -1368,16 +1368,6 @@ class _KernelTuningLayout:
         )
 
     @gluon.constexpr_function
-    def sorted_shuffled_c_k1(self, K):
-        """Number of K256 scale groups per row stripe."""
-        return _v(K) // 256
-
-    @gluon.constexpr_function
-    def sorted_shuffled_chunk_dwords(self, K):
-        """Dwords per 128-row chunk; the stride from one chunk to the next."""
-        return (_v(self.BLOCK_M) // 32) * self.sorted_shuffled_c_k1(K) * 4 * 16
-
-    @gluon.constexpr_function
     def dot_operand_scale_lds_layout(self, idx):
         """Identity (K-contiguous) shared tile for the raw E8M0 scales.
 

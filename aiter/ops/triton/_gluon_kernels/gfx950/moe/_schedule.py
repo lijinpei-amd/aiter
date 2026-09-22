@@ -25,7 +25,6 @@ from ._types import (
     SCALE,
     A,
     B,
-    WaitCommitScheme,
 )
 
 __all__ = [
@@ -319,12 +318,6 @@ def _fill_slots_valid(tc):
         if len(set(mapping)) != len(mapping):
             return False
     return True
-
-
-@gluon.constexpr_function
-def _payload_buffer_load_slot(is_a, tile, NM, NN):
-    a_slots, b_slots = _payload_fill_slots(NM, NN)
-    return (a_slots if bool(_v(is_a)) else b_slots)[_v(tile)]
 
 
 @gluon.constexpr_function
