@@ -754,7 +754,7 @@ def chunk_delta_attn_fwd_intra(
         )
 
     grid = (NT, B * HV)
-    _intj_launch(chunk_delta_attn_fwd_kernel_inter_solve_fused, grid,
+    chunk_delta_attn_fwd_kernel_inter_solve_fused[grid](
         q=q,
         k=k,
         g=gk,

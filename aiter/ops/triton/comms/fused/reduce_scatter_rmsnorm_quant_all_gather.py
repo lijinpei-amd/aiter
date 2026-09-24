@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING
 import torch
 import triton
 import triton.language as tl
-from intj.compat import launch as _intj_launch
 from torch import Tensor
 
 from aiter.ops.triton._triton_kernels.normalization.rmsnorm import _rms_norm_kernel
@@ -366,7 +365,7 @@ def reduce_scatter_rmsnorm_quant_all_gather(
     quant_mode_flag = 0 if quant_mode == "none" else 1
 
     # Launch fused kernel
-    _intj_launch(fused_pipeline_kernel, grid,
+    fused_pipeline_kernel[grid](
         input_tensor,
         rs_buffer,
         norm_buffer,

@@ -15,7 +15,6 @@ import iris
 import torch
 import triton
 import triton.language as tl
-from intj.compat import launch as _intj_launch
 from torch import Tensor
 
 if TYPE_CHECKING:
@@ -224,7 +223,7 @@ def all_gather(
 
     # Launch kernel
     grid = (num_sms,)
-    _intj_launch(_all_gather_kernel, grid,
+    _all_gather_kernel[grid](
         input_shard,
         full_output,
         M,

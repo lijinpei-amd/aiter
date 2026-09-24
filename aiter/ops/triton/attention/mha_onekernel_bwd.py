@@ -269,7 +269,7 @@ def flash_attn_onekernel_backward(
     )
 
     if causal:
-        _intj_launch(bwd_kernel_causal, grid,
+        bwd_kernel_causal[grid](
             q,
             k,
             v,
@@ -326,7 +326,7 @@ def flash_attn_onekernel_backward(
             **config_onekernel,
         )
     else:
-        _intj_launch(bwd_kernel_noncausal, grid,
+        bwd_kernel_noncausal[grid](
             q,
             k,
             v,

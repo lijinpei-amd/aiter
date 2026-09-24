@@ -4,7 +4,6 @@
 import math
 
 import torch
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla import (
     _sparse_mla as _sparse_mla_gfx950,
@@ -605,7 +604,7 @@ def sparse_mla_fwd(
     # Q is read once per query without split-K, and re-read by every split
     q_cache = ".cg" if num_splits == 1 else ""
     grid = (num_queries, num_splits, heads_blocks)
-    _intj_launch(_sparse_mla_gfx950, grid,
+    _sparse_mla_gfx950[grid](
         q,
         cache,
         alt,
@@ -683,7 +682,7 @@ def sparse_mla_fwd(
 
     # One head per reduce workgroup
     rgrid = (num_queries, num_heads)
-    _intj_launch(_sparse_mla_reduce_gfx950, rgrid,
+    _sparse_mla_reduce_gfx950[rgrid](
         part_m,
         part_l,
         part_acc,

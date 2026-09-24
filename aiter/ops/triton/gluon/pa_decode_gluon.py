@@ -4356,7 +4356,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
                 QUERY_SEQ_LEN_POW2 = triton.cdiv(QUERY_SEQ_LEN_POW2, mtp_splits)
         else:
             paged_attention_kernel = paged_attention_decode_sliding_window
-        _intj_launch(paged_attention_kernel, grid,
+        paged_attention_kernel[grid](
             exp_sums_ptr,
             max_logits_ptr,
             output_ptr,
@@ -4425,7 +4425,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         paged_attention_kernel = paged_attention_decode_v2_gluon_dot_kernel
 
     # Launch the dot kernel
-    _intj_launch(paged_attention_kernel, grid,
+    paged_attention_kernel[grid](
         exp_sums_ptr,
         max_logits_ptr,
         output_ptr,

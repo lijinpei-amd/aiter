@@ -713,9 +713,11 @@ def _flash_attn_forward(
                 config.get("num_stages", 1),
             )
 
-        grid = (batch * num_q_heads * triton.cdiv(seqlen_q, config["BLOCK_M"]),)
+        grid = lambda META: (
+            batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),
+        )
 
-        _intj_launch(_attn_fwd, grid,
+        _attn_fwd[grid](
             q,
             k,
             v,

@@ -701,7 +701,7 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
     # buffer ops need the tensor to fit a 32-bit offset; gfx1250 loads through TDM
     MAX_INT32 = 2**31 - 1
     USE_STORE_BUFFER_OP = params.out.nelement() * params.out.element_size() <= MAX_INT32
-    _intj_launch(_unified_attention_kernel_2d_gfx1250, (params.num_kv_heads, total_query_blocks),
+    _unified_attention_kernel_2d_gfx1250[(params.num_kv_heads, total_query_blocks)](
         query_ptr=params.q,
         key_cache_ptr=params.k,
         value_cache_ptr=params.v,

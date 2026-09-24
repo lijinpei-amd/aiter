@@ -650,7 +650,7 @@ def _pa_decode_sparse_gfx950_gluon(
     # Grid dim 0 varies fastest and XCD assignment is round-robin over the linear
     # workgroup id, so the axis order decides what shares an XCD's L2.
     grid = (num_queries, num_splits, heads_blocks)
-    _intj_launch(_sparse_mla_gfx950, grid,
+    _sparse_mla_gfx950[grid](
         q,
         cache,
         main_bf16,
@@ -726,7 +726,7 @@ def _pa_decode_sparse_gfx950_gluon(
 
     # One head per reduce workgroup
     rgrid = (num_queries, num_heads)
-    _intj_launch(_sparse_mla_reduce_gfx950, rgrid,
+    _sparse_mla_reduce_gfx950[rgrid](
         part_m,
         part_l,
         part_acc,

@@ -11,7 +11,6 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
-from intj.compat import launch as _intj_launch
 from jinja2 import Template
 
 import aiter
@@ -589,7 +588,7 @@ def run_direct_attention_kernel(
             waves_per_eu = 4
 
     # Launch the kernel directly (following _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper)
-    _intj_launch(kernel, grid,
+    kernel[grid](
         exp_sums,
         max_logits,
         temporary_output,
