@@ -13,6 +13,7 @@ it. It lived in ``aiter/ops/triton/moe/quant_moe.py`` until it was moved here.
 import torch
 import triton
 import triton.language as tl
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -220,7 +221,7 @@ def upcast_from_mxfp(
     BLOCK_QUANT_DIM = 32
     blocks_out_dim = triton.cdiv(reshaped_out.shape[0], BLOCK_OUT_DIM)
     blocks_quant_dim = triton.cdiv(reshaped_out.shape[1], BLOCK_QUANT_DIM)
-    _upcast_from_mxfp[(blocks_out_dim, blocks_quant_dim)](
+    _intj_launch(_upcast_from_mxfp, (blocks_out_dim, blocks_quant_dim),
         reshaped_out,
         *reshaped_out.stride(),
         reshaped_scale,

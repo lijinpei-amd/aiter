@@ -18,6 +18,7 @@ interface is converted to the ExptData routing format internally.
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w8 import _moe_gemm_a8w8
 from aiter.ops.triton.moe.moe_utils import group_sizes_to_expt_tensors
@@ -110,7 +111,7 @@ def moe_gemm_mxfp8(
     w_scale_kn = w_scale.permute(0, 2, 1).contiguous()
     bias_stride = N if bias is not None else 0
 
-    _moe_gemm_a8w8[(grid_m * grid_n,)](
+    _intj_launch(_moe_gemm_a8w8, (grid_m * grid_n,),
         # output
         out,
         out.stride(0),  # stride_y_k  (SPLIT_K=1, unused)

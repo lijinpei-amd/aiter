@@ -26,6 +26,7 @@ from functools import cache
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 from packaging.version import Version
 from triton.backends.compiler import GPUTarget
 
@@ -108,7 +109,7 @@ def deepgemm_fp8_paged_mqa_logits_ragged_k(
     }
 
     grid = (batch_size * next_n * config["SplitKV"],)
-    _deepgemm_fp8_paged_mqa_logits_ragged_k[grid](
+    _intj_launch(_deepgemm_fp8_paged_mqa_logits_ragged_k, grid,
         batch_size,
         next_n,
         heads,
@@ -158,7 +159,7 @@ def deepgemm_fp8_paged_mqa_logits_stage1_ragged_k(
     assert heads % config["ChunkQ"] == 0
 
     grid = (batch_size * next_n * (heads // config["ChunkQ"] * config["SplitKV"]),)
-    _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k[grid](
+    _intj_launch(_deepgemm_fp8_paged_mqa_logits_stage1_ragged_k, grid,
         batch_size,
         next_n,
         heads,
@@ -227,7 +228,7 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
     assert heads % config["ChunkQ"] == 0
 
     grid = (batch_size * next_n * (heads // config["ChunkQ"] * SplitKV),)
-    _deepgemm_fp8_paged_mqa_logits_stage1[grid](
+    _intj_launch(_deepgemm_fp8_paged_mqa_logits_stage1, grid,
         batch_size,
         next_n,
         heads,
@@ -449,7 +450,7 @@ def deepgemm_fp8_paged_mqa_logits_schedule(
         device="cuda",
         dtype=torch.int32,
     )
-    _deepgemm_fp8_paged_mqa_logits_varctx_schedule[grid](
+    _intj_launch(_deepgemm_fp8_paged_mqa_logits_varctx_schedule, grid,
         batch_size,
         context_lens,
         safe_chunks_per_cta,

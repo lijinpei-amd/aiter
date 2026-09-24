@@ -3,6 +3,7 @@
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.kv_cache import _cat_and_cache_mla_kernel
@@ -119,7 +120,7 @@ def cat_and_cache_mla(
         kv_cache_stride_d == 1
     ), "The stride of the last dimension of KV cache must be 1"
 
-    _cat_and_cache_mla_kernel[(b * kh,)](
+    _intj_launch(_cat_and_cache_mla_kernel, (b * kh,),
         k_nope,
         k_pe,
         kv_cache,

@@ -3,6 +3,7 @@
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16_atomic import (
@@ -78,15 +79,15 @@ def gemm_a16w16_atomic_(
         else:
             y = torch.zeros((M, N), dtype=dtype, device=x.device)
 
-    grid = lambda META: (
-        triton.cdiv(M, META["BLOCK_SIZE_M"])
-        * triton.cdiv(N, META["BLOCK_SIZE_N"])
-        * META["NUM_KSPLIT"],
+    grid = (
+        triton.cdiv(M, config["BLOCK_SIZE_M"])
+        * triton.cdiv(N, config["BLOCK_SIZE_N"])
+        * config["NUM_KSPLIT"],
     )
     # NOTE: if k split doesnt divide K evenly, this will waste compute
     SPLITK_BLOCK_SIZE = triton.cdiv(K, config["NUM_KSPLIT"])
     config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
-    _gemm_a16_w16_atomic_kernel[grid](
+    _intj_launch(_gemm_a16_w16_atomic_kernel, grid,
         x,
         w,
         y,

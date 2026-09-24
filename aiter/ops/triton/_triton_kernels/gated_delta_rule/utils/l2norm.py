@@ -12,6 +12,7 @@ supporting both forward and backward passes.
 import torch
 import triton
 import triton.language as tl
+from intj.compat import launch as _intj_launch
 from torch import nn
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
@@ -253,7 +254,7 @@ def l2norm_fwd(
 
     if D <= 512:
         BT = _L2NORM_FWD_BT
-        l2norm_fwd_kernel[(triton.cdiv(T, BT),)](
+        _intj_launch(l2norm_fwd_kernel, (triton.cdiv(T, BT),),
             x,
             y,
             rstd,
@@ -266,7 +267,7 @@ def l2norm_fwd(
             num_warps=_L2NORM_FWD_NUM_WARPS,
         )
     else:
-        l2norm_fwd_kernel1[(T,)](
+        _intj_launch(l2norm_fwd_kernel1, (T,),
             x,
             y,
             rstd,
@@ -318,7 +319,7 @@ def l2norm_bwd(
         def grid(meta):
             return (triton.cdiv(T, meta["BT"]),)
 
-        l2norm_bwd_kernel[grid](
+        _intj_launch(l2norm_bwd_kernel, grid,
             y=y,
             rstd=rstd,
             dy=dy,
@@ -330,7 +331,7 @@ def l2norm_bwd(
             NB=NB,
         )
     else:
-        l2norm_bwd_kernel1[(T,)](
+        _intj_launch(l2norm_bwd_kernel1, (T,),
             y=y,
             rstd=rstd,
             dy=dy,

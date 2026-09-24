@@ -4,6 +4,7 @@
 import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.attention.mha_onekernel_bwd import (
     _bwd_preprocess,
@@ -221,7 +222,7 @@ def flash_attn_onekernel_backward(
         batch,
         num_q_heads,
     )
-    _bwd_preprocess[pre_grid](
+    _intj_launch(_bwd_preprocess, pre_grid,
         o,
         do,
         delta,
@@ -268,7 +269,7 @@ def flash_attn_onekernel_backward(
     )
 
     if causal:
-        bwd_kernel_causal[grid](
+        _intj_launch(bwd_kernel_causal, grid,
             q,
             k,
             v,
@@ -325,7 +326,7 @@ def flash_attn_onekernel_backward(
             **config_onekernel,
         )
     else:
-        bwd_kernel_noncausal[grid](
+        _intj_launch(bwd_kernel_noncausal, grid,
             q,
             k,
             v,

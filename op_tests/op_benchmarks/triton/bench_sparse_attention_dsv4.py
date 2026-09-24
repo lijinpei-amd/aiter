@@ -18,6 +18,7 @@ import argparse
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
     _sparse_attn_prefill_kernel as csa_prefill_tl,
@@ -120,7 +121,7 @@ def _launch_prefill(
         def grid(META):
             return (num_queries, triton.cdiv(num_heads, META["BLOCK_H"]))
 
-        sparse_attn_prefill_kernel[grid](
+        _intj_launch(sparse_attn_prefill_kernel, grid,
             q,
             kv,
             indices,

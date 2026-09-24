@@ -13,6 +13,7 @@ Convention (TN layout):
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.moe.moe_gemm_per_token import (
     _moe_gemm_per_token_kernel,
@@ -85,7 +86,7 @@ def moe_gemm_per_token(
     num_n_blocks = triton.cdiv(N, BLOCK_N)
     grid = (total_m_blocks * num_n_blocks,)
 
-    _moe_gemm_per_token_kernel[grid](
+    _intj_launch(_moe_gemm_per_token_kernel, grid,
         lhs,
         rhs,
         out,

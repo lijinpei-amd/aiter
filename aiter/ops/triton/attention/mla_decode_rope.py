@@ -27,6 +27,7 @@ import copy
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.attention.mla_decode_rope import (
     _fwd_grouped_kernel_stage1_rope,
@@ -77,7 +78,7 @@ def _decode_grouped_att_m_fwd_rope(
         * config["NUM_KV_SPLITS"],
     )
 
-    _fwd_grouped_kernel_stage1_rope[grid](
+    _intj_launch(_fwd_grouped_kernel_stage1_rope, grid,
         q,
         k_buffer,
         v_buffer,
@@ -127,7 +128,7 @@ def _decode_softmax_reducev_fwd(
     config["NUM_KV_SPLITS"] = num_kv_splits
 
     grid = (batch * head_num,)
-    _fwd_kernel_stage2[grid](
+    _intj_launch(_fwd_kernel_stage2, grid,
         logits,
         o,
         kv_indptr,

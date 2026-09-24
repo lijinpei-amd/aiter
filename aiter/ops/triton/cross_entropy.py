@@ -12,6 +12,7 @@ call.
 import torch
 import torch.distributed as dist
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.cross_entropy import (
     _ce_fused_loss_grad_kernel,
@@ -126,7 +127,7 @@ def cross_entropy_forward(
     else:
         n_valid = torch.ones((), dtype=torch.int64, device=_input.device)
 
-    _ce_local_softmax_stats_kernel[(n_rows,)](
+    _intj_launch(_ce_local_softmax_stats_kernel, (n_rows,),
         _input,
         _input.stride(-2),
         target,
@@ -149,7 +150,7 @@ def cross_entropy_forward(
     else:
         gathered = m_d_Xy
 
-    _ce_fused_loss_grad_kernel[(n_rows,)](
+    _intj_launch(_ce_fused_loss_grad_kernel, (n_rows,),
         _input,
         _input.stride(-2),
         target,
@@ -280,7 +281,7 @@ def cross_entropy_forward_chunked(
         chunk_loss = loss_1d[row : row + rows_this]  # view [rows_this]
         m_d_Xy_chunk = m_d_Xy[: rows_this * 3]
 
-        _ce_local_softmax_stats_kernel[(rows_this,)](
+        _intj_launch(_ce_local_softmax_stats_kernel, (rows_this,),
             chunk_x,
             chunk_x.stride(0),
             chunk_y,
@@ -301,7 +302,7 @@ def cross_entropy_forward_chunked(
         else:
             gathered = m_d_Xy_chunk
 
-        _ce_fused_loss_grad_kernel[(rows_this,)](
+        _intj_launch(_ce_fused_loss_grad_kernel, (rows_this,),
             chunk_x,
             chunk_x.stride(0),
             chunk_y,
@@ -370,7 +371,7 @@ def cross_entropy_backward(
     grad_output = grad_output.contiguous()
 
     BLOCK_SIZE, num_warps = _block_size_and_warps(_input.element_size(), V)
-    _ce_grad_scale_kernel[(n_rows,)](
+    _intj_launch(_ce_grad_scale_kernel, (n_rows,),
         _input,
         _input.stride(-2),
         grad_output,

@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.moe.reduce import (
     _reduce_grouped,
@@ -84,7 +85,7 @@ def scatter_grouped(
 
     BLOCK_N = 512
     num_blocks = triton.cdiv(x.shape[-1], BLOCK_N)
-    _scatter_grouped[(num_blocks * m_rows,)](
+    _intj_launch(_scatter_grouped, (num_blocks * m_rows,),
         x,
         x.stride(0),
         x.stride(1),
@@ -210,7 +211,7 @@ def reduce_grouped(
                 f"out.shape {tuple(out.shape)}"
             )
         gluon_num_warps = _reduce_grouped_gluon_num_warps(npad)
-        _reduce_grouped_gluon[(num_groups,)](
+        _intj_launch(_reduce_grouped_gluon, (num_groups,),
             X=x,
             Out=out,
             InIndx=indx,
@@ -246,7 +247,7 @@ def reduce_grouped(
         res_stride_m = 0
         res_stride_n = 0
         has_ext_residual = False
-    _reduce_grouped[(num_blocks * num_groups,)](
+    _intj_launch(_reduce_grouped, (num_blocks * num_groups,),
         x,
         x.stride(0),
         x.stride(1),

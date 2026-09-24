@@ -5,6 +5,7 @@ import math
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.attention.pa_decode import (
     _paged_attn_decode_v1_w_dot_kernel,
@@ -191,7 +192,7 @@ def paged_attn_decode_v1(
     # MHA- Multi-Head Attention
     if query_grp_sz == 1:
         grid = (num_q_heads, num_seqs, 1)
-        _paged_attn_decode_v1_wo_dot_kernel[grid](
+        _intj_launch(_paged_attn_decode_v1_wo_dot_kernel, grid,
             output,
             query,
             key_cache,
@@ -224,7 +225,7 @@ def paged_attn_decode_v1(
             query_grp_sz_pow2 = 16
         else:
             query_grp_sz_pow2 = triton.next_power_of_2(query_grp_sz)
-        _paged_attn_decode_v1_w_dot_kernel[grid](
+        _intj_launch(_paged_attn_decode_v1_w_dot_kernel, grid,
             output,
             query,
             key_cache,
@@ -313,7 +314,7 @@ def paged_attn_decode_v2(
         tmp_output = torch.empty(
             (*shape_info, head_sz), dtype=output.dtype, device=output.device
         )
-        _paged_attn_decode_v2_wo_dot_kernel[grid](
+        _intj_launch(_paged_attn_decode_v2_wo_dot_kernel, grid,
             exp_sums,
             max_logits,
             tmp_output,
@@ -347,7 +348,7 @@ def paged_attn_decode_v2(
             SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
         )
         grid = (num_q_heads, num_seqs, 1)
-        _paged_attn_decode_v2_wo_dot_reduce_kernel[grid](
+        _intj_launch(_paged_attn_decode_v2_wo_dot_reduce_kernel, grid,
             output,
             exp_sums,
             max_logits,
@@ -378,7 +379,7 @@ def paged_attn_decode_v2(
             query_grp_sz_pow2 = 16
         else:
             query_grp_sz_pow2 = triton.next_power_of_2(query_grp_sz)
-        _paged_attn_decode_v2_w_dot_kernel[grid](
+        _intj_launch(_paged_attn_decode_v2_w_dot_kernel, grid,
             exp_sums,
             max_logits,
             tmp_output,
@@ -414,7 +415,7 @@ def paged_attn_decode_v2(
             SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
         )
         grid = (num_seqs, num_kv_heads, 1)
-        _paged_attn_decode_v2_w_dot_reduce_kernel[grid](
+        _intj_launch(_paged_attn_decode_v2_w_dot_reduce_kernel, grid,
             output,
             exp_sums,
             max_logits,
@@ -474,7 +475,7 @@ def paged_attn_decode_v1_per_token_quant(
     # MHA- Multi-Head Attention
     if query_grp_sz == 1:
         grid = (num_q_heads, num_seqs, 1)
-        _paged_attn_decode_v1_wo_dot_kernel_per_token_quant[grid](
+        _intj_launch(_paged_attn_decode_v1_wo_dot_kernel_per_token_quant, grid,
             output,
             query,
             key_cache,
@@ -510,7 +511,7 @@ def paged_attn_decode_v1_per_token_quant(
             query_grp_sz_pow2 = 16
         else:
             query_grp_sz_pow2 = triton.next_power_of_2(query_grp_sz)
-        _paged_attn_decode_v1_w_dot_kernel_per_token_quant[grid](
+        _intj_launch(_paged_attn_decode_v1_w_dot_kernel_per_token_quant, grid,
             output,
             query,
             key_cache,
@@ -602,7 +603,7 @@ def paged_attn_decode_v2_per_token_quant(
         tmp_output = torch.empty(
             (*shape_info, head_sz), dtype=output.dtype, device=output.device
         )
-        _paged_attn_decode_v2_wo_dot_kernel_per_token_quant[grid](
+        _intj_launch(_paged_attn_decode_v2_wo_dot_kernel_per_token_quant, grid,
             exp_sums,
             max_logits,
             tmp_output,
@@ -639,7 +640,7 @@ def paged_attn_decode_v2_per_token_quant(
             SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
         )
         grid = (num_q_heads, num_seqs, 1)
-        _paged_attn_decode_v2_wo_dot_reduce_kernel_per_token_quant[grid](
+        _intj_launch(_paged_attn_decode_v2_wo_dot_reduce_kernel_per_token_quant, grid,
             output,
             exp_sums,
             max_logits,
@@ -670,7 +671,7 @@ def paged_attn_decode_v2_per_token_quant(
             query_grp_sz_pow2 = 16
         else:
             query_grp_sz_pow2 = triton.next_power_of_2(query_grp_sz)
-        _paged_attn_decode_v2_w_dot_kernel_per_token_quant[grid](
+        _intj_launch(_paged_attn_decode_v2_w_dot_kernel_per_token_quant, grid,
             exp_sums,
             max_logits,
             tmp_output,
@@ -709,7 +710,7 @@ def paged_attn_decode_v2_per_token_quant(
             SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
         )
         grid = (num_seqs, num_kv_heads, 1)
-        _paged_attn_decode_v2_w_dot_reduce_kernel_per_token_quant[grid](
+        _intj_launch(_paged_attn_decode_v2_w_dot_reduce_kernel_per_token_quant, grid,
             output,
             exp_sums,
             max_logits,

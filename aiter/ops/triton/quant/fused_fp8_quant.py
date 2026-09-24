@@ -118,7 +118,11 @@ def fused_rms_fp8_per_tensor_static_quant(
         else torch.iinfo(out1_fp8.dtype).max
     )
 
-    _fused_rms_fp8_per_tensor_static_quant_kernel[(M,)](
+    from intj.compat import launch
+
+    launch(
+        _fused_rms_fp8_per_tensor_static_quant_kernel,
+        (M,),
         inp1,
         inp1_weight,
         inp2,
@@ -291,7 +295,11 @@ def fused_rms_fp8_group_quant(
         out1_bs_row_stride = out1_bs.stride(0)
         out1_bs_col_stride = out1_bs.stride(1)
 
-    _fused_rms_fp8_group_quant_kernel[(M,)](
+    from intj.compat import launch
+
+    launch(
+        _fused_rms_fp8_group_quant_kernel,
+        (M,),
         inp1_ptr=inp1,
         weight1_ptr=inp1_weight,
         inp2_ptr=inp2,
@@ -469,7 +477,11 @@ def fused_rms_gated_fp8_group_quant(
     grid = (triton.cdiv(M, rows_per_block),)
     BLOCK_SIZE_PAD = max(triton.next_power_of_2(N), effective_gs)
 
-    _fused_rms_fp8_group_quant_kernel[grid](
+    from intj.compat import launch
+
+    launch(
+        _fused_rms_fp8_group_quant_kernel,
+        grid,
         inp1_ptr=x,
         weight1_ptr=weight,
         inp2_ptr=dummy,
@@ -586,7 +598,11 @@ def fused_flatten_fp8_group_quant(
         M,
         N1,
     )
-    _fused_flatten_fp8_group_quant_kernel[grid](
+    from intj.compat import launch
+
+    launch(
+        _fused_flatten_fp8_group_quant_kernel,
+        grid,
         x,
         out,
         out_block_scales,
@@ -693,7 +709,11 @@ def fused_reduce_act_mul_fp8_group_quant(
     if X_HAS_SPLITK:
         num_pid += triton.cdiv(M, BLOCK_SIZE_M2) * triton.cdiv(N2, BLOCK_SIZE_N2)
     grid = (num_pid,)
-    _fused_reduce_act_mul_fp8_group_quant[grid](
+    from intj.compat import launch
+
+    launch(
+        _fused_reduce_act_mul_fp8_group_quant,
+        grid,
         x,
         y,
         y_scale,
@@ -915,7 +935,11 @@ def fused_reduce_rms_fp8_group_quant(
         if torch.is_floating_point(out1_fp8)
         else torch.iinfo(out1_fp8.dtype).max
     )
-    _fused_reduce_rms_fp8_group_quant_kernel[(3 * M if HAS_SPLITK else 2 * M,)](
+    from intj.compat import launch
+
+    launch(
+        _fused_reduce_rms_fp8_group_quant_kernel,
+        (3 * M if HAS_SPLITK else 2 * M,),
         inp1,
         inp1_weight,
         inp2,
@@ -1028,7 +1052,11 @@ def fused_silu_mul_fp8_per_tensor_static_quant(
         else torch.iinfo(out_fp8.dtype).max
     )
 
-    _fused_silu_mul_fp8_per_tensor_static_quant_kernel[(M,)](
+    from intj.compat import launch
+
+    launch(
+        _fused_silu_mul_fp8_per_tensor_static_quant_kernel,
+        (M,),
         inp,
         out_fp8,
         inp_scale,

@@ -101,7 +101,11 @@ def convert_to_mxfp8(
     # differ from the default 64×64 (MI308X benchmark: nw=1/2/4 differ < 1%
     # at default tile, nw≥8 regresses).
     num_warps = min(16, max(1, block_m * block_n // 1024))
-    _convert_to_mxfp8_kernel[grid](
+    from intj.compat import launch
+
+    launch(
+        _convert_to_mxfp8_kernel,
+        grid,
         x,
         y,
         s,
@@ -185,7 +189,11 @@ def convert_from_mxfp8(
 
     grid = (triton.cdiv(M, block_m), triton.cdiv(N, block_n))
     num_warps = min(16, max(1, block_m * block_n // 1024))
-    _convert_from_mxfp8_kernel[grid](
+    from intj.compat import launch
+
+    launch(
+        _convert_from_mxfp8_kernel,
+        grid,
         x,
         y,
         s,

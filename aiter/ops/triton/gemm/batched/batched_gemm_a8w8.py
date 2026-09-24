@@ -3,6 +3,7 @@
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a8w8 import (
     _batched_gemm_a8w8_kernel,
@@ -79,12 +80,12 @@ def batched_gemm_a8w8(
     if config is None:
         config, _ = _get_config(M, N, K)
 
-    grid = lambda META: (
+    grid = (
         B,
-        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),
     )
 
-    _batched_gemm_a8w8_kernel[grid](
+    _intj_launch(_batched_gemm_a8w8_kernel, grid,
         XQ,
         WQ,
         YQ,

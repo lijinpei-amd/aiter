@@ -19,6 +19,7 @@ It supports page size = 1 and prefill with KV cache (i.e. extend).
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.attention.extend_attention import (
     _fwd_kernel,
@@ -118,7 +119,7 @@ def extend_attention_fwd(
     num_blocks = triton.cdiv(max_len_extend, config["BLOCK_M"])
     grid = (head_num * num_blocks * batch_size,)
 
-    _fwd_kernel[grid](
+    _intj_launch(_fwd_kernel, grid,
         q_extend,
         k_extend,
         v_extend,

@@ -25,6 +25,7 @@ concatenation ``[Q | K | V]`` (``dim == 2*k_dim + v_dim``).
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.prefill_batch_metadata import CausalConvPrefillMetadata
 from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.causal_conv1d_fwd_split_qkv import (
@@ -90,7 +91,7 @@ def causal_conv1d_split_qkv_triton_fn(
             triton.cdiv(dim, META["BLOCK_N"]),
         )
 
-    _causal_conv1d_fwd_split_qkv_kernel[grid](
+    _intj_launch(_causal_conv1d_fwd_split_qkv_kernel, grid,
         x,
         weight,
         bias,
@@ -267,7 +268,7 @@ def causal_conv1d_split_qkv_triton_tile_fn(
         )
 
     grid = (tot, triton.cdiv(dim, BLOCK_N))
-    _causal_conv1d_fwd_split_qkv_tile_kernel[grid](
+    _intj_launch(_causal_conv1d_fwd_split_qkv_tile_kernel, grid,
         x,
         weight,
         bias,

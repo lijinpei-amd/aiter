@@ -3,6 +3,7 @@
 import torch
 import triton
 import triton.language as tl
+from intj.compat import launch as _intj_launch
 from torch import Tensor
 
 from . import dtypes
@@ -572,7 +573,7 @@ def dynamic_mxfp4_quant(
 
     BLOCK_SIZE = 128
     grid = (triton.cdiv(M, BLOCK_SIZE), scaleN)
-    _dynamic_mxfp4_quant_kernel_asm_layout[grid](
+    _intj_launch(_dynamic_mxfp4_quant_kernel_asm_layout, grid,
         x,
         x_fp4,
         blockscale_e8m0,
@@ -835,12 +836,12 @@ def moe_mxfp4_sort(
     if token_num > _FUSED_N_THRESHOLD:
         N_TILES = triton.cdiv(N_i, BLOCK_SIZE_N)
         grid = (triton.cdiv(M_o, BLOCK_SIZE_M),)
-        _moe_mxfp4_sort_kernel_fused_n[grid](
+        _intj_launch(_moe_mxfp4_sort_kernel_fused_n, grid,
             *common_args, **common_kwargs, N_TILES=N_TILES
         )
     else:
         grid = (triton.cdiv(M_o, BLOCK_SIZE_M), triton.cdiv(N_i, BLOCK_SIZE_N))
-        _moe_mxfp4_sort_kernel[grid](*common_args, **common_kwargs)
+        _intj_launch(_moe_mxfp4_sort_kernel, grid, *common_args, **common_kwargs)
 
     # ``N_i`` was padded to a multiple of BLOCK_SIZE_N above, so ``N_o == N_i``
     # is also a multiple of BLOCK_SIZE_N and the flat view is well-defined.

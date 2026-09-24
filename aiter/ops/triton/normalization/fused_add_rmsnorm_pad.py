@@ -1,5 +1,6 @@
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._gluon_kernels.gfx1250.norm.fused_add_rmsnorm_pad import (
     _gluon_fused_add_rmsnorm_pad_kernel,
@@ -79,7 +80,7 @@ def fused_add_rmsnorm_pad(
             BLOCK_SIZE_N = triton.next_power_of_2(N_out)
             config = _get_config(BLOCK_SIZE_N, "gluon")
             NUM_WARPS = config["num_warps"]
-            _gluon_fused_add_rmsnorm_pad_kernel[(M,)](
+            _intj_launch(_gluon_fused_add_rmsnorm_pad_kernel, (M,),
                 x,
                 res,
                 out,
@@ -125,7 +126,7 @@ def fused_add_rmsnorm_pad(
         res_out = torch.empty((M, N), dtype=res.dtype, device=res.device)
     BLOCK_SIZE_N = triton.next_power_of_2(N_out)
 
-    _fused_add_rmsnorm_pad[(M,)](
+    _intj_launch(_fused_add_rmsnorm_pad, (M,),
         x,
         res,
         out,

@@ -3,6 +3,7 @@
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.rope.fused_qk_norm_rope_cached import (
     _fused_qk_norm_rope_cached_kernel,
@@ -72,7 +73,7 @@ def fused_qk_norm_rope_cached(
         rot % 2 == 0 and rot <= D
     ), f"rotated width {rot} must be even and at most head_dim {D}"
 
-    _fused_qk_norm_rope_cached_kernel[(T,)](
+    _intj_launch(_fused_qk_norm_rope_cached_kernel, (T,),
         q,
         k,
         q_weight,

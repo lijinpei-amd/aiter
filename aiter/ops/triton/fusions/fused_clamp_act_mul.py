@@ -7,6 +7,7 @@ from typing import Literal
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_clamp_act_mul import (
     _fused_clamp_silu_mul_kernel as _fused_clamp_silu_mul_gluon_kernel,
@@ -304,12 +305,10 @@ def fused_clamp_act_mul(
         ), f"Gluon backend requires gfx1250, got '{get_arch()}'"
 
         # (M chunks * rows to process, N tiles)
-        _fused_clamp_silu_mul_gluon_kernel[
-            (
+        _intj_launch(_fused_clamp_silu_mul_gluon_kernel, (
                 triton.cdiv(M, ROWS_PER_PROG * BLOCK_SIZE_M),
                 triton.cdiv(n_half, BLOCK_SIZE_N),
-            )
-        ](
+            ),
             inp,
             out,
             scale_arg,
@@ -347,7 +346,7 @@ def fused_clamp_act_mul(
         # only for triton
         num_warps = _get_config(M, n_half, BLOCK_SIZE_N, "triton")["num_warps"]
 
-        _fused_clamp_silu_mul_kernel[(M,)](
+        _intj_launch(_fused_clamp_silu_mul_kernel, (M,),
             inp,
             out,
             scale_arg,

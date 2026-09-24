@@ -3,6 +3,7 @@
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
@@ -117,14 +118,14 @@ def gemm_a16wfp4_(
         config["SPLITK_BLOCK_SIZE"] = 2 * K
         y_pp = None
 
-    grid = lambda META: (
+    grid = (
         (
-            META["NUM_KSPLIT"]
-            * triton.cdiv(M, META["BLOCK_SIZE_M"])
-            * triton.cdiv(N, META["BLOCK_SIZE_N"])
+            config["NUM_KSPLIT"]
+            * triton.cdiv(M, config["BLOCK_SIZE_M"])
+            * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
-    _gemm_a16wfp4_kernel[grid](
+    _intj_launch(_gemm_a16wfp4_kernel, grid,
         x,
         w,
         y if y_pp is None else y_pp,
@@ -157,7 +158,7 @@ def gemm_a16wfp4_(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _gemm_splitk_reduce_kernel[grid_reduce](
+        _intj_launch(_gemm_splitk_reduce_kernel, grid_reduce,
             y_pp,
             y,
             None,
@@ -302,14 +303,14 @@ def gemm_a16wfp4_preshuffle_(
     if y is None and not return_y_pp:
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
-    grid = lambda META: (
+    grid = (
         (
-            META["NUM_KSPLIT"]
-            * triton.cdiv(M, META["BLOCK_SIZE_M"])
-            * triton.cdiv(N, META["BLOCK_SIZE_N"])
+            config["NUM_KSPLIT"]
+            * triton.cdiv(M, config["BLOCK_SIZE_M"])
+            * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
-    _gemm_a16wfp4_preshuffle_kernel[grid](
+    _intj_launch(_gemm_a16wfp4_preshuffle_kernel, grid,
         x,
         w,
         y if y_pp is None else y_pp,
@@ -344,7 +345,7 @@ def gemm_a16wfp4_preshuffle_(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _gemm_splitk_reduce_kernel[grid_reduce](
+        _intj_launch(_gemm_splitk_reduce_kernel, grid_reduce,
             y_pp,
             y,
             None,

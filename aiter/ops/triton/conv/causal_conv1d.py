@@ -2,6 +2,7 @@ import os
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.conv.causal_conv1d import (
     PAD_SLOT_ID,
@@ -172,7 +173,7 @@ def causal_conv1d_fn(
             triton.cdiv(dim, META["BLOCK_N"]),
         )
 
-    _causal_conv1d_fwd_kernel[grid](
+    _intj_launch(_causal_conv1d_fwd_kernel, grid,
         # Pointers to matrices
         x,
         weight,
@@ -367,7 +368,7 @@ def causal_conv1d_update(
     else:
         stride_inter_seq = stride_inter_step = stride_inter_dim = stride_inter_win = 0
 
-    _causal_conv1d_update_kernel[grid](
+    _intj_launch(_causal_conv1d_update_kernel, grid,
         # Pointers to matrices
         x,
         weight,

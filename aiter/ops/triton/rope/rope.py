@@ -6,6 +6,7 @@ from enum import IntEnum
 import torch
 import triton
 import triton.language as tl
+from intj.compat import launch as _intj_launch
 from torch import autograd
 
 from aiter.ops.triton._triton_kernels.rope.rope import (
@@ -81,7 +82,7 @@ def _rope_fwd(
     waves_per_eu = 0
     grid = (b, h, triton.cdiv(s, BLOCK_S))
 
-    _rope_kernel_sbhd_fwd[grid](
+    _intj_launch(_rope_kernel_sbhd_fwd, grid,
         x,
         freqs,
         out,
@@ -188,7 +189,7 @@ def _rope_bwd(
     waves_per_eu = 0
     grid = (b, h, triton.cdiv(s, BLOCK_S))
 
-    _rope_kernel_sbhd_bwd[grid](
+    _intj_launch(_rope_kernel_sbhd_bwd, grid,
         x,
         freqs,
         out,
@@ -273,7 +274,7 @@ def _rope_thd_fwd(
     waves_per_eu = 0
     grid = (b, h, triton.cdiv(t, BLOCK_T))
 
-    _rope_kernel_thd_fwd[grid](
+    _intj_launch(_rope_kernel_thd_fwd, grid,
         x,
         cu_seqlens,
         freqs,
@@ -386,7 +387,7 @@ def _rope_thd_bwd(
     waves_per_eu = 0
     grid = (b, h, triton.cdiv(t, BLOCK_T))
 
-    _rope_kernel_thd_bwd[grid](
+    _intj_launch(_rope_kernel_thd_bwd, grid,
         x,
         cu_seqlens,
         freqs,
@@ -476,7 +477,7 @@ def _rope_cached_fwd(
     grid = (b, h, triton.cdiv(s, BLOCK_S))
 
     pos_stride = positions.stride() if positions is not None else (1, 1)
-    _rope_kernel_sbhd_cached_fwd[grid](
+    _intj_launch(_rope_kernel_sbhd_cached_fwd, grid,
         x,
         cos,
         sin,
@@ -761,7 +762,7 @@ def _rope_cached_bwd(
     grid = (b, h, triton.cdiv(s, BLOCK_S))
 
     pos_stride = positions.stride() if positions is not None else (1, 1)
-    _rope_kernel_sbhd_cached_bwd[grid](
+    _intj_launch(_rope_kernel_sbhd_cached_bwd, grid,
         x,
         cos,
         sin,
@@ -949,7 +950,7 @@ def _rope_cached_thd_2c_fwd(
         waves_per_eu = 0
         num_stages = 2 if SPLIT_H_SIZE > 1 else 1
 
-        _rope_kernel_thd_cached_2c_fwd[grid](
+        _intj_launch(_rope_kernel_thd_cached_2c_fwd, grid,
             x,
             y,
             cos,
@@ -991,7 +992,7 @@ def _rope_cached_thd_2c_fwd(
             waves_per_eu = 0
             num_stages = 2 if QH_per_G > 1 else 1
 
-            _rope_kernel_cached_thd_2c_gqa_fwd[grid](
+            _intj_launch(_rope_kernel_cached_thd_2c_gqa_fwd, grid,
                 x,
                 y,
                 cos,
@@ -1028,7 +1029,7 @@ def _rope_cached_thd_2c_fwd(
             grid = (SPLIT_T, h, 1)
             num_warps = 4
             waves_per_eu = 0
-            _rope_kernel_cached_thd_2c_gqa_onehead_fwd[grid](
+            _intj_launch(_rope_kernel_cached_thd_2c_gqa_onehead_fwd, grid,
                 x,
                 y,
                 cos,
@@ -1265,7 +1266,7 @@ def _rope_cached_thd_positions_offsets_2c_bwd(
         waves_per_eu = 0
         num_stages = 2 if SPLIT_H_SIZE > 1 else 1
 
-        _rope_kernel_thd_cached_2c_bwd[grid](
+        _intj_launch(_rope_kernel_thd_cached_2c_bwd, grid,
             x,
             y,
             cos,
@@ -1307,7 +1308,7 @@ def _rope_cached_thd_positions_offsets_2c_bwd(
             waves_per_eu = 0
             num_stages = 2 if QH_per_G > 1 else 1
 
-            _rope_kernel_cached_thd_2c_gqa_bwd[grid](
+            _intj_launch(_rope_kernel_cached_thd_2c_gqa_bwd, grid,
                 x,
                 y,
                 cos,
@@ -1344,7 +1345,7 @@ def _rope_cached_thd_positions_offsets_2c_bwd(
             grid = (SPLIT_T, h, 1)
             num_warps = 4
             waves_per_eu = 0
-            _rope_kernel_cached_thd_2c_gqa_onehead_bwd[grid](
+            _intj_launch(_rope_kernel_cached_thd_2c_gqa_onehead_bwd, grid,
                 x,
                 y,
                 cos,
@@ -1463,7 +1464,7 @@ def _rope_fwd_2d(
     # out = torch.empty((b,wh,h,d), dtype=x.dtype, device=x.device, requires_grad=False)
 
     grid = (b, h, 1)
-    _rope_fwd_2d_kernel_neox[grid](
+    _intj_launch(_rope_fwd_2d_kernel_neox, grid,
         x,
         cos_h,
         sin_h,
@@ -1580,7 +1581,7 @@ def rope_fwd_3d(
     num_warps = 4
     waves_per_eu = 1
 
-    _rope_fwd_3d[grid](
+    _intj_launch(_rope_fwd_3d, grid,
         x,
         freqs_real,
         freqs_imag,

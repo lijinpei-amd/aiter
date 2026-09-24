@@ -3,6 +3,7 @@
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
@@ -115,7 +116,7 @@ def gemm_a8w8(
             triton.cdiv(M, config["BLOCK_SIZE_M"])
             * triton.cdiv(N, config["BLOCK_SIZE_N"]),
         )
-        _gluon_gemm_a8w8_kernel[grid](
+        _intj_launch(_gluon_gemm_a8w8_kernel, grid,
             x,
             w,
             x_scale,
@@ -148,14 +149,14 @@ def gemm_a8w8(
     else:
         y_pp = None
 
-    grid = lambda META: (
+    grid = (
         (
-            META["NUM_KSPLIT"]
-            * triton.cdiv(M, META["BLOCK_SIZE_M"])
-            * triton.cdiv(N, META["BLOCK_SIZE_N"])
+            config["NUM_KSPLIT"]
+            * triton.cdiv(M, config["BLOCK_SIZE_M"])
+            * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
-    _gemm_a8w8_kernel[grid](
+    _intj_launch(_gemm_a8w8_kernel, grid,
         x,
         w,
         x_scale,
@@ -188,7 +189,7 @@ def gemm_a8w8(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _gemm_splitk_reduce_kernel[grid_reduce](
+        _intj_launch(_gemm_splitk_reduce_kernel, grid_reduce,
             y_pp,
             y,
             bias,
@@ -278,7 +279,7 @@ def gemm_a8w8_preshuffle(
     grid = (
         triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),
     )
-    _gluon_gemm_a8w8_preshuffled_kernel[grid](
+    _intj_launch(_gluon_gemm_a8w8_preshuffled_kernel, grid,
         x,
         w,
         x_scale,

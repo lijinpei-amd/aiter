@@ -7,6 +7,7 @@ import os
 import numpy as np
 import pandas as pd
 import torch
+from intj.compat import launch as _intj_launch
 from torch import Tensor
 
 from aiter import logger
@@ -904,7 +905,7 @@ def _launch_quant_mxfp6_gemm_triton(
         BM = _BATCHED_PACK_BLOCK_M
         NSTEP = NB // _BATCHED_PACK_K_BLOCKS
         grid = ((rows + BM - 1) // BM * NSTEP,)
-        _quant_pack_4block_kernel[grid](
+        _intj_launch(_quant_pack_4block_kernel, grid,
             x,
             packed,
             packed_scale,
@@ -919,7 +920,7 @@ def _launch_quant_mxfp6_gemm_triton(
     else:
         BM = 128
         grid = ((rows + BM - 1) // BM * NB,)
-        _quant_pack_kernel[grid](
+        _intj_launch(_quant_pack_kernel, grid,
             x,
             packed,
             packed_scale,

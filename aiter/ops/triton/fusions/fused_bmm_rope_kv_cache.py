@@ -4,6 +4,7 @@
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.fusions.fused_bmm_rope_kv_cache import (
     _fused_fp4_bmm_reduce_kernel,
@@ -256,7 +257,7 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
         stride_cm = q_out.stride(0)
         stride_cn = q_out.stride(2)
 
-    _fused_fp4_bmm_rope_cat_and_cache_mla_kernel[grid](
+    _intj_launch(_fused_fp4_bmm_rope_cat_and_cache_mla_kernel, grid,
         q_nope,
         w_k,
         w_k_scale,
@@ -362,7 +363,7 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
 
-        _fused_fp4_bmm_reduce_kernel[grid_reduce](
+        _intj_launch(_fused_fp4_bmm_reduce_kernel, grid_reduce,
             y_pp,
             q_out,
             M,
@@ -578,7 +579,7 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
         else torch.iinfo(w_k_t.dtype).max
     )
 
-    _fused_fp8_bmm_rope_cat_and_cache_mla_kernel[grid](
+    _intj_launch(_fused_fp8_bmm_rope_cat_and_cache_mla_kernel, grid,
         q_nope,
         w_k_t,
         w_k_scale,

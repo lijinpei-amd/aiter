@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_conv_recurrent_norm_unified import (
     _fused_kda_decode_unified_kernel,
@@ -127,7 +128,7 @@ def fused_kda_decode_unified(
     dummy = torch.empty(1, device=device)
 
     grid = (batch, H)
-    _fused_kda_decode_unified_kernel[grid](
+    _intj_launch(_fused_kda_decode_unified_kernel, grid,
         mixed_qkv,
         conv_weight,
         conv_state,

@@ -13,6 +13,7 @@ deconvert roundtrip stays within MXFP8 (block-scaled e8m0) precision.
 
 import pytest
 import torch
+from triton.runtime.jit import JITFunction
 
 from aiter.ops.triton.quant.quant_mxfp8 import convert_from_mxfp8, convert_to_mxfp8
 from aiter.ops.triton.utils._triton import arch_info
@@ -25,6 +26,17 @@ _gfx950_only = pytest.mark.skipif(
 
 # e4m3 keeps 3 mantissa bits, e5m2 only 2 — allow a looser bound for e5m2.
 _TOL = {torch.float8_e4m3fn: 0.16, torch.float8_e5m2: 0.35}
+
+
+def test_convert_mxfp8_uses_intj_without_fallback(monkeypatch):
+    def reject_triton_launch(self, grid):
+        raise AssertionError("Triton bracket launch was used")
+
+    monkeypatch.setattr(JITFunction, "__getitem__", reject_triton_launch)
+    x = torch.ones((64, 64), dtype=torch.float32, device="cuda")
+    y, scales = convert_to_mxfp8(x, torch.float8_e4m3fn, use_asm=False)
+    result = convert_from_mxfp8(y, scales, torch.float32, use_asm=False)
+    torch.testing.assert_close(result, x)
 
 
 @pytest.mark.parametrize("M, N", [(64, 64), (128, 256), (256, 128)])

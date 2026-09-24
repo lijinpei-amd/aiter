@@ -9,6 +9,7 @@
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.attention.pa_prefill import (
     _fwd_kernel,
@@ -108,7 +109,7 @@ def context_attention_fwd(
         sliding_window = 0
 
     if alibi_slopes is not None:
-        _fwd_kernel_alibi[grid](
+        _intj_launch(_fwd_kernel_alibi, grid,
             q,
             k,
             v,
@@ -160,7 +161,7 @@ def context_attention_fwd(
         )
         return
 
-    _fwd_kernel[grid](
+    _intj_launch(_fwd_kernel, grid,
         q,
         k,
         v,

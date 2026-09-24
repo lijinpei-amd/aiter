@@ -1,5 +1,6 @@
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.moe.moe_routing.topk import (
     _grouped_topk,
@@ -121,7 +122,7 @@ def grouped_topk(
 
     pids = max(triton.cdiv(n_rows, BLOCK_M), s_blocks + sp_blocks)
 
-    _grouped_topk[(pids,)](
+    _intj_launch(_grouped_topk, (pids,),
         x,
         x.stride(0),
         expert_group,
@@ -254,7 +255,7 @@ def topk(
     sp_size = torch.numel(scratchpad_partials)
     sp_blocks = triton.cdiv(sp_size, BLOCK_SP)
     pids = max(triton.cdiv(n_rows, BLOCK_M), s_blocks + sp_blocks)
-    _topk[(pids,)](
+    _intj_launch(_topk, (pids,),
         x,
         x.stride(0),  # inputs
         y_vals,  # output [topk]
@@ -364,7 +365,7 @@ def hash_routing(
         input_ids.to(torch.int32) if input_ids.dtype != torch.int32 else input_ids
     )
 
-    _hash_routing[(pids,)](
+    _intj_launch(_hash_routing, (pids,),
         input_ids_i32,
         tid2eid,
         tid2eid.stride(0),

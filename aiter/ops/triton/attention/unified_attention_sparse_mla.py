@@ -1,3 +1,5 @@
+from intj.compat import launch as _intj_launch
+
 from aiter.ops.triton._triton_kernels.attention.unified_attention_sparse_mla import (
     _kernel_unified_attention_sparse_mla_2d,
 )
@@ -57,7 +59,7 @@ def unified_attention_sparse_mla(
     TILE_SIZE = block_size
     num_stages_2d = 1
     num_warps = 4
-    _kernel_unified_attention_sparse_mla_2d[(total_num_q_blocks,)](
+    _intj_launch(_kernel_unified_attention_sparse_mla_2d, (total_num_q_blocks,),
         output_ptr=out,
         query_ptr=q,
         key_cache_ptr=k,

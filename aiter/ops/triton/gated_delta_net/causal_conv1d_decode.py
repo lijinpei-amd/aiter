@@ -11,6 +11,7 @@ q/k/v. The ``@triton.jit`` / Gluon kernels live in
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.causal_conv1d_update_split_qkv import (
     PAD_SLOT_ID,
@@ -103,7 +104,7 @@ def causal_conv1d_update_split_qkv(
     else:
         kernel_fn = _causal_conv1d_update_split_qkv_kernel
 
-    kernel_fn[grid](
+    _intj_launch(kernel_fn, grid,
         x_ptr=x,
         w_ptr=weight,
         bias_ptr=bias,

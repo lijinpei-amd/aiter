@@ -2,6 +2,7 @@
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.gather_kv_b_proj import (
     _next_pow2,
@@ -126,7 +127,7 @@ def gather_kv_b_proj(
             max_kv_chunks,
             max(1, (get_num_sms() * 6 + tp_k_head_num_k - 1) // tp_k_head_num_k),
         )
-        _triton_gather_kv_b_proj_flat[(tp_k_head_num_k * chunk_workers,)](
+        _intj_launch(_triton_gather_kv_b_proj_flat, (tp_k_head_num_k * chunk_workers,),
             total_kv_k,
             k_buffer,
             k_scale,
@@ -154,7 +155,7 @@ def gather_kv_b_proj(
     if is_fp4_weight:
         grid = (batch_size * tp_k_head_num_k * max_kv_chunks,)
         fp4_scale_k_granularity = 32 if weight_preshuffle else 128
-        _triton_gather_kv_b_proj[grid](
+        _intj_launch(_triton_gather_kv_b_proj, grid,
             batch_size,
             k_buffer,
             k_scale,
@@ -184,7 +185,7 @@ def gather_kv_b_proj(
         return
 
     grid = (batch_size * tp_k_head_num_k,)
-    _triton_gather_kv_b_proj[grid](
+    _intj_launch(_triton_gather_kv_b_proj, grid,
         batch_size,
         k_buffer,
         k_scale,

@@ -3,6 +3,7 @@
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_afp4wfp4 import (
     _batched_gemm_afp4_wfp4_kernel,
@@ -83,15 +84,15 @@ def batched_gemm_afp4wfp4(
     else:
         y_pp = None
 
-    grid = lambda META: (
+    grid = (
         Batch,
         (
-            META["NUM_KSPLIT"]
-            * triton.cdiv(M, META["BLOCK_SIZE_M"])
-            * triton.cdiv(N, META["BLOCK_SIZE_N"])
+            config["NUM_KSPLIT"]
+            * triton.cdiv(M, config["BLOCK_SIZE_M"])
+            * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
-    _batched_gemm_afp4_wfp4_kernel[grid](
+    _intj_launch(_batched_gemm_afp4_wfp4_kernel, grid,
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -132,7 +133,7 @@ def batched_gemm_afp4wfp4(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _batched_gemm_afp4_wfp4_reduce_kernel[grid_reduce](
+        _intj_launch(_batched_gemm_afp4_wfp4_reduce_kernel, grid_reduce,
             y_pp,
             y,
             M,

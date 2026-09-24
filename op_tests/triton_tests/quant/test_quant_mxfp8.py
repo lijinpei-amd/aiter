@@ -3,6 +3,7 @@
 
 import pytest
 import torch
+from triton.runtime.jit import JITFunction
 
 from aiter.ops.triton.quant.fused_mxfp8_quant import (
     fused_dual_rmsnorm_mxfp8_quant,
@@ -11,6 +12,7 @@ from aiter.ops.triton.quant.fused_mxfp8_quant import (
 )
 from aiter.ops.triton.quant.quant import (
     dynamic_mxfp8_quant,
+    dynamic_mxfp8_quant_n32k4_mbn,
     fp8_legacy_to_mxfp8,
 )
 from aiter.ops.triton.utils._triton import arch_info
@@ -19,6 +21,25 @@ QUANT_BLOCK_SIZE = 32
 LEGACY_BLOCK_SIZE = 128
 # 0xFF800000 in two's complement int32. Mask keeps sign + 8-bit exponent + top mantissa bit.
 _E8M0_MASK_INT32 = -8388608
+
+
+@pytest.fixture(autouse=True)
+def _reject_triton_bracket_launch(monkeypatch):
+    def reject(self, grid):
+        raise AssertionError("Triton bracket launch was used")
+
+    monkeypatch.setattr(JITFunction, "__getitem__", reject)
+
+
+def test_n32k4_mbn_quant_uses_intj_and_preserves_scale_layout():
+    x = torch.ones((2, 2, 32), dtype=torch.bfloat16, device="cuda")
+    y, scales = dynamic_mxfp8_quant_n32k4_mbn(x)
+
+    torch.testing.assert_close(y.float(), torch.full_like(x.float(), 256.0))
+    expected_scales = torch.zeros((1, 2, 32), dtype=torch.uint8, device="cuda")
+    expected_scales[:, :, 0] = 119
+    expected_scales[:, :, 4] = 119
+    torch.testing.assert_close(scales, expected_scales)
 
 
 def torch_mxfp8_quant_from_fp32(x_fp32: torch.Tensor):
@@ -437,3 +458,21 @@ def test_fused_flatten_mxfp8_quant_matches_per_1x32_after_flatten():
         atol=1,
         rtol=0,
     )
+
+
+@pytest.mark.parametrize("which", ["rms", "dual", "flatten"])
+def test_fused_mxfp8_quant_uses_intj_without_fallback(monkeypatch, which):
+    def reject_triton_launch(self, grid):
+        raise AssertionError("Triton bracket launch was used")
+
+    monkeypatch.setattr(JITFunction, "__getitem__", reject_triton_launch)
+    x = torch.ones((2, 32), dtype=torch.bfloat16, device="cuda")
+    weight = torch.ones((32,), dtype=torch.bfloat16, device="cuda")
+    calls = {
+        "rms": lambda: fused_rms_mxfp8_quant(x, weight, 1e-5),
+        "dual": lambda: fused_dual_rmsnorm_mxfp8_quant(
+            x, x, weight, weight, 1e-5
+        ),
+        "flatten": lambda: fused_flatten_mxfp8_quant(x.unsqueeze(1)),
+    }
+    calls[which]()

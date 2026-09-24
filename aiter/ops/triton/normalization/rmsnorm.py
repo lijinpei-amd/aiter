@@ -3,6 +3,7 @@
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.normalization.rmsnorm import (
     _fused_add_rmsnorm_kernel,
@@ -79,8 +80,8 @@ def _rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, epsilon: float):
     USE_BLOCKED = use_blocked(x)
     NUM_PRGMS = num_programs_fwd(x)
 
-    grid = lambda meta: (NUM_PRGMS,)
-    _rms_norm_kernel[grid](
+    grid = (NUM_PRGMS,)
+    _intj_launch(_rms_norm_kernel, grid,
         x,
         y,
         weight,
@@ -114,8 +115,8 @@ def _rmsnorm_forward_with_add(
     USE_BLOCKED = use_blocked(x)
     NUM_PRGMS = num_programs_fwd(x)
 
-    grid = lambda meta: (NUM_PRGMS,)
-    _fused_add_rmsnorm_kernel[grid](
+    grid = (NUM_PRGMS,)
+    _intj_launch(_fused_add_rmsnorm_kernel, grid,
         x,
         out,
         residual_in,
@@ -152,7 +153,7 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
         num_prgms = triton.cdiv(M, BLOCK_M)
         dg_tmp = torch.empty(num_prgms, N, device=x_.device, dtype=torch.float32)
         _cfg = get_normalization_config("rmsnorm_large_m_small_n", get_arch())
-        _rmsnorm_bwd_kernel_large_m_small_n[(num_prgms,)](
+        _intj_launch(_rmsnorm_bwd_kernel_large_m_small_n, (num_prgms,),
             dz_,
             x_,
             gamma_,
@@ -170,8 +171,8 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
             num_warps=_cfg["num_warps"],
             num_stages=_cfg["num_stages"],
         )
-        grid_reduce = lambda meta: [triton.cdiv(N, meta["BLOCK_SIZE_N"])]
-        _rmsnorm_bwd_dg_reduce_triton[grid_reduce](
+        grid_reduce = (triton.cdiv(N, 64),)
+        _intj_launch(_rmsnorm_bwd_dg_reduce_triton, grid_reduce,
             dg_tmp,
             dgamma,
             dg_tmp.stride(0),
@@ -199,8 +200,8 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
         else None
     )
 
-    grid_bwd = lambda meta: (NUM_PRGMS,)
-    _rmsnorm_bwd_triton[grid_bwd](
+    grid_bwd = (NUM_PRGMS,)
+    _intj_launch(_rmsnorm_bwd_triton, grid_bwd,
         dz_,
         x_,
         gamma_,
@@ -218,10 +219,10 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
     )
 
     if need_reduction:
-        grid_reduce = lambda meta: [triton.cdiv(N, meta["BLOCK_SIZE_N"])]
+        grid_reduce = (triton.cdiv(N, 64),)
         # Widening the workgroup helps on gfx950. Left at default otherwise
         dg_reduce_kwargs = {"num_warps": 8} if get_arch() == "gfx950" else {}
-        _rmsnorm_bwd_dg_reduce_triton[grid_reduce](
+        _intj_launch(_rmsnorm_bwd_dg_reduce_triton, grid_reduce,
             dg_tmp,
             dgamma,
             dg_tmp.stride(0),
@@ -429,8 +430,8 @@ def rmsnorm2d_fwd_with_smoothquant(
     if USE_BLOCKED:
         aux = torch.empty(n_rows, n_cols, dtype=torch.float32, device=input.device)
 
-    grid = lambda meta: (NUM_PRGMS,)
-    _quant_rms_norm_kernel[grid](
+    grid = (NUM_PRGMS,)
+    _intj_launch(_quant_rms_norm_kernel, grid,
         input,
         out,
         xscale,
@@ -502,8 +503,8 @@ def rmsnorm2d_fwd_with_dynamicquant(
     if USE_BLOCKED:
         aux = torch.empty(n_rows, n_cols, dtype=torch.float32, device=input.device)
 
-    grid = lambda meta: (NUM_PRGMS,)
-    _quant_rms_norm_kernel[grid](
+    grid = (NUM_PRGMS,)
+    _intj_launch(_quant_rms_norm_kernel, grid,
         input,
         out,
         xscale,
@@ -577,8 +578,8 @@ def rmsnorm2d_fwd_with_add_smoothquant(
     if USE_BLOCKED:
         aux = torch.empty(n_rows, n_cols, dtype=torch.float32, device=input.device)
 
-    grid = lambda meta: (NUM_PRGMS,)
-    _quant_fused_add_rmsnorm_kernel[grid](
+    grid = (NUM_PRGMS,)
+    _intj_launch(_quant_fused_add_rmsnorm_kernel, grid,
         input,
         out,
         residual_in,
@@ -645,8 +646,8 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
     if USE_BLOCKED:
         aux = torch.empty(n_rows, n_cols, dtype=torch.float32, device=input.device)
 
-    grid = lambda meta: (NUM_PRGMS,)
-    _quant_fused_add_rmsnorm_kernel[grid](
+    grid = (NUM_PRGMS,)
+    _intj_launch(_quant_fused_add_rmsnorm_kernel, grid,
         input,
         out,
         residual_in,
@@ -689,7 +690,7 @@ def _rmsnorm_forward_large_m_small_n(
 
     _cfg = get_normalization_config("rmsnorm_large_m_small_n", get_arch())
     grid = (triton.cdiv(M, BLOCK_M),)
-    _rmsnorm_kernel_large_m_small_n[grid](
+    _intj_launch(_rmsnorm_kernel_large_m_small_n, grid,
         x,
         y,
         weight,

@@ -11,6 +11,7 @@ from typing import Literal
 import torch
 import triton
 import triton.language as tl
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
     DEBUG,
@@ -320,7 +321,7 @@ def cast_to_fp8(
     stride_desc_batch, stride_desc_head = descale_factors.stride()
 
     grid = (batch, num_heads)
-    _cast_varlen_to_fp8_kernel_2d[grid](
+    _intj_launch(_cast_varlen_to_fp8_kernel_2d, grid,
         x,
         x_fp8,
         descale_factors,

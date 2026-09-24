@@ -3,6 +3,7 @@
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
@@ -172,15 +173,15 @@ def batched_gemm_a16wfp4_(
         stride_cm = y_pp.stride(2)
         stride_cn = y_pp.stride(3)
 
-    grid = lambda META: (
+    grid = (
         B,
         (
-            META["NUM_KSPLIT"]
-            * triton.cdiv(M, META["BLOCK_SIZE_M"])
-            * triton.cdiv(N, META["BLOCK_SIZE_N"])
+            config["NUM_KSPLIT"]
+            * triton.cdiv(M, config["BLOCK_SIZE_M"])
+            * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
-    _batched_gemm_a16wfp4_kernel[grid](
+    _intj_launch(_batched_gemm_a16wfp4_kernel, grid,
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -220,7 +221,7 @@ def batched_gemm_a16wfp4_(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _batched_gemm_a16wfp4_reduce_kernel[grid_reduce](
+        _intj_launch(_batched_gemm_a16wfp4_reduce_kernel, grid_reduce,
             y_pp,
             y,
             M,

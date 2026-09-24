@@ -18,6 +18,7 @@ import torch
 
 # @manual=//triton:triton
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.attention.hstu_attention import (
     _get_bwd_config,
@@ -101,12 +102,9 @@ def triton_hstu_attention_fwd(
             AUTOTUNE_Z,
         )
 
-    grid = lambda meta: (
-        triton.cdiv(N, meta["BLOCK_M"]),
-        Z * H,
-    )
+    grid = (triton.cdiv(N, config["BLOCK_M"]), Z * H)
 
-    _hstu_attn_fwd[grid](
+    _intj_launch(_hstu_attn_fwd, grid,
         Q=q,
         K=k,
         V=v,
@@ -211,9 +209,9 @@ def triton_hstu_attention_bwd(
             AUTOTUNE_Z,
         )
 
-    grid = lambda meta: (
+    grid = (
         Z * H,
-        (triton.cdiv(N, meta["BLOCK_N"]) if meta["SEQUENCE_PARALLEL"] else 1),
+        triton.cdiv(N, config["BLOCK_N"]) if config["SEQUENCE_PARALLEL"] else 1,
     )
     # The minimum size of BLOCK_M used in `_get_bw_configs`.
     # TODO (linjianma): avoid hardcoding the value.
@@ -228,7 +226,7 @@ def triton_hstu_attention_bwd(
     if config["SEQUENCE_PARALLEL"] == 1:
         lock.zero_()
 
-    _hstu_attn_bwd[grid](
+    _intj_launch(_hstu_attn_bwd, grid,
         Q=q,
         K=k,
         V=v,

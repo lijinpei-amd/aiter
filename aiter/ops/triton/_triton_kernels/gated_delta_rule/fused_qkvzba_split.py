@@ -3,6 +3,7 @@
 import torch
 import triton
 import triton.language as tl
+from intj.compat import launch as _intj_launch
 
 
 @triton.jit
@@ -123,7 +124,7 @@ def fused_qkvzba_split_reshape_cat_decode(
     )
     a = torch.empty_like(b)
     grid = (batch * seq_len, num_heads_qk)
-    _fused_qkvzba_split_reshape_cat_decode_kernel[grid](
+    _intj_launch(_fused_qkvzba_split_reshape_cat_decode_kernel, grid,
         mixed_qkv,
         z,
         b,
@@ -501,7 +502,7 @@ def fused_qkvzba_split_reshape_cat_prefill(
     # Select specialized kernel based on num_heads_qk
     if num_heads_qk == 1:
         grid = (seq_len,)
-        _fused_qkvzba_prefill_kernel_nqk1[grid](
+        _intj_launch(_fused_qkvzba_prefill_kernel_nqk1, grid,
             mixed_qkv,
             z,
             b,
@@ -516,7 +517,7 @@ def fused_qkvzba_split_reshape_cat_prefill(
         )
     elif num_heads_qk == 2:
         grid = (seq_len,)
-        _fused_qkvzba_prefill_kernel_nqk2[grid](
+        _intj_launch(_fused_qkvzba_prefill_kernel_nqk2, grid,
             mixed_qkv,
             z,
             b,
@@ -531,7 +532,7 @@ def fused_qkvzba_split_reshape_cat_prefill(
         )
     elif num_heads_qk == 4:
         grid = (seq_len,)
-        _fused_qkvzba_prefill_kernel_nqk4[grid](
+        _intj_launch(_fused_qkvzba_prefill_kernel_nqk4, grid,
             mixed_qkv,
             z,
             b,
@@ -546,7 +547,7 @@ def fused_qkvzba_split_reshape_cat_prefill(
         )
     elif num_heads_qk == 8:
         grid = (seq_len,)
-        _fused_qkvzba_prefill_kernel_nqk8[grid](
+        _intj_launch(_fused_qkvzba_prefill_kernel_nqk8, grid,
             mixed_qkv,
             z,
             b,
@@ -562,7 +563,7 @@ def fused_qkvzba_split_reshape_cat_prefill(
     else:
         # Fallback to generic 2D-grid kernel
         grid = (seq_len, num_heads_qk)
-        _fused_qkvzba_split_reshape_cat_prefill_kernel[grid](
+        _intj_launch(_fused_qkvzba_split_reshape_cat_prefill_kernel, grid,
             mixed_qkv,
             z,
             b,

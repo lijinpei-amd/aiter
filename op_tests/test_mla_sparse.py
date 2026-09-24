@@ -9,6 +9,7 @@ import pandas as pd
 import torch
 import triton
 import triton.language as tl
+from intj.compat import launch as _intj_launch
 
 import aiter
 from aiter import dtypes
@@ -300,7 +301,7 @@ def triton_convert_req_index_to_global_index(
     # Exact 2D grid: tokens x column tiles
     grid = (num_tokens, tiles_per_row)
 
-    _convert_req_index_to_global_index_kernel[grid](
+    _intj_launch(_convert_req_index_to_global_index_kernel, grid,
         kv_indptr_c,
         kv_indices_c,
         token_indices_c,

@@ -1,5 +1,6 @@
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.fusions.fused_mul_add import _fused_mul_add_kernel
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -72,7 +73,7 @@ def fused_mul_add(
 
     BLOCK_SIZE_N = max(min(triton.next_power_of_2(N), 32), 1024)
     grid = (triton.cdiv(N, BLOCK_SIZE_N),)
-    _fused_mul_add_kernel[grid](
+    _intj_launch(_fused_mul_add_kernel, grid,
         x,
         a,
         b,

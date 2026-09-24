@@ -5,6 +5,7 @@ import itertools
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a8w4 import (
     _moe_gemm_a8w4_decode as _moe_gemm_a8w4_decode_gluon,
@@ -571,7 +572,7 @@ def moe_gemm_a8w4(
     grid = grid_m * grid_n * config["split_k"]
     # launch kernel
     if use_gluon and config["persistent_iters"] > 1:
-        _moe_gemm_a8w4_decode_persistent_gluon[(grid,)](
+        _intj_launch(_moe_gemm_a8w4_decode_persistent_gluon, (grid,),
             y,
             y.stride(1),
             y.stride(2),
@@ -629,7 +630,7 @@ def moe_gemm_a8w4(
             HAS_MX_OUT=out_mx_quant,
         )
     elif use_gluon and block_m == 16:
-        _moe_gemm_a8w4_decode_gluon[(grid,)](
+        _intj_launch(_moe_gemm_a8w4_decode_gluon, (grid,),
             y_ptr,
             stride_y_m,
             stride_y_n,
@@ -768,7 +769,7 @@ def moe_gemm_a8w4(
             **layouts,
         )
     else:
-        _moe_gemm_a8w4_triton[(grid,)](
+        _intj_launch(_moe_gemm_a8w4_triton, (grid,),
             y,
             y.stride(0),
             y.stride(1),

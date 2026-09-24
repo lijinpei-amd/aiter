@@ -20,6 +20,7 @@ import torch
 import triton
 import triton.language as tl
 from einops import rearrange
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
@@ -78,7 +79,7 @@ def rmsnorm_gated_bf16(x, weight, gate, eps):
     else:
         stride_g_outer, stride_g_head = gate.stride(0), 0
     BLOCK = triton.next_power_of_2(h)
-    _rmsnorm_gated_kernel[(m,)](
+    _intj_launch(_rmsnorm_gated_kernel, (m,),
         x2,
         weight,
         gate,

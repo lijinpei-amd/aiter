@@ -68,6 +68,7 @@ against an upstream checkout formatted the same way shows the shims and nothing
 else.
 """
 
+from intj.compat import launch as _intj_launch
 from typing import Optional
 
 import torch
@@ -140,7 +141,7 @@ def fused_gdn_gating_vllm(
     grid = (batch, seq_len, triton.cdiv(num_heads, 8))
     g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
     beta_output = torch.empty(1, batch, num_heads, dtype=b.dtype, device=b.device)
-    fused_gdn_gating_kernel_vllm[grid](
+    _intj_launch(fused_gdn_gating_kernel_vllm, grid,
         g,
         beta_output,
         A_log,
@@ -363,7 +364,7 @@ def fused_recurrent_gated_delta_rule_fwd_vllm(
         stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
 
     grid = (NK, NV, N * HV)
-    fused_recurrent_gated_delta_rule_fwd_kernel_vllm[grid](
+    _intj_launch(fused_recurrent_gated_delta_rule_fwd_kernel_vllm, grid,
         q=q,
         k=k,
         v=v,
@@ -995,7 +996,7 @@ def fused_sigmoid_gating_delta_rule_update_sglang(
         max_cache_len = 0
         stride_rawv_slot = stride_rawk_slot = stride_g_slot = stride_beta_slot = 0
 
-    fused_sigmoid_gating_delta_rule_update_kernel_sglang[grid](
+    _intj_launch(fused_sigmoid_gating_delta_rule_update_kernel_sglang, grid,
         A_log=A_log,
         a=a,
         dt_bias=dt_bias,

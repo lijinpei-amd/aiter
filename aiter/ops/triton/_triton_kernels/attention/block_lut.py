@@ -9,6 +9,7 @@ attention mask without using nonzero or argsort.
 import torch
 import triton
 import triton.language as tl
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -97,7 +98,7 @@ def block_attn_mask_to_lut_kernel(
     num_programs = batch * num_heads * num_q_blocks
 
     grid = (num_programs,)
-    _block_attn_mask_to_lut_kernel[grid](
+    _intj_launch(_block_attn_mask_to_lut_kernel, grid,
         block_attn_mask,
         lut_start,
         lut_count,

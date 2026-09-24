@@ -5,6 +5,7 @@ import itertools
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w8 import (
     _moe_gemm_a8w8,
@@ -228,7 +229,7 @@ def moe_gemm_a8w8(
     grid_n = triton.cdiv(N, config["block_n"])
     grid = grid_m * grid_n * config["split_k"]
     # launch kernel
-    _moe_gemm_a8w8[(grid,)](
+    _intj_launch(_moe_gemm_a8w8, (grid,),
         y,
         y.stride(0),
         y.stride(1),

@@ -4,6 +4,7 @@
 
 import pytest
 import torch
+from triton.runtime.jit import JITFunction
 
 from aiter.ops.triton.quant.fast_transpose import fast_transpose_2d
 
@@ -46,3 +47,12 @@ def test_fast_transpose_2d_correctness(M, N, dtype):
         ), "FP8 bit pattern mismatch"
     else:
         torch.testing.assert_close(out, ref)
+
+
+def test_fast_transpose_uses_intj_without_fallback(monkeypatch):
+    def reject_triton_launch(self, grid):
+        raise AssertionError("Triton bracket launch was used")
+
+    monkeypatch.setattr(JITFunction, "__getitem__", reject_triton_launch)
+    x = torch.arange(32, dtype=torch.float32, device="cuda").reshape(4, 8)
+    torch.testing.assert_close(fast_transpose_2d(x), x.T.contiguous())

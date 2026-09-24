@@ -7,6 +7,7 @@ import os
 import torch
 import triton
 import triton.language as tl
+from intj.compat import launch as _intj_launch
 
 from aiter import dtypes
 from aiter.ops.enum import Enum, MlaVersion, QuantType
@@ -1699,7 +1700,7 @@ def decode_update_mla_metadata_v1(
         num_heads_per_head_k = 16
         batch_size *= qk_batch_ratio
     grid = (max_work,)
-    decode_update_mla_metadata_v1_kernel[grid](
+    _intj_launch(decode_update_mla_metadata_v1_kernel, grid,
         seqlens_qo_indptr,
         seqlens_kv_indptr,
         kv_last_page_lens,

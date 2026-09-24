@@ -3,6 +3,7 @@
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
@@ -108,13 +109,13 @@ def fused_gemm_a16w16_quant_x(
     else:
         y_pp = None
 
-    grid = lambda META: (
-        META["NUM_KSPLIT"]
-        * triton.cdiv(M, META["BLOCK_SIZE_M"])
-        * triton.cdiv(N, META["BLOCK_SIZE_N"])
-        + triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(K, META["BLOCK_SIZE_K"]),
+    grid = (
+        config["NUM_KSPLIT"]
+        * triton.cdiv(M, config["BLOCK_SIZE_M"])
+        * triton.cdiv(N, config["BLOCK_SIZE_N"])
+        + triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(K, config["BLOCK_SIZE_K"]),
     )
-    _fused_gemm_a16w16_quant_x_kernel[grid](
+    _intj_launch(_fused_gemm_a16w16_quant_x_kernel, grid,
         x,
         w,
         bias,
@@ -155,7 +156,7 @@ def fused_gemm_a16w16_quant_x(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _gemm_splitk_reduce_kernel[grid_reduce](
+        _intj_launch(_gemm_splitk_reduce_kernel, grid_reduce,
             y_pp,
             y,
             bias,

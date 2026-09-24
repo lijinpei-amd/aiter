@@ -2,6 +2,7 @@ from typing import Literal
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 import aiter
 from aiter.ops.triton._triton_kernels.activation import (
@@ -102,7 +103,7 @@ def act_mul_and_mxfp4_quant(
         triton.cdiv(M, BLOCK_SIZE_M),
         triton.cdiv(N_half, BLOCK_SIZE_N * NUM_ITER),
     )
-    _act_mul_and_dynamic_mxfp4_quant_kernel[grid](
+    _intj_launch(_act_mul_and_dynamic_mxfp4_quant_kernel, grid,
         x,
         x_fp4,
         blockscale_e8m0,
@@ -182,7 +183,7 @@ def act_mul_and_fp8_group_quant(
         M,
         triton.cdiv(N_half, BLOCK_SIZE_N),
     )
-    _act_mul_and_dynamic_fp8_group_quant_kernel[grid](
+    _intj_launch(_act_mul_and_dynamic_fp8_group_quant_kernel, grid,
         x,
         x_fp8,
         out_bs,
@@ -296,7 +297,7 @@ def fused_silu_mul(
     num_warps = _pick_num_warps(n_rows, block_m, block_n)
 
     grid = (grid_m, grid_n)
-    fused_silu_mul_kernel[grid](
+    _intj_launch(fused_silu_mul_kernel, grid,
         x,
         out,
         n_rows,

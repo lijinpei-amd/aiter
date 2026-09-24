@@ -3,6 +3,7 @@
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.conv.conv_1x1 import (
     _conv2d_1x1_kernel,
@@ -111,7 +112,7 @@ def _launch_nchw_to_cblocked(x, x_blocked, N, C, H, W, C_pad, block_c):
         triton.cdiv(C_pad, meta["BLOCK_C"]),
         N,
     )
-    _nchw_to_cblocked_kernel[grid](
+    _intj_launch(_nchw_to_cblocked_kernel, grid,
         x,
         x_blocked,
         C,
@@ -170,7 +171,7 @@ def _launch_1x1(
         variants=(layout,),
     )
 
-    _conv2d_1x1_kernel[_make_mn_grid(M_total, K_out)](
+    _intj_launch(_conv2d_1x1_kernel, _make_mn_grid(M_total, K_out),
         x,
         w,
         bias_fp32,
@@ -239,7 +240,7 @@ def _launch_3x3_nhwc(
         M=M_total,
     )
 
-    _conv2d_3x3_nhwc_kernel[_make_mn_grid(M_total, K_out)](
+    _intj_launch(_conv2d_3x3_nhwc_kernel, _make_mn_grid(M_total, K_out),
         x,
         w_3x3,
         bias_fp32,
@@ -311,7 +312,7 @@ def _launch_3x3_cblocked(
         M=M_total,
     )
 
-    _conv2d_3x3_cblocked_kernel[_make_mn_grid(M_total, K_out)](
+    _intj_launch(_conv2d_3x3_cblocked_kernel, _make_mn_grid(M_total, K_out),
         x_blocked,
         w_3x3,
         bias_fp32,
@@ -379,7 +380,7 @@ def _launch_3x3_nchw(
     config = _get_config_nchw(shape_key=shape_key, M=M_total)
     row_aligned = "BLOCK_M" in config and Q % config["BLOCK_M"] == 0
 
-    _conv2d_3x3_nchw_kernel[_make_mn_grid(M_total, K_out)](
+    _intj_launch(_conv2d_3x3_nchw_kernel, _make_mn_grid(M_total, K_out),
         x,
         w_3x3,
         bias,
@@ -458,7 +459,7 @@ def _launch_general(
         variants=(layout,),
     )
 
-    _conv2d_general_kernel[_make_mn_grid(M_total, K_out)](
+    _intj_launch(_conv2d_general_kernel, _make_mn_grid(M_total, K_out),
         x,
         w_k,
         bias_fp32,
@@ -534,7 +535,7 @@ def _launch_winograd_f4x3(
     output_config = _get_config_wino_output(shape_key=shape_key, M=T)
 
     # 1. Input transform
-    _winograd_f4x3_input_transform_kernel[_make_wino_input_grid(T, C_pad)](
+    _intj_launch(_winograd_f4x3_input_transform_kernel, _make_wino_input_grid(T, C_pad),
         x,
         V,
         N,
@@ -552,7 +553,7 @@ def _launch_winograd_f4x3(
     )
 
     # 2. Batched GEMM
-    _winograd_f4x3_batched_gemm_kernel[_make_wino_gemm_grid(T, K_out)](
+    _intj_launch(_winograd_f4x3_batched_gemm_kernel, _make_wino_gemm_grid(T, K_out),
         V,
         U,
         M,
@@ -563,7 +564,7 @@ def _launch_winograd_f4x3(
     )
 
     # 3. Output transform
-    _winograd_f4x3_output_transform_kernel[_make_wino_output_grid(T, K_out)](
+    _intj_launch(_winograd_f4x3_output_transform_kernel, _make_wino_output_grid(T, K_out),
         M,
         bias_fp32,
         y,
@@ -630,7 +631,7 @@ def _launch_winograd_f4x3_cblocked(
     output_config = _get_config_wino_output(shape_key=shape_key, M=T)
 
     # 1. Cblocked input transform
-    _winograd_f4x3_cblocked_input_transform_kernel[_make_wino_input_grid(T, C_pad)](
+    _intj_launch(_winograd_f4x3_cblocked_input_transform_kernel, _make_wino_input_grid(T, C_pad),
         x_blocked,
         V,
         N,
@@ -647,7 +648,7 @@ def _launch_winograd_f4x3_cblocked(
         **input_config,
     )
 
-    _winograd_f4x3_batched_gemm_kernel[_make_wino_gemm_grid(T, K_out)](
+    _intj_launch(_winograd_f4x3_batched_gemm_kernel, _make_wino_gemm_grid(T, K_out),
         V,
         U,
         M,
@@ -657,7 +658,7 @@ def _launch_winograd_f4x3_cblocked(
         **gemm_config,
     )
 
-    _winograd_f4x3_output_transform_kernel[_make_wino_output_grid(T, K_out)](
+    _intj_launch(_winograd_f4x3_output_transform_kernel, _make_wino_output_grid(T, K_out),
         M,
         bias_fp32,
         y,

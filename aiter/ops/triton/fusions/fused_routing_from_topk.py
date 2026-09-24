@@ -7,6 +7,7 @@
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.fusions.fused_routing_from_topk import (
     _fused_routing_from_topk_hist_kernel,
@@ -126,7 +127,7 @@ def fused_routing_from_topk(
     # Kernel 1 (Phase A): histogram via tl.histogram (warp-local
     # shared-memory reduction). num_warps=1 keeps the reduction within a
     # single wave, matching the CTA-local design of the original kernel.
-    _fused_routing_from_topk_hist_kernel[(1,)](
+    _intj_launch(_fused_routing_from_topk_hist_kernel, (1,),
         topk_ids_flat,
         expert_map_flat,
         expert_map_numel,
@@ -141,7 +142,7 @@ def fused_routing_from_topk(
 
     # Kernel 2 (Phase B): exclusive prefix-sum hist → offset. The kernel
     # boundary above publishes hist without an explicit barrier.
-    _fused_routing_from_topk_offset_kernel[(1,)](
+    _intj_launch(_fused_routing_from_topk_offset_kernel, (1,),
         hist,
         offset_scratch,
         E=n_expts_tot,
@@ -151,7 +152,7 @@ def fused_routing_from_topk(
 
     # Kernel 3 (Phase C): placement. The kernel boundary publishes the
     # prefix-sum offsets without an explicit barrier or atomic_xchg.
-    _fused_routing_from_topk_place_kernel[(1,)](
+    _intj_launch(_fused_routing_from_topk_place_kernel, (1,),
         topk_ids_flat,
         topk_weights_flat,
         expert_map_flat,

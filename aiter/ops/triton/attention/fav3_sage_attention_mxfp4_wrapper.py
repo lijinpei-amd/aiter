@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 import aiter
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import map_dims
@@ -319,10 +320,8 @@ def fav3_sage_mxfp4_func(
         lut_start = torch.zeros(1, dtype=torch.int32, device=q.device)
         lut_count = torch.zeros(1, dtype=torch.int32, device=q.device)
 
-    def grid(META):
-        return (triton.cdiv(seqlen_q, META["BLOCK_M"]), nheads_q, batch)
-
-    sage_fwd_mxfp4[grid](
+    grid = (triton.cdiv(seqlen_q, config["BLOCK_M"]), nheads_q, batch)
+    _intj_launch(sage_fwd_mxfp4, grid,
         Q=q,
         K=k,
         V=v,

@@ -3,6 +3,7 @@
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
@@ -236,7 +237,7 @@ def gemm_a16w16_(
 
             out_ptr = y if NUM_KSPLIT == 1 else y_pp
 
-            _GLUON_PERSISTENT_KERNEL_MAP[kernel_type][(NUM_WGS,)](
+            _intj_launch(_GLUON_PERSISTENT_KERNEL_MAP[kernel_type], (NUM_WGS,),
                 x,
                 w,
                 bias,
@@ -284,7 +285,7 @@ def gemm_a16w16_(
                     triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
                     triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
                 )
-                _gemm_splitk_reduce_kernel[grid_reduce](
+                _intj_launch(_gemm_splitk_reduce_kernel, grid_reduce,
                     y_pp,
                     y,
                     bias,
@@ -324,7 +325,7 @@ def gemm_a16w16_(
         num_tiles = triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(
             N, config["BLOCK_SIZE_N"]
         )
-        _triton_persistent_kernel[(min(NUM_WGS, num_tiles),)](
+        _intj_launch(_triton_persistent_kernel, (min(NUM_WGS, num_tiles),),
             x,
             w,
             bias,
@@ -445,7 +446,7 @@ def gemm_a16w16_(
             w.shape,
         )
 
-        _KERNEL_MAP[kernel_type][grid](
+        _intj_launch(_KERNEL_MAP[kernel_type], grid,
             x,
             w,
             y,
@@ -498,14 +499,14 @@ def gemm_a16w16_(
     else:
         y_pp = None
 
-    grid = lambda META: (
+    grid = (
         (
-            META["NUM_KSPLIT"]
-            * triton.cdiv(M, META["BLOCK_SIZE_M"])
-            * triton.cdiv(N, META["BLOCK_SIZE_N"])
+            config["NUM_KSPLIT"]
+            * triton.cdiv(M, config["BLOCK_SIZE_M"])
+            * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
-    _gemm_a16_w16_kernel[grid](
+    _intj_launch(_gemm_a16_w16_kernel, grid,
         x,
         w,
         bias,
@@ -539,7 +540,7 @@ def gemm_a16w16_(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _gemm_splitk_reduce_kernel[grid_reduce](
+        _intj_launch(_gemm_splitk_reduce_kernel, grid_reduce,
             y_pp,
             y,
             bias,

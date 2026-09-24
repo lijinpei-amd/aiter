@@ -8,6 +8,7 @@ a temporary, one multiply pass reading it back) with a single pass
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.fusions.fused_sigmoid_mul import (
     _fused_sigmoid_mul_kernel,
@@ -77,7 +78,7 @@ def fused_sigmoid_mul(
     config = _get_config()
     BLOCK_SIZE_N = config.pop("BLOCK_SIZE_N")
 
-    _fused_sigmoid_mul_kernel[(triton.cdiv(N, BLOCK_SIZE_N),)](
+    _intj_launch(_fused_sigmoid_mul_kernel, (triton.cdiv(N, BLOCK_SIZE_N),),
         x,
         gate,
         out,

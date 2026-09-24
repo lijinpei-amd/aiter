@@ -7,6 +7,7 @@
 import torch
 import triton
 import triton.language as tl
+from intj.compat import launch as _intj_launch
 
 # Default forward-kernel tile config (MBLOCK=32, num_warps=4): a robust
 # choice across the supported head dimensions D in {64, 128, 256, 512}.
@@ -110,7 +111,7 @@ def l2norm_fwd(
 
     if D <= 512:
         BT = _L2NORM_FWD_BT
-        l2norm_fwd_kernel[(triton.cdiv(T, BT),)](
+        _intj_launch(l2norm_fwd_kernel, (triton.cdiv(T, BT),),
             x,
             y,
             rstd,
@@ -123,7 +124,7 @@ def l2norm_fwd(
             num_warps=_L2NORM_FWD_NUM_WARPS,
         )
     else:
-        l2norm_fwd_kernel1[(T,)](
+        _intj_launch(l2norm_fwd_kernel1, (T,),
             x,
             y,
             rstd,

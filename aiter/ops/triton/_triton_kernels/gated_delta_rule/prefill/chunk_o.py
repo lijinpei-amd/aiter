@@ -11,6 +11,7 @@ This module provides functions for computing the final output in chunk mode.
 import torch
 import triton
 import triton.language as tl
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     IS_NVIDIA_HOPPER,
@@ -607,7 +608,7 @@ def chunk_fwd_o(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * H)
 
-    chunk_fwd_kernel_o[grid](
+    _intj_launch(chunk_fwd_kernel_o, grid,
         q=q,
         k=k,
         v=v,
@@ -773,7 +774,7 @@ def chunk_fwd_o_opt(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * H)
 
-    chunk_fwd_kernel_o_opt[grid](
+    _intj_launch(chunk_fwd_kernel_o_opt, grid,
         q=q,
         k=k,
         v=v,
@@ -1004,7 +1005,7 @@ def chunk_fwd_o_opt_vk(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * H)
 
-    chunk_fwd_kernel_o_opt_vk[grid](
+    _intj_launch(chunk_fwd_kernel_o_opt_vk, grid,
         q=q,
         k=k,
         v=v,
@@ -1061,7 +1062,7 @@ def chunk_bwd_dv(
 
     dv = torch.empty_like(do)
     grid = (NV, NT, B * H)
-    chunk_bwd_kernel_dv[grid](
+    _intj_launch(chunk_bwd_kernel_dv, grid,
         q=q,
         k=k,
         g=g,
@@ -1112,7 +1113,7 @@ def chunk_bwd_dv_local(
 
     dv = torch.empty_like(do)
     grid = (NT, B * H)
-    chunk_bwd_kernel_dv_local[grid](
+    _intj_launch(chunk_bwd_kernel_dv_local, grid,
         q=q,
         k=k,
         g=g,
@@ -1171,7 +1172,7 @@ def chunk_bwd_dqkwg(
     dw = torch.empty_like(w) if w is not None else None
 
     grid = (NK, NT, B * H)
-    chunk_bwd_kernel_dqkwg[grid](
+    _intj_launch(chunk_bwd_kernel_dqkwg, grid,
         q=q,
         k=k,
         v=v,

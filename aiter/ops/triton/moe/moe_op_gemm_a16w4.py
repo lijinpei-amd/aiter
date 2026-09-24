@@ -6,6 +6,7 @@ from functools import lru_cache
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a16w4 import (
     _moe_gemm_a16w4 as _moe_gemm_a16w4_gluon,
@@ -348,7 +349,7 @@ def moe_gemm_a16w4(
 
     # launch kernel
     if backend == "gluon":
-        _moe_gemm_a16w4_gluon[(grid,)](
+        _intj_launch(_moe_gemm_a16w4_gluon, (grid,),
             y,
             y.stride(0),
             y.stride(1),
@@ -401,7 +402,7 @@ def moe_gemm_a16w4(
             kpack=config["kpack"],
         )
     else:
-        _moe_gemm_a16w4_triton[(grid,)](
+        _intj_launch(_moe_gemm_a16w4_triton, (grid,),
             y,
             y.stride(0),
             y.stride(1),

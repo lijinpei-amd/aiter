@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     autotune_cache_kwargs,
@@ -231,7 +232,7 @@ def fused_sigmoid_gating_delta_rule_update(
     def grid(META):
         return (NK, triton.cdiv(V, META["BV"]), N * HV)
 
-    fused_sigmoid_gating_delta_rule_update_kernel[grid](
+    _intj_launch(fused_sigmoid_gating_delta_rule_update_kernel, grid,
         A_log=A_log,
         a=a,
         dt_bias=dt_bias,

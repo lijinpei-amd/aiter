@@ -5,6 +5,7 @@ import os
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_a16w16 import (
     _fused_gemm_afp4wfp4_a16w16_kernel,
@@ -151,13 +152,13 @@ def fused_gemm_afp4wfp4_a16w16(
                 config["BLOCK_SIZE_M"] >= 32
             ), "for M >= 32, BLOCK_SIZE_M must be 32 or more as x_scale are assumed to be preshuffled"
 
-    grid = lambda META: (
+    grid = (
         (
-            META["NUM_KSPLIT"]
-            * triton.cdiv(M, META["BLOCK_SIZE_M"])
+            config["NUM_KSPLIT"]
+            * triton.cdiv(M, config["BLOCK_SIZE_M"])
             * (
-                triton.cdiv(N_fp4, META["BLOCK_SIZE_N"])
-                + triton.cdiv(N_bf16, META["BLOCK_SIZE_N"])
+                triton.cdiv(N_fp4, config["BLOCK_SIZE_N"])
+                + triton.cdiv(N_bf16, config["BLOCK_SIZE_N"])
             )
         ),
     )
@@ -168,7 +169,7 @@ def fused_gemm_afp4wfp4_a16w16(
     )
 
     def selected_kernel_wrapper():
-        selected_kernel[grid](
+        _intj_launch(selected_kernel, grid,
             x_fp4,
             w_fp4,
             bias_fp4,
@@ -232,7 +233,7 @@ def fused_gemm_afp4wfp4_a16w16(
             triton.cdiv(N_fp4, REDUCE_BLOCK_SIZE_N)
             + triton.cdiv(N_bf16, REDUCE_BLOCK_SIZE_N),
         )
-        _fused_gemm_afp4wfp4_a16w16_reduce_kernel[grid_reduce](
+        _intj_launch(_fused_gemm_afp4wfp4_a16w16_reduce_kernel, grid_reduce,
             bias_fp4,
             y_fp4_pp,
             y_fp4,

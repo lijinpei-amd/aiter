@@ -5,6 +5,7 @@ import os
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_mul_add import (
     _fused_gemm_afp4wfp4_mul_add_kernel,
@@ -161,14 +162,14 @@ def fused_gemm_afp4wfp4_mul_add(
         config["SPLITK_BLOCK_SIZE"] = 2 * K
         y_pp = None
 
-    grid = lambda META: (
+    grid = (
         (
-            META["NUM_KSPLIT"]
-            * triton.cdiv(M, META["BLOCK_SIZE_M"])
-            * triton.cdiv(N, META["BLOCK_SIZE_N"])
+            config["NUM_KSPLIT"]
+            * triton.cdiv(M, config["BLOCK_SIZE_M"])
+            * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
-    _fused_gemm_afp4wfp4_mul_add_kernel[grid](
+    _intj_launch(_fused_gemm_afp4wfp4_mul_add_kernel, grid,
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -214,7 +215,7 @@ def fused_gemm_afp4wfp4_mul_add(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _fused_gemm_afp4wfp4_mul_add_reduce_kernel[grid_reduce](
+        _intj_launch(_fused_gemm_afp4wfp4_mul_add_reduce_kernel, grid_reduce,
             y_pp,
             y,
             a,
@@ -350,16 +351,16 @@ def fused_gemm_afp4wfp4_preshuffle_add_mul(
             config["BLOCK_SIZE_M"] >= 32
         ), "for M >= 32, BLOCK_SIZE_M must be 32 or more as x_scale are assumed to be preshuffled"
 
-    grid = lambda META: (
+    grid = (
         (
-            META["NUM_KSPLIT"]
-            * triton.cdiv(M, META["BLOCK_SIZE_M"])
-            * triton.cdiv(N, META["BLOCK_SIZE_N"])
+            config["NUM_KSPLIT"]
+            * triton.cdiv(M, config["BLOCK_SIZE_M"])
+            * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
 
     def kernel_wrapper():
-        _fused_gemm_afp4wfp4_preshuffle_mul_add_kernel[grid](
+        _intj_launch(_fused_gemm_afp4wfp4_preshuffle_mul_add_kernel, grid,
             x,
             w,
             y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -418,7 +419,7 @@ def fused_gemm_afp4wfp4_preshuffle_add_mul(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _fused_gemm_afp4wfp4_mul_add_reduce_kernel[grid_reduce](
+        _intj_launch(_fused_gemm_afp4wfp4_mul_add_reduce_kernel, grid_reduce,
             y_pp,
             y,
             a,

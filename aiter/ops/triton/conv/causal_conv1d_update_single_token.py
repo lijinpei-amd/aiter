@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.conv.causal_conv1d import PAD_SLOT_ID
 from aiter.ops.triton._triton_kernels.conv.causal_conv1d_update_single_token import (
@@ -110,7 +111,7 @@ def causal_conv1d_update_single_token(
     def grid(META):
         return (batch, triton.cdiv(dim, META["BLOCK_N"]))
 
-    _causal_conv1d_update_single_token_kernel[grid](
+    _intj_launch(_causal_conv1d_update_single_token_kernel, grid,
         x,
         weight,
         bias,
@@ -288,7 +289,7 @@ def fused_reshape_causal_conv1d_update_single_token(
             1 + num_program_write_z + triton.cdiv(dim, META["BLOCK_N"]),
         )
 
-    _reshape_causal_conv1d_update_single_token_kernel[grid](
+    _intj_launch(_reshape_causal_conv1d_update_single_token_kernel, grid,
         x,
         ba,
         z_out,

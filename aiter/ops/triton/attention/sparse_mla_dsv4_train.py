@@ -6,6 +6,7 @@
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.attention.sparse_mla_dsv4_train import (
     _FWD_FALLBACK,
@@ -86,7 +87,7 @@ def sparse_mla_fwd(q, kv, attn_sink, indices, scale=None):
     BLOCK_K_fwd = fwd_cfg.kwargs["BLOCK_K"]
     grid = (N, triton.cdiv(H, BLOCK_H_fwd))
 
-    _sparse_mla_fwd_kernel[grid](
+    _intj_launch(_sparse_mla_fwd_kernel, grid,
         q,
         kv,
         indices,
@@ -157,7 +158,7 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, attn_sink, scale=None):
     dp_buf = torch.empty(N, H, topk, device=q.device, dtype=torch.bfloat16)
 
     # Kernel 1: dQ + store P/dP — grid (N, num_hg)
-    _bwd_dq_store_dp_kernel[(N, num_hg)](
+    _intj_launch(_bwd_dq_store_dp_kernel, (N, num_hg),
         q,
         kv,
         do,
@@ -195,7 +196,7 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, attn_sink, scale=None):
 
     # Kernel 2: dKV intermediate — grid (N,)
     interm = torch.empty(N, topk, D, device=q.device, dtype=torch.float32)
-    _bwd_dkv_interm_kernel[(N,)](
+    _intj_launch(_bwd_dkv_interm_kernel, (N,),
         q,
         do,
         p_buf,
@@ -224,7 +225,7 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, attn_sink, scale=None):
     dkv = torch.zeros(N_kv, D, device=q.device, dtype=torch.float32)
 
     BLOCK_G = 64
-    _bwd_dkv_gather_kernel[(N_kv,)](
+    _intj_launch(_bwd_dkv_gather_kernel, (N_kv,),
         interm,
         inv_ptr,
         inv_data,

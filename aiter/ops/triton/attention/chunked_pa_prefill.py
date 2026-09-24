@@ -11,6 +11,7 @@
 
 
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.attention.chunked_pa_prefill import (
     _kernel_paged_attention_2d,
@@ -103,12 +104,10 @@ def chunked_prefill_paged_decode(
     num_queries_per_kv = query.shape[1] // key.shape[1]
     head_size = query.shape[2]
 
-    _kernel_paged_attention_2d[
-        (
+    _intj_launch(_kernel_paged_attention_2d, (
             num_seqs,
             num_query_heads,
-        )
-    ](
+        ),
         output_ptr=output,
         query_ptr=query,
         key_cache_ptr=key_cache,

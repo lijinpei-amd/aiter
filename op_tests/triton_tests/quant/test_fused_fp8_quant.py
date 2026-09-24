@@ -1,6 +1,7 @@
 import pytest
 import torch
 import torch.nn.functional as F
+from triton.runtime.jit import JITFunction
 
 import aiter
 import aiter as rocm_aiter
@@ -17,6 +18,14 @@ from aiter.test_common import (
 )
 
 rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
+
+
+@pytest.fixture(autouse=True)
+def _reject_triton_bracket_launch(monkeypatch):
+    def reject(self, grid):
+        raise AssertionError("Triton bracket launch was used")
+
+    monkeypatch.setattr(JITFunction, "__getitem__", reject)
 
 
 def rmsnorm(input, weight, eps=1e-6):

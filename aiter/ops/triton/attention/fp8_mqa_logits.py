@@ -2,6 +2,7 @@ import inspect
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 from packaging.version import Version
 
 from aiter.ops.triton._triton_kernels.attention.fp8_mqa_logits import (
@@ -181,7 +182,7 @@ def fp8_mqa_logits(
         if scale_mul != 1.0:
             kv_scales = kv_scales.to(torch.float32) * scale_mul
 
-        _fp8_mqa_logits_kernel[(seq_len,)](
+        _intj_launch(_fp8_mqa_logits_kernel, (seq_len,),
             Q_ptr=Q,
             KV_ptr=KV,
             kv_scales_ptr=kv_scales,
@@ -301,7 +302,7 @@ def fp8_mqa_logits(
             other = {"LOOP_VARIANT": loop_variant}
             grid = ((seq_len + block_m - 1) // block_m,)
 
-        _gluon_fp8_mqa_logits_kernel[grid](
+        _intj_launch(_gluon_fp8_mqa_logits_kernel, grid,
             Q_ptr=Q,
             KV_ptr=KV,
             kv_scales_ptr=kv_scales,

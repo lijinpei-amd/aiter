@@ -13,6 +13,7 @@ import math
 
 import pytest
 import torch
+from triton.runtime.jit import JITFunction
 
 from aiter.ops.triton.quant.quant_fp8_blockwise import (
     quant_fp8_blockwise,
@@ -25,6 +26,14 @@ from aiter.ops.triton.quant.quant_fp8_blockwise import (
 # e4m3 keeps 3 mantissa bits, so per-element relative quant error tops out
 # around 2^-3; allow headroom for the block-shared scale.
 _REL = 0.16
+
+
+@pytest.fixture(autouse=True)
+def _reject_triton_bracket_launch(monkeypatch):
+    def reject(self, grid):
+        raise AssertionError("Triton bracket launch was used")
+
+    monkeypatch.setattr(JITFunction, "__getitem__", reject)
 
 
 def _assert_fp8_close(dequant, ref):

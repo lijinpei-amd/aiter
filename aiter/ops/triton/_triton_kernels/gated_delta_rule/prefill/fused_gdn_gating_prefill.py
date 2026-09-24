@@ -3,6 +3,7 @@
 import torch
 import triton
 import triton.language as tl
+from intj.compat import launch as _intj_launch
 
 
 @triton.jit
@@ -63,7 +64,7 @@ def fused_gdn_gating_and_sigmoid(
     BLK_HEADS = triton.next_power_of_2(num_heads)
     grid = (seq_len,)
 
-    fused_gdn_gating_sigmoid_kernel[grid](
+    _intj_launch(fused_gdn_gating_sigmoid_kernel, grid,
         g,
         beta,
         A_log,

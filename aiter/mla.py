@@ -9,6 +9,7 @@ import os
 import torch
 import triton
 import triton.language as tl
+from intj.compat import launch as _intj_launch
 
 import aiter
 from aiter import dtypes
@@ -712,7 +713,7 @@ def mla_decode_fwd(
             else torch.empty((1,), dtype=dtypes.fp32, device=device)
         )
 
-        _fwd_kernel_stage2_asm[grid](
+        _intj_launch(_fwd_kernel_stage2_asm, grid,
             logits,
             attn_lse,
             o,
@@ -1521,7 +1522,7 @@ def mla_prefill_reduce_triton(
     # Grid: (num_reduce_groups, num_heads, TILE_Q)
     grid = (num_reduce_groups, num_heads, tile_q)
 
-    _mla_prefill_reduce_kernel[grid](
+    _intj_launch(_mla_prefill_reduce_kernel, grid,
         partial_output,
         partial_lse,
         reduce_indptr,
@@ -1903,7 +1904,7 @@ def mla_decode_fwd_v4_nm(
 
         final_lse_buf = torch.empty((1,), dtype=dtypes.fp32, device=device)
 
-        _fwd_kernel_stage2_asm[(num_seqs, num_heads)](
+        _intj_launch(_fwd_kernel_stage2_asm, (num_seqs, num_heads),
             logits,  # Mid_O   [total_q, num_kv_splits, num_heads, dv]
             attn_lse,  # Mid_lse [total_q, num_kv_splits, num_heads, 1]
             output,  # final O [total_q, num_heads, dv]   BF16

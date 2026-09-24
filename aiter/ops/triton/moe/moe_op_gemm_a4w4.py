@@ -5,6 +5,7 @@ import itertools
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a4w4 import (
     _moe_gemm_a4w4_decode,
@@ -489,7 +490,7 @@ def moe_gemm_a4w4(
             X_SCALES_TDM=x_scales_tdm,
         )
         # launch gluon kernel
-        _moe_gemm_a4w4_decode[(grid,)](
+        _intj_launch(_moe_gemm_a4w4_decode, (grid,),
             y_ptr,
             stride_y_m,
             stride_y_n,
@@ -663,7 +664,7 @@ def moe_gemm_a4w4(
         )
     else:
         # launch triton kernel
-        _moe_gemm_a4w4[(grid,)](
+        _intj_launch(_moe_gemm_a4w4, (grid,),
             y,
             y.stride(0),
             y.stride(1),

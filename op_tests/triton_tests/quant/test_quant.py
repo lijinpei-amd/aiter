@@ -3,15 +3,33 @@
 
 import pytest
 import torch
+from triton.runtime.jit import JITFunction
 
 from aiter.ops.triton.quant import (
     dynamic_per_tensor_quant_fp8_i8,
     dynamic_per_token_quant_fp8_i8,
     static_per_tensor_quant_fp8_i8,
 )
+from aiter.ops.triton.quant.quant import dynamic_mxfp4_quant_blockscale
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
 DEBUG = False
+
+
+@pytest.fixture(autouse=True)
+def _reject_triton_bracket_launch(monkeypatch):
+    def reject(self, grid):
+        raise AssertionError("Triton bracket launch was used")
+
+    monkeypatch.setattr(JITFunction, "__getitem__", reject)
+
+
+def test_mxfp4_blockscale_uses_intj_without_fallback():
+    x = torch.zeros((32, 32), dtype=torch.bfloat16, device="cuda")
+    packed, scales = dynamic_mxfp4_quant_blockscale(x)
+    assert packed.shape == (32, 16)
+    assert scales.shape == (1, 1)
+    assert torch.count_nonzero(packed) == 0
 
 
 def torch_static_per_tensor_quant_fp8_i8(out, x, scale, dtype_quant):

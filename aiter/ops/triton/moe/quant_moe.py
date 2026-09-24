@@ -2,6 +2,7 @@ from enum import Enum
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.moe.quant_moe import (
     _downcast_to_mxfp,
@@ -99,7 +100,7 @@ def downcast_to_mxfp(
     grid_out = triton.cdiv(kernel_src_tensor.shape[0], BLOCK_OUT_DIM)
     grid_quant = triton.cdiv(kernel_src_tensor.shape[1], BLOCK_QUANT_DIM)
 
-    _downcast_to_mxfp[(grid_out, grid_quant)](
+    _intj_launch(_downcast_to_mxfp, (grid_out, grid_quant),
         kernel_quant_tensor,
         *kernel_quant_tensor.stride(),
         kernel_scale,
@@ -219,7 +220,7 @@ def smoothquant_quantize(
         BLOCK_K = triton.next_power_of_2(K)
         grid = (triton.cdiv(M, BLOCK_M),)
 
-        _smoothquant_fuse_quant_kernel_single_pass[grid](
+        _intj_launch(_smoothquant_fuse_quant_kernel_single_pass, grid,
             x,
             x.stride(0),
             x.stride(1),
@@ -238,7 +239,7 @@ def smoothquant_quantize(
     else:
         BLOCK_K = 256
         grid = (triton.cdiv(M, BLOCK_M),)
-        _smoothquant_fuse_quant_kernel[grid](
+        _intj_launch(_smoothquant_fuse_quant_kernel, grid,
             x,
             x.stride(0),
             x.stride(1),

@@ -15,6 +15,7 @@ import triton.language as tl
 from flydsl.expr import gpu, rocdl
 from flydsl.expr.primitive import range_constexpr
 from flydsl.expr.typing import Float4E2M1FN, Int32, T
+from intj.compat import launch as _intj_launch
 
 from .pa_mqa_logits_fp4_common import (
     _NON_WRITER_LANE_OFF,
@@ -89,7 +90,7 @@ def compute_prefill_schedule(
         cta_info = cta_info_out
     BLOCK_P = 256
     grid = (triton.cdiv(P, BLOCK_P),)
-    _prefill_cta_info_kernel[grid](
+    _intj_launch(_prefill_cta_info_kernel, grid,
         plan.incl,
         plan.excl,
         plan.chunks,
@@ -172,7 +173,7 @@ def _row_plan(le, block_k, P, s_max) -> _RowPlan:
         total_splits=work[tail + _I32_PER_16B : tail + _I32_PER_16B + 1],
     )
     # Named, not `*plan`: field ORDER should not become load-bearing.
-    _prefill_row_plan_kernel[(1,)](
+    _intj_launch(_prefill_row_plan_kernel, (1,),
         le,
         plan.incl,
         plan.excl,
@@ -1014,7 +1015,7 @@ def compute_varqlen_windows(cu_seq_q, context_lens, total_q, *, out=None):
     if total_q > 0:
         BLOCK = 256
         grid = (triton.cdiv(total_q, BLOCK),)
-        _varqlen_windows_kernel[grid](
+        _intj_launch(_varqlen_windows_kernel, grid,
             cu,
             ctx,
             row_to_batch,

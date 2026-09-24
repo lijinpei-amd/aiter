@@ -3,6 +3,7 @@
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.normalization.norm import (
     _fused_add_layernorm_kernel,
@@ -35,7 +36,7 @@ def _layernorm_forward(
     MAX_FUSED_SIZE = 65536 // x.element_size()
     BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
 
-    _layernorm_kernel[(M,)](
+    _intj_launch(_layernorm_kernel, (M,),
         x, y, weight, bias, mean, rstd, x.stride(0), y.stride(0), M, N, eps, BLOCK_SIZE
     )
 
@@ -58,7 +59,7 @@ def _layernorm_forward_with_add(
     MAX_FUSED_SIZE = 65536 // x.element_size()
     BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
 
-    _fused_add_layernorm_kernel[(M,)](
+    _intj_launch(_fused_add_layernorm_kernel, (M,),
         x,
         y,
         res_in,
@@ -115,7 +116,7 @@ def _layernorm_backward(
         _db = None
 
     grid_bwd = (tile_num,)
-    _layernorm_bwd_dx_fused_triton[grid_bwd](
+    _intj_launch(_layernorm_bwd_dx_fused_triton, grid_bwd,
         dx,
         dy,
         _dw,
@@ -132,13 +133,13 @@ def _layernorm_backward(
         num_warps=num_warps,
         IGNORE_DW_DB=IGNORE_DW_DB_IN_FUSED,
     )
-    grid_reduce = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE_N"]),)
     if not IGNORE_DW_DB_IN_FUSED:
         dwdb_block_n = max(16, N // 256)
         dwdb_block_n = triton.next_power_of_2(dwdb_block_n)
         dwdb_block_m = (64 * 128) // dwdb_block_n
         dwdb_block_m = min(triton.next_power_of_2(tile_num), dwdb_block_m)
-        _layernorm_bwd_dwdb_triton[grid_reduce](
+        grid_reduce = (triton.cdiv(N, dwdb_block_n),)
+        _intj_launch(_layernorm_bwd_dwdb_triton, grid_reduce,
             _dw,
             _db,
             dw,
@@ -153,7 +154,8 @@ def _layernorm_backward(
         dwdb_block_n = triton.next_power_of_2(dwdb_block_n)
         dwdb_block_m = (64 * 128) // dwdb_block_n
         dwdb_block_m = min(triton.next_power_of_2(M), dwdb_block_m)
-        _layernorm_bwd_dwdb_triton_v2[grid_reduce](
+        grid_reduce = (triton.cdiv(N, dwdb_block_n),)
+        _intj_launch(_layernorm_bwd_dwdb_triton_v2, grid_reduce,
             x,
             dy,
             mu,
@@ -353,7 +355,7 @@ def layernorm2d_fwd_with_dynamicquant(
     # Auxiliary tensor to store the RMSNorm output as fp32 before applying the quantization when using the blocked approach
     aux = torch.empty(M, N, dtype=torch.float32, device=input.device)
 
-    _quant_layernorm_kernel[(M,)](
+    _intj_launch(_quant_layernorm_kernel, (M,),
         input,
         out,
         weight,
@@ -418,7 +420,7 @@ def layernorm2d_fwd_with_smoothquant(
     # Auxiliary tensor to store the RMSNorm output as fp32 before applying the quantization when using the blocked approach
     aux = torch.empty(M, N, dtype=torch.float32, device=input.device)
 
-    _quant_layernorm_kernel[(M,)](
+    _intj_launch(_quant_layernorm_kernel, (M,),
         input,
         out,
         weight,
@@ -488,7 +490,7 @@ def layernorm2d_fwd_with_add_dynamicquant(
     # Auxiliary tensor to store the RMSNorm output as fp32 before applying the quantization when using the blocked approach
     aux = torch.empty(M, N, dtype=torch.float32, device=input.device)
 
-    _quant_fused_add_layernorm_kernel[(M,)](
+    _intj_launch(_quant_fused_add_layernorm_kernel, (M,),
         input,
         out,
         residual_in,
@@ -562,7 +564,7 @@ def layernorm2d_fwd_with_add_smoothquant(
     # Auxiliary tensor to store the RMSNorm output as fp32 before applying the quantization when using the blocked approach
     aux = torch.empty(M, N, dtype=torch.float32, device=input.device)
 
-    _quant_fused_add_layernorm_kernel[(M,)](
+    _intj_launch(_quant_fused_add_layernorm_kernel, (M,),
         input,
         out,
         residual_in,

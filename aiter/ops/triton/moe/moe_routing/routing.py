@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.moe.moe_routing.routing import (
     _combined_routing,
@@ -114,7 +115,7 @@ def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOC
 
     indx_offs = partial_hist
 
-    _combined_routing[(blocks1a + blocks1b,)](
+    _intj_launch(_combined_routing, (blocks1a + blocks1b,),
         topk_indx,
         gate_indx,
         gate_scal,  # outputs
@@ -184,7 +185,7 @@ def sort_tokens_fused(
 
     blocks1b = cdiv(n_tokens, HIST_BLOCK_M)
 
-    _combined_routing_fused[(blocks1a + blocks1b,)](
+    _intj_launch(_combined_routing_fused, (blocks1a + blocks1b,),
         topk_indx,
         gate_indx,
         gate_scal,  # outputs
@@ -621,7 +622,7 @@ def ep_sort_routing(
     else:
         dst_row = torch.empty(n_gates, dtype=torch.int32, device=device)
         src_token_map = ep_scatter_geometry.src_token_map
-    _ep_gate_prep_scan_kernel[(n_ctas,)](
+    _intj_launch(_ep_gate_prep_scan_kernel, (n_ctas,),
         dispatch_ids,
         expert_map,
         num_local_tokens,
@@ -653,7 +654,7 @@ def ep_sort_routing(
     topk_indx = torch.empty(n_gates, dtype=torch.int32, device=device)
     gate_indx = torch.empty(n_gates, dtype=torch.int32, device=device)
     gate_scal = torch.empty(n_gates, dtype=torch.float32, device=device)
-    _ep_scatter_atomic_expt_data_kernel[(num_local_experts + n_ctas,)](
+    _intj_launch(_ep_scatter_atomic_expt_data_kernel, (num_local_experts + n_ctas,),
         expt_indx,
         dispatch_weights,
         cursor,

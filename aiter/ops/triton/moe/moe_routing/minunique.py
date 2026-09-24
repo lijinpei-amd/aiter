@@ -1,5 +1,6 @@
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.moe.moe_routing.minunique import _keepk_sort0
 from aiter.ops.triton._triton_kernels.moe.moe_routing.routing import _combined_routing
@@ -33,7 +34,7 @@ def keepk_sort0(
     num_blocks = triton.cdiv(M, HIST_BLOCK_M)
     Vout = torch.empty((M, k), dtype=expt_scal.dtype, device=dev)
     Iout = torch.empty((M, k), dtype=torch.int16, device=dev)
-    _keepk_sort0[(M,)](
+    _intj_launch(_keepk_sort0, (M,),
         expt_scal,
         expt_indx,
         expt_scal.stride(0),
@@ -107,7 +108,7 @@ def _minunique_common(
         _compute_expt_data_internal(n_expts_tot, n_gates, block_m, dev)
     )
     blocks1b = triton.cdiv(num_tokens, HIST_BLOCK_M)
-    _combined_routing[(blocks1a + blocks1b,)](
+    _intj_launch(_combined_routing, (blocks1a + blocks1b,),
         topk_indx,
         gate_indx,
         gate_scal,

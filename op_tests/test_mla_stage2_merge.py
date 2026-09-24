@@ -33,6 +33,7 @@ import pandas as pd
 import torch
 import triton
 import triton.language as tl
+from intj.compat import launch as _intj_launch
 
 import aiter
 from aiter import dtypes
@@ -197,7 +198,7 @@ def test_stage2_merge(
     ref = run_torch(logits, attn_lse, num_valid, out_dtype)
 
     def run_base():
-        _fwd_kernel_stage2_asm[(T, H)](
+        _intj_launch(_fwd_kernel_stage2_asm, (T, H),
             logits,
             attn_lse,
             out_base,
@@ -229,7 +230,7 @@ def test_stage2_merge(
         return out_base
 
     def run_vec():
-        _stage2_merge_vec[(T, H)](
+        _intj_launch(_stage2_merge_vec, (T, H),
             logits,
             attn_lse,
             out_vec,

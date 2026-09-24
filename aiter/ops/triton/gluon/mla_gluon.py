@@ -46,14 +46,16 @@
 # isort and black disagree here: isort wants two blank lines after this block,
 # black folds them back to one because the `# fmt: off` below starts a
 # formatting-disabled region. black is the one CI enforces, so it wins.
-import torch  # noqa: I001
+import torch
 import triton
 import triton.language as tl
+from intj.compat import launch as _intj_launch
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import get_num_xcds
+
 
 # fmt: off
 @gluon.jit
@@ -1043,7 +1045,7 @@ def mla_gluon(
         grid = (batch_size, NUM_KV_SPLITS, triton.cdiv(nhead, BLOCK_H) * qlen)
     stride_page_bs = page_table.stride(0) if use_2d_view else 0
 
-    _mla_gluon[grid](
+    _intj_launch(_mla_gluon, grid,
         q_nope,
         q_pe,
         kv_c,
@@ -1102,7 +1104,7 @@ def mla_gluon(
     # grid axis 2 is q_pos (qlen). o uses the caller's layout (3-D or 4-D).
     grid_reduce = (batch_size, nhead, qlen)
     sl_b, sl_qs, sl_h, sl_split, _ = logits_buf.stride()
-    _mla_softmax_reducev_kernel[grid_reduce](
+    _intj_launch(_mla_softmax_reducev_kernel, grid_reduce,
         logits_buf,
         mid_lse,
         o,

@@ -4,6 +4,7 @@
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.fusions.fused_reduce_qk_norm_rope_swa_write import (
     _fused_reduce_qk_norm_rope_swa_write_kernel,
@@ -151,7 +152,7 @@ def fused_reduce_qk_norm_rope_swa_write(
         M, num_local_heads, num_splitk
     )
     grid = (triton.cdiv(M, BLOCK_SIZE_M), num_local_heads + 1)
-    _fused_reduce_qk_norm_rope_swa_write_kernel[grid](
+    _intj_launch(_fused_reduce_qk_norm_rope_swa_write_kernel, grid,
         q,
         q_out,
         kv,

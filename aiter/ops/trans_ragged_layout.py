@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+from intj.compat import launch as _intj_launch
 
 
 @triton.jit
@@ -87,7 +88,7 @@ def ragged_layout_trans(kv_indptr, kv_indices, k_buffer, v_buffer):
 
     grid = (token_blocks,)
 
-    _ragged_trans_kernel[grid](
+    _intj_launch(_ragged_trans_kernel, grid,
         k_buffer,
         v_buffer,
         k_values,

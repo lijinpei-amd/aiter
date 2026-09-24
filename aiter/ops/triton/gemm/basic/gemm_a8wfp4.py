@@ -3,6 +3,7 @@
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
@@ -103,11 +104,11 @@ def gemm_a8wfp4(
         config["SPLITK_BLOCK_SIZE"] = 2 * K
         y_pp = None
 
-    grid = lambda META: (
+    grid = (
         (
             config["NUM_KSPLIT"]
-            * triton.cdiv(M, META["BLOCK_SIZE_M"])
-            * triton.cdiv(N, META["BLOCK_SIZE_N"])
+            * triton.cdiv(M, config["BLOCK_SIZE_M"])
+            * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
 
@@ -120,7 +121,7 @@ def gemm_a8wfp4(
     stride_asm, stride_ask = x_scales.stride()
     stride_bsn, stride_bsk = w_scales.stride()
 
-    _gemm_a8wfp4_kernel[grid](
+    _intj_launch(_gemm_a8wfp4_kernel, grid,
         x,
         w,
         y_final,
@@ -156,7 +157,7 @@ def gemm_a8wfp4(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _gemm_splitk_reduce_kernel[grid_reduce](
+        _intj_launch(_gemm_splitk_reduce_kernel, grid_reduce,
             y_pp,
             y,
             None,

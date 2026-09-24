@@ -37,6 +37,7 @@ from functools import lru_cache
 import torch
 import triton
 import triton.language as tl
+from intj.compat import launch as _intj_launch
 
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, wave_size_of
@@ -215,7 +216,7 @@ def _gather_selected(scores, idx, fill):
     """
     rows, topk = idx.shape
     out = torch.empty((rows, topk), dtype=scores.dtype, device=scores.device)
-    _gather_selected_kernel[(rows,)](
+    _intj_launch(_gather_selected_kernel, (rows,),
         scores,
         idx,
         out,

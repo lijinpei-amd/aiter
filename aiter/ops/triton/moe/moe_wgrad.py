@@ -5,6 +5,7 @@
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.moe.moe_wgrad import _moe_wgrad_kernel
 from aiter.ops.triton.utils.device_info import get_num_xcds
@@ -61,7 +62,7 @@ def moe_wgrad(
         triton.cdiv(N, META["BLOCK_SIZE_N"]) * triton.cdiv(K, META["BLOCK_SIZE_K"]),
     )
 
-    _moe_wgrad_kernel[grid](
+    _intj_launch(_moe_wgrad_kernel, grid,
         grad,
         input,
         dW,

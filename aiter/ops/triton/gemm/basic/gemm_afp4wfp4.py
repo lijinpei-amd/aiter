@@ -4,6 +4,7 @@
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
@@ -235,15 +236,15 @@ def gemm_afp4wfp4_(
 
     # config["BLOCK_SIZE_N"] = max(config["BLOCK_SIZE_N"], 32)
 
-    grid = lambda META: (
+    grid = (
         (
-            META["NUM_KSPLIT"]
-            * triton.cdiv(M, META["BLOCK_SIZE_M"])
-            * triton.cdiv(N, META["BLOCK_SIZE_N"])
+            config["NUM_KSPLIT"]
+            * triton.cdiv(M, config["BLOCK_SIZE_M"])
+            * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
 
-    impl[grid](
+    _intj_launch(impl, grid,
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -280,7 +281,7 @@ def gemm_afp4wfp4_(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _gemm_splitk_reduce_kernel[grid_reduce](
+        _intj_launch(_gemm_splitk_reduce_kernel, grid_reduce,
             y_pp,
             y,
             None,
@@ -413,15 +414,15 @@ def gemm_afp4wfp4_preshuffled_scales(
 
     config["BLOCK_SIZE_N"] = max(config["BLOCK_SIZE_N"], 32)
 
-    grid = lambda META: (
+    grid = (
         (
-            META["NUM_KSPLIT"]
-            * triton.cdiv(M, META["BLOCK_SIZE_M"])
-            * triton.cdiv(N, META["BLOCK_SIZE_N"])
+            config["NUM_KSPLIT"]
+            * triton.cdiv(M, config["BLOCK_SIZE_M"])
+            * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
 
-    _triton_gemm_afp4wfp4_kernel_preshuffle_scales[grid](
+    _intj_launch(_triton_gemm_afp4wfp4_kernel_preshuffle_scales, grid,
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -456,7 +457,7 @@ def gemm_afp4wfp4_preshuffled_scales(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _gemm_splitk_reduce_kernel[grid_reduce](
+        _intj_launch(_gemm_splitk_reduce_kernel, grid_reduce,
             y_pp,
             y,
             None,
@@ -571,10 +572,10 @@ def gemm_afp4wfp4_preshuffle(
             get_gemm_afp4wfp4_preshuffle_layouts,
         )
 
-        grid = lambda META: (
+        grid = (
             (
-                triton.cdiv(M, META["BLOCK_SIZE_M"])
-                * triton.cdiv(N, META["BLOCK_SIZE_N"])
+                triton.cdiv(M, config["BLOCK_SIZE_M"])
+                * triton.cdiv(N, config["BLOCK_SIZE_N"])
             ),
         )
         # gluon path does not support splitk; config has no NUM_KSPLIT / SPLITK_BLOCK_SIZE
@@ -593,7 +594,7 @@ def gemm_afp4wfp4_preshuffle(
             config["BLOCK_SIZE_K"],
         )
 
-        _gluon_gemm_mxfp4_preshuffle_gfx1250[grid](
+        _intj_launch(_gluon_gemm_mxfp4_preshuffle_gfx1250, grid,
             x_fp4,
             w_preshuf,
             y,
@@ -652,16 +653,16 @@ def gemm_afp4wfp4_preshuffle(
     if M < 32 and M_POW2 > 16:
         M_POW2 = 16
 
-    grid = lambda META: (
+    grid = (
         (
-            META["NUM_KSPLIT"]
-            * triton.cdiv(M, META["BLOCK_SIZE_M"])
-            * triton.cdiv(N, META["BLOCK_SIZE_N"])
+            config["NUM_KSPLIT"]
+            * triton.cdiv(M, config["BLOCK_SIZE_M"])
+            * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
 
     config.pop("NUM_BUFFERS", None)
-    _triton_gemm_afp4wfp4_preshuffle_kernel[grid](
+    _intj_launch(_triton_gemm_afp4wfp4_preshuffle_kernel, grid,
         x_fp4,
         w_preshuf,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -698,7 +699,7 @@ def gemm_afp4wfp4_preshuffle(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _gemm_splitk_reduce_kernel[grid_reduce](
+        _intj_launch(_gemm_splitk_reduce_kernel, grid_reduce,
             y_pp,
             y,
             None,

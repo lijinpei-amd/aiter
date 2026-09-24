@@ -155,7 +155,11 @@ def quantize_fp6_v_clean_triton(
     kvtab = _v_kvtab_dev(v_fp8.device, direct_p)
     BLOCK_N = 128
     grid = (triton.cdiv(n_blocks, BLOCK_N),)
-    _pack_v_fp6_kernel[grid](
+    from intj.compat import launch
+
+    launch(
+        _pack_v_fp6_kernel,
+        grid,
         v_fp8,
         out,
         out,
@@ -192,7 +196,11 @@ def quantize_fp6_v_data_scale_triton(
     kvtab = _v_kvtab_dev(v_fp8.device, True)
     BLOCK_N = 128
     grid = (triton.cdiv(n_blocks, BLOCK_N),)
-    _pack_v_fp6_kernel[grid](
+    from intj.compat import launch
+
+    launch(
+        _pack_v_fp6_kernel,
+        grid,
         v_fp8,
         data,
         scale,
@@ -557,7 +565,11 @@ def quantize_fp6_lastdim_triton(x: "torch.Tensor"):
     # The hd128 FMHA workloads consistently select 16/1. Pin it to avoid paying and logging
     # the five-config autotune in every fresh benchmark process.
     grid = (triton.cdiv(n_blocks, 16),)
-    _pack_qk_fp6_kernel[grid](
+    from intj.compat import launch
+
+    launch(
+        _pack_qk_fp6_kernel,
+        grid,
         xflat,
         packed,
         scale,
@@ -671,7 +683,11 @@ def reorder_fp6_k_lds_order_triton(
     data_hs = nt * _K_COMPACT_DATA_BYTES
     assert data_hs % BLOCK == 0, (data_hs, BLOCK)
     grid = (b * h * (data_hs // BLOCK),)
-    _gather_k_lds_kernel[grid](
+    from intj.compat import launch
+
+    launch(
+        _gather_k_lds_kernel,
+        grid,
         packed.reshape(-1),
         buf,
         srcw,
@@ -687,7 +703,9 @@ def reorder_fp6_k_lds_order_triton(
     # Fill the per-tile 1024B scale tail: Region A (unshifted) + Region B (pre-shifted +1 byte, so
     # the kernel MFMA op_sel picks dblk1/dblk3 with no runtime shift). The B pre-shift reads 1 byte
     # past the last token's scale on the final tile -> the +256 buf slack keeps it mapped.
-    _fill_k_scale_tail_kernel[(b * h * nt,)](
+    launch(
+        _fill_k_scale_tail_kernel,
+        (b * h * nt,),
         scale.reshape(-1),
         buf,
         sk,

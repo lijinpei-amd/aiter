@@ -4,6 +4,7 @@
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.fusions.fused_rmsnorm_indexed_adaln import (
     _fused_rmsnorm_indexed_adaln_kernel,
@@ -83,7 +84,7 @@ def fused_rmsnorm_indexed_adaln(
     # of tokens that share an index, which is the common case.
     BLOCK_M = 8 if M >= 8 else 1
 
-    _fused_rmsnorm_indexed_adaln_kernel[(triton.cdiv(M, BLOCK_M),)](
+    _intj_launch(_fused_rmsnorm_indexed_adaln_kernel, (triton.cdiv(M, BLOCK_M),),
         out,
         x,
         weight,

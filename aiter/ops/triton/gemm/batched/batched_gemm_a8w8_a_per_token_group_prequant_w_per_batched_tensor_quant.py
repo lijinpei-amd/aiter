@@ -3,6 +3,7 @@
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel,
@@ -89,9 +90,9 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         config, _ = _get_config(M, N, K)
     config["BLOCK_SIZE_K"] = group_size
 
-    grid = lambda META: (
+    grid = (
         B,
-        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),
     )
 
     DTYPE_MAX = (
@@ -100,9 +101,7 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         else torch.iinfo(WQ.dtype).max
     )
 
-    _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel[
-        grid
-    ](
+    _intj_launch(_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel, grid,
         X,
         WQ,
         YQ,

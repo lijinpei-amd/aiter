@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.moe.moe_routing.bitmatrix import (
     _sum_bitmatrix_memset,
@@ -43,7 +44,7 @@ def clear_sums(n_cols, device, MEMSET_BLOCK=512):
     cdiv = triton.cdiv
     blocks = cdiv(n_cols, MEMSET_BLOCK)
     out_ret = torch.empty((blocks * MEMSET_BLOCK,), device=device, dtype=torch.int32)
-    _sum_bitmatrix_memset[(blocks,)](out_ret, MEMSET_BLOCK)
+    _intj_launch(_sum_bitmatrix_memset, (blocks,), out_ret, MEMSET_BLOCK)
     return out_ret
 
 
@@ -62,7 +63,7 @@ def sum_bitmatrix_rows(x, out_ret, partials_block_size=None):
     out_partials = x.scratchpad_partials
 
     # output tensors
-    _sum_bitmatrix_rows[(pids_x, pids_y)](
+    _intj_launch(_sum_bitmatrix_rows, (pids_x, pids_y),
         x.data,
         n_rows,
         x.data.stride(0),

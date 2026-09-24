@@ -20,6 +20,7 @@ UPDATE:
 import warnings
 
 import torch
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.attention.lean_atten_paged import (
     la_persistent_paged,
@@ -91,7 +92,7 @@ def persistent_lean_attention_paged(
 
     o = torch.empty_like(q, dtype=v.dtype)
 
-    la_persistent_paged[grid](
+    _intj_launch(la_persistent_paged, grid,
         q,
         k,
         v,

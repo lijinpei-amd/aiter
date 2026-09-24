@@ -4,6 +4,7 @@ import math
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.attention.mla import (
     _mla_decode_fwd_kernel as triton_mla_decode_fwd_kernel,
@@ -193,7 +194,7 @@ def mla_prefill_fwd(
     )
 
     if IS_DEVICE_ARCH_GFX12:
-        gluon_mla_prefill_fwd_kernel_non_pipelined[(num_kv_heads, total_num_q_blocks)](
+        _intj_launch(gluon_mla_prefill_fwd_kernel_non_pipelined, (num_kv_heads, total_num_q_blocks),
             output_ptr=out,
             query_ptr=q,
             kv_buffer_ptr=kv_buffer,
@@ -228,7 +229,7 @@ def mla_prefill_fwd(
             **attn_config,
         )
     else:
-        triton_mla_prefill_fwd_kernel[(num_kv_heads, total_num_q_blocks)](
+        _intj_launch(triton_mla_prefill_fwd_kernel, (num_kv_heads, total_num_q_blocks),
             output_ptr=out,
             query_ptr=q,
             kv_buffer_ptr=kv_buffer,
@@ -407,7 +408,7 @@ def mla_decode_fwd(
         else:
             impl = gluon_mla_decode_fwd_kernel_non_pipelined
 
-        impl[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
+        _intj_launch(impl, (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS),
             segm_output_ptr=segm_output,
             segm_max_ptr=segm_max,
             segm_expsum_ptr=segm_expsum,
@@ -453,7 +454,7 @@ def mla_decode_fwd(
             **attn_config,
         )
     else:
-        triton_mla_decode_fwd_kernel[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
+        _intj_launch(triton_mla_decode_fwd_kernel, (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS),
             segm_output_ptr=segm_output,
             segm_max_ptr=segm_max,
             segm_expsum_ptr=segm_expsum,
@@ -503,7 +504,7 @@ def mla_decode_fwd(
 
     _reduce_kernel = triton_mla_decode_fwd_reduce_kernel
 
-    _reduce_kernel[(total_num_tokens, num_query_heads)](
+    _intj_launch(_reduce_kernel, (total_num_tokens, num_query_heads),
         output_ptr=out,
         segm_output_ptr=segm_output,
         segm_max_ptr=segm_max,

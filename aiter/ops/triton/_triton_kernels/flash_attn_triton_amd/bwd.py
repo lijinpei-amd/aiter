@@ -4,6 +4,7 @@ from typing import Literal
 import torch
 import triton
 import triton.language as tl
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
     AUTOTUNE,
@@ -4744,7 +4745,7 @@ def attention_backward_triton_impl(
             nheads_q,
         )
 
-    _bwd_preprocess[pre_grid](
+    _intj_launch(_bwd_preprocess, pre_grid,
         o,
         do,
         delta,
@@ -4803,7 +4804,7 @@ def attention_backward_triton_impl(
 
             if DEBUG_TRITON:
                 print(f"bwd_kernel: grid = {grid}")
-            bwd_kernel_fused_causal[grid](
+            _intj_launch(bwd_kernel_fused_causal, grid,
                 q,
                 k,
                 v,
@@ -4894,7 +4895,7 @@ def attention_backward_triton_impl(
                 NUM_XCD=num_xcd,
             )
         else:
-            bwd_kernel_fused_noncausal[grid](
+            _intj_launch(bwd_kernel_fused_noncausal, grid,
                 q,
                 k,
                 v,
@@ -5011,7 +5012,7 @@ def attention_backward_triton_impl(
         grid_dkdvdq = (batch * nheads_k * num_k_pids,)
 
         if causal:
-            _bwd_kernel_fused_atomic_causal[grid_dkdvdq](
+            _intj_launch(_bwd_kernel_fused_atomic_causal, grid_dkdvdq,
                 q,
                 k,
                 v,
@@ -5076,7 +5077,7 @@ def attention_backward_triton_impl(
                 **config,
             )
         else:
-            _bwd_kernel_fused_atomic_noncausal[grid_dkdvdq](
+            _intj_launch(_bwd_kernel_fused_atomic_noncausal, grid_dkdvdq,
                 q,
                 k,
                 v,
@@ -5151,7 +5152,7 @@ def attention_backward_triton_impl(
         grid_dq = ((max_seqlen_q + BLOCK_M2 - 1) // BLOCK_M2, batch, nheads_k)
 
         if causal:
-            _bwd_kernel_split_dkdv_causal[grid_dkdv](
+            _intj_launch(_bwd_kernel_split_dkdv_causal, grid_dkdv,
                 q,
                 k,
                 v,
@@ -5217,7 +5218,7 @@ def attention_backward_triton_impl(
                 num_stages=NUM_STAGES,
                 waves_per_eu=WAVES_PER_EU,
             )
-            _bwd_kernel_split_dq_causal[grid_dq](
+            _intj_launch(_bwd_kernel_split_dq_causal, grid_dq,
                 q,
                 k,
                 v,
@@ -5283,7 +5284,7 @@ def attention_backward_triton_impl(
                 waves_per_eu=WAVES_PER_EU,
             )
         else:
-            _bwd_kernel_split_dkdv_noncausal[grid_dkdv](
+            _intj_launch(_bwd_kernel_split_dkdv_noncausal, grid_dkdv,
                 q,
                 k,
                 v,
@@ -5350,7 +5351,7 @@ def attention_backward_triton_impl(
                 waves_per_eu=WAVES_PER_EU,
             )
 
-            _bwd_kernel_split_dq_noncausal[grid_dq](
+            _intj_launch(_bwd_kernel_split_dq_noncausal, grid_dq,
                 q,
                 k,
                 v,

@@ -7,6 +7,7 @@ import os
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 import aiter
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
@@ -536,10 +537,8 @@ def fav3_sage_func(
         lut_count = torch.zeros(1, dtype=torch.int32, device=q.device)
 
     # --- 7. Kernel Launch ---
-    def grid(META):
-        return (triton.cdiv(seqlen_q, META["BLOCK_M"]), nheads_q, batch)
-
-    sage_fwd[grid](
+    grid = (triton.cdiv(seqlen_q, config["BLOCK_M"]), nheads_q, batch)
+    _intj_launch(sage_fwd, grid,
         q,
         k,
         v,

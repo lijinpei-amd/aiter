@@ -81,7 +81,11 @@ def sage_quant_mxfp4(
         smooth_k=smooth_k,
     )
 
-    sage_quant_v_kernel[grid](
+    from intj.compat import launch
+
+    launch(
+        sage_quant_v_kernel,
+        grid,
         v,
         v_fp8,
         v_scale,
@@ -157,7 +161,11 @@ def _apply_int8_q_smoothing(q, k, BLKQ, layout, sm_scale):
 
     sm_scale_log2 = sm_scale * 1.4426950408889634
     grid_q = (b * h_q, Q_NUM_BLKS, triton.cdiv(d, 32))
-    _q_smooth_int8_kernel[grid_q](
+    from intj.compat import launch
+
+    launch(
+        _q_smooth_int8_kernel,
+        grid_q,
         q,
         q_out,
         q_mean,
@@ -182,7 +190,9 @@ def _apply_int8_q_smoothing(q, k, BLKQ, layout, sm_scale):
     )
 
     grid_delta = (b * h_q, Q_NUM_BLKS, K_NUM_BLKS)
-    _compute_delta_s_kernel[grid_delta](
+    launch(
+        _compute_delta_s_kernel,
+        grid_delta,
         q_mean,
         k,
         delta_s,
@@ -271,7 +281,11 @@ def sage_quant_v_f4f4(v, layout="bshd"):
     packed = buf[: b * h_kv * padded_kv_len * FP4_V_PACKED_BYTES_PER_TOKEN].view(
         b, h_kv, nT * tile * FP4_V_PACKED_BYTES_PER_TOKEN
     )
-    sage_quant_v_fp4_colmajor_kernel[(b * h_kv * nT * 8,)](
+    from intj.compat import launch
+
+    launch(
+        sage_quant_v_fp4_colmajor_kernel,
+        (b * h_kv * nT * 8,),
         v_tok,
         packed,
         v_descale,
@@ -326,7 +340,11 @@ def pack_v_mxfp4_colmajor_raw(
     value_bhsd = value.permute(0, 2, 1, 3)
     payload = raw[: batch * heads * tiles * 8192].view(batch, heads, tiles * 8192)
     kperm = _f4f4_v_kperm(value.device)
-    sage_quant_v_mxfp4_colmajor_kernel[(batch * heads * tiles * 16,)](
+    from intj.compat import launch
+
+    launch(
+        sage_quant_v_mxfp4_colmajor_kernel,
+        (batch * heads * tiles * 16,),
         value_bhsd,
         payload,
         scale,
@@ -449,7 +467,11 @@ def sage_quant_mxfp6(
         K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
         v_scale = v.abs().amax(dim=1).to(torch.float32) / FP8_MAX
         grid = (b * h_kv * K_NUM_BLKS,)
-        sage_quant_v_kernel[grid](
+        from intj.compat import launch
+
+        launch(
+            sage_quant_v_kernel,
+            grid,
             v,
             v_quantized,
             v_scale,
@@ -601,7 +623,11 @@ def sage_quant(
     grid = (q_task_count + k_task_count + v_task_count,)
 
     # call sage_quant_kernel
-    sage_quant_kernel[grid](
+    from intj.compat import launch
+
+    launch(
+        sage_quant_kernel,
+        grid,
         q,
         q_int8,
         q_scale,
@@ -722,7 +748,11 @@ def rotation_smooth_qk(
     stride_kob, stride_kon, stride_koh, stride_kod = map_dims(K_rot.stride(), bshd)
     # rotate q and optionally smooth
     grid_q = (b * h_q, Q_NUM_BLKS, d // BLOCK_R)
-    _rot_q_kernel[grid_q](
+    from intj.compat import launch
+
+    launch(
+        _rot_q_kernel,
+        grid_q,
         q,
         Q_rot,
         q_mean,
@@ -752,7 +782,9 @@ def rotation_smooth_qk(
 
     # rotate k
     grid_k = (b * h_k, K_NUM_BLKS, d // BLOCK_R)
-    _rot_k_only_kernel[grid_k](
+    launch(
+        _rot_k_only_kernel,
+        grid_k,
         k,
         K_rot,
         R,
@@ -784,7 +816,9 @@ def rotation_smooth_qk(
         # = Q_rot x K_rot + q_mean x K_rot
         # = Q_rot x K_rot + delta_s
         grid_delta = (b * h_q, Q_NUM_BLKS, K_NUM_BLKS)
-        _compute_delta_s_kernel[grid_delta](
+        launch(
+            _compute_delta_s_kernel,
+            grid_delta,
             q_mean,
             K_rot,
             delta_s,
@@ -871,7 +905,11 @@ def smooth_rotate_downcast_qk(
     stride_ksb, stride_ksn, stride_ksh, stride_ksd = map_dims(K_descale.stride(), bshd)
 
     grid_q = (b * h_q * Q_NUM_BLKS,)
-    _rotate_quantize_q_kernel[grid_q](
+    from intj.compat import launch
+
+    launch(
+        _rotate_quantize_q_kernel,
+        grid_q,
         q,
         Q_q,
         Q_descale,
@@ -908,7 +946,9 @@ def smooth_rotate_downcast_qk(
     )
 
     grid_k = (b * h_k * K_NUM_BLKS,)
-    _rotate_quantize_k_kernel[grid_k](
+    launch(
+        _rotate_quantize_k_kernel,
+        grid_k,
         q,
         Q_q,
         Q_descale,
@@ -963,7 +1003,9 @@ def smooth_rotate_downcast_qk(
 
     if q_smoothing:
         grid_delta = (b * h_q, Q_NUM_BLKS, K_NUM_BLKS)
-        _compute_delta_s_kernel[grid_delta](
+        launch(
+            _compute_delta_s_kernel,
+            grid_delta,
             q_mean,
             k,
             delta_s,

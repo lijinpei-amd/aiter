@@ -6,6 +6,7 @@ import math
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
@@ -138,15 +139,15 @@ def gemm_afp8wfp8(
     else:
         y_pp = None
 
-    grid = lambda META: (
+    grid = (
         (
-            META["NUM_KSPLIT"]
-            * triton.cdiv(M, META["BLOCK_SIZE_M"])
-            * triton.cdiv(N, META["BLOCK_SIZE_N"])
+            config["NUM_KSPLIT"]
+            * triton.cdiv(M, config["BLOCK_SIZE_M"])
+            * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
 
-    _gemm_afp8wfp8_kernel[grid](
+    _intj_launch(_gemm_afp8wfp8_kernel, grid,
         x,
         w_t,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -182,7 +183,7 @@ def gemm_afp8wfp8(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _gemm_splitk_reduce_kernel[grid_reduce](
+        _intj_launch(_gemm_splitk_reduce_kernel, grid_reduce,
             y_pp,
             y,
             None,
@@ -324,11 +325,11 @@ def gemm_afp8wfp8_preshuffle(
     else:
         y_pp = None
 
-    grid = lambda META: (
+    grid = (
         (
-            META["NUM_KSPLIT"]
-            * triton.cdiv(M, META["BLOCK_SIZE_M"])
-            * triton.cdiv(N, META["BLOCK_SIZE_N"])
+            config["NUM_KSPLIT"]
+            * triton.cdiv(M, config["BLOCK_SIZE_M"])
+            * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
     if backend == "gluon":
@@ -418,7 +419,7 @@ def gemm_afp8wfp8_preshuffle(
             num_ctas=num_ctas,
         )
     else:
-        _gemm_afp8wfp8_preshuffle_kernel[grid](
+        _intj_launch(_gemm_afp8wfp8_preshuffle_kernel, grid,
             x,
             w_view,
             y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -454,7 +455,7 @@ def gemm_afp8wfp8_preshuffle(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _gemm_splitk_reduce_kernel[grid_reduce](
+        _intj_launch(_gemm_splitk_reduce_kernel, grid_reduce,
             y_pp,
             y,
             None,

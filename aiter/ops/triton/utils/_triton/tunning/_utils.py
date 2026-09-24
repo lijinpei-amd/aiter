@@ -4,6 +4,7 @@ from collections.abc import Callable
 import torch
 import triton
 import triton.language as tl
+from intj.compat import launch as _intj_launch
 from triton.testing import runtime
 
 
@@ -26,7 +27,7 @@ def run_profile(fn: Callable, n_run: int = 250):
     d = torch.empty(128, dtype=torch.float32, device="cuda")
     cache.zero_()
     di.synchronize()
-    split_dummy[(128,)](d)
+    _intj_launch(split_dummy, (128,), d)
     di.synchronize()
 
 

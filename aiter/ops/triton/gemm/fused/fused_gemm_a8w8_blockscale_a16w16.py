@@ -3,6 +3,7 @@
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_a8w8_blockscale_a16w16 import (
     _fused_gemm_a8w8_blockscale_a16w16_kernel,
@@ -121,17 +122,17 @@ def fused_gemm_a8w8_blockscale_a16w16(
     config["GROUP_N"] = triton.next_power_of_2(triton.cdiv(N_fp8, w_fp8_scale.shape[1]))
 
     # grid = (config["NUM_KSPLIT"], triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
-    grid = lambda META: (
+    grid = (
         (
-            META["NUM_KSPLIT"]
-            * triton.cdiv(M, META["BLOCK_SIZE_M"])
+            config["NUM_KSPLIT"]
+            * triton.cdiv(M, config["BLOCK_SIZE_M"])
             * (
-                triton.cdiv(N_fp8, META["BLOCK_SIZE_N"])
-                + triton.cdiv(N_bf16, META["BLOCK_SIZE_N"])
+                triton.cdiv(N_fp8, config["BLOCK_SIZE_N"])
+                + triton.cdiv(N_bf16, config["BLOCK_SIZE_N"])
             )
         ),
     )
-    _fused_gemm_a8w8_blockscale_a16w16_kernel[grid](
+    _intj_launch(_fused_gemm_a8w8_blockscale_a16w16_kernel, grid,
         x_fp8,
         w_fp8,
         bias_fp8,
@@ -182,7 +183,7 @@ def fused_gemm_a8w8_blockscale_a16w16(
             triton.cdiv(N_fp8, REDUCE_BLOCK_SIZE_N)
             + triton.cdiv(N_bf16, REDUCE_BLOCK_SIZE_N),
         )
-        _fused_gemm_a8w8_blockscale_a16w16_reduce_kernel[grid_reduce](
+        _intj_launch(_fused_gemm_a8w8_blockscale_a16w16_reduce_kernel, grid_reduce,
             bias_fp8,
             y_fp8_pp,
             y_fp8,

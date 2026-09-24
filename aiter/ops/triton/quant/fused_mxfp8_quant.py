@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+from functools import cache
+
 import torch
 import triton
 
@@ -17,6 +19,16 @@ __all__ = [
 ]
 
 _QUANT_BLOCK_SIZE = 32
+
+
+@cache
+def _intj_launcher(kernel, device: int, grid_dims: int):
+    from intj import make_launcher
+
+    with torch.cuda.device(device):
+        return make_launcher(
+            kernel, grid_arg=grid_dims, bind_device=True
+        ).bind_device(device)
 
 
 def fused_rms_mxfp8_quant(
@@ -52,26 +64,27 @@ def fused_rms_mxfp8_quant(
         scale = torch.empty((M, Ns), dtype=torch.uint8, device=x.device)
 
     NUM_PRGMS = M
-    grid = (NUM_PRGMS,)
-
-    _fused_rms_mxfp8_kernel[grid](
-        x,
-        weight,
-        y,
-        scale,
-        M,
-        K,
-        x.stride(0),
-        x.stride(1),
-        y.stride(0),
-        y.stride(1),
-        scale.stride(0),
-        scale.stride(1),
-        eps,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-        QUANT_BLOCK_SIZE=_QUANT_BLOCK_SIZE,
-        NUM_PRGMS=NUM_PRGMS,
-    )
+    with torch.cuda.device(x.device):
+        _intj_launcher(_fused_rms_mxfp8_kernel, x.get_device(), 1)(
+            torch.cuda.current_stream().cuda_stream,
+            NUM_PRGMS,
+            x,
+            weight,
+            y,
+            scale,
+            M,
+            K,
+            x.stride(0),
+            x.stride(1),
+            y.stride(0),
+            y.stride(1),
+            scale.stride(0),
+            scale.stride(1),
+            eps,
+            BLOCK_SIZE_K,
+            _QUANT_BLOCK_SIZE,
+            NUM_PRGMS,
+        )
     return y, scale
 
 
@@ -132,36 +145,37 @@ def fused_dual_rmsnorm_mxfp8_quant(
         yk = torch.empty((M, KK), dtype=k.dtype, device=k.device)
 
     NUM_PRGMS = M
-    grid = (NUM_PRGMS,)
-
-    _fused_dual_rmsnorm_mxfp8_quant_kernel[grid](
-        q,
-        k,
-        q_weight,
-        k_weight,
-        yq,
-        sq,
-        yk,
-        M,
-        KQ,
-        KK,
-        q.stride(0),
-        q.stride(1),
-        k.stride(0),
-        k.stride(1),
-        yq.stride(0),
-        yq.stride(1),
-        sq.stride(0),
-        sq.stride(1),
-        yk.stride(0),
-        yk.stride(1),
-        eps_q,
-        eps_k,
-        BLOCK_SIZE_KQ=BLOCK_SIZE_KQ,
-        BLOCK_SIZE_KK=BLOCK_SIZE_KK,
-        QUANT_BLOCK_SIZE=_QUANT_BLOCK_SIZE,
-        NUM_PRGMS=NUM_PRGMS,
-    )
+    with torch.cuda.device(q.device):
+        _intj_launcher(_fused_dual_rmsnorm_mxfp8_quant_kernel, q.get_device(), 1)(
+            torch.cuda.current_stream().cuda_stream,
+            NUM_PRGMS,
+            q,
+            k,
+            q_weight,
+            k_weight,
+            yq,
+            sq,
+            yk,
+            M,
+            KQ,
+            KK,
+            q.stride(0),
+            q.stride(1),
+            k.stride(0),
+            k.stride(1),
+            yq.stride(0),
+            yq.stride(1),
+            sq.stride(0),
+            sq.stride(1),
+            yk.stride(0),
+            yk.stride(1),
+            eps_q,
+            eps_k,
+            BLOCK_SIZE_KQ,
+            BLOCK_SIZE_KK,
+            _QUANT_BLOCK_SIZE,
+            NUM_PRGMS,
+        )
     return yq, sq, yk
 
 
@@ -201,17 +215,20 @@ def fused_flatten_mxfp8_quant(
         (M, N // _QUANT_BLOCK_SIZE), dtype=torch.uint8, device=x.device
     )
 
-    grid = (M, N1)
-    _fused_flatten_mxfp8_quant_kernel[grid](
-        x,
-        out,
-        out_scales,
-        *x.stride(),
-        *out.stride(),
-        *out_scales.stride(),
-        N2,
-        BLOCK_SIZE_N2=BLOCK_SIZE_N2,
-        QUANT_BLOCK_SIZE=_QUANT_BLOCK_SIZE,
-    )
+    with torch.cuda.device(x.device):
+        _intj_launcher(_fused_flatten_mxfp8_quant_kernel, x.get_device(), 2)(
+            torch.cuda.current_stream().cuda_stream,
+            M,
+            N1,
+            x,
+            out,
+            out_scales,
+            *x.stride(),
+            *out.stride(),
+            *out_scales.stride(),
+            N2,
+            BLOCK_SIZE_N2,
+            _QUANT_BLOCK_SIZE,
+        )
 
     return out, out_scales

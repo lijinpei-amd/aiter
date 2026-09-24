@@ -94,7 +94,11 @@ def quant_fp8_blockwise(
         )
 
     grid = (math.ceil(M / block_size), math.ceil(N / block_size))
-    quant_fp8_blockwise_kernel[grid](
+    from intj.compat import launch
+
+    launch(
+        quant_fp8_blockwise_kernel,
+        grid,
         x,
         x_fp8,
         scales,
@@ -157,7 +161,11 @@ def quant_fp8_blockwise_segment_m(
         device=x.device,
     )
     grid = (math.ceil(M / block_size) + batch_size, math.ceil(N / block_size))
-    quant_fp8_blockwise_segment_m_kernel[grid](
+    from intj.compat import launch
+
+    launch(
+        quant_fp8_blockwise_segment_m_kernel,
+        grid,
         x,
         x_fp8,
         scales,
@@ -208,7 +216,11 @@ def quant_fp8_blockwise_for_weight(
         device=w.device,
     )
     grid = (B, math.ceil(M / block_size), math.ceil(N / block_size))
-    quant_fp8_blockwise_for_weight_kernel[grid](
+    from intj.compat import launch
+
+    launch(
+        quant_fp8_blockwise_for_weight_kernel,
+        grid,
         w,
         w_fp8,
         scales,
@@ -258,7 +270,11 @@ def quant_fp8_blockwise_for_act_grad(
     # Same kernel as quant_fp8_blockwise, with DUAL=True to emit the col copy
     # (axis=0) alongside the row copy (axis=1) from a single tile load.
     grid = (math.ceil(M / block_size), math.ceil(N / block_size))
-    quant_fp8_blockwise_kernel[grid](
+    from intj.compat import launch
+
+    launch(
+        quant_fp8_blockwise_kernel,
+        grid,
         x,
         x_fp8_row,
         scales_row,
@@ -318,7 +334,11 @@ def requant_fp8_row_to_col(
     )
 
     grid = (math.ceil(M / block_size), math.ceil(K / block_size))
-    requant_fp8_row_to_col_kernel[grid](
+    from intj.compat import launch
+
+    launch(
+        requant_fp8_row_to_col_kernel,
+        grid,
         x_fp8,
         x_scales,
         y_fp8,

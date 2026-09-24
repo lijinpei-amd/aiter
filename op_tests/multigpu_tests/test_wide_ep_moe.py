@@ -180,6 +180,8 @@ import os
 import time
 from dataclasses import dataclass
 
+from intj.compat import launch as _intj_launch
+
 os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "16G")
 
 import mori
@@ -448,7 +450,7 @@ class TestWideEpMoe:
                 "MORI dispatch capacity changed after route buffers were allocated"
             )
         total = route_shape[0] * route_shape[1]
-        _append_fake_route_kernel[(triton.cdiv(total, 256),)](
+        _intj_launch(_append_fake_route_kernel, (triton.cdiv(total, 256),),
             recv[1],
             recv[3],
             self._fmoe_route_weights,

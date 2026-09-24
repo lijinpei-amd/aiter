@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+from functools import cache
+
 import torch
 import triton
 
@@ -10,6 +12,19 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 __all__ = ["fast_transpose_2d"]
 
 _LOGGER = AiterTritonLogger()
+
+
+@cache
+def _intj_transpose_launcher(device: int):
+    from intj import make_launcher
+
+    with torch.cuda.device(device):
+        return make_launcher(
+            _transpose_2d_kernel,
+            grid_arg=1,
+            bind_device=True,
+            options={"num_warps": 1, "waves_per_eu": 2, "num_stages": 2},
+        ).bind_device(device)
 
 
 def fast_transpose_2d(x: torch.Tensor) -> torch.Tensor:
@@ -28,23 +43,23 @@ def fast_transpose_2d(x: torch.Tensor) -> torch.Tensor:
 
     BLOCK_M = 32
     BLOCK_N = 32
-    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
+    grid_x = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
 
     # num_warps=1: 32×32=1024-element tile is small; benchmarks on MI308X show
     # nw=1/2 tie for best, nw≥4 regresses (nw=16 is 2.5× slower than nw=1).
-    _transpose_2d_kernel[grid](
-        x,
-        out,
-        M,
-        N,
-        x.stride(0),
-        x.stride(1),
-        out.stride(0),
-        out.stride(1),
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        num_warps=1,
-        waves_per_eu=2,
-        num_stages=2,
-    )
+    with torch.cuda.device(x.device):
+        _intj_transpose_launcher(x.get_device())(
+            torch.cuda.current_stream().cuda_stream,
+            grid_x,
+            x,
+            out,
+            M,
+            N,
+            x.stride(0),
+            x.stride(1),
+            out.stride(0),
+            out.stride(1),
+            BLOCK_M,
+            BLOCK_N,
+        )
     return out

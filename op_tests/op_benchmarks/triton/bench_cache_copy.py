@@ -4,6 +4,7 @@ import math
 import torch
 import triton
 import triton.experimental.gluon.language as gl
+from intj.compat import launch as _intj_launch
 from triton.experimental import gluon
 
 from aiter.ops.triton.utils._triton import arch_info
@@ -400,7 +401,7 @@ def benchmark(args):
         )
 
         def fn():
-            simple_tdm_kernel[(num_kv_heads,)](
+            _intj_launch(simple_tdm_kernel, (num_kv_heads,),
                 key_cache_ptr=key_cache_shuffled,
                 y_ptr=y,
                 num_blocks=num_blocks,

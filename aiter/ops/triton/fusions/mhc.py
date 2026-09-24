@@ -4,6 +4,7 @@
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.fusions import (
     _mhc_asymmetric_sinkhorn_kernel,
@@ -262,7 +263,7 @@ def mhc(
         )
 
         grid_split = (triton.cdiv(M, BLOCK_M), num_ksplit)
-        _mhc_fused_split_kernel[grid_split](
+        _intj_launch(_mhc_fused_split_kernel, grid_split,
             x,
             phi,
             acc_partial,
@@ -289,7 +290,7 @@ def mhc(
         )
 
         grid_reduce_apply = (triton.cdiv(M, BLOCK_M), triton.cdiv(C, BLOCK_C))
-        _mhc_reduce_apply_kernel[grid_reduce_apply](
+        _intj_launch(_mhc_reduce_apply_kernel, grid_reduce_apply,
             acc_partial,
             acc_sq_partial,
             alpha_pre,
@@ -331,7 +332,7 @@ def mhc(
         )
     else:
         grid = (triton.cdiv(M, BLOCK_M), total_n_blocks)
-        _mhc_fused_kernel[grid](
+        _intj_launch(_mhc_fused_kernel, grid,
             x,
             phi,
             alpha_pre,
@@ -478,7 +479,7 @@ def mhc_post(
         ), f"out shape mismatch: expected ({M}, {n}, {C}), got {out.shape}"
 
     grid = (triton.cdiv(M, BLOCK_M),)
-    _mhc_post_kernel[grid](
+    _intj_launch(_mhc_post_kernel, grid,
         out,
         layer_input,
         residual,
@@ -757,7 +758,7 @@ def mhc_post_pre(
 
     # --- Launch 1: fused post + partial pre GEMM/sqrsum, one CTA per (M-tile, C-tile).
     grid_split = (triton.cdiv(M, BLOCK_M), NUM_KSPLIT)
-    _mhc_post_pre_split_kernel[grid_split](
+    _intj_launch(_mhc_post_pre_split_kernel, grid_split,
         layer_input,
         residual_in,
         post_mix,
@@ -844,7 +845,7 @@ def mhc_post_pre(
     grid_reduce_apply = (
         triton.cdiv(M, BLOCK_M) * NUM_C_BLOCKS + triton.cdiv(M, BLOCK_M_POST_RES) * 2,
     )
-    _mhc_post_pre_reduce_apply_kernel[grid_reduce_apply](
+    _intj_launch(_mhc_post_pre_reduce_apply_kernel, grid_reduce_apply,
         acc_partial,
         acc_sq_partial,
         alphas,
@@ -1044,7 +1045,7 @@ def _mhc_pre_dsv4_forward(
     sink_cfg = get_tuned_kernel_config(
         "fusions", "MHC_DSV4", "_mhc_asymmetric_sinkhorn_kernel", _SINKHORN_FALLBACK
     )
-    _mhc_asymmetric_sinkhorn_kernel[(M,)](
+    _intj_launch(_mhc_asymmetric_sinkhorn_kernel, (M,),
         raw_comb_flat,
         comb_flat,
         M=M,
@@ -1213,7 +1214,7 @@ def _mhc_head_dsv4_forward(
         "BLOCK_C", head_cfg.kwargs.get("BLOCK_C", min(128, triton.next_power_of_2(C)))
     )
     out = torch.empty(M, C, dtype=residual.dtype, device=residual.device)
-    _mhc_head_kernel[(triton.cdiv(M, BLOCK_M),)](
+    _intj_launch(_mhc_head_kernel, (triton.cdiv(M, BLOCK_M),),
         x,
         fn,
         scale,

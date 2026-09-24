@@ -4,6 +4,7 @@ from typing import NamedTuple
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     kernel_unified_attention_2d,
@@ -467,12 +468,10 @@ def _unified_attention_2d_triton(params: _UAParams):
     else:
         total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
 
-    kernel_unified_attention_2d[
-        (
+    _intj_launch(kernel_unified_attention_2d, (
             params.num_kv_heads,
             total_num_q_blocks,
-        )
-    ](
+        ),
         output_ptr=params.out,
         query_ptr=params.q,
         key_cache_ptr=params.k,
@@ -541,9 +540,7 @@ def _unified_attention_3d_triton(
     else:
         total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
 
-    kernel_unified_attention_3d[
-        (total_num_q_blocks, params.num_kv_heads, NUM_SEGMENTS)
-    ](
+    _intj_launch(kernel_unified_attention_3d, (total_num_q_blocks, params.num_kv_heads, NUM_SEGMENTS),
         segm_output_ptr=segm_output,
         segm_max_ptr=segm_max,
         segm_expsum_ptr=segm_expsum,
@@ -611,7 +608,7 @@ def _reduce_segments_triton(
     head_size_padded = triton.next_power_of_2(params.head_size)
     config = get_unified_attention_config("reduce", params, backend="triton")
 
-    reduce_segments[(params.num_tokens, params.num_query_heads)](
+    _intj_launch(reduce_segments, (params.num_tokens, params.num_query_heads),
         output_ptr=params.out,
         segm_output_ptr=segm_output,
         segm_max_ptr=segm_max,
@@ -704,7 +701,7 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
     # buffer ops need the tensor to fit a 32-bit offset; gfx1250 loads through TDM
     MAX_INT32 = 2**31 - 1
     USE_STORE_BUFFER_OP = params.out.nelement() * params.out.element_size() <= MAX_INT32
-    _unified_attention_kernel_2d_gfx1250[(params.num_kv_heads, total_query_blocks)](
+    _intj_launch(_unified_attention_kernel_2d_gfx1250, (params.num_kv_heads, total_query_blocks),
         query_ptr=params.q,
         key_cache_ptr=params.k,
         value_cache_ptr=params.v,
@@ -780,9 +777,7 @@ def _unified_attention_3d_gfx1250(
     else:
         total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
 
-    _unified_attention_kernel_3d_gfx1250[
-        (total_num_q_blocks, params.num_kv_heads, NUM_SEGMENTS)
-    ](
+    _intj_launch(_unified_attention_kernel_3d_gfx1250, (total_num_q_blocks, params.num_kv_heads, NUM_SEGMENTS),
         segm_output_ptr=segm_output,
         segm_max_ptr=segm_max,
         segm_expsum_ptr=segm_expsum,
@@ -863,7 +858,7 @@ def _reduce_segments_gfx1250(
     gluon_num_warps = 8 if params.num_query_heads % 8 == 0 else 4
     config = get_unified_attention_config("reduce", params, backend="gluon")
 
-    _reduce_segments_kernel_gfx1250[(params.num_tokens,)](
+    _intj_launch(_reduce_segments_kernel_gfx1250, (params.num_tokens,),
         output_ptr=params.out,
         segm_output_ptr=segm_output,
         segm_max_ptr=segm_max,

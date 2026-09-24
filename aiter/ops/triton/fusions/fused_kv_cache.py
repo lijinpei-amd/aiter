@@ -5,6 +5,7 @@ import os
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
     _fused_qk_rope_cat_and_cache_mla_kernel as triton_fused_qk_rope_cat_and_cache_mla_kernel,
@@ -275,7 +276,7 @@ def fused_qk_rope_cat_and_cache_mla(
     else:
         _kernel = triton_fused_qk_rope_cat_and_cache_mla_kernel
 
-    _kernel[grid](
+    _intj_launch(_kernel, grid,
         q_nope,
         q_pe,
         k_nope,
@@ -574,7 +575,7 @@ def fused_qk_rope_reshape_and_cache(
             "KH_BLOCK": max(1, BLOCK_H // (qh // kh)),
         }
     grid = (n_pid, 1, 1)
-    _kernel[grid](
+    _intj_launch(_kernel, grid,
         q,
         k,
         v,
@@ -739,7 +740,7 @@ def fused_qk_rope_cosine_cache_llama(
 
     n_pid = t * qh + (t_slot - t) * kh
     grid = (n_pid, 1, 1)
-    _fused_qk_rope_cosine_cache_llama_kernel[grid](
+    _intj_launch(_fused_qk_rope_cosine_cache_llama_kernel, grid,
         q,
         k,
         v,

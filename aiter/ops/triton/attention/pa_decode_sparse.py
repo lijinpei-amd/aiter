@@ -11,6 +11,7 @@ import math
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla import (
     _sparse_mla as _sparse_mla_gfx950,
@@ -338,7 +339,7 @@ def pa_decode_sparse(
         reduce_impl = triton_pa_decode_sparse_reduce
 
     grid_attn = (T, n_head_blocks, kv_splits)
-    impl[grid_attn](
+    _intj_launch(impl, grid_attn,
         q,
         unified_kv,
         kv_scales_arg,
@@ -401,7 +402,7 @@ def pa_decode_sparse(
     block_h_reduce = 1
     grid_reduce = (T, triton.cdiv(H, block_h_reduce))
 
-    reduce_impl[grid_reduce](
+    _intj_launch(reduce_impl, grid_reduce,
         m_partial,
         l_partial,
         acc_partial,
@@ -649,7 +650,7 @@ def _pa_decode_sparse_gfx950_gluon(
     # Grid dim 0 varies fastest and XCD assignment is round-robin over the linear
     # workgroup id, so the axis order decides what shares an XCD's L2.
     grid = (num_queries, num_splits, heads_blocks)
-    _sparse_mla_gfx950[grid](
+    _intj_launch(_sparse_mla_gfx950, grid,
         q,
         cache,
         main_bf16,
@@ -725,7 +726,7 @@ def _pa_decode_sparse_gfx950_gluon(
 
     # One head per reduce workgroup
     rgrid = (num_queries, num_heads)
-    _sparse_mla_reduce_gfx950[rgrid](
+    _intj_launch(_sparse_mla_reduce_gfx950, rgrid,
         part_m,
         part_l,
         part_acc,

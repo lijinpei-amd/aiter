@@ -13,6 +13,7 @@ import torch
 
 # Triton
 import triton
+from intj.compat import launch as _intj_launch
 from torch import Tensor
 
 # AITER: GMM Triton kernels
@@ -259,7 +260,7 @@ def gmm(
     )
 
     # fmt: off
-    gmm_kernel[grid](
+    _intj_launch(gmm_kernel, grid,
         # Tensor pointers:
         lhs, rhs, group_sizes, out, bias, tile_counter,
         # Tensor shapes:
@@ -477,7 +478,7 @@ def ptgmm(
     )
 
     # fmt: off
-    tgmm_persistent_kernel[grid](
+    _intj_launch(tgmm_persistent_kernel, grid,
         # Tensor pointers:
         lhs, rhs, group_sizes, out, bias_grad_ptr,
         # Tensor shapes:
@@ -672,7 +673,7 @@ def nptgmm(
     )
 
     # fmt: off
-    tgmm_non_persistent_kernel[grid](
+    _intj_launch(tgmm_non_persistent_kernel, grid,
         # Tensor pointers:
         lhs, rhs, group_sizes, out, bias_grad_ptr,
         # Tensor shapes:

@@ -12,6 +12,7 @@ import math
 import torch
 import triton
 import triton.language as tl
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.topk import (
     _topk_kernel,
@@ -42,7 +43,7 @@ def one_stage_topk(
 
     out_v = torch.empty((B, k), device=x.device, dtype=x.dtype)
     out_i = torch.empty((B, k), device=x.device, dtype=torch.int64)
-    _topk_kernel[(B,)](
+    _intj_launch(_topk_kernel, (B,),
         x.contiguous(),
         out_v,
         out_i,
@@ -87,10 +88,7 @@ def two_stage_topk(x, k, dim=-1, largest=True):
     stage2_out = torch.empty(out_shape, device=x.device, dtype=x.dtype)
     stage2_out_idx = torch.empty(out_shape, device=x.device, dtype=torch.int64)
 
-    topk_stage1_kernel[
-        batch_size,
-        chunk_num,
-    ](
+    _intj_launch(topk_stage1_kernel, (batch_size, chunk_num),
         stage1_out,  # pointer to the output
         stage1_out_idx,  # pointer to the output
         x,  # pointer to the input
@@ -109,7 +107,7 @@ def two_stage_topk(x, k, dim=-1, largest=True):
     BLOCK_SIZE = triton.next_power_of_2(stage2_elem_cnt)
 
     (
-        topk_stage2_kernel[batch_size,](
+        _intj_launch(topk_stage2_kernel, (batch_size,),
             stage2_out,
             stage2_out_idx,
             stage1_out,

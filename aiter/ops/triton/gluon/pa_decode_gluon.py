@@ -6,6 +6,7 @@ from functools import lru_cache
 import torch
 import triton
 import triton.language as tl
+from intj.compat import launch as _intj_launch
 from triton.language.extra.hip import libdevice as hip_libdevice
 
 import aiter
@@ -4355,7 +4356,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
                 QUERY_SEQ_LEN_POW2 = triton.cdiv(QUERY_SEQ_LEN_POW2, mtp_splits)
         else:
             paged_attention_kernel = paged_attention_decode_sliding_window
-        paged_attention_kernel[grid](
+        _intj_launch(paged_attention_kernel, grid,
             exp_sums_ptr,
             max_logits_ptr,
             output_ptr,
@@ -4424,7 +4425,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         paged_attention_kernel = paged_attention_decode_v2_gluon_dot_kernel
 
     # Launch the dot kernel
-    paged_attention_kernel[grid](
+    _intj_launch(paged_attention_kernel, grid,
         exp_sums_ptr,
         max_logits_ptr,
         output_ptr,
@@ -4589,7 +4590,7 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
             )
             return
         ps_reduce_grid = (grid[0], grid[1], query_seq_len * query_group_size)
-        paged_attention_decode_ps_reduce_kernel[ps_reduce_grid](
+        _intj_launch(paged_attention_decode_ps_reduce_kernel, ps_reduce_grid,
             output_ptr,
             exp_sums_ptr,
             max_logits_ptr,
@@ -4614,7 +4615,7 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
             MAX_CONTEXT_PARTITION_NUM=triton.next_power_of_2(context_partition_num),
         )
     else:
-        paged_attention_decode_v2_reduce_kernel[grid](
+        _intj_launch(paged_attention_decode_v2_reduce_kernel, grid,
             output_ptr,
             exp_sums_ptr,
             max_logits_ptr,

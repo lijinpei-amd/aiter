@@ -1,5 +1,6 @@
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.rope.fused_qkv_split_qk_rope import (
     _fused_qkv_split_qk_rope_kernel,
@@ -56,7 +57,7 @@ def fused_qkv_split_qk_rope(
     waves_per_eu = 0
     grid = (triton.cdiv(T, BLOCK_T), qh, 1)
 
-    _fused_qkv_split_qk_rope_kernel[grid](
+    _intj_launch(_fused_qkv_split_qk_rope_kernel, grid,
         qkv,
         cos,
         sin,

@@ -5,6 +5,7 @@
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 from torch import Tensor
 
 from aiter import dtypes
@@ -156,7 +157,7 @@ def _quantize_per_tensor(
     partial = input.new_empty((blocks,), dtype=torch.float32)
     scale = input.new_empty((1,), dtype=torch.float32)
     output = input.new_empty(input.shape, dtype=output_dtype)
-    mha_v4_per_tensor_amax_kernel[(blocks,)](
+    _intj_launch(mha_v4_per_tensor_amax_kernel, (blocks,),
         input,
         partial,
         numel,
@@ -164,7 +165,7 @@ def _quantize_per_tensor(
         num_warps=8,
     )
     scale_block = triton.next_power_of_2(blocks)
-    mha_v4_per_tensor_scale_kernel[(1,)](
+    _intj_launch(mha_v4_per_tensor_scale_kernel, (1,),
         partial,
         scale,
         blocks,
@@ -172,7 +173,7 @@ def _quantize_per_tensor(
         BLOCK_SIZE=scale_block,
         num_warps=8,
     )
-    mha_v4_per_tensor_quant_kernel[(blocks,)](
+    _intj_launch(mha_v4_per_tensor_quant_kernel, (blocks,),
         input,
         output,
         scale,
@@ -469,7 +470,7 @@ def quantize_v_fp8(input: Tensor) -> tuple[Tensor, Tensor]:
         (batch * heads, scale_blocks, head_dim), dtype=torch.float32
     )
     scale = input.new_empty((batch, heads, head_dim), dtype=torch.float32)
-    sage_quant_v_amax_partial_kernel[(batch * heads * scale_blocks,)](
+    _intj_launch(sage_quant_v_amax_partial_kernel, (batch * heads * scale_blocks,),
         input,
         partial,
         input.stride(0),
@@ -483,7 +484,7 @@ def quantize_v_fp8(input: Tensor) -> tuple[Tensor, Tensor]:
         BLOCK_K=scale_block_k,
         num_warps=8,
     )
-    sage_quant_v_amax_finalize_kernel[(triton.cdiv(head_dim, 32), batch * heads)](
+    _intj_launch(sage_quant_v_amax_finalize_kernel, (triton.cdiv(head_dim, 32), batch * heads),
         partial,
         scale,
         scale_blocks,
@@ -496,7 +497,7 @@ def quantize_v_fp8(input: Tensor) -> tuple[Tensor, Tensor]:
     block_k = 64
     blocks = triton.cdiv(sequence, block_k)
     quantized = torch.empty_like(input, dtype=dtypes.fp8)
-    sage_quant_v_kernel[(batch * heads * blocks,)](
+    _intj_launch(sage_quant_v_kernel, (batch * heads * blocks,),
         input,
         quantized,
         scale,

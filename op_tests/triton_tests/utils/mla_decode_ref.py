@@ -25,6 +25,7 @@ It supports page size = 1.
 
 import triton
 import triton.language as tl
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
@@ -200,7 +201,7 @@ def _decode_att_m_fwd(
     BLOCK_DMODEL = triton.next_power_of_2(Lk)
     BLOCK_DV = triton.next_power_of_2(Lv)
 
-    _fwd_kernel_stage1[grid](
+    _intj_launch(_fwd_kernel_stage1, grid,
         q,
         k_buffer,
         v_buffer,
@@ -440,7 +441,7 @@ def _decode_grouped_att_m_fwd(
             extra_kargs["kpack"] = 1
         num_stages = 1
 
-    _fwd_grouped_kernel_stage1[grid](
+    _intj_launch(_fwd_grouped_kernel_stage1, grid,
         q,
         k_buffer,
         v_buffer,
@@ -555,7 +556,7 @@ def _decode_softmax_reducev_fwd(
             extra_kargs["kpack"] = 1
 
     grid = (batch, head_num)
-    _fwd_kernel_stage2[grid](
+    _intj_launch(_fwd_kernel_stage2, grid,
         logits,
         o,
         kv_indptr,

@@ -20,6 +20,7 @@ from collections.abc import Sequence
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule import (
     _fused_recurrent_gated_delta_rule_fwd_kernel,
@@ -178,7 +179,7 @@ def fused_recurrent_gated_delta_rule(
 
     # Launch kernel
     grid = (NV, N * HV)
-    _fused_recurrent_gated_delta_rule_fwd_kernel[grid](
+    _intj_launch(_fused_recurrent_gated_delta_rule_fwd_kernel, grid,
         q=q,
         k=k,
         v=v,

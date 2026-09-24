@@ -82,7 +82,11 @@ def static_per_tensor_quant_fp8_i8(
         BLOCK_N = min(cols_pow2, 512)
         BLOCK_M = max(1, min(triton.next_power_of_2(rows), 2048 // BLOCK_N))
     grid = (triton.cdiv(rows, BLOCK_M), triton.cdiv(cols, BLOCK_N))
-    _static_per_tensor_quant_fp8_i8_kernel[grid](
+    from intj.compat import launch
+
+    launch(
+        _static_per_tensor_quant_fp8_i8_kernel,
+        grid,
         q2d,
         x2d,
         scale_in,
@@ -118,7 +122,11 @@ def dynamic_per_tensor_quant_fp8_i8(
     rows = x_in.shape[0]
     cols = x_in.shape[1]
     NUM_COL_POW2 = triton.next_power_of_2(cols)
-    _dynamic_per_tensor_quant_fp8_i8_kernel[(rows,)](
+    from intj.compat import launch
+
+    launch(
+        _dynamic_per_tensor_quant_fp8_i8_kernel,
+        (rows,),
         x_in,
         scale_out,
         cols,
@@ -159,7 +167,11 @@ def dynamic_per_token_quant_fp8_i8(
     cols = x_in.shape[1]
     NUM_COL_POW2 = triton.next_power_of_2(cols)
     grid = (rows,)
-    _dynamic_per_token_quant_fp8_i8_kernel[grid](
+    from intj.compat import launch
+
+    launch(
+        _dynamic_per_token_quant_fp8_i8_kernel,
+        grid,
         qx,
         scale_out,
         x_in,
@@ -313,7 +325,11 @@ def dynamic_mxfp4_quant(
         triton.cdiv(N, BLOCK_SIZE_N * NUM_ITER),
     )
 
-    _dynamic_mxfp4_quant_kernel[grid](
+    from intj.compat import launch
+
+    launch(
+        _dynamic_mxfp4_quant_kernel,
+        grid,
         x,
         x_fp4,
         blockscale_e8m0,
@@ -386,7 +402,11 @@ def dynamic_mxfp4_quant_blockscale(
 
     # Each program owns one fixed 32x32 scale tile.
     grid = (M // block_size, N // block_size)
-    _dynamic_mxfp4_quant_blockscale_kernel[grid](
+    from intj.compat import launch
+
+    launch(
+        _dynamic_mxfp4_quant_blockscale_kernel,
+        grid,
         x,
         x_fp4,
         blockscale_e8m0,
@@ -442,7 +462,11 @@ def dynamic_mxfp8_quant(
     NUM_PRGMS = min(M, 32768)
     grid = (NUM_PRGMS,)
 
-    _dynamic_mxfp8_quant_kernel[grid](
+    from intj.compat import launch
+
+    launch(
+        _dynamic_mxfp8_quant_kernel,
+        grid,
         x2d,
         y,
         scale,
@@ -503,7 +527,11 @@ def dynamic_mxfp8_quant_n32k4_mbn(
 
     BLOCK_SIZE_N = triton.next_power_of_2(K)
     grid = (R,)
-    _dynamic_mxfp8_quant_n32k4_mbn_kernel[grid](
+    from intj.compat import launch
+
+    launch(
+        _dynamic_mxfp8_quant_n32k4_mbn_kernel,
+        grid,
         x2d,
         y,
         scale,
@@ -561,7 +589,11 @@ def fp8_legacy_to_mxfp8(
     BLOCK_SIZE_M = 1
     grid = (triton.cdiv(M, BLOCK_SIZE_M), Ns)
 
-    _fp8_legacy_to_mxfp8_kernel[grid](
+    from intj.compat import launch
+
+    launch(
+        _fp8_legacy_to_mxfp8_kernel,
+        grid,
         x_fnuz,
         x_scale_fp32,
         y_fn,
@@ -644,7 +676,11 @@ def dynamic_nvfp4_quant(
         triton.cdiv(N, BLOCK_SIZE_N * NUM_ITER),
     )
 
-    _dynamic_nvfp4_quant_kernel[grid](
+    from intj.compat import launch
+
+    launch(
+        _dynamic_nvfp4_quant_kernel,
+        grid,
         x,
         x_fp4,
         blockscale_e4m3,

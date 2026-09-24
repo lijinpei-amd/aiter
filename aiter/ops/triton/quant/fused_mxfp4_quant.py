@@ -167,6 +167,8 @@ def fused_rms_mxfp4_quant(
         "SHUFFLE_PAD": use_scale_shuffle_padding,
     }
 
+    from intj.compat import launch
+
     if use_gluon:
         # Aim for at least 32 CTAs to keep all WGPs fed.
         _TARGET_MIN_CTAS = 32
@@ -174,14 +176,18 @@ def fused_rms_mxfp4_quant(
         while ROWS_PER_CTA > 1 and M % ROWS_PER_CTA != 0:
             ROWS_PER_CTA //= 2
         grid = (triton.cdiv(M, ROWS_PER_CTA) * (1 if x2 is None else 2),)
-        _gluon_fused_rms_mxfp4_quant_kernel[grid](
+        launch(
+            _gluon_fused_rms_mxfp4_quant_kernel,
+            grid,
             *_common_args,
             **_common_kwargs,
             ROWS_PER_CTA=ROWS_PER_CTA,
         )
     else:
         grid = (M * (1 if x2 is None else 2),)
-        _fused_rms_mxfp4_quant_kernel[grid](
+        launch(
+            _fused_rms_mxfp4_quant_kernel,
+            grid,
             *_common_args,
             **_common_kwargs,
         )
@@ -219,7 +225,11 @@ def fused_flatten_mxfp4_quant(
         M,
         N1,
     )
-    _fused_flatten_mxfp4_quant[grid](
+    from intj.compat import launch
+
+    launch(
+        _fused_flatten_mxfp4_quant,
+        grid,
         x,
         out,
         out_block_scales,
@@ -368,7 +378,11 @@ def fused_reduce_act_mul_and_mxfp4_quant(
         num_pid += triton.cdiv(M, BLOCK_SIZE_M2) * triton.cdiv(N2, BLOCK_SIZE_N2)
 
     grid = (num_pid,)
-    _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel[grid](
+    from intj.compat import launch
+
+    launch(
+        _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel,
+        grid,
         x,
         y,
         y_scale,
@@ -566,7 +580,11 @@ def fused_reduce_rms_mxfp4_quant(
         else _fused_reduce_rms_mxfp4_quant_kernel
     )
 
-    kernel[grid](
+    from intj.compat import launch
+
+    launch(
+        kernel,
+        grid,
         x1,
         x1_weight,
         x2,
@@ -700,7 +718,11 @@ def fused_dynamic_mxfp4_quant_moe_sort(
         else _fused_dynamic_mxfp4_quant_moe_sort_kernel
     )
 
-    kernel[(num_pid,)](
+    from intj.compat import launch
+
+    launch(
+        kernel,
+        (num_pid,),
         x,
         x_fp4,
         sorted_ids,
@@ -910,7 +932,11 @@ def fused_quant_fp8_sort(
         triton.cdiv(N_o, BLOCK_SIZE_N),  # 8
     )
 
-    _fused_quant_fp8_sort_kernel[grid](
+    from intj.compat import launch
+
+    launch(
+        _fused_quant_fp8_sort_kernel,
+        grid,
         input,
         sorted_ids,
         num_valid_ids,

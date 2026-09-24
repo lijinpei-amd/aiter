@@ -1,4 +1,5 @@
 import torch
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.fusions.fused_qk_concat import (
     _qk_cat_kernel,
@@ -55,7 +56,7 @@ def fused_qk_cat(
 
     grid = (b, qh, 1)
 
-    _qk_cat_kernel[grid](
+    _intj_launch(_qk_cat_kernel, grid,
         q1,
         q2,
         k1,
@@ -139,7 +140,7 @@ def fused_qk_rope_cat(
 
     grid = (b, qh, 1)
 
-    _qk_rope_cat_kernel[grid](
+    _intj_launch(_qk_rope_cat_kernel, grid,
         q_nope,
         q_pe,
         k_nope,

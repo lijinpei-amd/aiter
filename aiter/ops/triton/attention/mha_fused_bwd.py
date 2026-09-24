@@ -3,6 +3,7 @@
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.attention.mha_fused_bwd import (
     _bwd_kernel_dkdvdq_causal,
@@ -181,7 +182,7 @@ def flash_attn_fused_backward(
         num_q_heads,
     )
 
-    _bwd_preprocess[pre_grid](
+    _intj_launch(_bwd_preprocess, pre_grid,
         o,
         do,
         delta,
@@ -224,7 +225,7 @@ def flash_attn_fused_backward(
     if causal:
         grid_dkdvdq = (batch * num_q_heads * num_k_pids,)
 
-        _bwd_kernel_dkdvdq_causal[grid_dkdvdq](
+        _intj_launch(_bwd_kernel_dkdvdq_causal, grid_dkdvdq,
             q,
             k,
             v,
@@ -273,7 +274,7 @@ def flash_attn_fused_backward(
     else:
         # in non causal inner loop over grouped q heads
         grid_dkdvdq = (batch * num_k_heads * num_k_pids,)
-        _bwd_kernel_dkdvdq_noncausal[grid_dkdvdq](
+        _intj_launch(_bwd_kernel_dkdvdq_noncausal, grid_dkdvdq,
             q,
             k,
             v,

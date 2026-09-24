@@ -8,6 +8,7 @@ eliminating q/k/v intermediate HBM traffic and kernel launch overhead.
 """
 
 import torch
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_conv_recurrent_norm import (
     fused_conv_recurrent_norm_kernel,
@@ -80,7 +81,7 @@ def fused_kda_decode(
     stride_og_tok = out_gate.stride(0)
 
     grid = (batch, H)
-    fused_conv_recurrent_norm_kernel[grid](
+    _intj_launch(fused_conv_recurrent_norm_kernel, grid,
         mixed_qkv,
         conv_weight,
         conv_state,

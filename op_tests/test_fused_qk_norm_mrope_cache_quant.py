@@ -6,6 +6,7 @@ import argparse
 import torch
 import triton
 import triton.language as tl
+from intj.compat import launch as _intj_launch
 from torch import Tensor
 
 import aiter
@@ -156,7 +157,7 @@ def set_kv_cache_shuffle_layout(
     new_value_cache = v_cache.view_as(v_cache_template)
 
     grid = (num_tokens, num_kv_heads)
-    set_kv_cache_shuffle_kernel[grid](
+    _intj_launch(set_kv_cache_shuffle_kernel, grid,
         k_quantized,
         v_quantized,
         new_key_cache,

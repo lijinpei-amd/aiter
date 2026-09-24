@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import torch
 import triton
 import triton.language as tl
+from intj.compat import launch as _intj_launch
 
 
 @triton.jit
@@ -189,7 +190,7 @@ def plan_pa_decode(
             raise ValueError("query_length must match the reused plan")
     plan.validate(batch, num_kv_heads, dev)
     with torch.cuda.device(dev):
-        _plan_pa_decode[(batch,)](
+        _intj_launch(_plan_pa_decode, (batch,),
             context_lengths,
             plan.work_info,
             plan.reduce_info,

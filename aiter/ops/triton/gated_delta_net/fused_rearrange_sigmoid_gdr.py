@@ -11,6 +11,7 @@ import os
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_rearrange_sigmoid_gdr import (
     fused_rearrange_sigmoid_gated_delta_rule_update_kernel,
@@ -313,7 +314,7 @@ def fused_rearrange_sigmoid_gated_delta_rule(
     stride_qkv_l, stride_qkv_hd = qkv.stride()
 
     grid = (NK, NV, N * HV)
-    fused_rearrange_sigmoid_gated_delta_rule_update_kernel[grid](
+    _intj_launch(fused_rearrange_sigmoid_gated_delta_rule_update_kernel, grid,
         A_log=A_log,
         a=a.contiguous(),
         b=b.contiguous(),

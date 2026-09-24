@@ -23,6 +23,7 @@ It supports page size = 1 and prefill with KV cache (i.e. extend).
 import torch
 import triton
 import triton.language as tl
+from intj.compat import launch as _intj_launch
 
 # from sglang.srt.layers.attention.triton_ops.prefill_attention import (
 #     context_attention_fwd,
@@ -381,7 +382,7 @@ def extend_attention_fwd(
     if _is_hip:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
 
-    _fwd_kernel[grid](
+    _intj_launch(_fwd_kernel, grid,
         q_extend,
         k_extend,
         v_extend,

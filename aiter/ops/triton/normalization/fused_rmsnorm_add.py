@@ -4,6 +4,7 @@
 
 import torch
 import triton
+from intj.compat import launch as _intj_launch
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._gluon_kernels.gfx1250.norm.fused_rmsnorm_add import (
@@ -61,7 +62,7 @@ def _fused_rmsnorm_add_core(x, weight, epsilon, res1):
 
         BLOCK_SIZE_M = 1
         grid = (triton.cdiv(M, BLOCK_SIZE_M),)
-        _gluon_fused_rms_kernel[grid](
+        _intj_launch(_gluon_fused_rms_kernel, grid,
             x,
             weight,
             res1,
@@ -81,7 +82,7 @@ def _fused_rmsnorm_add_core(x, weight, epsilon, res1):
     else:
 
         grid = (M,)
-        _triton_fused_rms_kernel[grid](
+        _intj_launch(_triton_fused_rms_kernel, grid,
             x,
             weight,
             res1,

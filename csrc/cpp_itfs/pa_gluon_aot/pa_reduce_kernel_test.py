@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+from intj.compat import launch as _intj_launch
 from jinja2 import Template
 
 import aiter
@@ -267,7 +268,7 @@ def run_direct_kernel(
     kernel = paged_attention_decode_v2_reduce_kernel
 
     # Launch the kernel directly
-    kernel[grid](
+    _intj_launch(kernel, grid,
         output_5d,
         exp_sums,
         max_logits,

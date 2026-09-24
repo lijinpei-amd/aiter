@@ -9,6 +9,7 @@ from typing import Literal
 import torch
 import triton
 import triton.language as tl
+from intj.compat import launch as _intj_launch
 from packaging.version import Version
 
 from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
@@ -441,7 +442,7 @@ def _gluon_flash_attn_forward(
 
     grid = (batch * num_q_heads * triton.cdiv(seqlen_q, BLOCK_M), 1)
 
-    _gluon_attn_fwd[grid](
+    _intj_launch(_gluon_attn_fwd, grid,
         q,
         k,
         v,
@@ -712,11 +713,9 @@ def _flash_attn_forward(
                 config.get("num_stages", 1),
             )
 
-        grid = lambda META: (
-            batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),
-        )
+        grid = (batch * num_q_heads * triton.cdiv(seqlen_q, config["BLOCK_M"]),)
 
-        _attn_fwd[grid](
+        _intj_launch(_attn_fwd, grid,
             q,
             k,
             v,

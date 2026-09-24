@@ -29,6 +29,7 @@ Supports both MHA (kv_group_num==1) and GQA/MQA/MLA (kv_group_num>1).
 import torch
 import triton
 import triton.language as tl
+from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -260,7 +261,7 @@ def _decode_att_m_fwd(
         BLOCK_DPE = 0
     BLOCK_DV = triton.next_power_of_2(Lv)
 
-    _fwd_kernel_stage1[grid](
+    _intj_launch(_fwd_kernel_stage1, grid,
         q,
         k_buffer,
         v_buffer,
@@ -541,7 +542,7 @@ def _decode_grouped_att_m_fwd(
         if BLOCK_DMODEL >= 512:
             num_warps = 2
 
-    _fwd_grouped_kernel_stage1[grid](
+    _intj_launch(_fwd_grouped_kernel_stage1, grid,
         q,
         k_buffer,
         v_buffer,
@@ -672,7 +673,7 @@ def _decode_softmax_reducev_fwd(
         extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
 
     grid = (batch, head_num)
-    _fwd_kernel_stage2[grid](
+    _intj_launch(_fwd_kernel_stage2, grid,
         logits,
         o,
         lse,
@@ -731,7 +732,7 @@ def csr_to_dense_block_table(kv_indices, kv_indptr, dense_table, max_ctx, bs):
     """Convert CSR (kv_indices + kv_indptr) to dense [B, max_ctx] block table on GPU."""
     BLOCK_N = 128
     grid = (bs, triton.cdiv(max_ctx, BLOCK_N))
-    _csr_to_dense_kernel[grid](
+    _intj_launch(_csr_to_dense_kernel, grid,
         kv_indices,
         kv_indptr,
         dense_table,
