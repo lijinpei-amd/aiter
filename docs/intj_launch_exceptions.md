@@ -1,30 +1,32 @@
 # intj launch migration exceptions
 
 The migration targets Triton and Gluon `JITFunction` launches through
-`intj.compat.launch`. This branch needs the sibling intj callable-grid checkout
+`intj.compat.launch` or a bound `make_launcher`. This branch needs the sibling
+intj callable-grid checkout
 installed in the environment or on `PYTHONPATH`; Aiter does not yet publish an
 intj dependency. The source imports with Python 3.10 and Triton 3.7.1, and all
 changed Python files parse under Python 3.10. GPU smoke tests below ran with
 Triton 3.7.1 and 3.8.0 on gfx942. The gfx950/gfx1250-only paths remain untested
 on this machine.
 
-These are the 38 remaining tracked Triton-style bracket launches. Most need a
-runtime capability or return value that `intj.compat.launch` cannot preserve.
+These are the 37 remaining tracked Triton-style bracket launches. The three
+FlashKDA Triton wrappers use native intj on cache hits; their first call still
+uses Triton to select an autotuned config. Most other sites need a runtime
+capability or launch behavior intj cannot preserve.
 The direct Iris kernels also have unsupported `tl.tensor` annotations; the fused
 Iris path remains pending Iris-enabled multi-GPU validation. Line numbers refer
 to this branch.
 
 | Site | Target | Reason |
 | --- | --- | --- |
-| `aiter/ops/triton/_gluon_kernels/gfx950/chunk_delta_attn/flash_kda_k1.py:320` | `_k1_fast` | Custom `_FastLaunch` cache wrapper; the caller returns its `CompiledKernel`. |
-| `aiter/ops/triton/_triton_kernels/chunk_delta_attn/fast_launch.py:89` | `self._kernel` | Bypass path preserves the wrapped kernel and returned `CompiledKernel`. |
-| `aiter/ops/triton/_triton_kernels/chunk_delta_attn/fast_launch.py:106` | `self._kernel` | Unhashable-argument bypass preserves the wrapped kernel and returned `CompiledKernel`. |
-| `aiter/ops/triton/_triton_kernels/chunk_delta_attn/fast_launch.py:148` | `self._kernel` | Cache capture needs `JITFunction.pre_run_hooks` and the returned `CompiledKernel`. |
-| `aiter/ops/triton/_triton_kernels/chunk_delta_attn/flash_kda.py:985` | `_prepare_fast` | Custom `_FastLaunch` wrapper, not a `JITFunction`. |
-| `aiter/ops/triton/_triton_kernels/chunk_delta_attn/flash_kda.py:1062` | `_segment_fast` | Custom `_FastLaunch` wrapper with autotuning and its own cache. |
-| `aiter/ops/triton/_triton_kernels/chunk_delta_attn/flash_kda.py:1077` | `_g2.k2_ab_fused_fast` | Custom `_FastLaunch` wrapper. |
-| `aiter/ops/triton/_triton_kernels/chunk_delta_attn/flash_kda.py:1122` | `_seg_scan_fast` | Custom `_FastLaunch` wrapper with autotuning and its own cache. |
-| `aiter/ops/triton/_triton_kernels/chunk_delta_attn/intra_attn.py:757` | `chunk_delta_attn_fwd_kernel_inter_solve_fused` | intj refuses its `used_global_vals` reference to `SOLVE_TRIL_DOT_PRECISION`. |
+| `aiter/ops/triton/_gluon_kernels/gfx950/chunk_delta_attn/flash_kda_k1.py:320` | `_k1_fast` | Its Gluon JIT reads 12 global layout constants that intj refuses. |
+| `aiter/ops/triton/_triton_kernels/chunk_delta_attn/fast_launch.py:94` | `self._kernel` | Explicit bypass uses Triton for comparison tests. |
+| `aiter/ops/triton/_triton_kernels/chunk_delta_attn/fast_launch.py:111` | `self._kernel` | An unhashable argument cannot be guarded by the wrapper cache. |
+| `aiter/ops/triton/_triton_kernels/chunk_delta_attn/fast_launch.py:157` | `self._kernel` | First-call capture uses Triton's pre-run hook to select the autotuned config; warmed Triton FlashKDA calls use native intj. |
+| `aiter/ops/triton/_triton_kernels/chunk_delta_attn/flash_kda.py:985` | `_prepare_fast` | First-call autotuning uses Triton; warmed calls use bound `make_launcher(grid_arg=2)`. |
+| `aiter/ops/triton/_triton_kernels/chunk_delta_attn/flash_kda.py:1062` | `_segment_fast` | First-call autotuning uses Triton; warmed calls use bound `make_launcher(grid_arg=2)` with the selected `BW`. |
+| `aiter/ops/triton/_triton_kernels/chunk_delta_attn/flash_kda.py:1077` | `_g2.k2_ab_fused_fast` | Its Gluon JIT takes layout objects as constexprs, which intj cannot decode. |
+| `aiter/ops/triton/_triton_kernels/chunk_delta_attn/flash_kda.py:1122` | `_seg_scan_fast` | First-call capture uses Triton; warmed calls use bound `make_launcher(grid_arg=2)`. |
 | `aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/common.py:403` | `torch.library.wrap_triton(_rotary_kernel)` | `torch.library.wrap_triton` is required for `torch.compile` behavior. |
 | `aiter/ops/triton/attention/mha.py:720` | `_attn_fwd` | intj cannot resolve its inline `torch.Tensor` parameter annotations, starting with `q_ptr`. |
 | `aiter/ops/triton/attention/mha_onekernel_bwd.py:272` | `bwd_kernel_causal` | intj refuses its `used_global_vals` reference to `tl_DROPOUT_USE_PYTORCH`. |
@@ -56,7 +58,7 @@ to this branch.
 | `op_tests/triton_tests/utils/causal_conv1d_update_refs.py:1199` | `_causal_conv1d_update_kernel_vllm` | `launch_pdl=_is_arch_support_pdl()` can request PDL. |
 
 Two cached `CompiledKernel.run` calls also bypass bracket syntax:
-`aiter/ops/triton/_triton_kernels/chunk_delta_attn/fast_launch.py:120` and
+`aiter/ops/triton/_triton_kernels/chunk_delta_attn/fast_launch.py:129` (Gluon wrappers) and
 `aiter/ops/triton/fusions/attn_res.py:426`. They are part of the custom caches
 described above. The 144 FlyDSL `.launch(grid=..., block=..., stream=...)` sites
 in 77 files are excluded: they compile FlyDSL kernels with a different launch
@@ -77,3 +79,8 @@ AITER_TRITON_ONLY=1 PYTHONPATH="$PWD:/mnt/nvme2/jinpli/workspace/home/jinpli/dev
 All five selected tests passed with Triton 3.7.1. Equivalent selected tests
 passed with `/tmp/gb2/bin/python` (Triton 3.8.0), and an autotuned sparse
 prefill smoke case matched its Torch reference on both versions.
+
+The `test_fast_launch.py` and `test_flash_kda.py` suites in
+`op_tests/triton_tests/chunk_delta_attn/` passed on gfx942 with both Triton
+3.7.1 and 3.8.0: 86 passed, 3 skipped for each version. The gfx950 Gluon
+routes still need validation on that architecture.

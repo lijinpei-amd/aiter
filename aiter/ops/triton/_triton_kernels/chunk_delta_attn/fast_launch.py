@@ -15,12 +15,16 @@ Wrap a kernel once and call it as before::
     _kernel = fast_launch(_kernel)
     _kernel[grid](arg=..., ...)
 
+For supported Triton kernels, ``use_intj=True`` keeps Triton's first-call
+autotuning and runs cache hits through a bound native launcher.
+
 """
 
 import contextlib
 from collections import ChainMap, OrderedDict
 
 import torch
+from intj import Constexpr, make_launcher
 from triton.runtime import driver
 from triton.runtime.jit import JITFunction
 
@@ -72,9 +76,10 @@ def _tensor_key(t: torch.Tensor):
 class _FastLaunch:
     """A kernel that remembers what it compiled for a given set of shapes."""
 
-    def __init__(self, kernel):
+    def __init__(self, kernel, *, use_intj=False):
         self._kernel = kernel
         self._cache = OrderedDict()
+        self._use_intj = use_intj
         # The autotuner and any other decorator wrap the JITFunction that owns
         # the argument binder, which is the only piece of it needed here.
         jit = kernel
@@ -109,7 +114,7 @@ class _FastLaunch:
                 return self._capture(grid, kwargs, key)
             self._cache.move_to_end(key)
 
-            compiled, names, frozen = entry
+            compiled, names, frozen, native, native_names = entry
             # Rebuilt per call rather than captured: keeping the bound arguments
             # pinned every tensor of the call that created the entry, and handed
             # a shape-dependent grid the extents of a call already returned.
@@ -117,18 +122,22 @@ class _FastLaunch:
             # Not hoisted: capture redirects work onto its own stream, so the
             # answer changes under torch.cuda.graph.
             stream = driver.active.get_current_stream(device)
-            compiled.run(
-                g[0],
-                g[1] if len(g) > 1 else 1,
-                g[2] if len(g) > 2 else 1,
-                stream,
-                compiled.function,
-                compiled.packed_metadata,
-                None,
-                None,
-                None,
-                *[kwargs[n] if n in kwargs else frozen[n] for n in names],
-            )
+            if native is not None:
+                values = [kwargs[n] if n in kwargs else frozen[n] for n in native_names]
+                native(stream, *g, *values)
+            else:
+                compiled.run(
+                    g[0],
+                    g[1] if len(g) > 1 else 1,
+                    g[2] if len(g) > 2 else 1,
+                    stream,
+                    compiled.function,
+                    compiled.packed_metadata,
+                    None,
+                    None,
+                    None,
+                    *[kwargs[n] if n in kwargs else frozen[n] for n in names],
+                )
             return compiled
 
         return launch
@@ -156,14 +165,31 @@ class _FastLaunch:
         args, kw = seen[-1]
         device = driver.active.get_current_device()
         binder = self._jit.device_caches[device][4]
-        bound_args, _, _ = binder(*args, **kw)
+        bound_args, _, options = binder(*args, **kw)
 
         names = list(bound_args.keys())
         # Arguments the call site does not pass -- defaults, and whatever the
         # autotuner added. The key pins every non-tensor value, so these are
         # constant for as long as this entry is the one selected.
         frozen = {n: v for n, v in bound_args.items() if n not in kwargs}
-        self._cache[key] = (compiled, names, frozen)
+        native = None
+        native_names = ()
+        if self._use_intj:
+            baked = {
+                p.name: Constexpr(value=bound_args[p.name])
+                for p in self._jit.params
+                if p.is_constexpr and type(bound_args[p.name]) is str
+            }
+            native_names = tuple(n for n in names if n not in baked)
+            g = grid(ChainMap(kwargs, frozen)) if callable(grid) else grid
+            native = make_launcher(
+                self._jit,
+                grid_arg=len(g),
+                options=options,
+                extra_annotation=baked,
+                bind_device=True,
+            ).bind_device(device)
+        self._cache[key] = (compiled, names, frozen, native, native_names)
         while len(self._cache) > _MAX_ENTRIES:
             self._cache.popitem(last=False)
         return compiled
@@ -173,5 +199,5 @@ class _FastLaunch:
         self._cache.clear()
 
 
-def fast_launch(kernel):
-    return _FastLaunch(kernel)
+def fast_launch(kernel, *, use_intj=False):
+    return _FastLaunch(kernel, use_intj=use_intj)

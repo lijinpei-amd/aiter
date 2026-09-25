@@ -201,7 +201,9 @@ def _chunk_delta_attn_fwd_intra_token_parallel(
     def grid(meta):
         return (B * T, triton.cdiv(HV, meta["BH"]))
 
-    _intj_launch(chunk_delta_attn_fwd_kernel_intra_token_parallel, grid,
+    _intj_launch(
+        chunk_delta_attn_fwd_kernel_intra_token_parallel,
+        grid,
         q=q,
         k=k,
         g=gk,
@@ -405,6 +407,7 @@ def chunk_delta_attn_fwd_kernel_inter_solve_fused(
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_SAFE_GATE: tl.constexpr,
+    DOT_PRECISION: tl.constexpr,
 ):
     """
     Fused kernel:
@@ -625,40 +628,40 @@ def chunk_delta_attn_fwd_kernel_inter_solve_fused(
             b_Ai33 += m_I
 
     b_Ai10 = -tl.dot(
-        tl.dot(b_Ai11, b_Akk10, input_precision=SOLVE_TRIL_DOT_PRECISION),
+        tl.dot(b_Ai11, b_Akk10, input_precision=DOT_PRECISION),
         b_Ai00,
-        input_precision=SOLVE_TRIL_DOT_PRECISION,
+        input_precision=DOT_PRECISION,
     )
     if NC >= 3:
         b_Ai21 = -tl.dot(
-            tl.dot(b_Ai22, b_Akk21, input_precision=SOLVE_TRIL_DOT_PRECISION),
+            tl.dot(b_Ai22, b_Akk21, input_precision=DOT_PRECISION),
             b_Ai11,
-            input_precision=SOLVE_TRIL_DOT_PRECISION,
+            input_precision=DOT_PRECISION,
         )
         b_Ai20 = -tl.dot(
             b_Ai22,
-            tl.dot(b_Akk20, b_Ai00, input_precision=SOLVE_TRIL_DOT_PRECISION)
-            + tl.dot(b_Akk21, b_Ai10, input_precision=SOLVE_TRIL_DOT_PRECISION),
-            input_precision=SOLVE_TRIL_DOT_PRECISION,
+            tl.dot(b_Akk20, b_Ai00, input_precision=DOT_PRECISION)
+            + tl.dot(b_Akk21, b_Ai10, input_precision=DOT_PRECISION),
+            input_precision=DOT_PRECISION,
         )
     if NC >= 4:
         b_Ai32 = -tl.dot(
-            tl.dot(b_Ai33, b_Akk32, input_precision=SOLVE_TRIL_DOT_PRECISION),
+            tl.dot(b_Ai33, b_Akk32, input_precision=DOT_PRECISION),
             b_Ai22,
-            input_precision=SOLVE_TRIL_DOT_PRECISION,
+            input_precision=DOT_PRECISION,
         )
         b_Ai31 = -tl.dot(
             b_Ai33,
-            tl.dot(b_Akk31, b_Ai11, input_precision=SOLVE_TRIL_DOT_PRECISION)
-            + tl.dot(b_Akk32, b_Ai21, input_precision=SOLVE_TRIL_DOT_PRECISION),
-            input_precision=SOLVE_TRIL_DOT_PRECISION,
+            tl.dot(b_Akk31, b_Ai11, input_precision=DOT_PRECISION)
+            + tl.dot(b_Akk32, b_Ai21, input_precision=DOT_PRECISION),
+            input_precision=DOT_PRECISION,
         )
         b_Ai30 = -tl.dot(
             b_Ai33,
-            tl.dot(b_Akk30, b_Ai00, input_precision=SOLVE_TRIL_DOT_PRECISION)
-            + tl.dot(b_Akk31, b_Ai10, input_precision=SOLVE_TRIL_DOT_PRECISION)
-            + tl.dot(b_Akk32, b_Ai20, input_precision=SOLVE_TRIL_DOT_PRECISION),
-            input_precision=SOLVE_TRIL_DOT_PRECISION,
+            tl.dot(b_Akk30, b_Ai00, input_precision=DOT_PRECISION)
+            + tl.dot(b_Akk31, b_Ai10, input_precision=DOT_PRECISION)
+            + tl.dot(b_Akk32, b_Ai20, input_precision=DOT_PRECISION),
+            input_precision=DOT_PRECISION,
         )
 
     p_Akk00 = Akk + o_c0[:, None] * (HV * BT) + o_i[None, :]
@@ -720,7 +723,9 @@ def chunk_delta_attn_fwd_intra(
     if safe_gate:
         BK = min(64, triton.next_power_of_2(K))
         grid = (NT, NC, B * HV)
-        _intj_launch(chunk_delta_attn_fwd_kernel_intra_sub_chunk, grid,
+        _intj_launch(
+            chunk_delta_attn_fwd_kernel_intra_sub_chunk,
+            grid,
             q=q,
             k=k,
             g=gk,
@@ -754,7 +759,9 @@ def chunk_delta_attn_fwd_intra(
         )
 
     grid = (NT, B * HV)
-    chunk_delta_attn_fwd_kernel_inter_solve_fused[grid](
+    _intj_launch(
+        chunk_delta_attn_fwd_kernel_inter_solve_fused,
+        grid,
         q=q,
         k=k,
         g=gk,
@@ -773,6 +780,7 @@ def chunk_delta_attn_fwd_intra(
         BC=BC,
         NC=NC,
         USE_SAFE_GATE=safe_gate,
+        DOT_PRECISION=SOLVE_TRIL_DOT_PRECISION.value,
     )
 
     w, u, qg, kg = recompute_w_u_fwd(

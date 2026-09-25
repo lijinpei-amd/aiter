@@ -19,6 +19,8 @@ that produces. So the tests here are about the key, not about speed:
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 
 from aiter.ops.triton._triton_kernels.chunk_delta_attn import fast_launch
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.flash_kda import flash_kda_fwd
@@ -31,6 +33,11 @@ device = "cuda"
 dtype = torch.bfloat16
 K_DIM = 128
 LOWER_BOUND = -5.0
+
+
+@triton.jit
+def _write_one(out):
+    tl.store(out, 1)
 
 
 def make_inputs(B, T, H, seed=0, bias=False, state=False, varlen=False):
@@ -96,6 +103,48 @@ def test_matches_ordinary_path_when_segmented(chunks_per_seg):
     assert torch.equal(got_s, want_s)
 
 
+def test_triton_cache_hits_launch_without_compiled_kernel_run(monkeypatch):
+    """Repeat calls use intj while retaining Triton's first-call autotuning."""
+    from aiter.ops.triton._triton_kernels.chunk_delta_attn import flash_kda as fk
+
+    monkeypatch.setattr(fk, "AITER_FDA_USE_GLUON_K1", False)
+    monkeypatch.setattr(fk, "AITER_FDA_USE_GLUON_K2", False)
+    wrappers = (fk._prepare_fast, fk._segment_fast, fk._seg_scan_fast)
+    for wrapper in wrappers:
+        wrapper.clear()
+
+    args = make_inputs(1, 512, 4)
+    want_o, want_s = run(args, chunks_per_seg=4)
+
+    def refuse_old_dispatch(*args, **kwargs):
+        raise AssertionError("cache hit launched through CompiledKernel.run")
+
+    for wrapper in wrappers:
+        assert wrapper._cache, "segmented FlashKDA must reach every Triton wrapper"
+    compiled = next(iter(wrappers[0]._cache.values()))[0]
+    monkeypatch.setattr(
+        type(compiled), "run", property(lambda self: refuse_old_dispatch)
+    )
+
+    got_o, got_s = run(args, chunks_per_seg=4)
+    assert torch.equal(got_o, want_o)
+    assert torch.equal(got_s, want_s)
+
+
+def test_first_native_hit_can_be_captured_after_one_warmup():
+    wrapped = fast_launch.fast_launch(_write_one, use_intj=True)
+    out = torch.zeros(1, device=device, dtype=torch.int32)
+    wrapped[(1,)](out=out)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapped[(1,)](out=out)
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert out.item() == 1
+
+
 def test_matches_ordinary_path_varlen():
     args = make_inputs(3, 512, 12, varlen=True)
     with fast_launch.bypassed():
@@ -152,7 +201,7 @@ def test_entries_do_not_pin_their_inputs():
     for wrapper in _wrapped():
         for entry in wrapper._cache.values():
             entries += 1
-            held = [v for part in entry[2:] for v in part.values()]
+            held = entry[2].values()
             tensors = [v for v in held if isinstance(v, torch.Tensor)]
             assert not tensors, f"entry holds {len(tensors)} tensors"
     assert entries, "nothing was cached, so nothing was tested"

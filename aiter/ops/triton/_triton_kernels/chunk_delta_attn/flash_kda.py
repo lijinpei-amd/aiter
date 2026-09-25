@@ -844,9 +844,9 @@ def _build_segments(
     return desc, off, len(chunk_base), max_per_seq
 
 
-_prepare_fast = fast_launch(_flash_kda_prepare_kernel)
-_segment_fast = fast_launch(_flash_kda_segment_kernel)
-_seg_scan_fast = fast_launch(_flash_kda_seg_scan_kernel)
+_prepare_fast = fast_launch(_flash_kda_prepare_kernel, use_intj=True)
+_segment_fast = fast_launch(_flash_kda_segment_kernel, use_intj=True)
+_seg_scan_fast = fast_launch(_flash_kda_seg_scan_kernel, use_intj=True)
 
 
 @input_guard
