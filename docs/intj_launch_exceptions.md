@@ -6,8 +6,9 @@ intj callable-grid checkout
 installed in the environment or on `PYTHONPATH`; Aiter does not yet publish an
 intj dependency. The source imports with Python 3.10 and Triton 3.7.1, and all
 changed Python files parse under Python 3.10. GPU smoke tests below ran with
-Triton 3.7.1 and 3.8.0 on gfx942. The gfx950/gfx1250-only paths remain untested
-on this machine.
+Triton 3.7.1 and 3.8.0 on gfx942. Selected chunk-delta tests and benchmarks
+also ran on gfx950 with Triton 3.8.0; other gfx950/gfx1250-only paths remain
+untested.
 
 These are the 37 remaining tracked Triton-style bracket launches. The three
 FlashKDA Triton wrappers use native intj on cache hits; their first call still
@@ -82,5 +83,42 @@ prefill smoke case matched its Torch reference on both versions.
 
 The `test_fast_launch.py` and `test_flash_kda.py` suites in
 `op_tests/triton_tests/chunk_delta_attn/` passed on gfx942 with both Triton
-3.7.1 and 3.8.0: 86 passed, 3 skipped for each version. The gfx950 Gluon
-routes still need validation on that architecture.
+3.7.1 and 3.8.0: 86 passed, 3 skipped for each version. On gfx950, six
+focused tests passed on the converted revision, including the native cache
+hit, converted solve launch, and segmented Gluon K2 route; three matching
+tests passed on the baseline. The full suite has not run on gfx950.
+
+## gfx950 chunk-delta benchmark
+
+On an MI350X (`gfx950`), compare isolated Aiter snapshots `28ba24c0a6`
+(baseline) and `f48301958` (converted) with intj `8619f455`. The environment
+was Python 3.14.4, Torch 2.15.0.dev20260816+rocm7.14, HIP 7.14.60850, and
+Triton 3.8.0. intj's automatic tensor access resolved to `CPYTHON` because
+its verified fast Torch layout does not cover Torch 2.15. Each result is the
+median of five alternating baseline/converted runs on GPU 0, with 300 ms of
+warmup and 500 ms in `triton.testing.do_bench`. Negative change means faster.
+
+| Path and shape (B×T×H×K×V) | Baseline ms | Converted ms | Change |
+| --- | ---: | ---: | ---: |
+| FlashKDA 1×512×12×128×128, normal gfx950 Gluon route | 0.0432 | 0.0432 | 0.00% |
+| FlashKDA 1×512×12×128×128, forced Triton route | 0.0467 | 0.0468 | +0.21% |
+| FlashKDA 1×16384×12×128×128, normal gfx950 Gluon route | 0.5442 | 0.5441 | −0.02% |
+| FlashKDA 1×16384×12×128×128, forced Triton route | 0.7869 | 0.7820 | −0.62% |
+| Default pipeline 2×4096×16×64×64 | 2.1290 | 2.0919 | −1.74% |
+
+FlashKDA uses `bench_flash_kda.py` with `AITER_FDA_USE_GLUON=1` or `0`;
+the default pipeline uses `bench_chunk_delta_attn.py` with
+`AITER_FDA_ENABLE=0`. Both scripts live in `op_tests/op_benchmarks/triton/`
+and were run with `AITER_TRITON_ONLY=1`, `HIP_VISIBLE_DEVICES=0`,
+`--warmup-ms 300 --rep-ms 500`, and the table's `--shape` values. GPU-event
+times include host-induced gaps between eager launches, but exclude initial
+JIT compilation and autotuning.
+
+For the forced-Triton 512-token case, 100 warmed K1 prepare launches per
+host-timed block took 12.5658 µs/call on the baseline and 11.8462 µs/call
+with intj (−5.73%). This excludes GPU completion, allocations, JIT, and
+autotuning; two processes per revision each contributed nine blocks. A
+same-process A/B changing only the default pipeline's solve dispatch measured
+2.1197 ms with Triton and 2.0917 ms with intj (−1.32%) over five alternating
+rounds. Its output and `Akk` were bitwise equal. The FlashKDA pipeline
+differences are within the observed run-to-run variation.
