@@ -15,7 +15,8 @@
 - Use `grid_arg=2`, `bind_device=True`, and `return_compiled=False` for every native handle.
 - Keep the current GPU equal to `q.device` through the whole call, and reject every non-null input pointer tensor on another device before the first native launch.
 - Key native handles by the JIT source key, device, options, baked values, the JIT debug flag, and current Triton runtime debug, instrumentation, and fpsan knobs. Reject interpreter mode before checking this cache. Never retain an input or workspace tensor in the handle factory.
-- Select `configs[0]` only when a K1/K2 tuner has one config. With more than one, execute the existing decorated kernel; gfx950's published Triton K2 shortlist has six configs even without opt-in tuning. Do not copy Triton's tuning-key algorithm or use mutable `best_config`.
+- Select `configs[0]` only when a K1/K2 tuner has one config. With more than one, execute the existing decorated kernel; default gfx950 has one K1 config and one fallback K2 config, while opt-in tuning has four K1 and 24 K2 candidates and tests may install the six published K2 candidates. Do not copy Triton's tuning-key algorithm or use mutable `best_config`. A separate intj native-autotune design will replace the warmed decorated path after this phase.
+- Bypassing K1's outer `@triton.heuristics` requires passing `IS_VARLEN = cu_seqlens is not None` and `HAS_BIAS = dt_bias is not None` explicitly to its raw JIT. The multi-config branch still calls the outer wrapper.
 - Keep intj's global-value refusal, Gluon source mode, and constant decoder unchanged. Preserve Aiter Python 3.10 and Triton 3.7.1 support; do not silently fall back on a single-config intj refusal.
 - Read the current stream immediately before each native call. Build kernel arguments from the current invocation, not a prior call's tensors. Compare baseline and final with the same resolved intj `TorchAccess` mode; time warmed full-forward host calls with synchronization outside short measured blocks.
 
@@ -347,7 +348,7 @@ def test_single_config_never_enters_decorated_run(monkeypatch):
     assert seen == expected
 ```
 
-- [ ] **Step 2: Use the raw K1 JIT only when the tuner has one config.** Put the current keyword arguments at `flash_kda.py:985-1012` under `if len(_flash_kda_prepare_kernel.fn.configs) > 1:`, but change its callee from `_prepare_fast[grid]` to `_flash_kda_prepare_kernel[grid]`. Add this `else` arm (the two cache modifiers are baked):
+- [ ] **Step 2: Use the raw K1 JIT only when the tuner has one config.** Put the current keyword arguments at `flash_kda.py:985-1012` under `if len(_flash_kda_prepare_kernel.fn.configs) > 1:`, but change its callee from `_prepare_fast[grid]` to `_flash_kda_prepare_kernel[grid]`. Keep the outer wrapper on that multi-config branch. Add this `else` arm: it supplies the two heuristic flags explicitly because the raw JIT bypasses `@triton.heuristics`, and bakes the two cache modifiers.
 
 ```python
         config = _flash_kda_prepare_kernel.fn.configs[0]
@@ -630,9 +631,9 @@ Repeat the command with `AITER_FDA_USE_GLUON=0`. In a third process, run the tun
 ssh -p 30004 jinpli@localhost "cd '$KDA_STAGE/after' && AITER_TRITON_ONLY=1 AITER_USE_SYSTEM_TRITON=1 AITER_FDA_USE_GLUON=0 CHUNK_DELTA_ATTN_TRITON_AUTOTUNE=1 HIP_VISIBLE_DEVICES=0 PYTHONPATH='$KDA_STAGE/after:$KDA_STAGE/intj' /raid/jinpli/workspace/home01/jinpli/development/venv/01/bin/python -m pytest -q 'op_tests/triton_tests/chunk_delta_attn/test_flash_kda.py::test_triton_route_matches_reference[tail chunk]' 'op_tests/triton_tests/chunk_delta_attn/test_flash_kda.py::test_triton_route_matches_reference[segmented]' op_tests/triton_tests/chunk_delta_attn/test_flash_kda.py::test_tuner_keeps_the_two_schedules_apart"
 ```
 
-The baseline still has `test_fast_launch.py`; use it for baseline correctness if needed.
+The baseline still has `test_fast_launch.py`; use it for baseline correctness if needed. The tuner-key test above inspects the original `tuner.cache` and applies only while this plan's multi-config path uses decorated Triton. When the separate native-autotune design replaces that branch, change the test to inspect intj's private selection keys and winners or create a fresh launcher and count native selections; clearing `tuner.cache` will not reset native selection state.
 
-- [ ] **Step 4: Benchmark matched baseline and final revisions.** From the local Aiter worktree, run this loop against the two isolated remote trees. It uses GPU 0, a fresh process per route, five alternating baseline/final rounds, and `--warmup-ms 300 --rep-ms 500` for each GPU-event benchmark:
+- [ ] **Step 4: Benchmark matched baseline and final revisions.** From the local Aiter worktree, run this loop against the two isolated remote trees. It uses GPU 0, a fresh process per route and opt-in setting, five alternating baseline/final rounds, and `--warmup-ms 300 --rep-ms 500` for each GPU-event benchmark:
 
 ```sh
 KDA_STAGE=$(cat /tmp/kda-direct-stage-path)
@@ -640,10 +641,12 @@ set -o pipefail
 for KDA_ROUND in 1 2 3 4 5; do
   if [ $((KDA_ROUND % 2)) -eq 1 ]; then set -- before after; else set -- after before; fi
   for KDA_TREE in "$@"; do
-    for KDA_ROUTE in 1 0; do
+    for KDA_CASE in 1:0 0:0 0:1; do
+      KDA_ROUTE=${KDA_CASE%%:*}
+      KDA_TUNE=${KDA_CASE#*:}
       for KDA_T in 512 16384; do
-        ssh -p 30004 jinpli@localhost "cd '$KDA_STAGE/$KDA_TREE' && AITER_TRITON_ONLY=1 AITER_USE_SYSTEM_TRITON=1 AITER_FDA_USE_GLUON=$KDA_ROUTE HIP_VISIBLE_DEVICES=0 PYTHONPATH='$KDA_STAGE/$KDA_TREE:$KDA_STAGE/intj' /raid/jinpli/workspace/home01/jinpli/development/venv/01/bin/python op_tests/op_benchmarks/triton/bench_flash_kda.py --shape 1 $KDA_T 12 128 128 --warmup-ms 300 --rep-ms 500" \
-          | tee "/tmp/kda-event-$KDA_ROUND-$KDA_TREE-$KDA_ROUTE-$KDA_T.log"
+        ssh -p 30004 jinpli@localhost "cd '$KDA_STAGE/$KDA_TREE' && AITER_TRITON_ONLY=1 AITER_USE_SYSTEM_TRITON=1 AITER_FDA_USE_GLUON=$KDA_ROUTE CHUNK_DELTA_ATTN_TRITON_AUTOTUNE=$KDA_TUNE HIP_VISIBLE_DEVICES=0 PYTHONPATH='$KDA_STAGE/$KDA_TREE:$KDA_STAGE/intj' /raid/jinpli/workspace/home01/jinpli/development/venv/01/bin/python op_tests/op_benchmarks/triton/bench_flash_kda.py --shape 1 $KDA_T 12 128 128 --warmup-ms 300 --rep-ms 500" \
+          | tee "/tmp/kda-event-$KDA_ROUND-$KDA_TREE-$KDA_ROUTE-$KDA_TUNE-$KDA_T.log"
       done
     done
     ssh -p 30004 jinpli@localhost "cd '$KDA_STAGE/$KDA_TREE' && AITER_TRITON_ONLY=1 AITER_USE_SYSTEM_TRITON=1 AITER_FDA_ENABLE=0 HIP_VISIBLE_DEVICES=0 PYTHONPATH='$KDA_STAGE/$KDA_TREE:$KDA_STAGE/intj' /raid/jinpli/workspace/home01/jinpli/development/venv/01/bin/python op_tests/op_benchmarks/triton/bench_chunk_delta_attn.py --shape 2 4096 16 64 64 --warmup-ms 300 --rep-ms 500" \
@@ -652,9 +655,9 @@ for KDA_ROUND in 1 2 3 4 5; do
 done
 ```
 
-The last command is an unchanged default-pipeline control: this benchmark fixes `CHUNK_SIZE=64`, so it does not route through FlashKDA. For host-call timing, run Appendix B's standalone script in each staged tree for both route values, alternating baseline/final processes five times. Keep first compilation and synchronization outside the timed blocks; report each block, median, and actual route. The full-forward host interval includes argument assembly, allocation, stream reads, and launches. GPU-event results include host gaps in eager runs, so do not attribute their full difference to one kernel.
+The last command is an unchanged default-pipeline control: this benchmark fixes `CHUNK_SIZE=64`, so it does not route through FlashKDA. For host-call timing, run Appendix B's standalone script in each staged tree for all three route/tuning cases, alternating baseline/final processes five times. Keep first compilation and synchronization outside the timed blocks; report each block, median, and actual route. The full-forward host interval includes argument assembly, allocation, stream reads, and launches. GPU-event results include host gaps in eager runs, so do not attribute their full difference to one kernel.
 
-- [ ] **Step 5: Apply the performance gate and commit the inventory.** Add a dated baseline/final table, environment versions, command lines, access mode, and any inconclusive/noisy rows to `docs/intj_launch_exceptions.md`. If any gfx950 FlashKDA route or shape has a repeatable warmed full-forward host-call regression beyond run-to-run variation, stop acceptance, attribute the cost (especially the six-config K2 decorated path), revise Task 3's dispatch, and rerun correctness and matched benchmarks. Otherwise, run `git diff --check`; stage only that document; commit with `git commit -m 'Record KDA direct-launch results'`. Verify `git status --short` is clean in Aiter and intj remains unchanged.
+- [ ] **Step 5: Apply the performance gate and commit the inventory.** Add a dated baseline/final table, environment versions, command lines, access mode, and any inconclusive/noisy rows to `docs/intj_launch_exceptions.md`. If any gfx950 FlashKDA route or shape has a repeatable warmed full-forward host-call regression beyond run-to-run variation, stop acceptance, attribute the cost (especially the opt-in multi-config K2 decorated path), revise Task 3's dispatch, and rerun correctness and matched benchmarks. Otherwise, run `git diff --check`; stage only that document; commit with `git commit -m 'Record KDA direct-launch results'`. Verify `git status --short` is clean in Aiter and intj remains unchanged.
 
 ## Appendix A: Offline gfx950 Gluon compile check
 
@@ -753,7 +756,9 @@ def bench(B, T, H, seg):
     k2a = ("gluon" if fk.AITER_FDA_USE_GLUON_K2 and fk._gluon_k2_usable(32, 128, 128)
            else "triton") if seg else "none"
     print(f"B={B} T={T} H={H} seg={seg} gluon={os.getenv('AITER_FDA_USE_GLUON')} "
+          f"autotune={os.getenv('CHUNK_DELTA_ATTN_TRITON_AUTOTUNE')} "
           f"route=K1:{k1},K2A:{k2a},K2C:triton "
+          f"k1_configs={len(fk._flash_kda_prepare_kernel.fn.configs)} "
           f"k2_configs={len(fk._flash_kda_segment_kernel.configs)} "
           f"median_us={statistics.median(samples):.3f} "
           f"blocks_us={[round(x, 3) for x in samples]}", flush=True)
@@ -767,10 +772,12 @@ scp -P 30004 /tmp/bench_kda_host.py "jinpli@localhost:$KDA_STAGE/bench_kda_host.
 set -o pipefail
 for KDA_ROUND in 1 2 3 4 5; do
   if [ $((KDA_ROUND % 2)) -eq 1 ]; then set -- before after; else set -- after before; fi
-  for KDA_ROUTE in 1 0; do
+  for KDA_CASE in 1:0 0:0 0:1; do
+    KDA_ROUTE=${KDA_CASE%%:*}
+    KDA_TUNE=${KDA_CASE#*:}
     for KDA_TREE in "$@"; do
-      ssh -p 30004 jinpli@localhost "cd '$KDA_STAGE/$KDA_TREE' && AITER_TRITON_ONLY=1 AITER_USE_SYSTEM_TRITON=1 AITER_FDA_USE_GLUON=$KDA_ROUTE HIP_VISIBLE_DEVICES=0 PYTHONPATH='$KDA_STAGE/$KDA_TREE:$KDA_STAGE/intj' /raid/jinpli/workspace/home01/jinpli/development/venv/01/bin/python '$KDA_STAGE/bench_kda_host.py'" \
-        | tee "/tmp/kda-host-$KDA_ROUND-$KDA_ROUTE-$KDA_TREE.log"
+      ssh -p 30004 jinpli@localhost "cd '$KDA_STAGE/$KDA_TREE' && AITER_TRITON_ONLY=1 AITER_USE_SYSTEM_TRITON=1 AITER_FDA_USE_GLUON=$KDA_ROUTE CHUNK_DELTA_ATTN_TRITON_AUTOTUNE=$KDA_TUNE HIP_VISIBLE_DEVICES=0 PYTHONPATH='$KDA_STAGE/$KDA_TREE:$KDA_STAGE/intj' /raid/jinpli/workspace/home01/jinpli/development/venv/01/bin/python '$KDA_STAGE/bench_kda_host.py'" \
+        | tee "/tmp/kda-host-$KDA_ROUND-$KDA_ROUTE-$KDA_TUNE-$KDA_TREE.log"
     done
   done
 done
