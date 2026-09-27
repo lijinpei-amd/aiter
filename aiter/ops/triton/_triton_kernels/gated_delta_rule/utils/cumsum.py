@@ -12,7 +12,6 @@ including local and global cumsum for both scalar and vector inputs.
 import torch
 import triton
 import triton.language as tl
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     autotune_cache_kwargs,
@@ -22,6 +21,7 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils im
 from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.index import (
     prepare_chunk_indices,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
@@ -91,6 +91,9 @@ def chunk_local_cumsum_scalar_kernel(
     if HAS_SCALE:
         b_o *= scale
     tl.store(o_base + o_t * stride_t, b_o.to(o_base.dtype.element_ty), mask=m_t)
+
+
+_chunk_local_cumsum_scalar_kernel_launch = intj_handle(chunk_local_cumsum_scalar_kernel)
 
 
 @triton.heuristics(
@@ -167,6 +170,17 @@ def chunk_local_cumsum_vector_kernel(
     tl.store(o_base + offs, b_o.to(o_base.dtype.element_ty), mask=msk)
 
 
+def _chunk_local_cumsum_vector_kernel_grid(S: int, BS: int, B: int, H: int, *, NT: int):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (triton.cdiv(S, BS), NT, B * H)
+
+
+_chunk_local_cumsum_vector_kernel_launch = intj_handle(
+    chunk_local_cumsum_vector_kernel,
+    grid_cpp=_chunk_local_cumsum_vector_kernel_grid,
+)
+
+
 def chunk_local_cumsum_scalar(
     g: torch.Tensor,
     chunk_size: int,
@@ -190,18 +204,21 @@ def chunk_local_cumsum_scalar(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
     grid = (NT, B * H)
-    _intj_launch_tuned(chunk_local_cumsum_scalar_kernel, grid,
-        s=g_org,
-        o=g,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        T=T,
-        B=B,
-        H=H,
-        BT=BT,
-        HEAD_FIRST=head_first,
-        REVERSE=reverse,
+    dev, stream = current_device_stream()
+    _chunk_local_cumsum_scalar_kernel_launch(dev)(
+        stream,
+        grid,
+        g_org,  # s
+        g,  # o
+        scale,
+        cu_seqlens,
+        chunk_indices,
+        T,
+        B,
+        H,
+        BT,
+        reverse,  # REVERSE
+        head_first,  # HEAD_FIRST
     )
     return g
 
@@ -230,25 +247,25 @@ def chunk_local_cumsum_vector(
 
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
 
-    def grid(meta):
-        return (triton.cdiv(meta["S"], meta["BS"]), NT, B * H)
-
     # keep cummulative normalizer in fp32
     # this kernel is equivalent to
     # g = g.view(B, H, NT, BT, -1).cumsum(-2).view(B, H, T, -1)
-    _intj_launch_tuned(chunk_local_cumsum_vector_kernel, grid,
-        s=g_org,
-        o=g,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        T=T,
-        B=B,
-        H=H,
-        S=S,
-        BT=BT,
-        HEAD_FIRST=head_first,
-        REVERSE=reverse,
+    dev, stream = current_device_stream()
+    _chunk_local_cumsum_vector_kernel_launch(dev)(
+        stream,
+        NT,  # grid
+        g_org,  # s
+        g,  # o
+        scale,
+        cu_seqlens,
+        chunk_indices,
+        T,
+        B,
+        H,
+        S,
+        BT,
+        reverse,  # REVERSE
+        head_first,  # HEAD_FIRST
     )
     return g
 

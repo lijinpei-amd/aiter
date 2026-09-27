@@ -20,7 +20,6 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils im
     input_guard,
 )
 from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 # Backward-pass autotune config space. Forward kernels deliberately do not
@@ -101,6 +100,9 @@ def l2norm_bwd_kernel1(
     b_dy = tl.load(dy + cols, mask=mask, other=0.0).to(tl.float32)
     b_dx = b_dy * b_rstd - tl.sum(b_dy * b_y) * b_y * b_rstd
     tl.store(dx + cols, b_dx, mask=mask)
+
+
+_l2norm_bwd_kernel1_launch = intj_handle(l2norm_bwd_kernel1, grid_arg=1)
 
 
 @triton.jit
@@ -206,6 +208,17 @@ def l2norm_bwd_kernel(
         b_dx.to(dx.dtype.element_ty),
         mask=(_p_dx_0[:, None] < (T)) & (_p_dx_1[None, :] < (D)),
     )
+
+
+def _l2norm_bwd_kernel_grid(T: int, BT: int):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (triton.cdiv(T, BT),)
+
+
+_l2norm_bwd_kernel_launch = intj_handle(
+    l2norm_bwd_kernel,
+    grid_cpp=_l2norm_bwd_kernel_grid,
+)
 
 
 def l2norm_fwd(
@@ -332,29 +345,31 @@ def l2norm_bwd(
     if D <= 512:
         NB = triton.cdiv(T, 2048)
 
-        def grid(meta):
-            return (triton.cdiv(T, meta["BT"]),)
-
-        _intj_launch_tuned(l2norm_bwd_kernel, grid,
-            y=y,
-            rstd=rstd,
-            dy=dy,
-            dx=dx,
-            eps=eps,
-            T=T,
-            D=D,
-            BD=BD,
-            NB=NB,
+        dev, stream = current_device_stream()
+        _l2norm_bwd_kernel_launch(dev)(
+            stream,
+            y,
+            rstd,
+            dy,
+            dx,
+            eps,
+            T,
+            D,
+            BD,
+            NB,
         )
     else:
-        _intj_launch_tuned(l2norm_bwd_kernel1, (T,),
-            y=y,
-            rstd=rstd,
-            dy=dy,
-            dx=dx,
-            eps=eps,
-            D=D,
-            BD=BD,
+        dev, stream = current_device_stream()
+        _l2norm_bwd_kernel1_launch(dev)(
+            stream,
+            T,
+            y,
+            rstd,
+            dy,
+            dx,
+            eps,
+            D,
+            BD,
         )
 
     return dx.view(y_shape_og)

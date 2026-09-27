@@ -6,7 +6,6 @@ import itertools
 import torch
 import triton
 from intj.compat import launch as _intj_launch
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._gluon_kernels.gfx942.moe.moe_op_gemm_int8_smoothquant import (
     _gluon_moe_gemm_int8_smoothquant,
@@ -18,6 +17,7 @@ from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.shuffle import shuffle_weight
 
 # -----------------------------------------------------------------------------
@@ -142,6 +142,13 @@ def get_kernel_config(m, n, k, routing_data):
 # -----------------------------------------------------------------------------
 
 
+_gluon_moe_gemm_int8_smoothquant_launch = intj_handle(
+    _gluon_moe_gemm_int8_smoothquant,
+    grid_arg=1,
+    options={"num_warps": 4},
+)
+
+
 def moe_gemm_int8_smoothquant(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -259,7 +266,10 @@ def moe_gemm_int8_smoothquant(
 
     if use_gluon:
         # launch Gluon-optimized kernel
-        _intj_launch_tuned(_gluon_moe_gemm_int8_smoothquant, (grid,),
+        dev, stream = current_device_stream()
+        _gluon_moe_gemm_int8_smoothquant_launch(dev)(
+            stream,
+            grid,
             y,
             y.stride(0),
             y.stride(1),
@@ -298,9 +308,9 @@ def moe_gemm_int8_smoothquant(
             gluon_block_n,
             gluon_block_k,
             config["group_m"],
-            EVEN_K=K % gluon_block_k == 0,
-            MASK_K_LIMIT=K % gluon_block_k,
-            num_warps=gluon_num_warps,
+            K % gluon_block_k == 0,  # EVEN_K
+            K % gluon_block_k,  # MASK_K_LIMIT
+            gluon_num_warps,  # num_warps
         )
     else:
         # launch standard kernel

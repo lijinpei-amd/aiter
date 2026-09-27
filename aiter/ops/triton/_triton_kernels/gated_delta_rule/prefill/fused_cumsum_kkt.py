@@ -1,7 +1,6 @@
 import torch
 import triton
 import triton.language as tl
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     IS_AMD,
@@ -14,6 +13,7 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
     prepare_rebased_cu_seqlens,
 )
 from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.op import exp
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 
@@ -91,6 +91,13 @@ def _fused_cumsum_kkt_kernel(
     )
 
 
+_fused_cumsum_kkt_kernel_launch = intj_handle(
+    _fused_cumsum_kkt_kernel,
+    grid_arg=2,
+    options={"num_stages": 3, "num_warps": 4},
+)
+
+
 def fused_cumsum_kkt(
     g: torch.Tensor,
     k: torch.Tensor,
@@ -123,7 +130,11 @@ def fused_cumsum_kkt(
     g_cumsum = torch.empty(B, T, H, device=g.device, dtype=torch.float32)
     A = torch.empty(B, T, H, chunk_size, device=k.device, dtype=torch.float32)
 
-    _intj_launch_tuned(_fused_cumsum_kkt_kernel, (NT, B * H),
+    dev, stream = current_device_stream()
+    _fused_cumsum_kkt_kernel_launch(dev)(
+        stream,
+        NT,
+        B * H,
         g,
         k,
         beta,
@@ -136,8 +147,6 @@ def fused_cumsum_kkt(
         Hg,
         K,
         chunk_size,
-        num_warps=4,
-        num_stages=3,
     )
     return g_cumsum, A
 
@@ -265,6 +274,12 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel(
     )
 
 
+_fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel_launch = intj_handle(
+    fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel,
+    grid_arg=2,
+)
+
+
 def fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
     k: torch.Tensor,
     beta: torch.Tensor,
@@ -346,7 +361,11 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
     g_cumsum_out = torch.empty(B, H, T, device=g.device, dtype=g_output_dtype)
     A_out = torch.empty(B, T, H, BT, device=k.device, dtype=A_output_dtype)
 
-    _intj_launch_tuned(fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel, (NT, B * H),
+    dev, stream = current_device_stream()
+    _fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel_launch(dev)(
+        stream,
+        NT,
+        B * H,
         g,
         k,
         beta,
@@ -355,13 +374,13 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
         kernel_cu_seqlens,
         sequence_ids,
         chunk_ids,
-        T=T,
-        H=H,
-        Hg=Hg,
-        K=K,
-        BT=BT,
-        INDEX_STRIDE=index_stride,
-        USE_EXP2=use_exp2,
-        G_SCALE=RCP_LN2 if use_exp2 else 1.0,
+        T,
+        H,
+        Hg,
+        K,
+        BT,
+        index_stride,  # INDEX_STRIDE
+        use_exp2,  # USE_EXP2
+        RCP_LN2 if use_exp2 else 1.0,  # G_SCALE
     )
     return g_cumsum_out, A_out

@@ -14,7 +14,6 @@ import os
 import torch
 import triton
 import triton.language as tl
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     IS_TMA_SUPPORTED,
@@ -27,6 +26,7 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.index import (
 from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.op import (
     make_tensor_descriptor,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 FLA_TRIL_PRECISION = os.environ.get("FLA_TRIL_PRECISION", "ieee")
@@ -624,6 +624,15 @@ def merge_16x16_to_64x64_inverse_kernel(
         desc_o.store([i_t * BT + 32, 48], z16.to(desc_o.dtype))
 
 
+_solve_tril_16x16_launch = intj_handle(solve_tril_16x16_kernel, grid_arg=2)
+_merge_16x16_to_32x32_inverse_launch = intj_handle(
+    merge_16x16_to_32x32_inverse_kernel, grid_arg=2
+)
+_merge_16x16_to_64x64_inverse_launch = intj_handle(
+    merge_16x16_to_64x64_inverse_kernel, grid_arg=2
+)
+
+
 @input_guard
 def solve_tril(
     A: torch.Tensor,
@@ -694,22 +703,26 @@ def solve_tril(
     # uses boundary_check.
     Ai = torch.empty_like(A, dtype=output_dtype)
     if BT == 16:
-        merge_fn = solve_tril_16x16_kernel
+        merge_fn = _solve_tril_16x16_launch
     elif BT == 32:
-        merge_fn = merge_16x16_to_32x32_inverse_kernel
+        merge_fn = _merge_16x16_to_32x32_inverse_launch
     elif BT == 64:
-        merge_fn = merge_16x16_to_64x64_inverse_kernel
+        merge_fn = _merge_16x16_to_64x64_inverse_launch
 
-    _intj_launch_tuned(merge_fn, (NT, B * H),
-        A=A,
-        Ai=Ai,
-        cu_seqlens=cu_seqlens,
-        sequence_ids=sequence_ids,
-        chunk_ids=chunk_ids,
-        T=T,
-        H=H,
-        BT=BT,
-        INDEX_STRIDE=index_stride,
-        USE_TMA=IS_TMA_SUPPORTED,
+    dev, stream = current_device_stream()
+    merge_fn(dev)(
+        stream,
+        NT,
+        B * H,
+        A,
+        Ai,
+        cu_seqlens,
+        sequence_ids,
+        chunk_ids,
+        T,
+        H,
+        BT,
+        IS_TMA_SUPPORTED,  # USE_TMA
+        index_stride,  # INDEX_STRIDE
     )
     return Ai

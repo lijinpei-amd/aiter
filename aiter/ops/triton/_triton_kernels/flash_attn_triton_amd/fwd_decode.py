@@ -4,7 +4,6 @@ from typing import Literal
 import torch
 import triton
 import triton.language as tl
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.common import apply_rotary
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
@@ -17,6 +16,7 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
     get_stride_from_layout,
     is_fp8,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 FWD_DECODE_AUTOTUNE_KEYS = [
@@ -696,6 +696,17 @@ def _fwd_kernel_splitK(
     tl.store(metadata_ptr + stride_m2_i64, l_i)
 
 
+def _fwd_kernel_splitK_grid(BLOCK_M: int, *, seqlen_q: int, gy: int, split_k: int):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (triton.cdiv(seqlen_q, BLOCK_M), gy, split_k)
+
+
+_fwd_kernel_splitK_launch = intj_handle(
+    _fwd_kernel_splitK,
+    grid_cpp=_fwd_kernel_splitK_grid,
+)
+
+
 FWD_DECODE_REDUCE_AUTOTUNE_KEYS = [
     "BLOCK_DMODEL",
     "split_k",
@@ -815,6 +826,9 @@ def _splitK_reduce(
     l_ptrs = LSE + pid_zhg * stride_lse_zhg_i64 + pid_m
     lse_val = tl.where(g_sum > 0, (g_m + tl.math.log2(g_sum)) / 1.44269504, g_m)
     tl.store(l_ptrs, lse_val)
+
+
+_splitK_reduce_launch = intj_handle(_splitK_reduce)
 
 
 @triton.jit
@@ -1145,13 +1159,6 @@ def attention_forward_decode_triton_impl(
     # Use MAX_BLOCK_M for intermediate tensor allocation to ensure enough space
     seqlen_q_ceil = (seqlen_q + MAX_BLOCK_M - 1) // MAX_BLOCK_M * MAX_BLOCK_M
 
-    def grid(META):
-        return (
-            triton.cdiv(seqlen_q, META["BLOCK_M"]),
-            batch_size * n_group_q * heads_per_group_q,
-            split_k,
-        )
-
     # create intermediate tensors
     out_splitk = torch.empty(
         [
@@ -1309,104 +1316,109 @@ def attention_forward_decode_triton_impl(
         )
         print("stride_lse_zhg, stride_lse_m", (stride_lse_zhg, stride_lse_m))
 
-    _intj_launch_tuned(_fwd_kernel_splitK, grid,
-        Q=q,
-        K=k_cache,
-        V=v_cache,
-        Q_Descale=q_descale,
-        K_Descale=k_descale,
-        V_Descale=v_descale,
-        sm_scale=sm_scale,
-        Out_splitK=out_splitk,
-        Metadata=metadata,
-        K_new=None,
-        V_new=None,
-        Cache_seqlens=cache_seqlens,
-        Cache_batch_idx=cache_batch_idx,
-        Block_table=block_table,
-        Alibi_slopes=alibi_slopes,
+    dev, stream = current_device_stream()
+    _fwd_kernel_splitK_launch(dev)(
+        stream,
+        seqlen_q,  # grid
+        batch_size * n_group_q * heads_per_group_q,  # grid
+        split_k,  # grid
+        q,  # Q
+        k_cache,  # K
+        v_cache,  # V
+        q_descale,  # Q_Descale
+        k_descale,  # K_Descale
+        v_descale,  # V_Descale
+        sm_scale,
+        out_splitk,  # Out_splitK
+        metadata,  # Metadata
+        None,  # K_new
+        None,  # V_new
+        cache_seqlens,  # Cache_seqlens
+        cache_batch_idx,  # Cache_batch_idx
+        block_table,  # Block_table
+        alibi_slopes,  # Alibi_slopes
         # q strides
-        stride_qz=stride_qz,
-        stride_qm=stride_qm,
-        stride_qg=stride_qg,
-        stride_qh=stride_qh,
-        stride_qd=stride_qd,
+        stride_qz,
+        stride_qm,
+        stride_qg,
+        stride_qh,
+        stride_qd,
         # k strides
-        stride_kz=stride_kc_z,
-        stride_kn=stride_kc_n,
-        stride_kg=stride_kc_g,
-        stride_kh=stride_kc_h,
-        stride_kd=stride_kc_d,
+        stride_kc_z,  # stride_kz
+        stride_kc_n,  # stride_kn
+        stride_kc_g,  # stride_kg
+        stride_kc_h,  # stride_kh
+        stride_kc_d,  # stride_kd
         # v strides
-        stride_vz=stride_vc_z,
-        stride_vn=stride_vc_n,
-        stride_vg=stride_vc_g,
-        stride_vh=stride_vc_h,
-        stride_vd=stride_vc_d,
+        stride_vc_z,  # stride_vz
+        stride_vc_n,  # stride_vn
+        stride_vc_g,  # stride_vg
+        stride_vc_h,  # stride_vh
+        stride_vc_d,  # stride_vd
         # out_splitk strides
-        stride_osk_zhg=stride_osk_zhg,
-        stride_osk_s=stride_osk_s,
-        stride_osk_m=stride_osk_m,
-        stride_osk_d=stride_osk_d,
+        stride_osk_zhg,
+        stride_osk_s,
+        stride_osk_m,
+        stride_osk_d,
         # metadata strides
-        stride_mzhg=stride_mzhg,
-        stride_m2=stride_m2,
-        stride_ms=stride_ms,
-        stride_mm=stride_mm,
+        stride_mzhg,
+        stride_m2,
+        stride_ms,
+        stride_mm,
         # k_new strides
-        stride_kn_z=stride_kn_z,
-        stride_kn_n=stride_kn_n,
-        stride_kn_g=stride_kn_g,
-        stride_kn_h=stride_kn_h,
-        stride_kn_d=stride_kn_d,
+        stride_kn_z,
+        stride_kn_n,
+        stride_kn_g,
+        stride_kn_h,
+        stride_kn_d,
         # v_new strides
-        stride_vn_z=stride_vn_z,
-        stride_vn_n=stride_vn_n,
-        stride_vn_g=stride_vn_g,
-        stride_vn_h=stride_vn_h,
-        stride_vn_d=stride_vn_d,
+        stride_vn_z,
+        stride_vn_n,
+        stride_vn_g,
+        stride_vn_h,
+        stride_vn_d,
         # block table strides
-        stride_bt_b=stride_bt_b,
-        stride_bt_s=stride_bt_s,
+        stride_bt_b,
+        stride_bt_s,
         # paged KV block strides (real k/v_cache.stride(0)); lets the kernel
         # index a non-contiguous paged cache instead of assuming the block
         # stride equals BLOCK_SIZE_K * stride_kn (contiguous-only).
-        stride_kb=(k_cache.stride(0) if use_block_table else 0),
-        stride_vb=(v_cache.stride(0) if use_block_table else 0),
+        k_cache.stride(0) if use_block_table else 0,  # stride_kb
+        v_cache.stride(0) if use_block_table else 0,  # stride_vb
         # alibi strides
-        stride_az=stride_az,
-        stride_ah=stride_ah,
+        stride_az,
+        stride_ah,
         # FP8 descale strides
-        stride_q_descale_z=stride_q_descale_z,
-        stride_q_descale_h=stride_q_descale_h,
-        stride_k_descale_z=stride_k_descale_z,
-        stride_k_descale_h=stride_k_descale_h,
-        stride_v_descale_z=stride_v_descale_z,
-        stride_v_descale_h=stride_v_descale_h,
-        Z=batch_size,
-        H_q=heads_per_group_q,
-        H_kv=heads_per_group_k,
-        G_q=n_group_q,
-        N_CTX_Q=seqlen_q,
-        N_CTX_K=seqlen_kc,
-        N_CTX_NEW=0,  # No new KV, cache already updated
-        BLOCK_N_PER_SPLIT=split_size,
-        BLOCK_SIZE_K=block_size_k if use_block_table else 256,
-        BLOCK_DMODEL=dim_padded,
-        ACTUAL_BLOCK_DMODEL=dim_kc,
-        USE_CACHE_SEQLENs=use_cache_seqlens,
-        USE_CACHE_BATCH_IDX=cache_batch_idx is not None,
-        NEW_KV=False,  # Cache already updated
-        IS_GQA=is_gqa,
-        IS_CAUSAL=causal,
-        USE_ALIBI=use_alibi,
-        PADDED_HEAD=is_padded_head,
-        GROUP_SIZE=group_size,
-        USE_SLIDING_WINDOW=use_sliding_window,
-        WINDOW_SIZE_LEFT=window_size_left,
-        WINDOW_SIZE_RIGHT=window_size_right,
-        USE_BLOCK_TABLE=use_block_table,
-        IS_FP8=IS_FP8,
+        stride_q_descale_z,
+        stride_q_descale_h,
+        stride_k_descale_z,
+        stride_k_descale_h,
+        stride_v_descale_z,
+        stride_v_descale_h,
+        batch_size,  # Z
+        seqlen_q,  # N_CTX_Q
+        seqlen_kc,  # N_CTX_K
+        0,  # N_CTX_NEW; No new KV, cache already updated
+        split_size,  # BLOCK_N_PER_SPLIT
+        block_size_k if use_block_table else 256,  # BLOCK_SIZE_K
+        heads_per_group_q,  # H_q
+        heads_per_group_k,  # H_kv
+        n_group_q,  # G_q
+        dim_padded,  # BLOCK_DMODEL
+        dim_kc,  # ACTUAL_BLOCK_DMODEL
+        use_cache_seqlens,  # USE_CACHE_SEQLENs
+        cache_batch_idx is not None,  # USE_CACHE_BATCH_IDX
+        False,  # NEW_KV; Cache already updated
+        is_gqa,  # IS_GQA
+        causal,  # IS_CAUSAL
+        use_alibi,  # USE_ALIBI
+        is_padded_head,  # PADDED_HEAD
+        group_size,  # GROUP_SIZE
+        use_sliding_window,  # USE_SLIDING_WINDOW
+        window_size_left,  # WINDOW_SIZE_LEFT
+        window_size_right,  # WINDOW_SIZE_RIGHT
+        use_block_table,  # USE_BLOCK_TABLE
+        IS_FP8,
     )
 
     if DEBUG:
@@ -1432,38 +1444,40 @@ def attention_forward_decode_triton_impl(
         print("k_block_size:", k_block_size)
         print("grid:", reduce_grid)
 
-    _intj_launch_tuned(_splitK_reduce, reduce_grid,
+    _splitK_reduce_launch(dev)(
+        stream,
+        reduce_grid,
         out_splitk,
         metadata,
         out,
         lse,
         # Split-K output strides
-        stride_osk_zhg=stride_osk_zhg,
-        stride_osk_s=stride_osk_s,
-        stride_osk_m=stride_osk_m,
-        stride_osk_k=stride_osk_d,
+        stride_osk_zhg,
+        stride_osk_s,
+        stride_osk_m,
+        stride_osk_d,  # stride_osk_k
         # Metadata strides
-        stride_mzhg=stride_mzhg,
-        stride_m2=stride_m2,
-        stride_ms=stride_ms,
-        stride_mm=stride_mm,
+        stride_mzhg,
+        stride_m2,
+        stride_ms,
+        stride_mm,
         # Output tensor strides
-        stride_oz=stride_oz,
-        stride_oh=stride_oh,
-        stride_og=stride_og,
-        stride_om=stride_om,
-        stride_ok=stride_od,
+        stride_oz,
+        stride_oh,
+        stride_og,
+        stride_om,
+        stride_od,  # stride_ok
         # LSE strides
-        stride_lse_zhg=stride_lse_zhg,
-        stride_lse_m=stride_lse_m,
-        K_BLOCK_SIZE=k_block_size,
-        BLOCK_DMODEL=dim_padded,
-        ACTUAL_BLOCK_DMODEL=dim_kc,
-        G=n_group_q,
-        H=heads_per_group_q,
+        stride_lse_zhg,
+        stride_lse_m,
+        k_block_size,  # K_BLOCK_SIZE
+        dim_padded,  # BLOCK_DMODEL
+        dim_kc,  # ACTUAL_BLOCK_DMODEL
+        heads_per_group_q,  # H
+        n_group_q,  # G
         # TODO: Tune num_warps
-        split_k=split_k,
-        splitK_pow2=splitK_pow2,
-        MASK_SPLITK=mask_split_k,
-        PADDED_HEAD=is_padded_head,
+        split_k,
+        splitK_pow2,
+        mask_split_k,  # MASK_SPLITK
+        is_padded_head,  # PADDED_HEAD
     )

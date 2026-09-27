@@ -21,7 +21,6 @@ take a 1-D ``(kv_indices, kv_indptr)`` pair over one pool.
 import torch
 import triton
 from intj.compat import launch as _intj_launch
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_prefill_sparse import (
     _pa_prefill_sparse as gluon_pa_prefill_sparse,
@@ -33,11 +32,23 @@ from aiter.ops.triton.gluon.mla_gluon import (
     mla_gluon as gluon_mla_sparse_prefill,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 DEVICE_ARCH = arch_info.get_arch()
 
 _LOGGER = AiterTritonLogger()
+
+
+def _sparse_attn_prefill_kernel_grid(num_heads: int, BLOCK_H: int, *, num_queries: int):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (num_queries, triton.cdiv(num_heads, BLOCK_H))
+
+
+_sparse_attn_prefill_kernel_launch = intj_handle(
+    _sparse_attn_prefill_kernel,
+    grid_cpp=_sparse_attn_prefill_kernel_grid,
+)
 
 
 def pa_prefill_sparse(
@@ -214,7 +225,10 @@ def pa_prefill_sparse(
             num_queries,
             triton.cdiv(num_heads, META["BLOCK_H"]),
         )
-        _intj_launch_tuned(_sparse_attn_prefill_kernel, grid,
+        dev, stream = current_device_stream()
+        _sparse_attn_prefill_kernel_launch(dev)(
+            stream,
+            num_queries,  # grid
             q,
             unified_kv,
             kv_indices_prefix,
@@ -233,8 +247,8 @@ def pa_prefill_sparse(
             head_dim,
             unified_kv.shape[0],
             float(softmax_scale),
-            HAS_ATTN_SINK=has_attn_sink,
-            BLOCK_D=block_d,
+            has_attn_sink,  # HAS_ATTN_SINK
+            block_d,  # BLOCK_D
         )
         return out
 

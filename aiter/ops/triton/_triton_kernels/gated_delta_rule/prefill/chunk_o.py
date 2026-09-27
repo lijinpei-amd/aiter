@@ -11,7 +11,6 @@ This module provides functions for computing the final output in chunk mode.
 import torch
 import triton
 import triton.language as tl
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     IS_NVIDIA_HOPPER,
@@ -24,6 +23,7 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
     prepare_rebased_cu_seqlens,
 )
 from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.op import exp
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
@@ -184,6 +184,17 @@ def chunk_fwd_kernel_o(
         BT,
         BV,
     )
+
+
+def _chunk_fwd_kernel_o_grid(V: int, BV: int, H: int, *, NT: int, B: int):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (triton.cdiv(V, BV), NT, B * H)
+
+
+_chunk_fwd_kernel_o_launch = intj_handle(
+    chunk_fwd_kernel_o,
+    grid_cpp=_chunk_fwd_kernel_o_grid,
+)
 
 
 @triton.heuristics(
@@ -387,6 +398,9 @@ def chunk_bwd_kernel_dqkwg(
         )
 
 
+_chunk_bwd_kernel_dqkwg_launch = intj_handle(chunk_bwd_kernel_dqkwg)
+
+
 @triton.heuristics(
     {
         "USE_G": lambda args: args["g"] is not None,
@@ -489,6 +503,9 @@ def chunk_bwd_kernel_dv(
     )
 
 
+_chunk_bwd_kernel_dv_launch = intj_handle(chunk_bwd_kernel_dv)
+
+
 @triton.heuristics(
     {
         "USE_G": lambda args: args["g"] is not None,
@@ -583,6 +600,9 @@ def chunk_bwd_kernel_dv_local(
         )
 
 
+_chunk_bwd_kernel_dv_local_launch = intj_handle(chunk_bwd_kernel_dv_local)
+
+
 def chunk_fwd_o(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -605,25 +625,26 @@ def chunk_fwd_o(
 
     o = torch.empty_like(v)
 
-    def grid(meta):
-        return (triton.cdiv(V, meta["BV"]), NT, B * H)
-
-    _intj_launch_tuned(chunk_fwd_kernel_o, grid,
-        q=q,
-        k=k,
-        v=v,
-        h=h,
-        g=g,
-        g_gamma=g_gamma,
-        o=o,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        scale=scale,
-        T=T,
-        H=H,
-        K=K,
-        V=V,
-        BT=BT,
+    dev, stream = current_device_stream()
+    _chunk_fwd_kernel_o_launch(dev)(
+        stream,
+        NT,  # grid
+        B,  # grid
+        q,
+        k,
+        v,
+        h,
+        g,
+        g_gamma,
+        o,
+        cu_seqlens,
+        chunk_indices,
+        scale,
+        T,
+        H,
+        K,
+        V,
+        BT,
     )
     return o
 
@@ -731,6 +752,17 @@ def chunk_fwd_kernel_o_opt(
     _bp_st2d(o, T, V, H * V, 1, i_t * BT, i_v * BV, b_o.to(o.dtype.element_ty), BT, BV)
 
 
+def _chunk_fwd_kernel_o_opt_grid(V: int, BV: int, H: int, *, NT: int, B: int):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (triton.cdiv(V, BV), NT, B * H)
+
+
+_chunk_fwd_kernel_o_opt_launch = intj_handle(
+    chunk_fwd_kernel_o_opt,
+    grid_cpp=_chunk_fwd_kernel_o_opt_grid,
+)
+
+
 def chunk_fwd_o_opt(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -771,26 +803,27 @@ def chunk_fwd_o_opt(
 
     o = v.new_empty(B, T, H, V)
 
-    def grid(meta):
-        return (triton.cdiv(V, meta["BV"]), NT, B * H)
-
-    _intj_launch_tuned(chunk_fwd_kernel_o_opt, grid,
-        q=q,
-        k=k,
-        v=v,
-        h=h,
-        g=g,
-        o=o,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        scale=scale,
-        T=T,
-        T_flat=T_flat,
-        H=H,
-        Hg=Hg,
-        K=K,
-        V=V,
-        BT=BT,
+    dev, stream = current_device_stream()
+    _chunk_fwd_kernel_o_opt_launch(dev)(
+        stream,
+        NT,  # grid
+        B,  # grid
+        q,
+        k,
+        v,
+        h,
+        g,
+        o,
+        cu_seqlens,
+        chunk_indices,
+        scale,
+        T,
+        T_flat,
+        H,
+        Hg,
+        K,
+        V,
+        BT,
     )
     return o
 
@@ -921,6 +954,17 @@ def chunk_fwd_kernel_o_opt_vk(
     _bp_st2d(o, T, V, H * V, 1, i_t * BT, i_v * BV, b_o.to(o.dtype.element_ty), BT, BV)
 
 
+def _chunk_fwd_kernel_o_opt_vk_grid(V: int, BV: int, H: int, *, NT: int, B: int):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (triton.cdiv(V, BV), NT, B * H)
+
+
+_chunk_fwd_kernel_o_opt_vk_launch = intj_handle(
+    chunk_fwd_kernel_o_opt_vk,
+    grid_cpp=_chunk_fwd_kernel_o_opt_vk_grid,
+)
+
+
 def chunk_fwd_o_opt_vk(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1002,30 +1046,31 @@ def chunk_fwd_o_opt_vk(
 
     # o = v.new_empty(B, T, H, V)
 
-    def grid(meta):
-        return (triton.cdiv(V, meta["BV"]), NT, B * H)
-
-    _intj_launch_tuned(chunk_fwd_kernel_o_opt_vk, grid,
-        q=q,
-        k=k,
-        v=v,
-        h=h,
-        g=g,
-        o=o,
-        cu_seqlens=kernel_cu_seqlens,
-        sequence_ids=sequence_ids,
-        chunk_ids=chunk_ids,
-        scale=scale,
-        T=T,
-        T_flat=T_flat,
-        H=H,
-        Hg=Hg,
-        K=K,
-        V=V,
-        BT=BT,
-        INDEX_STRIDE=index_stride,
-        H_IS_FP32=h.dtype == torch.float32,
-        USE_EXP2=use_exp2,
+    dev, stream = current_device_stream()
+    _chunk_fwd_kernel_o_opt_vk_launch(dev)(
+        stream,
+        NT,  # grid
+        B,  # grid
+        q,
+        k,
+        v,
+        h,
+        g,
+        o,
+        kernel_cu_seqlens,  # cu_seqlens
+        sequence_ids,
+        chunk_ids,
+        scale,
+        T,
+        T_flat,
+        H,
+        Hg,
+        K,
+        V,
+        BT,
+        index_stride,  # INDEX_STRIDE
+        h.dtype == torch.float32,  # H_IS_FP32
+        use_exp2,  # USE_EXP2
     )
     return o
 
@@ -1062,24 +1107,27 @@ def chunk_bwd_dv(
 
     dv = torch.empty_like(do)
     grid = (NV, NT, B * H)
-    _intj_launch_tuned(chunk_bwd_kernel_dv, grid,
-        q=q,
-        k=k,
-        g=g,
-        g_gamma=g_gamma,
-        do=do,
-        dv=dv,
-        dh=dh,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        scale=scale,
-        T=T,
-        H=H,
-        K=K,
-        V=V,
-        BT=BT,
-        BK=BK,
-        BV=BV,
+    dev, stream = current_device_stream()
+    _chunk_bwd_kernel_dv_launch(dev)(
+        stream,
+        grid,
+        q,
+        k,
+        g,
+        g_gamma,
+        do,
+        dv,
+        dh,
+        cu_seqlens,
+        chunk_indices,
+        scale,
+        T,
+        H,
+        K,
+        V,
+        BT,
+        BK,
+        BV,
     )
     return dv
 
@@ -1113,24 +1161,27 @@ def chunk_bwd_dv_local(
 
     dv = torch.empty_like(do)
     grid = (NT, B * H)
-    _intj_launch_tuned(chunk_bwd_kernel_dv_local, grid,
-        q=q,
-        k=k,
-        g=g,
-        g_gamma=g_gamma,
-        A=A,
-        do=do,
-        dv=dv,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        scale=scale,
-        T=T,
-        H=H,
-        K=K,
-        V=V,
-        BT=BT,
-        BK=BK,
-        BV=BV,
+    dev, stream = current_device_stream()
+    _chunk_bwd_kernel_dv_local_launch(dev)(
+        stream,
+        grid,
+        q,
+        k,
+        g,
+        g_gamma,
+        A,
+        do,
+        dv,
+        cu_seqlens,
+        chunk_indices,
+        scale,
+        T,
+        H,
+        K,
+        V,
+        BT,
+        BK,
+        BV,
     )
     return dv
 
@@ -1172,31 +1223,34 @@ def chunk_bwd_dqkwg(
     dw = torch.empty_like(w) if w is not None else None
 
     grid = (NK, NT, B * H)
-    _intj_launch_tuned(chunk_bwd_kernel_dqkwg, grid,
-        q=q,
-        k=k,
-        v=v,
-        g=g,
-        g_gamma=g_gamma,
-        h=h,
-        do=do,
-        dh=dh,
-        dw=dw,
-        dq=dq,
-        dk=dk,
-        dv=dv,
-        dg=dg,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        scale=scale,
-        B=B,
-        T=T,
-        H=H,
-        K=K,
-        V=V,
-        BT=BT,
-        BK=BK,
-        BV=BV,
+    dev, stream = current_device_stream()
+    _chunk_bwd_kernel_dqkwg_launch(dev)(
+        stream,
+        grid,
+        q,
+        k,
+        v,
+        g,
+        g_gamma,
+        h,
+        do,
+        dh,
+        dq,
+        dk,
+        dw,
+        dv,
+        dg,
+        cu_seqlens,
+        chunk_indices,
+        scale,
+        B,
+        T,
+        H,
+        K,
+        V,
+        BT,
+        BK,
+        BV,
     )
 
     if dg is not None:

@@ -7,7 +7,6 @@
 import torch
 import triton
 import triton.language as tl
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils import (
     autotune_cache_kwargs,
@@ -19,6 +18,7 @@ from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils im
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.index import (
     prepare_chunk_indices,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
@@ -109,6 +109,17 @@ def chunk_gate_cumsum_kernel(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=m_s)
 
 
+def _chunk_gate_cumsum_kernel_grid(S: int, BS: int, H: int, *, NT: int, B: int):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (triton.cdiv(S, BS), NT, B * H)
+
+
+_chunk_gate_cumsum_kernel_launch = intj_handle(
+    chunk_gate_cumsum_kernel,
+    grid_cpp=_chunk_gate_cumsum_kernel_grid,
+)
+
+
 @input_guard
 def chunk_gate_cumsum(
     g: torch.Tensor,
@@ -134,21 +145,22 @@ def chunk_gate_cumsum(
 
     g_out = torch.empty_like(g, dtype=output_dtype or g.dtype)
 
-    def grid(meta):
-        return (triton.cdiv(S, meta["BS"]), NT, B * H)
-
-    _intj_launch_tuned(chunk_gate_cumsum_kernel, grid,
-        s=g,
-        A_log=A_log,
-        dt_bias=dt_bias,
-        o=g_out,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        lower_bound=lower_bound,
-        T=T,
-        H=H,
-        S=S,
-        BT=BT,
+    dev, stream = current_device_stream()
+    _chunk_gate_cumsum_kernel_launch(dev)(
+        stream,
+        NT,  # grid
+        B,  # grid
+        g,  # s
+        A_log,
+        dt_bias,
+        g_out,  # o
+        scale,
+        cu_seqlens,
+        chunk_indices,
+        lower_bound,
+        T,
+        H,
+        S,
+        BT,
     )
     return g_out

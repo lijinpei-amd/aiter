@@ -14,7 +14,6 @@ import os
 import torch
 import triton
 import triton.language as tl
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     IS_AMD,
@@ -30,6 +29,7 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.solve_tril import (
     FLA_TRIL_PRECISION,
     solve_tril,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 # solve_tril + recompute_w_u dispatch threshold in chunks (NT). At or below
@@ -458,6 +458,13 @@ def fused_solve_tril_recompute_w_u_kernel(
         )
 
 
+_fused_solve_tril_recompute_w_u_kernel_launch = intj_handle(
+    fused_solve_tril_recompute_w_u_kernel,
+    grid_arg=2,
+    baked={"DOT_PRECISION": FLA_TRIL_PRECISION},
+)
+
+
 # =============================================================================
 # Split path: head-major recompute_w_u kernel (consumes pre-inverted Ai).
 #
@@ -588,6 +595,12 @@ def recompute_w_u_head_major_kernel(
         )
 
 
+_recompute_w_u_head_major_kernel_launch = intj_handle(
+    recompute_w_u_head_major_kernel,
+    grid_arg=2,
+)
+
+
 def _run_split_path(
     A_raw: torch.Tensor,
     k: torch.Tensor,
@@ -623,7 +636,11 @@ def _run_split_path(
     )
     u_out = v.new_empty(B, H, T, V)
     w_out = k.new_empty(B, H, T, K)
-    _intj_launch_tuned(recompute_w_u_head_major_kernel, (NT, B * H),
+    dev, stream = current_device_stream()
+    _recompute_w_u_head_major_kernel_launch(dev)(
+        stream,
+        NT,
+        B * H,
         k,
         v,
         beta,
@@ -634,14 +651,14 @@ def _run_split_path(
         cu_seqlens,
         sequence_ids,
         chunk_ids,
-        T=T,
-        H=H,
-        Hg=Hg,
-        K=K,
-        V=V,
-        BT=BT,
-        INDEX_STRIDE=index_stride,
-        USE_EXP2=use_exp2,
+        T,
+        H,
+        Hg,
+        K,
+        V,
+        BT,
+        index_stride,  # INDEX_STRIDE
+        use_exp2,  # USE_EXP2
     )
     return w_out, u_out
 
@@ -755,7 +772,11 @@ def fused_solve_tril_recompute_w_u(
     u_out = v.new_empty(B, H, T, V)
     w_out = k.new_empty(B, H, T, K)
 
-    _intj_launch_tuned(fused_solve_tril_recompute_w_u_kernel, (NT, B * H),
+    dev, stream = current_device_stream()
+    _fused_solve_tril_recompute_w_u_kernel_launch(dev)(
+        stream,
+        NT,
+        B * H,
         A_raw,
         k,
         v,
@@ -766,15 +787,14 @@ def fused_solve_tril_recompute_w_u(
         kernel_cu_seqlens,
         sequence_ids,
         chunk_ids,
-        T=T,
-        H=H,
-        Hg=Hg,
-        K=K,
-        V=V,
-        BT=BT,
-        INDEX_STRIDE=index_stride,
-        DOT_PRECISION=FLA_TRIL_PRECISION,
-        USE_EXP2=use_exp2,
-        LOWP_DTYPE_IS_BF16=k.dtype == torch.bfloat16,
+        T,
+        H,
+        Hg,
+        K,
+        V,
+        BT,
+        index_stride,  # INDEX_STRIDE
+        use_exp2,  # USE_EXP2
+        k.dtype == torch.bfloat16,  # LOWP_DTYPE_IS_BF16
     )
     return w_out, u_out

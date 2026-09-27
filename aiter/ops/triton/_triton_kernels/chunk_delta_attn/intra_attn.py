@@ -18,7 +18,6 @@ and returns w, u, qg, kg, Aqk, Akk as required by the top-level forward.
 import torch
 import triton
 import triton.language as tl
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils import (
     IS_GATHER_SUPPORTED,
@@ -33,6 +32,7 @@ from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.index import (
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.wy_fast import (
     recompute_w_u_fwd,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 if IS_TF32_SUPPORTED:
@@ -180,6 +180,17 @@ def chunk_delta_attn_fwd_kernel_intra_token_parallel(
         )
 
 
+def _chunk_delta_attn_fwd_kernel_intra_token_parallel_grid(T: int, HV: int, BH: int, *, B: int):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (B * T, triton.cdiv(HV, BH))
+
+
+_chunk_delta_attn_fwd_kernel_intra_token_parallel_launch = intj_handle(
+    chunk_delta_attn_fwd_kernel_intra_token_parallel,
+    grid_cpp=_chunk_delta_attn_fwd_kernel_intra_token_parallel_grid,
+)
+
+
 def _chunk_delta_attn_fwd_intra_token_parallel(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -198,27 +209,25 @@ def _chunk_delta_attn_fwd_intra_token_parallel(
     BT = chunk_size
     BC = sub_chunk_size
 
-    def grid(meta):
-        return (B * T, triton.cdiv(HV, meta["BH"]))
-
-    _intj_launch_tuned(
-        chunk_delta_attn_fwd_kernel_intra_token_parallel,
-        grid,
-        q=q,
-        k=k,
-        g=gk,
-        beta=beta,
-        Aqk=Aqk,
-        Akk=Akk,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        N=N,
-        T=T,
-        H=H,
-        HV=HV,
-        K=K,
-        BT=BT,
-        BC=BC,
+    dev, stream = current_device_stream()
+    _chunk_delta_attn_fwd_kernel_intra_token_parallel_launch(dev)(
+        stream,
+        B,  # grid
+        q,
+        k,
+        gk,  # g
+        beta,
+        Aqk,
+        Akk,
+        scale,
+        cu_seqlens,
+        N,
+        T,
+        H,
+        HV,
+        K,
+        BT,
+        BC,
     )
     return Aqk, Akk
 
@@ -365,6 +374,11 @@ def chunk_delta_attn_fwd_kernel_intra_sub_chunk(
         b_Ai = tl.where((o_i == i)[:, None], b_a, b_Ai)
     b_Ai += m_I
     tl.store(p_Akk, b_Ai.to(Akk.dtype.element_ty), mask=m_Akk_st)
+
+
+_chunk_delta_attn_fwd_kernel_intra_sub_chunk_launch = intj_handle(
+    chunk_delta_attn_fwd_kernel_intra_sub_chunk,
+)
 
 
 @triton.heuristics(
@@ -688,6 +702,12 @@ def chunk_delta_attn_fwd_kernel_inter_solve_fused(
         tl.store(p_Akk33, b_Ai33.to(Akk.dtype.element_ty), mask=m_A3)
 
 
+_chunk_delta_attn_fwd_kernel_inter_solve_fused_launch = intj_handle(
+    chunk_delta_attn_fwd_kernel_inter_solve_fused,
+    baked={"DOT_PRECISION": SOLVE_TRIL_DOT_PRECISION.value},
+)
+
+
 @input_guard
 def chunk_delta_attn_fwd_intra(
     q: torch.Tensor,
@@ -723,26 +743,27 @@ def chunk_delta_attn_fwd_intra(
     if safe_gate:
         BK = min(64, triton.next_power_of_2(K))
         grid = (NT, NC, B * HV)
-        _intj_launch_tuned(
-            chunk_delta_attn_fwd_kernel_intra_sub_chunk,
+        dev, stream = current_device_stream()
+        _chunk_delta_attn_fwd_kernel_intra_sub_chunk_launch(dev)(
+            stream,
             grid,
-            q=q,
-            k=k,
-            g=gk,
-            beta=beta,
-            Aqk=Aqk,
-            Akk=Akkd,
-            scale=scale,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            T=T,
-            H=H,
-            HV=HV,
-            K=K,
-            BT=BT,
-            BC=BC,
-            BK=BK,
-            USE_GATHER=IS_GATHER_SUPPORTED,
+            q,
+            k,
+            gk,  # g
+            beta,
+            Aqk,
+            Akkd,  # Akk
+            scale,
+            cu_seqlens,
+            chunk_indices,
+            T,
+            H,
+            HV,
+            K,
+            BT,
+            BC,
+            BK,
+            IS_GATHER_SUPPORTED,  # USE_GATHER
         )
     else:
         _chunk_delta_attn_fwd_intra_token_parallel(
@@ -759,28 +780,28 @@ def chunk_delta_attn_fwd_intra(
         )
 
     grid = (NT, B * HV)
-    _intj_launch_tuned(
-        chunk_delta_attn_fwd_kernel_inter_solve_fused,
+    dev, stream = current_device_stream()
+    _chunk_delta_attn_fwd_kernel_inter_solve_fused_launch(dev)(
+        stream,
         grid,
-        q=q,
-        k=k,
-        g=gk,
-        beta=beta,
-        Aqk=Aqk,
-        Akkd=Akkd,
-        Akk=Akk,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        T=T,
-        H=H,
-        HV=HV,
-        K=K,
-        BT=BT,
-        BC=BC,
-        NC=NC,
-        USE_SAFE_GATE=safe_gate,
-        DOT_PRECISION=SOLVE_TRIL_DOT_PRECISION.value,
+        q,
+        k,
+        gk,  # g
+        beta,
+        Aqk,
+        Akkd,
+        Akk,
+        scale,
+        cu_seqlens,
+        chunk_indices,
+        T,
+        H,
+        HV,
+        K,
+        BT,
+        BC,
+        NC,
+        safe_gate,  # USE_SAFE_GATE
     )
 
     w, u, qg, kg = recompute_w_u_fwd(

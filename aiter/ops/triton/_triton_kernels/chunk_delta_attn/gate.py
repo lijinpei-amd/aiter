@@ -22,7 +22,6 @@ from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils im
     softplus,
 )
 from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 _BETA_SIGMOID_BLOCK_SIZE = 2048
@@ -131,6 +130,17 @@ def chunk_delta_attn_gate_fwd_kernel(
     tl.store(p_yg, b_yg.to(p_yg.dtype.element_ty), mask=m_g)
 
 
+def _chunk_delta_attn_gate_fwd_kernel_grid(T: int, BT: int, H: int):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (triton.cdiv(T, BT), H)
+
+
+_chunk_delta_attn_gate_fwd_kernel_launch = intj_handle(
+    chunk_delta_attn_gate_fwd_kernel,
+    grid_cpp=_chunk_delta_attn_gate_fwd_kernel_grid,
+)
+
+
 @input_guard
 def chunk_delta_attn_gate_fwd(
     g: torch.Tensor,
@@ -157,18 +167,17 @@ def chunk_delta_attn_gate_fwd(
 
     yg = torch.empty_like(g, dtype=output_dtype)
 
-    def grid(meta):
-        return (triton.cdiv(T, meta["BT"]), H)
-
-    _intj_launch_tuned(chunk_delta_attn_gate_fwd_kernel, grid,
-        g=g,
-        A_log=A_log,
-        dt_bias=dt_bias,
-        yg=yg,
-        lower_bound=lower_bound,
-        T=T,
-        H=H,
-        D=D,
-        BD=triton.next_power_of_2(D),
+    dev, stream = current_device_stream()
+    _chunk_delta_attn_gate_fwd_kernel_launch(dev)(
+        stream,
+        g,
+        A_log,
+        dt_bias,
+        yg,
+        lower_bound,
+        T,
+        H,
+        D,
+        triton.next_power_of_2(D),  # BD
     )
     return yg

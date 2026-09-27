@@ -4,7 +4,6 @@ from typing import Literal
 import torch
 import triton
 import triton.language as tl
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.common import (
     apply_rotary,
@@ -20,6 +19,7 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
     is_fp8,
     remap_xcd,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 FWD_PREFILL_AUTOTUNE_KEYS = [
@@ -1473,6 +1473,14 @@ def attn_fwd(
     tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=o_ptrs_mask)
 
 
+def _attn_fwd_grid(BLOCK_M: int, *, nheads_q: int, max_seqlens_q: int, batch: int):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (nheads_q, triton.cdiv(max_seqlens_q, BLOCK_M), batch)
+
+
+_attn_fwd_launch = intj_handle(attn_fwd, grid_cpp=_attn_fwd_grid)
+
+
 def attention_forward_prefill_triton_impl(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1874,10 +1882,13 @@ def attention_forward_prefill_triton_impl(
     )
 
     # launch kernel
-    def grid(META):
-        return (nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]), batch)
 
-    _intj_launch_tuned(attn_fwd, grid,
+    dev, stream = current_device_stream()
+    _attn_fwd_launch(dev)(
+        stream,
+        nheads_q,  # grid
+        max_seqlens_q,  # grid
+        batch,  # grid
         q,
         k,
         v,
@@ -1925,33 +1936,33 @@ def attention_forward_prefill_triton_impl(
         cu_seqlens_k,
         seqused_q,
         seqused_k,  # Pass seqused tensors
-        dropout_p=dropout_p,
-        philox_seed=philox_seed,
-        philox_offset_base=philox_offset,
-        HQ=nheads_q,
-        HK=nheads_k,
-        ACTUAL_BLOCK_DMODEL_QK=head_size_qk,
-        ACTUAL_BLOCK_DMODEL_V=head_size_v,
-        MAX_SEQLENS_Q=max_seqlens_q,
-        MAX_SEQLENS_K=max_seqlens_k,
-        SM_SCALE=sm_scale,
-        IS_CAUSAL=causal,
-        USE_SLIDING_WINDOW=use_sliding_window,
-        WINDOW_SIZE_LEFT=window_size_left,
-        WINDOW_SIZE_RIGHT=window_size_right,
-        IS_VARLEN=IS_VARLEN,
-        BLOCK_DMODEL_QK=padded_d_model_qk,
-        BLOCK_DMODEL_V=padded_d_model_v,
-        USE_BIAS=not bias is None,
-        USE_ALIBI=use_alibi,
-        ENABLE_DROPOUT=dropout_p > 0.0,
-        USE_EXP2=use_exp2,
-        RETURN_SCORES=return_scores,
-        IS_FP8=IS_FP8,
-        FP8_MAX=FP8_MAX,
-        FP8_P_DESCALE=False,
-        USE_SEQUSED=(seqused_q is not None or seqused_k is not None),
-        FORCE_MASKING=force_masking,
-        NUM_XCD=num_xcd,
-        HEAD_STRIDE_ALIGNED_8=head_stride_aligned_8,
+        dropout_p,
+        philox_seed,
+        philox_offset,  # philox_offset_base
+        nheads_q,  # HQ
+        nheads_k,  # HK
+        head_size_qk,  # ACTUAL_BLOCK_DMODEL_QK
+        head_size_v,  # ACTUAL_BLOCK_DMODEL_V
+        max_seqlens_q,  # MAX_SEQLENS_Q
+        max_seqlens_k,  # MAX_SEQLENS_K
+        IS_VARLEN,
+        sm_scale,  # SM_SCALE
+        causal,  # IS_CAUSAL
+        use_sliding_window,  # USE_SLIDING_WINDOW
+        window_size_left,  # WINDOW_SIZE_LEFT
+        window_size_right,  # WINDOW_SIZE_RIGHT
+        padded_d_model_qk,  # BLOCK_DMODEL_QK
+        padded_d_model_v,  # BLOCK_DMODEL_V
+        not bias is None,  # USE_BIAS
+        dropout_p > 0.0,  # ENABLE_DROPOUT
+        return_scores,  # RETURN_SCORES
+        use_alibi,  # USE_ALIBI
+        use_exp2,  # USE_EXP2
+        IS_FP8,
+        FP8_MAX,
+        False,  # FP8_P_DESCALE
+        seqused_q is not None or seqused_k is not None,  # USE_SEQUSED
+        force_masking,  # FORCE_MASKING
+        num_xcd,  # NUM_XCD
+        head_stride_aligned_8,  # HEAD_STRIDE_ALIGNED_8
     )

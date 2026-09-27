@@ -1,12 +1,12 @@
 import torch
 import triton
 import triton.language as tl
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     autotune_cache_kwargs,
     input_guard,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 
@@ -193,6 +193,17 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
 
+def _fused_sigmoid_gating_delta_rule_update_kernel_grid(V: int, BV: int, HV: int, *, NK: int, N: int):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (NK, triton.cdiv(V, BV), N * HV)
+
+
+_fused_sigmoid_gating_delta_rule_update_kernel_launch = intj_handle(
+    fused_sigmoid_gating_delta_rule_update_kernel,
+    grid_cpp=_fused_sigmoid_gating_delta_rule_update_kernel_grid,
+)
+
+
 @input_guard
 def fused_sigmoid_gating_delta_rule_update(
     A_log: torch.Tensor,
@@ -229,32 +240,33 @@ def fused_sigmoid_gating_delta_rule_update(
 
     o = q.new_empty(NK, *v.shape)
 
-    def grid(META):
-        return (NK, triton.cdiv(V, META["BV"]), N * HV)
-
-    _intj_launch_tuned(fused_sigmoid_gating_delta_rule_update_kernel, grid,
-        A_log=A_log,
-        a=a,
-        dt_bias=dt_bias,
-        softplus_beta=softplus_beta,
-        softplus_threshold=softplus_threshold,
-        q=q,
-        k=k,
-        v=v,
-        b=b,
-        o=o,
-        h0_source=initial_state_source,
-        h0_indices=initial_state_indices,
-        cu_seqlens=cu_seqlens,
-        scale=scale,
-        T=T,
-        B=B,
-        H=H,
-        HV=HV,
-        K=K,
-        V=V,
-        BK=BK,
-        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+    dev, stream = current_device_stream()
+    _fused_sigmoid_gating_delta_rule_update_kernel_launch(dev)(
+        stream,
+        NK,  # grid
+        N,  # grid
+        A_log,
+        a,
+        dt_bias,
+        softplus_beta,
+        softplus_threshold,
+        q,
+        k,
+        v,
+        b,
+        o,
+        initial_state_source,  # h0_source
+        initial_state_indices,  # h0_indices
+        cu_seqlens,
+        scale,
+        T,
+        B,
+        H,
+        HV,
+        K,
+        V,
+        BK,
+        use_qk_l2norm_in_kernel,  # USE_QK_L2NORM_IN_KERNEL
     )
     o = o.squeeze(0)
     return o

@@ -13,12 +13,12 @@ Convention (TN layout):
 
 import torch
 import triton
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.moe.moe_gemm_per_token import (
     _moe_gemm_per_token_kernel,
 )
 from aiter.ops.triton.moe.moe_utils import build_block_mapping
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 __all__ = ["moe_gemm_per_token"]
@@ -28,6 +28,9 @@ _LOGGER = AiterTritonLogger()
 BLOCK_M = 64
 BLOCK_N = 128
 BLOCK_K = 128
+
+
+_moe_gemm_per_token_kernel_launch = intj_handle(_moe_gemm_per_token_kernel)
 
 
 def moe_gemm_per_token(
@@ -86,7 +89,10 @@ def moe_gemm_per_token(
     num_n_blocks = triton.cdiv(N, BLOCK_N)
     grid = (total_m_blocks * num_n_blocks,)
 
-    _intj_launch_tuned(_moe_gemm_per_token_kernel, grid,
+    dev, stream = current_device_stream()
+    _moe_gemm_per_token_kernel_launch(dev)(
+        stream,
+        grid,
         lhs,
         rhs,
         out,
@@ -106,9 +112,9 @@ def moe_gemm_per_token(
         rhs.stride(2),
         out.stride(0),
         out.stride(1),
-        HAS_BIAS=bias is not None,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
+        bias is not None,  # HAS_BIAS
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
     )
     return out

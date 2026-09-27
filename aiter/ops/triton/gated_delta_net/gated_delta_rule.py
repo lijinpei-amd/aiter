@@ -20,7 +20,6 @@ from collections.abc import Sequence
 
 import torch
 import triton
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule import (
     _fused_recurrent_gated_delta_rule_fwd_kernel,
@@ -32,9 +31,16 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
     GatedDeltaRulePrefillMetadata,
     l2norm_fwd,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+
+_fused_recurrent_gated_delta_rule_fwd_kernel_launch = intj_handle(
+    _fused_recurrent_gated_delta_rule_fwd_kernel,
+    options={"num_stages": 3, "num_warps": 1},
+)
 
 
 def fused_recurrent_gated_delta_rule(
@@ -179,31 +185,32 @@ def fused_recurrent_gated_delta_rule(
 
     # Launch kernel
     grid = (NV, N * HV)
-    _intj_launch_tuned(_fused_recurrent_gated_delta_rule_fwd_kernel, grid,
-        q=q,
-        k=k,
-        v=v,
-        g=g,
-        gk=gk,
-        gv=gv,
-        beta=beta,
-        o=o,
-        h0=initial_state,
-        ht=final_state,
-        cu_seqlens=cu_seqlens,
-        scale=scale,
-        T=T,
-        B=B,
-        H=H,
-        HV=HV,
-        K=K,
-        V=V,
-        BK=BK,
-        BV=BV,
-        IS_BETA_HEADWISE=beta.ndim != v.ndim,
-        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
-        num_warps=1,
-        num_stages=3,
+    dev, stream = current_device_stream()
+    _fused_recurrent_gated_delta_rule_fwd_kernel_launch(dev)(
+        stream,
+        grid,
+        q,
+        k,
+        v,
+        g,
+        gk,
+        gv,
+        beta,
+        o,
+        initial_state,  # h0
+        final_state,  # ht
+        cu_seqlens,
+        scale,
+        T,
+        B,
+        H,
+        HV,
+        K,
+        V,
+        BK,
+        BV,
+        use_qk_l2norm_in_kernel,  # USE_QK_L2NORM_IN_KERNEL
+        beta.ndim != v.ndim,  # IS_BETA_HEADWISE
     )
 
     return o, final_state

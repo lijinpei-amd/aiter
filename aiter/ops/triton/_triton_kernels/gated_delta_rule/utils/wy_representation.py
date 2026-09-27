@@ -12,7 +12,6 @@ chunk-based gated delta rule operations.
 import torch
 import triton
 import triton.language as tl
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     autotune_cache_kwargs,
@@ -21,6 +20,7 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.index import (
     prepare_chunk_indices,
 )
 from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.op import exp
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 
@@ -106,6 +106,12 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     )
 
 
+_chunk_scaled_dot_kkt_fwd_kernel_launch = intj_handle(
+    chunk_scaled_dot_kkt_fwd_kernel,
+    grid_arg=2,
+)
+
+
 def chunk_scaled_dot_kkt_fwd(
     k: torch.Tensor,
     g: torch.Tensor | None = None,
@@ -141,17 +147,21 @@ def chunk_scaled_dot_kkt_fwd(
     )
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     A = torch.empty(B, T, H, BT, device=k.device, dtype=output_dtype)
-    _intj_launch_tuned(chunk_scaled_dot_kkt_fwd_kernel, (NT, B * H),
-        k=k,
-        g=g,
-        beta=beta,
-        A=A,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        T=T,
-        H=H,
-        K=K,
-        BT=BT,
+    dev, stream = current_device_stream()
+    _chunk_scaled_dot_kkt_fwd_kernel_launch(dev)(
+        stream,
+        NT,
+        B * H,
+        k,
+        g,
+        beta,
+        A,
+        cu_seqlens,
+        chunk_indices,
+        T,
+        H,
+        K,
+        BT,
     )
     return A
 
@@ -264,6 +274,9 @@ def recompute_w_u_fwd_kernel(
         )
 
 
+_recompute_w_u_fwd_kernel_launch = intj_handle(recompute_w_u_fwd_kernel, grid_arg=2)
+
+
 def recompute_w_u_fwd(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -299,22 +312,26 @@ def recompute_w_u_fwd(
 
     w = torch.empty_like(k)
     u = torch.empty_like(v)
-    _intj_launch_tuned(recompute_w_u_fwd_kernel, (NT, B * H),
-        k=k,
-        v=v,
-        beta=beta,
-        w=w,
-        u=u,
-        A=A,
-        g=g,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        T=T,
-        H=H,
-        K=K,
-        V=V,
-        BT=BT,
-        BK=BK,
-        BV=BV,
+    dev, stream = current_device_stream()
+    _recompute_w_u_fwd_kernel_launch(dev)(
+        stream,
+        NT,
+        B * H,
+        k,
+        v,
+        beta,
+        w,
+        u,
+        A,
+        g,
+        cu_seqlens,
+        chunk_indices,
+        T,
+        H,
+        K,
+        V,
+        BT,
+        BK,
+        BV,
     )
     return w, u

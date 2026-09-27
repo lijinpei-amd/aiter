@@ -15,7 +15,6 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
     remap_xcd,
 )
 from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 PREPROCESS_AUTOTUNE_KEYS = [
@@ -2869,6 +2868,14 @@ def _bwd_preprocess(
     tl.store(Delta + off_delta, delta, mask=mask_m)
 
 
+def _bwd_preprocess_grid(max_seqlen_q: int, PRE_BLOCK: int, *, batch: int, nheads_q: int):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (triton.cdiv(max_seqlen_q, PRE_BLOCK), batch, nheads_q)
+
+
+_bwd_preprocess_launch = intj_handle(_bwd_preprocess, grid_cpp=_bwd_preprocess_grid)
+
+
 # The main inner-loop logic for computing dK and dV.
 @triton.jit
 def _bwd_dkdv_inner(
@@ -3972,6 +3979,17 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
             offs_dq = offs_m[:, None] * stride_dqm + offs_d_qk[None, :] * stride_dqd
             dq *= sm_scale
             tl.store(DQ + adj_dq + offs_dq, dq, mask=mask_q)
+
+
+def _bwd_kernel_fused_causal_grid(BLOCK_N1: int, *, nheads_k: int, seqlen: int, batch: int):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (nheads_k, (((seqlen + BLOCK_N1) - 1) // BLOCK_N1), batch)
+
+
+_bwd_kernel_fused_causal_launch = intj_handle(
+    bwd_kernel_fused_causal,
+    grid_cpp=_bwd_kernel_fused_causal_grid,
+)
             # end of GQA/MQA of dq
 
 
@@ -4401,6 +4419,17 @@ def bwd_kernel_fused_noncausal(
             tl.store(DQ + adj_dq + offs_dq, dq, mask=mask_q)
 
 
+def _bwd_kernel_fused_noncausal_grid(BLOCK_N1: int, *, nheads_k: int, seqlen: int, batch: int):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (nheads_k, (((seqlen + BLOCK_N1) - 1) // BLOCK_N1), batch)
+
+
+_bwd_kernel_fused_noncausal_launch = intj_handle(
+    bwd_kernel_fused_noncausal,
+    grid_cpp=_bwd_kernel_fused_noncausal_grid,
+)
+
+
 def is_contiguous(x, name):
     if x.is_contiguous():
         return x
@@ -4764,14 +4793,11 @@ def attention_backward_triton_impl(
         assert delta.device == q.device, "delta must be on same device as q"
         stride_delta_b, stride_delta_h, stride_delta_m = delta.stride()
 
-    def pre_grid(META):
-        return (
-            triton.cdiv(max_seqlen_q, META["PRE_BLOCK"]),
-            batch,
-            nheads_q,
-        )
-
-    _intj_launch_tuned(_bwd_preprocess, pre_grid,
+    intj_dev, intj_stream = current_device_stream()
+    _bwd_preprocess_launch(intj_dev)(
+        intj_stream,
+        batch,  # grid
+        nheads_q,  # grid
         o,
         do,
         delta,
@@ -4788,10 +4814,10 @@ def attention_backward_triton_impl(
         stride_delta_m,
         cu_seqlens_q,
         max_seqlen_q,
-        HEAD_DIM_V=HEAD_DIM_V,
-        ACTUAL_HEAD_DIM_V=ACTUAL_HEAD_DIM_V,
-        IS_VARLEN=IS_VARLEN,
-        IS_FP8=IS_FP8,
+        HEAD_DIM_V,
+        ACTUAL_HEAD_DIM_V,
+        IS_VARLEN,
+        IS_FP8,
     )
 
     if DEBUG:
@@ -4830,7 +4856,12 @@ def attention_backward_triton_impl(
 
             if DEBUG_TRITON:
                 print(f"bwd_kernel: grid = {grid}")
-            _intj_launch_tuned(bwd_kernel_fused_causal, grid,
+            intj_dev, intj_stream = current_device_stream()
+            _bwd_kernel_fused_causal_launch(intj_dev)(
+                intj_stream,
+                nheads_k,  # grid
+                seqlen,  # grid
+                batch,  # grid
                 q,
                 k,
                 v,
@@ -4900,28 +4931,31 @@ def attention_backward_triton_impl(
                 descale_q,
                 descale_k,
                 descale_v,
-                HEAD_DIM_QK=HEAD_DIM_QK,
-                HEAD_DIM_V=HEAD_DIM_V,
-                ACTUAL_HEAD_DIM_QK=ACTUAL_HEAD_DIM_QK,
-                ACTUAL_HEAD_DIM_V=ACTUAL_HEAD_DIM_V,
-                ENABLE_DROPOUT=use_dropout,
-                IS_VARLEN=IS_VARLEN,
-                USE_ALIBI=use_alibi,
-                USE_EXP2=use_exp2,
-                IS_FP8=IS_FP8,
-                FP8_MAX=FP8_MAX,
-                USE_SEQUSED=(
-                    seqused_q is not None or seqused_k is not None
-                ),  # Add flag for seqused
-                USE_SLIDING_WINDOW=use_sliding_window,
-                WINDOW_SIZE_LEFT=window_size_left,
-                WINDOW_SIZE_RIGHT=window_size_right,
-                DEBUG_TRITON=DEBUG_TRITON,
-                DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
-                NUM_XCD=num_xcd,
+                HEAD_DIM_QK,
+                HEAD_DIM_V,
+                ACTUAL_HEAD_DIM_QK,
+                ACTUAL_HEAD_DIM_V,
+                use_dropout,  # ENABLE_DROPOUT
+                IS_VARLEN,
+                use_alibi,  # USE_ALIBI
+                use_exp2,  # USE_EXP2
+                IS_FP8,
+                FP8_MAX,
+                seqused_q is not None or seqused_k is not None,  # USE_SEQUSED
+                use_sliding_window,  # USE_SLIDING_WINDOW
+                window_size_left,  # WINDOW_SIZE_LEFT
+                window_size_right,  # WINDOW_SIZE_RIGHT
+                DEBUG_TRITON,
+                DEBUG_TRITON_DETAIL,
+                num_xcd,  # NUM_XCD
             )
         else:
-            _intj_launch_tuned(bwd_kernel_fused_noncausal, grid,
+            intj_dev, intj_stream = current_device_stream()
+            _bwd_kernel_fused_noncausal_launch(intj_dev)(
+                intj_stream,
+                nheads_k,  # grid
+                seqlen,  # grid
+                batch,  # grid
                 q,
                 k,
                 v,
@@ -4991,25 +5025,23 @@ def attention_backward_triton_impl(
                 descale_q,
                 descale_k,
                 descale_v,
-                HEAD_DIM_QK=HEAD_DIM_QK,
-                HEAD_DIM_V=HEAD_DIM_V,
-                ACTUAL_HEAD_DIM_QK=ACTUAL_HEAD_DIM_QK,
-                ACTUAL_HEAD_DIM_V=ACTUAL_HEAD_DIM_V,
-                ENABLE_DROPOUT=use_dropout,
-                IS_VARLEN=IS_VARLEN,
-                USE_ALIBI=use_alibi,
-                USE_EXP2=use_exp2,
-                IS_FP8=IS_FP8,
-                FP8_MAX=FP8_MAX,
-                USE_SEQUSED=(
-                    seqused_q is not None or seqused_k is not None
-                ),  # Add flag for seqused
-                USE_SLIDING_WINDOW=use_sliding_window,
-                WINDOW_SIZE_LEFT=window_size_left,
-                WINDOW_SIZE_RIGHT=window_size_right,
-                DEBUG_TRITON=DEBUG_TRITON,
-                DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
-                NUM_XCD=num_xcd,
+                HEAD_DIM_QK,
+                HEAD_DIM_V,
+                ACTUAL_HEAD_DIM_QK,
+                ACTUAL_HEAD_DIM_V,
+                use_dropout,  # ENABLE_DROPOUT
+                IS_VARLEN,
+                use_alibi,  # USE_ALIBI
+                use_exp2,  # USE_EXP2
+                IS_FP8,
+                FP8_MAX,
+                seqused_q is not None or seqused_k is not None,  # USE_SEQUSED
+                use_sliding_window,  # USE_SLIDING_WINDOW
+                window_size_left,  # WINDOW_SIZE_LEFT
+                window_size_right,  # WINDOW_SIZE_RIGHT
+                DEBUG_TRITON,
+                DEBUG_TRITON_DETAIL,
+                num_xcd,  # NUM_XCD
             )
     elif mode == "fused_atomic":
         BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 64, 64, 64, 16

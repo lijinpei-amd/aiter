@@ -29,6 +29,9 @@ from aiter.utility import dtypes
 _LOGGER = AiterTritonLogger()
 
 
+_fused_rms_mxfp4_quant_launch = intj_handle(_fused_rms_mxfp4_quant_kernel, grid_arg=1)
+
+
 def fused_rms_mxfp4_quant(
     x1: torch.Tensor,
     x1_weight: torch.Tensor,
@@ -184,12 +187,12 @@ def fused_rms_mxfp4_quant(
             ROWS_PER_CTA=ROWS_PER_CTA,
         )
     else:
-        grid = (M * (1 if x2 is None else 2),)
-        launch_tuned(
-            _fused_rms_mxfp4_quant_kernel,
-            grid,
+        dev, stream = current_device_stream()
+        _fused_rms_mxfp4_quant_launch(dev)(
+            stream,
+            M * (1 if x2 is None else 2),
             *_common_args,
-            **_common_kwargs,
+            *_common_kwargs.values(),  # built in kernel parameter order
         )
 
     return (out1_fp4, out1_bs), out1, out2, out_res1
@@ -428,6 +431,12 @@ def fused_reduce_act_mul_and_mxfp4_quant(
     return (y, y_scale), y2
 
 
+_reduce_rms_mxfp4_quant_launch = intj_handle(_fused_reduce_rms_mxfp4_quant_kernel)
+_gluon_reduce_rms_mxfp4_quant_launch = intj_handle(
+    _gluon_fused_reduce_rms_mxfp4_quant_kernel
+)
+
+
 def fused_reduce_rms_mxfp4_quant(
     x1: torch.Tensor,
     x1_weight: torch.Tensor,
@@ -576,13 +585,14 @@ def fused_reduce_rms_mxfp4_quant(
 
     # select kernel based on args and arch
     kernel = (
-        _gluon_fused_reduce_rms_mxfp4_quant_kernel
+        _gluon_reduce_rms_mxfp4_quant_launch
         if (args in ["gluon", "auto"]) and get_arch() == "gfx1250"
-        else _fused_reduce_rms_mxfp4_quant_kernel
+        else _reduce_rms_mxfp4_quant_launch
     )
 
-    launch_tuned(
-        kernel,
+    dev, stream = current_device_stream()
+    kernel(dev)(
+        stream,
         grid,
         x1,
         x1_weight,

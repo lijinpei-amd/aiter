@@ -10,7 +10,6 @@ from triton.runtime.jit import JITFunction
 
 import aiter.ops.triton.quant.fused_mxfp4_quant as _wrapper
 from aiter.ops.triton._triton_kernels.quant import fused_mxfp4_quant as _kernels
-
 from aiter.ops.triton.quant.fused_mxfp4_quant import (
     fused_dynamic_mxfp4_quant_moe_sort,
     fused_flatten_mxfp4_quant,
@@ -44,6 +43,27 @@ def _raw_bracket_launch(kernel, grid, *args, **kwargs):
     return kernel[grid](*args, **kwargs)
 
 
+def _bracket_handle(kernel, grid_arg=None):
+    """An intj_handle stand-in that launches ``kernel[grid](...)`` instead."""
+    jit, assigned = kernel, set()
+    while not isinstance(jit, JITFunction):
+        assigned.update(jit.values)
+        jit = jit.fn
+    names = [p.name for p in jit.params if p.name not in assigned]
+
+    def bound(_device):
+        def launch(_stream, *args):
+            if grid_arg:
+                grid, args = args[:grid_arg], args[grid_arg:]
+            else:
+                grid, args = args[0], args[1:]
+            kernel[grid](**dict(zip(names, args)))
+
+        return launch
+
+    return bound
+
+
 def test_dynamic_mxfp4_quant_uses_intj():
     packed, scales = dynamic_mxfp4_quant(_input())
     assert packed.shape == (2, 32)
@@ -71,7 +91,11 @@ def test_fused_rms_mxfp4_quant_matches_triton_reference(monkeypatch):
             _input(), _input(1)[0], 1e-6, output_unquantized_inp1=True, inargs="triton"
         )
 
-    monkeypatch.setattr(_wrapper, "launch_tuned", _raw_bracket_launch)
+    monkeypatch.setattr(
+        _wrapper,
+        "_fused_rms_mxfp4_quant_launch",
+        _bracket_handle(_kernels._fused_rms_mxfp4_quant_kernel, grid_arg=1),
+    )
     (packed_t, scales_t), norm_t, _, _ = _run()
     monkeypatch.undo()
 
@@ -105,7 +129,11 @@ def test_fused_reduce_rms_mxfp4_quant_matches_triton_reference(monkeypatch):
             _input(), _input(1)[0], 1e-6, output_unquantized_inp1=True, args="triton"
         )
 
-    monkeypatch.setattr(_wrapper, "launch_tuned", _raw_bracket_launch)
+    monkeypatch.setattr(
+        _wrapper,
+        "_reduce_rms_mxfp4_quant_launch",
+        _bracket_handle(_kernels._fused_reduce_rms_mxfp4_quant_kernel),
+    )
     (packed_t, scales_t), norm_t, _, _, _ = _run()
     monkeypatch.undo()
 

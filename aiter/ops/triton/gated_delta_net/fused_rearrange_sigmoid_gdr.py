@@ -11,11 +11,11 @@ import os
 
 import torch
 import triton
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_rearrange_sigmoid_gdr import (
     fused_rearrange_sigmoid_gated_delta_rule_update_kernel,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 
 
 def _flydsl_gdr_enabled() -> bool:
@@ -184,6 +184,12 @@ def _try_flydsl_mtp(
     return out.view(1, total_tokens, HV, head_v_dim), initial_state
 
 
+_fused_rearrange_sigmoid_gated_delta_rule_update_kernel_launch = intj_handle(
+    fused_rearrange_sigmoid_gated_delta_rule_update_kernel,
+    options={"num_stages": 3, "num_warps": 4},
+)
+
+
 def fused_rearrange_sigmoid_gated_delta_rule(
     A_log: torch.Tensor,
     a: torch.Tensor,
@@ -277,8 +283,6 @@ def fused_rearrange_sigmoid_gated_delta_rule(
     BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
-    num_stages = 3
-    num_warps = 4
 
     if inplace_final_state and ssm_state_indices is None:
         raise ValueError(
@@ -314,41 +318,42 @@ def fused_rearrange_sigmoid_gated_delta_rule(
     stride_qkv_l, stride_qkv_hd = qkv.stride()
 
     grid = (NK, NV, N * HV)
-    _intj_launch_tuned(fused_rearrange_sigmoid_gated_delta_rule_update_kernel, grid,
-        A_log=A_log,
-        a=a.contiguous(),
-        b=b.contiguous(),
-        dt_bias=dt_bias,
-        beta=beta,
-        threshold=threshold,
-        qkv=qkv,
-        o=o,
-        h0=initial_state,
-        ht=final_state,
-        cu_seqlens=cu_seqlens,
-        ssm_state_indices=ssm_state_indices,
-        num_accepted_tokens=num_accepted_tokens,
-        scale=scale,
-        N=N,
-        T=T,
-        B=B,
-        H=H,
-        HV=HV,
-        K=K,
-        V=V,
-        BK=BK,
-        BV=BV,
-        stride_qkv_l=stride_qkv_l,
-        stride_qkv_hd=stride_qkv_hd,
-        stride_init_state_token=stride_init_state_token,
-        stride_final_state_token=stride_final_state_token,
-        stride_indices_seq=stride_indices_seq,
-        stride_indices_tok=stride_indices_tok,
-        INPLACE_FINAL_STATE=inplace_final_state,
-        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
-        IS_KDA=is_kda,
-        num_warps=num_warps,
-        num_stages=num_stages,
+    dev, stream = current_device_stream()
+    _fused_rearrange_sigmoid_gated_delta_rule_update_kernel_launch(dev)(
+        stream,
+        grid,
+        A_log,
+        a.contiguous(),  # a
+        b.contiguous(),  # b
+        dt_bias,
+        beta,
+        threshold,
+        qkv,
+        o,
+        initial_state,  # h0
+        final_state,  # ht
+        cu_seqlens,
+        ssm_state_indices,
+        num_accepted_tokens,
+        scale,
+        N,
+        T,
+        B,
+        H,
+        HV,
+        K,
+        V,
+        BK,
+        BV,
+        stride_qkv_l,
+        stride_qkv_hd,
+        stride_init_state_token,
+        stride_final_state_token,
+        stride_indices_seq,
+        stride_indices_tok,
+        inplace_final_state,  # INPLACE_FINAL_STATE
+        use_qk_l2norm_in_kernel,  # USE_QK_L2NORM_IN_KERNEL
+        is_kda,  # IS_KDA
     )
     o = o.squeeze(0)
     return o, final_state

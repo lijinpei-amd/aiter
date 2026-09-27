@@ -14,7 +14,6 @@ matrix (Aqk).
 import torch
 import triton
 import triton.language as tl
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils import (
     autotune_cache_kwargs,
@@ -26,6 +25,7 @@ from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils im
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.index import (
     prepare_chunk_indices,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 # The BV=128 / num_stages=3 tile this kernel came with wants up to 123KB of LDS,
@@ -165,6 +165,17 @@ def chunk_gla_fwd_kernel_o(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=m_tv)
 
 
+def _chunk_gla_fwd_kernel_o_grid(V: int, BV: int, HV: int, *, NT: int, B: int):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (triton.cdiv(V, BV), NT, B * HV)
+
+
+_chunk_gla_fwd_kernel_o_launch = intj_handle(
+    chunk_gla_fwd_kernel_o,
+    grid_cpp=_chunk_gla_fwd_kernel_o_grid,
+)
+
+
 @input_guard
 def chunk_gla_fwd_o(
     q: torch.Tensor,
@@ -209,26 +220,27 @@ def chunk_gla_fwd_o(
 
     o = torch.zeros_like(v)
 
-    def grid(meta):
-        return (triton.cdiv(V, meta["BV"]), NT, B * HV)
-
-    _intj_launch_tuned(chunk_gla_fwd_kernel_o, grid,
-        q=q,
-        v=v,
-        g=g,
-        h=h,
-        o=o,
-        A=A,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        scale=scale,
-        T=T,
-        H=H,
-        HV=HV,
-        K=K,
-        V=V,
-        BT=BT,
-        USE_EXP2=use_exp2,
-        TRANSPOSE_STATE=transpose_state,
+    dev, stream = current_device_stream()
+    _chunk_gla_fwd_kernel_o_launch(dev)(
+        stream,
+        NT,  # grid
+        B,  # grid
+        q,
+        v,
+        g,
+        h,
+        o,
+        A,
+        cu_seqlens,
+        chunk_indices,
+        scale,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        BT,
+        use_exp2,  # USE_EXP2
+        transpose_state,  # TRANSPOSE_STATE
     )
     return o

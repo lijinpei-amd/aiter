@@ -5,12 +5,23 @@
 
 import torch
 import triton
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.moe.moe_wgrad import _moe_wgrad_kernel
 from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 
 __all__ = ["moe_wgrad"]
+
+
+def _moe_wgrad_kernel_grid(N: int, BLOCK_SIZE_N: int, K: int, BLOCK_SIZE_K: int, *, gx: int):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (gx, (triton.cdiv(N, BLOCK_SIZE_N) * triton.cdiv(K, BLOCK_SIZE_K)))
+
+
+_moe_wgrad_kernel_launch = intj_handle(
+    _moe_wgrad_kernel,
+    grid_cpp=_moe_wgrad_kernel_grid,
+)
 
 
 def moe_wgrad(
@@ -57,12 +68,15 @@ def moe_wgrad(
     if num_sorted == 0:
         return dW
 
-    grid = lambda META: (
+    lambda META: (
         num_sorted // block_size_m,
         triton.cdiv(N, META["BLOCK_SIZE_N"]) * triton.cdiv(K, META["BLOCK_SIZE_K"]),
     )
 
-    _intj_launch_tuned(_moe_wgrad_kernel, grid,
+    dev, stream = current_device_stream()
+    _moe_wgrad_kernel_launch(dev)(
+        stream,
+        num_sorted // block_size_m,  # grid
         grad,
         input,
         dW,
@@ -80,8 +94,8 @@ def moe_wgrad(
         dW.stride(1),
         dW.stride(2),
         num_sorted,
-        top_k=top_k,
-        BLOCK_SIZE_M=block_size_m,
-        NUM_XCDS=get_num_xcds(),
+        top_k,
+        block_size_m,  # BLOCK_SIZE_M
+        get_num_xcds(),  # NUM_XCDS
     )
     return dW

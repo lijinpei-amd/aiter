@@ -68,7 +68,6 @@ against an upstream checkout formatted the same way shows the shims and nothing
 else.
 """
 
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from typing import Optional
 
 import torch
@@ -333,6 +332,12 @@ def fused_recurrent_gated_delta_rule_fwd_kernel_vllm(
         p_beta += HV * (V if IS_BETA_HEADWISE else 1)
 
 
+_fused_recurrent_gated_delta_rule_fwd_kernel_vllm_launch = intj_handle(
+    fused_recurrent_gated_delta_rule_fwd_kernel_vllm,
+    options={"num_stages": 3, "num_warps": 1},
+)
+
+
 def fused_recurrent_gated_delta_rule_fwd_vllm(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -373,38 +378,39 @@ def fused_recurrent_gated_delta_rule_fwd_vllm(
         stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
 
     grid = (NK, NV, N * HV)
-    _intj_launch_tuned(fused_recurrent_gated_delta_rule_fwd_kernel_vllm, grid,
-        q=q,
-        k=k,
-        v=v,
-        g=g,
-        beta=beta,
-        o=o,
-        h0=initial_state,
-        ht=final_state,
-        cu_seqlens=cu_seqlens,
-        ssm_state_indices=ssm_state_indices,
-        num_accepted_tokens=num_accepted_tokens,
-        scale=scale,
-        N=N,
-        T=T,
-        B=B,
-        H=H,
-        HV=HV,
-        K=K,
-        V=V,
-        BK=BK,
-        BV=BV,
-        stride_init_state_token=stride_init_state_token,
-        stride_final_state_token=stride_final_state_token,
-        stride_indices_seq=stride_indices_seq,
-        stride_indices_tok=stride_indices_tok,
-        IS_BETA_HEADWISE=beta.ndim == v.ndim,
-        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
-        INPLACE_FINAL_STATE=inplace_final_state,
-        IS_KDA=False,
-        num_warps=num_warps,
-        num_stages=num_stages,
+    dev, stream = current_device_stream()
+    _fused_recurrent_gated_delta_rule_fwd_kernel_vllm_launch(dev)(
+        stream,
+        grid,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        o,
+        initial_state,  # h0
+        final_state,  # ht
+        cu_seqlens,
+        ssm_state_indices,
+        num_accepted_tokens,
+        scale,
+        N,
+        T,
+        B,
+        H,
+        HV,
+        K,
+        V,
+        BK,
+        BV,
+        stride_init_state_token,
+        stride_final_state_token,
+        stride_indices_seq,
+        stride_indices_tok,
+        inplace_final_state,  # INPLACE_FINAL_STATE
+        beta.ndim == v.ndim,  # IS_BETA_HEADWISE
+        use_qk_l2norm_in_kernel,  # USE_QK_L2NORM_IN_KERNEL
+        False,  # IS_KDA
     )
     o = o.squeeze(0)
     return o, final_state

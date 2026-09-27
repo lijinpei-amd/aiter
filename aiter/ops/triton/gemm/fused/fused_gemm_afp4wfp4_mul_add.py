@@ -5,7 +5,6 @@ import os
 
 import torch
 import triton
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_mul_add import (
     _fused_gemm_afp4wfp4_mul_add_kernel,
@@ -15,6 +14,8 @@ from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_mul_add imp
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.config_utils import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
 
@@ -63,6 +64,11 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
         )
 
     return SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT
+
+
+_fused_gemm_afp4wfp4_mul_add_reduce_kernel_launch = intj_handle(
+    _fused_gemm_afp4wfp4_mul_add_reduce_kernel,
+)
 
 
 def fused_gemm_afp4wfp4_mul_add(
@@ -215,7 +221,10 @@ def fused_gemm_afp4wfp4_mul_add(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _intj_launch_tuned(_fused_gemm_afp4wfp4_mul_add_reduce_kernel, grid_reduce,
+        dev, stream = current_device_stream()
+        _fused_gemm_afp4wfp4_mul_add_reduce_kernel_launch(dev)(
+            stream,
+            grid_reduce,
             y_pp,
             y,
             a,
@@ -235,11 +244,11 @@ def fused_gemm_afp4wfp4_mul_add(
             REDUCE_BLOCK_SIZE_N,
             ACTUAL_KSPLIT,
             triton.next_power_of_2(config["NUM_KSPLIT"]),
-            IS_A_SCALAR=IS_A_SCALAR,
-            IS_B_SCALAR=IS_B_SCALAR,
-            IS_A_TENSOR=IS_A_TENSOR,
-            IS_B_TENSOR=IS_B_TENSOR,
-            FUSE_TYPE=fuse_type,
+            IS_A_SCALAR,
+            IS_B_SCALAR,
+            IS_A_TENSOR,
+            IS_B_TENSOR,
+            fuse_type,  # FUSE_TYPE
         )
 
     return y
@@ -419,7 +428,10 @@ def fused_gemm_afp4wfp4_preshuffle_add_mul(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _intj_launch_tuned(_fused_gemm_afp4wfp4_mul_add_reduce_kernel, grid_reduce,
+        dev, stream = current_device_stream()
+        _fused_gemm_afp4wfp4_mul_add_reduce_kernel_launch(dev)(
+            stream,
+            grid_reduce,
             y_pp,
             y,
             a,
@@ -439,11 +451,11 @@ def fused_gemm_afp4wfp4_preshuffle_add_mul(
             REDUCE_BLOCK_SIZE_N,
             ACTUAL_KSPLIT,
             triton.next_power_of_2(config["NUM_KSPLIT"]),
-            IS_A_SCALAR=IS_A_SCALAR,
-            IS_B_SCALAR=IS_B_SCALAR,
-            IS_A_TENSOR=IS_A_TENSOR,
-            IS_B_TENSOR=IS_B_TENSOR,
-            FUSE_TYPE=fuse_type,
+            IS_A_SCALAR,
+            IS_B_SCALAR,
+            IS_A_TENSOR,
+            IS_B_TENSOR,
+            fuse_type,  # FUSE_TYPE
         )
 
     return y
