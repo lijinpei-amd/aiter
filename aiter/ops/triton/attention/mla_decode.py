@@ -262,7 +262,9 @@ def _decode_att_m_fwd(
         BLOCK_DPE = 0
     BLOCK_DV = triton.next_power_of_2(Lv)
 
-    _intj_launch(_fwd_kernel_stage1, grid,
+    _intj_launch(
+        _fwd_kernel_stage1,
+        grid,
         q,
         k_buffer,
         v_buffer,
@@ -543,7 +545,9 @@ def _decode_grouped_att_m_fwd(
         if BLOCK_DMODEL >= 512:
             num_warps = 2
 
-    _intj_launch(_fwd_grouped_kernel_stage1, grid,
+    _intj_launch(
+        _fwd_grouped_kernel_stage1,
+        grid,
         q,
         k_buffer,
         v_buffer,

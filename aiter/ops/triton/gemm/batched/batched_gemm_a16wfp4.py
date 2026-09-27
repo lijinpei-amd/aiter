@@ -187,7 +187,9 @@ def batched_gemm_a16wfp4_(
             * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
-    _intj_launch_tuned(_batched_gemm_a16wfp4_kernel, grid,
+    _intj_launch_tuned(
+        _batched_gemm_a16wfp4_kernel,
+        grid,
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,

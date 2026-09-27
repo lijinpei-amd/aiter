@@ -987,7 +987,9 @@ def _rope_cached_thd_2c_fwd(
         waves_per_eu = 0
         num_stages = 2 if SPLIT_H_SIZE > 1 else 1
 
-        _intj_launch(_rope_kernel_thd_cached_2c_fwd, grid,
+        _intj_launch(
+            _rope_kernel_thd_cached_2c_fwd,
+            grid,
             x,
             y,
             cos,
@@ -1029,7 +1031,9 @@ def _rope_cached_thd_2c_fwd(
             waves_per_eu = 0
             num_stages = 2 if QH_per_G > 1 else 1
 
-            _intj_launch(_rope_kernel_cached_thd_2c_gqa_fwd, grid,
+            _intj_launch(
+                _rope_kernel_cached_thd_2c_gqa_fwd,
+                grid,
                 x,
                 y,
                 cos,
@@ -1310,7 +1314,9 @@ def _rope_cached_thd_positions_offsets_2c_bwd(
         waves_per_eu = 0
         num_stages = 2 if SPLIT_H_SIZE > 1 else 1
 
-        _intj_launch(_rope_kernel_thd_cached_2c_bwd, grid,
+        _intj_launch(
+            _rope_kernel_thd_cached_2c_bwd,
+            grid,
             x,
             y,
             cos,
@@ -1352,7 +1358,9 @@ def _rope_cached_thd_positions_offsets_2c_bwd(
             waves_per_eu = 0
             num_stages = 2 if QH_per_G > 1 else 1
 
-            _intj_launch(_rope_kernel_cached_thd_2c_gqa_bwd, grid,
+            _intj_launch(
+                _rope_kernel_cached_thd_2c_gqa_bwd,
+                grid,
                 x,
                 y,
                 cos,

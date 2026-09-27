@@ -1036,7 +1036,9 @@ def fused_sigmoid_gating_delta_rule_update_sglang(
         initial_state_indices,  # h0_indices
         # Envelope-strided state pools (page-major / unified memory) have a
         # per-slot pitch != HV*K*V; contiguous pools pass exactly HV*K*V.
-        initial_state_source.stride(0) if initial_state_source is not None else 0,  # stride_h0_source
+        (
+            initial_state_source.stride(0) if initial_state_source is not None else 0
+        ),  # stride_h0_source
         cu_seqlens,
         intermediate_states_buffer,
         intermediate_state_indices,

@@ -232,7 +232,9 @@ def flash_attn_fused_backward(
     if causal:
         grid_dkdvdq = (batch * num_q_heads * num_k_pids,)
 
-        _intj_launch(_bwd_kernel_dkdvdq_causal, grid_dkdvdq,
+        _intj_launch(
+            _bwd_kernel_dkdvdq_causal,
+            grid_dkdvdq,
             q,
             k,
             v,
@@ -281,7 +283,9 @@ def flash_attn_fused_backward(
     else:
         # in non causal inner loop over grouped q heads
         grid_dkdvdq = (batch * num_k_heads * num_k_pids,)
-        _intj_launch(_bwd_kernel_dkdvdq_noncausal, grid_dkdvdq,
+        _intj_launch(
+            _bwd_kernel_dkdvdq_noncausal,
+            grid_dkdvdq,
             q,
             k,
             v,

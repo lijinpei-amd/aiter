@@ -132,7 +132,9 @@ def gemm_a16wfp4_(
             * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
-    _intj_launch_tuned(_gemm_a16wfp4_kernel, grid,
+    _intj_launch_tuned(
+        _gemm_a16wfp4_kernel,
+        grid,
         x,
         w,
         y if y_pp is None else y_pp,
@@ -318,7 +320,9 @@ def gemm_a16wfp4_preshuffle_(
             * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
-    _intj_launch_tuned(_gemm_a16wfp4_preshuffle_kernel, grid,
+    _intj_launch_tuned(
+        _gemm_a16wfp4_preshuffle_kernel,
+        grid,
         x,
         w,
         y if y_pp is None else y_pp,

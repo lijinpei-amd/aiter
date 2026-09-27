@@ -191,7 +191,9 @@ def _row_plan(le, block_k, P, s_max) -> _RowPlan:
         P,
         block_k,
         s_max,
-        _ROW_PLAN_BLOCK_FLOOR if T <= _ROW_PLAN_BLOCK_FLOOR else _ROW_PLAN_MAX_ROWS,  # BLOCK_T
+        (
+            _ROW_PLAN_BLOCK_FLOOR if T <= _ROW_PLAN_BLOCK_FLOOR else _ROW_PLAN_MAX_ROWS
+        ),  # BLOCK_T
         max(1, (s_max - 1).bit_length() + 1),  # SEARCH_STEPS
     )
     return plan

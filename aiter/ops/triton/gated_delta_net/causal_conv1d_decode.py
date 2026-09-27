@@ -107,9 +107,7 @@ def causal_conv1d_update_split_qkv(
 
     if use_gluon:
         kernel_fn = (
-            _gluon_notuple_kernel_launch
-            if use_gluon_notuple
-            else _gluon_kernel_launch
+            _gluon_notuple_kernel_launch if use_gluon_notuple else _gluon_kernel_launch
         )
     else:
         kernel_fn = _triton_kernel_launch

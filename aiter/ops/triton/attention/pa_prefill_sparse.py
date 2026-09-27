@@ -148,7 +148,9 @@ def pa_prefill_sparse(
             waves_per_eu = 1
         grid = (T, triton.cdiv(H, block_h))
 
-        _intj_launch(gluon_pa_prefill_sparse, grid,
+        _intj_launch(
+            gluon_pa_prefill_sparse,
+            grid,
             q,
             unified_kv,
             kv_indices_prefix,

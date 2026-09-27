@@ -200,7 +200,9 @@ def batched_gemm_bf16(
         num_ksplit = NUM_KSPLIT
         splitk_block_size = SPLITK_BLOCK_SIZE
 
-        _intj_launch(_KERNEL_MAP[kernel_type], grid,
+        _intj_launch(
+            _KERNEL_MAP[kernel_type],
+            grid,
             XQ,
             WQ,
             out_tensor,
@@ -264,7 +266,9 @@ def batched_gemm_bf16(
             * triton.cdiv(N, config["BLOCK_SIZE_N"]),
         )
 
-        _intj_launch_tuned(_batched_gemm_bf16_kernel, grid,
+        _intj_launch_tuned(
+            _batched_gemm_bf16_kernel,
+            grid,
             XQ,
             WQ,
             YQ if num_ksplit == 1 else y_pp,

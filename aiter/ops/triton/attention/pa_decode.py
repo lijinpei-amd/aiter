@@ -193,7 +193,9 @@ def paged_attn_decode_v1(
     # MHA- Multi-Head Attention
     if query_grp_sz == 1:
         grid = (num_q_heads, num_seqs, 1)
-        _intj_launch(_paged_attn_decode_v1_wo_dot_kernel, grid,
+        _intj_launch(
+            _paged_attn_decode_v1_wo_dot_kernel,
+            grid,
             output,
             query,
             key_cache,
@@ -226,7 +228,9 @@ def paged_attn_decode_v1(
             query_grp_sz_pow2 = 16
         else:
             query_grp_sz_pow2 = triton.next_power_of_2(query_grp_sz)
-        _intj_launch(_paged_attn_decode_v1_w_dot_kernel, grid,
+        _intj_launch(
+            _paged_attn_decode_v1_w_dot_kernel,
+            grid,
             output,
             query,
             key_cache,
@@ -323,7 +327,9 @@ def paged_attn_decode_v2(
         tmp_output = torch.empty(
             (*shape_info, head_sz), dtype=output.dtype, device=output.device
         )
-        _intj_launch(_paged_attn_decode_v2_wo_dot_kernel, grid,
+        _intj_launch(
+            _paged_attn_decode_v2_wo_dot_kernel,
+            grid,
             exp_sums,
             max_logits,
             tmp_output,
@@ -391,7 +397,9 @@ def paged_attn_decode_v2(
             query_grp_sz_pow2 = 16
         else:
             query_grp_sz_pow2 = triton.next_power_of_2(query_grp_sz)
-        _intj_launch(_paged_attn_decode_v2_w_dot_kernel, grid,
+        _intj_launch(
+            _paged_attn_decode_v2_w_dot_kernel,
+            grid,
             exp_sums,
             max_logits,
             tmp_output,
@@ -450,7 +458,9 @@ def paged_attn_decode_v2(
             query_grp_sz,  # QUERY_GRP_SZ
             query_grp_sz_pow2,  # QUERY_GRP_SZ_POW2
             _SEQ_PARTITION_SIZE,  # SEQ_PARTITION_SZ
-            int(triton.next_power_of_2(max_num_partitions)),  # MAX_NUM_SEQ_PARTITIONS_POW2
+            int(
+                triton.next_power_of_2(max_num_partitions)
+            ),  # MAX_NUM_SEQ_PARTITIONS_POW2
         )
 
 
@@ -490,7 +500,9 @@ def paged_attn_decode_v1_per_token_quant(
     # MHA- Multi-Head Attention
     if query_grp_sz == 1:
         grid = (num_q_heads, num_seqs, 1)
-        _intj_launch(_paged_attn_decode_v1_wo_dot_kernel_per_token_quant, grid,
+        _intj_launch(
+            _paged_attn_decode_v1_wo_dot_kernel_per_token_quant,
+            grid,
             output,
             query,
             key_cache,
@@ -526,7 +538,9 @@ def paged_attn_decode_v1_per_token_quant(
             query_grp_sz_pow2 = 16
         else:
             query_grp_sz_pow2 = triton.next_power_of_2(query_grp_sz)
-        _intj_launch(_paged_attn_decode_v1_w_dot_kernel_per_token_quant, grid,
+        _intj_launch(
+            _paged_attn_decode_v1_w_dot_kernel_per_token_quant,
+            grid,
             output,
             query,
             key_cache,
@@ -626,7 +640,9 @@ def paged_attn_decode_v2_per_token_quant(
         tmp_output = torch.empty(
             (*shape_info, head_sz), dtype=output.dtype, device=output.device
         )
-        _intj_launch(_paged_attn_decode_v2_wo_dot_kernel_per_token_quant, grid,
+        _intj_launch(
+            _paged_attn_decode_v2_wo_dot_kernel_per_token_quant,
+            grid,
             exp_sums,
             max_logits,
             tmp_output,
@@ -697,7 +713,9 @@ def paged_attn_decode_v2_per_token_quant(
             query_grp_sz_pow2 = 16
         else:
             query_grp_sz_pow2 = triton.next_power_of_2(query_grp_sz)
-        _intj_launch(_paged_attn_decode_v2_w_dot_kernel_per_token_quant, grid,
+        _intj_launch(
+            _paged_attn_decode_v2_w_dot_kernel_per_token_quant,
+            grid,
             exp_sums,
             max_logits,
             tmp_output,
@@ -759,5 +777,7 @@ def paged_attn_decode_v2_per_token_quant(
             query_grp_sz,  # QUERY_GRP_SZ
             query_grp_sz_pow2,  # QUERY_GRP_SZ_POW2
             _SEQ_PARTITION_SIZE,  # SEQ_PARTITION_SZ
-            int(triton.next_power_of_2(max_num_partitions)),  # MAX_NUM_SEQ_PARTITIONS_POW2
+            int(
+                triton.next_power_of_2(max_num_partitions)
+            ),  # MAX_NUM_SEQ_PARTITIONS_POW2
         )

@@ -308,7 +308,9 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), mask=m_h4)
 
 
-def _chunk_gated_delta_rule_fwd_kernel_h_blockdim64_grid(V: int, BV: int, H: int, *, N: int):
+def _chunk_gated_delta_rule_fwd_kernel_h_blockdim64_grid(
+    V: int, BV: int, H: int, *, N: int
+):
     # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
     return (triton.cdiv(V, BV), N * H)
 
@@ -577,7 +579,9 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
             tl.store(p_dh3, b_dh4.to(p_dh3.dtype.element_ty), mask=m_h4)
 
 
-def _chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64_grid(V: int, BV: int, H: int, *, N: int):
+def _chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64_grid(
+    V: int, BV: int, H: int, *, N: int
+):
     # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
     return (triton.cdiv(V, BV), N * H)
 
@@ -1267,7 +1271,9 @@ def chunk_gated_delta_rule_fwd_kernel_h_opt_vk(
             tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), mask=m_h4)
 
 
-def _chunk_gated_delta_rule_fwd_kernel_h_opt_vk_grid(V: int, BV: int, H: int, *, N: int):
+def _chunk_gated_delta_rule_fwd_kernel_h_opt_vk_grid(
+    V: int, BV: int, H: int, *, N: int
+):
     # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
     return (triton.cdiv(V, BV), N * H)
 

@@ -585,7 +585,9 @@ def fused_qk_rope_reshape_and_cache(
             "KH_BLOCK": max(1, BLOCK_H // (qh // kh)),
         }
     grid = (n_pid, 1, 1)
-    _intj_launch(_kernel, grid,
+    _intj_launch(
+        _kernel,
+        grid,
         q,
         k,
         v,

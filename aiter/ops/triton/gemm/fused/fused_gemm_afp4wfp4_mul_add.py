@@ -175,7 +175,9 @@ def fused_gemm_afp4wfp4_mul_add(
             * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
-    _intj_launch_tuned(_fused_gemm_afp4wfp4_mul_add_kernel, grid,
+    _intj_launch_tuned(
+        _fused_gemm_afp4wfp4_mul_add_kernel,
+        grid,
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -369,7 +371,9 @@ def fused_gemm_afp4wfp4_preshuffle_add_mul(
     )
 
     def kernel_wrapper():
-        _intj_launch_tuned(_fused_gemm_afp4wfp4_preshuffle_mul_add_kernel, grid,
+        _intj_launch_tuned(
+            _fused_gemm_afp4wfp4_preshuffle_mul_add_kernel,
+            grid,
             x,
             w,
             y if config["NUM_KSPLIT"] == 1 else y_pp,

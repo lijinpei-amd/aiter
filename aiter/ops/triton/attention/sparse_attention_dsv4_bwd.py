@@ -147,7 +147,9 @@ def sparse_mla_bwd_dkv_interm_v4(
     h_pow2 = H_POW2 or triton.next_power_of_2(H)
     if interm is None:
         interm = torch.empty(T, R_CHUNK, D, dtype=torch.bfloat16, device=q.device)
-    _intj_launch(_dkv_interm_v4_kernel, (T, D // BD),
+    _intj_launch(
+        _dkv_interm_v4_kernel,
+        (T, D // BD),
         q,
         do,
         chunk_dS,
@@ -186,7 +188,9 @@ def delta_v4(o, do, out=None, BLOCK_R=8, num_warps=8):
     n_rows = T * H
     if out is None:
         out = torch.empty(T, H, dtype=torch.float32, device=o.device)
-    _intj_launch(_delta_v4_kernel, (triton.cdiv(n_rows, BLOCK_R),),
+    _intj_launch(
+        _delta_v4_kernel,
+        (triton.cdiv(n_rows, BLOCK_R),),
         o,
         do,
         out,
@@ -237,7 +241,9 @@ def dkv_gather_acc(
     """
     _, _, D = interm.shape
     num_kv = dkv_acc.shape[0]
-    _intj_launch(_bwd_dkv_gather_acc_v4, (num_kv,),
+    _intj_launch(
+        _bwd_dkv_gather_acc_v4,
+        (num_kv,),
         interm,
         inv_ptr,
         inv_data,

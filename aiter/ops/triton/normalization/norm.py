@@ -147,7 +147,9 @@ def _layernorm_backward(
         _db = None
 
     grid_bwd = (tile_num,)
-    _intj_launch(_layernorm_bwd_dx_fused_triton, grid_bwd,
+    _intj_launch(
+        _layernorm_bwd_dx_fused_triton,
+        grid_bwd,
         dx,
         dy,
         _dw,

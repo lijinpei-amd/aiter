@@ -1052,7 +1052,9 @@ def mla_gluon(
         grid = (batch_size, NUM_KV_SPLITS, triton.cdiv(nhead, BLOCK_H) * qlen)
     stride_page_bs = page_table.stride(0) if use_2d_view else 0
 
-    _intj_launch(_mla_gluon, grid,
+    _intj_launch(
+        _mla_gluon,
+        grid,
         q_nope,
         q_pe,
         kv_c,

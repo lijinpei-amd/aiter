@@ -277,7 +277,9 @@ def causal_conv1d_split_qkv_triton_tile_fn(
         )
 
     grid = (tot, triton.cdiv(dim, BLOCK_N))
-    _intj_launch(_causal_conv1d_fwd_split_qkv_tile_kernel, grid,
+    _intj_launch(
+        _causal_conv1d_fwd_split_qkv_tile_kernel,
+        grid,
         x,
         weight,
         bias,

@@ -193,7 +193,9 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
 
-def _fused_sigmoid_gating_delta_rule_update_kernel_grid(V: int, BV: int, HV: int, *, NK: int, N: int):
+def _fused_sigmoid_gating_delta_rule_update_kernel_grid(
+    V: int, BV: int, HV: int, *, NK: int, N: int
+):
     # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
     return (NK, triton.cdiv(V, BV), N * HV)
 

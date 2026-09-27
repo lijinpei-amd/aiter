@@ -84,7 +84,9 @@ def fused_add_rmsnorm_pad(
             BLOCK_SIZE_N = triton.next_power_of_2(N_out)
             config = _get_config(BLOCK_SIZE_N, "gluon")
             NUM_WARPS = config["num_warps"]
-            _intj_launch(_gluon_fused_add_rmsnorm_pad_kernel, (M,),
+            _intj_launch(
+                _gluon_fused_add_rmsnorm_pad_kernel,
+                (M,),
                 x,
                 res,
                 out,

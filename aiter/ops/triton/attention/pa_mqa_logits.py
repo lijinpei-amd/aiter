@@ -110,7 +110,9 @@ def deepgemm_fp8_paged_mqa_logits_ragged_k(
     }
 
     grid = (batch_size * next_n * config["SplitKV"],)
-    _intj_launch(_deepgemm_fp8_paged_mqa_logits_ragged_k, grid,
+    _intj_launch(
+        _deepgemm_fp8_paged_mqa_logits_ragged_k,
+        grid,
         batch_size,
         next_n,
         heads,
@@ -160,7 +162,9 @@ def deepgemm_fp8_paged_mqa_logits_stage1_ragged_k(
     assert heads % config["ChunkQ"] == 0
 
     grid = (batch_size * next_n * (heads // config["ChunkQ"] * config["SplitKV"]),)
-    _intj_launch(_deepgemm_fp8_paged_mqa_logits_stage1_ragged_k, grid,
+    _intj_launch(
+        _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k,
+        grid,
         batch_size,
         next_n,
         heads,
@@ -229,7 +233,9 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
     assert heads % config["ChunkQ"] == 0
 
     grid = (batch_size * next_n * (heads // config["ChunkQ"] * SplitKV),)
-    _intj_launch(_deepgemm_fp8_paged_mqa_logits_stage1, grid,
+    _intj_launch(
+        _deepgemm_fp8_paged_mqa_logits_stage1,
+        grid,
         batch_size,
         next_n,
         heads,

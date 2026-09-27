@@ -145,9 +145,11 @@ def dynamic_per_tensor_quant_fp8_i8(
         cols,
         x_in.stride(0),
         NUM_COL_POW2,
-        (torch.finfo(qx.dtype).max
+        (
+            torch.finfo(qx.dtype).max
             if torch.is_floating_point(qx)
-            else torch.iinfo(qx.dtype).max),  # DTYPE_MAX
+            else torch.iinfo(qx.dtype).max
+        ),  # DTYPE_MAX
     )
 
     static_per_tensor_quant_fp8_i8(qx, x_in, scale_out)
@@ -194,9 +196,11 @@ def dynamic_per_token_quant_fp8_i8(
         cols,
         x_in.stride(0),
         NUM_COL_POW2,
-        (torch.finfo(qx.dtype).max
+        (
+            torch.finfo(qx.dtype).max
             if torch.is_floating_point(qx)
-            else torch.iinfo(qx.dtype).max),  # DTYPE_MAX
+            else torch.iinfo(qx.dtype).max
+        ),  # DTYPE_MAX
     )
 
     return qx, scale_out

@@ -180,7 +180,9 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
         num_prgms = triton.cdiv(M, BLOCK_M)
         dg_tmp = torch.empty(num_prgms, N, device=x_.device, dtype=torch.float32)
         _cfg = get_normalization_config("rmsnorm_large_m_small_n", get_arch())
-        _intj_launch(_rmsnorm_bwd_kernel_large_m_small_n, (num_prgms,),
+        _intj_launch(
+            _rmsnorm_bwd_kernel_large_m_small_n,
+            (num_prgms,),
             dz_,
             x_,
             gamma_,
@@ -740,7 +742,9 @@ def _rmsnorm_forward_large_m_small_n(
 
     _cfg = get_normalization_config("rmsnorm_large_m_small_n", get_arch())
     grid = (triton.cdiv(M, BLOCK_M),)
-    _intj_launch(_rmsnorm_kernel_large_m_small_n, grid,
+    _intj_launch(
+        _rmsnorm_kernel_large_m_small_n,
+        grid,
         x,
         y,
         weight,

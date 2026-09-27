@@ -2868,7 +2868,9 @@ def _bwd_preprocess(
     tl.store(Delta + off_delta, delta, mask=mask_m)
 
 
-def _bwd_preprocess_grid(max_seqlen_q: int, PRE_BLOCK: int, *, batch: int, nheads_q: int):
+def _bwd_preprocess_grid(
+    max_seqlen_q: int, PRE_BLOCK: int, *, batch: int, nheads_q: int
+):
     # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
     return (triton.cdiv(max_seqlen_q, PRE_BLOCK), batch, nheads_q)
 
@@ -3979,18 +3981,20 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
             offs_dq = offs_m[:, None] * stride_dqm + offs_d_qk[None, :] * stride_dqd
             dq *= sm_scale
             tl.store(DQ + adj_dq + offs_dq, dq, mask=mask_q)
+            # end of GQA/MQA of dq
 
 
-def _bwd_kernel_fused_causal_grid(BLOCK_N1: int, *, nheads_k: int, seqlen: int, batch: int):
+def _bwd_kernel_fused_causal_grid(
+    BLOCK_N1: int, *, nheads_k: int, seqlen: int, batch: int
+):
     # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
-    return (nheads_k, (((seqlen + BLOCK_N1) - 1) // BLOCK_N1), batch)
+    return (nheads_k, (seqlen + BLOCK_N1 - 1) // BLOCK_N1, batch)
 
 
 _bwd_kernel_fused_causal_launch = intj_handle(
     bwd_kernel_fused_causal,
     grid_cpp=_bwd_kernel_fused_causal_grid,
 )
-            # end of GQA/MQA of dq
 
 
 @triton.autotune(
@@ -4419,9 +4423,11 @@ def bwd_kernel_fused_noncausal(
             tl.store(DQ + adj_dq + offs_dq, dq, mask=mask_q)
 
 
-def _bwd_kernel_fused_noncausal_grid(BLOCK_N1: int, *, nheads_k: int, seqlen: int, batch: int):
+def _bwd_kernel_fused_noncausal_grid(
+    BLOCK_N1: int, *, nheads_k: int, seqlen: int, batch: int
+):
     # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
-    return (nheads_k, (((seqlen + BLOCK_N1) - 1) // BLOCK_N1), batch)
+    return (nheads_k, (seqlen + BLOCK_N1 - 1) // BLOCK_N1, batch)
 
 
 _bwd_kernel_fused_noncausal_launch = intj_handle(
@@ -5068,7 +5074,9 @@ def attention_backward_triton_impl(
         grid_dkdvdq = (batch * nheads_k * num_k_pids,)
 
         if causal:
-            _intj_launch(_bwd_kernel_fused_atomic_causal, grid_dkdvdq,
+            _intj_launch(
+                _bwd_kernel_fused_atomic_causal,
+                grid_dkdvdq,
                 q,
                 k,
                 v,
@@ -5133,7 +5141,9 @@ def attention_backward_triton_impl(
                 **config,
             )
         else:
-            _intj_launch(_bwd_kernel_fused_atomic_noncausal, grid_dkdvdq,
+            _intj_launch(
+                _bwd_kernel_fused_atomic_noncausal,
+                grid_dkdvdq,
                 q,
                 k,
                 v,

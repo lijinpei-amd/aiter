@@ -180,7 +180,9 @@ def fused_gemm_a8w8_blockscale_mul_add(
             * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
-    _intj_launch_tuned(_fused_gemm_a8w8_blockscale_mul_add_kernel, grid,
+    _intj_launch_tuned(
+        _fused_gemm_a8w8_blockscale_mul_add_kernel,
+        grid,
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,

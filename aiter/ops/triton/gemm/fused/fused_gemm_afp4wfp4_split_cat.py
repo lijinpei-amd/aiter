@@ -128,7 +128,9 @@ def fused_gemm_afp4wfp4_split_cat(
             * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),  # Effective launch grid dims: [NUM_KSPLIT, NUM_M_BLOCKS, NUM_N_BLOCKS]
     )
-    _intj_launch_tuned(_fused_gemm_afp4wfp4_split_cat, grid,
+    _intj_launch_tuned(
+        _fused_gemm_afp4wfp4_split_cat,
+        grid,
         x,
         w,
         y,
@@ -315,7 +317,9 @@ def fused_gemm_afp4wfp4_preshuffle_split_cat(
             * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),  # Effective launch grid dims: [NUM_KSPLIT, NUM_M_BLOCKS, NUM_N_BLOCKS]
     )
-    _intj_launch_tuned(_fused_gemm_afp4wfp4_preshuffle_split_cat, grid,
+    _intj_launch_tuned(
+        _fused_gemm_afp4wfp4_preshuffle_split_cat,
+        grid,
         x,
         w,
         y,

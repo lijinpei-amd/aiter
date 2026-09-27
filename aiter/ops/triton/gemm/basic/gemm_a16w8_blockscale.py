@@ -102,7 +102,9 @@ def gemm_a16w8_blockscale(
             * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
-    _intj_launch_tuned(_gemm_a16w8_blockscale_kernel, grid,
+    _intj_launch_tuned(
+        _gemm_a16w8_blockscale_kernel,
+        grid,
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -243,7 +245,9 @@ def gemm_a16w8_blockscale_preshuffle(
             * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
-    _intj_launch_tuned(_gemm_a16w8_blockscale_preshuffle_kernel, grid,
+    _intj_launch_tuned(
+        _gemm_a16w8_blockscale_preshuffle_kernel,
+        grid,
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,

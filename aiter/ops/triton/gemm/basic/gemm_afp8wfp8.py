@@ -154,7 +154,9 @@ def gemm_afp8wfp8(
         ),
     )
 
-    _intj_launch_tuned(_gemm_afp8wfp8_kernel, grid,
+    _intj_launch_tuned(
+        _gemm_afp8wfp8_kernel,
+        grid,
         x,
         w_t,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -434,7 +436,9 @@ def gemm_afp8wfp8_preshuffle(
             num_ctas=num_ctas,
         )
     else:
-        _intj_launch_tuned(_gemm_afp8wfp8_preshuffle_kernel, grid,
+        _intj_launch_tuned(
+            _gemm_afp8wfp8_preshuffle_kernel,
+            grid,
             x,
             w_view,
             y if config["NUM_KSPLIT"] == 1 else y_pp,

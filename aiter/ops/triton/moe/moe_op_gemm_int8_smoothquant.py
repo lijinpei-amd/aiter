@@ -314,7 +314,9 @@ def moe_gemm_int8_smoothquant(
         )
     else:
         # launch standard kernel
-        _intj_launch(_moe_gemm_int8_smoothquant, (grid,),
+        _intj_launch(
+            _moe_gemm_int8_smoothquant,
+            (grid,),
             y,
             y.stride(0),
             y.stride(1),

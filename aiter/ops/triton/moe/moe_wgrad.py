@@ -13,9 +13,11 @@ from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handl
 __all__ = ["moe_wgrad"]
 
 
-def _moe_wgrad_kernel_grid(N: int, BLOCK_SIZE_N: int, K: int, BLOCK_SIZE_K: int, *, gx: int):
+def _moe_wgrad_kernel_grid(
+    N: int, BLOCK_SIZE_N: int, K: int, BLOCK_SIZE_K: int, *, gx: int
+):
     # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
-    return (gx, (triton.cdiv(N, BLOCK_SIZE_N) * triton.cdiv(K, BLOCK_SIZE_K)))
+    return (gx, triton.cdiv(N, BLOCK_SIZE_N) * triton.cdiv(K, BLOCK_SIZE_K))
 
 
 _moe_wgrad_kernel_launch = intj_handle(

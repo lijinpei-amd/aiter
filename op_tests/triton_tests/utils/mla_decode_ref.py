@@ -202,7 +202,9 @@ def _decode_att_m_fwd(
     BLOCK_DMODEL = triton.next_power_of_2(Lk)
     BLOCK_DV = triton.next_power_of_2(Lv)
 
-    _intj_launch(_fwd_kernel_stage1, grid,
+    _intj_launch(
+        _fwd_kernel_stage1,
+        grid,
         q,
         k_buffer,
         v_buffer,
@@ -398,8 +400,13 @@ def _stage1_options():
     # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
     # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
     kpack = 1 if get_arch() == "gfx950" else 2
-    return {"num_warps": 4, "num_stages": 1, "waves_per_eu": 1,
-            "matrix_instr_nonkdim": 16, "kpack": kpack}
+    return {
+        "num_warps": 4,
+        "num_stages": 1,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": kpack,
+    }
 
 
 _fwd_grouped_kernel_stage1_launch = intj_handle(
@@ -545,8 +552,13 @@ def _stage2_options():
     if not is_hip_:
         return {"num_warps": 4, "num_stages": 2}
     kpack = 1 if get_arch() == "gfx950" else 2
-    return {"num_warps": 4, "num_stages": 2, "waves_per_eu": 4,
-            "matrix_instr_nonkdim": 16, "kpack": kpack}
+    return {
+        "num_warps": 4,
+        "num_stages": 2,
+        "waves_per_eu": 4,
+        "matrix_instr_nonkdim": 16,
+        "kpack": kpack,
+    }
 
 
 _fwd_kernel_stage2_launch = intj_handle(_fwd_kernel_stage2, options=_stage2_options)

@@ -252,7 +252,9 @@ def gemm_afp4wfp4_(
         ),
     )
 
-    _intj_launch_tuned(impl, grid,
+    _intj_launch_tuned(
+        impl,
+        grid,
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -431,7 +433,9 @@ def gemm_afp4wfp4_preshuffled_scales(
         ),
     )
 
-    _intj_launch_tuned(_triton_gemm_afp4wfp4_kernel_preshuffle_scales, grid,
+    _intj_launch_tuned(
+        _triton_gemm_afp4wfp4_kernel_preshuffle_scales,
+        grid,
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -604,7 +608,9 @@ def gemm_afp4wfp4_preshuffle(
             config["BLOCK_SIZE_K"],
         )
 
-        _intj_launch(_gluon_gemm_mxfp4_preshuffle_gfx1250, grid,
+        _intj_launch(
+            _gluon_gemm_mxfp4_preshuffle_gfx1250,
+            grid,
             x_fp4,
             w_preshuf,
             y,
@@ -672,7 +678,9 @@ def gemm_afp4wfp4_preshuffle(
     )
 
     config.pop("NUM_BUFFERS", None)
-    _intj_launch_tuned(_triton_gemm_afp4wfp4_preshuffle_kernel, grid,
+    _intj_launch_tuned(
+        _triton_gemm_afp4wfp4_preshuffle_kernel,
+        grid,
         x_fp4,
         w_preshuf,
         y if config["NUM_KSPLIT"] == 1 else y_pp,

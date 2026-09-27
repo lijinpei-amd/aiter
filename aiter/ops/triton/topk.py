@@ -111,9 +111,11 @@ def two_stage_topk(x, k, dim=-1, largest=True):
         topk_elem_cnt,
         chunk_size,
         descending,
-        (torch.finfo(torch.float32).min
+        (
+            torch.finfo(torch.float32).min
             if descending
-            else torch.finfo(torch.float32).max),
+            else torch.finfo(torch.float32).max
+        ),
         is_tdm_avail(),  # USE_TDM
     )
     stage2_elem_cnt = chunk_num * k

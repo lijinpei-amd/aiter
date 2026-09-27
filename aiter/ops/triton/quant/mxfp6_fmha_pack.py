@@ -455,7 +455,9 @@ if _HAVE_TRITON:
         sb = ((E + 127) & 0xFF).to(tl.uint8)
         tl.store(scale_ptr + scale_off, sb, mask=m)
 
-    _pack_qk_fp6_kernel_launch = intj_handle(_pack_qk_fp6_kernel, options={"num_warps": 1})
+    _pack_qk_fp6_kernel_launch = intj_handle(
+        _pack_qk_fp6_kernel, options={"num_warps": 1}
+    )
 
     _gather_k_lds_repr = make_kernel_repr(
         "_gather_k_lds_kernel",

@@ -187,7 +187,9 @@ def gemm_a8w8_blockscale(
     else:
         impl = triton_gemm_a8w8_blockscale_kernel
 
-    _intj_launch_tuned(impl, grid,
+    _intj_launch_tuned(
+        impl,
+        grid,
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -405,7 +407,9 @@ def gemm_a8w8_blockscale_preshuffle(
     else:
         impl = triton_gemm_a8w8_blockscale_preshuffle_kernel
 
-    _intj_launch_tuned(impl, grid,
+    _intj_launch_tuned(
+        impl,
+        grid,
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,

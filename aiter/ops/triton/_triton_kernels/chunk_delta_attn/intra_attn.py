@@ -180,7 +180,9 @@ def chunk_delta_attn_fwd_kernel_intra_token_parallel(
         )
 
 
-def _chunk_delta_attn_fwd_kernel_intra_token_parallel_grid(T: int, HV: int, BH: int, *, B: int):
+def _chunk_delta_attn_fwd_kernel_intra_token_parallel_grid(
+    T: int, HV: int, BH: int, *, B: int
+):
     # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
     return (B * T, triton.cdiv(HV, BH))
 

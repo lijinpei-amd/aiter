@@ -128,7 +128,9 @@ def gemm_a8wfp4(
     stride_asm, stride_ask = x_scales.stride()
     stride_bsn, stride_bsk = w_scales.stride()
 
-    _intj_launch_tuned(_gemm_a8wfp4_kernel, grid,
+    _intj_launch_tuned(
+        _gemm_a8wfp4_kernel,
+        grid,
         x,
         w,
         y_final,

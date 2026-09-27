@@ -79,10 +79,10 @@ def _block_attn_mask_to_lut_kernel(
         )
         write_offset = write_offset + tl.sum(mask_vals)
 
+    # No return; kv_block_indices is written in place
+
 
 _block_attn_mask_to_lut_kernel_launch = intj_handle(_block_attn_mask_to_lut_kernel)
-
-    # No return; kv_block_indices is written in place
 
 
 def block_attn_mask_to_lut_kernel(

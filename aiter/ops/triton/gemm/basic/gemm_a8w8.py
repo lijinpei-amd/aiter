@@ -123,7 +123,9 @@ def gemm_a8w8(
             triton.cdiv(M, config["BLOCK_SIZE_M"])
             * triton.cdiv(N, config["BLOCK_SIZE_N"]),
         )
-        _intj_launch_tuned(_gluon_gemm_a8w8_kernel, grid,
+        _intj_launch_tuned(
+            _gluon_gemm_a8w8_kernel,
+            grid,
             x,
             w,
             x_scale,
@@ -163,7 +165,9 @@ def gemm_a8w8(
             * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
-    _intj_launch_tuned(_gemm_a8w8_kernel, grid,
+    _intj_launch_tuned(
+        _gemm_a8w8_kernel,
+        grid,
         x,
         w,
         x_scale,
@@ -287,7 +291,9 @@ def gemm_a8w8_preshuffle(
     grid = (
         triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),
     )
-    _intj_launch_tuned(_gluon_gemm_a8w8_preshuffled_kernel, grid,
+    _intj_launch_tuned(
+        _gluon_gemm_a8w8_preshuffled_kernel,
+        grid,
         x,
         w,
         x_scale,

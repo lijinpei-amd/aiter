@@ -138,7 +138,9 @@ def fused_gemm_a8w8_blockscale_a16w16(
             )
         ),
     )
-    _intj_launch_tuned(_fused_gemm_a8w8_blockscale_a16w16_kernel, grid,
+    _intj_launch_tuned(
+        _fused_gemm_a8w8_blockscale_a16w16_kernel,
+        grid,
         x_fp8,
         w_fp8,
         bias_fp8,

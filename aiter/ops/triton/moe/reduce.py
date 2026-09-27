@@ -228,7 +228,9 @@ def reduce_grouped(
                 f"out.shape {tuple(out.shape)}"
             )
         gluon_num_warps = _reduce_grouped_gluon_num_warps(npad)
-        _intj_launch(_reduce_grouped_gluon, (num_groups,),
+        _intj_launch(
+            _reduce_grouped_gluon,
+            (num_groups,),
             X=x,
             Out=out,
             InIndx=indx,

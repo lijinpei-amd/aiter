@@ -175,7 +175,9 @@ def fused_gemm_afp4wfp4_a16w16(
     )
 
     def selected_kernel_wrapper():
-        _intj_launch(selected_kernel, grid,
+        _intj_launch(
+            selected_kernel,
+            grid,
             x_fp4,
             w_fp4,
             bias_fp4,

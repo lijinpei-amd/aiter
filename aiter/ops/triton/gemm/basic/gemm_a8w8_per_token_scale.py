@@ -83,7 +83,9 @@ def gemm_a8w8_per_token_scale(
             * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
-    _intj_launch_tuned(_gemm_a8w8_per_token_scale_kernel, grid,
+    _intj_launch_tuned(
+        _gemm_a8w8_per_token_scale_kernel,
+        grid,
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,

@@ -646,7 +646,6 @@ def fused_reduce_rms_mxfp4_quant(
     return (out1_fp4, out1_bs), out1, out2, out_res1, out3
 
 
-
 _moe_sort_launch = intj_handle(_fused_dynamic_mxfp4_quant_moe_sort_kernel, grid_arg=1)
 _gluon_moe_sort_launch = intj_handle(
     _gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel, grid_arg=1
