@@ -625,22 +625,22 @@ def fused_reduce_rms_mxfp4_quant(
         out2_stride_m,
         out3_stride_m,
         out_res1_stride_m,
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_N2=BLOCK_SIZE_N2,
-        BLOCK_SIZE_N3=BLOCK_SIZE_N3,
-        MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
-        HAS_SECOND_INPUT=(x2 is not None),
-        FIRST_INPUT_RES=(res1 is not None),
-        FIRST_INPUT_OUT=output_unquantized_inp1,
-        HAS_SPLITK=HAS_SPLITK,
-        NUM_SPLITK=SPK,
-        NUM_SPLITK_POW2=triton.next_power_of_2(SPK),
-        SCALE_N=SCALE_N_valid,
-        SCALE_M_PAD=(SCALE_M if use_scale_shuffle_padding else 1),
-        SCALE_N_PAD=SCALE_N,
-        SHUFFLE=shuffle,
-        SHUFFLE_PAD=use_scale_shuffle_padding,
+        BLOCK_SIZE_M,
+        BLOCK_SIZE_N,
+        BLOCK_SIZE_N2,
+        BLOCK_SIZE_N3,
+        MXFP4_QUANT_BLOCK_SIZE,
+        x2 is not None,  # HAS_SECOND_INPUT
+        res1 is not None,  # FIRST_INPUT_RES
+        output_unquantized_inp1,  # FIRST_INPUT_OUT
+        HAS_SPLITK,
+        SPK,  # NUM_SPLITK
+        triton.next_power_of_2(SPK),  # NUM_SPLITK_POW2
+        SCALE_N_valid,  # SCALE_N
+        SCALE_M if use_scale_shuffle_padding else 1,  # SCALE_M_PAD
+        SCALE_N,  # SCALE_N_PAD
+        shuffle,  # SHUFFLE
+        use_scale_shuffle_padding,  # SHUFFLE_PAD
     )
 
     return (out1_fp4, out1_bs), out1, out2, out_res1, out3
