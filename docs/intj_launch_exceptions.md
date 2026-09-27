@@ -106,8 +106,9 @@ through `grid_cpp`. The Gluon JITs build their layouts inside the kernel
 (K2's from `gl.num_warps()`), which intj requires; their gfx950 ISA is
 unchanged. See
 [the KDA direct-launch plan](superpowers/plans/2026-09-25-kda-direct-intj-launch.md).
-Known intj issue: a tuned handle retains the argument tensors of its last
-tuning miss until its next miss (`test_intj_launch.py` xfails on it).
+Needs intj `develop` at or after `ad8c832`: earlier, a tuned handle retained
+the argument tensors of its last tuning miss, which
+`test_cached_native_handle_does_not_retain_tensor` catches.
 
 On gfx942 with Triton 3.8.0 and intj `b4e9f1f`, evenly spaced samples (at most
 120 tests per file) of 41 affected test files passed; mxfp4/fp4 and other

@@ -282,11 +282,6 @@ def test_input_gpu_must_be_current():
         assert torch.equal(got_s, want_s)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="intj bug: a tuned launcher keeps its last tuning miss's arguments "
-    "(intj/tuning.py _Shim.final) until the next miss",
-)
 def test_cached_native_handle_does_not_retain_tensor():
     args = make_inputs(1, 512, 12)
     ref = weakref.ref(args["q"])

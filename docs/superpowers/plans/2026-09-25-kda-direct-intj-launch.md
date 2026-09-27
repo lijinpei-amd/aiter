@@ -32,8 +32,8 @@
 >   swapping a tuner's configs requires `_cached_intj_launcher.cache_clear()`.
 > - Tests: `test_intj_launch.py` forbids `JITFunction.run` for both one and
 >   several configs; its `ordinary_launches()` adapter also handles decorated
->   kernels and `grid_cpp`. The retention test is `xfail(strict=True)`: intj
->   keeps a tuned handle's last miss arguments (`tuning.py`, `_Shim.final`).
+>   kernels and `grid_cpp`. The retention test needs intj `ad8c832`
+>   or later; before it, a tuned handle kept its last miss's arguments.
 > - Task 4: no multi-config decorated Triton calls remain to record.
 
 ## Global Constraints
