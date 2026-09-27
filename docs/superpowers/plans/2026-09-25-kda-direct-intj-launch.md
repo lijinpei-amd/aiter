@@ -10,6 +10,32 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-25-kda-direct-intj-launch-design.md`
 
+> **Amendment (2026-09-27): multi-config K1/K2 also launch through intj.** intj
+> `develop` now accepts `@triton.autotune`/`@triton.heuristics` chains in
+> `make_launcher` (intj `docs/Usage.md`, "Autotune and heuristics"), so the
+> decorated-Triton branch below is not built. Task 1 (in-JIT Gluon layouts),
+> the cached device-bound handles, and the device/stream rules stand as
+> written. What changes in Tasks 2-4:
+>
+> - K1, K2 and the scan pass their decorated kernel (`_flash_kda_prepare_kernel`,
+>   `_flash_kda_segment_kernel`, `_flash_kda_seg_scan_kernel`) to
+>   `_intj_launcher(kernel, device, options=(), baked=(), grid_cpp=None)`,
+>   whatever the config count; there is no `configs[0]` branch. intj tunes on a
+>   miss and drops tuned and heuristic values from the call. K1's
+>   `IS_VARLEN`/`HAS_BIAS` and the scan's `HAS_H0` stay heuristics
+>   (`x is not None`, lowered to C). K2 bakes only `CM_OUT`; its grid is
+>   `grid_cpp=_k2_grid` reading the tuned `BW`, with `num_segs * H` as an extra
+>   launcher argument. Gluon handles use `grid_arg=2`; Gluon K2 passes `BW`.
+> - `return_compiled` is left at its default (`False`).
+> - Each handle owns private tuner copies. `test_tuner_keeps_the_two_schedules_apart`
+>   collects keys from the private K2 tuners (spying `Autotuner.run`), and
+>   swapping a tuner's configs requires `_cached_intj_launcher.cache_clear()`.
+> - Tests: `test_intj_launch.py` forbids `JITFunction.run` for both one and
+>   several configs; its `ordinary_launches()` adapter also handles decorated
+>   kernels and `grid_cpp`. The retention test is `xfail(strict=True)`: intj
+>   keeps a tuned handle's last miss arguments (`tuning.py`, `_Shim.final`).
+> - Task 4: no multi-config decorated Triton calls remain to record.
+
 ## Global Constraints
 
 - Use `grid_arg=2`, `bind_device=True`, and `return_compiled=False` for every native handle.

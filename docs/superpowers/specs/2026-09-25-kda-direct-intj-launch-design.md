@@ -1,5 +1,14 @@
 # KDA Direct intj Launch Design
 
+> **Amendment (2026-09-27).** intj `develop` launches `@triton.autotune` and
+> `@triton.heuristics` kernels natively (Triton tunes on a miss, intj launches
+> on a hit), so the "keep decorated Triton launches for multi-config K1/K2"
+> rule below is superseded: K1, K2 and the scan always pass their decorated
+> kernel to a cached, device-bound `make_launcher` handle, K2's grid reads the
+> tuned `BW` via `grid_cpp`, and the `is not None` heuristics stay heuristics.
+> The Gluon, device, stream, knob and cache-identity rules are unchanged. See
+> the plan's amendment for details.
+
 ## Goal
 
 Remove `_tensor_key` and `_FastLaunch` from FlashKDA. Single-config Triton kernels and both gfx950 Gluon kernels must launch through bound `intj.make_launcher` functions. Keep decorated Triton launches for K1/K2 whenever their tuner has multiple configs. Preserve KDA's route choices, kernel results, graph-capture behavior, and autotuning.
