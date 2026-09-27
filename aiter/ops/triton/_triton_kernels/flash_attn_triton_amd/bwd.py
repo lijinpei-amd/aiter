@@ -5,6 +5,7 @@ import torch
 import triton
 import triton.language as tl
 from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
     AUTOTUNE,
@@ -4745,7 +4746,7 @@ def attention_backward_triton_impl(
             nheads_q,
         )
 
-    _intj_launch(_bwd_preprocess, pre_grid,
+    _intj_launch_tuned(_bwd_preprocess, pre_grid,
         o,
         do,
         delta,
@@ -4804,7 +4805,7 @@ def attention_backward_triton_impl(
 
             if DEBUG_TRITON:
                 print(f"bwd_kernel: grid = {grid}")
-            _intj_launch(bwd_kernel_fused_causal, grid,
+            _intj_launch_tuned(bwd_kernel_fused_causal, grid,
                 q,
                 k,
                 v,
@@ -4895,7 +4896,7 @@ def attention_backward_triton_impl(
                 NUM_XCD=num_xcd,
             )
         else:
-            _intj_launch(bwd_kernel_fused_noncausal, grid,
+            _intj_launch_tuned(bwd_kernel_fused_noncausal, grid,
                 q,
                 k,
                 v,

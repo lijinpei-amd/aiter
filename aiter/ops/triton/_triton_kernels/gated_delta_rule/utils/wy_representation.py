@@ -12,7 +12,7 @@ chunk-based gated delta rule operations.
 import torch
 import triton
 import triton.language as tl
-from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     autotune_cache_kwargs,
@@ -141,7 +141,7 @@ def chunk_scaled_dot_kkt_fwd(
     )
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     A = torch.empty(B, T, H, BT, device=k.device, dtype=output_dtype)
-    _intj_launch(chunk_scaled_dot_kkt_fwd_kernel, (NT, B * H),
+    _intj_launch_tuned(chunk_scaled_dot_kkt_fwd_kernel, (NT, B * H),
         k=k,
         g=g,
         beta=beta,
@@ -299,7 +299,7 @@ def recompute_w_u_fwd(
 
     w = torch.empty_like(k)
     u = torch.empty_like(v)
-    _intj_launch(recompute_w_u_fwd_kernel, (NT, B * H),
+    _intj_launch_tuned(recompute_w_u_fwd_kernel, (NT, B * H),
         k=k,
         v=v,
         beta=beta,

@@ -14,6 +14,7 @@ import torch
 # Triton
 import triton
 from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from torch import Tensor
 
 # AITER: GMM Triton kernels
@@ -260,7 +261,7 @@ def gmm(
     )
 
     # fmt: off
-    _intj_launch(gmm_kernel, grid,
+    _intj_launch_tuned(gmm_kernel, grid,
         # Tensor pointers:
         lhs, rhs, group_sizes, out, bias, tile_counter,
         # Tensor shapes:
@@ -673,7 +674,7 @@ def nptgmm(
     )
 
     # fmt: off
-    _intj_launch(tgmm_non_persistent_kernel, grid,
+    _intj_launch_tuned(tgmm_non_persistent_kernel, grid,
         # Tensor pointers:
         lhs, rhs, group_sizes, out, bias_grad_ptr,
         # Tensor shapes:

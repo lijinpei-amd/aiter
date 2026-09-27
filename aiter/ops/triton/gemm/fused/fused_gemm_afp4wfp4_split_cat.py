@@ -4,6 +4,7 @@
 import torch
 import triton
 from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import _get_config
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
@@ -122,7 +123,7 @@ def fused_gemm_afp4wfp4_split_cat(
             * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),  # Effective launch grid dims: [NUM_KSPLIT, NUM_M_BLOCKS, NUM_N_BLOCKS]
     )
-    _intj_launch(_fused_gemm_afp4wfp4_split_cat, grid,
+    _intj_launch_tuned(_fused_gemm_afp4wfp4_split_cat, grid,
         x,
         w,
         y,
@@ -306,7 +307,7 @@ def fused_gemm_afp4wfp4_preshuffle_split_cat(
             * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),  # Effective launch grid dims: [NUM_KSPLIT, NUM_M_BLOCKS, NUM_N_BLOCKS]
     )
-    _intj_launch(_fused_gemm_afp4wfp4_preshuffle_split_cat, grid,
+    _intj_launch_tuned(_fused_gemm_afp4wfp4_preshuffle_split_cat, grid,
         x,
         w,
         y,

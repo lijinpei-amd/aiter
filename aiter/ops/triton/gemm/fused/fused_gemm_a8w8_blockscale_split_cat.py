@@ -4,6 +4,7 @@
 import torch
 import triton
 from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_a8w8_blockscale_split_cat import (
     _fused_gemm_a8w8_blockscale_preshuffle_split_cat,
@@ -129,7 +130,7 @@ def fused_gemm_a8w8_blockscale_split_cat(
             * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),  # Effective launch grid dims: [NUM_KSPLIT, NUM_M_BLOCKS, NUM_N_BLOCKS]
     )
-    _intj_launch(_fused_gemm_a8w8_blockscale_split_cat, grid,
+    _intj_launch_tuned(_fused_gemm_a8w8_blockscale_split_cat, grid,
         x,
         w,
         y,
@@ -325,7 +326,7 @@ def fused_gemm_a8w8_blockscale_preshuffle_split_cat(
             * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),  # Effective launch grid dims: [NUM_KSPLIT, NUM_M_BLOCKS, NUM_N_BLOCKS]
     )
-    _intj_launch(_fused_gemm_a8w8_blockscale_preshuffle_split_cat, grid,
+    _intj_launch_tuned(_fused_gemm_a8w8_blockscale_preshuffle_split_cat, grid,
         x,
         w,
         y,

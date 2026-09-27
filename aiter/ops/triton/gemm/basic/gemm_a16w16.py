@@ -4,6 +4,7 @@
 import torch
 import triton
 from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
@@ -325,7 +326,7 @@ def gemm_a16w16_(
         num_tiles = triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(
             N, config["BLOCK_SIZE_N"]
         )
-        _intj_launch(_triton_persistent_kernel, (min(NUM_WGS, num_tiles),),
+        _intj_launch_tuned(_triton_persistent_kernel, (min(NUM_WGS, num_tiles),),
             x,
             w,
             bias,
@@ -506,7 +507,7 @@ def gemm_a16w16_(
             * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
-    _intj_launch(_gemm_a16_w16_kernel, grid,
+    _intj_launch_tuned(_gemm_a16_w16_kernel, grid,
         x,
         w,
         bias,

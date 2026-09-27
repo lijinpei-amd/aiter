@@ -6,6 +6,7 @@ import itertools
 import torch
 import triton
 from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._gluon_kernels.gfx942.moe.moe_op_gemm_int8_smoothquant import (
     _gluon_moe_gemm_int8_smoothquant,
@@ -258,7 +259,7 @@ def moe_gemm_int8_smoothquant(
 
     if use_gluon:
         # launch Gluon-optimized kernel
-        _intj_launch(_gluon_moe_gemm_int8_smoothquant, (grid,),
+        _intj_launch_tuned(_gluon_moe_gemm_int8_smoothquant, (grid,),
             y,
             y.stride(0),
             y.stride(1),

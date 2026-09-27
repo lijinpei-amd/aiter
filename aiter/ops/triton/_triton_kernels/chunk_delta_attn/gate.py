@@ -15,6 +15,7 @@ import torch
 import triton
 import triton.language as tl
 from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils import (
     autotune_cache_kwargs,
@@ -151,7 +152,7 @@ def chunk_delta_attn_gate_fwd(
     def grid(meta):
         return (triton.cdiv(T, meta["BT"]), H)
 
-    _intj_launch(chunk_delta_attn_gate_fwd_kernel, grid,
+    _intj_launch_tuned(chunk_delta_attn_gate_fwd_kernel, grid,
         g=g,
         A_log=A_log,
         dt_bias=dt_bias,

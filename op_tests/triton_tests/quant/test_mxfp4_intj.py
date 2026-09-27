@@ -4,8 +4,12 @@
 
 import pytest
 import torch
+from intj import make_launcher
+from intj.launcher import UnsupportedKernel
 from triton.runtime.autotuner import Heuristics
 from triton.runtime.jit import JITFunction
+
+from aiter.ops.triton._triton_kernels.quant import fused_mxfp4_quant as _kernels
 
 from aiter.ops.triton.quant.fused_mxfp4_quant import (
     fused_dynamic_mxfp4_quant_moe_sort,
@@ -19,7 +23,10 @@ from aiter.ops.triton.quant.quant import dynamic_mxfp4_quant, dynamic_nvfp4_quan
 
 
 @pytest.fixture(autouse=True)
-def _reject_triton_brackets(monkeypatch):
+def _reject_triton_brackets(request, monkeypatch):
+    if request.node.name.endswith("_stays_on_triton"):
+        return
+
     def reject(*_args, **_kwargs):
         raise AssertionError("Triton bracket launch was used")
 
@@ -52,7 +59,7 @@ def test_fused_flatten_mxfp4_quant_uses_intj():
     torch.cuda.synchronize()
 
 
-def test_fused_rms_mxfp4_quant_uses_intj():
+def test_fused_rms_mxfp4_quant_stays_on_triton():
     (packed, scales), norm, _, _ = fused_rms_mxfp4_quant(
         _input(), _input(1)[0], 1e-6, output_unquantized_inp1=True, inargs="triton"
     )
@@ -61,7 +68,7 @@ def test_fused_rms_mxfp4_quant_uses_intj():
     torch.testing.assert_close(norm, _input())
 
 
-def test_fused_reduce_act_mul_mxfp4_quant_uses_intj():
+def test_fused_reduce_act_mul_mxfp4_quant_stays_on_triton():
     (packed, scales), _ = fused_reduce_act_mul_and_mxfp4_quant(
         _input(columns=128), "silu"
     )
@@ -70,7 +77,7 @@ def test_fused_reduce_act_mul_mxfp4_quant_uses_intj():
     torch.cuda.synchronize()
 
 
-def test_fused_reduce_rms_mxfp4_quant_uses_intj():
+def test_fused_reduce_rms_mxfp4_quant_stays_on_triton():
     (packed, scales), norm, _, _, _ = fused_reduce_rms_mxfp4_quant(
         _input(), _input(1)[0], 1e-6, output_unquantized_inp1=True, args="triton"
     )
@@ -99,3 +106,18 @@ def test_fused_quant_fp8_sort_uses_intj():
     assert quantized.shape == (32, 256)
     assert scales.shape == (32, 8)
     torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "_fused_rms_mxfp4_quant_kernel",
+        "_fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel",
+        "_fused_reduce_rms_mxfp4_quant_kernel",
+    ],
+)
+def test_partial_heuristics_are_refused_by_intj(name):
+    # These wrappers launch through Triton because their functools.partial
+    # heuristics are outside intj's heuristic subset. Convert them if this fails.
+    with pytest.raises(UnsupportedKernel, match="must be a lambda or def"):
+        make_launcher(getattr(_kernels, name))

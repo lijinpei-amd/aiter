@@ -69,6 +69,7 @@ else.
 """
 
 from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from typing import Optional
 
 import torch
@@ -364,7 +365,7 @@ def fused_recurrent_gated_delta_rule_fwd_vllm(
         stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
 
     grid = (NK, NV, N * HV)
-    _intj_launch(fused_recurrent_gated_delta_rule_fwd_kernel_vllm, grid,
+    _intj_launch_tuned(fused_recurrent_gated_delta_rule_fwd_kernel_vllm, grid,
         q=q,
         k=k,
         v=v,

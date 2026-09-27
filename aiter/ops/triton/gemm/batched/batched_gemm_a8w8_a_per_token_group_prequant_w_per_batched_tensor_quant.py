@@ -3,7 +3,7 @@
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel,
@@ -101,7 +101,7 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         else torch.iinfo(WQ.dtype).max
     )
 
-    _intj_launch(_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel, grid,
+    _intj_launch_tuned(_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel, grid,
         X,
         WQ,
         YQ,

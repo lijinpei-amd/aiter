@@ -14,7 +14,7 @@ import os
 import torch
 import triton
 import triton.language as tl
-from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     IS_AMD,
@@ -623,7 +623,7 @@ def _run_split_path(
     )
     u_out = v.new_empty(B, H, T, V)
     w_out = k.new_empty(B, H, T, K)
-    _intj_launch(recompute_w_u_head_major_kernel, (NT, B * H),
+    _intj_launch_tuned(recompute_w_u_head_major_kernel, (NT, B * H),
         k,
         v,
         beta,
@@ -755,7 +755,7 @@ def fused_solve_tril_recompute_w_u(
     u_out = v.new_empty(B, H, T, V)
     w_out = k.new_empty(B, H, T, K)
 
-    _intj_launch(fused_solve_tril_recompute_w_u_kernel, (NT, B * H),
+    _intj_launch_tuned(fused_solve_tril_recompute_w_u_kernel, (NT, B * H),
         A_raw,
         k,
         v,

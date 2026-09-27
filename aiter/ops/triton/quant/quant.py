@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 import torch
 import triton
 
@@ -327,7 +328,7 @@ def dynamic_mxfp4_quant(
 
     from intj.compat import launch
 
-    launch(
+    _intj_launch_tuned(
         _dynamic_mxfp4_quant_kernel,
         grid,
         x,
@@ -678,7 +679,7 @@ def dynamic_nvfp4_quant(
 
     from intj.compat import launch
 
-    launch(
+    _intj_launch_tuned(
         _dynamic_nvfp4_quant_kernel,
         grid,
         x,

@@ -5,6 +5,7 @@
 import torch
 import triton
 from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
@@ -244,7 +245,7 @@ def gemm_afp4wfp4_(
         ),
     )
 
-    _intj_launch(impl, grid,
+    _intj_launch_tuned(impl, grid,
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -422,7 +423,7 @@ def gemm_afp4wfp4_preshuffled_scales(
         ),
     )
 
-    _intj_launch(_triton_gemm_afp4wfp4_kernel_preshuffle_scales, grid,
+    _intj_launch_tuned(_triton_gemm_afp4wfp4_kernel_preshuffle_scales, grid,
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -662,7 +663,7 @@ def gemm_afp4wfp4_preshuffle(
     )
 
     config.pop("NUM_BUFFERS", None)
-    _intj_launch(_triton_gemm_afp4wfp4_preshuffle_kernel, grid,
+    _intj_launch_tuned(_triton_gemm_afp4wfp4_preshuffle_kernel, grid,
         x_fp4,
         w_preshuf,
         y if config["NUM_KSPLIT"] == 1 else y_pp,

@@ -12,7 +12,7 @@ including local and global cumsum for both scalar and vector inputs.
 import torch
 import triton
 import triton.language as tl
-from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     autotune_cache_kwargs,
@@ -190,7 +190,7 @@ def chunk_local_cumsum_scalar(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
     grid = (NT, B * H)
-    _intj_launch(chunk_local_cumsum_scalar_kernel, grid,
+    _intj_launch_tuned(chunk_local_cumsum_scalar_kernel, grid,
         s=g_org,
         o=g,
         scale=scale,
@@ -236,7 +236,7 @@ def chunk_local_cumsum_vector(
     # keep cummulative normalizer in fp32
     # this kernel is equivalent to
     # g = g.view(B, H, NT, BT, -1).cumsum(-2).view(B, H, T, -1)
-    _intj_launch(chunk_local_cumsum_vector_kernel, grid,
+    _intj_launch_tuned(chunk_local_cumsum_vector_kernel, grid,
         s=g_org,
         o=g,
         scale=scale,

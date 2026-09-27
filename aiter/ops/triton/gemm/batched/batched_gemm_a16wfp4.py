@@ -4,6 +4,7 @@
 import torch
 import triton
 from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
@@ -181,7 +182,7 @@ def batched_gemm_a16wfp4_(
             * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
-    _intj_launch(_batched_gemm_a16wfp4_kernel, grid,
+    _intj_launch_tuned(_batched_gemm_a16wfp4_kernel, grid,
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,

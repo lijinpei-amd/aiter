@@ -7,6 +7,7 @@ import math
 import torch
 import triton
 from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
@@ -147,7 +148,7 @@ def gemm_afp8wfp8(
         ),
     )
 
-    _intj_launch(_gemm_afp8wfp8_kernel, grid,
+    _intj_launch_tuned(_gemm_afp8wfp8_kernel, grid,
         x,
         w_t,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -419,7 +420,7 @@ def gemm_afp8wfp8_preshuffle(
             num_ctas=num_ctas,
         )
     else:
-        _intj_launch(_gemm_afp8wfp8_preshuffle_kernel, grid,
+        _intj_launch_tuned(_gemm_afp8wfp8_preshuffle_kernel, grid,
             x,
             w_view,
             y if config["NUM_KSPLIT"] == 1 else y_pp,

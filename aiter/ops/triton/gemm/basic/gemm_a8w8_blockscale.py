@@ -7,6 +7,7 @@ import os
 import torch
 import triton
 from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from packaging.version import Version
 
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
@@ -180,7 +181,7 @@ def gemm_a8w8_blockscale(
     else:
         impl = triton_gemm_a8w8_blockscale_kernel
 
-    _intj_launch(impl, grid,
+    _intj_launch_tuned(impl, grid,
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -397,7 +398,7 @@ def gemm_a8w8_blockscale_preshuffle(
     else:
         impl = triton_gemm_a8w8_blockscale_preshuffle_kernel
 
-    _intj_launch(impl, grid,
+    _intj_launch_tuned(impl, grid,
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,

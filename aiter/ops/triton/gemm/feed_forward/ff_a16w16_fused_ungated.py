@@ -5,7 +5,7 @@ import warnings
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
 from aiter.ops.triton._triton_kernels.gemm.feed_forward.ff_a16w16_fused_ungated import (
@@ -78,7 +78,7 @@ def ff_a16w16_fused_ungated(
     grid = (
         triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),
     )
-    _intj_launch(_ff_a16w16_fused_ungated, grid,
+    _intj_launch_tuned(_ff_a16w16_fused_ungated, grid,
         x,
         w_up,
         w_down,

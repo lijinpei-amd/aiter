@@ -4,7 +4,7 @@ from typing import Literal
 import torch
 import triton
 import triton.language as tl
-from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.common import apply_rotary
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
@@ -1309,7 +1309,7 @@ def attention_forward_decode_triton_impl(
         )
         print("stride_lse_zhg, stride_lse_m", (stride_lse_zhg, stride_lse_m))
 
-    _intj_launch(_fwd_kernel_splitK, grid,
+    _intj_launch_tuned(_fwd_kernel_splitK, grid,
         Q=q,
         K=k_cache,
         V=v_cache,
@@ -1432,7 +1432,7 @@ def attention_forward_decode_triton_impl(
         print("k_block_size:", k_block_size)
         print("grid:", reduce_grid)
 
-    _intj_launch(_splitK_reduce, reduce_grid,
+    _intj_launch_tuned(_splitK_reduce, reduce_grid,
         out_splitk,
         metadata,
         out,

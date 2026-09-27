@@ -4,6 +4,7 @@
 import torch
 import triton
 from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
@@ -77,7 +78,7 @@ def gemm_a8w8_per_token_scale(
             * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
-    _intj_launch(_gemm_a8w8_per_token_scale_kernel, grid,
+    _intj_launch_tuned(_gemm_a8w8_per_token_scale_kernel, grid,
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,

@@ -43,7 +43,7 @@ from collections.abc import Sequence
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from triton import knobs
 from triton.runtime import driver
 
@@ -540,7 +540,7 @@ def _run_sequence(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm)
     L2 = max(1, triton.next_power_of_2(L))
     num_warps, num_stages = _pick_attn_res_seq_config(N)
 
-    _intj_launch(attnres_fwd_kernel, (N,),
+    attnres_fwd_kernel[(N,)](
         q=q_flat,
         res=res,
         w=w_flat,
@@ -607,7 +607,7 @@ def _run_packed(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm):
     L2 = max(1, triton.next_power_of_2(L))
     num_warps, num_stages, bl = _pick_attn_res_packed_config(N, L2)
 
-    _intj_launch(attnres_fwd_kernel, (N,),
+    _intj_launch_tuned(attnres_fwd_kernel, (N,),
         q=q_flat,
         res=None,  # unused when IS_PACKED (sequence branch is dead); None keeps
         # the L2 dead pointer slots out of the kernarg segment

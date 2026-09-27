@@ -3,7 +3,7 @@
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_a8w8_blockscale_mul_add import (
     _fused_gemm_a8w8_blockscale_mul_add_kernel,
@@ -174,7 +174,7 @@ def fused_gemm_a8w8_blockscale_mul_add(
             * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
-    _intj_launch(_fused_gemm_a8w8_blockscale_mul_add_kernel, grid,
+    _intj_launch_tuned(_fused_gemm_a8w8_blockscale_mul_add_kernel, grid,
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -217,7 +217,7 @@ def fused_gemm_a8w8_blockscale_mul_add(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _intj_launch(_fused_gemm_a8w8_blockscale_mul_add_reduce_kernel, grid_reduce,
+        _intj_launch_tuned(_fused_gemm_a8w8_blockscale_mul_add_reduce_kernel, grid_reduce,
             y_pp,
             y,
             a,

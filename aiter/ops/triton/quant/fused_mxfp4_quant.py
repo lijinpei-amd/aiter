@@ -167,8 +167,6 @@ def fused_rms_mxfp4_quant(
         "SHUFFLE_PAD": use_scale_shuffle_padding,
     }
 
-    from intj.compat import launch
-
     if use_gluon:
         # Aim for at least 32 CTAs to keep all WGPs fed.
         _TARGET_MIN_CTAS = 32
@@ -176,18 +174,14 @@ def fused_rms_mxfp4_quant(
         while ROWS_PER_CTA > 1 and M % ROWS_PER_CTA != 0:
             ROWS_PER_CTA //= 2
         grid = (triton.cdiv(M, ROWS_PER_CTA) * (1 if x2 is None else 2),)
-        launch(
-            _gluon_fused_rms_mxfp4_quant_kernel,
-            grid,
+        _gluon_fused_rms_mxfp4_quant_kernel[grid](
             *_common_args,
             **_common_kwargs,
             ROWS_PER_CTA=ROWS_PER_CTA,
         )
     else:
         grid = (M * (1 if x2 is None else 2),)
-        launch(
-            _fused_rms_mxfp4_quant_kernel,
-            grid,
+        _fused_rms_mxfp4_quant_kernel[grid](
             *_common_args,
             **_common_kwargs,
         )
@@ -378,11 +372,7 @@ def fused_reduce_act_mul_and_mxfp4_quant(
         num_pid += triton.cdiv(M, BLOCK_SIZE_M2) * triton.cdiv(N2, BLOCK_SIZE_N2)
 
     grid = (num_pid,)
-    from intj.compat import launch
-
-    launch(
-        _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel,
-        grid,
+    _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel[grid](
         x,
         y,
         y_scale,
@@ -580,11 +570,7 @@ def fused_reduce_rms_mxfp4_quant(
         else _fused_reduce_rms_mxfp4_quant_kernel
     )
 
-    from intj.compat import launch
-
-    launch(
-        kernel,
-        grid,
+    kernel[grid](
         x1,
         x1_weight,
         x2,

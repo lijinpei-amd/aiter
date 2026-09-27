@@ -4,7 +4,7 @@ from typing import Literal
 import torch
 import triton
 import triton.language as tl
-from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.common import (
     apply_rotary,
@@ -1877,7 +1877,7 @@ def attention_forward_prefill_triton_impl(
     def grid(META):
         return (nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]), batch)
 
-    _intj_launch(attn_fwd, grid,
+    _intj_launch_tuned(attn_fwd, grid,
         q,
         k,
         v,

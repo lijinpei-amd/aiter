@@ -14,7 +14,7 @@ matrix (Aqk).
 import torch
 import triton
 import triton.language as tl
-from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils import (
     autotune_cache_kwargs,
@@ -212,7 +212,7 @@ def chunk_gla_fwd_o(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * HV)
 
-    _intj_launch(chunk_gla_fwd_kernel_o, grid,
+    _intj_launch_tuned(chunk_gla_fwd_kernel_o, grid,
         q=q,
         v=v,
         g=g,

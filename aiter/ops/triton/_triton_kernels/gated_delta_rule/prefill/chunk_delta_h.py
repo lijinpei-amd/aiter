@@ -13,7 +13,7 @@ the `[K, V]` and the transposed `[V, K]` hidden-state layouts.
 import torch
 import triton
 import triton.language as tl
-from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     IS_AMD,
@@ -626,7 +626,7 @@ def chunk_gated_delta_rule_fwd_h(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
 
-    _intj_launch(chunk_gated_delta_rule_fwd_kernel_h_blockdim64, grid,
+    _intj_launch_tuned(chunk_gated_delta_rule_fwd_kernel_h_blockdim64, grid,
         k=k,
         v=u,
         w=w,
@@ -933,7 +933,7 @@ def chunk_gated_delta_rule_fwd_h_opt(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
 
-    _intj_launch(chunk_gated_delta_rule_fwd_kernel_h_opt, grid,
+    _intj_launch_tuned(chunk_gated_delta_rule_fwd_kernel_h_opt, grid,
         k=k,
         v=u,
         w=w,
@@ -1394,7 +1394,7 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
 
-    _intj_launch(chunk_gated_delta_rule_fwd_kernel_h_opt_vk, grid,
+    _intj_launch_tuned(chunk_gated_delta_rule_fwd_kernel_h_opt_vk, grid,
         k=k,
         v=u,
         w=w,
@@ -1459,7 +1459,7 @@ def chunk_gated_delta_rule_bwd_dhu(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
 
-    _intj_launch(chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64, grid,
+    _intj_launch_tuned(chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64, grid,
         q=q,
         k=k,
         w=w,

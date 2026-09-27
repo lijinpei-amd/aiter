@@ -4,6 +4,7 @@
 import torch
 import triton
 from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
@@ -125,7 +126,7 @@ def gemm_a16wfp4_(
             * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
-    _intj_launch(_gemm_a16wfp4_kernel, grid,
+    _intj_launch_tuned(_gemm_a16wfp4_kernel, grid,
         x,
         w,
         y if y_pp is None else y_pp,
@@ -310,7 +311,7 @@ def gemm_a16wfp4_preshuffle_(
             * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
-    _intj_launch(_gemm_a16wfp4_preshuffle_kernel, grid,
+    _intj_launch_tuned(_gemm_a16wfp4_preshuffle_kernel, grid,
         x,
         w,
         y if y_pp is None else y_pp,

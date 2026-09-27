@@ -16,7 +16,7 @@ Recompute W and U tensors for chunk_delta_attn forward pass.
 import torch
 import triton
 import triton.language as tl
-from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils import (
     autotune_cache_kwargs,
@@ -216,7 +216,7 @@ def recompute_w_u_fwd(
     )
     kg = torch.empty(B, T, HV, K, device=k.device, dtype=k.dtype)
 
-    _intj_launch(recompute_w_u_fwd_kernel, (NT, B * HV),
+    _intj_launch_tuned(recompute_w_u_fwd_kernel, (NT, B * HV),
         q=q,
         k=k,
         qg=qg,

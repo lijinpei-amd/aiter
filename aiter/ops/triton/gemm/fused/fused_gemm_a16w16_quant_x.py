@@ -4,6 +4,7 @@
 import torch
 import triton
 from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
@@ -115,7 +116,7 @@ def fused_gemm_a16w16_quant_x(
         * triton.cdiv(N, config["BLOCK_SIZE_N"])
         + triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(K, config["BLOCK_SIZE_K"]),
     )
-    _intj_launch(_fused_gemm_a16w16_quant_x_kernel, grid,
+    _intj_launch_tuned(_fused_gemm_a16w16_quant_x_kernel, grid,
         x,
         w,
         bias,

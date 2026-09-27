@@ -13,6 +13,7 @@ import torch
 import triton
 import triton.language as tl
 from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from torch import nn
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
@@ -319,7 +320,7 @@ def l2norm_bwd(
         def grid(meta):
             return (triton.cdiv(T, meta["BT"]),)
 
-        _intj_launch(l2norm_bwd_kernel, grid,
+        _intj_launch_tuned(l2norm_bwd_kernel, grid,
             y=y,
             rstd=rstd,
             dy=dy,
@@ -331,7 +332,7 @@ def l2norm_bwd(
             NB=NB,
         )
     else:
-        _intj_launch(l2norm_bwd_kernel1, (T,),
+        _intj_launch_tuned(l2norm_bwd_kernel1, (T,),
             y=y,
             rstd=rstd,
             dy=dy,

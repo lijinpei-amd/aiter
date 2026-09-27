@@ -14,7 +14,7 @@ import os
 import torch
 import triton
 import triton.language as tl
-from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     IS_TMA_SUPPORTED,
@@ -700,7 +700,7 @@ def solve_tril(
     elif BT == 64:
         merge_fn = merge_16x16_to_64x64_inverse_kernel
 
-    _intj_launch(merge_fn, (NT, B * H),
+    _intj_launch_tuned(merge_fn, (NT, B * H),
         A=A,
         Ai=Ai,
         cu_seqlens=cu_seqlens,

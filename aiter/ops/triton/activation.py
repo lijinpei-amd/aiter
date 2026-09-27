@@ -3,6 +3,7 @@ from typing import Literal
 import torch
 import triton
 from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 import aiter
 from aiter.ops.triton._triton_kernels.activation import (
@@ -103,7 +104,7 @@ def act_mul_and_mxfp4_quant(
         triton.cdiv(M, BLOCK_SIZE_M),
         triton.cdiv(N_half, BLOCK_SIZE_N * NUM_ITER),
     )
-    _intj_launch(_act_mul_and_dynamic_mxfp4_quant_kernel, grid,
+    _intj_launch_tuned(_act_mul_and_dynamic_mxfp4_quant_kernel, grid,
         x,
         x_fp4,
         blockscale_e8m0,
@@ -183,7 +184,7 @@ def act_mul_and_fp8_group_quant(
         M,
         triton.cdiv(N_half, BLOCK_SIZE_N),
     )
-    _intj_launch(_act_mul_and_dynamic_fp8_group_quant_kernel, grid,
+    _intj_launch_tuned(_act_mul_and_dynamic_fp8_group_quant_kernel, grid,
         x,
         x_fp8,
         out_bs,

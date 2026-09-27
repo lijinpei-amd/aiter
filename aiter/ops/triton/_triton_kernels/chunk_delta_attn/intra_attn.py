@@ -18,7 +18,7 @@ and returns w, u, qg, kg, Aqk, Akk as required by the top-level forward.
 import torch
 import triton
 import triton.language as tl
-from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils import (
     IS_GATHER_SUPPORTED,
@@ -201,7 +201,7 @@ def _chunk_delta_attn_fwd_intra_token_parallel(
     def grid(meta):
         return (B * T, triton.cdiv(HV, meta["BH"]))
 
-    _intj_launch(
+    _intj_launch_tuned(
         chunk_delta_attn_fwd_kernel_intra_token_parallel,
         grid,
         q=q,
@@ -723,7 +723,7 @@ def chunk_delta_attn_fwd_intra(
     if safe_gate:
         BK = min(64, triton.next_power_of_2(K))
         grid = (NT, NC, B * HV)
-        _intj_launch(
+        _intj_launch_tuned(
             chunk_delta_attn_fwd_kernel_intra_sub_chunk,
             grid,
             q=q,
@@ -759,7 +759,7 @@ def chunk_delta_attn_fwd_intra(
         )
 
     grid = (NT, B * HV)
-    _intj_launch(
+    _intj_launch_tuned(
         chunk_delta_attn_fwd_kernel_inter_solve_fused,
         grid,
         q=q,

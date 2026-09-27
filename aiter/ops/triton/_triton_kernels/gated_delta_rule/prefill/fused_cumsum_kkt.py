@@ -1,7 +1,7 @@
 import torch
 import triton
 import triton.language as tl
-from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     IS_AMD,
@@ -123,7 +123,7 @@ def fused_cumsum_kkt(
     g_cumsum = torch.empty(B, T, H, device=g.device, dtype=torch.float32)
     A = torch.empty(B, T, H, chunk_size, device=k.device, dtype=torch.float32)
 
-    _intj_launch(_fused_cumsum_kkt_kernel, (NT, B * H),
+    _intj_launch_tuned(_fused_cumsum_kkt_kernel, (NT, B * H),
         g,
         k,
         beta,
@@ -346,7 +346,7 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
     g_cumsum_out = torch.empty(B, H, T, device=g.device, dtype=g_output_dtype)
     A_out = torch.empty(B, T, H, BT, device=k.device, dtype=A_output_dtype)
 
-    _intj_launch(fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel, (NT, B * H),
+    _intj_launch_tuned(fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel, (NT, B * H),
         g,
         k,
         beta,

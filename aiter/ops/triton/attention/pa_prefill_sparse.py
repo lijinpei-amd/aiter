@@ -21,6 +21,7 @@ take a 1-D ``(kv_indices, kv_indptr)`` pair over one pool.
 import torch
 import triton
 from intj.compat import launch as _intj_launch
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_prefill_sparse import (
     _pa_prefill_sparse as gluon_pa_prefill_sparse,
@@ -213,7 +214,7 @@ def pa_prefill_sparse(
             num_queries,
             triton.cdiv(num_heads, META["BLOCK_H"]),
         )
-        _intj_launch(_sparse_attn_prefill_kernel, grid,
+        _intj_launch_tuned(_sparse_attn_prefill_kernel, grid,
             q,
             unified_kv,
             kv_indices_prefix,
