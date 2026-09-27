@@ -10,7 +10,7 @@ Triton 3.7.1 and 3.8.0 on gfx942. Selected chunk-delta tests and benchmarks
 also ran on gfx950 with Triton 3.8.0; other gfx950/gfx1250-only paths remain
 untested.
 
-These are the 42 remaining tracked Triton-style bracket launches. The three
+These are the 38 remaining tracked Triton-style bracket launches. The three
 FlashKDA Triton wrappers use native intj on cache hits; their first call still
 uses Triton to select an autotuned config. Most other sites need a runtime
 capability or launch behavior intj cannot preserve.
@@ -51,10 +51,6 @@ to this branch.
 | `aiter/ops/triton/gluon/pa_decode_gluon.py:4428` | `paged_attention_kernel` | Can select `paged_attention_decode_v2_gluon_large_block_dot_kernel`, which references `COMPUTE` and `VMEM_LOAD` globals that intj refuses. |
 | `aiter/ops/triton/moe/moe_op_gemm_a4w4.py:604` | `_moe_gemm_a4w4_prefill` | Selected config can use `num_ctas > 1`; intj refuses it. |
 | `aiter/ops/triton/moe/moe_op_gemm_a8w4.py:710` | `_moe_gemm_a8w4_prefill_gluon` | Selected config can use `num_ctas > 1`; intj refuses it. |
-| `aiter/ops/triton/quant/fused_mxfp4_quant.py:177` | `_gluon_fused_rms_mxfp4_quant_kernel` | gfx1250 Gluon path; `@triton.heuristics` uses `functools.partial(_even_m_n, ...)`; intj refuses it: `UnsupportedKernel: heuristic 'EVEN_M_N' must be a lambda or def`. |
-| `aiter/ops/triton/quant/fused_mxfp4_quant.py:184` | `_fused_rms_mxfp4_quant_kernel` | `@triton.heuristics` uses `functools.partial(_even_m_n, ...)`; intj refuses it: `UnsupportedKernel: heuristic 'EVEN_M_N' must be a lambda or def`. |
-| `aiter/ops/triton/quant/fused_mxfp4_quant.py:375` | `_fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel` | `@triton.heuristics` uses `functools.partial(_even_m_n, ...)`; intj refuses it: `UnsupportedKernel: heuristic 'EVEN_M_N' must be a lambda or def`. |
-| `aiter/ops/triton/quant/fused_mxfp4_quant.py:573` | `kernel` | Either target (`_gluon_fused_reduce_rms_mxfp4_quant_kernel` or `_fused_reduce_rms_mxfp4_quant_kernel`) has `@triton.heuristics` uses `functools.partial(_even_m_n, ...)`; intj refuses it: `UnsupportedKernel: heuristic 'EVEN_M_N' must be a lambda or def`. |
 | `csrc/cpp_itfs/pa_gluon_aot/pa_attention_kernel_test.py:591` | `kernel` | Can select `paged_attention_decode_v2_gluon_large_block_dot_kernel`, which references `COMPUTE` and `VMEM_LOAD` globals that intj refuses. |
 | `csrc/cpp_itfs/utils.py:515` | `self.triton_kernel` | `HsacoKernel._call` preserves the returned kernel alongside its separate HSACO path. |
 | `op_tests/triton_tests/torch_compile/test_compile_constexpr_mutation.py:37` | `_rmsnorm_constexpr_kernel` | Test checks Triton launch behavior under `torch.compile`. |
@@ -73,7 +69,7 @@ ABI, not Triton/Gluon `JITFunction`s.
 ## Autotune and heuristics
 
 `intj.compat.launch` refuses `@triton.autotune` and `@triton.heuristics`
-wrappers. The 91 call sites that launch such a kernel (or pick one at runtime)
+wrappers. The 95 call sites that launch such a kernel (or pick one at runtime)
 use `launch_tuned` from
 [`aiter/ops/triton/utils/intj_tuned.py`](../aiter/ops/triton/utils/intj_tuned.py)
 instead: it keeps the Triton call spelling, drops the values the decorators
@@ -87,10 +83,20 @@ about 11 us of host time per `gemm_a8w8` launch against 38 us for
 `kernel[grid](...)` (gfx942, Triton 3.8.0). Hot call sites can still move to a
 direct `make_launcher` handle with a `grid_cpp` grid.
 
-Five sites stay on Triton: the four `functools.partial` heuristics in
-`fused_mxfp4_quant.py` and the tuple argument of `attn_res.py:543` (see the
-table). `op_tests/triton_tests/quant/test_mxfp4_intj.py` asserts that intj
-still refuses those heuristics. The FlashKDA first-call autotuning entries
+One site stays on Triton: the tuple argument of `attn_res.py:543` (see the
+table). The four `fused_mxfp4_quant.py` sites that used
+`functools.partial(_even_m_n, ...)` heuristics (lines 177/184/375/573) now go
+through `launch_tuned`: the heuristics were rewritten as module-level,
+closure-free defs (`even_m_n1`/`even_m_n2`/`even_m_n3`/`even_m_n1_iter` in
+`aiter/ops/triton/utils/mxfp4_heuristics.py`) that intj's subset accepts.
+`op_tests/triton_tests/quant/test_mxfp4_intj.py` asserts `make_launcher`
+accepts them and that the intj launch matches a raw Triton launch. The Gluon
+kernels these wrappers can also select (`_gluon_fused_rms_mxfp4_quant_kernel`,
+`_gluon_fused_reduce_rms_mxfp4_quant_kernel`, gfx1250-only) keep their own
+`functools.partial(_even_m_n, ...)` heuristics unchanged, so `launch_tuned`
+still raises `UnsupportedKernel` if that branch is ever taken; this is
+untested here (no gfx1250 hardware) and unchanged from before this
+conversion for that path. The FlashKDA first-call autotuning entries
 above are unchanged: replacing `_FastLaunch` with a native autotuned launcher
 is the follow-up in
 [the KDA direct-launch plan](superpowers/plans/2026-09-25-kda-direct-intj-launch.md).

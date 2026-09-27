@@ -137,5 +137,62 @@ def test_alignment_truth_table(module_name, kernel_name, kind, dimensions, expec
     assert set(kernel.values) == set(names)
     for name, value in zip(names, expected[kind]):
         predicate = kernel.values[name]
-        assert predicate.func is even_m_n
+        if module_name == GLUON:
+            # The Gluon kernels keep the closure-free functools.partial form.
+            assert predicate.func is even_m_n
+        else:
+            # intj's make_launcher only accepts a lambda or single-return def
+            # with no free variables, so the Triton kernels use module-level
+            # defs (`even_m_n1`/`even_m_n2`/`even_m_n3`/`even_m_n1_iter`)
+            # instead of a `functools.partial(even_m_n, ...)`.
+            assert predicate.__code__.co_freevars == ()
         assert predicate(args) is value, name
+
+
+def test_new_heuristics_match_old_partial_style():
+    """The 4 literal-key defs must agree with the shared, closure-based
+    `even_m_n` (still used by the Gluon kernels via `functools.partial`) on
+    every combination they can be asked about."""
+    from aiter.ops.triton.utils.mxfp4_heuristics import (
+        even_m_n,
+        even_m_n1,
+        even_m_n1_iter,
+        even_m_n2,
+        even_m_n3,
+    )
+
+    values = [0, 1, 3, 7, 8, 15, 16, 31, 32, 63, 64]
+    for m in values:
+        for n in values:
+            for block_m in (1, 8, 16, 32):
+                for block_n in (1, 8, 16, 32):
+                    for num_iter in (1, 2, 3):
+                        args = {
+                            "M": m,
+                            "N1": n,
+                            "N2": n,
+                            "N3": n,
+                            "NUM_ITER": num_iter,
+                            "BLOCK_SIZE_M": block_m,
+                            "BLOCK_SIZE_M1": block_m,
+                            "BLOCK_SIZE_N": block_n,
+                            "BLOCK_SIZE_N1": block_n,
+                            "BLOCK_SIZE_N2": block_n,
+                            "BLOCK_SIZE_N3": block_n,
+                        }
+                        assert even_m_n1(args) == even_m_n(
+                            args, block_m="BLOCK_SIZE_M", n="N1", block_n="BLOCK_SIZE_N"
+                        )
+                        assert even_m_n2(args) == even_m_n(
+                            args, block_m="BLOCK_SIZE_M", n="N2", block_n="BLOCK_SIZE_N2"
+                        )
+                        assert even_m_n3(args) == even_m_n(
+                            args, block_m="BLOCK_SIZE_M", n="N3", block_n="BLOCK_SIZE_N3"
+                        )
+                        assert even_m_n1_iter(args) == even_m_n(
+                            args,
+                            block_m="BLOCK_SIZE_M1",
+                            n="N1",
+                            block_n="BLOCK_SIZE_N1",
+                            num_iter="NUM_ITER",
+                        )

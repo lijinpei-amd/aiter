@@ -1,11 +1,12 @@
-from functools import partial
-
 import triton
 import triton.language as tl
 
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils.mxfp4_heuristics import even_m_n as _even_m_n
+from aiter.ops.triton.utils.mxfp4_heuristics import even_m_n1 as _even_m_n1
+from aiter.ops.triton.utils.mxfp4_heuristics import even_m_n1_iter as _even_m_n1_iter
+from aiter.ops.triton.utils.mxfp4_heuristics import even_m_n2 as _even_m_n2
+from aiter.ops.triton.utils.mxfp4_heuristics import even_m_n3 as _even_m_n3
 
 
 @triton.jit
@@ -43,12 +44,8 @@ _fused_rms_mxfp4_quant_repr = make_kernel_repr(
 
 @triton.heuristics(
     {
-        "EVEN_M_N": partial(
-            _even_m_n, block_m="BLOCK_SIZE_M", n="N1", block_n="BLOCK_SIZE_N"
-        ),
-        "EVEN_M_N2": partial(
-            _even_m_n, block_m="BLOCK_SIZE_M", n="N2", block_n="BLOCK_SIZE_N2"
-        ),
+        "EVEN_M_N": _even_m_n1,
+        "EVEN_M_N2": _even_m_n2,
     }
 )
 @triton.jit(repr=_fused_rms_mxfp4_quant_repr)
@@ -331,13 +328,7 @@ _fused_reduce_act_mul_and_dynamic_mxfp4_quant_repr = make_kernel_repr(
 
 @triton.heuristics(
     {
-        "EVEN_M_N": partial(
-            _even_m_n,
-            block_m="BLOCK_SIZE_M1",
-            n="N1",
-            block_n="BLOCK_SIZE_N1",
-            num_iter="NUM_ITER",
-        ),
+        "EVEN_M_N": _even_m_n1_iter,
     }
 )
 @triton.jit(repr=_fused_reduce_act_mul_and_dynamic_mxfp4_quant_repr)
@@ -576,15 +567,9 @@ _fused_reduce_rms_mxfp4_quant_repr = make_kernel_repr(
 
 @triton.heuristics(
     {
-        "EVEN_M_N": partial(
-            _even_m_n, block_m="BLOCK_SIZE_M", n="N1", block_n="BLOCK_SIZE_N"
-        ),
-        "EVEN_M_N2": partial(
-            _even_m_n, block_m="BLOCK_SIZE_M", n="N2", block_n="BLOCK_SIZE_N2"
-        ),
-        "EVEN_M_N3": partial(
-            _even_m_n, block_m="BLOCK_SIZE_M", n="N3", block_n="BLOCK_SIZE_N3"
-        ),
+        "EVEN_M_N": _even_m_n1,
+        "EVEN_M_N2": _even_m_n2,
+        "EVEN_M_N3": _even_m_n3,
     }
 )
 @triton.jit(repr=_fused_reduce_rms_mxfp4_quant_repr)

@@ -21,6 +21,7 @@ from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.intj_tuned import launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.utility import dtypes
 
@@ -174,14 +175,18 @@ def fused_rms_mxfp4_quant(
         while ROWS_PER_CTA > 1 and M % ROWS_PER_CTA != 0:
             ROWS_PER_CTA //= 2
         grid = (triton.cdiv(M, ROWS_PER_CTA) * (1 if x2 is None else 2),)
-        _gluon_fused_rms_mxfp4_quant_kernel[grid](
+        launch_tuned(
+            _gluon_fused_rms_mxfp4_quant_kernel,
+            grid,
             *_common_args,
             **_common_kwargs,
             ROWS_PER_CTA=ROWS_PER_CTA,
         )
     else:
         grid = (M * (1 if x2 is None else 2),)
-        _fused_rms_mxfp4_quant_kernel[grid](
+        launch_tuned(
+            _fused_rms_mxfp4_quant_kernel,
+            grid,
             *_common_args,
             **_common_kwargs,
         )
@@ -372,7 +377,9 @@ def fused_reduce_act_mul_and_mxfp4_quant(
         num_pid += triton.cdiv(M, BLOCK_SIZE_M2) * triton.cdiv(N2, BLOCK_SIZE_N2)
 
     grid = (num_pid,)
-    _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel[grid](
+    launch_tuned(
+        _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel,
+        grid,
         x,
         y,
         y_scale,
@@ -570,7 +577,9 @@ def fused_reduce_rms_mxfp4_quant(
         else _fused_reduce_rms_mxfp4_quant_kernel
     )
 
-    kernel[grid](
+    launch_tuned(
+        kernel,
+        grid,
         x1,
         x1_weight,
         x2,
