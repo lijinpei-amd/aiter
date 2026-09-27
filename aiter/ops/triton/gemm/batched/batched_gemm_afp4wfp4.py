@@ -3,8 +3,6 @@
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_afp4wfp4 import (
     _batched_gemm_afp4_wfp4_kernel,
@@ -12,6 +10,8 @@ from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_afp4wfp4 import 
     _get_config,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -22,6 +22,11 @@ _USE_GEMM_SPLITK_BF16 = False
 def set_use_gemm_splitk_bf16(value: bool):
     global _USE_GEMM_SPLITK_BF16
     _USE_GEMM_SPLITK_BF16 = value
+
+
+_batched_gemm_afp4_wfp4_reduce_kernel_launch = intj_handle(
+    _batched_gemm_afp4_wfp4_reduce_kernel,
+)
 
 
 def batched_gemm_afp4wfp4(
@@ -134,7 +139,10 @@ def batched_gemm_afp4wfp4(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _intj_launch(_batched_gemm_afp4_wfp4_reduce_kernel, grid_reduce,
+        dev, stream = current_device_stream()
+        _batched_gemm_afp4_wfp4_reduce_kernel_launch(dev)(
+            stream,
+            grid_reduce,
             y_pp,
             y,
             M,

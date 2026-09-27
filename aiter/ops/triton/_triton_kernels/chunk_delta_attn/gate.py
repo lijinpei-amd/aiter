@@ -14,8 +14,6 @@ Provides:
 import torch
 import triton
 import triton.language as tl
-from intj.compat import launch as _intj_launch
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils import (
     autotune_cache_kwargs,
@@ -23,6 +21,8 @@ from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils im
     input_guard,
     softplus,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 _BETA_SIGMOID_BLOCK_SIZE = 2048
@@ -47,18 +47,26 @@ def beta_sigmoid_fwd_kernel(
     tl.store(y + offs, b_y.to(y.dtype.element_ty), mask=mask)
 
 
+_beta_sigmoid_fwd_kernel_launch = intj_handle(
+    beta_sigmoid_fwd_kernel,
+    options={"num_warps": _BETA_SIGMOID_NUM_WARPS},
+)
+
+
 @input_guard
 def beta_sigmoid_fwd(x: torch.Tensor) -> torch.Tensor:
     """Elementwise sigmoid of ``x``, output in float32."""
     y = torch.empty_like(x, dtype=torch.float32)
     n = x.numel()
     grid = (triton.cdiv(n, _BETA_SIGMOID_BLOCK_SIZE),)
-    _intj_launch(beta_sigmoid_fwd_kernel, grid,
+    dev, stream = current_device_stream()
+    _beta_sigmoid_fwd_kernel_launch(dev)(
+        stream,
+        grid,
         x,
         y,
         n,
-        BLOCK_SIZE=_BETA_SIGMOID_BLOCK_SIZE,
-        num_warps=_BETA_SIGMOID_NUM_WARPS,
+        _BETA_SIGMOID_BLOCK_SIZE,  # BLOCK_SIZE
     )
     return y
 

@@ -3,7 +3,8 @@
 import torch
 import triton
 import triton.language as tl
-from intj.compat import launch as _intj_launch
+
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 
 
 @triton.jit
@@ -96,6 +97,12 @@ def _fused_qkvzba_split_reshape_cat_decode_kernel(
         tl.store(blk_a_st_ptr, tl.load(blk_a_ptr))
 
 
+_fused_qkvzba_split_reshape_cat_decode_kernel_launch = intj_handle(
+    _fused_qkvzba_split_reshape_cat_decode_kernel,
+    options={"num_stages": 3, "num_warps": 1},
+)
+
+
 def fused_qkvzba_split_reshape_cat_decode(
     mixed_qkvz: torch.Tensor,
     mixed_ba: torch.Tensor,
@@ -124,7 +131,10 @@ def fused_qkvzba_split_reshape_cat_decode(
     )
     a = torch.empty_like(b)
     grid = (batch * seq_len, num_heads_qk)
-    _intj_launch(_fused_qkvzba_split_reshape_cat_decode_kernel, grid,
+    dev, stream = current_device_stream()
+    _fused_qkvzba_split_reshape_cat_decode_kernel_launch(dev)(
+        stream,
+        grid,
         mixed_qkv,
         z,
         b,
@@ -135,8 +145,6 @@ def fused_qkvzba_split_reshape_cat_decode(
         num_heads_v,
         head_qk,
         head_v,
-        num_warps=1,
-        num_stages=3,
     )
     return mixed_qkv, z, b, a
 
@@ -186,6 +194,12 @@ def _fused_qkvzba_prefill_kernel_nqk1(
     for i in tl.static_range(V_PER_QK):
         tl.store(b_out + i_seq * NUM_HEADS_V + i, tl.load(base_ba + i))
         tl.store(a_out + i_seq * NUM_HEADS_V + i, tl.load(base_ba + V_PER_QK + i))
+
+
+_fused_qkvzba_prefill_kernel_nqk1_launch = intj_handle(
+    _fused_qkvzba_prefill_kernel_nqk1,
+    options={"num_stages": 3, "num_warps": 1},
+)
 
 
 @triton.jit
@@ -258,6 +272,12 @@ def _fused_qkvzba_prefill_kernel_nqk2(
             )
 
 
+_fused_qkvzba_prefill_kernel_nqk2_launch = intj_handle(
+    _fused_qkvzba_prefill_kernel_nqk2,
+    options={"num_stages": 3, "num_warps": 1},
+)
+
+
 @triton.jit
 def _fused_qkvzba_prefill_kernel_nqk4(
     mixed_qkv,
@@ -321,6 +341,12 @@ def _fused_qkvzba_prefill_kernel_nqk4(
             )
 
 
+_fused_qkvzba_prefill_kernel_nqk4_launch = intj_handle(
+    _fused_qkvzba_prefill_kernel_nqk4,
+    options={"num_stages": 3, "num_warps": 1},
+)
+
+
 @triton.jit
 def _fused_qkvzba_prefill_kernel_nqk8(
     mixed_qkv,
@@ -382,6 +408,12 @@ def _fused_qkvzba_prefill_kernel_nqk8(
                 a_out + i_seq * NUM_HEADS_V + i_qk * V_PER_QK + i,
                 tl.load(base_ba + V_PER_QK + i),
             )
+
+
+_fused_qkvzba_prefill_kernel_nqk8_launch = intj_handle(
+    _fused_qkvzba_prefill_kernel_nqk8,
+    options={"num_stages": 3, "num_warps": 1},
+)
 
 
 @triton.jit
@@ -470,6 +502,12 @@ def _fused_qkvzba_split_reshape_cat_prefill_kernel(
         tl.store(blk_a_st_ptr, tl.load(blk_a_ptr))
 
 
+_fused_qkvzba_split_reshape_cat_prefill_kernel_launch = intj_handle(
+    _fused_qkvzba_split_reshape_cat_prefill_kernel,
+    options={"num_stages": 3, "num_warps": 1},
+)
+
+
 def fused_qkvzba_split_reshape_cat_prefill(
     mixed_qkvz: torch.Tensor,
     mixed_ba: torch.Tensor,
@@ -502,7 +540,10 @@ def fused_qkvzba_split_reshape_cat_prefill(
     # Select specialized kernel based on num_heads_qk
     if num_heads_qk == 1:
         grid = (seq_len,)
-        _intj_launch(_fused_qkvzba_prefill_kernel_nqk1, grid,
+        dev, stream = current_device_stream()
+        _fused_qkvzba_prefill_kernel_nqk1_launch(dev)(
+            stream,
+            grid,
             mixed_qkv,
             z,
             b,
@@ -512,12 +553,13 @@ def fused_qkvzba_split_reshape_cat_prefill(
             num_heads_v,
             head_qk,
             head_v,
-            num_warps=1,
-            num_stages=3,
         )
     elif num_heads_qk == 2:
         grid = (seq_len,)
-        _intj_launch(_fused_qkvzba_prefill_kernel_nqk2, grid,
+        dev, stream = current_device_stream()
+        _fused_qkvzba_prefill_kernel_nqk2_launch(dev)(
+            stream,
+            grid,
             mixed_qkv,
             z,
             b,
@@ -527,12 +569,13 @@ def fused_qkvzba_split_reshape_cat_prefill(
             num_heads_v,
             head_qk,
             head_v,
-            num_warps=1,
-            num_stages=3,
         )
     elif num_heads_qk == 4:
         grid = (seq_len,)
-        _intj_launch(_fused_qkvzba_prefill_kernel_nqk4, grid,
+        dev, stream = current_device_stream()
+        _fused_qkvzba_prefill_kernel_nqk4_launch(dev)(
+            stream,
+            grid,
             mixed_qkv,
             z,
             b,
@@ -542,12 +585,13 @@ def fused_qkvzba_split_reshape_cat_prefill(
             num_heads_v,
             head_qk,
             head_v,
-            num_warps=1,
-            num_stages=3,
         )
     elif num_heads_qk == 8:
         grid = (seq_len,)
-        _intj_launch(_fused_qkvzba_prefill_kernel_nqk8, grid,
+        dev, stream = current_device_stream()
+        _fused_qkvzba_prefill_kernel_nqk8_launch(dev)(
+            stream,
+            grid,
             mixed_qkv,
             z,
             b,
@@ -557,13 +601,14 @@ def fused_qkvzba_split_reshape_cat_prefill(
             num_heads_v,
             head_qk,
             head_v,
-            num_warps=1,
-            num_stages=3,
         )
     else:
         # Fallback to generic 2D-grid kernel
         grid = (seq_len, num_heads_qk)
-        _intj_launch(_fused_qkvzba_split_reshape_cat_prefill_kernel, grid,
+        dev, stream = current_device_stream()
+        _fused_qkvzba_split_reshape_cat_prefill_kernel_launch(dev)(
+            stream,
+            grid,
             mixed_qkv,
             z,
             b,
@@ -574,8 +619,6 @@ def fused_qkvzba_split_reshape_cat_prefill(
             num_heads_v,
             head_qk,
             head_v,
-            num_warps=1,
-            num_stages=3,
         )
 
     return mixed_qkv, z, b, a

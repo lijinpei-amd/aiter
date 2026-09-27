@@ -4,8 +4,6 @@
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.fusions.fused_bmm_rope_kv_cache import (
     _fused_fp4_bmm_reduce_kernel,
@@ -21,6 +19,8 @@ from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
 from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import get_splitk
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import deserialize_str
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -31,6 +31,9 @@ _USE_GEMM_SPLITK_BF16 = False
 def set_use_gemm_splitk_bf16(value: bool):
     global _USE_GEMM_SPLITK_BF16
     _USE_GEMM_SPLITK_BF16 = value
+
+
+_fused_fp4_bmm_reduce_kernel_launch = intj_handle(_fused_fp4_bmm_reduce_kernel)
 
 
 def fused_fp4_bmm_rope_cat_and_cache_mla(
@@ -364,7 +367,10 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
 
-        _intj_launch(_fused_fp4_bmm_reduce_kernel, grid_reduce,
+        dev, stream = current_device_stream()
+        _fused_fp4_bmm_reduce_kernel_launch(dev)(
+            stream,
+            grid_reduce,
             y_pp,
             q_out,
             M,

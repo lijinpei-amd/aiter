@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 import torch
 import triton
 
@@ -21,6 +20,8 @@ from aiter.ops.triton._triton_kernels.quant.quant import (
     _static_per_tensor_quant_fp8_i8_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import e4m3_dtype
 
@@ -44,6 +45,12 @@ _MXFP8_LEGACY_BLOCK_SIZE = 128
 
 
 _LOGGER = AiterTritonLogger()
+
+
+_static_per_tensor_quant_fp8_i8_kernel_launch = intj_handle(
+    _static_per_tensor_quant_fp8_i8_kernel,
+    options={"num_warps": 4},
+)
 
 
 def static_per_tensor_quant_fp8_i8(
@@ -83,10 +90,10 @@ def static_per_tensor_quant_fp8_i8(
         BLOCK_N = min(cols_pow2, 512)
         BLOCK_M = max(1, min(triton.next_power_of_2(rows), 2048 // BLOCK_N))
     grid = (triton.cdiv(rows, BLOCK_M), triton.cdiv(cols, BLOCK_N))
-    from intj.compat import launch
 
-    launch(
-        _static_per_tensor_quant_fp8_i8_kernel,
+    dev, stream = current_device_stream()
+    _static_per_tensor_quant_fp8_i8_kernel_launch(dev)(
+        stream,
         grid,
         q2d,
         x2d,
@@ -97,11 +104,16 @@ def static_per_tensor_quant_fp8_i8(
         x2d.stride(1),
         q2d.stride(0),
         q2d.stride(1),
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        num_warps=4,
+        BLOCK_M,
+        BLOCK_N,
     )
     return qx
+
+
+_dynamic_per_tensor_quant_fp8_i8_kernel_launch = intj_handle(
+    _dynamic_per_tensor_quant_fp8_i8_kernel,
+    grid_arg=1,
+)
 
 
 def dynamic_per_tensor_quant_fp8_i8(
@@ -123,26 +135,29 @@ def dynamic_per_tensor_quant_fp8_i8(
     rows = x_in.shape[0]
     cols = x_in.shape[1]
     NUM_COL_POW2 = triton.next_power_of_2(cols)
-    from intj.compat import launch
 
-    launch(
-        _dynamic_per_tensor_quant_fp8_i8_kernel,
-        (rows,),
+    dev, stream = current_device_stream()
+    _dynamic_per_tensor_quant_fp8_i8_kernel_launch(dev)(
+        stream,
+        rows,
         x_in,
         scale_out,
         cols,
         x_in.stride(0),
-        NUM_COL_POW2=NUM_COL_POW2,
-        DTYPE_MAX=(
-            torch.finfo(qx.dtype).max
+        NUM_COL_POW2,
+        (torch.finfo(qx.dtype).max
             if torch.is_floating_point(qx)
-            else torch.iinfo(qx.dtype).max
-        ),
+            else torch.iinfo(qx.dtype).max),  # DTYPE_MAX
     )
 
     static_per_tensor_quant_fp8_i8(qx, x_in, scale_out)
 
     return qx, scale_out
+
+
+_dynamic_per_token_quant_fp8_i8_kernel_launch = intj_handle(
+    _dynamic_per_token_quant_fp8_i8_kernel,
+)
 
 
 def dynamic_per_token_quant_fp8_i8(
@@ -168,22 +183,20 @@ def dynamic_per_token_quant_fp8_i8(
     cols = x_in.shape[1]
     NUM_COL_POW2 = triton.next_power_of_2(cols)
     grid = (rows,)
-    from intj.compat import launch
 
-    launch(
-        _dynamic_per_token_quant_fp8_i8_kernel,
+    dev, stream = current_device_stream()
+    _dynamic_per_token_quant_fp8_i8_kernel_launch(dev)(
+        stream,
         grid,
         qx,
         scale_out,
         x_in,
         cols,
         x_in.stride(0),
-        NUM_COL_POW2=NUM_COL_POW2,
-        DTYPE_MAX=(
-            torch.finfo(qx.dtype).max
+        NUM_COL_POW2,
+        (torch.finfo(qx.dtype).max
             if torch.is_floating_point(qx)
-            else torch.iinfo(qx.dtype).max
-        ),
+            else torch.iinfo(qx.dtype).max),  # DTYPE_MAX
     )
 
     return qx, scale_out
@@ -326,8 +339,6 @@ def dynamic_mxfp4_quant(
         triton.cdiv(N, BLOCK_SIZE_N * NUM_ITER),
     )
 
-    from intj.compat import launch
-
     _intj_launch_tuned(
         _dynamic_mxfp4_quant_kernel,
         grid,
@@ -353,6 +364,11 @@ def dynamic_mxfp4_quant(
     )
 
     return (x_fp4, blockscale_e8m0)
+
+
+_dynamic_mxfp4_quant_blockscale_kernel_launch = intj_handle(
+    _dynamic_mxfp4_quant_blockscale_kernel,
+)
 
 
 def dynamic_mxfp4_quant_blockscale(
@@ -403,10 +419,10 @@ def dynamic_mxfp4_quant_blockscale(
 
     # Each program owns one fixed 32x32 scale tile.
     grid = (M // block_size, N // block_size)
-    from intj.compat import launch
 
-    launch(
-        _dynamic_mxfp4_quant_blockscale_kernel,
+    dev, stream = current_device_stream()
+    _dynamic_mxfp4_quant_blockscale_kernel_launch(dev)(
+        stream,
         grid,
         x,
         x_fp4,
@@ -414,10 +430,13 @@ def dynamic_mxfp4_quant_blockscale(
         *x.stride(),
         *x_fp4.stride(),
         *blockscale_e8m0.stride(),
-        BLOCK_SIZE=block_size,
+        block_size,  # BLOCK_SIZE
     )
 
     return x_fp4, blockscale_e8m0
+
+
+_dynamic_mxfp8_quant_kernel_launch = intj_handle(_dynamic_mxfp8_quant_kernel)
 
 
 def dynamic_mxfp8_quant(
@@ -463,10 +482,9 @@ def dynamic_mxfp8_quant(
     NUM_PRGMS = min(M, 32768)
     grid = (NUM_PRGMS,)
 
-    from intj.compat import launch
-
-    launch(
-        _dynamic_mxfp8_quant_kernel,
+    dev, stream = current_device_stream()
+    _dynamic_mxfp8_quant_kernel_launch(dev)(
+        stream,
         grid,
         x2d,
         y,
@@ -479,14 +497,19 @@ def dynamic_mxfp8_quant(
         y.stride(1),
         scale.stride(0),
         scale.stride(1),
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        QUANT_BLOCK_SIZE=_MXFP8_QUANT_BLOCK_SIZE,
-        NUM_PRGMS=NUM_PRGMS,
+        BLOCK_SIZE_N,
+        _MXFP8_QUANT_BLOCK_SIZE,  # QUANT_BLOCK_SIZE
+        NUM_PRGMS,
     )
 
     y = y.view(*orig_shape[:-1], K)
     s = scale.view(*orig_shape[:-1], Ns)
     return y, s
+
+
+_dynamic_mxfp8_quant_n32k4_mbn_kernel_launch = intj_handle(
+    _dynamic_mxfp8_quant_n32k4_mbn_kernel,
+)
 
 
 def dynamic_mxfp8_quant_n32k4_mbn(
@@ -528,10 +551,10 @@ def dynamic_mxfp8_quant_n32k4_mbn(
 
     BLOCK_SIZE_N = triton.next_power_of_2(K)
     grid = (R,)
-    from intj.compat import launch
 
-    launch(
-        _dynamic_mxfp8_quant_n32k4_mbn_kernel,
+    dev, stream = current_device_stream()
+    _dynamic_mxfp8_quant_n32k4_mbn_kernel_launch(dev)(
+        stream,
         grid,
         x2d,
         y,
@@ -544,12 +567,15 @@ def dynamic_mxfp8_quant_n32k4_mbn(
         y.stride(0),
         y.stride(1),
         S_SUPER,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        QUANT_BLOCK_SIZE=_MXFP8_QUANT_BLOCK_SIZE,
-        NUM_PRGMS=R,
+        BLOCK_SIZE_N,
+        _MXFP8_QUANT_BLOCK_SIZE,  # QUANT_BLOCK_SIZE
+        R,  # NUM_PRGMS
     )
 
     return y.view(M, B, K), scale
+
+
+_fp8_legacy_to_mxfp8_kernel_launch = intj_handle(_fp8_legacy_to_mxfp8_kernel)
 
 
 def fp8_legacy_to_mxfp8(
@@ -590,10 +616,9 @@ def fp8_legacy_to_mxfp8(
     BLOCK_SIZE_M = 1
     grid = (triton.cdiv(M, BLOCK_SIZE_M), Ns)
 
-    from intj.compat import launch
-
-    launch(
-        _fp8_legacy_to_mxfp8_kernel,
+    dev, stream = current_device_stream()
+    _fp8_legacy_to_mxfp8_kernel_launch(dev)(
+        stream,
         grid,
         x_fnuz,
         x_scale_fp32,
@@ -609,9 +634,9 @@ def fp8_legacy_to_mxfp8(
         y_fn.stride(1),
         y_scale.stride(0),
         y_scale.stride(1),
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        QUANT_BLOCK_SIZE=_MXFP8_QUANT_BLOCK_SIZE,
-        LEGACY_BLOCK_SIZE=_MXFP8_LEGACY_BLOCK_SIZE,
+        BLOCK_SIZE_M,
+        _MXFP8_QUANT_BLOCK_SIZE,  # QUANT_BLOCK_SIZE
+        _MXFP8_LEGACY_BLOCK_SIZE,  # LEGACY_BLOCK_SIZE
     )
 
     return y_fn, y_scale
@@ -676,8 +701,6 @@ def dynamic_nvfp4_quant(
         triton.cdiv(M, BLOCK_SIZE_M),
         triton.cdiv(N, BLOCK_SIZE_N * NUM_ITER),
     )
-
-    from intj.compat import launch
 
     _intj_launch_tuned(
         _dynamic_nvfp4_quant_kernel,

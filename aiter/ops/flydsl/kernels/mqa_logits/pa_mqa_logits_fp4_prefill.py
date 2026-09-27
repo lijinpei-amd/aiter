@@ -15,7 +15,8 @@ import triton.language as tl
 from flydsl.expr import gpu, rocdl
 from flydsl.expr.primitive import range_constexpr
 from flydsl.expr.typing import Float4E2M1FN, Int32, T
-from intj.compat import launch as _intj_launch
+
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 
 from .pa_mqa_logits_fp4_common import (
     _NON_WRITER_LANE_OFF,
@@ -90,7 +91,10 @@ def compute_prefill_schedule(
         cta_info = cta_info_out
     BLOCK_P = 256
     grid = (triton.cdiv(P, BLOCK_P),)
-    _intj_launch(_prefill_cta_info_kernel, grid,
+    dev, stream = current_device_stream()
+    _prefill_cta_info_kernel_launch(dev)(
+        stream,
+        grid,
         plan.incl,
         plan.excl,
         plan.chunks,
@@ -102,7 +106,7 @@ def compute_prefill_schedule(
         cta_info,
         T,
         P,
-        BLOCK_P=BLOCK_P,
+        BLOCK_P,
     )
     return plan.safe, cta_info, P
 
@@ -173,7 +177,10 @@ def _row_plan(le, block_k, P, s_max) -> _RowPlan:
         total_splits=work[tail + _I32_PER_16B : tail + _I32_PER_16B + 1],
     )
     # Named, not `*plan`: field ORDER should not become load-bearing.
-    _intj_launch(_prefill_row_plan_kernel, (1,),
+    dev, stream = current_device_stream()
+    _prefill_row_plan_kernel_launch(dev)(
+        stream,
+        1,
         le,
         plan.incl,
         plan.excl,
@@ -184,10 +191,8 @@ def _row_plan(le, block_k, P, s_max) -> _RowPlan:
         P,
         block_k,
         s_max,
-        BLOCK_T=(
-            _ROW_PLAN_BLOCK_FLOOR if T <= _ROW_PLAN_BLOCK_FLOOR else _ROW_PLAN_MAX_ROWS
-        ),
-        SEARCH_STEPS=max(1, (s_max - 1).bit_length() + 1),
+        _ROW_PLAN_BLOCK_FLOOR if T <= _ROW_PLAN_BLOCK_FLOOR else _ROW_PLAN_MAX_ROWS,  # BLOCK_T
+        max(1, (s_max - 1).bit_length() + 1),  # SEARCH_STEPS
     )
     return plan
 
@@ -294,6 +299,9 @@ def _prefill_row_plan_kernel(
     tl.store(total_splits_ptr, tl.sum(ctas, axis=0))
 
 
+_prefill_row_plan_kernel_launch = intj_handle(_prefill_row_plan_kernel, grid_arg=1)
+
+
 @triton.jit(do_not_specialize=["T", "P"])
 def _prefill_cta_info_kernel(
     incl_ptr,  # [T] int32 inclusive prefix sum of per-row CTA counts
@@ -355,6 +363,9 @@ def _prefill_cta_info_kernel(
     tl.store(cta_info_ptr + base + 3, count, mask=smask)
     tl.store(cta_info_ptr + base + 4, ls_out, mask=smask)
     tl.store(cta_info_ptr + base + 5, le_out, mask=smask)
+
+
+_prefill_cta_info_kernel_launch = intj_handle(_prefill_cta_info_kernel)
 
 
 def build_pa_mqa_logits_fp4_prefill_module(
@@ -993,6 +1004,9 @@ def _varqlen_windows_kernel(
     tl.store(local_ends_ptr + r, le, mask=rmask)
 
 
+_varqlen_windows_kernel_launch = intj_handle(_varqlen_windows_kernel)
+
+
 def compute_varqlen_windows(cu_seq_q, context_lens, total_q, *, out=None):
     """Build ragged-row metadata for per-batch variable query length (MTP).
 
@@ -1015,7 +1029,10 @@ def compute_varqlen_windows(cu_seq_q, context_lens, total_q, *, out=None):
     if total_q > 0:
         BLOCK = 256
         grid = (triton.cdiv(total_q, BLOCK),)
-        _intj_launch(_varqlen_windows_kernel, grid,
+        intj_dev, intj_stream = current_device_stream()
+        _varqlen_windows_kernel_launch(intj_dev)(
+            intj_stream,
+            grid,
             cu,
             ctx,
             row_to_batch,
@@ -1023,7 +1040,7 @@ def compute_varqlen_windows(cu_seq_q, context_lens, total_q, *, out=None):
             local_ends,
             total_q,
             B,
-            BLOCK=BLOCK,
+            BLOCK,
         )
     return row_to_batch, local_starts, local_ends
 

@@ -32,6 +32,7 @@ import triton.language as tl
 from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 
 is_hip_ = hasattr(torch.version, "hip") and torch.version.hip is not None
 
@@ -653,6 +654,12 @@ def _fwd_kernel_stage2(
     )
 
 
+_STAGE2_OPTIONS = {"num_warps": 4, "num_stages": 2}
+if is_hip_:
+    _STAGE2_OPTIONS.update(waves_per_eu=4, matrix_instr_nonkdim=16, kpack=2)
+_fwd_kernel_stage2_launch = intj_handle(_fwd_kernel_stage2, options=_STAGE2_OPTIONS)
+
+
 def _decode_softmax_reducev_fwd(
     logits,
     q,
@@ -668,12 +675,11 @@ def _decode_softmax_reducev_fwd(
 
     NUM_KV_SPLITS = num_kv_splits
 
-    extra_kargs = {}
-    if is_hip_:
-        extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
-
     grid = (batch, head_num)
-    _intj_launch(_fwd_kernel_stage2, grid,
+    dev, stream = current_device_stream()
+    _fwd_kernel_stage2_launch(dev)(
+        stream,
+        grid,
         logits,
         o,
         lse,
@@ -684,12 +690,9 @@ def _decode_softmax_reducev_fwd(
         o.stride(0),
         o.stride(1),
         lse.stride(0),
-        NUM_KV_SPLITS=NUM_KV_SPLITS,
-        BLOCK_DV=BLOCK_DV,
-        Lv=Lv,
-        num_warps=4,
-        num_stages=2,
-        **extra_kargs,
+        NUM_KV_SPLITS,
+        BLOCK_DV,
+        Lv,
     )
 
 
@@ -728,16 +731,22 @@ def _csr_to_dense_kernel(
     )
 
 
+_csr_to_dense_kernel_launch = intj_handle(_csr_to_dense_kernel)
+
+
 def csr_to_dense_block_table(kv_indices, kv_indptr, dense_table, max_ctx, bs):
     """Convert CSR (kv_indices + kv_indptr) to dense [B, max_ctx] block table on GPU."""
     BLOCK_N = 128
     grid = (bs, triton.cdiv(max_ctx, BLOCK_N))
-    _intj_launch(_csr_to_dense_kernel, grid,
+    dev, stream = current_device_stream()
+    _csr_to_dense_kernel_launch(dev)(
+        stream,
+        grid,
         kv_indices,
         kv_indptr,
         dense_table,
         dense_table.stride(0),
-        BLOCK_N=BLOCK_N,
+        BLOCK_N,
     )
 
 

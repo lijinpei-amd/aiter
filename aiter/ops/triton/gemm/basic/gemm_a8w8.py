@@ -3,8 +3,6 @@
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
@@ -16,6 +14,8 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8 import (
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import (
     get_scaled_dot_format_string,
@@ -25,6 +25,12 @@ from aiter.ops.triton.utils.types import (
 _LOGGER = AiterTritonLogger()
 
 _GLUON_SUPPORTED_ARCHS = ("gfx950",)
+
+
+_gemm_splitk_reduce_kernel_launch = intj_handle(
+    _gemm_splitk_reduce_kernel,
+    baked={"KERNEL_NAME": "_gemm_a8w8_reduce_kernel", "activation": ""},
+)
 
 
 def gemm_a8w8(
@@ -190,7 +196,10 @@ def gemm_a8w8(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _intj_launch(_gemm_splitk_reduce_kernel, grid_reduce,
+        dev, stream = current_device_stream()
+        _gemm_splitk_reduce_kernel_launch(dev)(
+            stream,
+            grid_reduce,
             y_pp,
             y,
             bias,
@@ -201,14 +210,12 @@ def gemm_a8w8(
             y_pp.stride(2),
             y.stride(0),
             y.stride(1),
-            BLOCK_SIZE_M=REDUCE_BLOCK_SIZE_M,
-            BLOCK_SIZE_N=REDUCE_BLOCK_SIZE_N,
-            ACTUAL_KSPLIT=ACTUAL_KSPLIT,
-            MAX_KSPLIT=triton.next_power_of_2(config["NUM_KSPLIT"]),
-            ADD_BIAS=bias is not None,
-            activation="",
-            use_activation=False,
-            KERNEL_NAME="_gemm_a8w8_reduce_kernel",
+            REDUCE_BLOCK_SIZE_M,  # BLOCK_SIZE_M
+            REDUCE_BLOCK_SIZE_N,  # BLOCK_SIZE_N
+            ACTUAL_KSPLIT,
+            triton.next_power_of_2(config["NUM_KSPLIT"]),  # MAX_KSPLIT
+            bias is not None,  # ADD_BIAS
+            False,  # use_activation
         )
 
     return y

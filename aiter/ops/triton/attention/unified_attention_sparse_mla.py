@@ -1,7 +1,13 @@
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.attention.unified_attention_sparse_mla import (
     _kernel_unified_attention_sparse_mla_2d,
+)
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+
+_kernel_unified_attention_sparse_mla_2d_launch = intj_handle(
+    _kernel_unified_attention_sparse_mla_2d,
+    grid_arg=1,
+    options={"num_stages": 1, "num_warps": 4},
 )
 
 
@@ -57,41 +63,40 @@ def unified_attention_sparse_mla(
     ROPE_RANK = head_size - kv_lora_rank
     KV_LORA_RANK = kv_lora_rank
     TILE_SIZE = block_size
-    num_stages_2d = 1
-    num_warps = 4
-    _intj_launch(_kernel_unified_attention_sparse_mla_2d, (total_num_q_blocks,),
-        output_ptr=out,
-        query_ptr=q,
-        key_cache_ptr=k,
-        value_cache_ptr=v,
-        block_tables_ptr=block_table,
-        topk_indices_ptr=topk_indices,
-        seq_lens_ptr=seqused_k,
-        scale=softmax_scale,
-        num_query_heads=num_query_heads,
-        num_queries_per_kv=num_queries_per_kv,
-        block_table_stride=block_table.stride(0),
-        query_stride_0=q.stride(0),
-        query_stride_1=q.stride(1),
-        output_stride_0=out.stride(0),
-        output_stride_1=out.stride(1),
-        BLOCK_SIZE=block_size,
-        stride_k_cache_0=k.stride(0),
-        stride_k_cache_1=k.stride(1),
-        stride_k_cache_2=k.stride(2),
-        stride_k_cache_3=k.stride(3),
-        stride_v_cache_0=v.stride(0),
-        stride_v_cache_1=v.stride(1),
-        stride_v_cache_2=v.stride(2),
-        stride_v_cache_3=v.stride(3),
-        topk_count=topk_count,
-        query_start_len_ptr=cu_seqlens_q,
-        num_seqs=num_seqs,
-        BLOCK_M=BLOCK_M,
-        ROPE_RANK=ROPE_RANK,
-        KV_LORA_RANK=KV_LORA_RANK,
-        TILE_SIZE=TILE_SIZE,
-        ALL_DECODE=ALL_DECODE,
-        num_warps=num_warps,
-        num_stages=num_stages_2d,
+    dev, stream = current_device_stream()
+    _kernel_unified_attention_sparse_mla_2d_launch(dev)(
+        stream,
+        total_num_q_blocks,
+        out,  # output_ptr
+        q,  # query_ptr
+        k,  # key_cache_ptr
+        v,  # value_cache_ptr
+        block_table,  # block_tables_ptr
+        topk_indices,  # topk_indices_ptr
+        seqused_k,  # seq_lens_ptr
+        softmax_scale,  # scale
+        num_query_heads,
+        num_queries_per_kv,
+        block_table.stride(0),  # block_table_stride
+        q.stride(0),  # query_stride_0
+        q.stride(1),  # query_stride_1
+        out.stride(0),  # output_stride_0
+        out.stride(1),  # output_stride_1
+        block_size,  # BLOCK_SIZE
+        k.stride(0),  # stride_k_cache_0
+        k.stride(1),  # stride_k_cache_1
+        k.stride(2),  # stride_k_cache_2
+        k.stride(3),  # stride_k_cache_3
+        v.stride(0),  # stride_v_cache_0
+        v.stride(1),  # stride_v_cache_1
+        v.stride(2),  # stride_v_cache_2
+        v.stride(3),  # stride_v_cache_3
+        topk_count,
+        cu_seqlens_q,  # query_start_len_ptr
+        num_seqs,
+        BLOCK_M,
+        ROPE_RANK,
+        KV_LORA_RANK,
+        TILE_SIZE,
+        ALL_DECODE,
     )

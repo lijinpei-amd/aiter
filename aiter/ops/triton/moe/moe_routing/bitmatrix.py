@@ -2,12 +2,12 @@ from dataclasses import dataclass
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.moe.moe_routing.bitmatrix import (
     _sum_bitmatrix_memset,
     _sum_bitmatrix_rows,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 
 
 @dataclass
@@ -40,12 +40,28 @@ class Bitmatrix:
         return sum_bitmatrix_rows(self, out_ret, partials_block_size)
 
 
+_sum_bitmatrix_memset_launch = intj_handle(_sum_bitmatrix_memset, grid_arg=1)
+
+
 def clear_sums(n_cols, device, MEMSET_BLOCK=512):
     cdiv = triton.cdiv
     blocks = cdiv(n_cols, MEMSET_BLOCK)
     out_ret = torch.empty((blocks * MEMSET_BLOCK,), device=device, dtype=torch.int32)
-    _intj_launch(_sum_bitmatrix_memset, (blocks,), out_ret, MEMSET_BLOCK)
+    dev, stream = current_device_stream()
+    _sum_bitmatrix_memset_launch(dev)(
+        stream,
+        blocks,
+        out_ret,
+        MEMSET_BLOCK,
+    )
     return out_ret
+
+
+_sum_bitmatrix_rows_launch = intj_handle(
+    _sum_bitmatrix_rows,
+    grid_arg=2,
+    options={"num_warps": 8},
+)
 
 
 def sum_bitmatrix_rows(x, out_ret, partials_block_size=None):
@@ -63,7 +79,11 @@ def sum_bitmatrix_rows(x, out_ret, partials_block_size=None):
     out_partials = x.scratchpad_partials
 
     # output tensors
-    _intj_launch(_sum_bitmatrix_rows, (pids_x, pids_y),
+    dev, stream = current_device_stream()
+    _sum_bitmatrix_rows_launch(dev)(
+        stream,
+        pids_x,
+        pids_y,
         x.data,
         n_rows,
         x.data.stride(0),
@@ -74,9 +94,8 @@ def sum_bitmatrix_rows(x, out_ret, partials_block_size=None):
         out_partials.stride(1),
         out_partials.shape[1],
         pids_x,  # output [partial reductions]
-        BLOCK_M=PARTIALS_BLOCK_M,
-        BLOCK_MM=BLOCK_MM,  # constants
-        num_warps=8,
+        BLOCK_MM,  # constants
+        PARTIALS_BLOCK_M,  # BLOCK_M
     )
 
     out_partials = out_partials[: cdiv(n_rows, PARTIALS_BLOCK_M), :]

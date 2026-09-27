@@ -3,17 +3,22 @@
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_a8w8_blockscale_a16w16 import (
     _fused_gemm_a8w8_blockscale_a16w16_kernel,
     _fused_gemm_a8w8_blockscale_a16w16_reduce_kernel,
     _get_config,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+
+_fused_gemm_a8w8_blockscale_a16w16_reduce_kernel_launch = intj_handle(
+    _fused_gemm_a8w8_blockscale_a16w16_reduce_kernel,
+)
 
 
 def fused_gemm_a8w8_blockscale_a16w16(
@@ -184,7 +189,10 @@ def fused_gemm_a8w8_blockscale_a16w16(
             triton.cdiv(N_fp8, REDUCE_BLOCK_SIZE_N)
             + triton.cdiv(N_bf16, REDUCE_BLOCK_SIZE_N),
         )
-        _intj_launch(_fused_gemm_a8w8_blockscale_a16w16_reduce_kernel, grid_reduce,
+        dev, stream = current_device_stream()
+        _fused_gemm_a8w8_blockscale_a16w16_reduce_kernel_launch(dev)(
+            stream,
+            grid_reduce,
             bias_fp8,
             y_fp8_pp,
             y_fp8,
@@ -208,8 +216,8 @@ def fused_gemm_a8w8_blockscale_a16w16(
             REDUCE_BLOCK_SIZE_N,
             ACTUAL_KSPLIT,
             triton.next_power_of_2(config["NUM_KSPLIT"]),
-            ADD_BIAS_FP8=(bias_fp8 is not None),
-            ADD_BIAS_BF16=(bias_bf16 is not None),
+            bias_fp8 is not None,  # ADD_BIAS_FP8
+            bias_bf16 is not None,  # ADD_BIAS_BF16
         )
 
     return y_fp8, y_bf16

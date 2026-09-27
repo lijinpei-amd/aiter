@@ -11,8 +11,6 @@ import math
 
 import torch
 import triton
-import triton.language as tl
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.topk import (
     _topk_kernel,
@@ -20,6 +18,7 @@ from aiter.ops.triton._triton_kernels.topk import (
     topk_stage2_kernel,
 )
 from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -30,6 +29,13 @@ def _pick_block(m: int, k: int) -> int:
     while blk < m and blk < 1024:
         blk <<= 1
     return blk
+
+
+_topk_kernel_launch = intj_handle(
+    _topk_kernel,
+    grid_arg=1,
+    options={"num_stages": 2, "num_warps": 4},
+)
 
 
 def one_stage_topk(
@@ -43,22 +49,27 @@ def one_stage_topk(
 
     out_v = torch.empty((B, k), device=x.device, dtype=x.dtype)
     out_i = torch.empty((B, k), device=x.device, dtype=torch.int64)
-    _intj_launch(_topk_kernel, (B,),
+    dev, stream = current_device_stream()
+    _topk_kernel_launch(dev)(
+        stream,
+        B,
         x.contiguous(),
         out_v,
         out_i,
         x.stride(0),
         out_v.stride(0),
         out_i.stride(0),
-        M=M,
-        K=k,
-        BLOCK=BLOCK,
-        FILL_VALUE=torch.finfo(torch.float32).min,
-        USE_TDM=is_tdm_avail(),
-        num_warps=4,
-        num_stages=2,
+        M,
+        k,  # K
+        BLOCK,
+        torch.finfo(torch.float32).min,  # FILL_VALUE
+        is_tdm_avail(),  # USE_TDM
     )
     return out_v, out_i
+
+
+_topk_stage1_kernel_launch = intj_handle(topk_stage1_kernel, grid_arg=2)
+_topk_stage2_kernel_launch = intj_handle(topk_stage2_kernel, grid_arg=1)
 
 
 def two_stage_topk(x, k, dim=-1, largest=True):
@@ -88,7 +99,11 @@ def two_stage_topk(x, k, dim=-1, largest=True):
     stage2_out = torch.empty(out_shape, device=x.device, dtype=x.dtype)
     stage2_out_idx = torch.empty(out_shape, device=x.device, dtype=torch.int64)
 
-    _intj_launch(topk_stage1_kernel, (batch_size, chunk_num),
+    dev, stream = current_device_stream()
+    _topk_stage1_kernel_launch(dev)(
+        stream,
+        batch_size,
+        chunk_num,
         stage1_out,  # pointer to the output
         stage1_out_idx,  # pointer to the output
         x,  # pointer to the input
@@ -96,18 +111,20 @@ def two_stage_topk(x, k, dim=-1, largest=True):
         topk_elem_cnt,
         chunk_size,
         descending,
-        (
-            torch.finfo(torch.float32).min
+        (torch.finfo(torch.float32).min
             if descending
-            else torch.finfo(torch.float32).max
-        ),
-        USE_TDM=is_tdm_avail(),
+            else torch.finfo(torch.float32).max),
+        is_tdm_avail(),  # USE_TDM
     )
     stage2_elem_cnt = chunk_num * k
     BLOCK_SIZE = triton.next_power_of_2(stage2_elem_cnt)
 
-    (
-        _intj_launch(topk_stage2_kernel, (batch_size,),
+    # The stage-2 launch only runs when ``descending`` (unchanged upstream behavior).
+    if descending:
+        dev, stream = current_device_stream()
+        _topk_stage2_kernel_launch(dev)(
+            stream,
+            batch_size,
             stage2_out,
             stage2_out_idx,
             stage1_out,
@@ -122,11 +139,8 @@ def two_stage_topk(x, k, dim=-1, largest=True):
                 else torch.finfo(torch.float32).max
             ),
             torch.iinfo(torch.int32).min,
-            USE_TDM=is_tdm_avail(),
+            is_tdm_avail(),  # USE_TDM
         )
-        if descending
-        else tl.constexpr(torch.iinfo(torch.int32).max)
-    )
 
     return (stage2_out, stage2_out_idx)
 

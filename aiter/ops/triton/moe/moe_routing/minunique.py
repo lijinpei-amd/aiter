@@ -1,6 +1,5 @@
 import torch
 import triton
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.moe.moe_routing.minunique import _keepk_sort0
 from aiter.ops.triton._triton_kernels.moe.moe_routing.routing import _combined_routing
@@ -11,6 +10,9 @@ from aiter.ops.triton.moe.moe_routing.routing import (
 )
 from aiter.ops.triton.moe.moe_routing.topk import topk
 from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+
+_keepk_sort0_launch = intj_handle(_keepk_sort0, grid_arg=1, options={"num_warps": 1})
 
 
 def keepk_sort0(
@@ -34,7 +36,10 @@ def keepk_sort0(
     num_blocks = triton.cdiv(M, HIST_BLOCK_M)
     Vout = torch.empty((M, k), dtype=expt_scal.dtype, device=dev)
     Iout = torch.empty((M, k), dtype=torch.int16, device=dev)
-    _intj_launch(_keepk_sort0, (M,),
+    intj_dev, intj_stream = current_device_stream()
+    _keepk_sort0_launch(intj_dev)(
+        intj_stream,
+        M,
         expt_scal,
         expt_indx,
         expt_scal.stride(0),
@@ -48,17 +53,23 @@ def keepk_sort0(
         part.stride(1),
         M,
         n_expts_tot,
-        HIST_BLOCK_M=HIST_BLOCK_M,
-        NUM_BLOCKS=num_blocks,
-        KP1=KP1,
-        K=k,
-        KP1_PAD=KP1_PAD,
-        APPLY_SOFTMAX=apply_softmax,
-        APPLY_RENORM=apply_renorm,
-        ROUTED_SCALING=routed_scaling_factor,
-        num_warps=1,
+        HIST_BLOCK_M,
+        num_blocks,  # NUM_BLOCKS
+        KP1,
+        k,  # K
+        KP1_PAD,
+        apply_softmax,  # APPLY_SOFTMAX
+        apply_renorm,  # APPLY_RENORM
+        routed_scaling_factor,  # ROUTED_SCALING
     )
     return Vout, Iout
+
+
+_combined_routing_launch = intj_handle(
+    _combined_routing,
+    grid_arg=1,
+    options={"num_warps": 1},
+)
 
 
 def _minunique_common(
@@ -108,7 +119,10 @@ def _minunique_common(
         _compute_expt_data_internal(n_expts_tot, n_gates, block_m, dev)
     )
     blocks1b = triton.cdiv(num_tokens, HIST_BLOCK_M)
-    _intj_launch(_combined_routing, (blocks1a + blocks1b,),
+    intj_dev, intj_stream = current_device_stream()
+    _combined_routing_launch(intj_dev)(
+        intj_stream,
+        blocks1a + blocks1b,
         topk_indx,
         gate_indx,
         gate_scal,
@@ -130,10 +144,9 @@ def _minunique_common(
         block_pid_map,
         block_pid_map.shape[0],
         block_m_log2,
-        BLOCK_A=BLOCK_A,
-        EQUAL_A=(hist.shape[0] == BLOCK_A),
-        USE_TDM=is_tdm_avail(),
-        num_warps=1,
+        BLOCK_A,
+        hist.shape[0] == BLOCK_A,  # EQUAL_A
+        is_tdm_avail(),  # USE_TDM
     )
     expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
     routing_data = RoutingData(block_m, gate_scal, hist, n_expts_tot, k, expt_data)

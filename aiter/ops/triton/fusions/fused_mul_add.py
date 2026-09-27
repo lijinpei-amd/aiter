@@ -1,11 +1,17 @@
 import torch
 import triton
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.fusions.fused_mul_add import _fused_mul_add_kernel
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+
+_fused_mul_add_kernel_launch = intj_handle(
+    _fused_mul_add_kernel,
+    options={"num_warps": 4, "waves_per_eu": 0},
+)
 
 
 def fused_mul_add(
@@ -73,20 +79,21 @@ def fused_mul_add(
 
     BLOCK_SIZE_N = max(min(triton.next_power_of_2(N), 32), 1024)
     grid = (triton.cdiv(N, BLOCK_SIZE_N),)
-    _intj_launch(_fused_mul_add_kernel, grid,
+    dev, stream = current_device_stream()
+    _fused_mul_add_kernel_launch(dev)(
+        stream,
+        grid,
         x,
         a,
         b,
         out,
         N,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        NEED_MASK=N % BLOCK_SIZE_N != 0,
-        IS_A_SCALAR=IS_A_SCALAR,
-        IS_B_SCALAR=IS_B_SCALAR,
-        IS_A_TENSOR=IS_A_TENSOR,
-        IS_B_TENSOR=IS_B_TENSOR,
-        num_warps=4,
-        waves_per_eu=0,
+        BLOCK_SIZE_N,
+        N % BLOCK_SIZE_N != 0,  # NEED_MASK
+        IS_A_SCALAR,
+        IS_B_SCALAR,
+        IS_A_TENSOR,
+        IS_B_TENSOR,
     )
 
     return out

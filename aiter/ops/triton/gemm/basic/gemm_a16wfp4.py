@@ -3,8 +3,6 @@
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
@@ -20,6 +18,8 @@ from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -39,6 +39,12 @@ def gemm_a16wfp4_fake_tensor(
         N, _ = w.shape
         return torch.zeros((M, N), dtype=dtype, device=x.device)
     return y
+
+
+_gemm_splitk_reduce_kernel_launch = intj_handle(
+    _gemm_splitk_reduce_kernel,
+    baked={"KERNEL_NAME": "_gemm_afp4wfp4_reduce_kernel", "activation": ""},
+)
 
 
 @torch_compile_guard(gen_fake=gemm_a16wfp4_fake_tensor)
@@ -159,7 +165,10 @@ def gemm_a16wfp4_(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _intj_launch(_gemm_splitk_reduce_kernel, grid_reduce,
+        dev, stream = current_device_stream()
+        _gemm_splitk_reduce_kernel_launch(dev)(
+            stream,
+            grid_reduce,
             y_pp,
             y,
             None,
@@ -174,10 +183,8 @@ def gemm_a16wfp4_(
             REDUCE_BLOCK_SIZE_N,
             ACTUAL_KSPLIT,
             triton.next_power_of_2(config["NUM_KSPLIT"]),
-            ADD_BIAS=False,
-            activation="",
-            use_activation=False,
-            KERNEL_NAME="_gemm_afp4wfp4_reduce_kernel",
+            False,  # ADD_BIAS
+            False,  # use_activation
         )
 
     return y
@@ -346,7 +353,10 @@ def gemm_a16wfp4_preshuffle_(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _intj_launch(_gemm_splitk_reduce_kernel, grid_reduce,
+        dev, stream = current_device_stream()
+        _gemm_splitk_reduce_kernel_launch(dev)(
+            stream,
+            grid_reduce,
             y_pp,
             y,
             None,
@@ -361,10 +371,8 @@ def gemm_a16wfp4_preshuffle_(
             REDUCE_BLOCK_SIZE_N,
             ACTUAL_KSPLIT,
             triton.next_power_of_2(config["NUM_KSPLIT"]),
-            ADD_BIAS=False,
-            activation="",
-            use_activation=False,
-            KERNEL_NAME="_gemm_afp4wfp4_reduce_kernel",
+            False,  # ADD_BIAS
+            False,  # use_activation
         )
 
     return y

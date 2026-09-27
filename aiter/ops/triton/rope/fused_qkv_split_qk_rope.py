@@ -1,9 +1,14 @@
 import torch
 import triton
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.rope.fused_qkv_split_qk_rope import (
     _fused_qkv_split_qk_rope_kernel,
+)
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+
+_fused_qkv_split_qk_rope_kernel_launch = intj_handle(
+    _fused_qkv_split_qk_rope_kernel,
+    options={"num_warps": 4, "waves_per_eu": 0},
 )
 
 
@@ -53,11 +58,12 @@ def fused_qkv_split_qk_rope(
         BLOCK_D_HALF = head_dim // 2
 
     BLOCK_T = 32
-    num_warps = 4
-    waves_per_eu = 0
     grid = (triton.cdiv(T, BLOCK_T), qh, 1)
 
-    _intj_launch(_fused_qkv_split_qk_rope_kernel, grid,
+    dev, stream = current_device_stream()
+    _fused_qkv_split_qk_rope_kernel_launch(dev)(
+        stream,
+        grid,
         qkv,
         cos,
         sin,
@@ -73,19 +79,17 @@ def fused_qkv_split_qk_rope(
         *positions.stride(),
         *q.stride(),
         *k.stride(),
-        HAVE_NOPE=have_nope,
-        NOPE_FIRST=nope_first,
-        REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
-        IS_NEOX=is_neox,
-        HAVE_POS=(positions is not None),
-        HAVE_OFFS=(offsets is not None),
-        QH=qh,
-        KVH=kvh,
-        BLOCK_T=BLOCK_T,
-        BLOCK_D=BLOCK_D,
-        BLOCK_D_HALF=BLOCK_D_HALF,
-        num_warps=num_warps,
-        waves_per_eu=waves_per_eu,
+        have_nope,  # HAVE_NOPE
+        nope_first,  # NOPE_FIRST
+        reuse_freqs_front_part,  # REUSE_FREQS_FRONT_PART
+        is_neox,  # IS_NEOX
+        positions is not None,  # HAVE_POS
+        offsets is not None,  # HAVE_OFFS
+        qh,  # QH
+        kvh,  # KVH
+        BLOCK_T,
+        BLOCK_D,
+        BLOCK_D_HALF,
     )
 
     return q, k, v

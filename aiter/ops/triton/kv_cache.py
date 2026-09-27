@@ -3,10 +3,10 @@
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.kv_cache import _cat_and_cache_mla_kernel
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import e4m3_dtype
 
@@ -23,6 +23,13 @@ def cat_and_cache_mla_fake_tensor(
     shuffled_kv_cache: bool = False,
 ) -> None:
     return None
+
+
+_cat_and_cache_mla_kernel_launch = intj_handle(
+    _cat_and_cache_mla_kernel,
+    grid_arg=1,
+    options={"num_warps": 1},
+)
 
 
 @torch_compile_guard(gen_fake=cat_and_cache_mla_fake_tensor)
@@ -120,7 +127,10 @@ def cat_and_cache_mla(
         kv_cache_stride_d == 1
     ), "The stride of the last dimension of KV cache must be 1"
 
-    _intj_launch(_cat_and_cache_mla_kernel, (b * kh,),
+    dev, stream = current_device_stream()
+    _cat_and_cache_mla_kernel_launch(dev)(
+        stream,
+        b * kh,
         k_nope,
         k_pe,
         kv_cache,
@@ -130,14 +140,13 @@ def cat_and_cache_mla(
         kv_cache_stride_b,
         kv_cache_stride_h,
         kv_cache_stride_d,
-        k_scale_ptr=k_scale,
-        KH=kh,
-        BLOCK_D_nope=d_nope,
-        BLOCK_D_pe=d_rope,
-        BLOCK_SIZE=block_size,
-        SHUFFLED_KV_CACHE=shuffled_kv_cache,
-        SCALE_K_WIDTH_NOPE=SCALE_K_WIDTH_NOPE,
-        SCALE_K_WIDTH_ROPE=SCALE_K_WIDTH_ROPE,
-        HAVE_K_SCALE=(k_scale is not None and apply_scale),
-        num_warps=1,
+        k_scale,  # k_scale_ptr
+        kh,  # KH
+        d_nope,  # BLOCK_D_nope
+        d_rope,  # BLOCK_D_pe
+        block_size,  # BLOCK_SIZE
+        shuffled_kv_cache,  # SHUFFLED_KV_CACHE
+        SCALE_K_WIDTH_NOPE,
+        SCALE_K_WIDTH_ROPE,
+        k_scale is not None and apply_scale,  # HAVE_K_SCALE
     )

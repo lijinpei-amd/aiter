@@ -33,12 +33,19 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.causal_conv1d_fwd
     _causal_conv1d_fwd_split_qkv_kernel,
     _causal_conv1d_fwd_split_qkv_tile_kernel,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 
 __all__ = [
     "PAD_SLOT_ID",
     "causal_conv1d_split_qkv_triton_fn",
     "causal_conv1d_split_qkv_triton_tile_fn",
 ]
+
+
+_causal_conv1d_fwd_split_qkv_kernel_launch = intj_handle(
+    _causal_conv1d_fwd_split_qkv_kernel,
+    options={"num_stages": 2},
+)
 
 
 def causal_conv1d_split_qkv_triton_fn(
@@ -83,15 +90,18 @@ def causal_conv1d_split_qkv_triton_fn(
         stride_istate_dim = conv_states.stride(1)
         stride_istate_token = conv_states.stride(2)
 
-    def grid(META):
-        max_seq_len = max(seq_lens_cpu)
-        return (
-            len(seq_lens_cpu),
-            (max_seq_len + META["BLOCK_M"] - 1) // META["BLOCK_M"],
-            triton.cdiv(dim, META["BLOCK_N"]),
-        )
+    BLOCK_M, BLOCK_N = 8, 256
+    max_seq_len = max(seq_lens_cpu)
+    grid = (
+        len(seq_lens_cpu),
+        triton.cdiv(max_seq_len, BLOCK_M),
+        triton.cdiv(dim, BLOCK_N),
+    )
 
-    _intj_launch(_causal_conv1d_fwd_split_qkv_kernel, grid,
+    dev, stream = current_device_stream()
+    _causal_conv1d_fwd_split_qkv_kernel_launch(dev)(
+        stream,
+        grid,
         x,
         weight,
         bias,
@@ -121,17 +131,16 @@ def causal_conv1d_split_qkv_triton_fn(
         v_out.stride(0),
         v_out.stride(1),
         pad_slot_id,
-        HAS_BIAS=bias is not None,
-        KERNEL_WIDTH=width,
-        SILU_ACTIVATION=activation in ["silu", "swish"],
-        HAS_INITIAL_STATES=has_initial_state is not None,
-        HAS_CACHE=conv_states is not None,
-        IS_CONTINUOUS_BATCHING=cache_indices is not None,
-        USE_PAD_SLOT=pad_slot_id is not None,
-        NP2_STATELEN=np2_statelen,
-        BLOCK_M=8,
-        BLOCK_N=256,
-        num_stages=2,
+        bias is not None,  # HAS_BIAS
+        width,  # KERNEL_WIDTH
+        activation in ["silu", "swish"],  # SILU_ACTIVATION
+        has_initial_state is not None,  # HAS_INITIAL_STATES
+        conv_states is not None,  # HAS_CACHE
+        cache_indices is not None,  # IS_CONTINUOUS_BATCHING
+        pad_slot_id is not None,  # USE_PAD_SLOT
+        np2_statelen,  # NP2_STATELEN
+        BLOCK_M,
+        BLOCK_N,
     )
 
     return q_out, k_out, v_out

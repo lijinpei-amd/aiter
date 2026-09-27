@@ -8,7 +8,8 @@ from dataclasses import dataclass
 import torch
 import triton
 import triton.language as tl
-from intj.compat import launch as _intj_launch
+
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 
 
 @triton.jit
@@ -71,6 +72,13 @@ def _plan_pa_decode(
     padding = (pad >= total_tasks) & (pad < CAPACITY)
     for field in tl.static_range(4):
         tl.store(work + pad * 4 + field, 0, padding)
+
+
+_plan_pa_decode_launch = intj_handle(
+    _plan_pa_decode,
+    grid_arg=1,
+    options={"num_warps": 4},
+)
 
 
 @dataclass(frozen=True)
@@ -190,7 +198,10 @@ def plan_pa_decode(
             raise ValueError("query_length must match the reused plan")
     plan.validate(batch, num_kv_heads, dev)
     with torch.cuda.device(dev):
-        _intj_launch(_plan_pa_decode, (batch,),
+        intj_dev, intj_stream = current_device_stream()
+        _plan_pa_decode_launch(intj_dev)(
+            intj_stream,
+            batch,
             context_lengths,
             plan.work_info,
             plan.reduce_info,
@@ -202,6 +213,5 @@ def plan_pa_decode(
             query_length if sliding_window > 0 else 1,
             triton.next_power_of_2(batch),
             triton.next_power_of_2(plan.max_partitions),
-            num_warps=4,
         )
     return plan

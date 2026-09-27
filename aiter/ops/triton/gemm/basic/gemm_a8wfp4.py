@@ -3,8 +3,6 @@
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
@@ -14,6 +12,8 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8wfp4 import (
     _get_config,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -24,6 +24,12 @@ _USE_GEMM_SPLITK_BF16 = False
 def set_use_gemm_splitk_bf16(value: bool):
     global _USE_GEMM_SPLITK_BF16
     _USE_GEMM_SPLITK_BF16 = value
+
+
+_gemm_splitk_reduce_kernel_launch = intj_handle(
+    _gemm_splitk_reduce_kernel,
+    baked={"KERNEL_NAME": "_gemm_afp4_wfp4_reduce_kernel", "activation": ""},
+)
 
 
 def gemm_a8wfp4(
@@ -158,7 +164,10 @@ def gemm_a8wfp4(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _intj_launch(_gemm_splitk_reduce_kernel, grid_reduce,
+        dev, stream = current_device_stream()
+        _gemm_splitk_reduce_kernel_launch(dev)(
+            stream,
+            grid_reduce,
             y_pp,
             y,
             None,
@@ -173,8 +182,6 @@ def gemm_a8wfp4(
             REDUCE_BLOCK_SIZE_N,
             ACTUAL_KSPLIT,
             config["NUM_KSPLIT"],
-            ADD_BIAS=False,
-            activation="",
-            use_activation=False,
-            KERNEL_NAME="_gemm_afp4_wfp4_reduce_kernel",
+            False,  # ADD_BIAS
+            False,  # use_activation
         )

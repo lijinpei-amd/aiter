@@ -1,11 +1,17 @@
 import torch
 import triton
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.softmax import _softmax_kernel_online
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+
+_softmax_kernel_online_launch = intj_handle(
+    _softmax_kernel_online,
+    options={"num_stages": 2, "num_warps": 8, "waves_per_eu": 2},
+)
 
 
 def softmax(x):
@@ -25,23 +31,19 @@ def softmax(x):
     BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(n_cols))
     y = torch.empty_like(x)
 
-    waves_per_eu = 2
-    num_warps = 8
-    num_stages = 2
-
     num_programs = n_rows
 
     grid = (num_programs,)
-    _intj_launch(_softmax_kernel_online, grid,
+    dev, stream = current_device_stream()
+    _softmax_kernel_online_launch(dev)(
+        stream,
+        grid,
         y,
         x,
         x.stride(0),
         y.stride(0),
         n_cols,
         BLOCK_SIZE,
-        waves_per_eu=waves_per_eu,
-        num_warps=num_warps,
-        num_stages=num_stages,
     )
 
     return y

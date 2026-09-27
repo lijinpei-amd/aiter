@@ -7,10 +7,10 @@ import os
 import numpy as np
 import pandas as pd
 import torch
-from intj.compat import launch as _intj_launch
 from torch import Tensor
 
 from aiter import logger
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 
 from ..jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG, compile_ops
 from ..jit.utils.chip_info import get_cu_num
@@ -345,6 +345,8 @@ if _HAS_TRITON:
         scaddr = (t * NK_PAD + step) * 1024 + su * 512 + kg * 128 + r16 * 8 + sub
         tl.store(s_ptr + scaddr, e8, mask=rm)
 
+    _quant_pack_kernel_launch = intj_handle(_quant_pack_kernel)
+
     @triton.jit
     def _quant_pack_4block_kernel(
         x_ptr,
@@ -428,6 +430,11 @@ if _HAS_TRITON:
         sub = (rem % 128) // 16
         scaddr = (t * NK_PAD + step) * 1024 + su * 512 + kg * 128 + r16 * 8 + sub
         tl.store(s_ptr + scaddr, e8, mask=rm)
+
+    _quant_pack_4block_kernel_launch = intj_handle(
+        _quant_pack_4block_kernel,
+        options={"num_warps": 4},
+    )
 
 
 def quant_mxfp6(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -905,7 +912,10 @@ def _launch_quant_mxfp6_gemm_triton(
         BM = _BATCHED_PACK_BLOCK_M
         NSTEP = NB // _BATCHED_PACK_K_BLOCKS
         grid = ((rows + BM - 1) // BM * NSTEP,)
-        _intj_launch(_quant_pack_4block_kernel, grid,
+        dev, stream = current_device_stream()
+        _quant_pack_4block_kernel_launch(dev)(
+            stream,
+            grid,
             x,
             packed,
             packed_scale,
@@ -914,13 +924,15 @@ def _launch_quant_mxfp6_gemm_triton(
             NK_PAD,
             x.stride(0),
             _had32_t(x.device),
-            BLOCK_M=BM,
-            num_warps=4,
+            BM,  # BLOCK_M
         )
     else:
         BM = 128
         grid = ((rows + BM - 1) // BM * NB,)
-        _intj_launch(_quant_pack_kernel, grid,
+        dev, stream = current_device_stream()
+        _quant_pack_kernel_launch(dev)(
+            stream,
+            grid,
             x,
             packed,
             packed_scale,
@@ -929,7 +941,7 @@ def _launch_quant_mxfp6_gemm_triton(
             NK_PAD,
             x.stride(0),
             _had32_t(x.device),
-            BLOCK_M=BM,
+            BM,  # BLOCK_M
         )
 
 

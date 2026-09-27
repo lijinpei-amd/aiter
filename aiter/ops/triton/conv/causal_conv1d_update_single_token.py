@@ -13,17 +13,22 @@ from __future__ import annotations
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.conv.causal_conv1d import PAD_SLOT_ID
 from aiter.ops.triton._triton_kernels.conv.causal_conv1d_update_single_token import (
     _causal_conv1d_update_single_token_kernel,
     _reshape_causal_conv1d_update_single_token_kernel,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 
 
 def _default_conv_state_indices(batch: int, device: torch.device) -> torch.Tensor:
     return torch.arange(batch, device=device, dtype=torch.int32)
+
+
+_causal_conv1d_update_single_token_kernel_launch = intj_handle(
+    _causal_conv1d_update_single_token_kernel,
+)
 
 
 def causal_conv1d_update_single_token(
@@ -108,10 +113,13 @@ def causal_conv1d_update_single_token(
         state_len = width - 1
     np2_statelen = triton.next_power_of_2(state_len)
 
-    def grid(META):
-        return (batch, triton.cdiv(dim, META["BLOCK_N"]))
+    BLOCK_N = 256
+    grid = (batch, triton.cdiv(dim, BLOCK_N))
 
-    _intj_launch(_causal_conv1d_update_single_token_kernel, grid,
+    dev, stream = current_device_stream()
+    _causal_conv1d_update_single_token_kernel_launch(dev)(
+        stream,
+        grid,
         x,
         weight,
         bias,
@@ -138,17 +146,22 @@ def causal_conv1d_update_single_token(
         stride_o_dim,
         stride_o_token,
         pad_slot_id,
-        HAS_BIAS=bias is not None,
-        KERNEL_WIDTH=width,
-        SILU_ACTIVATION=activation in ["silu", "swish"],
-        IS_APC_ENABLED=block_idx_last_scheduled_token is not None,
-        NP2_STATELEN=np2_statelen,
-        USE_PAD_SLOT=pad_slot_id is not None,
-        BLOCK_N=256,
+        bias is not None,  # HAS_BIAS
+        width,  # KERNEL_WIDTH
+        activation in ["silu", "swish"],  # SILU_ACTIVATION
+        block_idx_last_scheduled_token is not None,  # IS_APC_ENABLED
+        np2_statelen,  # NP2_STATELEN
+        pad_slot_id is not None,  # USE_PAD_SLOT
+        BLOCK_N,
     )
     if unsqueeze:
         out = out.squeeze(-1)
     return out.to(original_x_dtype)
+
+
+_reshape_causal_conv1d_update_single_token_kernel_launch = intj_handle(
+    _reshape_causal_conv1d_update_single_token_kernel,
+)
 
 
 def fused_reshape_causal_conv1d_update_single_token(
@@ -283,13 +296,13 @@ def fused_reshape_causal_conv1d_update_single_token(
     BLOCK_Z = 512
     num_program_write_z = triton.cdiv(num_v_heads * head_v_dim, BLOCK_Z)
 
-    def grid(META):
-        return (
-            batch,
-            1 + num_program_write_z + triton.cdiv(dim, META["BLOCK_N"]),
-        )
+    BLOCK_N = 256
+    grid = (batch, 1 + num_program_write_z + triton.cdiv(dim, BLOCK_N))
 
-    _intj_launch(_reshape_causal_conv1d_update_single_token_kernel, grid,
+    dev, stream = current_device_stream()
+    _reshape_causal_conv1d_update_single_token_kernel_launch(dev)(
+        stream,
+        grid,
         x,
         ba,
         z_out,
@@ -333,15 +346,15 @@ def fused_reshape_causal_conv1d_update_single_token(
         pad_slot_id,
         num_program_write_z,
         BLOCK_Z,
-        HV=HV,
-        HAS_BIAS=bias is not None,
-        KERNEL_WIDTH=width,
-        SILU_ACTIVATION=activation in ["silu", "swish"],
-        IS_APC_ENABLED=block_idx_last_scheduled_token is not None,
-        NP2_STATELEN=np2_statelen,
-        USE_PAD_SLOT=pad_slot_id is not None,
-        BLOCK_N=256,
-        INTERLEAVED_QKVZ=interleaved,
+        HV,
+        bias is not None,  # HAS_BIAS
+        width,  # KERNEL_WIDTH
+        activation in ["silu", "swish"],  # SILU_ACTIVATION
+        block_idx_last_scheduled_token is not None,  # IS_APC_ENABLED
+        np2_statelen,  # NP2_STATELEN
+        pad_slot_id is not None,  # USE_PAD_SLOT
+        BLOCK_N,
+        interleaved,  # INTERLEAVED_QKVZ
     )
     if unsqueeze:
         out = out.squeeze(-1)

@@ -3,14 +3,21 @@
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.rope.fused_qk_norm_rope_cached import (
     _fused_qk_norm_rope_cached_kernel,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+
+_fused_qk_norm_rope_cached_kernel_launch = intj_handle(
+    _fused_qk_norm_rope_cached_kernel,
+    grid_arg=1,
+    options={"num_warps": 4},
+)
 
 
 def fused_qk_norm_rope_cached(
@@ -73,7 +80,10 @@ def fused_qk_norm_rope_cached(
         rot % 2 == 0 and rot <= D
     ), f"rotated width {rot} must be even and at most head_dim {D}"
 
-    _intj_launch(_fused_qk_norm_rope_cached_kernel, (T,),
+    dev, stream = current_device_stream()
+    _fused_qk_norm_rope_cached_kernel_launch(dev)(
+        stream,
+        T,
         q,
         k,
         q_weight,
@@ -86,8 +96,7 @@ def fused_qk_norm_rope_cached(
         k.stride(0),
         cos_sin_cache.stride(0),
         eps,
-        BLOCK_H=triton.next_power_of_2(H),
-        BLOCK_D=triton.next_power_of_2(D),
-        num_warps=4,
+        triton.next_power_of_2(H),  # BLOCK_H
+        triton.next_power_of_2(D),  # BLOCK_D
     )
     return q, k

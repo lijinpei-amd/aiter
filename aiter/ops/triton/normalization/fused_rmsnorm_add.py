@@ -4,7 +4,6 @@
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._gluon_kernels.gfx1250.norm.fused_rmsnorm_add import (
@@ -14,6 +13,10 @@ from aiter.ops.triton._triton_kernels.normalization.fused_rmsnorm_add import (
     _triton_fused_rms_kernel,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+
+_gluon_fused_rms_kernel_launch = intj_handle(_gluon_fused_rms_kernel)
+_triton_fused_rms_kernel_launch = intj_handle(_triton_fused_rms_kernel)
 
 
 def _fused_rmsnorm_add_core(x, weight, epsilon, res1):
@@ -62,7 +65,10 @@ def _fused_rmsnorm_add_core(x, weight, epsilon, res1):
 
         BLOCK_SIZE_M = 1
         grid = (triton.cdiv(M, BLOCK_SIZE_M),)
-        _intj_launch(_gluon_fused_rms_kernel, grid,
+        dev, stream = current_device_stream()
+        _gluon_fused_rms_kernel_launch(dev)(
+            stream,
+            grid,
             x,
             weight,
             res1,
@@ -75,14 +81,17 @@ def _fused_rmsnorm_add_core(x, weight, epsilon, res1):
             res1_stride_m,
             out1.stride(0),
             out_res1_stride_m,
-            BLOCK_SIZE_M=BLOCK_SIZE_M,
-            BLOCK_SIZE_N=BLOCK_SIZE_N,
-            FIRST_INPUT_RES=(res1 is not None),
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            res1 is not None,  # FIRST_INPUT_RES
         )
     else:
 
         grid = (M,)
-        _intj_launch(_triton_fused_rms_kernel, grid,
+        dev, stream = current_device_stream()
+        _triton_fused_rms_kernel_launch(dev)(
+            stream,
+            grid,
             x,
             weight,
             res1,
@@ -95,8 +104,8 @@ def _fused_rmsnorm_add_core(x, weight, epsilon, res1):
             res1_stride_m,
             out1.stride(0),
             out_res1_stride_m,
-            BLOCK_SIZE_N=BLOCK_SIZE_N,
-            FIRST_INPUT_RES=(res1 is not None),
+            BLOCK_SIZE_N,
+            res1 is not None,  # FIRST_INPUT_RES
         )
 
     return out1, out_res1

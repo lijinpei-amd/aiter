@@ -12,10 +12,14 @@ from aiter.ops.triton._triton_kernels.attention.mha_fused_bwd import (
     _get_config,
 )
 from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import _is_fp8
 
 _LOGGER = AiterTritonLogger()
+
+
+_bwd_preprocess_launch = intj_handle(_bwd_preprocess)
 
 
 def flash_attn_fused_backward(
@@ -182,7 +186,10 @@ def flash_attn_fused_backward(
         num_q_heads,
     )
 
-    _intj_launch(_bwd_preprocess, pre_grid,
+    dev, stream = current_device_stream()
+    _bwd_preprocess_launch(dev)(
+        stream,
+        pre_grid,
         o,
         do,
         delta,
@@ -193,11 +200,11 @@ def flash_attn_fused_backward(
         cu_seqlens_q,
         max_seqlen_q,
         descale_do,
-        BLOCK_M=config["preprocess_kernel"]["PRE_BLOCK"],
-        BLOCK_D_MODEL=head_sz,
-        BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
-        IS_VARLEN=IS_VARLEN,
-        IS_FP8=IS_FP8,
+        config["preprocess_kernel"]["PRE_BLOCK"],  # BLOCK_M
+        head_sz,  # BLOCK_D_MODEL
+        BLOCK_D_MODEL_POW2,
+        IS_VARLEN,
+        IS_FP8,
     )
     # dropout_mask
     use_dropout = dropout_p > 0.0

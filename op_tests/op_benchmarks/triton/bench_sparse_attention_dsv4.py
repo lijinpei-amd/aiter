@@ -18,11 +18,11 @@ import argparse
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
     _sparse_attn_prefill_kernel as csa_prefill_tl,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 
 # The Gluon prefill kernel is opt-in (gfx950 + Triton >= 3.6). Probe it once at
 # import time; the benchmark falls back to Triton-only when unavailable.
@@ -37,6 +37,16 @@ except ImportError:
 
 
 sparse_attn_prefill_kernel = csa_prefill_tl
+
+
+def _sparse_attn_prefill_grid(num_heads: int, BLOCK_H: int, *, num_queries: int):
+    # Compiled into the launcher by intj (grid_cpp); BLOCK_H is the tuned value.
+    return (num_queries, triton.cdiv(num_heads, BLOCK_H))
+
+
+_sparse_attn_prefill_kernel_launch = intj_handle(
+    sparse_attn_prefill_kernel, grid_cpp=_sparse_attn_prefill_grid
+)
 
 
 NOPE_DIM = 448
@@ -117,11 +127,10 @@ def _launch_prefill(
         )
         return
     else:  # default triton backend
-
-        def grid(META):
-            return (num_queries, triton.cdiv(num_heads, META["BLOCK_H"]))
-
-        _intj_launch(sparse_attn_prefill_kernel, grid,
+        dev, stream = current_device_stream()
+        _sparse_attn_prefill_kernel_launch(dev)(
+            stream,
+            num_queries,
             q,
             kv,
             indices,
@@ -140,8 +149,8 @@ def _launch_prefill(
             head_dim,
             kv.shape[0],
             scale,
-            HAS_ATTN_SINK=has_sink,
-            BLOCK_D=block_d,
+            has_sink,  # HAS_ATTN_SINK
+            block_d,  # BLOCK_D
         )
 
 

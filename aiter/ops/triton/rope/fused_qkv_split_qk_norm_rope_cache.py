@@ -1,10 +1,10 @@
 import torch
 import triton
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.rope.fused_qkv_split_qk_norm_rope_cache import (
     _fused_qkv_split_qk_norm_rope_cache_kernel,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 
 
 def infer_rope_cache_triton_block_t(T: int, device: torch.device) -> int:
@@ -30,6 +30,12 @@ def infer_rope_cache_triton_block_t(T: int, device: torch.device) -> int:
     )
     block_t = triton.next_power_of_2(triton.cdiv(T, 2 * sm_count))
     return max(1, min(int(block_t), 32))
+
+
+_fused_qkv_split_qk_norm_rope_cache_kernel_launch = intj_handle(
+    _fused_qkv_split_qk_norm_rope_cache_kernel,
+    options={"num_warps": 4},
+)
 
 
 def fused_qkv_split_qk_norm_rope_cache(
@@ -177,64 +183,65 @@ def fused_qkv_split_qk_norm_rope_cache(
     BLOCK_D_HALF = head_dim // 2
 
     BLOCK_T = infer_rope_cache_triton_block_t(T, qkv.device)
-    num_warps = 4
     grid = (triton.cdiv(T, BLOCK_T), qh)
 
-    _intj_launch(_fused_qkv_split_qk_norm_rope_cache_kernel, grid,
-        qkv_ptr=qkv,
-        q_weight_ptr=q_weight,
-        k_weight_ptr=k_weight,
-        cos_ptr=cos,
-        sin_ptr=sin,
-        pos_ptr=positions,
-        off_ptr=offsets,
-        q_ptr=q,
-        gate_ptr=gate,
-        k_ptr=k,
-        v_ptr=v,
-        key_cache_ptr=key_cache,
-        value_cache_ptr=value_cache,
-        slot_mapping_ptr=slot_mapping,
-        T=T,
-        eps=eps,
-        k_scale_ptr=k_scale,
-        v_scale_ptr=v_scale,
-        stride_qkv_t=qkv.stride(0),
-        stride_qkv_d=qkv.stride(1),
-        stride_cos_t=cos.stride(0),
-        stride_cos_d=cos.stride(-1),
-        stride_pos_t=positions.stride(0),
-        stride_q_t=q.stride(0),
-        stride_q_h=q.stride(1),
-        stride_q_d=q.stride(2),
-        stride_kv_t=k.stride(0),
-        stride_kv_h=k.stride(1),
-        stride_kv_d=k.stride(2),
-        key_cache_stride_t=key_cache_stride_t,
-        key_cache_stride_h=key_cache_stride_h,
-        key_cache_stride_d=key_cache_stride_d,
-        key_cache_stride_b=key_cache_stride_b,
-        value_cache_stride_t=value_cache_stride_t,
-        value_cache_stride_h=value_cache_stride_h,
-        value_cache_stride_d=value_cache_stride_d,
-        value_cache_stride_b=value_cache_stride_b,
-        REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
-        IS_NEOX=is_neox,
-        HAVE_POS=(positions is not None),
-        HAVE_OFFS=(offsets is not None),
-        ENABLE_GATED_Q=attn_output_gate,
-        QH=qh,
-        KVH=kvh,
-        BLOCK_T=BLOCK_T,
-        BLOCK_D=BLOCK_D,
-        BLOCK_D_HALF=BLOCK_D_HALF,
-        BLOCK_SIZE=block_size,
-        ROTARY_DIM_EFFECTIVE=ROTARY_DIM_EFFECTIVE,
-        BLOCKED_GATED_LAYOUT=(attn_output_gate and gated_qkv_layout == "blocked"),
-        HAVE_K_SCALE=k_scale is not None,
-        HAVE_V_SCALE=v_scale is not None,
-        total_num_kv_cache_tokens=total_num_kv_cache_tokens,
-        num_warps=num_warps,
+    dev, stream = current_device_stream()
+    _fused_qkv_split_qk_norm_rope_cache_kernel_launch(dev)(
+        stream,
+        grid,
+        qkv,  # qkv_ptr
+        q_weight,  # q_weight_ptr
+        k_weight,  # k_weight_ptr
+        cos,  # cos_ptr
+        sin,  # sin_ptr
+        positions,  # pos_ptr
+        offsets,  # off_ptr
+        q,  # q_ptr
+        gate,  # gate_ptr
+        k,  # k_ptr
+        v,  # v_ptr
+        key_cache,  # key_cache_ptr
+        value_cache,  # value_cache_ptr
+        slot_mapping,  # slot_mapping_ptr
+        T,
+        eps,
+        qkv.stride(0),  # stride_qkv_t
+        qkv.stride(1),  # stride_qkv_d
+        cos.stride(0),  # stride_cos_t
+        cos.stride(-1),  # stride_cos_d
+        positions.stride(0),  # stride_pos_t
+        q.stride(0),  # stride_q_t
+        q.stride(1),  # stride_q_h
+        q.stride(2),  # stride_q_d
+        k.stride(0),  # stride_kv_t
+        k.stride(1),  # stride_kv_h
+        k.stride(2),  # stride_kv_d
+        key_cache_stride_t,
+        key_cache_stride_h,
+        key_cache_stride_d,
+        key_cache_stride_b,
+        value_cache_stride_t,
+        value_cache_stride_h,
+        value_cache_stride_d,
+        value_cache_stride_b,
+        k_scale,  # k_scale_ptr
+        v_scale,  # v_scale_ptr
+        total_num_kv_cache_tokens,
+        reuse_freqs_front_part,  # REUSE_FREQS_FRONT_PART
+        is_neox,  # IS_NEOX
+        positions is not None,  # HAVE_POS
+        offsets is not None,  # HAVE_OFFS
+        attn_output_gate,  # ENABLE_GATED_Q
+        qh,  # QH
+        kvh,  # KVH
+        BLOCK_T,
+        BLOCK_D,
+        BLOCK_D_HALF,
+        block_size,  # BLOCK_SIZE
+        ROTARY_DIM_EFFECTIVE,
+        attn_output_gate and gated_qkv_layout == "blocked",  # BLOCKED_GATED_LAYOUT
+        k_scale is not None,  # HAVE_K_SCALE
+        v_scale is not None,  # HAVE_V_SCALE
     )
 
     if attn_output_gate:

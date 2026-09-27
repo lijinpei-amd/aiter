@@ -28,6 +28,7 @@ import triton.language as tl
 from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 
 
 def is_hip():
@@ -390,6 +391,22 @@ def _fwd_grouped_kernel_stage1(
         )
 
 
+def _stage1_options():
+    # Evaluated on the device when the handle is built.
+    if not is_hip_:
+        return {"num_warps": 4, "num_stages": 2}
+    # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
+    # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
+    kpack = 1 if get_arch() == "gfx950" else 2
+    return {"num_warps": 4, "num_stages": 1, "waves_per_eu": 1,
+            "matrix_instr_nonkdim": 16, "kpack": kpack}
+
+
+_fwd_grouped_kernel_stage1_launch = intj_handle(
+    _fwd_grouped_kernel_stage1, options=_stage1_options
+)
+
+
 def _decode_grouped_att_m_fwd(
     q,
     k_buffer,
@@ -431,17 +448,10 @@ def _decode_grouped_att_m_fwd(
         NUM_KV_SPLITS,
     )
 
-    extra_kargs = {}
-    num_stages = 2
-    if is_hip_:
-        # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
-        # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
-        extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
-        if get_arch() == "gfx950":
-            extra_kargs["kpack"] = 1
-        num_stages = 1
-
-    _intj_launch(_fwd_grouped_kernel_stage1, grid,
+    dev, stream = current_device_stream()
+    _fwd_grouped_kernel_stage1_launch(dev)(
+        stream,
+        grid,
         q,
         k_buffer,
         v_buffer,
@@ -458,20 +468,17 @@ def _decode_grouped_att_m_fwd(
         att_out.stride(0),
         att_out.stride(1),
         att_out.stride(2),
-        kv_group_num=kv_group_num,
-        q_head_num=head_num,
-        BLOCK_DMODEL=BLOCK_DMODEL,
-        BLOCK_DPE=BLOCK_DPE,
-        BLOCK_DV=BLOCK_DV,
-        BLOCK_N=BLOCK,
-        BLOCK_H=BLOCK_H,
-        NUM_KV_SPLITS=NUM_KV_SPLITS,
-        logit_cap=logit_cap,
-        num_warps=4,
-        num_stages=num_stages,
-        Lk=Lk,
-        Lv=Lv,
-        **extra_kargs,
+        kv_group_num,
+        head_num,  # q_head_num
+        BLOCK_DMODEL,
+        BLOCK_DPE,
+        BLOCK_DV,
+        BLOCK,  # BLOCK_N
+        BLOCK_H,
+        NUM_KV_SPLITS,
+        logit_cap,
+        Lk,
+        Lv,
     )
 
 
@@ -533,6 +540,18 @@ def _fwd_kernel_stage2(
     )
 
 
+def _stage2_options():
+    # Evaluated on the device when the handle is built.
+    if not is_hip_:
+        return {"num_warps": 4, "num_stages": 2}
+    kpack = 1 if get_arch() == "gfx950" else 2
+    return {"num_warps": 4, "num_stages": 2, "waves_per_eu": 4,
+            "matrix_instr_nonkdim": 16, "kpack": kpack}
+
+
+_fwd_kernel_stage2_launch = intj_handle(_fwd_kernel_stage2, options=_stage2_options)
+
+
 def _decode_softmax_reducev_fwd(
     logits,
     q,
@@ -547,16 +566,11 @@ def _decode_softmax_reducev_fwd(
 
     NUM_KV_SPLITS = num_kv_splits
 
-    extra_kargs = {}
-    if is_hip_:
-        # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
-        # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
-        extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
-        if get_arch() == "gfx950":
-            extra_kargs["kpack"] = 1
-
     grid = (batch, head_num)
-    _intj_launch(_fwd_kernel_stage2, grid,
+    dev, stream = current_device_stream()
+    _fwd_kernel_stage2_launch(dev)(
+        stream,
+        grid,
         logits,
         o,
         kv_indptr,
@@ -565,12 +579,9 @@ def _decode_softmax_reducev_fwd(
         logits.stride(2),
         o.stride(0),
         o.stride(1),
-        NUM_KV_SPLITS=NUM_KV_SPLITS,
-        BLOCK_DV=BLOCK_DV,
-        Lv=Lv,
-        num_warps=4,
-        num_stages=2,
-        **extra_kargs,
+        NUM_KV_SPLITS,
+        BLOCK_DV,
+        Lv,
     )
 
 

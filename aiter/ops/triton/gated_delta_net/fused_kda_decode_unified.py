@@ -14,12 +14,23 @@ from __future__ import annotations
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_conv_recurrent_norm_unified import (
     _fused_kda_decode_unified_kernel,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+
+
+def _decode_options():
+    # Evaluated on the device when the handle is built.
+    return {"num_warps": 2 if get_arch() == "gfx942" else 4}
+
+
+_fused_kda_decode_unified_kernel_launch = intj_handle(
+    _fused_kda_decode_unified_kernel,
+    options=_decode_options,
+)
 
 
 def fused_kda_decode_unified(
@@ -128,7 +139,10 @@ def fused_kda_decode_unified(
     dummy = torch.empty(1, device=device)
 
     grid = (batch, H)
-    _intj_launch(_fused_kda_decode_unified_kernel, grid,
+    dev, stream = current_device_stream()
+    _fused_kda_decode_unified_kernel_launch(dev)(
+        stream,
+        grid,
         mixed_qkv,
         conv_weight,
         conv_state,
@@ -153,37 +167,36 @@ def fused_kda_decode_unified(
         norm_eps,
         K**-0.5,
         T,
-        H=H,
-        K=K,
-        V=V,
-        W=W_val,
-        STATE_LEN=STATE_LEN,
-        CAP=CAP,
-        T_MAX=max_query_len,
-        BH=BH,
-        USE_REPLAY=use_replay,
-        IS_SPEC=is_spec,
-        stride_x_tok=mixed_qkv.stride(0),
-        stride_cw_group=s_cw_group,
-        stride_cw_width=s_cw_width,
-        stride_cw_ch=s_cw_ch,
-        stride_cs_slot=conv_state.stride(0),
-        stride_cs_dim=conv_state.stride(1),
-        stride_cs_pos=conv_state.stride(2),
-        stride_beta_tok=s_beta_tok,
-        stride_og_tok=s_og_tok,
-        stride_state_slot=state.stride(0),
-        stride_indices_seq=s_idx_seq,
-        stride_indices_tok=s_idx_tok,
-        stride_bufk_slot=s_bk_slot,
-        stride_bufk_hv=s_bk_hv,
-        stride_bufk_pos=s_bk_pos,
-        stride_bufu_slot=s_bu_slot,
-        stride_bufu_hv=s_bu_hv,
-        stride_bufu_pos=s_bu_pos,
-        stride_bufg_slot=s_bg_slot,
-        stride_bufg_hv=s_bg_hv,
-        stride_bufg_pos=s_bg_pos,
-        num_warps=2 if get_arch() == "gfx942" else 4,
+        H,
+        K,
+        V,
+        W_val,  # W
+        STATE_LEN,
+        CAP,
+        max_query_len,  # T_MAX
+        BH,
+        use_replay,  # USE_REPLAY
+        is_spec,  # IS_SPEC
+        mixed_qkv.stride(0),  # stride_x_tok
+        s_cw_group,  # stride_cw_group
+        s_cw_width,  # stride_cw_width
+        s_cw_ch,  # stride_cw_ch
+        conv_state.stride(0),  # stride_cs_slot
+        conv_state.stride(1),  # stride_cs_dim
+        conv_state.stride(2),  # stride_cs_pos
+        s_beta_tok,  # stride_beta_tok
+        s_og_tok,  # stride_og_tok
+        state.stride(0),  # stride_state_slot
+        s_idx_seq,  # stride_indices_seq
+        s_idx_tok,  # stride_indices_tok
+        s_bk_slot,  # stride_bufk_slot
+        s_bk_hv,  # stride_bufk_hv
+        s_bk_pos,  # stride_bufk_pos
+        s_bu_slot,  # stride_bufu_slot
+        s_bu_hv,  # stride_bufu_hv
+        s_bu_pos,  # stride_bufu_pos
+        s_bg_slot,  # stride_bufg_slot
+        s_bg_hv,  # stride_bufg_hv
+        s_bg_pos,  # stride_bufg_pos
     )
     return out

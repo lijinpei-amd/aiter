@@ -9,7 +9,6 @@ import os
 import torch
 import triton
 import triton.language as tl
-from intj.compat import launch as _intj_launch
 
 import aiter
 from aiter import dtypes
@@ -17,6 +16,7 @@ from aiter.jit.core import is_experimental_enabled
 from aiter.jit.utils.asm_guard import require_gfx1250_asm
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.attention import get_mla_decode_fwd_max_splits
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 
 _FLYDSL_MLA_REDUCE_TARGET_GFX = ("gfx942", "gfx950")
 _FLYDSL_MLA_REDUCE_TARGET_H = 16
@@ -261,6 +261,16 @@ def _fwd_kernel_stage2_asm(
                     Final_lse + cur_qo * stride_lse_bs + cur_head,
                     e_max + tl.log(e_sum),
                 )
+
+
+# One (token, head) per CTA, no cross-lane reduction: the merge is
+# memory-latency bound, so max occupancy (num_warps=1) beats wider
+# tiles. Measured 1.7-1.9x over num_warps=4 on gfx950 decode shapes.
+_fwd_kernel_stage2_asm_launch = intj_handle(
+    _fwd_kernel_stage2_asm,
+    grid_arg=2,
+    options={"num_stages": 2, "num_warps": 1, "waves_per_eu": 4},
+)
 
 
 @functools.lru_cache
@@ -703,8 +713,6 @@ def mla_decode_fwd(
 
         Lv = v_head_dim
         BLOCK_DV = triton.next_power_of_2(Lv)
-        grid = (bs, nhead)
-        extra_kargs = {"waves_per_eu": 4}
 
         has_final_lse = final_lse is not None
         final_lse_buf = (
@@ -713,7 +721,11 @@ def mla_decode_fwd(
             else torch.empty((1,), dtype=dtypes.fp32, device=device)
         )
 
-        _intj_launch(_fwd_kernel_stage2_asm, grid,
+        dev, stream = current_device_stream()
+        _fwd_kernel_stage2_asm_launch(dev)(
+            stream,
+            bs,
+            nhead,
             logits,
             attn_lse,
             o,
@@ -729,21 +741,15 @@ def mla_decode_fwd(
             o.stride(0),
             o.stride(1),
             final_lse_buf.stride(0) if has_final_lse else 0,
-            page_size=page_size,
-            KV_INDPTR_IS_PAGE_LEVEL=page_size > 1,
-            MAYBE_FINAL_OUT=MAYBE_FINAL_OUT,
-            HAS_FINAL_LSE=has_final_lse,
-            USE_VALID_SPLIT_COUNT_REDUCE=use_valid_split_count_reduce,
-            BATCH_NUM=bs,
-            BLOCK_DV=BLOCK_DV,
-            Lv=Lv,
-            mgc=mgc,
-            # One (token, head) per CTA, no cross-lane reduction: the merge is
-            # memory-latency bound, so max occupancy (num_warps=1) beats wider
-            # tiles. Measured 1.7-1.9x over num_warps=4 on gfx950 decode shapes.
-            num_warps=1,
-            num_stages=2,
-            **extra_kargs,
+            page_size,
+            page_size > 1,  # KV_INDPTR_IS_PAGE_LEVEL
+            MAYBE_FINAL_OUT,
+            has_final_lse,  # HAS_FINAL_LSE
+            use_valid_split_count_reduce,  # USE_VALID_SPLIT_COUNT_REDUCE
+            bs,  # BATCH_NUM
+            BLOCK_DV,
+            Lv,
+            mgc,
         )
     else:
         if num_kv_splits is None:
@@ -1477,6 +1483,12 @@ def _mla_prefill_reduce_kernel(
         )
 
 
+_mla_prefill_reduce_kernel_launch = intj_handle(
+    _mla_prefill_reduce_kernel,
+    options={"num_warps": 4},
+)
+
+
 def mla_prefill_reduce_triton(
     partial_output: torch.Tensor,  # [padded_num_tokens * available_tgs, num_head_q, v_head_dim]
     partial_lse: torch.Tensor,  # [padded_num_tokens * available_tgs, num_head_q]
@@ -1522,7 +1534,10 @@ def mla_prefill_reduce_triton(
     # Grid: (num_reduce_groups, num_heads, TILE_Q)
     grid = (num_reduce_groups, num_heads, tile_q)
 
-    _intj_launch(_mla_prefill_reduce_kernel, grid,
+    dev, stream = current_device_stream()
+    _mla_prefill_reduce_kernel_launch(dev)(
+        stream,
+        grid,
         partial_output,
         partial_lse,
         reduce_indptr,
@@ -1539,11 +1554,10 @@ def mla_prefill_reduce_triton(
         output.stride(1),
         output.stride(2),
         # Constants
-        TILE_Q=tile_q,
-        V_HEAD_DIM=v_head_dim,
-        BLOCK_DIM=BLOCK_DIM,
-        MAX_PARTIALS=MAX_PARTIALS_STATIC,
-        num_warps=4,
+        tile_q,  # TILE_Q
+        v_head_dim,  # V_HEAD_DIM
+        BLOCK_DIM,
+        MAX_PARTIALS_STATIC,  # MAX_PARTIALS
     )
 
 
@@ -1904,7 +1918,11 @@ def mla_decode_fwd_v4_nm(
 
         final_lse_buf = torch.empty((1,), dtype=dtypes.fp32, device=device)
 
-        _intj_launch(_fwd_kernel_stage2_asm, (num_seqs, num_heads),
+        dev, stream = current_device_stream()
+        _fwd_kernel_stage2_asm_launch(dev)(
+            stream,
+            num_seqs,
+            num_heads,
             logits,  # Mid_O   [total_q, num_kv_splits, num_heads, dv]
             attn_lse,  # Mid_lse [total_q, num_kv_splits, num_heads, 1]
             output,  # final O [total_q, num_heads, dv]   BF16
@@ -1920,21 +1938,15 @@ def mla_decode_fwd_v4_nm(
             output.stride(0),  # stride_obs    = num_heads * v_head_dim
             output.stride(1),  # stride_oh     = v_head_dim
             0,  # stride_lse_bs (unused, HAS_FINAL_LSE=False)
-            page_size=1,  # v4 nm KV cache is page_size=1
-            KV_INDPTR_IS_PAGE_LEVEL=False,  # page_size=1 -> token-level indptr
-            MAYBE_FINAL_OUT=True,
-            HAS_FINAL_LSE=False,
-            USE_VALID_SPLIT_COUNT_REDUCE=int(num_kv_splits > 1),
-            BATCH_NUM=num_seqs,
-            BLOCK_DV=BLOCK_DV,
-            Lv=Lv,
-            mgc=mgc,
-            # One (token, head) per CTA, no cross-lane reduction: the merge is
-            # memory-latency bound, so max occupancy (num_warps=1) beats wider
-            # tiles. Measured 1.7-1.9x over num_warps=4 on gfx950 decode shapes.
-            num_warps=1,
-            num_stages=2,
-            waves_per_eu=4,
+            1,  # page_size; v4 nm KV cache is page_size=1
+            False,  # KV_INDPTR_IS_PAGE_LEVEL; page_size=1 -> token-level indptr
+            True,  # MAYBE_FINAL_OUT
+            False,  # HAS_FINAL_LSE
+            int(num_kv_splits > 1),  # USE_VALID_SPLIT_COUNT_REDUCE
+            num_seqs,  # BATCH_NUM
+            BLOCK_DV,
+            Lv,
+            mgc,
         )
 
     return logits, attn_lse

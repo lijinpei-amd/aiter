@@ -3,8 +3,9 @@
 import torch
 import triton
 import triton.language as tl
-from intj.compat import launch as _intj_launch
 from torch import Tensor
+
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 
 from . import dtypes
 from .mx_types import (
@@ -534,6 +535,11 @@ def _dynamic_mxfp4_quant_kernel_asm_layout(
         tl.store(bs_ptr + bs_offs, bs_e8m0, mask=bs_mask)
 
 
+_dynamic_mxfp4_quant_kernel_asm_layout_launch = intj_handle(
+    _dynamic_mxfp4_quant_kernel_asm_layout,
+)
+
+
 def dynamic_mxfp4_quant(
     x: torch.Tensor, scaling_mode: str = "even", shuffle: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -573,22 +579,25 @@ def dynamic_mxfp4_quant(
 
     BLOCK_SIZE = 128
     grid = (triton.cdiv(M, BLOCK_SIZE), scaleN)
-    _intj_launch(_dynamic_mxfp4_quant_kernel_asm_layout, grid,
+    dev, stream = current_device_stream()
+    _dynamic_mxfp4_quant_kernel_asm_layout_launch(dev)(
+        stream,
+        grid,
         x,
         x_fp4,
         blockscale_e8m0,
         *x.stride(),
         *x_fp4.stride(),
         *blockscale_e8m0.stride(),
-        M=M,
-        N=N,
-        scaleN=scaleN_valid,
-        scaleM_pad=scaleM,
-        scaleN_pad=scaleN,
-        BLOCK_SIZE=BLOCK_SIZE,
-        MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
-        SCALING_MODE=0,
-        SHUFFLE=shuffle,
+        M,
+        N,
+        scaleN_valid,  # scaleN
+        scaleM,  # scaleM_pad
+        scaleN,  # scaleN_pad
+        BLOCK_SIZE,
+        MXFP4_QUANT_BLOCK_SIZE,
+        0,  # SCALING_MODE
+        shuffle,  # SHUFFLE
     )
 
     if not shuffle:
@@ -756,6 +765,12 @@ def _moe_mxfp4_sort_kernel_fused_n(
         tl.store(blockscale_e8m0_sorted_ptr + store_offs, out)
 
 
+_moe_mxfp4_sort_kernel_fused_n_launch = intj_handle(
+    _moe_mxfp4_sort_kernel_fused_n, grid_arg=1
+)
+_moe_mxfp4_sort_kernel_launch = intj_handle(_moe_mxfp4_sort_kernel, grid_arg=2)
+
+
 def moe_mxfp4_sort(
     blockscale_e8m0: torch.Tensor,
     sorted_ids: torch.Tensor,
@@ -825,23 +840,27 @@ def moe_mxfp4_sort(
         *blockscale_e8m0.stride(),
         *blockscale_e8m0_sorted.stride(),
     )
-    common_kwargs = {
-        "token_num": token_num,
-        "N_i": N_i,
-        "BLOCK_SIZE_M": BLOCK_SIZE_M // 2,
-        "BLOCK_SIZE_N": BLOCK_SIZE_N // 2,
-        "TOPK": topk,
-    }
+    common_args += (
+        token_num,
+        N_i,
+        BLOCK_SIZE_M // 2,  # BLOCK_SIZE_M
+        BLOCK_SIZE_N // 2,  # BLOCK_SIZE_N
+        topk,  # TOPK
+    )
 
+    dev, stream = current_device_stream()
     if token_num > _FUSED_N_THRESHOLD:
         N_TILES = triton.cdiv(N_i, BLOCK_SIZE_N)
-        grid = (triton.cdiv(M_o, BLOCK_SIZE_M),)
-        _intj_launch(_moe_mxfp4_sort_kernel_fused_n, grid,
-            *common_args, **common_kwargs, N_TILES=N_TILES
+        _moe_mxfp4_sort_kernel_fused_n_launch(dev)(
+            stream, triton.cdiv(M_o, BLOCK_SIZE_M), *common_args, N_TILES
         )
     else:
-        grid = (triton.cdiv(M_o, BLOCK_SIZE_M), triton.cdiv(N_i, BLOCK_SIZE_N))
-        _intj_launch(_moe_mxfp4_sort_kernel, grid, *common_args, **common_kwargs)
+        _moe_mxfp4_sort_kernel_launch(dev)(
+            stream,
+            triton.cdiv(M_o, BLOCK_SIZE_M),
+            triton.cdiv(N_i, BLOCK_SIZE_N),
+            *common_args,
+        )
 
     # ``N_i`` was padded to a multiple of BLOCK_SIZE_N above, so ``N_o == N_i``
     # is also a multiple of BLOCK_SIZE_N and the flat view is well-defined.

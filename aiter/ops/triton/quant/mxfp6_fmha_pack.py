@@ -10,6 +10,7 @@ try:
     import triton.language as tl
 
     from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+    from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 
     _HAVE_TRITON = True
 except ImportError:
@@ -155,10 +156,10 @@ def quantize_fp6_v_clean_triton(
     kvtab = _v_kvtab_dev(v_fp8.device, direct_p)
     BLOCK_N = 128
     grid = (triton.cdiv(n_blocks, BLOCK_N),)
-    from intj.compat import launch
 
-    launch(
-        _pack_v_fp6_kernel,
+    dev, stream = current_device_stream()
+    _pack_v_fp6_kernel_launch(dev)(
+        stream,
         grid,
         v_fp8,
         out,
@@ -172,10 +173,10 @@ def quantize_fp6_v_clean_triton(
         h_kv,
         nT,
         n_blocks,
-        CLAMP_TAIL=False,
-        FIXED_E8M0=fixed_e8m0,
-        SEPARATE_OUTPUT=False,
-        BLOCK_N=BLOCK_N,
+        False,  # CLAMP_TAIL
+        fixed_e8m0,  # FIXED_E8M0
+        False,  # SEPARATE_OUTPUT
+        BLOCK_N,
     )
     return out.view(b, h_kv, nT * 12800)
 
@@ -196,10 +197,10 @@ def quantize_fp6_v_data_scale_triton(
     kvtab = _v_kvtab_dev(v_fp8.device, True)
     BLOCK_N = 128
     grid = (triton.cdiv(n_blocks, BLOCK_N),)
-    from intj.compat import launch
 
-    launch(
-        _pack_v_fp6_kernel,
+    dev, stream = current_device_stream()
+    _pack_v_fp6_kernel_launch(dev)(
+        stream,
         grid,
         v_fp8,
         data,
@@ -213,10 +214,10 @@ def quantize_fp6_v_data_scale_triton(
         h_kv,
         nT,
         n_blocks,
-        CLAMP_TAIL=sk % tile != 0,
-        FIXED_E8M0=fixed_e8m0,
-        SEPARATE_OUTPUT=True,
-        BLOCK_N=BLOCK_N,
+        sk % tile != 0,  # CLAMP_TAIL
+        fixed_e8m0,  # FIXED_E8M0
+        True,  # SEPARATE_OUTPUT
+        BLOCK_N,
     )
     return data, scale
 
@@ -383,6 +384,8 @@ if _HAVE_TRITON:
             scale_off = base + 12288 + physical_d * 4 + kvblk
             tl.store(out_ptr + scale_off, sb, mask=m)
 
+    _pack_v_fp6_kernel_launch = intj_handle(_pack_v_fp6_kernel)
+
 
 def _qk_field_perm() -> np.ndarray:
     """Per-output-field source index within a 32-block for the lastdim pack.
@@ -452,6 +455,8 @@ if _HAVE_TRITON:
         sb = ((E + 127) & 0xFF).to(tl.uint8)
         tl.store(scale_ptr + scale_off, sb, mask=m)
 
+    _pack_qk_fp6_kernel_launch = intj_handle(_pack_qk_fp6_kernel, options={"num_warps": 1})
+
     _gather_k_lds_repr = make_kernel_repr(
         "_gather_k_lds_kernel",
         [
@@ -493,6 +498,11 @@ if _HAVE_TRITON:
             bh * (DATA_HS // DATA_TILE_BYTES) * TILE_BYTES + tile * TILE_BYTES + in_tile
         )
         tl.store(buf_ptr + dst_addr, byte)
+
+    _gather_k_lds_kernel_launch = intj_handle(
+        _gather_k_lds_kernel,
+        options={"num_warps": 4},
+    )
 
     _fill_k_scale_tail_repr = make_kernel_repr(
         "_fill_k_scale_tail_kernel",
@@ -536,6 +546,12 @@ if _HAVE_TRITON:
         val = tl.load(scale_ptr + src, mask=valid, other=0).to(tl.uint8)
         tl.store(buf_ptr + dst, val)
 
+    _fill_k_scale_tail_kernel_launch = intj_handle(
+        _fill_k_scale_tail_kernel,
+        grid_arg=1,
+        options={"num_warps": 4},
+    )
+
 
 _QK_FIELD_PERM_CACHE: dict = {}
 
@@ -565,10 +581,10 @@ def quantize_fp6_lastdim_triton(x: "torch.Tensor"):
     # The hd128 FMHA workloads consistently select 16/1. Pin it to avoid paying and logging
     # the five-config autotune in every fresh benchmark process.
     grid = (triton.cdiv(n_blocks, 16),)
-    from intj.compat import launch
 
-    launch(
-        _pack_qk_fp6_kernel,
+    dev, stream = current_device_stream()
+    _pack_qk_fp6_kernel_launch(dev)(
+        stream,
         grid,
         xflat,
         packed,
@@ -577,8 +593,7 @@ def quantize_fp6_lastdim_triton(x: "torch.Tensor"):
         D,
         NB,
         n_blocks,
-        BLOCK_N=16,
-        num_warps=1,
+        16,  # BLOCK_N
     )
     return (
         packed.reshape(*lead, NB * 24),
@@ -683,10 +698,10 @@ def reorder_fp6_k_lds_order_triton(
     data_hs = nt * _K_COMPACT_DATA_BYTES
     assert data_hs % BLOCK == 0, (data_hs, BLOCK)
     grid = (b * h * (data_hs // BLOCK),)
-    from intj.compat import launch
 
-    launch(
-        _gather_k_lds_kernel,
+    dev, stream = current_device_stream()
+    _gather_k_lds_kernel_launch(dev)(
+        stream,
         grid,
         packed.reshape(-1),
         buf,
@@ -696,25 +711,23 @@ def reorder_fp6_k_lds_order_triton(
         k_tile_bytes,
         sk * h * 96,
         h,
-        DATA_TILE_BYTES=_K_COMPACT_DATA_BYTES,
-        BLOCK=BLOCK,
-        num_warps=4,
+        _K_COMPACT_DATA_BYTES,  # DATA_TILE_BYTES
+        BLOCK,
     )
     # Fill the per-tile 1024B scale tail: Region A (unshifted) + Region B (pre-shifted +1 byte, so
     # the kernel MFMA op_sel picks dblk1/dblk3 with no runtime shift). The B pre-shift reads 1 byte
     # past the last token's scale on the final tile -> the +256 buf slack keeps it mapped.
-    launch(
-        _fill_k_scale_tail_kernel,
-        (b * h * nt,),
+    _fill_k_scale_tail_kernel_launch(dev)(
+        stream,
+        b * h * nt,
         scale.reshape(-1),
         buf,
         sk,
         h,
         nt,
-        TILE_BYTES=_K_TILE_BYTES,
-        SCALE_TAIL_OFFSET=_K_SCALE_TAIL_OFFSET,
-        BLOCK=1024,
-        num_warps=4,
+        _K_TILE_BYTES,  # TILE_BYTES
+        _K_SCALE_TAIL_OFFSET,  # SCALE_TAIL_OFFSET
+        1024,  # BLOCK
     )
     k_view = buf.as_strided(
         (b, sk, h, _K_PACKED_ROW_BYTES),

@@ -68,13 +68,13 @@ against an upstream checkout formatted the same way shows the shims and nothing
 else.
 """
 
-from intj.compat import launch as _intj_launch
 from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 
 # vLLM's `.op` module binds these to the plain Triton ops unless the
 # `FLA_USE_FAST_OPS` env var is set, which neither aiter nor its CI sets.
@@ -123,6 +123,12 @@ def fused_gdn_gating_kernel_vllm(
     )
 
 
+_fused_gdn_gating_kernel_vllm_launch = intj_handle(
+    fused_gdn_gating_kernel_vllm,
+    options={"num_warps": 1},
+)
+
+
 def fused_gdn_gating_vllm(
     A_log: torch.Tensor,
     a: torch.Tensor,
@@ -142,7 +148,10 @@ def fused_gdn_gating_vllm(
     grid = (batch, seq_len, triton.cdiv(num_heads, 8))
     g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
     beta_output = torch.empty(1, batch, num_heads, dtype=b.dtype, device=b.device)
-    _intj_launch(fused_gdn_gating_kernel_vllm, grid,
+    dev, stream = current_device_stream()
+    _fused_gdn_gating_kernel_vllm_launch(dev)(
+        stream,
+        grid,
         g,
         beta_output,
         A_log,
@@ -154,7 +163,6 @@ def fused_gdn_gating_vllm(
         beta,
         threshold,
         8,
-        num_warps=1,
     )
     return g, beta_output
 
@@ -884,6 +892,12 @@ def fused_sigmoid_gating_delta_rule_update_kernel_sglang(
                 tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
 
+_fused_sigmoid_gating_delta_rule_update_kernel_sglang_launch = intj_handle(
+    fused_sigmoid_gating_delta_rule_update_kernel_sglang,
+    options={"num_stages": 3, "num_warps": 1},
+)
+
+
 def fused_sigmoid_gating_delta_rule_update_sglang(
     A_log: torch.Tensor,
     a: torch.Tensor,
@@ -997,67 +1011,66 @@ def fused_sigmoid_gating_delta_rule_update_sglang(
         max_cache_len = 0
         stride_rawv_slot = stride_rawk_slot = stride_g_slot = stride_beta_slot = 0
 
-    _intj_launch(fused_sigmoid_gating_delta_rule_update_kernel_sglang, grid,
-        A_log=A_log,
-        a=a,
-        dt_bias=dt_bias,
-        softplus_beta=softplus_beta,
-        softplus_threshold=softplus_threshold,
-        lower_bound=lower_bound if lower_bound is not None else 0.0,
-        q=q,
-        k=k,
-        v=v,
-        b=b,
-        o=o,
-        h0_source=initial_state_source,
-        h0_indices=initial_state_indices,
+    dev, stream = current_device_stream()
+    _fused_sigmoid_gating_delta_rule_update_kernel_sglang_launch(dev)(
+        stream,
+        grid,
+        A_log,
+        a,
+        dt_bias,
+        softplus_beta,
+        softplus_threshold,
+        lower_bound if lower_bound is not None else 0.0,  # lower_bound
+        q,
+        k,
+        v,
+        b,
+        o,
+        initial_state_source,  # h0_source
+        initial_state_indices,  # h0_indices
         # Envelope-strided state pools (page-major / unified memory) have a
         # per-slot pitch != HV*K*V; contiguous pools pass exactly HV*K*V.
-        stride_h0_source=(
-            initial_state_source.stride(0) if initial_state_source is not None else 0
-        ),
-        cu_seqlens=cu_seqlens,
-        intermediate_states_buffer=intermediate_states_buffer,
-        intermediate_state_indices=intermediate_state_indices,
-        cache_steps=cache_stride_steps,
-        retrieve_parent_token_ptr=retrieve_parent_token,
-        stride_retrieve_parent_token_seq=stride_retrieve_parent_token_seq,
-        stride_retrieve_parent_token_token=stride_retrieve_parent_token_token,
-        scale=scale,
-        T=T,
-        stride_a=stride_a,
-        stride_q=stride_q,
-        stride_k=stride_k,
-        stride_v=stride_v,
-        stride_b=stride_b,
-        NP2_T=NP2_T,
-        B=B,
-        H=H,
-        HV=HV,
-        K=K,
-        V=V,
-        BK=BK,
-        BV=BV,
-        USE_INITIAL_STATE=initial_state_source is not None,
-        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
-        IS_VARLEN=cu_seqlens is not None,
-        IS_KDA=is_kda,
-        USE_LOWER_BOUND=lower_bound is not None,
-        DISABLE_STATE_UPDATE=disable_state_update,
-        CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
-        HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
-        replayssm_rawv=replayssm_rawv,
-        replayssm_rawk=replayssm_rawk,
-        replayssm_g=replayssm_g,
-        replayssm_beta=replayssm_beta,
-        stride_rawv_slot=stride_rawv_slot,
-        stride_rawk_slot=stride_rawk_slot,
-        stride_g_slot=stride_g_slot,
-        stride_beta_slot=stride_beta_slot,
-        MAX_CACHE_LEN=max_cache_len,
-        CACHE_RING=cache_ring,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        initial_state_source.stride(0) if initial_state_source is not None else 0,  # stride_h0_source
+        cu_seqlens,
+        intermediate_states_buffer,
+        intermediate_state_indices,
+        cache_stride_steps,  # cache_steps
+        retrieve_parent_token,  # retrieve_parent_token_ptr
+        stride_retrieve_parent_token_seq,
+        stride_retrieve_parent_token_token,
+        scale,
+        T,
+        stride_a,
+        stride_q,
+        stride_k,
+        stride_v,
+        stride_b,
+        NP2_T,
+        B,
+        H,
+        HV,
+        K,
+        V,
+        BK,
+        BV,
+        initial_state_source is not None,  # USE_INITIAL_STATE
+        use_qk_l2norm_in_kernel,  # USE_QK_L2NORM_IN_KERNEL
+        cu_seqlens is not None,  # IS_VARLEN
+        is_kda,  # IS_KDA
+        lower_bound is not None,  # USE_LOWER_BOUND
+        disable_state_update,  # DISABLE_STATE_UPDATE
+        intermediate_states_buffer is not None,  # CACHE_INTERMEDIATE_STATES
+        retrieve_parent_token is not None,  # HAS_EAGLE_TREE_CUSTOM_ATTN_MASK
+        replayssm_rawv,
+        replayssm_rawk,
+        replayssm_g,
+        replayssm_beta,
+        stride_rawv_slot,
+        stride_rawk_slot,
+        stride_g_slot,
+        stride_beta_slot,
+        max_cache_len,  # MAX_CACHE_LEN
+        cache_ring,  # CACHE_RING
     )
     o = o.squeeze(0)
     return o

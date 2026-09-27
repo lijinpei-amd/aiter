@@ -29,6 +29,7 @@ from aiter.ops.triton._triton_kernels.rope.rope import (
     _rope_kernel_thd_cached_2c_fwd,
     _rope_kernel_thd_fwd,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 __all__ = [
@@ -44,6 +45,12 @@ _LOGGER = AiterTritonLogger()
 class RotateStyle(IntEnum):
     NEOX = (0,)
     GPTJ = 1
+
+
+_rope_kernel_sbhd_fwd_launch = intj_handle(
+    _rope_kernel_sbhd_fwd,
+    options={"num_warps": 4, "waves_per_eu": 0},
+)
 
 
 # TODO: For now BLOCK_D is assumed to be power of 2. Expand to handle other value of D.
@@ -78,11 +85,12 @@ def _rope_fwd(
 
     # TODO: performance optimization
     BLOCK_S = 32
-    num_warps = 4
-    waves_per_eu = 0
     grid = (b, h, triton.cdiv(s, BLOCK_S))
 
-    _intj_launch(_rope_kernel_sbhd_fwd, grid,
+    dev, stream = current_device_stream()
+    _rope_kernel_sbhd_fwd_launch(dev)(
+        stream,
+        grid,
         x,
         freqs,
         out,
@@ -90,16 +98,14 @@ def _rope_fwd(
         *freqs.stride(),
         *out.stride(),
         s,
-        HAVE_NOPE=have_nope,
-        NOPE_FIRST=nope_first,
-        INPLACE=inplace,
-        REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
-        IS_NEOX=(rotate_style == RotateStyle.NEOX),
-        BLOCK_S=BLOCK_S,
-        BLOCK_D=BLOCK_D,
-        BLOCK_D_HALF=BLOCK_D_HALF,
-        num_warps=num_warps,
-        waves_per_eu=waves_per_eu,
+        have_nope,  # HAVE_NOPE
+        nope_first,  # NOPE_FIRST
+        inplace,  # INPLACE
+        reuse_freqs_front_part,  # REUSE_FREQS_FRONT_PART
+        rotate_style == RotateStyle.NEOX,  # IS_NEOX
+        BLOCK_S,
+        BLOCK_D,
+        BLOCK_D_HALF,
     )
 
     return out
@@ -154,6 +160,12 @@ def rope_fwd_inplace(
     return out
 
 
+_rope_kernel_sbhd_bwd_launch = intj_handle(
+    _rope_kernel_sbhd_bwd,
+    options={"num_warps": 4, "waves_per_eu": 0},
+)
+
+
 def _rope_bwd(
     x: torch.Tensor,
     out: torch.Tensor,
@@ -185,11 +197,12 @@ def _rope_bwd(
 
     # TODO: performance optimization
     BLOCK_S = 32
-    num_warps = 4
-    waves_per_eu = 0
     grid = (b, h, triton.cdiv(s, BLOCK_S))
 
-    _intj_launch(_rope_kernel_sbhd_bwd, grid,
+    dev, stream = current_device_stream()
+    _rope_kernel_sbhd_bwd_launch(dev)(
+        stream,
+        grid,
         x,
         freqs,
         out,
@@ -197,16 +210,14 @@ def _rope_bwd(
         *freqs.stride(),
         *out.stride(),
         s,
-        HAVE_NOPE=have_nope,
-        NOPE_FIRST=nope_first,
-        INPLACE=inplace,
-        REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
-        IS_NEOX=(rotate_style == RotateStyle.NEOX),
-        BLOCK_S=BLOCK_S,
-        BLOCK_D=BLOCK_D,
-        BLOCK_D_HALF=BLOCK_D_HALF,
-        num_warps=num_warps,
-        waves_per_eu=waves_per_eu,
+        have_nope,  # HAVE_NOPE
+        nope_first,  # NOPE_FIRST
+        inplace,  # INPLACE
+        reuse_freqs_front_part,  # REUSE_FREQS_FRONT_PART
+        rotate_style == RotateStyle.NEOX,  # IS_NEOX
+        BLOCK_S,
+        BLOCK_D,
+        BLOCK_D_HALF,
     )
 
     return out
@@ -235,6 +246,12 @@ def rope_bwd(
     )
 
     return out
+
+
+_rope_kernel_thd_fwd_launch = intj_handle(
+    _rope_kernel_thd_fwd,
+    options={"num_warps": 4, "waves_per_eu": 0},
+)
 
 
 def _rope_thd_fwd(
@@ -270,11 +287,12 @@ def _rope_thd_fwd(
 
     # TODO: performance optimization
     BLOCK_T = 32
-    num_warps = 4
-    waves_per_eu = 0
     grid = (b, h, triton.cdiv(t, BLOCK_T))
 
-    _intj_launch(_rope_kernel_thd_fwd, grid,
+    dev, stream = current_device_stream()
+    _rope_kernel_thd_fwd_launch(dev)(
+        stream,
+        grid,
         x,
         cu_seqlens,
         freqs,
@@ -282,16 +300,14 @@ def _rope_thd_fwd(
         *x.stride(),
         *freqs.stride(),
         *out.stride(),
-        HAVE_NOPE=have_nope,
-        NOPE_FIRST=nope_first,
-        INPLACE=inplace,
-        REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
-        IS_NEOX=(rotate_style == RotateStyle.NEOX),
-        BLOCK_T=BLOCK_T,
-        BLOCK_D=BLOCK_D,
-        BLOCK_D_HALF=BLOCK_D_HALF,
-        num_warps=num_warps,
-        waves_per_eu=waves_per_eu,
+        have_nope,  # HAVE_NOPE
+        nope_first,  # NOPE_FIRST
+        inplace,  # INPLACE
+        reuse_freqs_front_part,  # REUSE_FREQS_FRONT_PART
+        rotate_style == RotateStyle.NEOX,  # IS_NEOX
+        BLOCK_T,
+        BLOCK_D,
+        BLOCK_D_HALF,
     )
 
     return out
@@ -350,6 +366,12 @@ def rope_thd_fwd_inplace(
     return out
 
 
+_rope_kernel_thd_bwd_launch = intj_handle(
+    _rope_kernel_thd_bwd,
+    options={"num_warps": 4, "waves_per_eu": 0},
+)
+
+
 def _rope_thd_bwd(
     x: torch.Tensor,
     out: torch.Tensor,
@@ -383,11 +405,12 @@ def _rope_thd_bwd(
 
     # TODO: performance optimization
     BLOCK_T = 32
-    num_warps = 4
-    waves_per_eu = 0
     grid = (b, h, triton.cdiv(t, BLOCK_T))
 
-    _intj_launch(_rope_kernel_thd_bwd, grid,
+    dev, stream = current_device_stream()
+    _rope_kernel_thd_bwd_launch(dev)(
+        stream,
+        grid,
         x,
         cu_seqlens,
         freqs,
@@ -395,16 +418,14 @@ def _rope_thd_bwd(
         *x.stride(),
         *freqs.stride(),
         *out.stride(),
-        HAVE_NOPE=have_nope,
-        NOPE_FIRST=nope_first,
-        INPLACE=inplace,
-        REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
-        IS_NEOX=(rotate_style == RotateStyle.NEOX),
-        BLOCK_T=BLOCK_T,
-        BLOCK_D=BLOCK_D,
-        BLOCK_D_HALF=BLOCK_D_HALF,
-        num_warps=num_warps,
-        waves_per_eu=waves_per_eu,
+        have_nope,  # HAVE_NOPE
+        nope_first,  # NOPE_FIRST
+        inplace,  # INPLACE
+        reuse_freqs_front_part,  # REUSE_FREQS_FRONT_PART
+        rotate_style == RotateStyle.NEOX,  # IS_NEOX
+        BLOCK_T,
+        BLOCK_D,
+        BLOCK_D_HALF,
     )
 
     return out
@@ -435,6 +456,12 @@ def rope_thd_bwd(
     )
 
     return out
+
+
+_rope_kernel_sbhd_cached_fwd_launch = intj_handle(
+    _rope_kernel_sbhd_cached_fwd,
+    options={"num_warps": 4, "waves_per_eu": 0},
+)
 
 
 # TODO: For now BLOCK_D is assumed to be power of 2. Expand to handle other value of D.
@@ -472,12 +499,13 @@ def _rope_cached_fwd(
 
     # TODO: performance optimization
     BLOCK_S = 32
-    num_warps = 4
-    waves_per_eu = 0
     grid = (b, h, triton.cdiv(s, BLOCK_S))
 
     pos_stride = positions.stride() if positions is not None else (1, 1)
-    _intj_launch(_rope_kernel_sbhd_cached_fwd, grid,
+    dev, stream = current_device_stream()
+    _rope_kernel_sbhd_cached_fwd_launch(dev)(
+        stream,
+        grid,
         x,
         cos,
         sin,
@@ -489,18 +517,16 @@ def _rope_cached_fwd(
         *pos_stride,
         *out.stride(),
         s,
-        HAVE_NOPE=have_nope,
-        NOPE_FIRST=nope_first,
-        INPLACE=inplace,
-        REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
-        IS_NEOX=(rotate_style == RotateStyle.NEOX),
-        HAVE_POS=(positions is not None),
-        HAVE_OFFS=(offsets is not None),
-        BLOCK_S=BLOCK_S,
-        BLOCK_D=BLOCK_D,
-        BLOCK_D_HALF=BLOCK_D_HALF,
-        num_warps=num_warps,
-        waves_per_eu=waves_per_eu,
+        have_nope,  # HAVE_NOPE
+        nope_first,  # NOPE_FIRST
+        inplace,  # INPLACE
+        reuse_freqs_front_part,  # REUSE_FREQS_FRONT_PART
+        rotate_style == RotateStyle.NEOX,  # IS_NEOX
+        positions is not None,  # HAVE_POS
+        offsets is not None,  # HAVE_OFFS
+        BLOCK_S,
+        BLOCK_D,
+        BLOCK_D_HALF,
     )
 
     return out
@@ -683,6 +709,12 @@ def rope_cached_positions_offsets_fwd_inplace(
     return out
 
 
+_rope_kernel_sbhd_cached_bwd_launch = intj_handle(
+    _rope_kernel_sbhd_cached_bwd,
+    options={"num_warps": 4, "waves_per_eu": 0},
+)
+
+
 def _rope_cached_bwd(
     x: torch.Tensor,
     out: torch.Tensor,
@@ -757,12 +789,13 @@ def _rope_cached_bwd(
 
     # TODO: performance optimization
     BLOCK_S = 32
-    num_warps = 4
-    waves_per_eu = 0
     grid = (b, h, triton.cdiv(s, BLOCK_S))
 
     pos_stride = positions.stride() if positions is not None else (1, 1)
-    _intj_launch(_rope_kernel_sbhd_cached_bwd, grid,
+    dev, stream = current_device_stream()
+    _rope_kernel_sbhd_cached_bwd_launch(dev)(
+        stream,
+        grid,
         x,
         cos,
         sin,
@@ -774,18 +807,16 @@ def _rope_cached_bwd(
         *pos_stride,
         *out.stride(),
         s,
-        HAVE_NOPE=have_nope,
-        NOPE_FIRST=nope_first,
-        INPLACE=inplace,
-        REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
-        IS_NEOX=(rotate_style == RotateStyle.NEOX),
-        HAVE_POS=(positions is not None),
-        HAVE_OFFS=(offsets is not None),
-        BLOCK_S=BLOCK_S,
-        BLOCK_D=BLOCK_D,
-        BLOCK_D_HALF=BLOCK_D_HALF,
-        num_warps=num_warps,
-        waves_per_eu=waves_per_eu,
+        have_nope,  # HAVE_NOPE
+        nope_first,  # NOPE_FIRST
+        inplace,  # INPLACE
+        reuse_freqs_front_part,  # REUSE_FREQS_FRONT_PART
+        rotate_style == RotateStyle.NEOX,  # IS_NEOX
+        positions is not None,  # HAVE_POS
+        offsets is not None,  # HAVE_OFFS
+        BLOCK_S,
+        BLOCK_D,
+        BLOCK_D_HALF,
     )
 
     return out
@@ -879,6 +910,12 @@ def rope_cached_positions_offsets_bwd(
     )
 
     return out
+
+
+_rope_kernel_cached_thd_2c_gqa_onehead_fwd_launch = intj_handle(
+    _rope_kernel_cached_thd_2c_gqa_onehead_fwd,
+    options={"num_warps": 4, "waves_per_eu": 0},
+)
 
 
 def _rope_cached_thd_2c_fwd(
@@ -1029,7 +1066,10 @@ def _rope_cached_thd_2c_fwd(
             grid = (SPLIT_T, h, 1)
             num_warps = 4
             waves_per_eu = 0
-            _intj_launch(_rope_kernel_cached_thd_2c_gqa_onehead_fwd, grid,
+            dev, stream = current_device_stream()
+            _rope_kernel_cached_thd_2c_gqa_onehead_fwd_launch(dev)(
+                stream,
+                grid,
                 x,
                 y,
                 cos,
@@ -1045,19 +1085,17 @@ def _rope_cached_thd_2c_fwd(
                 *out_x.stride(),
                 *out_y.stride(),
                 t,
-                HAVE_NOPE=have_nope,
-                NOPE_FIRST=nope_first,
-                INPLACE=inplace,
-                REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
-                IS_NEOX=(rotate_style == RotateStyle.NEOX),
-                HAVE_POS=(positions is not None),
-                HAVE_OFFS=(offsets is not None),
-                BLOCK_T=BLOCK_T,
-                G=kh,
-                BLOCK_D=BLOCK_D,
-                BLOCK_D_HALF=BLOCK_D_HALF,
-                num_warps=num_warps,
-                waves_per_eu=waves_per_eu,
+                have_nope,  # HAVE_NOPE
+                nope_first,  # NOPE_FIRST
+                inplace,  # INPLACE
+                reuse_freqs_front_part,  # REUSE_FREQS_FRONT_PART
+                rotate_style == RotateStyle.NEOX,  # IS_NEOX
+                positions is not None,  # HAVE_POS
+                offsets is not None,  # HAVE_OFFS
+                BLOCK_T,
+                kh,  # G
+                BLOCK_D,
+                BLOCK_D_HALF,
             )
 
     return out_x, out_y
@@ -1195,6 +1233,12 @@ def rope_cached_thd_positions_offsets_2c_fwd_inplace(
     )
 
     return out_x, out_y
+
+
+_rope_kernel_cached_thd_2c_gqa_onehead_bwd_launch = intj_handle(
+    _rope_kernel_cached_thd_2c_gqa_onehead_bwd,
+    options={"num_warps": 4, "waves_per_eu": 0},
+)
 
 
 def _rope_cached_thd_positions_offsets_2c_bwd(
@@ -1345,7 +1389,10 @@ def _rope_cached_thd_positions_offsets_2c_bwd(
             grid = (SPLIT_T, h, 1)
             num_warps = 4
             waves_per_eu = 0
-            _intj_launch(_rope_kernel_cached_thd_2c_gqa_onehead_bwd, grid,
+            dev, stream = current_device_stream()
+            _rope_kernel_cached_thd_2c_gqa_onehead_bwd_launch(dev)(
+                stream,
+                grid,
                 x,
                 y,
                 cos,
@@ -1361,19 +1408,17 @@ def _rope_cached_thd_positions_offsets_2c_bwd(
                 *out_x.stride(),
                 *out_y.stride(),
                 t,
-                HAVE_NOPE=have_nope,
-                NOPE_FIRST=nope_first,
-                INPLACE=inplace,
-                REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
-                IS_NEOX=(rotate_style == RotateStyle.NEOX),
-                HAVE_POS=(positions is not None),
-                HAVE_OFFS=(offsets is not None),
-                BLOCK_T=BLOCK_T,
-                G=kh,
-                BLOCK_D=BLOCK_D,
-                BLOCK_D_HALF=BLOCK_D_HALF,
-                num_warps=num_warps,
-                waves_per_eu=waves_per_eu,
+                have_nope,  # HAVE_NOPE
+                nope_first,  # NOPE_FIRST
+                inplace,  # INPLACE
+                reuse_freqs_front_part,  # REUSE_FREQS_FRONT_PART
+                rotate_style == RotateStyle.NEOX,  # IS_NEOX
+                positions is not None,  # HAVE_POS
+                offsets is not None,  # HAVE_OFFS
+                BLOCK_T,
+                kh,  # G
+                BLOCK_D,
+                BLOCK_D_HALF,
             )
 
     return out_x, out_y
@@ -1446,6 +1491,9 @@ def rope_cached_thd_positions_offsets_2c_bwd(
     return out_x, out_y
 
 
+_rope_fwd_2d_kernel_neox_launch = intj_handle(_rope_fwd_2d_kernel_neox)
+
+
 def _rope_fwd_2d(
     x: torch.Tensor,
     out: torch.Tensor,
@@ -1464,7 +1512,10 @@ def _rope_fwd_2d(
     # out = torch.empty((b,wh,h,d), dtype=x.dtype, device=x.device, requires_grad=False)
 
     grid = (b, h, 1)
-    _intj_launch(_rope_fwd_2d_kernel_neox, grid,
+    dev, stream = current_device_stream()
+    _rope_fwd_2d_kernel_neox_launch(dev)(
+        stream,
+        grid,
         x,
         cos_h,
         sin_h,
@@ -1477,7 +1528,7 @@ def _rope_fwd_2d(
         wh,
         img_height,
         img_width,
-        BLOCK_D=d,
+        d,  # BLOCK_D
     )
 
     return out
@@ -1554,6 +1605,12 @@ def rope_fwd_2d_inplace(
     return out
 
 
+_rope_fwd_3d_launch = intj_handle(
+    _rope_fwd_3d,
+    options={"num_warps": 4, "waves_per_eu": 1},
+)
+
+
 def rope_fwd_3d(
     x,
     grid_sizes: tl.constexpr,
@@ -1578,10 +1635,10 @@ def rope_fwd_3d(
 
     grid = (B, n_heads, triton.cdiv(s, BLOCK_L))
 
-    num_warps = 4
-    waves_per_eu = 1
-
-    _intj_launch(_rope_fwd_3d, grid,
+    dev, stream = current_device_stream()
+    _rope_fwd_3d_launch(dev)(
+        stream,
+        grid,
         x,
         freqs_real,
         freqs_imag,
@@ -1602,13 +1659,11 @@ def rope_fwd_3d(
         s,
         1.0,
         0.0,
-        BLOCK_L=BLOCK_L,
-        BLOCK_N=BLOCK_N,
-        BLOCK_C=BLOCK_C,
-        C1=c1,
-        C2=c2,
-        num_warps=num_warps,
-        waves_per_eu=waves_per_eu,
+        BLOCK_L,
+        BLOCK_N,
+        BLOCK_C,
+        c1,  # C1
+        c2,  # C2
     )
 
     return out

@@ -3,7 +3,8 @@
 import torch
 import triton
 import triton.language as tl
-from intj.compat import launch as _intj_launch
+
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 
 
 @triton.jit
@@ -48,6 +49,12 @@ def fused_gdn_gating_sigmoid_kernel(
     tl.store(beta_ptr + off, blk_beta.to(beta_ptr.dtype.element_ty), mask=mask)
 
 
+_fused_gdn_gating_sigmoid_kernel_launch = intj_handle(
+    fused_gdn_gating_sigmoid_kernel,
+    options={"num_warps": 2},
+)
+
+
 def fused_gdn_gating_and_sigmoid(
     A_log: torch.Tensor,
     a: torch.Tensor,
@@ -64,7 +71,10 @@ def fused_gdn_gating_and_sigmoid(
     BLK_HEADS = triton.next_power_of_2(num_heads)
     grid = (seq_len,)
 
-    _intj_launch(fused_gdn_gating_sigmoid_kernel, grid,
+    dev, stream = current_device_stream()
+    _fused_gdn_gating_sigmoid_kernel_launch(dev)(
+        stream,
+        grid,
         g,
         beta,
         A_log,
@@ -75,7 +85,6 @@ def fused_gdn_gating_and_sigmoid(
         softplus_beta,
         softplus_threshold,
         BLK_HEADS,
-        num_warps=2,
     )
 
     return g, beta

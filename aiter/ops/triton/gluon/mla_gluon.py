@@ -55,6 +55,7 @@ from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 
 
 # fmt: off
@@ -819,6 +820,12 @@ def _mla_softmax_reducev_kernel(
             Final_lse + cur_batch * stride_fl_b + q_pos * stride_fl_qs + cur_head * stride_fl_h,
             e_max + tl.log(e_sum),
         )
+
+
+_mla_softmax_reducev_kernel_launch = intj_handle(
+    _mla_softmax_reducev_kernel,
+    options={"num_warps": 8},
+)
 # fmt: on
 
 
@@ -1104,7 +1111,10 @@ def mla_gluon(
     # grid axis 2 is q_pos (qlen). o uses the caller's layout (3-D or 4-D).
     grid_reduce = (batch_size, nhead, qlen)
     sl_b, sl_qs, sl_h, sl_split, _ = logits_buf.stride()
-    _intj_launch(_mla_softmax_reducev_kernel, grid_reduce,
+    dev, stream = current_device_stream()
+    _mla_softmax_reducev_kernel_launch(dev)(
+        stream,
+        grid_reduce,
         logits_buf,
         mid_lse,
         o,
@@ -1124,13 +1134,12 @@ def mla_gluon(
         stride_final_lse_b,
         stride_final_lse_s,
         stride_final_lse_h,
-        NUM_KV_SPLITS=NUM_KV_SPLITS,
-        HEAD_DIM_CKV=head_dim_ckv,
-        HAS_FINAL_LSE=return_lse,
-        USE_2D_VIEW=use_2d_view,
-        BLOCK_S=min(64, triton.next_power_of_2(NUM_KV_SPLITS)),
-        BLOCK_N=BLOCK_N,
-        num_warps=8,
+        NUM_KV_SPLITS,
+        head_dim_ckv,  # HEAD_DIM_CKV
+        return_lse,  # HAS_FINAL_LSE
+        use_2d_view,  # USE_2D_VIEW
+        min(64, triton.next_power_of_2(NUM_KV_SPLITS)),  # BLOCK_S
+        BLOCK_N,
     )
 
     return o, final_lse

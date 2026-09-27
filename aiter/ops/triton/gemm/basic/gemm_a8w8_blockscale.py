@@ -6,8 +6,6 @@ import os
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from packaging.version import Version
 
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
@@ -24,6 +22,8 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -34,6 +34,12 @@ _GLUON_SUPPORTED_ARCHS = ("gfx950", "gfx1250")
 _GLUON_PRESHUFFLE_ARCHS = ("gfx1250",)
 _GLUON_DEFAULT_ARCHS = ("gfx1250",)
 _GLUON_KERNEL_TYPES = ("bandwidth_bound", "compute_bound")
+
+
+_gemm_splitk_reduce_kernel_launch = intj_handle(
+    _gemm_splitk_reduce_kernel,
+    baked={"KERNEL_NAME": "_gemm_a8w8_blockscale_reduce_kernel", "activation": ""},
+)
 
 
 def gemm_a8w8_blockscale(
@@ -217,7 +223,10 @@ def gemm_a8w8_blockscale(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _intj_launch(_gemm_splitk_reduce_kernel, grid_reduce,
+        dev, stream = current_device_stream()
+        _gemm_splitk_reduce_kernel_launch(dev)(
+            stream,
+            grid_reduce,
             y_pp,
             y,
             None,
@@ -232,10 +241,8 @@ def gemm_a8w8_blockscale(
             REDUCE_BLOCK_SIZE_N,
             ACTUAL_KSPLIT,
             triton.next_power_of_2(config["NUM_KSPLIT"]),
-            ADD_BIAS=False,
-            activation="",
-            use_activation=False,
-            KERNEL_NAME="_gemm_a8w8_blockscale_reduce_kernel",
+            False,  # ADD_BIAS
+            False,  # use_activation
         )
 
     return y
@@ -438,7 +445,10 @@ def gemm_a8w8_blockscale_preshuffle(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _intj_launch(_gemm_splitk_reduce_kernel, grid_reduce,
+        dev, stream = current_device_stream()
+        _gemm_splitk_reduce_kernel_launch(dev)(
+            stream,
+            grid_reduce,
             y_pp,
             y,
             None,
@@ -453,10 +463,8 @@ def gemm_a8w8_blockscale_preshuffle(
             REDUCE_BLOCK_SIZE_N,
             ACTUAL_KSPLIT,
             triton.next_power_of_2(config["NUM_KSPLIT"]),
-            ADD_BIAS=False,
-            activation="",
-            use_activation=False,
-            KERNEL_NAME="_gemm_a8w8_blockscale_reduce_kernel",
+            False,  # ADD_BIAS
+            False,  # use_activation
         )
 
     return y

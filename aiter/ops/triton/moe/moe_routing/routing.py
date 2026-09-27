@@ -3,7 +3,6 @@ from dataclasses import dataclass, field
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.moe.moe_routing.routing import (
     _combined_routing,
@@ -13,6 +12,7 @@ from aiter.ops.triton._triton_kernels.moe.moe_routing.routing import (
 )
 from aiter.ops.triton.moe.moe_routing.topk import grouped_topk
 from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 
 # HERD (Hot-Expert Routing for Decode): when AITER_TRITON_USE_HERD is set, the flat-topk
 # path uses fused min-unique routing (top-(k+1) -> drop least-batch-popular -> keep-k)
@@ -85,6 +85,13 @@ class RoutingData:
 # --------------------------
 
 
+_combined_routing_launch = intj_handle(
+    _combined_routing,
+    grid_arg=1,
+    options={"num_warps": 1},
+)
+
+
 def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M):
     cdiv = triton.cdiv
 
@@ -115,7 +122,10 @@ def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOC
 
     indx_offs = partial_hist
 
-    _intj_launch(_combined_routing, (blocks1a + blocks1b,),
+    dev, stream = current_device_stream()
+    _combined_routing_launch(dev)(
+        stream,
+        blocks1a + blocks1b,
         topk_indx,
         gate_indx,
         gate_scal,  # outputs
@@ -137,10 +147,9 @@ def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOC
         block_pid_map,
         block_pid_map.shape[0],
         block_m_log2,
-        BLOCK_A=BLOCK_A,
-        EQUAL_A=(hist.shape[0] == BLOCK_A),  # optimization parameters
-        USE_TDM=is_tdm_avail(),
-        num_warps=1,
+        BLOCK_A,
+        hist.shape[0] == BLOCK_A,  # EQUAL_A
+        is_tdm_avail(),  # USE_TDM
     )
 
     return (
@@ -152,6 +161,13 @@ def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOC
         token_offs_pad,
         block_pid_map,
     )
+
+
+_combined_routing_fused_launch = intj_handle(
+    _combined_routing_fused,
+    grid_arg=1,
+    options={"num_warps": 1},
+)
 
 
 def sort_tokens_fused(
@@ -185,7 +201,10 @@ def sort_tokens_fused(
 
     blocks1b = cdiv(n_tokens, HIST_BLOCK_M)
 
-    _intj_launch(_combined_routing_fused, (blocks1a + blocks1b,),
+    dev, stream = current_device_stream()
+    _combined_routing_fused_launch(dev)(
+        stream,
+        blocks1a + blocks1b,
         topk_indx,
         gate_indx,
         gate_scal,  # outputs
@@ -209,10 +228,9 @@ def sort_tokens_fused(
         block_pid_map,
         block_pid_map.shape[0],
         block_m_log2,
-        BLOCK_A=BLOCK_A,
-        EQUAL_A=(hist.shape[0] == BLOCK_A),  # optimization parameters
-        USE_TDM=is_tdm_avail(),
-        num_warps=1,
+        BLOCK_A,
+        hist.shape[0] == BLOCK_A,  # EQUAL_A
+        is_tdm_avail(),  # USE_TDM
     )
 
     return (
@@ -548,6 +566,13 @@ def _ep_sort_scratch(device, n_bins):
     return bufs
 
 
+_ep_gate_prep_scan_kernel_launch = intj_handle(_ep_gate_prep_scan_kernel, grid_arg=1)
+_ep_scatter_atomic_expt_data_kernel_launch = intj_handle(
+    _ep_scatter_atomic_expt_data_kernel,
+    grid_arg=1,
+)
+
+
 def ep_sort_routing(
     dispatch_weights,
     dispatch_ids,
@@ -622,7 +647,10 @@ def ep_sort_routing(
     else:
         dst_row = torch.empty(n_gates, dtype=torch.int32, device=device)
         src_token_map = ep_scatter_geometry.src_token_map
-    _intj_launch(_ep_gate_prep_scan_kernel, (n_ctas,),
+    dev, stream = current_device_stream()
+    _ep_gate_prep_scan_kernel_launch(dev)(
+        stream,
+        n_ctas,
         dispatch_ids,
         expert_map,
         num_local_tokens,
@@ -639,22 +667,24 @@ def ep_sort_routing(
         block_pid_map.shape[0],
         n_gates,
         expert_map.numel(),
-        N_EXPTS=num_local_experts,
-        TOPK=topk,
-        SENTINEL=sentinel,
-        N_BINS=n_bins,
-        BLOCK=GATE_BLOCK,
-        tile_dim_log2=block_m_log2,
-        BLOCK_A=BLOCK_A,
-        EQUAL_A=(num_local_experts == BLOCK_A),
-        N_CTAS=n_ctas,
-        HAS_DST_ROW=dst_row is not None,
+        num_local_experts,  # N_EXPTS
+        topk,  # TOPK
+        sentinel,  # SENTINEL
+        n_bins,  # N_BINS
+        GATE_BLOCK,  # BLOCK
+        block_m_log2,  # tile_dim_log2
+        BLOCK_A,
+        num_local_experts == BLOCK_A,  # EQUAL_A
+        n_ctas,  # N_CTAS
+        dst_row is not None,  # HAS_DST_ROW
     )
 
     topk_indx = torch.empty(n_gates, dtype=torch.int32, device=device)
     gate_indx = torch.empty(n_gates, dtype=torch.int32, device=device)
     gate_scal = torch.empty(n_gates, dtype=torch.float32, device=device)
-    _intj_launch(_ep_scatter_atomic_expt_data_kernel, (num_local_experts + n_ctas,),
+    _ep_scatter_atomic_expt_data_kernel_launch(dev)(
+        stream,
+        num_local_experts + n_ctas,
         expt_indx,
         dispatch_weights,
         cursor,
@@ -667,18 +697,16 @@ def ep_sort_routing(
         dst_row,
         src_token_map,
         n_gates,
-        N_EXPTS=num_local_experts,
-        SENTINEL=sentinel,
-        tile_dim_log2=block_m_log2,
-        GATE_BLOCK=GATE_BLOCK,
-        HAS_DST_ROW=dst_row is not None,
-        TOPK=topk,
-        MAX_TOK=(
-            0
+        num_local_experts,  # N_EXPTS
+        sentinel,  # SENTINEL
+        block_m_log2,  # tile_dim_log2
+        GATE_BLOCK,
+        dst_row is not None,  # HAS_DST_ROW
+        topk,  # TOPK
+        (0
             if ep_scatter_geometry is None
-            else ep_scatter_geometry.max_tokens_per_rank
-        ),
-        PEER_ROWS=(0 if ep_scatter_geometry is None else ep_scatter_geometry.peer_rows),
+            else ep_scatter_geometry.max_tokens_per_rank),  # MAX_TOK
+        0 if ep_scatter_geometry is None else ep_scatter_geometry.peer_rows,  # PEER_ROWS
     )
     return hist, topk_indx, gate_indx, gate_scal, gate_valid, dst_row
 

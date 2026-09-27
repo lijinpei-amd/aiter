@@ -1,13 +1,16 @@
 import torch
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.fusions.fused_qk_concat import (
     _qk_cat_kernel,
     _qk_rope_cat_kernel,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+
+_qk_cat_kernel_launch = intj_handle(_qk_cat_kernel)
 
 
 def fused_qk_cat(
@@ -56,7 +59,10 @@ def fused_qk_cat(
 
     grid = (b, qh, 1)
 
-    _intj_launch(_qk_cat_kernel, grid,
+    dev, stream = current_device_stream()
+    _qk_cat_kernel_launch(dev)(
+        stream,
+        grid,
         q1,
         q2,
         k1,
@@ -69,12 +75,15 @@ def fused_qk_cat(
         *k2.stride(),
         *q_out.stride(),
         *k_out.stride(),
-        QH_PER_KH=qh // kh,
-        BLOCK_D1=d1,
-        BLOCK_D2=d2,
+        qh // kh,  # QH_PER_KH
+        d1,  # BLOCK_D1
+        d2,  # BLOCK_D2
     )
 
     return q_out, k_out
+
+
+_qk_rope_cat_kernel_launch = intj_handle(_qk_rope_cat_kernel)
 
 
 def fused_qk_rope_cat(
@@ -140,7 +149,10 @@ def fused_qk_rope_cat(
 
     grid = (b, qh, 1)
 
-    _intj_launch(_qk_rope_cat_kernel, grid,
+    dev, stream = current_device_stream()
+    _qk_rope_cat_kernel_launch(dev)(
+        stream,
+        grid,
         q_nope,
         q_pe,
         k_nope,
@@ -159,12 +171,12 @@ def fused_qk_rope_cat(
         cos.stride(-1),
         *q_out.stride(),
         *k_out.stride(),
-        QH_PER_KH=qh // kh,
-        REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
-        IS_NEOX=is_neox,
-        BLOCK_D_nope=d_nope,
-        BLOCK_D_pe=d_pe,
-        BLOCK_D_HALF_pe=d_pe // 2,
+        qh // kh,  # QH_PER_KH
+        reuse_freqs_front_part,  # REUSE_FREQS_FRONT_PART
+        is_neox,  # IS_NEOX
+        d_nope,  # BLOCK_D_nope
+        d_pe,  # BLOCK_D_pe
+        d_pe // 2,  # BLOCK_D_HALF_pe
     )
 
     return q_out, k_out

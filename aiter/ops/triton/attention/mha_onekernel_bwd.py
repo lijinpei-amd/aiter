@@ -4,7 +4,6 @@
 import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.attention.mha_onekernel_bwd import (
     _bwd_preprocess,
@@ -12,6 +11,7 @@ from aiter.ops.triton._triton_kernels.attention.mha_onekernel_bwd import (
     bwd_kernel_causal,
     bwd_kernel_noncausal,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import _is_fp8
 
@@ -24,6 +24,9 @@ DROPOUT_DUMP = False
 
 tl_DROPOUT_USE_PYTORCH: tl.constexpr = triton.language.constexpr(DROPOUT_USE_PYTORCH)
 tl_DROPOUT_DUMP: tl.constexpr = triton.language.constexpr(DROPOUT_DUMP)
+
+
+_bwd_preprocess_launch = intj_handle(_bwd_preprocess)
 
 
 def flash_attn_onekernel_backward(
@@ -222,7 +225,10 @@ def flash_attn_onekernel_backward(
         batch,
         num_q_heads,
     )
-    _intj_launch(_bwd_preprocess, pre_grid,
+    dev, stream = current_device_stream()
+    _bwd_preprocess_launch(dev)(
+        stream,
+        pre_grid,
         o,
         do,
         delta,
@@ -233,11 +239,11 @@ def flash_attn_onekernel_backward(
         cu_seqlens_q,
         max_seqlen_q,
         descale_do,
-        BLOCK_M=config["preprocess_kernel"]["PRE_BLOCK"],
-        BLOCK_D_MODEL=v_head_dim,
-        BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
-        IS_VARLEN=IS_VARLEN,
-        IS_FP8=IS_FP8,
+        config["preprocess_kernel"]["PRE_BLOCK"],  # BLOCK_M
+        v_head_dim,  # BLOCK_D_MODEL
+        BLOCK_D_MODEL_POW2,
+        IS_VARLEN,
+        IS_FP8,
     )
 
     # dropout_mask

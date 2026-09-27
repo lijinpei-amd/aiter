@@ -34,6 +34,7 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.triton.utils.config_utils import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
 
 enable_aot_gluon_pa_mqa_logits = os.environ.get(
@@ -426,6 +427,12 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     return kernel
 
 
+_deepgemm_fp8_paged_mqa_logits_varctx_schedule_launch = intj_handle(
+    _deepgemm_fp8_paged_mqa_logits_varctx_schedule,
+    options={"waves_per_eu": 4},
+)
+
+
 def deepgemm_fp8_paged_mqa_logits_schedule(
     batch_size,
     next_n,
@@ -450,7 +457,10 @@ def deepgemm_fp8_paged_mqa_logits_schedule(
         device="cuda",
         dtype=torch.int32,
     )
-    _intj_launch(_deepgemm_fp8_paged_mqa_logits_varctx_schedule, grid,
+    dev, stream = current_device_stream()
+    _deepgemm_fp8_paged_mqa_logits_varctx_schedule_launch(dev)(
+        stream,
+        grid,
         batch_size,
         context_lens,
         safe_chunks_per_cta,
@@ -458,7 +468,6 @@ def deepgemm_fp8_paged_mqa_logits_schedule(
         ChunkK,
         align_power_of_2_batch,
         TryCount,
-        waves_per_eu=schedule_waves_per_eu,
     )
     return safe_chunks_per_cta
 

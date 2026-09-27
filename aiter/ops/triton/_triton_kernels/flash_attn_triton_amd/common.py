@@ -11,7 +11,6 @@ from typing import Literal
 import torch
 import triton
 import triton.language as tl
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
     DEBUG,
@@ -19,6 +18,7 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
     get_stride_from_layout,
     is_fp8,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 
 
 @triton.jit
@@ -154,6 +154,9 @@ def _cast_varlen_to_fp8_kernel_2d(
             + offs_dim[None, :] * stride_out_dim
         )
         tl.store(X_fp8 + addr_out, x_fp8_block, mask=mask_seq)
+
+
+_cast_varlen_to_fp8_kernel_2d_launch = intj_handle(_cast_varlen_to_fp8_kernel_2d)
 
 
 @triton.jit
@@ -321,7 +324,10 @@ def cast_to_fp8(
     stride_desc_batch, stride_desc_head = descale_factors.stride()
 
     grid = (batch, num_heads)
-    _intj_launch(_cast_varlen_to_fp8_kernel_2d, grid,
+    dev, stream = current_device_stream()
+    _cast_varlen_to_fp8_kernel_2d_launch(dev)(
+        stream,
+        grid,
         x,
         x_fp8,
         descale_factors,
@@ -340,10 +346,10 @@ def cast_to_fp8(
         stride_desc_head,
         clamp_val,
         fp8_max,
-        BLOCK_SIZE=BLOCK_SIZE,
-        HEAD_DIM=padded_head_dim,
-        ACTUAL_HEAD_DIM=head_dim,
-        IS_VARLEN=is_varlen,
+        BLOCK_SIZE,
+        padded_head_dim,  # HEAD_DIM
+        head_dim,  # ACTUAL_HEAD_DIM
+        is_varlen,  # IS_VARLEN
     )
 
     return x_fp8, descale_factors

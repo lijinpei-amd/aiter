@@ -6,11 +6,11 @@ from functools import lru_cache
 import torch
 import triton
 import triton.language as tl
-from intj.compat import launch as _intj_launch
 from triton.language.extra.hip import libdevice as hip_libdevice
 
 import aiter
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 
 _FLYDSL_REDUCE_DTYPE_NAMES = {
     torch.float32: "f32",
@@ -4032,6 +4032,11 @@ def paged_attention_decode_ps_reduce_kernel(
     )
 
 
+_paged_attention_decode_ps_reduce_kernel_launch = intj_handle(
+    paged_attention_decode_ps_reduce_kernel,
+)
+
+
 @triton.jit
 def paged_attention_decode_v2_reduce_kernel(
     output_ptr,  # [num_seqs, query_length, num_kv_heads, query_group_size, head_size]
@@ -4264,6 +4269,11 @@ def paged_attention_decode_v2_reduce_kernel(
         final_output.to(output_ptr.dtype.element_ty),
         mask=output_mask,
     )
+
+
+_paged_attention_decode_v2_reduce_kernel_launch = intj_handle(
+    paged_attention_decode_v2_reduce_kernel,
+)
 
 
 def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
@@ -4590,7 +4600,10 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
             )
             return
         ps_reduce_grid = (grid[0], grid[1], query_seq_len * query_group_size)
-        _intj_launch(paged_attention_decode_ps_reduce_kernel, ps_reduce_grid,
+        dev, stream = current_device_stream()
+        _paged_attention_decode_ps_reduce_kernel_launch(dev)(
+            stream,
+            ps_reduce_grid,
             output_ptr,
             exp_sums_ptr,
             max_logits_ptr,
@@ -4607,15 +4620,18 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
             stride_logits_head,
             stride_logits_part,
             stride_logits_group,
-            query_group_size=query_group_size,
-            head_size=head_size,
-            context_partition_num=context_partition_num,
-            HEAD_SIZE_POW2=triton.next_power_of_2(head_size),
-            USE_SINKS=sink_token_ptr is not None,
-            MAX_CONTEXT_PARTITION_NUM=triton.next_power_of_2(context_partition_num),
+            head_size,
+            context_partition_num,
+            query_group_size,
+            triton.next_power_of_2(head_size),  # HEAD_SIZE_POW2
+            sink_token_ptr is not None,  # USE_SINKS
+            triton.next_power_of_2(context_partition_num),  # MAX_CONTEXT_PARTITION_NUM
         )
     else:
-        _intj_launch(paged_attention_decode_v2_reduce_kernel, grid,
+        dev, stream = current_device_stream()
+        _paged_attention_decode_v2_reduce_kernel_launch(dev)(
+            stream,
+            grid,
             output_ptr,
             exp_sums_ptr,
             max_logits_ptr,
@@ -4633,14 +4649,14 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
             stride_logits_head,
             stride_logits_part,
             stride_logits_group,
-            head_size=head_size,
-            num_seqs=grid[0],
-            num_kv_heads=grid[1],
-            OUTPUT_SEQ_LEN=query_seq_len,
-            ONE_OUTPUT_GROUP_SIZE=query_group_size,
-            HEAD_SIZE_POW2=triton.next_power_of_2(head_size),
-            CONTEXT_PARTITION_SIZE=CONTEXT_PARTITION_SIZE,
-            USE_SINKS=sink_token_ptr is not None,
+            head_size,
+            grid[0],  # num_seqs
+            grid[1],  # num_kv_heads
+            query_seq_len,  # OUTPUT_SEQ_LEN
+            query_group_size,  # ONE_OUTPUT_GROUP_SIZE
+            triton.next_power_of_2(head_size),  # HEAD_SIZE_POW2
+            CONTEXT_PARTITION_SIZE,
+            sink_token_ptr is not None,  # USE_SINKS
         )
 
 

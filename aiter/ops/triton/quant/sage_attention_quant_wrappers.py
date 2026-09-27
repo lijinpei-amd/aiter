@@ -19,6 +19,7 @@ from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     sage_quant_v_mxfp4_colmajor_kernel,
 )
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 
 
 def _bshd_order(layout):
@@ -27,6 +28,12 @@ def _bshd_order(layout):
     if layout == "bhsd":
         return [0, 2, 1, 3]
     raise ValueError(f"Unknown tensor layout: {layout}")
+
+
+_sage_quant_v_kernel_launch = intj_handle(
+    sage_quant_v_kernel,
+    options={"num_stages": 3, "num_warps": 8},
+)
 
 
 def sage_quant_mxfp4(
@@ -81,10 +88,9 @@ def sage_quant_mxfp4(
         smooth_k=smooth_k,
     )
 
-    from intj.compat import launch
-
-    launch(
-        sage_quant_v_kernel,
+    dev, stream = current_device_stream()
+    _sage_quant_v_kernel_launch(dev)(
+        stream,
         grid,
         v,
         v_fp8,
@@ -99,10 +105,8 @@ def sage_quant_mxfp4(
         h_kv,
         K_NUM_BLKS,
         kv_len,
-        D=head_dim,
-        BLK_K=BLKK,
-        num_stages=3,
-        num_warps=8,
+        head_dim,  # D
+        BLKK,  # BLK_K
     )
 
     downcast_func = downcast_to_mxfp
@@ -140,6 +144,10 @@ def sage_quant_mxfp4(
     return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale, delta_s, delta_lse
 
 
+_q_smooth_int8_kernel_launch = intj_handle(_q_smooth_int8_kernel)
+_compute_delta_s_kernel_launch = intj_handle(_compute_delta_s_kernel)
+
+
 def _apply_int8_q_smoothing(q, k, BLKQ, layout, sm_scale):
     """Center Q per block and compute delta_s bias for INT8 Sage v1 (no Hadamard)."""
     order = _bshd_order(layout)
@@ -161,10 +169,10 @@ def _apply_int8_q_smoothing(q, k, BLKQ, layout, sm_scale):
 
     sm_scale_log2 = sm_scale * 1.4426950408889634
     grid_q = (b * h_q, Q_NUM_BLKS, triton.cdiv(d, 32))
-    from intj.compat import launch
 
-    launch(
-        _q_smooth_int8_kernel,
+    dev, stream = current_device_stream()
+    _q_smooth_int8_kernel_launch(dev)(
+        stream,
         grid_q,
         q,
         q_out,
@@ -185,13 +193,13 @@ def _apply_int8_q_smoothing(q, k, BLKQ, layout, sm_scale):
         h_q,
         s_q,
         d,
-        BLOCK_M=BLKQ,
-        BLOCK_D=32,
+        BLKQ,  # BLOCK_M
+        32,  # BLOCK_D
     )
 
     grid_delta = (b * h_q, Q_NUM_BLKS, K_NUM_BLKS)
-    launch(
-        _compute_delta_s_kernel,
+    _compute_delta_s_kernel_launch(dev)(
+        stream,
         grid_delta,
         q_mean,
         k,
@@ -212,7 +220,7 @@ def _apply_int8_q_smoothing(q, k, BLKQ, layout, sm_scale):
         h_k,
         s_k,
         d,
-        BLOCK_N=BLKQ,
+        BLKQ,  # BLOCK_N
     )
     return q_out, delta_s
 
@@ -255,6 +263,12 @@ def fp4_v_raw_buffer_size(batch, sequence, heads):
     )
 
 
+_sage_quant_v_fp4_colmajor_kernel_launch = intj_handle(
+    sage_quant_v_fp4_colmajor_kernel,
+    grid_arg=1,
+)
+
+
 def sage_quant_v_f4f4(v, layout="bshd"):
     """Pack per-channel FP4 V into a padded, slack-backed col-major LDS layout."""
     if layout == "bshd":
@@ -281,11 +295,11 @@ def sage_quant_v_f4f4(v, layout="bshd"):
     packed = buf[: b * h_kv * padded_kv_len * FP4_V_PACKED_BYTES_PER_TOKEN].view(
         b, h_kv, nT * tile * FP4_V_PACKED_BYTES_PER_TOKEN
     )
-    from intj.compat import launch
 
-    launch(
-        sage_quant_v_fp4_colmajor_kernel,
-        (b * h_kv * nT * 8,),
+    dev, stream = current_device_stream()
+    _sage_quant_v_fp4_colmajor_kernel_launch(dev)(
+        stream,
+        b * h_kv * nT * 8,
         v_tok,
         packed,
         v_descale,
@@ -315,6 +329,13 @@ def sage_quant_v_f4f4(v, layout="bshd"):
     return v_fp4_view, v_descale
 
 
+_sage_quant_v_mxfp4_colmajor_kernel_launch = intj_handle(
+    sage_quant_v_mxfp4_colmajor_kernel,
+    grid_arg=1,
+    options={"num_stages": 1, "num_warps": 1},
+)
+
+
 @torch.library.custom_op("aiter::pack_v_mxfp4_colmajor_raw", mutates_args=())
 def pack_v_mxfp4_colmajor_raw(
     value: torch.Tensor,
@@ -340,11 +361,11 @@ def pack_v_mxfp4_colmajor_raw(
     value_bhsd = value.permute(0, 2, 1, 3)
     payload = raw[: batch * heads * tiles * 8192].view(batch, heads, tiles * 8192)
     kperm = _f4f4_v_kperm(value.device)
-    from intj.compat import launch
 
-    launch(
-        sage_quant_v_mxfp4_colmajor_kernel,
-        (batch * heads * tiles * 16,),
+    dev, stream = current_device_stream()
+    _sage_quant_v_mxfp4_colmajor_kernel_launch(dev)(
+        stream,
+        batch * heads * tiles * 16,
         value_bhsd,
         payload,
         scale,
@@ -360,8 +381,6 @@ def pack_v_mxfp4_colmajor_raw(
         heads,
         tiles,
         sequence,
-        num_warps=1,
-        num_stages=1,
     )
     return raw, scale
 
@@ -467,10 +486,10 @@ def sage_quant_mxfp6(
         K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
         v_scale = v.abs().amax(dim=1).to(torch.float32) / FP8_MAX
         grid = (b * h_kv * K_NUM_BLKS,)
-        from intj.compat import launch
 
-        launch(
-            sage_quant_v_kernel,
+        dev, stream = current_device_stream()
+        _sage_quant_v_kernel_launch(dev)(
+            stream,
             grid,
             v,
             v_quantized,
@@ -485,10 +504,8 @@ def sage_quant_mxfp6(
             h_kv,
             K_NUM_BLKS,
             kv_len,
-            D=head_dim,
-            BLK_K=BLKK,
-            num_stages=3,
-            num_warps=8,
+            head_dim,  # D
+            BLKK,  # BLK_K
         )
 
     # Q -> base fp6 pack; K -> coalesced LDS-order pack (E8M0 K-scale in the tile tail).
@@ -496,6 +513,12 @@ def sage_quant_mxfp6(
     q_fp6, q_scale = q_packer(q) if q_packer is not None else _default_q_packer(q)
     k_view, k_scale = k_packer(k) if k_packer is not None else _default_k_packer(k)
     return q_fp6, q_scale, k_view, k_scale, v_quantized, v_scale, delta_s
+
+
+_sage_quant_kernel_launch = intj_handle(
+    sage_quant_kernel,
+    options={"num_stages": 3, "num_warps": 8},
+)
 
 
 def sage_quant(
@@ -623,10 +646,10 @@ def sage_quant(
     grid = (q_task_count + k_task_count + v_task_count,)
 
     # call sage_quant_kernel
-    from intj.compat import launch
 
-    launch(
-        sage_quant_kernel,
+    dev, stream = current_device_stream()
+    _sage_quant_kernel_launch(dev)(
+        stream,
         grid,
         q,
         q_int8,
@@ -649,7 +672,7 @@ def sage_quant(
         k_scale.stride(1),
         v_scale.stride(0),
         v_scale.stride(1),
-        (1.0 if q_smoothing else (sm_scale * 1.4426950408889634)),
+        1.0 if q_smoothing else (sm_scale * 1.4426950408889634),
         q_task_count,
         k_task_count,
         b,
@@ -660,13 +683,11 @@ def sage_quant(
         qo_len,
         kv_len,
         triton.next_power_of_2(kv_len),
-        FP8_MAX=FP8_MAX,
-        INT8_MAX=torch.iinfo(q_int8.dtype).max,
-        D=head_dim,
-        BLK_Q=BLKQ,
-        BLK_K=BLKK,
-        num_stages=3,
-        num_warps=8,
+        FP8_MAX,
+        torch.iinfo(q_int8.dtype).max,  # INT8_MAX
+        head_dim,  # D
+        BLKQ,  # BLK_Q
+        BLKK,  # BLK_K
     )
 
     out = [q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale]
@@ -696,6 +717,10 @@ def sage_quant(
             ) * sm_scale
         out.append(delta_lse)
     return tuple(out)
+
+
+_rot_q_kernel_launch = intj_handle(_rot_q_kernel)
+_rot_k_only_kernel_launch = intj_handle(_rot_k_only_kernel)
 
 
 def rotation_smooth_qk(
@@ -748,10 +773,10 @@ def rotation_smooth_qk(
     stride_kob, stride_kon, stride_koh, stride_kod = map_dims(K_rot.stride(), bshd)
     # rotate q and optionally smooth
     grid_q = (b * h_q, Q_NUM_BLKS, d // BLOCK_R)
-    from intj.compat import launch
 
-    launch(
-        _rot_q_kernel,
+    dev, stream = current_device_stream()
+    _rot_q_kernel_launch(dev)(
+        stream,
         grid_q,
         q,
         Q_rot,
@@ -775,15 +800,15 @@ def rotation_smooth_qk(
         h_q,
         s_q,
         d,
-        q_smoothing=q_smoothing,
-        BLOCK_M=BLOCK_SIZE_M,
-        BLOCK_D=BLOCK_R,
+        q_smoothing,
+        BLOCK_SIZE_M,  # BLOCK_M
+        BLOCK_R,  # BLOCK_D
     )
 
     # rotate k
     grid_k = (b * h_k, K_NUM_BLKS, d // BLOCK_R)
-    launch(
-        _rot_k_only_kernel,
+    _rot_k_only_kernel_launch(dev)(
+        stream,
         grid_k,
         k,
         K_rot,
@@ -801,8 +826,8 @@ def rotation_smooth_qk(
         h_k,
         s_k,
         d,
-        BLOCK_M=BLOCK_SIZE_M,
-        BLOCK_D=BLOCK_R,
+        BLOCK_SIZE_M,  # BLOCK_M
+        BLOCK_R,  # BLOCK_D
     )
 
     # smooth k
@@ -816,8 +841,9 @@ def rotation_smooth_qk(
         # = Q_rot x K_rot + q_mean x K_rot
         # = Q_rot x K_rot + delta_s
         grid_delta = (b * h_q, Q_NUM_BLKS, K_NUM_BLKS)
-        launch(
-            _compute_delta_s_kernel,
+        dev, stream = current_device_stream()
+        _compute_delta_s_kernel_launch(dev)(
+            stream,
             grid_delta,
             q_mean,
             K_rot,
@@ -838,10 +864,20 @@ def rotation_smooth_qk(
             h_k,
             s_k,
             d,
-            BLOCK_N=BLOCK_SIZE_M,
+            BLOCK_SIZE_M,  # BLOCK_N
         )
 
     return Q_rot, K_rot, delta_s
+
+
+_rotate_quantize_q_kernel_launch = intj_handle(
+    _rotate_quantize_q_kernel,
+    options={"num_stages": 5, "num_warps": 4},
+)
+_rotate_quantize_k_kernel_launch = intj_handle(
+    _rotate_quantize_k_kernel,
+    options={"num_stages": 5, "num_warps": 4},
+)
 
 
 def smooth_rotate_downcast_qk(
@@ -905,10 +941,10 @@ def smooth_rotate_downcast_qk(
     stride_ksb, stride_ksn, stride_ksh, stride_ksd = map_dims(K_descale.stride(), bshd)
 
     grid_q = (b * h_q * Q_NUM_BLKS,)
-    from intj.compat import launch
 
-    launch(
-        _rotate_quantize_q_kernel,
+    dev, stream = current_device_stream()
+    _rotate_quantize_q_kernel_launch(dev)(
+        stream,
         grid_q,
         q,
         Q_q,
@@ -936,18 +972,16 @@ def smooth_rotate_downcast_qk(
         h_q,
         s_q,
         d,
-        q_smoothing=q_smoothing,
-        hadamard_rotation=hadamard_rotation,
-        BLOCK_M=BLOCK_SIZE_M,
-        BLOCK_R=BLOCK_R,
-        D=d,
-        num_warps=4,
-        num_stages=5,
+        q_smoothing,
+        hadamard_rotation,
+        BLOCK_SIZE_M,  # BLOCK_M
+        BLOCK_R,
+        d,  # D
     )
 
     grid_k = (b * h_k * K_NUM_BLKS,)
-    launch(
-        _rotate_quantize_k_kernel,
+    _rotate_quantize_k_kernel_launch(dev)(
+        stream,
         grid_k,
         q,
         Q_q,
@@ -992,19 +1026,18 @@ def smooth_rotate_downcast_qk(
         s_q,
         s_k,
         d,
-        q_smoothing=q_smoothing,
-        hadamard_rotation=hadamard_rotation,
-        BLOCK_M=BLOCK_SIZE_M,
-        BLOCK_R=BLOCK_R,
-        D=d,
-        num_warps=4,
-        num_stages=5,
+        q_smoothing,
+        hadamard_rotation,
+        BLOCK_SIZE_M,  # BLOCK_M
+        BLOCK_R,
+        d,  # D
     )
 
     if q_smoothing:
         grid_delta = (b * h_q, Q_NUM_BLKS, K_NUM_BLKS)
-        launch(
-            _compute_delta_s_kernel,
+        dev, stream = current_device_stream()
+        _compute_delta_s_kernel_launch(dev)(
+            stream,
             grid_delta,
             q_mean,
             k,
@@ -1025,7 +1058,7 @@ def smooth_rotate_downcast_qk(
             h_q,
             s_k,
             d,
-            BLOCK_N=BLOCK_SIZE_M,
+            BLOCK_SIZE_M,  # BLOCK_N
         )
 
     return Q_q, Q_descale, K_q, K_descale, delta_s

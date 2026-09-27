@@ -10,6 +10,7 @@ from aiter.ops.triton._triton_kernels.normalization.fused_add_rmsnorm_pad import
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -24,6 +25,9 @@ def _get_config(block_size_n: int, backend: str) -> dict:
         if block_size_n <= bound:
             return dict(raw[f"N_LEQ_{bound}"])
     return dict(raw["any"])
+
+
+_fused_add_rmsnorm_pad_launch = intj_handle(_fused_add_rmsnorm_pad, grid_arg=1)
 
 
 def fused_add_rmsnorm_pad(
@@ -126,7 +130,10 @@ def fused_add_rmsnorm_pad(
         res_out = torch.empty((M, N), dtype=res.dtype, device=res.device)
     BLOCK_SIZE_N = triton.next_power_of_2(N_out)
 
-    _intj_launch(_fused_add_rmsnorm_pad, (M,),
+    dev, stream = current_device_stream()
+    _fused_add_rmsnorm_pad_launch(dev)(
+        stream,
+        M,
         x,
         res,
         out,
@@ -144,8 +151,8 @@ def fused_add_rmsnorm_pad(
         out.stride(1),
         res_out.stride(0) if res is not None else 0,
         res_out.stride(1) if res is not None else 0,
-        HAS_RES=(res is not None),
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        res is not None,  # HAS_RES
+        BLOCK_SIZE_N,
     )
 
     if res is not None:

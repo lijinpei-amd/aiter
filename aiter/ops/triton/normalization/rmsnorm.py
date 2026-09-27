@@ -17,6 +17,7 @@ from aiter.ops.triton._triton_kernels.normalization.rmsnorm import (
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.normalization_config_utils import get_normalization_config
 from aiter.ops.triton.utils.types import get_dtype_max
@@ -69,6 +70,9 @@ def num_programs_fwd(x):
         return num_programs(x)
 
 
+_rms_norm_kernel_launch = intj_handle(_rms_norm_kernel)
+
+
 def _rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, epsilon: float):
 
     n_rows, n_cols = x.shape
@@ -81,7 +85,10 @@ def _rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, epsilon: float):
     NUM_PRGMS = num_programs_fwd(x)
 
     grid = (NUM_PRGMS,)
-    _intj_launch(_rms_norm_kernel, grid,
+    dev, stream = current_device_stream()
+    _rms_norm_kernel_launch(dev)(
+        stream,
+        grid,
         x,
         y,
         weight,
@@ -97,6 +104,9 @@ def _rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, epsilon: float):
     )
 
     return y, rsigma
+
+
+_fused_add_rmsnorm_kernel_launch = intj_handle(_fused_add_rmsnorm_kernel)
 
 
 def _rmsnorm_forward_with_add(
@@ -116,7 +126,10 @@ def _rmsnorm_forward_with_add(
     NUM_PRGMS = num_programs_fwd(x)
 
     grid = (NUM_PRGMS,)
-    _intj_launch(_fused_add_rmsnorm_kernel, grid,
+    dev, stream = current_device_stream()
+    _fused_add_rmsnorm_kernel_launch(dev)(
+        stream,
+        grid,
         x,
         out,
         residual_in,
@@ -132,6 +145,20 @@ def _rmsnorm_forward_with_add(
         USE_BLOCKED,
         NUM_PRGMS,
     )
+
+
+_rmsnorm_bwd_triton_launch = intj_handle(_rmsnorm_bwd_triton, options={"num_warps": 8})
+_rmsnorm_bwd_dg_reduce_triton_launch = intj_handle(_rmsnorm_bwd_dg_reduce_triton)
+
+
+def _dg_reduce_options():
+    # Widening the workgroup helps on gfx950. Left at default otherwise
+    return {"num_warps": 8} if get_arch() == "gfx950" else {}
+
+
+_rmsnorm_bwd_dg_reduce_gfx950_launch = intj_handle(
+    _rmsnorm_bwd_dg_reduce_triton, options=_dg_reduce_options
+)
 
 
 def _rmsnorm_backward(dz, x, gamma, rsigma):
@@ -172,14 +199,17 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
             num_stages=_cfg["num_stages"],
         )
         grid_reduce = (triton.cdiv(N, 64),)
-        _intj_launch(_rmsnorm_bwd_dg_reduce_triton, grid_reduce,
+        dev, stream = current_device_stream()
+        _rmsnorm_bwd_dg_reduce_triton_launch(dev)(
+            stream,
+            grid_reduce,
             dg_tmp,
             dgamma,
             dg_tmp.stride(0),
             dg_tmp.shape[0],
             dg_tmp.shape[1],
-            BLOCK_SIZE_M=128,
-            BLOCK_SIZE_N=64,
+            128,  # BLOCK_SIZE_M
+            64,  # BLOCK_SIZE_N
         )
         return dx, dgamma
 
@@ -201,7 +231,10 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
     )
 
     grid_bwd = (NUM_PRGMS,)
-    _intj_launch(_rmsnorm_bwd_triton, grid_bwd,
+    dev, stream = current_device_stream()
+    _rmsnorm_bwd_triton_launch(dev)(
+        stream,
+        grid_bwd,
         dz_,
         x_,
         gamma_,
@@ -215,22 +248,21 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
         blk_size,
         USE_BLOCKED,
         NUM_PRGMS,
-        num_warps=8,
     )
 
     if need_reduction:
         grid_reduce = (triton.cdiv(N, 64),)
-        # Widening the workgroup helps on gfx950. Left at default otherwise
-        dg_reduce_kwargs = {"num_warps": 8} if get_arch() == "gfx950" else {}
-        _intj_launch(_rmsnorm_bwd_dg_reduce_triton, grid_reduce,
+        dev, stream = current_device_stream()
+        _rmsnorm_bwd_dg_reduce_gfx950_launch(dev)(
+            stream,
+            grid_reduce,
             dg_tmp,
             dgamma,
             dg_tmp.stride(0),
             dg_tmp.shape[0],
             dg_tmp.shape[1],
-            BLOCK_SIZE_M=128,
-            BLOCK_SIZE_N=64,
-            **dg_reduce_kwargs,
+            128,  # BLOCK_SIZE_M
+            64,  # BLOCK_SIZE_N
         )
 
     return dx, dgamma
@@ -384,6 +416,9 @@ def rmsnorm2d_fwd_with_add(
     )
 
 
+_quant_rms_norm_kernel_launch = intj_handle(_quant_rms_norm_kernel)
+
+
 def rmsnorm2d_fwd_with_smoothquant(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -431,7 +466,10 @@ def rmsnorm2d_fwd_with_smoothquant(
         aux = torch.empty(n_rows, n_cols, dtype=torch.float32, device=input.device)
 
     grid = (NUM_PRGMS,)
-    _intj_launch(_quant_rms_norm_kernel, grid,
+    dev, stream = current_device_stream()
+    _quant_rms_norm_kernel_launch(dev)(
+        stream,
+        grid,
         input,
         out,
         xscale,
@@ -504,7 +542,10 @@ def rmsnorm2d_fwd_with_dynamicquant(
         aux = torch.empty(n_rows, n_cols, dtype=torch.float32, device=input.device)
 
     grid = (NUM_PRGMS,)
-    _intj_launch(_quant_rms_norm_kernel, grid,
+    dev, stream = current_device_stream()
+    _quant_rms_norm_kernel_launch(dev)(
+        stream,
+        grid,
         input,
         out,
         xscale,
@@ -530,6 +571,9 @@ def rmsnorm2d_fwd_with_dynamicquant(
     )
 
     return out_rms_norm
+
+
+_quant_fused_add_rmsnorm_kernel_launch = intj_handle(_quant_fused_add_rmsnorm_kernel)
 
 
 def rmsnorm2d_fwd_with_add_smoothquant(
@@ -579,7 +623,10 @@ def rmsnorm2d_fwd_with_add_smoothquant(
         aux = torch.empty(n_rows, n_cols, dtype=torch.float32, device=input.device)
 
     grid = (NUM_PRGMS,)
-    _intj_launch(_quant_fused_add_rmsnorm_kernel, grid,
+    dev, stream = current_device_stream()
+    _quant_fused_add_rmsnorm_kernel_launch(dev)(
+        stream,
+        grid,
         input,
         out,
         residual_in,
@@ -647,7 +694,10 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
         aux = torch.empty(n_rows, n_cols, dtype=torch.float32, device=input.device)
 
     grid = (NUM_PRGMS,)
-    _intj_launch(_quant_fused_add_rmsnorm_kernel, grid,
+    dev, stream = current_device_stream()
+    _quant_fused_add_rmsnorm_kernel_launch(dev)(
+        stream,
+        grid,
         input,
         out,
         residual_in,

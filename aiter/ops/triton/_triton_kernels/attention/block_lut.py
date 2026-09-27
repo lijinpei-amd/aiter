@@ -9,9 +9,9 @@ attention mask without using nonzero or argsort.
 import torch
 import triton
 import triton.language as tl
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 
 _block_attn_mask_to_lut_kernel_repr = make_kernel_repr(
     "_block_attn_mask_to_lut_kernel",
@@ -79,6 +79,9 @@ def _block_attn_mask_to_lut_kernel(
         )
         write_offset = write_offset + tl.sum(mask_vals)
 
+
+_block_attn_mask_to_lut_kernel_launch = intj_handle(_block_attn_mask_to_lut_kernel)
+
     # No return; kv_block_indices is written in place
 
 
@@ -98,17 +101,20 @@ def block_attn_mask_to_lut_kernel(
     num_programs = batch * num_heads * num_q_blocks
 
     grid = (num_programs,)
-    _intj_launch(_block_attn_mask_to_lut_kernel, grid,
+    dev, stream = current_device_stream()
+    _block_attn_mask_to_lut_kernel_launch(dev)(
+        stream,
+        grid,
         block_attn_mask,
         lut_start,
         lut_count,
         kv_block_indices,
-        stride_mask_b=block_attn_mask.stride(0),
-        stride_mask_h=block_attn_mask.stride(1),
-        stride_mask_qb=block_attn_mask.stride(2),
-        stride_mask_kb=block_attn_mask.stride(3),
-        num_heads=num_heads,
-        num_q_blocks=num_q_blocks,
-        num_kv_blocks=num_kv_blocks,
-        BLOCK_KB=BLOCK_KB,
+        block_attn_mask.stride(0),  # stride_mask_b
+        block_attn_mask.stride(1),  # stride_mask_h
+        block_attn_mask.stride(2),  # stride_mask_qb
+        block_attn_mask.stride(3),  # stride_mask_kb
+        num_heads,
+        num_q_blocks,
+        num_kv_blocks,
+        BLOCK_KB,
     )

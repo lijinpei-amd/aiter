@@ -3,8 +3,6 @@
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
@@ -17,6 +15,8 @@ from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -53,6 +53,11 @@ def batched_gemm_a16wfp4_fake_tensor(
             return torch.empty((M, Bx, N), dtype=dtype, device=x.device)
         return torch.empty((Bx, M, N), dtype=dtype, device=x.device)
     return y
+
+
+_batched_gemm_a16wfp4_reduce_kernel_launch = intj_handle(
+    _batched_gemm_a16wfp4_reduce_kernel,
+)
 
 
 # Explicit ``mutates_args=["y"]`` rather than the ``torch_compile_guard``
@@ -222,7 +227,10 @@ def batched_gemm_a16wfp4_(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _intj_launch(_batched_gemm_a16wfp4_reduce_kernel, grid_reduce,
+        dev, stream = current_device_stream()
+        _batched_gemm_a16wfp4_reduce_kernel_launch(dev)(
+            stream,
+            grid_reduce,
             y_pp,
             y,
             M,

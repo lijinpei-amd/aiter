@@ -52,11 +52,19 @@ from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4_bwd import
     _delta_v4_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 
 _BLOCK_H_DQ = 64
 _TILE_K_DQ = 32
 _BD_DKV = 256
 _TILE_K_DKV = 128
+
+
+_dq_v4_kernel_launch = intj_handle(
+    _dq_v4_kernel,
+    grid_arg=2,
+    options={"num_warps": 4, "waves_per_eu": 1},
+)
 
 
 def sparse_mla_bwd_dq(
@@ -79,7 +87,11 @@ def sparse_mla_bwd_dq(
     """Launch the dQ kernel for one rank chunk. Writes ``dq`` (RMW when not the first chunk)
     plus this chunk's ``chunk_dS`` / ``chunk_P``."""
     T, H, D = q.shape
-    _intj_launch(_dq_v4_kernel, (T, triton.cdiv(H, BLOCK_H)),
+    dev, stream = current_device_stream()
+    _dq_v4_kernel_launch(dev)(
+        stream,
+        T,
+        triton.cdiv(H, BLOCK_H),
         q,
         kv,
         do,
@@ -102,13 +114,11 @@ def sparse_mla_bwd_dq(
         scale,
         H,
         r_start,
-        R_CHUNK=R_CHUNK,
-        BLOCK_H=BLOCK_H,
-        TILE_K=TILE_K,
-        D=D,
-        IS_FIRST_CHUNK=is_first_chunk,
-        num_warps=4,
-        waves_per_eu=1,
+        R_CHUNK,
+        BLOCK_H,
+        TILE_K,
+        D,
+        is_first_chunk,  # IS_FIRST_CHUNK
     )
 
 

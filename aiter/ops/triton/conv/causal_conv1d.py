@@ -2,13 +2,13 @@ import os
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.conv.causal_conv1d import (
     PAD_SLOT_ID,
     _causal_conv1d_fwd_kernel,
     _causal_conv1d_update_kernel,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -38,6 +38,12 @@ def _assert_implemented_width(width: int, fn: str) -> None:
     """
     if not 2 <= width <= 4:
         raise AssertionError(f"{fn}: width must be 2, 3 or 4, got {width}")
+
+
+_causal_conv1d_fwd_kernel_launch = intj_handle(
+    _causal_conv1d_fwd_kernel,
+    options={"num_stages": 2},
+)
 
 
 def causal_conv1d_fn(
@@ -165,15 +171,18 @@ def causal_conv1d_fn(
         assert (dim, width) == weight.shape
         assert is_channel_last, "Need to run in channel-last layout"
 
-    def grid(META):
-        max_seq_len = max(seq_lens_cpu)
-        return (
-            len(seq_lens_cpu),  # batch_size
-            (max_seq_len + META["BLOCK_M"] - 1) // META["BLOCK_M"],
-            triton.cdiv(dim, META["BLOCK_N"]),
-        )
+    BLOCK_M, BLOCK_N = 8, 256
+    max_seq_len = max(seq_lens_cpu)
+    grid = (
+        len(seq_lens_cpu),  # batch_size
+        triton.cdiv(max_seq_len, BLOCK_M),
+        triton.cdiv(dim, BLOCK_N),
+    )
 
-    _intj_launch(_causal_conv1d_fwd_kernel, grid,
+    dev, stream = current_device_stream()
+    _causal_conv1d_fwd_kernel_launch(dev)(
+        stream,
+        grid,
         # Pointers to matrices
         x,
         weight,
@@ -202,20 +211,22 @@ def causal_conv1d_fn(
         # others
         pad_slot_id,
         # META
-        HAS_BIAS=bias is not None,
-        KERNEL_WIDTH=width,
-        SILU_ACTIVATION=activation in ["silu", "swish"],
-        HAS_INITIAL_STATES=has_initial_state is not None,
-        HAS_CACHE=conv_states is not None,
-        IS_CONTINUOUS_BATCHING=cache_indices is not None,
-        USE_PAD_SLOT=pad_slot_id is not None,
-        NP2_STATELEN=np2_statelen,
+        bias is not None,  # HAS_BIAS
+        width,  # KERNEL_WIDTH
+        activation in ["silu", "swish"],  # SILU_ACTIVATION
+        has_initial_state is not None,  # HAS_INITIAL_STATES
+        conv_states is not None,  # HAS_CACHE
+        cache_indices is not None,  # IS_CONTINUOUS_BATCHING
+        pad_slot_id is not None,  # USE_PAD_SLOT
+        np2_statelen,  # NP2_STATELEN
         # launch_cooperative_grid=True
-        BLOCK_M=8,
-        BLOCK_N=256,
-        num_stages=2,
+        BLOCK_M,
+        BLOCK_N,
     )
     return out
+
+
+_causal_conv1d_update_kernel_launch = intj_handle(_causal_conv1d_update_kernel)
 
 
 def causal_conv1d_update(
@@ -351,11 +362,8 @@ def causal_conv1d_update(
         state_len = width - 1
     np2_statelen = triton.next_power_of_2(state_len)
 
-    def grid(META):
-        return (
-            batch,
-            triton.cdiv(dim, META["BLOCK_N"]),
-        )
+    BLOCK_N = 256
+    grid = (batch, triton.cdiv(dim, BLOCK_N))
 
     # prepare intermediate buffer strides if provided
     if intermediate_conv_window is not None:
@@ -368,7 +376,10 @@ def causal_conv1d_update(
     else:
         stride_inter_seq = stride_inter_step = stride_inter_dim = stride_inter_win = 0
 
-    _intj_launch(_causal_conv1d_update_kernel, grid,
+    dev, stream = current_device_stream()
+    _causal_conv1d_update_kernel_launch(dev)(
+        stream,
+        grid,
         # Pointers to matrices
         x,
         weight,
@@ -405,15 +416,15 @@ def causal_conv1d_update(
         # others
         pad_slot_id,
         # META
-        HAS_BIAS=bias is not None,
-        KERNEL_WIDTH=width,
-        SILU_ACTIVATION=activation in ["silu", "swish"],
-        IS_CONTINUOUS_BATCHING=conv_state_indices is not None,
-        IS_SPEC_DECODING=num_accepted_tokens is not None,
-        NP2_STATELEN=np2_statelen,
-        USE_PAD_SLOT=pad_slot_id is not None,
-        BLOCK_N=256,
-        SAVE_INTERMEDIATE=intermediate_conv_window is not None,
+        bias is not None,  # HAS_BIAS
+        width,  # KERNEL_WIDTH
+        activation in ["silu", "swish"],  # SILU_ACTIVATION
+        conv_state_indices is not None,  # IS_CONTINUOUS_BATCHING
+        num_accepted_tokens is not None,  # IS_SPEC_DECODING
+        np2_statelen,  # NP2_STATELEN
+        pad_slot_id is not None,  # USE_PAD_SLOT
+        BLOCK_N,
+        intermediate_conv_window is not None,  # SAVE_INTERMEDIATE
     )
     if unsqueeze:
         out = out.squeeze(-1)

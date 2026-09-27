@@ -1,7 +1,8 @@
 import torch
 import triton
 import triton.language as tl
-from intj.compat import launch as _intj_launch
+
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 
 
 @triton.jit
@@ -71,6 +72,9 @@ def _ragged_trans_kernel(
             )
 
 
+_ragged_trans_kernel_launch = intj_handle(_ragged_trans_kernel)
+
+
 def ragged_layout_trans(kv_indptr, kv_indices, k_buffer, v_buffer):
     B = kv_indptr.shape[0] - 1
     H_KV = k_buffer.shape[1]
@@ -88,18 +92,21 @@ def ragged_layout_trans(kv_indptr, kv_indices, k_buffer, v_buffer):
 
     grid = (token_blocks,)
 
-    _intj_launch(_ragged_trans_kernel, grid,
+    dev, stream = current_device_stream()
+    _ragged_trans_kernel_launch(dev)(
+        stream,
+        grid,
         k_buffer,
         v_buffer,
         k_values,
         v_values,
         kv_indptr,
         kv_indices,
-        B=B,
-        E_DIM=H_KV * D,
-        total_tokens=total_tokens,
-        BLOCK_TOKEN=BLOCK_TOKEN,
-        BLOCK_E_DIM=BLOCK_E_DIM,
+        B,
+        H_KV * D,  # E_DIM
+        total_tokens,
+        BLOCK_TOKEN,
+        BLOCK_E_DIM,
     )
 
     return k_values, v_values

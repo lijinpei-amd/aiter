@@ -7,13 +7,13 @@
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.fusions.fused_routing_from_topk import (
     _fused_routing_from_topk_hist_kernel,
     _fused_routing_from_topk_offset_kernel,
     _fused_routing_from_topk_place_kernel,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -24,6 +24,23 @@ _LOGGER = AiterTritonLogger()
 # back to a multi-kernel reference path for prefill-shaped inputs (NK in
 # the tens of thousands). Decode (num_tokens × top_k) at typical batch
 # sizes is well within this budget.
+
+
+_fused_routing_from_topk_hist_kernel_launch = intj_handle(
+    _fused_routing_from_topk_hist_kernel,
+    grid_arg=1,
+    options={"num_warps": 1},
+)
+_fused_routing_from_topk_offset_kernel_launch = intj_handle(
+    _fused_routing_from_topk_offset_kernel,
+    grid_arg=1,
+    options={"num_warps": 1},
+)
+_fused_routing_from_topk_place_kernel_launch = intj_handle(
+    _fused_routing_from_topk_place_kernel,
+    grid_arg=1,
+    options={"num_warps": 1},
+)
 
 
 def fused_routing_from_topk(
@@ -127,32 +144,37 @@ def fused_routing_from_topk(
     # Kernel 1 (Phase A): histogram via tl.histogram (warp-local
     # shared-memory reduction). num_warps=1 keeps the reduction within a
     # single wave, matching the CTA-local design of the original kernel.
-    _intj_launch(_fused_routing_from_topk_hist_kernel, (1,),
+    dev, stream = current_device_stream()
+    _fused_routing_from_topk_hist_kernel_launch(dev)(
+        stream,
+        1,
         topk_ids_flat,
         expert_map_flat,
         expert_map_numel,
         hist,
         n_gates_pad,
-        E=n_expts_tot,
-        HAS_EXPERT_MAP=has_expert_map,
-        BLOCK_NK=BLOCK_NK,
-        BLOCK_E=BLOCK_E,
-        num_warps=1,
+        n_expts_tot,  # E
+        has_expert_map,  # HAS_EXPERT_MAP
+        BLOCK_NK,
+        BLOCK_E,
     )
 
     # Kernel 2 (Phase B): exclusive prefix-sum hist → offset. The kernel
     # boundary above publishes hist without an explicit barrier.
-    _intj_launch(_fused_routing_from_topk_offset_kernel, (1,),
+    _fused_routing_from_topk_offset_kernel_launch(dev)(
+        stream,
+        1,
         hist,
         offset_scratch,
-        E=n_expts_tot,
-        BLOCK_E=BLOCK_E,
-        num_warps=1,
+        n_expts_tot,  # E
+        BLOCK_E,
     )
 
     # Kernel 3 (Phase C): placement. The kernel boundary publishes the
     # prefix-sum offsets without an explicit barrier or atomic_xchg.
-    _intj_launch(_fused_routing_from_topk_place_kernel, (1,),
+    _fused_routing_from_topk_place_kernel_launch(dev)(
+        stream,
+        1,
         topk_ids_flat,
         topk_weights_flat,
         expert_map_flat,
@@ -162,9 +184,8 @@ def fused_routing_from_topk(
         gate_indx,
         gate_scal,
         n_gates_pad,
-        HAS_EXPERT_MAP=has_expert_map,
-        BLOCK_NK=BLOCK_NK,
-        num_warps=1,
+        has_expert_map,  # HAS_EXPERT_MAP
+        BLOCK_NK,
     )
 
     return hist, topk_indx, gate_indx, gate_scal

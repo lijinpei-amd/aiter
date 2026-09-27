@@ -14,7 +14,8 @@ import triton.language as tl
 from flydsl.expr import gpu, rocdl
 from flydsl.expr.primitive import range_constexpr
 from flydsl.expr.typing import Float4E2M1FN, Int32, T
-from intj.compat import launch as _intj_launch
+
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 
 from .pa_mqa_logits_fp4_common import (
     _NON_WRITER_LANE_OFF,
@@ -104,6 +105,9 @@ def _varctx_cta_info_kernel(
         tl.store(cta_info_ptr + row * 4 + 3, ctx_slot, mask=rmask)
 
 
+_varctx_cta_info_kernel_launch = intj_handle(_varctx_cta_info_kernel)
+
+
 def compute_varctx_schedule(
     context_lens,
     block_k,
@@ -140,7 +144,10 @@ def compute_varctx_schedule(
     BLOCK_B = triton.next_power_of_2(max(int(B), 1))
     BLOCK_S = 256
     grid = (triton.cdiv(S, BLOCK_S),)
-    _intj_launch(_varctx_cta_info_kernel, grid,
+    intj_dev, intj_stream = current_device_stream()
+    _varctx_cta_info_kernel_launch(intj_dev)(
+        intj_stream,
+        grid,
         ctx_i32,
         cta_info,
         safe_out,
@@ -149,9 +156,9 @@ def compute_varctx_schedule(
         P,
         block_k,
         s_max,
-        NEXT_N=next_n,
-        BLOCK_B=BLOCK_B,
-        BLOCK_S=BLOCK_S,
+        next_n,  # NEXT_N
+        BLOCK_B,
+        BLOCK_S,
     )
     return safe_out, cta_info, P
 

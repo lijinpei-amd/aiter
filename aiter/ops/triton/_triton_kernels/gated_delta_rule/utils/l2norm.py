@@ -12,8 +12,6 @@ supporting both forward and backward passes.
 import torch
 import triton
 import triton.language as tl
-from intj.compat import launch as _intj_launch
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from torch import nn
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
@@ -21,6 +19,8 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils im
     autotune_cache_kwargs,
     input_guard,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 # Backward-pass autotune config space. Forward kernels deliberately do not
@@ -66,6 +66,9 @@ def l2norm_fwd_kernel1(
     tl.store(Y + cols, b_y.to(Y.dtype.element_ty), mask=mask)
     if STORE_RSTD:
         tl.store(Rstd + i_t, b_rstd)
+
+
+_l2norm_fwd_kernel1_launch = intj_handle(l2norm_fwd_kernel1, grid_arg=1)
 
 
 @triton.autotune(
@@ -139,6 +142,13 @@ def l2norm_fwd_kernel(
     if STORE_RSTD:
         row1d = xoffset + tl.arange(0, BT)
         tl.store(Rstd + row1d, rstd, mask=row1d < T)
+
+
+_l2norm_fwd_kernel_launch = intj_handle(
+    l2norm_fwd_kernel,
+    grid_arg=1,
+    options={"num_warps": _L2NORM_FWD_NUM_WARPS},
+)
 
 
 @triton.autotune(
@@ -255,7 +265,10 @@ def l2norm_fwd(
 
     if D <= 512:
         BT = _L2NORM_FWD_BT
-        _intj_launch(l2norm_fwd_kernel, (triton.cdiv(T, BT),),
+        dev, stream = current_device_stream()
+        _l2norm_fwd_kernel_launch(dev)(
+            stream,
+            triton.cdiv(T, BT),
             x,
             y,
             rstd,
@@ -264,18 +277,20 @@ def l2norm_fwd(
             D,
             BD,
             BT,
-            STORE_RSTD=need_rstd,
-            num_warps=_L2NORM_FWD_NUM_WARPS,
+            need_rstd,  # STORE_RSTD
         )
     else:
-        _intj_launch(l2norm_fwd_kernel1, (T,),
+        dev, stream = current_device_stream()
+        _l2norm_fwd_kernel1_launch(dev)(
+            stream,
+            T,
             x,
             y,
             rstd,
             eps,
             D,
             BD,
-            STORE_RSTD=need_rstd,
+            need_rstd,  # STORE_RSTD
         )
 
     if need_rstd:

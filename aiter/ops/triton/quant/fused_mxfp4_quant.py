@@ -21,6 +21,7 @@ from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.intj_tuned import launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.utility import dtypes
@@ -194,6 +195,9 @@ def fused_rms_mxfp4_quant(
     return (out1_fp4, out1_bs), out1, out2, out_res1
 
 
+_fused_flatten_mxfp4_quant_launch = intj_handle(_fused_flatten_mxfp4_quant)
+
+
 def fused_flatten_mxfp4_quant(
     x: torch.Tensor,
 ):
@@ -224,10 +228,10 @@ def fused_flatten_mxfp4_quant(
         M,
         N1,
     )
-    from intj.compat import launch
 
-    launch(
-        _fused_flatten_mxfp4_quant,
+    dev, stream = current_device_stream()
+    _fused_flatten_mxfp4_quant_launch(dev)(
+        stream,
         grid,
         x,
         out,
@@ -632,6 +636,13 @@ def fused_reduce_rms_mxfp4_quant(
     return (out1_fp4, out1_bs), out1, out2, out_res1, out3
 
 
+
+_moe_sort_launch = intj_handle(_fused_dynamic_mxfp4_quant_moe_sort_kernel, grid_arg=1)
+_gluon_moe_sort_launch = intj_handle(
+    _gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel, grid_arg=1
+)
+
+
 def fused_dynamic_mxfp4_quant_moe_sort(
     x: torch.Tensor,
     sorted_ids: torch.Tensor,
@@ -708,16 +719,15 @@ def fused_dynamic_mxfp4_quant_moe_sort(
         raise ValueError("Gluon is only supported on gfx1250")
 
     kernel = (
-        _gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel
+        _gluon_moe_sort_launch
         if (args in ["gluon", "auto"] and get_arch() == "gfx1250")
-        else _fused_dynamic_mxfp4_quant_moe_sort_kernel
+        else _moe_sort_launch
     )
 
-    from intj.compat import launch
-
-    launch(
-        kernel,
-        (num_pid,),
+    dev, stream = current_device_stream()
+    kernel(dev)(
+        stream,
+        num_pid,
         x,
         x_fp4,
         sorted_ids,
@@ -729,13 +739,13 @@ def fused_dynamic_mxfp4_quant_moe_sort(
         *x.stride(),
         *x_fp4.stride(),
         *blockscale_e8m0_sorted.stride(),
-        token_num=token_num,
-        N_i=N_i,
-        MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
-        BLOCK_SIZE_Mx=BLOCK_SIZE_Mx,
-        BLOCK_SIZE_M=BLOCK_SIZE_M // 2,
-        BLOCK_SIZE_N=BLOCK_SIZE_N // 2,
-        TOPK=topk,
+        token_num,
+        N_i,
+        MXFP4_QUANT_BLOCK_SIZE,
+        BLOCK_SIZE_Mx,
+        BLOCK_SIZE_M // 2,  # BLOCK_SIZE_M
+        BLOCK_SIZE_N // 2,  # BLOCK_SIZE_N
+        topk,  # TOPK
     )
 
     # The blockscale buffer is allocated with padded N (rounded up to
@@ -878,6 +888,9 @@ def _fused_quant_fp8_sort_kernel(
     tl.store(scale_sorted_ptr + offs, out)
 
 
+_fused_quant_fp8_sort_kernel_launch = intj_handle(_fused_quant_fp8_sort_kernel)
+
+
 def fused_quant_fp8_sort(
     input: torch.Tensor,
     sorted_ids: torch.Tensor,
@@ -927,10 +940,9 @@ def fused_quant_fp8_sort(
         triton.cdiv(N_o, BLOCK_SIZE_N),  # 8
     )
 
-    from intj.compat import launch
-
-    launch(
-        _fused_quant_fp8_sort_kernel,
+    dev, stream = current_device_stream()
+    _fused_quant_fp8_sort_kernel_launch(dev)(
+        stream,
         grid,
         input,
         sorted_ids,
@@ -940,16 +952,16 @@ def fused_quant_fp8_sort(
         *input.stride(),
         *x_fp8.stride(),
         *scale_e8m0_packed.stride(),
-        M_input=M,
-        N_input=N,
-        N_scale_cols=N_blocks,
-        token_num=token_num,
-        BLOCK_SIZE_M=BLOCK_SIZE_M // 2,
-        BLOCK_SIZE_N=BLOCK_SIZE_N // 2,
-        QUANT_BLOCK_SIZE=32,
-        TOPK=M // token_num,
-        DTYPE_MAX=DTYPE_MAX,
-        DTYPE_MIN=DTYPE_MIN,
+        M,  # M_input
+        N,  # N_input
+        N_blocks,  # N_scale_cols
+        token_num,
+        BLOCK_SIZE_M // 2,  # BLOCK_SIZE_M
+        BLOCK_SIZE_N // 2,  # BLOCK_SIZE_N
+        32,  # QUANT_BLOCK_SIZE
+        M // token_num,  # TOPK
+        DTYPE_MAX,
+        DTYPE_MIN,
     )
 
     return x_fp8, scale_e8m0_packed.view(dtypes.fp8_e8m0).view(-1, N_o)

@@ -4,14 +4,21 @@
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.fusions.fused_rmsnorm_indexed_adaln import (
     _fused_rmsnorm_indexed_adaln_kernel,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+
+_fused_rmsnorm_indexed_adaln_kernel_launch = intj_handle(
+    _fused_rmsnorm_indexed_adaln_kernel,
+    grid_arg=1,
+    options={"num_warps": 4},
+)
 
 
 def fused_rmsnorm_indexed_adaln(
@@ -84,7 +91,10 @@ def fused_rmsnorm_indexed_adaln(
     # of tokens that share an index, which is the common case.
     BLOCK_M = 8 if M >= 8 else 1
 
-    _intj_launch(_fused_rmsnorm_indexed_adaln_kernel, (triton.cdiv(M, BLOCK_M),),
+    dev, stream = current_device_stream()
+    _fused_rmsnorm_indexed_adaln_kernel_launch(dev)(
+        stream,
+        triton.cdiv(M, BLOCK_M),
         out,
         x,
         weight,
@@ -98,9 +108,8 @@ def fused_rmsnorm_indexed_adaln(
         shift.stride(0),
         scale.stride(0),
         eps,
-        ROUND_INTERMEDIATE=round_intermediate,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        num_warps=4,
+        round_intermediate,  # ROUND_INTERMEDIATE
+        BLOCK_M,
+        BLOCK_N,
     )
     return out

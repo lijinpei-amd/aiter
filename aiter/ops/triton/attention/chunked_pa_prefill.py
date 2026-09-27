@@ -11,19 +11,26 @@
 
 
 import triton
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.attention.chunked_pa_prefill import (
     _kernel_paged_attention_2d,
 )
 from aiter.ops.triton.attention.pa_prefill import context_attention_fwd
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 
 # gfx942 and gfx1250 keep Triton's defaults
 # For gfx950: tuned launch for the decode kernel.
 tuned_decode = arch_info.get_arch() == "gfx950"
 decode_launch = (
     {"num_warps": 1, "num_stages": 1, "waves_per_eu": 2} if tuned_decode else {}
+)
+
+
+_kernel_paged_attention_2d_launch = intj_handle(
+    _kernel_paged_attention_2d,
+    grid_arg=2,
+    options=decode_launch,
 )
 
 
@@ -104,44 +111,44 @@ def chunked_prefill_paged_decode(
     num_queries_per_kv = query.shape[1] // key.shape[1]
     head_size = query.shape[2]
 
-    _intj_launch(_kernel_paged_attention_2d, (
-            num_seqs,
-            num_query_heads,
-        ),
-        output_ptr=output,
-        query_ptr=query,
-        key_cache_ptr=key_cache,
-        value_cache_ptr=value_cache,
-        block_tables_ptr=block_table,
-        seq_lens_ptr=seq_lens,
-        alibi_slopes_ptr=alibi_slopes,
-        scale=sm_scale,
-        k_scale=k_scale,
-        v_scale=v_scale,
-        num_queries_per_kv=num_queries_per_kv,
-        block_table_stride=block_table.stride(0),
-        query_stride_0=query.stride(0),
-        query_stride_1=query.stride(1),
-        output_stride_0=output.stride(0),
-        output_stride_1=output.stride(1),
-        BLOCK_SIZE=block_size,
-        HEAD_SIZE=head_size,
-        HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
-        USE_ALIBI_SLOPES=use_alibi_slopes,
-        SLIDING_WINDOW=sliding_window,
-        x=key_cache.shape[4],
-        stride_k_cache_0=key_cache.stride(0),
-        stride_k_cache_1=key_cache.stride(1),
-        stride_k_cache_2=key_cache.stride(2),
-        stride_k_cache_3=key_cache.stride(3),
-        stride_k_cache_4=key_cache.stride(4),
-        stride_v_cache_0=value_cache.stride(0),
-        stride_v_cache_1=value_cache.stride(1),
-        stride_v_cache_2=value_cache.stride(2),
-        stride_v_cache_3=value_cache.stride(3),
-        filter_by_query_len=True,
-        query_start_len_ptr=query_start_loc,
+    dev, stream = current_device_stream()
+    _kernel_paged_attention_2d_launch(dev)(
+        stream,
+        num_seqs,
+        num_query_heads,
+        output,  # output_ptr
+        query,  # query_ptr
+        key_cache,  # key_cache_ptr
+        value_cache,  # value_cache_ptr
+        block_table,  # block_tables_ptr
+        seq_lens,  # seq_lens_ptr
+        alibi_slopes,  # alibi_slopes_ptr
+        sm_scale,  # scale
+        k_scale,
+        v_scale,
+        num_queries_per_kv,
+        block_table.stride(0),  # block_table_stride
+        query.stride(0),  # query_stride_0
+        query.stride(1),  # query_stride_1
+        output.stride(0),  # output_stride_0
+        output.stride(1),  # output_stride_1
+        block_size,  # BLOCK_SIZE
+        head_size,  # HEAD_SIZE
+        triton.next_power_of_2(head_size),  # HEAD_SIZE_PADDED
+        use_alibi_slopes,  # USE_ALIBI_SLOPES
+        sliding_window,  # SLIDING_WINDOW
+        key_cache.shape[4],  # x
+        key_cache.stride(0),  # stride_k_cache_0
+        key_cache.stride(1),  # stride_k_cache_1
+        key_cache.stride(2),  # stride_k_cache_2
+        key_cache.stride(3),  # stride_k_cache_3
+        key_cache.stride(4),  # stride_k_cache_4
+        value_cache.stride(0),  # stride_v_cache_0
+        value_cache.stride(1),  # stride_v_cache_1
+        value_cache.stride(2),  # stride_v_cache_2
+        value_cache.stride(3),  # stride_v_cache_3
+        True,  # filter_by_query_len
+        query_start_loc,  # query_start_len_ptr
         # num_warps=1 measured strictly faster on all
         # 34 decode shapes swept on gfx950/Triton 3.8
-        **decode_launch,
     )

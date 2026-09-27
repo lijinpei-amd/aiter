@@ -6,13 +6,13 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
-from intj.compat import launch as _intj_launch
 from jinja2 import Template
 
 import aiter
 from aiter.ops.triton.gluon.pa_decode_gluon import (
     paged_attention_decode_v2_reduce_kernel,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.test_common import perftest
 from csrc.cpp_itfs.gluon_aot_tools.compile import (
     CompileArgs,
@@ -243,6 +243,9 @@ def run_compiled_kernel(
     )
 
 
+_reduce_kernel_launch = intj_handle(paged_attention_decode_v2_reduce_kernel)
+
+
 @perftest()
 def run_direct_kernel(
     output_5d: torch.Tensor,  # [batch_size, query_length, num_kv_heads, query_group_size, head_size]
@@ -265,10 +268,11 @@ def run_direct_kernel(
     # Configure grid
     grid = (num_seqs, num_kv_heads, 1)
 
-    kernel = paged_attention_decode_v2_reduce_kernel
-
     # Launch the kernel directly
-    _intj_launch(kernel, grid,
+    dev, stream = current_device_stream()
+    _reduce_kernel_launch(dev)(
+        stream,
+        grid,
         output_5d,
         exp_sums,
         max_logits,
@@ -287,14 +291,14 @@ def run_direct_kernel(
         temporary_output.stride(1),
         temporary_output.stride(2),
         temporary_output.stride(3),
-        head_size=head_size,
-        num_seqs=num_seqs,
-        num_kv_heads=num_kv_heads,
-        OUTPUT_SEQ_LEN=output_seq_len,
-        ONE_OUTPUT_GROUP_SIZE=one_output_group_size,
-        HEAD_SIZE_POW2=triton.next_power_of_2(head_size),
-        CONTEXT_PARTITION_SIZE=context_partition_size,
-        USE_SINKS=sinks is not None,
+        head_size,
+        num_seqs,
+        num_kv_heads,
+        output_seq_len,  # OUTPUT_SEQ_LEN
+        one_output_group_size,  # ONE_OUTPUT_GROUP_SIZE
+        triton.next_power_of_2(head_size),  # HEAD_SIZE_POW2
+        context_partition_size,  # CONTEXT_PARTITION_SIZE
+        sinks is not None,  # USE_SINKS
     )
 
 

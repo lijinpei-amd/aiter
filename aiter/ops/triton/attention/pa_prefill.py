@@ -9,18 +9,28 @@
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.attention.pa_prefill import (
     _fwd_kernel,
     _fwd_kernel_alibi,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
 BASE_BLOCK = 64
 NUM_WARPS = 1
+
+
+_fwd_kernel_launch = intj_handle(
+    _fwd_kernel,
+    options={"num_stages": 1, "num_warps": NUM_WARPS, "waves_per_eu": 1},
+)
+_fwd_kernel_alibi_launch = intj_handle(
+    _fwd_kernel_alibi,
+    options={"num_stages": 1, "num_warps": NUM_WARPS, "waves_per_eu": 1},
+)
 
 
 @torch.inference_mode()
@@ -109,7 +119,10 @@ def context_attention_fwd(
         sliding_window = 0
 
     if alibi_slopes is not None:
-        _intj_launch(_fwd_kernel_alibi, grid,
+        dev, stream = current_device_stream()
+        _fwd_kernel_alibi_launch(dev)(
+            stream,
+            grid,
             q,
             k,
             v,
@@ -148,20 +161,20 @@ def context_attention_fwd(
             v_cache.stride(1),
             v_cache.stride(2),
             v_cache.stride(3),  # [num_blocks, num_kv_heads, head_size, block_size]
-            num_queries_per_kv=num_queries_per_kv,
-            IN_PRECISION=IN_PRECISION,
-            BLOCK_M=BLOCK,
-            BLOCK_DMODEL=Lk,
-            BLOCK_DMODEL_PADDED=Lk_padded,
-            BLOCK_N=BLOCK,
-            SKIP_DECODE=skip_decode,
-            num_warps=NUM_WARPS,
-            waves_per_eu=1,
-            num_stages=1,
+            num_queries_per_kv,
+            IN_PRECISION,
+            BLOCK,  # BLOCK_M
+            Lk,  # BLOCK_DMODEL
+            Lk_padded,  # BLOCK_DMODEL_PADDED
+            BLOCK,  # BLOCK_N
+            skip_decode,  # SKIP_DECODE
         )
         return
 
-    _intj_launch(_fwd_kernel, grid,
+    dev, stream = current_device_stream()
+    _fwd_kernel_launch(dev)(
+        stream,
+        grid,
         q,
         k,
         v,
@@ -199,16 +212,13 @@ def context_attention_fwd(
         v_cache.stride(1),
         v_cache.stride(2),
         v_cache.stride(3),  # [num_blocks, num_kv_heads, head_size, block_size]
-        num_queries_per_kv=num_queries_per_kv,
-        IN_PRECISION=IN_PRECISION,
-        BLOCK_M=BLOCK,
-        BLOCK_DMODEL=Lk,
-        BLOCK_DMODEL_PADDED=Lk_padded,
-        BLOCK_N=BLOCK,
-        SLIDING_WINDOW=sliding_window,
-        SKIP_DECODE=skip_decode,
-        num_warps=NUM_WARPS,
-        waves_per_eu=1,
-        num_stages=1,
+        num_queries_per_kv,
+        IN_PRECISION,
+        BLOCK,  # BLOCK_M
+        Lk,  # BLOCK_DMODEL
+        Lk_padded,  # BLOCK_DMODEL_PADDED
+        BLOCK,  # BLOCK_N
+        sliding_window,  # SLIDING_WINDOW
+        skip_decode,  # SKIP_DECODE
     )
     return

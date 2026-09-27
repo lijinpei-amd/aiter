@@ -7,11 +7,11 @@ import os
 import torch
 import triton
 import triton.language as tl
-from intj.compat import launch as _intj_launch
 
 from aiter import dtypes
 from aiter.ops.enum import Enum, MlaVersion, QuantType
 from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.utility.dtypes import _aiter_dtype_id
 from csrc.cpp_itfs.pa.pa import paged_attention_rocm as paged_attention_rocm_core
 from csrc.cpp_itfs.pa.pa_ragged import (
@@ -1620,6 +1620,11 @@ def decode_update_mla_metadata_v1_kernel(
                     found_partial_index = True
 
 
+_decode_update_mla_metadata_v1_kernel_launch = intj_handle(
+    decode_update_mla_metadata_v1_kernel,
+)
+
+
 def decode_update_mla_metadata_v1(
     seqlens_qo_indptr: torch.Tensor,
     seqlens_kv_indptr: torch.Tensor,
@@ -1700,7 +1705,10 @@ def decode_update_mla_metadata_v1(
         num_heads_per_head_k = 16
         batch_size *= qk_batch_ratio
     grid = (max_work,)
-    _intj_launch(decode_update_mla_metadata_v1_kernel, grid,
+    dev, stream = current_device_stream()
+    _decode_update_mla_metadata_v1_kernel_launch(dev)(
+        stream,
+        grid,
         seqlens_qo_indptr,
         seqlens_kv_indptr,
         kv_last_page_lens,

@@ -9,6 +9,7 @@ from aiter.ops.triton._triton_kernels.moe.reduce import (
     _scatter_grouped,
 )
 from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 
 try:
     from aiter.ops.triton._gluon_kernels.gfx1250.moe.reduce import (
@@ -59,6 +60,13 @@ class EpCombineScatter:
             raise ValueError("dst_row must be contiguous int32")
 
 
+_scatter_grouped_launch = intj_handle(
+    _scatter_grouped,
+    grid_arg=1,
+    options={"num_warps": 2},
+)
+
+
 def scatter_grouped(
     x: torch.Tensor,
     dst_row: torch.Tensor,
@@ -85,7 +93,10 @@ def scatter_grouped(
 
     BLOCK_N = 512
     num_blocks = triton.cdiv(x.shape[-1], BLOCK_N)
-    _intj_launch(_scatter_grouped, (num_blocks * m_rows,),
+    dev, stream = current_device_stream()
+    _scatter_grouped_launch(dev)(
+        stream,
+        num_blocks * m_rows,
         x,
         x.stride(0),
         x.stride(1),
@@ -98,9 +109,8 @@ def scatter_grouped(
         m_rows,
         x.shape[-1],
         num_blocks,
-        BLOCK_N=BLOCK_N,
-        EVEN_N=(x.shape[-1] % BLOCK_N == 0),
-        num_warps=2,
+        BLOCK_N,
+        x.shape[-1] % BLOCK_N == 0,  # EVEN_N
     )
     return out
 
@@ -138,6 +148,13 @@ def validate_reduce_out(out, shape, dtype, device):
         f"got strides {tuple(out.stride())}"
     )
     return out
+
+
+_reduce_grouped_launch = intj_handle(
+    _reduce_grouped,
+    grid_arg=1,
+    options={"num_warps": 2},
+)
 
 
 def reduce_grouped(
@@ -247,7 +264,10 @@ def reduce_grouped(
         res_stride_m = 0
         res_stride_n = 0
         has_ext_residual = False
-    _intj_launch(_reduce_grouped, (num_blocks * num_groups,),
+    dev, stream = current_device_stream()
+    _reduce_grouped_launch(dev)(
+        stream,
+        num_blocks * num_groups,
         x,
         x.stride(0),
         x.stride(1),
@@ -265,16 +285,15 @@ def reduce_grouped(
         alpha,
         limit,
         reduction_n,
-        BLOCK_N=BLOCK_N,
-        EVEN_N=(x.shape[-1] % BLOCK_N == 0),
-        K=K,
-        HAS_INDX_VALID=indx_valid is not None,
-        SWIGLU_ADD_RESIDUAL=swiglu_add_residual,
-        USE_TDM=is_tdm_avail(),
-        Residual=residual,
-        stride_extres_m=res_stride_m,
-        stride_extres_n=res_stride_n,
-        HAS_EXT_RESIDUAL=has_ext_residual,
-        num_warps=2,
+        K,
+        indx_valid is not None,  # HAS_INDX_VALID
+        BLOCK_N,
+        x.shape[-1] % BLOCK_N == 0,  # EVEN_N
+        swiglu_add_residual,  # SWIGLU_ADD_RESIDUAL
+        is_tdm_avail(),  # USE_TDM
+        residual,  # Residual
+        res_stride_m,  # stride_extres_m
+        res_stride_n,  # stride_extres_n
+        has_ext_residual,  # HAS_EXT_RESIDUAL
     )
     return out

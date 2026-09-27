@@ -8,12 +8,23 @@ eliminating q/k/v intermediate HBM traffic and kernel launch overhead.
 """
 
 import torch
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_conv_recurrent_norm import (
     fused_conv_recurrent_norm_kernel,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+
+
+def _decode_options():
+    # Evaluated on the device when the handle is built.
+    return {"num_warps": 2 if get_arch() == "gfx942" else 4}
+
+
+_fused_conv_recurrent_norm_kernel_launch = intj_handle(
+    fused_conv_recurrent_norm_kernel,
+    options=_decode_options,
+)
 
 
 def fused_kda_decode(
@@ -81,7 +92,10 @@ def fused_kda_decode(
     stride_og_tok = out_gate.stride(0)
 
     grid = (batch, H)
-    _intj_launch(fused_conv_recurrent_norm_kernel, grid,
+    dev, stream = current_device_stream()
+    _fused_conv_recurrent_norm_kernel_launch(dev)(
+        stream,
+        grid,
         mixed_qkv,
         conv_weight,
         conv_state,
@@ -99,20 +113,19 @@ def fused_kda_decode(
         norm_eps,
         K**-0.5,
         T,
-        H=H,
-        K=K,
-        V=V,
-        W=W,
-        stride_x_tok=mixed_qkv.stride(0),
-        stride_cw_group=stride_cw_group,
-        stride_cw_width=stride_cw_width,
-        stride_cw_ch=stride_cw_ch,
-        stride_cs_slot=conv_state.stride(0),
-        stride_cs_dim=conv_state.stride(1),
-        stride_cs_pos=conv_state.stride(2),
-        stride_beta_tok=stride_beta_tok,
-        stride_og_tok=stride_og_tok,
-        stride_ssm_slot=ssm_state.stride(0),
-        num_warps=2 if get_arch() == "gfx942" else 4,
+        H,
+        K,
+        V,
+        W,
+        mixed_qkv.stride(0),  # stride_x_tok
+        stride_cw_group,
+        stride_cw_width,
+        stride_cw_ch,
+        conv_state.stride(0),  # stride_cs_slot
+        conv_state.stride(1),  # stride_cs_dim
+        conv_state.stride(2),  # stride_cs_pos
+        stride_beta_tok,
+        stride_og_tok,
+        ssm_state.stride(0),  # stride_ssm_slot
     )
     return out

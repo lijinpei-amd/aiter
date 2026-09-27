@@ -20,7 +20,6 @@ import torch
 import triton
 import triton.language as tl
 from einops import rearrange
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
@@ -29,6 +28,7 @@ from aiter.ops.triton.gated_delta_net.causal_conv1d_decode import (
     causal_conv1d_update_split_qkv,
 )
 from aiter.ops.triton.gated_delta_net.fused_kda_decode import fused_kda_decode
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 
 DEVICE = "cuda"
 D = 128
@@ -67,6 +67,9 @@ def _rmsnorm_gated_kernel(
     tl.store(y_ptr + row * stride_ym + cols, y.to(y_ptr.dtype.element_ty), mask=mask)
 
 
+_rmsnorm_gated_kernel_launch = intj_handle(_rmsnorm_gated_kernel, grid_arg=1)
+
+
 def rmsnorm_gated_bf16(x, weight, gate, eps):
     """Gated RMSNorm -> bf16 (real Triton kernel)."""
     h = x.shape[-1]
@@ -79,7 +82,10 @@ def rmsnorm_gated_bf16(x, weight, gate, eps):
     else:
         stride_g_outer, stride_g_head = gate.stride(0), 0
     BLOCK = triton.next_power_of_2(h)
-    _intj_launch(_rmsnorm_gated_kernel, (m,),
+    dev, stream = current_device_stream()
+    _rmsnorm_gated_kernel_launch(dev)(
+        stream,
+        m,
         x2,
         weight,
         gate,
@@ -90,8 +96,8 @@ def rmsnorm_gated_bf16(x, weight, gate, eps):
         y.stride(0),
         stride_g_outer,
         stride_g_head,
-        HEADS=heads,
-        BLOCK=BLOCK,
+        heads,  # HEADS
+        BLOCK,
     )
     return y.reshape_as(x)
 

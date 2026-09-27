@@ -180,8 +180,6 @@ import os
 import time
 from dataclasses import dataclass
 
-from intj.compat import launch as _intj_launch
-
 os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "16G")
 
 import mori
@@ -212,6 +210,7 @@ from aiter.ops.shuffle import (
     shuffle_weight,
     shuffle_weight_a16w4,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.test_common import checkAllclose
 from aiter.utility import fp4_utils
 
@@ -241,6 +240,9 @@ def _append_fake_route_kernel(
     ids = tl.load(src_ids + src_offsets, mask=routed, other=fake_expert_id)
     tl.store(dst_weights + offsets, weights, mask=valid)
     tl.store(dst_ids + offsets, ids, mask=valid)
+
+
+_append_fake_route_kernel_launch = intj_handle(_append_fake_route_kernel, grid_arg=1)
 
 
 @torch.library.custom_op("aiter::test_wide_ep_forward", mutates_args=())
@@ -450,15 +452,18 @@ class TestWideEpMoe:
                 "MORI dispatch capacity changed after route buffers were allocated"
             )
         total = route_shape[0] * route_shape[1]
-        _intj_launch(_append_fake_route_kernel, (triton.cdiv(total, 256),),
+        dev, stream = current_device_stream()
+        _append_fake_route_kernel_launch(dev)(
+            stream,
+            triton.cdiv(total, 256),
             recv[1],
             recv[3],
             self._fmoe_route_weights,
             self._fmoe_route_ids,
             total,
-            routed_topk=self.topk,
-            fake_expert_id=self.experts,
-            BLOCK_SIZE=256,
+            self.topk,  # routed_topk
+            self.experts,  # fake_expert_id
+            256,  # BLOCK_SIZE
         )
         context = TestWideEpMoeContext(
             tokens=recv[0],

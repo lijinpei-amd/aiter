@@ -6,11 +6,11 @@ import argparse
 import torch
 import triton
 import triton.language as tl
-from intj.compat import launch as _intj_launch
 from torch import Tensor
 
 import aiter
 from aiter import per_tensor_quant
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import dtypes
 
@@ -123,6 +123,9 @@ def set_kv_cache_shuffle_kernel(
     tl.store(value_cache_ptr + dst_v_shuffle_offset, v_val)
 
 
+_set_kv_cache_shuffle_kernel_launch = intj_handle(set_kv_cache_shuffle_kernel)
+
+
 def set_kv_cache_shuffle_layout(
     k_quantized: Tensor,  # [num_tokens, num_kv_heads, head_size] - already quantized
     v_quantized: Tensor,  # [num_tokens, num_kv_heads, head_size] - already quantized
@@ -157,7 +160,10 @@ def set_kv_cache_shuffle_layout(
     new_value_cache = v_cache.view_as(v_cache_template)
 
     grid = (num_tokens, num_kv_heads)
-    _intj_launch(set_kv_cache_shuffle_kernel, grid,
+    dev, stream = current_device_stream()
+    _set_kv_cache_shuffle_kernel_launch(dev)(
+        stream,
+        grid,
         k_quantized,
         v_quantized,
         new_key_cache,
@@ -169,7 +175,7 @@ def set_kv_cache_shuffle_layout(
         block_size,
         head_size,
         num_kv_heads,
-        BLOCK_SIZE=head_size,
+        head_size,  # BLOCK_SIZE
     )
 
 

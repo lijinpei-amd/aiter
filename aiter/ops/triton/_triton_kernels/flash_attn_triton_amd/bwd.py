@@ -5,7 +5,6 @@ import torch
 import triton
 import triton.language as tl
 from intj.compat import launch as _intj_launch
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
     AUTOTUNE,
@@ -15,6 +14,8 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
     is_fp8,
     remap_xcd,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 PREPROCESS_AUTOTUNE_KEYS = [
@@ -1894,6 +1895,12 @@ def _bwd_kernel_split_dkdv_causal(
     tl.store(dk_ptr + offs_dkdv, dk, mask=mask_kv)
 
 
+_bwd_kernel_split_dkdv_causal_launch = intj_handle(
+    _bwd_kernel_split_dkdv_causal,
+    options={"num_stages": 1, "num_warps": 4, "waves_per_eu": 1},
+)
+
+
 @triton.jit
 def _bwd_kernel_split_dq_causal(
     q_ptr,
@@ -2166,6 +2173,12 @@ def _bwd_kernel_split_dq_causal(
         )
         dq *= sm_scale
         tl.store(dq_ptr + offs_dq, dq, mask=mask_q)
+
+
+_bwd_kernel_split_dq_causal_launch = intj_handle(
+    _bwd_kernel_split_dq_causal,
+    options={"num_stages": 1, "num_warps": 4, "waves_per_eu": 1},
+)
 
 
 @triton.jit
@@ -2577,6 +2590,12 @@ def _bwd_kernel_split_dkdv_noncausal(
     tl.store(DK + adj_dkdv, dk, mask=mask_kv)
 
 
+_bwd_kernel_split_dkdv_noncausal_launch = intj_handle(
+    _bwd_kernel_split_dkdv_noncausal,
+    options={"num_stages": 1, "num_warps": 4, "waves_per_eu": 1},
+)
+
+
 @triton.jit
 def _bwd_kernel_split_dq_noncausal(
     Q,
@@ -2757,6 +2776,12 @@ def _bwd_kernel_split_dq_noncausal(
         offs_dq = offs_m[:, None] * stride_dqm + offs_k[None, :] * stride_dqk
         dq *= sm_scale
         tl.store(DQ + adj_dq + offs_dq, dq, mask=mask_q)
+
+
+_bwd_kernel_split_dq_noncausal_launch = intj_handle(
+    _bwd_kernel_split_dq_noncausal,
+    options={"num_stages": 1, "num_warps": 4, "waves_per_eu": 1},
+)
 
 
 # This function computes delta given output Out and gradient DO
@@ -4987,8 +5012,6 @@ def attention_backward_triton_impl(
                 NUM_XCD=num_xcd,
             )
     elif mode == "fused_atomic":
-        NUM_WARPS, NUM_STAGES = 4, 1
-        WAVES_PER_EU = 1
         BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 64, 64, 64, 16
         BLK_SLICE_FACTOR = 2
         BLOCK_D_MODEL_POW2 = max(triton.next_power_of_2(HEAD_DIM_QK), 16)
@@ -5143,8 +5166,6 @@ def attention_backward_triton_impl(
                 **config,
             )
     elif mode == "split":
-        NUM_WARPS, NUM_STAGES = 4, 1
-        WAVES_PER_EU = 1
         BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 64, 64, 64, 16
         BLK_SLICE_FACTOR = 2
         BLOCK_D_MODEL_POW2 = max(triton.next_power_of_2(HEAD_DIM_QK), 16)
@@ -5153,7 +5174,10 @@ def attention_backward_triton_impl(
         grid_dq = ((max_seqlen_q + BLOCK_M2 - 1) // BLOCK_M2, batch, nheads_k)
 
         if causal:
-            _intj_launch(_bwd_kernel_split_dkdv_causal, grid_dkdv,
+            dev, stream = current_device_stream()
+            _bwd_kernel_split_dkdv_causal_launch(dev)(
+                stream,
+                grid_dkdv,
                 q,
                 k,
                 v,
@@ -5204,22 +5228,21 @@ def attention_backward_triton_impl(
                 descale_q,
                 descale_k,
                 descale_v,
-                NUM_Q_HEADS=nheads_q,
-                NUM_K_HEADS=nheads_k,
-                BLOCK_M=BLOCK_M1,
-                BLOCK_N=BLOCK_N1,
-                BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
-                BLOCK_D_MODEL=HEAD_DIM_QK,
-                BLOCK_D_MODEL_POW2=HEAD_DIM_QK,
-                ENABLE_DROPOUT=use_dropout,
-                IS_VARLEN=IS_VARLEN,
-                IS_FP8=IS_FP8,
-                FP8_MAX=FP8_MAX,
-                num_warps=NUM_WARPS,
-                num_stages=NUM_STAGES,
-                waves_per_eu=WAVES_PER_EU,
+                nheads_q,  # NUM_Q_HEADS
+                nheads_k,  # NUM_K_HEADS
+                BLOCK_M1,  # BLOCK_M
+                BLOCK_N1,  # BLOCK_N
+                BLK_SLICE_FACTOR,
+                HEAD_DIM_QK,  # BLOCK_D_MODEL
+                HEAD_DIM_QK,  # BLOCK_D_MODEL_POW2
+                use_dropout,  # ENABLE_DROPOUT
+                IS_VARLEN,
+                IS_FP8,
+                FP8_MAX,
             )
-            _intj_launch(_bwd_kernel_split_dq_causal, grid_dq,
+            _bwd_kernel_split_dq_causal_launch(dev)(
+                stream,
+                grid_dq,
                 q,
                 k,
                 v,
@@ -5269,23 +5292,23 @@ def attention_backward_triton_impl(
                 descale_q,
                 descale_k,
                 descale_v,
-                NUM_Q_HEADS=nheads_q,
-                NUM_K_HEADS=nheads_k,
-                BLOCK_M=BLOCK_M2,
-                BLOCK_N=BLOCK_N2,
-                BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
-                BLOCK_D_MODEL=HEAD_DIM_QK,
-                BLOCK_D_MODEL_POW2=HEAD_DIM_QK,
-                ENABLE_DROPOUT=use_dropout,
-                IS_VARLEN=IS_VARLEN,
-                IS_FP8=IS_FP8,
-                FP8_MAX=FP8_MAX,
-                num_warps=NUM_WARPS,
-                num_stages=NUM_STAGES,
-                waves_per_eu=WAVES_PER_EU,
+                nheads_q,  # NUM_Q_HEADS
+                nheads_k,  # NUM_K_HEADS
+                BLOCK_M2,  # BLOCK_M
+                BLOCK_N2,  # BLOCK_N
+                BLK_SLICE_FACTOR,
+                HEAD_DIM_QK,  # BLOCK_D_MODEL
+                HEAD_DIM_QK,  # BLOCK_D_MODEL_POW2
+                use_dropout,  # ENABLE_DROPOUT
+                IS_VARLEN,
+                IS_FP8,
+                FP8_MAX,
             )
         else:
-            _intj_launch(_bwd_kernel_split_dkdv_noncausal, grid_dkdv,
+            dev, stream = current_device_stream()
+            _bwd_kernel_split_dkdv_noncausal_launch(dev)(
+                stream,
+                grid_dkdv,
                 q,
                 k,
                 v,
@@ -5336,23 +5359,22 @@ def attention_backward_triton_impl(
                 descale_q,
                 descale_k,
                 descale_v,
-                NUM_Q_HEADS=nheads_q,
-                NUM_K_HEADS=nheads_k,
-                BLOCK_M=BLOCK_M1,
-                BLOCK_N=BLOCK_N1,
-                BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
-                BLOCK_D_MODEL=HEAD_DIM_QK,
-                BLOCK_D_MODEL_POW2=HEAD_DIM_QK,
-                ENABLE_DROPOUT=use_dropout,
-                IS_VARLEN=IS_VARLEN,
-                IS_FP8=IS_FP8,
-                FP8_MAX=FP8_MAX,
-                num_warps=NUM_WARPS,
-                num_stages=NUM_STAGES,
-                waves_per_eu=WAVES_PER_EU,
+                nheads_q,  # NUM_Q_HEADS
+                nheads_k,  # NUM_K_HEADS
+                BLOCK_M1,  # BLOCK_M
+                BLOCK_N1,  # BLOCK_N
+                BLK_SLICE_FACTOR,
+                HEAD_DIM_QK,  # BLOCK_D_MODEL
+                HEAD_DIM_QK,  # BLOCK_D_MODEL_POW2
+                use_dropout,  # ENABLE_DROPOUT
+                IS_VARLEN,
+                IS_FP8,
+                FP8_MAX,
             )
 
-            _intj_launch(_bwd_kernel_split_dq_noncausal, grid_dq,
+            _bwd_kernel_split_dq_noncausal_launch(dev)(
+                stream,
+                grid_dq,
                 q,
                 k,
                 v,
@@ -5402,20 +5424,17 @@ def attention_backward_triton_impl(
                 descale_q,
                 descale_k,
                 descale_v,
-                NUM_Q_HEADS=nheads_q,
-                NUM_K_HEADS=nheads_k,
-                BLOCK_M=BLOCK_M2,
-                BLOCK_N=BLOCK_N2,
-                BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
-                BLOCK_D_MODEL=HEAD_DIM_QK,
-                BLOCK_D_MODEL_POW2=HEAD_DIM_QK,
-                ENABLE_DROPOUT=use_dropout,
-                IS_VARLEN=IS_VARLEN,
-                IS_FP8=IS_FP8,
-                FP8_MAX=FP8_MAX,
-                num_warps=NUM_WARPS,
-                num_stages=NUM_STAGES,
-                waves_per_eu=WAVES_PER_EU,
+                nheads_q,  # NUM_Q_HEADS
+                nheads_k,  # NUM_K_HEADS
+                BLOCK_M2,  # BLOCK_M
+                BLOCK_N2,  # BLOCK_N
+                BLK_SLICE_FACTOR,
+                HEAD_DIM_QK,  # BLOCK_D_MODEL
+                HEAD_DIM_QK,  # BLOCK_D_MODEL_POW2
+                use_dropout,  # ENABLE_DROPOUT
+                IS_VARLEN,
+                IS_FP8,
+                FP8_MAX,
             )
     else:
         raise ValueError(

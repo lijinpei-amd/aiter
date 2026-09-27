@@ -30,8 +30,16 @@ except:  # noqa: E722
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import e4m3_dtype
+
+_triton_cat_and_cache_mla_launch = intj_handle(
+    triton_fused_qk_rope_cat_and_cache_mla_kernel, options={"num_warps": 1}
+)
+_gluon_cat_and_cache_mla_launch = intj_handle(
+    gluon_fused_qk_rope_cat_and_cache_mla_kernel, options={"num_warps": 1}
+)
 
 _LOGGER = AiterTritonLogger()
 
@@ -272,11 +280,14 @@ def fused_qk_rope_cat_and_cache_mla(
     n_pid = b * qh + (b_slot - b) * kh
     grid = (n_pid, 1, 1)
     if DEVICE_ARCH == "gfx1250":
-        _kernel = gluon_fused_qk_rope_cat_and_cache_mla_kernel
+        _kernel = _gluon_cat_and_cache_mla_launch
     else:
-        _kernel = triton_fused_qk_rope_cat_and_cache_mla_kernel
+        _kernel = _triton_cat_and_cache_mla_launch
 
-    _intj_launch(_kernel, grid,
+    dev, stream = current_device_stream()
+    _kernel(dev)(
+        stream,
+        grid,
         q_nope,
         q_pe,
         k_nope,
@@ -307,23 +318,22 @@ def fused_qk_rope_cat_and_cache_mla(
         kv_cache_stride_b,
         kv_cache_stride_h,
         kv_cache_stride_d,
-        k_scale_ptr=k_scale,
-        QH_PER_KH=qh // kh,
-        QH=qh,
-        KH=kh,
-        REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
-        IS_NEOX=is_neox,
-        BLOCK_D_nope=d_nope,
-        BLOCK_D_pe=d_pe,
-        BLOCK_D_HALF_pe=d_pe // 2,
-        BLOCK_SIZE=block_size,
-        SHUFFLED_KV_CACHE=shuffled_kv_cache,
-        SCALE_K_WIDTH_NOPE=SCALE_K_WIDTH_NOPE,
-        SCALE_K_WIDTH_ROPE=SCALE_K_WIDTH_ROPE,
-        OUTPUT_Q_NOPE_ZEROS_AND_Q_PE=(num_decode_toks_for_zeros > 0),
-        HAVE_K_SCALE=(k_scale is not None and apply_scale),
-        UPCAST_OPERAND=upcast_operand,
-        num_warps=1,
+        k_scale,  # k_scale_ptr
+        qh // kh,  # QH_PER_KH
+        qh,  # QH
+        kh,  # KH
+        reuse_freqs_front_part,  # REUSE_FREQS_FRONT_PART
+        is_neox,  # IS_NEOX
+        d_nope,  # BLOCK_D_nope
+        d_pe,  # BLOCK_D_pe
+        d_pe // 2,  # BLOCK_D_HALF_pe
+        block_size,  # BLOCK_SIZE
+        shuffled_kv_cache,  # SHUFFLED_KV_CACHE
+        SCALE_K_WIDTH_NOPE,
+        SCALE_K_WIDTH_ROPE,
+        num_decode_toks_for_zeros > 0,  # OUTPUT_Q_NOPE_ZEROS_AND_Q_PE
+        k_scale is not None and apply_scale,  # HAVE_K_SCALE
+        upcast_operand,  # UPCAST_OPERAND
     )
 
     return q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out
@@ -641,6 +651,12 @@ def fused_qk_rope_reshape_and_cache(
     return q_out, k_out, key_cache, value_cache
 
 
+_fused_qk_rope_cosine_cache_llama_kernel_launch = intj_handle(
+    _fused_qk_rope_cosine_cache_llama_kernel,
+    options={"num_warps": 1},
+)
+
+
 def fused_qk_rope_cosine_cache_llama(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -740,7 +756,10 @@ def fused_qk_rope_cosine_cache_llama(
 
     n_pid = t * qh + (t_slot - t) * kh
     grid = (n_pid, 1, 1)
-    _intj_launch(_fused_qk_rope_cosine_cache_llama_kernel, grid,
+    dev, stream = current_device_stream()
+    _fused_qk_rope_cosine_cache_llama_kernel_launch(dev)(
+        stream,
+        grid,
         q,
         k,
         v,
@@ -769,21 +788,20 @@ def fused_qk_rope_cosine_cache_llama(
         value_cache.stride(1) if not flash_layout else value_cache.stride(2),
         value_cache.stride(2) if not flash_layout else value_cache.stride(3),
         value_cache.stride(3) if not flash_layout else value_cache.stride(1),
-        k_scale_ptr=k_scale,
-        v_scale_ptr=v_scale,
-        QH_PER_KH=qh // kh,
-        QH=qh,
-        KH=kh,
-        REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
-        IS_NEOX=is_neox,
-        BLOCK_D_pe=d,
-        BLOCK_D_HALF_pe=d // 2,
-        BLOCK_SIZE=block_size,
-        X_SIZE=x_cache if not flash_layout else 0,
-        FLASH_LAYOUT=flash_layout,
-        HAVE_POS=(offs is not None),
-        HAVE_K_SCALE=(k_scale is not None and apply_scale),
-        HAVE_V_SCALE=(v_scale is not None and apply_scale),
-        num_warps=1,
+        k_scale,  # k_scale_ptr
+        v_scale,  # v_scale_ptr
+        qh // kh,  # QH_PER_KH
+        qh,  # QH
+        kh,  # KH
+        reuse_freqs_front_part,  # REUSE_FREQS_FRONT_PART
+        is_neox,  # IS_NEOX
+        d,  # BLOCK_D_pe
+        d // 2,  # BLOCK_D_HALF_pe
+        block_size,  # BLOCK_SIZE
+        x_cache if not flash_layout else 0,  # X_SIZE
+        flash_layout,  # FLASH_LAYOUT
+        offs is not None,  # HAVE_POS
+        k_scale is not None and apply_scale,  # HAVE_K_SCALE
+        v_scale is not None and apply_scale,  # HAVE_V_SCALE
     )
     return q_out, key_cache, value_cache

@@ -3,8 +3,6 @@
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_a8w8_blockscale_split_cat import (
     _fused_gemm_a8w8_blockscale_preshuffle_split_cat,
@@ -12,9 +10,16 @@ from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_a8w8_blockscale_spli
     _fused_gemm_a8w8_blockscale_split_cat_reduce,
     _get_config,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+
+_fused_gemm_a8w8_blockscale_split_cat_reduce_launch = intj_handle(
+    _fused_gemm_a8w8_blockscale_split_cat_reduce,
+)
 
 
 def fused_gemm_a8w8_blockscale_split_cat(
@@ -177,7 +182,10 @@ def fused_gemm_a8w8_blockscale_split_cat(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _intj_launch(_fused_gemm_a8w8_blockscale_split_cat_reduce, grid_reduce,
+        dev, stream = current_device_stream()
+        _fused_gemm_a8w8_blockscale_split_cat_reduce_launch(dev)(
+            stream,
+            grid_reduce,
             c_pp,
             c1,
             c2,
@@ -377,7 +385,10 @@ def fused_gemm_a8w8_blockscale_preshuffle_split_cat(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _intj_launch(_fused_gemm_a8w8_blockscale_split_cat_reduce, grid_reduce,
+        dev, stream = current_device_stream()
+        _fused_gemm_a8w8_blockscale_split_cat_reduce_launch(dev)(
+            stream,
+            grid_reduce,
             c_pp,
             c1,
             c2,

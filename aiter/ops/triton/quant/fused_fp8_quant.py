@@ -15,6 +15,7 @@ from aiter.ops.triton._triton_kernels.quant.fused_fp8_quant import (
     _fused_rms_fp8_per_tensor_static_quant_kernel,
     _fused_silu_mul_fp8_per_tensor_static_quant_kernel,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
@@ -542,6 +543,11 @@ def fused_rms_gated_fp8_group_quant(
     return x_quant, scales
 
 
+_fused_flatten_fp8_group_quant_kernel_launch = intj_handle(
+    _fused_flatten_fp8_group_quant_kernel,
+)
+
+
 def fused_flatten_fp8_group_quant(
     x: torch.Tensor,
     group_size,
@@ -598,10 +604,10 @@ def fused_flatten_fp8_group_quant(
         M,
         N1,
     )
-    from intj.compat import launch
 
-    launch(
-        _fused_flatten_fp8_group_quant_kernel,
+    dev, stream = current_device_stream()
+    _fused_flatten_fp8_group_quant_kernel_launch(dev)(
+        stream,
         grid,
         x,
         out,
@@ -610,10 +616,10 @@ def fused_flatten_fp8_group_quant(
         *out.stride(),
         *out_block_scales.stride(),
         N2,
-        BLOCK_SIZE_N2=BLOCK_SIZE_N2,
-        QUANT_BLOCK_SIZE=group_size,
-        DTYPE_MAX=DTYPE_MAX,
-        DTYPE_MIN=-DTYPE_MAX,
+        BLOCK_SIZE_N2,
+        group_size,  # QUANT_BLOCK_SIZE
+        DTYPE_MAX,
+        -DTYPE_MAX,  # DTYPE_MIN
     )
 
     return out, out_block_scales

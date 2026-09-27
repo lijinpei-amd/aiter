@@ -6,8 +6,6 @@ import math
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
@@ -18,6 +16,8 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp8wfp8 import (
     _get_config,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -69,6 +69,12 @@ def _resolve_x_scale_strides(
     if is_x_scale_transposed:
         return x_scales.stride(1), x_scales.numel() // x_scales.stride(0)
     return x_scales.stride(0), x_scales.stride(1)
+
+
+_gemm_splitk_reduce_kernel_launch = intj_handle(
+    _gemm_splitk_reduce_kernel,
+    baked={"KERNEL_NAME": "_gemm_afp8wfp8_reduce_kernel"},
+)
 
 
 def gemm_afp8wfp8(
@@ -184,7 +190,10 @@ def gemm_afp8wfp8(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _intj_launch(_gemm_splitk_reduce_kernel, grid_reduce,
+        dev, stream = current_device_stream()
+        _gemm_splitk_reduce_kernel_launch(dev)(
+            stream,
+            grid_reduce,
             y_pp,
             y,
             None,
@@ -195,17 +204,22 @@ def gemm_afp8wfp8(
             y_pp.stride(2),
             y.stride(0),
             y.stride(1),
-            BLOCK_SIZE_M=REDUCE_BLOCK_SIZE_M,
-            BLOCK_SIZE_N=REDUCE_BLOCK_SIZE_N,
-            ACTUAL_KSPLIT=ACTUAL_KSPLIT,
-            MAX_KSPLIT=triton.next_power_of_2(config["NUM_KSPLIT"]),
-            ADD_BIAS=False,
-            activation=None,
-            use_activation=False,
-            KERNEL_NAME="_gemm_afp8wfp8_reduce_kernel",
+            REDUCE_BLOCK_SIZE_M,  # BLOCK_SIZE_M
+            REDUCE_BLOCK_SIZE_N,  # BLOCK_SIZE_N
+            ACTUAL_KSPLIT,
+            triton.next_power_of_2(config["NUM_KSPLIT"]),  # MAX_KSPLIT
+            False,  # ADD_BIAS
+            None,  # activation
+            False,  # use_activation
         )
 
     return y
+
+
+_gemm_splitk_reduce_kernel_launch2 = intj_handle(
+    _gemm_splitk_reduce_kernel,
+    baked={"KERNEL_NAME": "_gemm_afp8wfp8_preshuffle_reduce_kernel"},
+)
 
 
 def gemm_afp8wfp8_preshuffle(
@@ -456,7 +470,10 @@ def gemm_afp8wfp8_preshuffle(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _intj_launch(_gemm_splitk_reduce_kernel, grid_reduce,
+        dev, stream = current_device_stream()
+        _gemm_splitk_reduce_kernel_launch2(dev)(
+            stream,
+            grid_reduce,
             y_pp,
             y,
             None,
@@ -467,14 +484,13 @@ def gemm_afp8wfp8_preshuffle(
             y_pp.stride(2),
             y.stride(0),
             y.stride(1),
-            BLOCK_SIZE_M=REDUCE_BLOCK_SIZE_M,
-            BLOCK_SIZE_N=REDUCE_BLOCK_SIZE_N,
-            ACTUAL_KSPLIT=ACTUAL_KSPLIT,
-            MAX_KSPLIT=triton.next_power_of_2(config["NUM_KSPLIT"]),
-            ADD_BIAS=False,
-            activation=None,
-            use_activation=False,
-            KERNEL_NAME="_gemm_afp8wfp8_preshuffle_reduce_kernel",
+            REDUCE_BLOCK_SIZE_M,  # BLOCK_SIZE_M
+            REDUCE_BLOCK_SIZE_N,  # BLOCK_SIZE_N
+            ACTUAL_KSPLIT,
+            triton.next_power_of_2(config["NUM_KSPLIT"]),  # MAX_KSPLIT
+            False,  # ADD_BIAS
+            None,  # activation
+            False,  # use_activation
         )
 
     return y

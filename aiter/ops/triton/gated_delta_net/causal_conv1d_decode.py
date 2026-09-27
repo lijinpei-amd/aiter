@@ -11,7 +11,6 @@ q/k/v. The ``@triton.jit`` / Gluon kernels live in
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.causal_conv1d_update_split_qkv import (
     PAD_SLOT_ID,
@@ -19,8 +18,19 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.causal_conv1d_upda
     gluon_causal_conv1d_update_split_qkv_kernel,
     gluon_causal_conv1d_update_split_qkv_kernel_notuple,
 )
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 
 __all__ = ["PAD_SLOT_ID", "causal_conv1d_update_split_qkv"]
+
+_triton_kernel_launch = intj_handle(
+    _causal_conv1d_update_split_qkv_kernel, options={"num_warps": 4}
+)
+_gluon_kernel_launch = intj_handle(
+    gluon_causal_conv1d_update_split_qkv_kernel, options={"num_warps": 2}
+)
+_gluon_notuple_kernel_launch = intj_handle(
+    gluon_causal_conv1d_update_split_qkv_kernel_notuple, options={"num_warps": 2}
+)
 
 
 def causal_conv1d_update_split_qkv(
@@ -97,56 +107,58 @@ def causal_conv1d_update_split_qkv(
 
     if use_gluon:
         kernel_fn = (
-            gluon_causal_conv1d_update_split_qkv_kernel_notuple
+            _gluon_notuple_kernel_launch
             if use_gluon_notuple
-            else gluon_causal_conv1d_update_split_qkv_kernel
+            else _gluon_kernel_launch
         )
     else:
-        kernel_fn = _causal_conv1d_update_split_qkv_kernel
+        kernel_fn = _triton_kernel_launch
 
-    _intj_launch(kernel_fn, grid,
-        x_ptr=x,
-        w_ptr=weight,
-        bias_ptr=bias,
-        conv_state_ptr=conv_state,
-        conv_state_indices_ptr=conv_state_indices,
-        q_ptr=query,
-        k_ptr=key,
-        v_ptr=value,
-        key_dim=key_dim,
-        value_dim=value_dim,
-        batch=batch,
-        dim=dim,
-        seqlen=seqlen,
-        state_len=state_len,
-        num_cache_lines=num_cache_lines,
-        stride_x_seq=x.stride(0),
-        stride_x_dim=x.stride(1),
-        stride_x_token=x.stride(2),
-        stride_w_dim=weight.stride(0),
-        stride_w_width=weight.stride(1),
-        stride_conv_state_seq=conv_state.stride(0),
-        stride_conv_state_dim=conv_state.stride(1),
-        stride_conv_state_tok=conv_state.stride(2),
-        stride_state_indices=stride_state_indices,
-        stride_q_seq=query.stride(0),
-        stride_q_dim=query.stride(1),
-        stride_q_token=query.stride(2),
-        stride_k_seq=key.stride(0),
-        stride_k_dim=key.stride(1),
-        stride_k_token=key.stride(2),
-        stride_v_seq=value.stride(0),
-        stride_v_dim=value.stride(1),
-        stride_v_token=value.stride(2),
-        pad_slot_id=pad_slot_id,
-        HAS_BIAS=bias is not None,
-        KERNEL_WIDTH=width,
-        SILU_ACTIVATION=activation in ["silu", "swish"],
-        IS_CONTINUOUS_BATCHING=conv_state_indices is not None,
-        NP2_STATELEN=np2_statelen,
-        USE_PAD_SLOT=pad_slot_id is not None,
-        BLOCK_N=BLOCK_N,
-        num_warps=2 if use_gluon else 4,
+    dev, stream = current_device_stream()
+    kernel_fn(dev)(
+        stream,
+        grid,
+        x,  # x_ptr
+        weight,  # w_ptr
+        bias,  # bias_ptr
+        conv_state,  # conv_state_ptr
+        conv_state_indices,  # conv_state_indices_ptr
+        query,  # q_ptr
+        key,  # k_ptr
+        value,  # v_ptr
+        key_dim,
+        value_dim,
+        batch,
+        dim,
+        seqlen,
+        state_len,
+        num_cache_lines,
+        x.stride(0),  # stride_x_seq
+        x.stride(1),  # stride_x_dim
+        x.stride(2),  # stride_x_token
+        weight.stride(0),  # stride_w_dim
+        weight.stride(1),  # stride_w_width
+        conv_state.stride(0),  # stride_conv_state_seq
+        conv_state.stride(1),  # stride_conv_state_dim
+        conv_state.stride(2),  # stride_conv_state_tok
+        stride_state_indices,
+        query.stride(0),  # stride_q_seq
+        query.stride(1),  # stride_q_dim
+        query.stride(2),  # stride_q_token
+        key.stride(0),  # stride_k_seq
+        key.stride(1),  # stride_k_dim
+        key.stride(2),  # stride_k_token
+        value.stride(0),  # stride_v_seq
+        value.stride(1),  # stride_v_dim
+        value.stride(2),  # stride_v_token
+        pad_slot_id,
+        bias is not None,  # HAS_BIAS
+        width,  # KERNEL_WIDTH
+        activation in ["silu", "swish"],  # SILU_ACTIVATION
+        conv_state_indices is not None,  # IS_CONTINUOUS_BATCHING
+        np2_statelen,  # NP2_STATELEN
+        pad_slot_id is not None,  # USE_PAD_SLOT
+        BLOCK_N,
     )
 
     if unsqueeze:

@@ -37,7 +37,6 @@ from functools import lru_cache
 import torch
 import triton
 import triton.language as tl
-from intj.compat import launch as _intj_launch
 
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, wave_size_of
@@ -58,6 +57,7 @@ from aiter.ops.flydsl.topk.topk_per_row_small_k import (
     topk_per_row_small_k_serves,
 )
 from aiter.ops.topk_plain import topk_plain, topk_plain_batches_ragged_rows
+from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 
 __all__ = ["topk_select", "topk_select_backend"]
 
@@ -205,6 +205,9 @@ def _gather_selected_kernel(
     tl.store(out_ptr + row * out_stride0 + offs, val, mask=live)
 
 
+_gather_selected_kernel_launch = intj_handle(_gather_selected_kernel, grid_arg=1)
+
+
 def _gather_selected(scores, idx, fill):
     """The selected scores, padded slots filled, in one launch.
 
@@ -216,7 +219,10 @@ def _gather_selected(scores, idx, fill):
     """
     rows, topk = idx.shape
     out = torch.empty((rows, topk), dtype=scores.dtype, device=scores.device)
-    _intj_launch(_gather_selected_kernel, (rows,),
+    dev, stream = current_device_stream()
+    _gather_selected_kernel_launch(dev)(
+        stream,
+        rows,
         scores,
         idx,
         out,
@@ -225,7 +231,7 @@ def _gather_selected(scores, idx, fill):
         out.stride(0),
         topk,
         fill,
-        BLOCK_K=triton.next_power_of_2(topk),
+        triton.next_power_of_2(topk),  # BLOCK_K
     )
     return out
 
