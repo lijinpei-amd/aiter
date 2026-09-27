@@ -1,7 +1,10 @@
 # intj launch migration exceptions
 
-The migration targets Triton and Gluon `JITFunction` launches through
-`intj.compat.launch` or a bound `make_launcher`. This branch needs the sibling
+The migration targets Triton and Gluon `JITFunction` launches through a
+bound `make_launcher`: 238 call sites call a lazily built handle directly
+(see [Direct handles](#direct-handles)); 134 still go through
+`intj.compat.launch` and 47 through the tree-local `launch_tuned` bridge. This
+branch needs the sibling
 intj checkout (`develop` at or after `b4e9f1f`, which added autotune and
 heuristics support to `make_launcher`) installed in the environment or on
 `PYTHONPATH`; Aiter does not yet publish an intj dependency. The source imports with Python 3.10 and Triton 3.7.1, and all
@@ -21,15 +24,15 @@ to this branch.
 
 | Site | Target | Reason |
 | --- | --- | --- |
-| `aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/common.py:403` | `torch.library.wrap_triton(_rotary_kernel)` | `torch.library.wrap_triton` is required for `torch.compile` behavior. |
+| `aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/common.py:409` | `torch.library.wrap_triton(_rotary_kernel)` | `torch.library.wrap_triton` is required for `torch.compile` behavior. |
 | `aiter/ops/triton/attention/mha.py:720` | `_attn_fwd` | intj cannot resolve its inline `torch.Tensor` parameter annotations, starting with `q_ptr`. |
-| `aiter/ops/triton/attention/mha_onekernel_bwd.py:272` | `bwd_kernel_causal` | intj refuses its `used_global_vals` reference to `tl_DROPOUT_USE_PYTORCH`. |
-| `aiter/ops/triton/attention/mha_onekernel_bwd.py:329` | `bwd_kernel_noncausal` | intj refuses its `used_global_vals` reference to `tl_DROPOUT_USE_PYTORCH`. |
+| `aiter/ops/triton/attention/mha_onekernel_bwd.py:278` | `bwd_kernel_causal` | intj refuses its `used_global_vals` reference to `tl_DROPOUT_USE_PYTORCH`. |
+| `aiter/ops/triton/attention/mha_onekernel_bwd.py:335` | `bwd_kernel_noncausal` | intj refuses its `used_global_vals` reference to `tl_DROPOUT_USE_PYTORCH`. |
 | `aiter/ops/triton/attention/pa_decode_sparse.py:653` | `_sparse_mla_gfx950` | intj refuses its `used_global_vals` reference to `_MAX_PROP_NAN`. |
 | `aiter/ops/triton/attention/pa_decode_sparse.py:729` | `_sparse_mla_reduce_gfx950` | intj refuses its `used_global_vals` reference to `_MAX_PROP_NAN`. |
-| `aiter/ops/triton/attention/pa_mqa_logits.py:557` | `kernel` | A precompiled `triton.compile` result, not a `JITFunction`. |
-| `aiter/ops/triton/attention/pa_mqa_logits.py:595` | `kernel` | A precompiled Gluon/AOT kernel, not a `JITFunction`. |
-| `aiter/ops/triton/attention/pa_mqa_logits.py:627` | `_deepgemm_fp8_paged_mqa_logits` | Caller reads the returned kernel's `hash` for Triton's cache key. |
+| `aiter/ops/triton/attention/pa_mqa_logits.py:572` | `kernel` | A precompiled `triton.compile` result, not a `JITFunction`. |
+| `aiter/ops/triton/attention/pa_mqa_logits.py:610` | `kernel` | A precompiled Gluon/AOT kernel, not a `JITFunction`. |
+| `aiter/ops/triton/attention/pa_mqa_logits.py:642` | `_deepgemm_fp8_paged_mqa_logits` | Caller reads the returned kernel's `hash` for Triton's cache key. |
 | `aiter/ops/triton/attention/pod_attention.py:199` | `pod_persistent` | Caller prints the returned kernel's `n_regs` and `n_spills`. |
 | `aiter/ops/triton/attention/sparse_mla.py:607` | `_sparse_mla_gfx950` | intj refuses its `used_global_vals` reference to `_MAX_PROP_NAN`. |
 | `aiter/ops/triton/attention/sparse_mla.py:685` | `_sparse_mla_reduce_gfx950` | intj refuses its `used_global_vals` reference to `_MAX_PROP_NAN`. |
@@ -39,9 +42,9 @@ to this branch.
 | `aiter/ops/triton/comms/reduce_scatter.py:236` | `_reduce_scatter_kernel` | intj cannot resolve `heap_bases: tl.tensor`; its nested JIT helper also calls Iris `load`. |
 | `aiter/ops/triton/fusions/attn_res.py:458` | `attnres_fwd_kernel` | Custom cache stores the returned `CompiledKernel` and later calls `cached.run`. |
 | `aiter/ops/triton/fusions/attn_res.py:543` | `attnres_fwd_kernel` | `_run_sequence` passes `res`, a tuple of residual tensors; intj raises `TypeError: unsupported argument 'res' of type tuple` (tuple arguments are unsupported, with or without `ATTN_RES_TRITON_AUTOTUNE`). |
-| `aiter/ops/triton/gemm/basic/gemm_afp8wfp8.py:368` | `_PRESHUFFLE_KERNEL_MAP[kernel_type]` | gfx1250 preshuffle can use `num_ctas > 1` (CGA multicast); intj refuses it. |
-| `aiter/ops/triton/gluon/pa_decode_gluon.py:4359` | `paged_attention_kernel` | Both possible targets annotate `softmax_scale: float`, which intj cannot resolve; `paged_attention_decode_sliding_window_head_1` also reads `MFMA` and `VMEM_LOAD` globals. |
-| `aiter/ops/triton/gluon/pa_decode_gluon.py:4428` | `paged_attention_kernel` | Can select `paged_attention_decode_v2_gluon_large_block_dot_kernel`, which references `COMPUTE` and `VMEM_LOAD` globals that intj refuses. |
+| `aiter/ops/triton/gemm/basic/gemm_afp8wfp8.py:384` | `_PRESHUFFLE_KERNEL_MAP[kernel_type]` | gfx1250 preshuffle can use `num_ctas > 1` (CGA multicast); intj refuses it. |
+| `aiter/ops/triton/gluon/pa_decode_gluon.py:4369` | `paged_attention_kernel` | Both possible targets annotate `softmax_scale: float`, which intj cannot resolve; `paged_attention_decode_sliding_window_head_1` also reads `MFMA` and `VMEM_LOAD` globals. |
+| `aiter/ops/triton/gluon/pa_decode_gluon.py:4438` | `paged_attention_kernel` | Can select `paged_attention_decode_v2_gluon_large_block_dot_kernel`, which references `COMPUTE` and `VMEM_LOAD` globals that intj refuses. |
 | `aiter/ops/triton/moe/moe_op_gemm_a4w4.py:604` | `_moe_gemm_a4w4_prefill` | Selected config can use `num_ctas > 1`; intj refuses it. |
 | `aiter/ops/triton/moe/moe_op_gemm_a8w4.py:710` | `_moe_gemm_a8w4_prefill_gluon` | Selected config can use `num_ctas > 1`; intj refuses it. |
 | `csrc/cpp_itfs/pa_gluon_aot/pa_attention_kernel_test.py:591` | `kernel` | Can select `paged_attention_decode_v2_gluon_large_block_dot_kernel`, which references `COMPUTE` and `VMEM_LOAD` globals that intj refuses. |
@@ -58,37 +61,127 @@ above. The 144 FlyDSL `.launch(grid=..., block=..., stream=...)` sites
 in 77 files are excluded: they compile FlyDSL kernels with a different launch
 ABI, not Triton/Gluon `JITFunction`s.
 
-## Autotune and heuristics
+## Direct handles
 
-`intj.compat.launch` refuses `@triton.autotune` and `@triton.heuristics`
-wrappers. The 95 call sites that launch such a kernel (or pick one at runtime)
-use `launch_tuned` from
-[`aiter/ops/triton/utils/intj_tuned.py`](../aiter/ops/triton/utils/intj_tuned.py)
-instead: it keeps the Triton call spelling, drops the values the decorators
-assign, bakes `str`/dtype constexprs, and caches one bound `make_launcher` --
-and so one intj tuner cache -- per kernel, device, grid shape, compile options
-and baked values. Triton still tunes on a miss; a hit launches natively. A
-bare `@triton.jit` kernel passed to it goes to `intj.compat.launch`. A
-keyword that names both a kernel parameter and a compile option (such as
-`num_warps: tl.constexpr`) is passed as both, as Triton does. Warmed, it costs
-about 11 us of host time per `gemm_a8w8` launch against 38 us for
-`kernel[grid](...)` (gfx942, Triton 3.8.0). Hot call sites can still move to a
-direct `make_launcher` handle with a `grid_cpp` grid.
+[`aiter/ops/triton/utils/intj_handle.py`](../aiter/ops/triton/utils/intj_handle.py)
+declares a handle next to its kernel (after the kernel's definition when the
+module defines it, else before the first function launching it):
+
+```python
+_foo_launch = intj_handle(_foo_kernel, grid_arg=1, options={"num_warps": 4})
+
+dev, stream = current_device_stream()
+_foo_launch(dev)(stream, grid_x, *public_args)
+```
+
+Aiter imports kernel modules without a GPU, and `make_launcher` builds an
+extension and queries the target, so `intj_handle` builds
+`make_launcher(kernel, bind_device=True, ...).bind_device(dev)` on the first
+launch on each device (a `functools.cache`), not at import; intj's
+`@make_launcher(...)` decorator form builds when it decorates, so it would
+need a GPU at import. The call is
+make_launcher's positional form: defaults are passed explicitly, `str` /
+dtype constexprs fixed at the site are `baked=`, and the values
+`@triton.autotune` / `@triton.heuristics` assign are not passed. Grids are
+`grid_arg` for tuple literals, make_launcher's default grid for a named
+tuple, and `grid_cpp` for callable grids that read tuned values; values the
+grid takes from the caller's frame become keyword-only grid arguments,
+passed before the kernel arguments. `options=` may be a callable evaluated on
+the device when the handle is built (options that depend on `get_arch()`).
+A parameter that is also a compile option (`num_warps: tl.constexpr`) is
+passed as both, as Triton does; `compat.launch` compiled those with default
+options. Sites that pick one of several kernels with one signature (Gluon or
+Triton, `solve_tril`'s three merge kernels) pick between handles.
+
+190 of the 324 `compat.launch` sites and 48 of the 95 `launch_tuned` sites
+moved. Warmed, gfx942, Triton 3.8.0, host time per launch statement:
+
+| Site | direct handle | before | `kernel[grid]` |
+| --- | ---: | ---: | ---: |
+| `fused_recurrent_gated_delta_rule` (heuristics) | 4.7 us | 10.6 us (`launch_tuned`) | 38.3 us |
+| `chunk_gated_delta_rule_fwd_h` (autotune, `grid_cpp`) | 4.6 us | 13.5 us (`launch_tuned`) | 40.2 us |
+| `l2norm_bwd` (autotune, `grid_cpp`) | 4.3 us | 10.8 us (`launch_tuned`) | 26.1 us |
+| `rms_norm` (plain JIT) | 4.4 us | 28.0 us (`compat.launch`) | 22.1 us |
+
+Each spelling launched the same captured arguments, 200 launches per batch
+without synchronizing, median of 40 batches, three processes. The direct
+number includes `current_device_stream()` (0.36 us) and the HIP launch.
+
+Unlike `compat.launch`, a handle does not check for Triton launch hooks,
+CPU tensors, `TensorWrapper` arguments or interpreter mode (make_launcher
+refuses `TRITON_INTERPRET=1` when the handle is built), and it is not keyed on
+the JIT source or Triton's debug/instrumentation knobs: changing those after
+the first launch keeps the handle built before. Like `compat.launch`, a
+handle launch graph-breaks under `torch.compile` (Dynamo cannot trace
+`_cuda_getCurrentRawStream`).
+
+On gfx942 with Triton 3.8.0 and intj `39f2547`, evenly spaced samples (at
+most 120 tests per file) of all 129 files under `op_tests/triton_tests`:
+4586 passed and 2907 skipped. The rest fail with the same test ids on the
+pre-conversion revision (`c26cf130d`): `test_layernorm.py` (48) and
+`test_rmsnorm.py` (78) need `aiter.pertoken_quant`, three files (40 errors
+each) need other ops `AITER_TRITON_ONLY` mode skips, and
+`test_fav3_sage_compile.py` (17) hits a `fullgraph=True` graph break. Eleven files
+also passed with Triton 3.7.1. A pytest plugin that re-ran every handle
+launch as `kernel.run(...)` on cloned storages (tuned kernels with intj's
+chosen config) found every output bitwise equal except where a kernel reads
+out of bounds (`_layernorm_bwd_dwdb_triton_v2` reads the stride-0 `dy` of
+`y.sum().backward()` with `x`'s stride; `chunk_delta_attn_gate_fwd` with a
+`[H]` `dt_bias`). All 228 handles construct on gfx942; handles that only
+gfx950/gfx1250 or Iris/FlyDSL paths reach are constructed only, not run.
+
+### Sites left on `compat.launch` (134)
+
+`compat.launch` serves sites whose launch varies per call in a way one
+handle cannot: 
+
+- Per-call compile options (58): `num_warps` / `num_stages` / `waves_per_eu`
+  computed from the shape or a config lookup (cross_entropy, fused_fp8_quant,
+  rope's thd-cached kernels, the MoE GEMMs, sparse MLA training/backward,
+  gather_kv_b_proj, ...).
+- Per-shape `**config` dicts carrying options and constexprs (52): conv,
+  unified_attention, mhc, mla, pa_mqa_logits, quant_fp8_blockwise, hstu,
+  mha_fused_bwd, fav3_sage, ....
+- Per-call `str` / dtype / JIT constexprs (13): `pa_decode.py`'s
+  `compute_type` (6), the moe topk kernels' `SCORE_MODE` (3), `mla_gluon`'s
+  `REGIME`, and the split-K reduce `activation` in `gemm_a16w16.py` (2) and
+  `fused_gemm_a16w16_quant_x.py`.
+- A kernel chosen at runtime (11) together with one of the above, or with
+  Gluon layout constexprs (`gemm_a16w16.py`, `batched_gemm_bf16.py`, gfx1250
+  `gemm_afp4wfp4.py`); `fused_kv_cache.py`'s reshape-and-cache kernels differ
+  in their extra constexprs.
+
+### Sites left on `launch_tuned` (47)
+
+`compat.launch` refuses `@triton.autotune` and `@triton.heuristics`
+wrappers, so decorated kernels with a per-call variant stay on `launch_tuned`
+from [`aiter/ops/triton/utils/intj_tuned.py`](../aiter/ops/triton/utils/intj_tuned.py):
+it keeps the Triton call spelling, drops the values the decorators assign,
+bakes `str`/dtype constexprs, and caches one bound `make_launcher` -- and so
+one intj tuner cache -- per kernel, device, grid shape, compile options and
+baked values. Triton still tunes on a miss; a hit launches natively.
+
+- Per-shape `**config` dicts (40): the GEMM wrappers (a8w8, a16w16, fp4, fp8,
+  batched, fused, feed-forward), `gmm.py`, `attn_res.py`'s
+  `_launch_tune_kwargs`, and the gfx1250 Gluon branch of
+  `fused_rms_mxfp4_quant`.
+- Per-call `num_warps` (5): `activation.py`, `quant.py` (2),
+  `fused_bmm_rope_kv_cache.py` (2).
+- Per-call activation JIT constexpr (2): `activation.py`,
+  `fused_reduce_act_mul_and_mxfp4_quant`.
 
 One site stays on Triton: the tuple argument of `attn_res.py:543` (see the
-table). The four `fused_mxfp4_quant.py` sites that used
-`functools.partial(_even_m_n, ...)` heuristics (lines 177/184/375/573) now go
-through `launch_tuned`: the heuristics were rewritten as module-level,
+table). The `fused_mxfp4_quant.py` heuristics that used
+`functools.partial(_even_m_n, ...)` were rewritten as module-level,
 closure-free defs (`even_m_n1`/`even_m_n2`/`even_m_n3`/`even_m_n1_iter` in
 `aiter/ops/triton/utils/mxfp4_heuristics.py`) that intj's subset accepts.
 `op_tests/triton_tests/quant/test_mxfp4_intj.py` asserts `make_launcher`
-accepts them and that the intj launch matches a raw Triton launch. The Gluon
+accepts them and that the intj launches match raw Triton launches. The Gluon
 kernels these wrappers can also select (`_gluon_fused_rms_mxfp4_quant_kernel`,
 `_gluon_fused_reduce_rms_mxfp4_quant_kernel`, gfx1250-only) keep their own
-`functools.partial(_even_m_n, ...)` heuristics unchanged, so `launch_tuned`
-still raises `UnsupportedKernel` if that branch is ever taken; this is
-untested here (no gfx1250 hardware) and unchanged from before this
-conversion for that path.
+`functools.partial(_even_m_n, ...)` heuristics, so their handle or
+`launch_tuned` raises `UnsupportedKernel` if that branch is ever taken; this
+is untested here (no gfx1250 hardware).
 
 ## FlashKDA
 
