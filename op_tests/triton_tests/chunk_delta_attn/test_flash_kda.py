@@ -105,11 +105,13 @@ def _k2_tuner_search_space():
     kern = _flash_kda._flash_kda_segment_kernel
     saved = kern.configs
     kern.configs = list(_flash_kda._K2_CONFIGS)
+    # Each native handle copies the tuner, configs included, when it is made.
+    _flash_kda._cached_intj_launcher.cache_clear()
     try:
         yield kern
     finally:
         kern.configs = saved
-        kern.cache.clear()
+        _flash_kda._cached_intj_launcher.cache_clear()
 
 
 def run_reference(q, k, v, g, beta, A_log, dt_bias, scale, **kw):
@@ -391,14 +393,32 @@ def test_tuner_keeps_the_two_schedules_apart():
     # without it the unsegmented one passes h_in=None and the key picks up the
     # difference through the dtypes it appends, hiding the collision.
     kw = {"initial_state": torch.zeros(1, 4, K_DIM, K_DIM, device=device)}
-    # This is about the Triton kernel's autotuner, which never runs -- and whose
-    # cache therefore stays empty -- when K2 is routed to Gluon.
+    # This is about the Triton kernel's autotuner, which never runs when K2 is
+    # routed to Gluon. intj tunes on private copies of it, one per native
+    # handle, so the keys are collected from every K2 tuner that runs.
+    from triton.runtime.autotuner import Autotuner
+
+    tuners = []
+    original = Autotuner.run
+
+    def spy(self, *a, **k):
+        if self.fn.fn is kern.fn:
+            tuners.append(self)
+        return original(self, *a, **k)
+
+    def keys():
+        return {key for t in tuners for key in t.cache}
+
     with _k2_tuner_search_space() as kern, _route(k2=False):
-        kern.cache.clear()
-        run_flash(*args, chunks_per_seg=4, **kw)
-        segmented_keys = set(kern.cache)
-        run_flash(*args, chunks_per_seg=0, **kw)
-        assert set(kern.cache) - segmented_keys, "unsegmented reused a segmented config"
+        Autotuner.run = spy
+        try:
+            run_flash(*args, chunks_per_seg=4, **kw)
+            segmented_keys = keys()
+            assert segmented_keys, "K2 was never tuned"
+            run_flash(*args, chunks_per_seg=0, **kw)
+        finally:
+            Autotuner.run = original
+        assert keys() - segmented_keys, "unsegmented reused a segmented config"
 
 
 def test_published_k2_schedules_can_split_their_tile():
@@ -568,29 +588,73 @@ def test_cases_reach_the_gluon_k2():
     )
 
     reached = set()
-    saved = _g2.k2_ab_fused_fast
+    original = _flash_kda._intj_launcher
 
-    class _Counting:
-        def __getitem__(self, grid):
-            inner = saved[grid]
+    def counted(kernel, *a, **k):
+        native = original(kernel, *a, **k)
+        if kernel is not _g2.k2_ab_fused_gluon:
+            return native
 
-            def launch(**kw):
-                reached.add(current)
-                return inner(**kw)
+        def launch(*args):
+            reached.add(current)
+            return native(*args)
 
-            return launch
+        return launch
 
-    _g2.k2_ab_fused_fast = _Counting()
+    _flash_kda._intj_launcher = counted
     try:
         for current, make in _CASES.items():
             args, kw = make()
             with _route(k1=True, k2=True):
                 run_flash(*args, **kw)
     finally:
-        _g2.k2_ab_fused_fast = saved
+        _flash_kda._intj_launcher = original
 
     want = {name for name in _CASES if name.startswith("segmented")}
     assert want <= reached, f"never reached the Gluon K2: {sorted(want - reached)}"
+
+
+def test_wide_gluon_k2_launch_matches_triton(monkeypatch):
+    """The published four-warp K2 schedule, which derives its layouts in-JIT."""
+    if not _flash_kda._gluon_k2_usable(FLASH_KDA_CHUNK, K_DIM, K_DIM):
+        pytest.skip("Gluon K2 requires gfx950")
+    from aiter.ops.triton._gluon_kernels.gfx950.chunk_delta_attn import (
+        flash_kda_k2 as _g2,
+    )
+
+    args = make_inputs(1, 512, 64)
+    assert _flash_kda._k2_gluon_schedule(K_DIM, 16, 64) == (64, 4)
+    with _route(k1=True, k2=False):
+        want, want_state = run_flash(*args, chunks_per_seg=1, output_final_state=True)
+
+    seen = []
+    original = _flash_kda._intj_launcher
+
+    def counted(kernel, device, options=(), *a, **k):
+        if kernel is _g2.k2_ab_fused_gluon:
+            seen.append(dict(options))
+        return original(kernel, device, options, *a, **k)
+
+    monkeypatch.setattr(_flash_kda, "_intj_launcher", counted)
+    with _route(k1=True, k2=True):
+        got, got_state = run_flash(*args, chunks_per_seg=1, output_final_state=True)
+    assert seen == [{"num_warps": 4}]
+    assert rel_err(got, want) < 2e-3
+    assert rel_err(got_state, want_state) < 1e-4
+
+
+def test_gluon_kda_jits_have_no_captured_layout_globals():
+    """intj refuses a JIT that reads globals, and cannot bake layout objects."""
+    from aiter.ops.triton._gluon_kernels.gfx950.chunk_delta_attn.flash_kda_k1 import (
+        k1_prepare_gluon,
+    )
+    from aiter.ops.triton._gluon_kernels.gfx950.chunk_delta_attn.flash_kda_k2 import (
+        k2_ab_fused_gluon,
+    )
+
+    for kernel in (k1_prepare_gluon, k2_ab_fused_gluon):
+        _ = kernel.cache_key  # Triton populates used_global_vals lazily.
+        assert not kernel.used_global_vals
 
 
 # A weak gate is the only setting that exposes the intra-chunk inverse. At the

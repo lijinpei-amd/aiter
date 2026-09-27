@@ -1,51 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import functools
-
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.fast_launch import fast_launch
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-
-KW = 8
-KW_BIG = 8
-
-
-@functools.cache
-def build_layouts(nw, kw=KW, kw_big=KW_BIG):
-    """The layout set, derived from one decision: the state stays in registers.
-
-    ``instr_shape[0:2] = [16, 16]`` with ``transposed=False`` is what makes an
-    MFMA accumulator a legal B operand, so the state can be the accumulator of
-    ``dot(kr^T, U)`` and the B operand of ``dot(kd, h)`` without a round trip.
-    ``kw`` names the dots that contract over C and ``kw_big`` the one that
-    contracts over K; the two accumulator distributions are the same, since an
-    accumulator's layout is set by M and N and not by K.
-    """
-    mma = gl.amd.AMDMFMALayout(
-        version=4,
-        instr_shape=[16, 16, 4 * kw],
-        transposed=False,
-        warps_per_cta=[1, nw],
-    )
-    mma_b = gl.amd.AMDMFMALayout(
-        version=4,
-        instr_shape=[16, 16, 4 * kw_big],
-        transposed=False,
-        warps_per_cta=[1, nw],
-    )
-    return {
-        "MMA": mma,
-        "A_OP": gl.DotOperandLayout(0, mma, kw),
-        "B_OP": gl.DotOperandLayout(1, mma, kw),
-        "MMA_B": mma_b,
-        "A_OP_B": gl.DotOperandLayout(0, mma_b, kw_big),
-        "B_OP_B": gl.DotOperandLayout(1, mma_b, kw_big),
-        "BLK": gl.BlockedLayout([1, 8], [4, 16], [nw, 1], [1, 0]),
-        "SH_KR": gl.SwizzledSharedLayout(8, 1, 16, [0, 1]),
-    }
 
 
 @gluon.jit
@@ -131,14 +90,6 @@ def k2_ab_fused_gluon(
     V: gl.constexpr,
     C: gl.constexpr,
     BW: gl.constexpr,
-    MMA: gl.constexpr,
-    A_OP: gl.constexpr,
-    B_OP: gl.constexpr,
-    MMA_B: gl.constexpr,
-    A_OP_B: gl.constexpr,
-    B_OP_B: gl.constexpr,
-    BLK: gl.constexpr,
-    SH_KR: gl.constexpr,
 ):
     """Both pass-A recurrences in one launch, sharing every operand load.
 
@@ -150,6 +101,25 @@ def k2_ab_fused_gluon(
     states are then the same width and one program covers a column block of
     both.
     """
+    # Built here rather than passed in: intj bakes scalars, not layout objects.
+    # ``instr_shape[0:2] = [16, 16]`` with ``transposed=False`` is what makes an
+    # MFMA accumulator a legal B operand, so the state can be the accumulator of
+    # ``dot(kr^T, U)`` and the B operand of ``dot(kd, h)`` without a round trip.
+    # The warps split BW, so every layout follows the launch's num_warps.
+    nw: gl.constexpr = gl.num_warps()
+    MMA: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4, instr_shape=[16, 16, 32], transposed=False, warps_per_cta=[1, nw]
+    )
+    A_OP: gl.constexpr = gl.DotOperandLayout(0, MMA, 8)
+    B_OP: gl.constexpr = gl.DotOperandLayout(1, MMA, 8)
+    MMA_B: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4, instr_shape=[16, 16, 32], transposed=False, warps_per_cta=[1, nw]
+    )
+    A_OP_B: gl.constexpr = gl.DotOperandLayout(0, MMA_B, 8)
+    B_OP_B: gl.constexpr = gl.DotOperandLayout(1, MMA_B, 8)
+    BLK: gl.constexpr = gl.BlockedLayout([1, 8], [4, 16], [nw, 1], [1, 0])
+    SH_KR: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 16, [0, 1])
+
     i_w = gl.program_id(0).to(gl.int64)
     i_sh = gl.program_id(1).to(gl.int64)
     i_seg = i_sh // H
@@ -217,6 +187,3 @@ def k2_ab_fused_gluon(
     s_off = (o_k_m[:, None] * V + o_w_m[None, :]).to(gl.int32)
     gl.amd.cdna4.buffer_store(h_b.to(h_out_b.dtype.element_ty), h_out_b + s_base, s_off)
     gl.amd.cdna4.buffer_store(h_a.to(h_out_a.dtype.element_ty), h_out_a + s_base, s_off)
-
-
-k2_ab_fused_fast = fast_launch(k2_ab_fused_gluon)

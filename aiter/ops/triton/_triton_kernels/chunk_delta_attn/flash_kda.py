@@ -53,6 +53,11 @@ import os
 import torch
 import triton
 import triton.language as tl
+from intj import Constexpr, make_launcher
+from intj.launcher import UnsupportedKernel
+from triton import knobs
+from triton.runtime import driver
+from triton.runtime.jit import JITFunction
 
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils import (
     CHUNK_DELTA_ATTN_TRITON_AUTOTUNE,
@@ -64,7 +69,6 @@ from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils im
     input_guard,
     tensor_cache,
 )
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.fast_launch import fast_launch
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.index import (
     prepare_chunk_indices,
 )
@@ -844,9 +848,63 @@ def _build_segments(
     return desc, off, len(chunk_base), max_per_seq
 
 
-_prepare_fast = fast_launch(_flash_kda_prepare_kernel, use_intj=True)
-_segment_fast = fast_launch(_flash_kda_segment_kernel, use_intj=True)
-_seg_scan_fast = fast_launch(_flash_kda_seg_scan_kernel, use_intj=True)
+def _k2_grid(W: int, BW: int, *, segs_h: int):
+    # Compiled into the launcher by intj (grid_cpp); BW is the tuned value.
+    return (triton.cdiv(W, BW), segs_h)
+
+
+@functools.cache
+def _cached_intj_launcher(kernel, device, options, baked, grid_cpp, identity):
+    del identity  # Only keys the cache: intj snapshots it at make_launcher.
+    grid = {"grid_cpp": grid_cpp} if grid_cpp is not None else {"grid_arg": 2}
+    with torch.cuda.device(device):
+        return make_launcher(
+            kernel,
+            **grid,
+            bind_device=True,
+            options=dict(options),
+            extra_annotation={name: Constexpr(value=value) for name, value in baked},
+        ).bind_device(device)
+
+
+def _intj_launcher(kernel, device, options=(), baked=(), grid_cpp=None):
+    """A bound native launch handle: ``(stream, *grid, *kernel_args)``.
+
+    ``kernel`` may be a raw JIT or an autotune/heuristics chain; intj tunes on a
+    miss and drops tuned and heuristic values from the call. Each handle owns
+    its own tuner cache. The key also carries the JIT source and the Triton
+    knobs intj reads when it builds the handle, and no tensor.
+    """
+    if knobs.runtime.interpret:
+        raise UnsupportedKernel("intj: TRITON_INTERPRET=1 is not supported")
+    jit = kernel
+    while not isinstance(jit, JITFunction):
+        jit = jit.fn
+    return _cached_intj_launcher(
+        kernel,
+        device,
+        options,
+        baked,
+        grid_cpp,
+        (
+            jit.cache_key,
+            jit.debug,
+            knobs.runtime.debug,
+            knobs.compilation.instrumentation_mode,
+            getattr(knobs.compilation, "fpsan_homomorphic_casts", None),
+        ),
+    )
+
+
+def _validated_device(q, *inputs):
+    if q.device.type != "cuda":
+        raise ValueError("FlashKDA requires GPU tensors on the same GPU")
+    device = q.get_device()
+    if driver.active.get_current_device() != device:
+        raise ValueError("FlashKDA requires the input GPU to be current")
+    if any(t is not None and t.device != q.device for t in inputs):
+        raise ValueError("FlashKDA requires input tensors on the same GPU")
+    return device
 
 
 @input_guard
@@ -898,6 +956,9 @@ def flash_kda_fwd(
     C = FLASH_KDA_CHUNK
     inv_block = min(FLASH_KDA_INV_BLOCK, C)
     dev = q.device
+    device = _validated_device(
+        q, k, v, g, beta, A_log, dt_bias, initial_state, cu_seqlens, chunk_indices
+    )
 
     if cu_seqlens is not None:
         if B != 1:
@@ -949,66 +1010,43 @@ def flash_kda_fwd(
     ws_inv_mqk = torch.empty(H * total_tiles, 2 * C, C, dtype=torch.float16, device=dev)
 
     use_gluon_k1 = AITER_FDA_USE_GLUON_K1 and _gluon_k1_usable(C, K)
+    k1_grid = (total_tiles if cu_seqlens is not None else NT, B * H)
+    k1_args = (
+        q, k, g, beta, A_log, dt_bias,
+        ws_kd, ws_qd, ws_kr, ws_gt, ws_inv_mqk,
+        cu_seqlens, chunk_indices, scale, lower_bound,
+        T, NT, total_tiles, H, K, C, inv_block,
+    )  # fmt: skip
     if use_gluon_k1:
         from aiter.ops.triton._gluon_kernels.gfx950.chunk_delta_attn.flash_kda_k1 import (
-            gluon_k1_prepare,
+            k1_prepare_gluon,
         )
 
-        gluon_k1_prepare(
-            q=q,
-            k=k,
-            g_raw=g,
-            beta_raw=beta,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            ws_kd=ws_kd,
-            ws_qd=ws_qd,
-            ws_kr=ws_kr,
-            ws_gt=ws_gt,
-            ws_inv_mqk=ws_inv_mqk,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            scale=scale,
-            lower_bound=lower_bound,
-            T=T,
-            NT=NT,
-            TOTAL_TILES=total_tiles,
-            H=H,
-            K=K,
-            C=C,
-            BC=inv_block,
-            B=B,
-            CM_WS=CM_STORE,
-            CM_LOAD=CM_LOAD,
+        _intj_launcher(
+            k1_prepare_gluon,
+            device,
+            (("num_warps", 2),),
+            (("CM_WS", CM_STORE), ("CM_LOAD", CM_LOAD)),
+        )(
+            driver.active.get_current_stream(device),
+            *k1_grid,
+            *k1_args,
+            cu_seqlens is not None,
+            dt_bias is not None,
         )
     else:
-        _prepare_fast[(total_tiles if cu_seqlens is not None else NT, B * H)](
-            q=q,
-            k=k,
-            g_raw=g,
-            beta_raw=beta,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            ws_kd=ws_kd,
-            ws_qd=ws_qd,
-            ws_kr=ws_kr,
-            ws_gt=ws_gt,
-            ws_inv_mqk=ws_inv_mqk,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            scale=scale,
-            lower_bound=lower_bound,
-            T=T,
-            NT=NT,
-            TOTAL_TILES=total_tiles,
-            H=H,
-            K=K,
-            C=C,
-            BC=inv_block,
-            NUM_DOUBLING=inv_block.bit_length() - 2,
-            NUM_MERGE=(C // inv_block).bit_length() - 1,
-            CM_QKG=CM_LOAD,
-            CM_WS=CM_STORE,
+        # IS_VARLEN / HAS_BIAS come from the kernel's heuristics, which intj
+        # lowers to C; num_warps / num_stages from its tuner.
+        _intj_launcher(
+            _flash_kda_prepare_kernel,
+            device,
+            baked=(("CM_QKG", CM_LOAD), ("CM_WS", CM_STORE)),
+        )(
+            driver.active.get_current_stream(device),
+            *k1_grid,
+            *k1_args,
+            inv_block.bit_length() - 2,
+            (C // inv_block).bit_length() - 1,
         )
 
     desc, seq_seg_off, num_segs, max_segs = _build_segments(
@@ -1031,37 +1069,32 @@ def flash_kda_fwd(
         state_dtype = h0.dtype if h0 is not None else torch.float32
         final_state = torch.empty(shape, dtype=state_dtype, device=dev)
 
-    common = {
-        "ws_kd": ws_kd,
-        "ws_qd": ws_qd,
-        "ws_kr": ws_kr,
-        "ws_gt": ws_gt,
-        "ws_inv_mqk": ws_inv_mqk,
-        "beta_raw": beta,
-        "seg_chunk_base": seg_chunk_base,
-        "seg_nchunks": seg_nchunks,
-        "seg_tok_base": seg_tok_base,
-        "seg_tok_end": seg_tok_end,
-        "seg_seq": seg_seq,
-        "seg_is_last": seg_is_last,
-        "TOTAL_TILES": total_tiles,
-        "NUM_SEGS_CLASS": _seg_occupancy_class(num_segs),
-        "H": H,
-        "K": K,
-        "V": V,
-        "C": C,
-        "STATE_V_FIRST": state_v_first,
-        "CM_OUT": CM_OUT_STORE,
-    }
-
     # Only pass A can go to Gluon, so an unsegmented shape reaches none of it.
     use_gluon_k2 = AITER_FDA_USE_GLUON_K2 and _gluon_k2_usable(C, K, V) and max_segs > 1
     _log_route(use_gluon_k1, use_gluon_k2, C, K, V)
 
-    def _launch_k2(*, W, **kw):
-        return _segment_fast[
-            lambda meta, _w=W: (triton.cdiv(_w, meta["BW"]), num_segs * H)
-        ](W=W, **common, **kw)
+    def _launch_k2(
+        *, W, out, h_in, h_out, final_state,
+        INIT_IDENTITY, HAS_H_IN, HAS_V, COMPUTE_OUTPUT, STORE_H_OUT, STORE_FINAL,
+    ):  # fmt: skip
+        # BW is tuned, so the grid reads it natively (_k2_grid) and the call
+        # omits it; CM_OUT is baked.
+        _intj_launcher(
+            _flash_kda_segment_kernel,
+            device,
+            baked=(("CM_OUT", CM_OUT_STORE),),
+            grid_cpp=_k2_grid,
+        )(
+            driver.active.get_current_stream(device),
+            num_segs * H,
+            ws_kd, ws_qd, ws_kr, ws_gt, ws_inv_mqk,
+            v, beta, out, h_in, h_out, final_state,
+            seg_chunk_base, seg_nchunks, seg_tok_base, seg_tok_end,
+            seg_seq, seg_is_last, total_tiles, _seg_occupancy_class(num_segs),
+            H, K, V, W, C,
+            INIT_IDENTITY, HAS_H_IN, HAS_V, COMPUTE_OUTPUT,
+            STORE_H_OUT, STORE_FINAL, state_v_first,
+        )  # fmt: skip
 
     if max_segs > 1:
         # Pass A: b_seg (affine part) and A_seg (linear part), both fully
@@ -1074,35 +1107,21 @@ def flash_kda_fwd(
             )
 
             bw, nw = _k2_gluon_schedule(V, num_segs, H)
-            _g2.k2_ab_fused_fast[(triton.cdiv(V, bw), num_segs * H)](
-                ws_kd=ws_kd,
-                ws_kr=ws_kr,
-                ws_gt=ws_gt,
-                ws_inv_mqk=ws_inv_mqk,
-                v_input=v,
-                beta_raw=beta,
-                h_out_b=b_seg,
-                h_out_a=A_seg,
-                seg_chunk_base=seg_chunk_base,
-                seg_nchunks=seg_nchunks,
-                seg_tok_base=seg_tok_base,
-                seg_tok_end=seg_tok_end,
-                TOTAL_TILES=total_tiles,
-                H=H,
-                K=K,
-                V=V,
-                C=C,
-                BW=bw,
-                **_g2.build_layouts(nw),
-                num_warps=nw,
-            )
+            _intj_launcher(_g2.k2_ab_fused_gluon, device, (("num_warps", nw),))(
+                driver.active.get_current_stream(device),
+                triton.cdiv(V, bw),
+                num_segs * H,
+                ws_kd, ws_kr, ws_gt, ws_inv_mqk,
+                v, beta, b_seg, A_seg,
+                seg_chunk_base, seg_nchunks, seg_tok_base, seg_tok_end,
+                total_tiles, H, K, V, C, bw,
+            )  # fmt: skip
         else:
             for buf, width, identity, has_v in (
                 (b_seg, V, False, True),
                 (A_seg, K, True, False),
             ):
                 _launch_k2(
-                    v_input=v,
                     out=None,
                     h_in=None,
                     h_out=buf,
@@ -1119,24 +1138,21 @@ def flash_kda_fwd(
         # Pass B: propagate across segments. Depth is the segment count.
         h_in = torch.empty(num_segs, H, K, V, dtype=torch.float32, device=dev)
         BV_SCAN, SCAN_WARPS = _scan_bv(N, H, V)
-        _seg_scan_fast[(triton.cdiv(V, BV_SCAN), N * H)](
-            A_seg=A_seg,
-            b_seg=b_seg,
-            h_in=h_in,
-            h0=h0,
-            seq_seg_off=seq_seg_off,
-            H=H,
-            K=K,
-            V=V,
-            BV=BV_SCAN,
-            num_warps=SCAN_WARPS,
-        )
+        # HAS_H0 comes from the kernel's heuristic.
+        _intj_launcher(
+            _flash_kda_seg_scan_kernel, device, (("num_warps", SCAN_WARPS),)
+        )(
+            driver.active.get_current_stream(device),
+            triton.cdiv(V, BV_SCAN),
+            N * H,
+            A_seg, b_seg, h_in, h0, seq_seg_off,
+            H, K, V, BV_SCAN,
+        )  # fmt: skip
     else:
         h_in = h0
 
     # Pass C: re-run each segment from its true incoming state, writing outputs.
     _launch_k2(
-        v_input=v,
         out=o,
         h_in=h_in,
         h_out=None,

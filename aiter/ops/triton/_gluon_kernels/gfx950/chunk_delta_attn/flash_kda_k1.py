@@ -1,33 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import math
-
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.fast_launch import fast_launch
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-
-_BLK_WARP_K: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [1, 2], [1, 0])
-_BLK1: gl.constexpr = gl.BlockedLayout([1], [64], [2], [0])
-_BLK_CC: gl.constexpr = gl.BlockedLayout([1, 1], [4, 16], [2, 1], [1, 0])
-
-_MMA_F16: gl.constexpr = gl.amd.AMDMFMALayout(
-    version=4, instr_shape=[16, 16, 4], transposed=True, warps_per_cta=[2, 1]
-)
-_AF16: gl.constexpr = gl.DotOperandLayout(0, _MMA_F16, 1)
-_BF16: gl.constexpr = gl.DotOperandLayout(1, _MMA_F16, 1)
-
-_MMA_B16: gl.constexpr = gl.amd.AMDMFMALayout(
-    version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[2, 1]
-)
-_A8_16: gl.constexpr = gl.DotOperandLayout(0, _MMA_B16, 8)
-_B8_16: gl.constexpr = gl.DotOperandLayout(1, _MMA_B16, 8)
-
-_SH_A: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 16, [1, 0])
-_SH_B: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 16, [0, 1])
-_SH_CC_F: gl.constexpr = gl.SwizzledSharedLayout(1, 2, 8, [0, 1])
 
 
 @gluon.jit
@@ -106,6 +83,27 @@ def k1_prepare_gluon(
     CM_LOAD: gl.constexpr = ".cg",
 ):
     gl.static_assert(C == 32 and K == 128)
+    # Local, not module globals: intj refuses a JIT that reads captured globals.
+    _BLK_WARP_K: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [1, 2], [1, 0])
+    _BLK1: gl.constexpr = gl.BlockedLayout([1], [64], [2], [0])
+    _BLK_CC: gl.constexpr = gl.BlockedLayout([1, 1], [4, 16], [2, 1], [1, 0])
+
+    _MMA_F16: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4, instr_shape=[16, 16, 4], transposed=True, warps_per_cta=[2, 1]
+    )
+    _AF16: gl.constexpr = gl.DotOperandLayout(0, _MMA_F16, 1)
+    _BF16: gl.constexpr = gl.DotOperandLayout(1, _MMA_F16, 1)
+
+    _MMA_B16: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[2, 1]
+    )
+    _A8_16: gl.constexpr = gl.DotOperandLayout(0, _MMA_B16, 8)
+    _B8_16: gl.constexpr = gl.DotOperandLayout(1, _MMA_B16, 8)
+
+    _SH_A: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 16, [1, 0])
+    _SH_B: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 16, [0, 1])
+    _SH_CC_F: gl.constexpr = gl.SwizzledSharedLayout(1, 2, 8, [0, 1])
+
     NUM_DOUBLING: gl.constexpr = BC.bit_length() - 2
     NUM_MERGE: gl.constexpr = (C // BC).bit_length() - 1
 
@@ -281,68 +279,4 @@ def k1_prepare_gluon(
         ws_inv_mqk,
         cc_off_raw,
         cache=CM_WS,
-    )
-
-
-_NUM_WARPS = math.prod(_MMA_F16.warps_per_cta)
-
-
-_k1_fast = fast_launch(k1_prepare_gluon)
-
-
-def gluon_k1_prepare(
-    q,
-    k,
-    g_raw,
-    beta_raw,
-    A_log,
-    dt_bias,
-    ws_kd,
-    ws_qd,
-    ws_kr,
-    ws_gt,
-    ws_inv_mqk,
-    cu_seqlens,
-    chunk_indices,
-    scale,
-    lower_bound,
-    T,
-    NT,
-    TOTAL_TILES,
-    H,
-    K,
-    C,
-    BC,
-    B,
-    CM_WS="",
-    CM_LOAD=".cg",
-):
-    return _k1_fast[(TOTAL_TILES if cu_seqlens is not None else NT, B * H)](
-        q=q,
-        k=k,
-        g_raw=g_raw,
-        beta_raw=beta_raw,
-        A_log=A_log,
-        dt_bias=dt_bias,
-        ws_kd=ws_kd,
-        ws_qd=ws_qd,
-        ws_kr=ws_kr,
-        ws_gt=ws_gt,
-        ws_inv_mqk=ws_inv_mqk,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        scale=scale,
-        lower_bound=lower_bound,
-        T=T,
-        NT=NT,
-        TOTAL_TILES=TOTAL_TILES,
-        H=H,
-        K=K,
-        C=C,
-        BC=BC,
-        IS_VARLEN=cu_seqlens is not None,
-        HAS_BIAS=dt_bias is not None,
-        CM_WS=CM_WS,
-        CM_LOAD=CM_LOAD,
-        num_warps=_NUM_WARPS,
     )
