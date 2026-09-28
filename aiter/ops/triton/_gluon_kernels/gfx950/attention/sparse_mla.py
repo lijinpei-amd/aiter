@@ -32,26 +32,25 @@ generation, so the tags here carry the generation instead:
                       Rope is appended, so this requires ROPE_SEPARATE.
 """
 
+import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
-from triton.language.core import PropagateNan
 from triton.language.core import _aggregate as aggregate
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.common_utils import strip_annotate
 
-# Triton's default max ignores NaN, which on AMD costs a canonicalize per
-# operand. Nothing here produces NaN (masked lanes are -inf and the all-masked
-# row is guarded), so propagate instead.
-_MAX_PROP_NAN: gl.constexpr = gl.constexpr(PropagateNan.ALL)
-
 _CG: gl.constexpr = gl.constexpr(".cg")
 _NO_CACHE: gl.constexpr = gl.constexpr("")
 
 
+# Triton's default max ignores NaN, which on AMD costs a canonicalize per
+# operand. Nothing here produces NaN (masked lanes are -inf and the all-masked
+# row is guarded), so propagate instead. Spelled through the tl module rather
+# than as a module-level constexpr, so no kernel reads a global.
 @gluon.jit
 def _max2(a, b):
-    return gl.maximum(a, b, propagate_nan=_MAX_PROP_NAN)
+    return gl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)
 
 
 @gluon.jit

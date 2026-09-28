@@ -107,6 +107,20 @@ _triton_pa_decode_sparse_reduce_launch = make_launcher(
     ),
 )
 
+# The gfx950 sparse-MLA kernels, shared with sparse_mla.py.
+_sparse_mla_gfx950_launch = make_launcher(
+    _sparse_mla_gfx950,
+    dynamic_options=(
+        "num_warps",
+        "waves_per_eu",
+    ),
+)
+
+_sparse_mla_reduce_gfx950_launch = make_launcher(
+    _sparse_mla_reduce_gfx950,
+    options={"num_warps": 1},
+)
+
 
 def pa_decode_sparse(
     q: torch.Tensor,
@@ -783,7 +797,13 @@ def _pa_decode_sparse_gfx950_gluon(
     # Grid dim 0 varies fastest and XCD assignment is round-robin over the linear
     # workgroup id, so the axis order decides what shares an XCD's L2.
     grid = (num_queries, num_splits, heads_blocks)
-    _sparse_mla_gfx950[grid](
+    dev, stream = current_device_stream()
+    _sparse_mla_gfx950_launch(
+        dev,
+        stream,
+        grid,
+        num_warps,
+        waves_per_eu,
         q,
         cache,
         main_bf16,
@@ -800,8 +820,8 @@ def _pa_decode_sparse_gfx950_gluon(
         part_acc,
         # f32 scale pointers (separated-rope formats only); None is elided,
         # keeping the DSv4 kernarg layout unchanged.
-        None,
-        None,
+        None,  # main_scl_ptr
+        None,  # extra_scl_ptr
         scale,
         q.stride(0),
         q.stride(1),
@@ -817,39 +837,47 @@ def _pa_decode_sparse_gfx950_gluon(
         pa_stride_s,
         pa_stride_h,
         num_heads,
-        HAS_EXTRA=has_extra,
-        HAS_SINK=has_sink,
-        MAIN_FMT=main_fmt,
-        EXTRA_FMT=extra_fmt,
-        MAIN_BLOCK_SIZE=main_block,
-        EXTRA_BLOCK_SIZE=extra_block,
-        CS0_ALIGN=cs0_align,
-        NOPE_DIM=nope_dim,
-        ROPE_DIM=ROPE_DIM,
-        HEAD_SIZE=head_dim,
-        ROPE_SEPARATE=False,
-        BLOCK_M=BLOCK_M,
-        BLOCK_K=BLOCK_K,
-        NUM_SPLITS=num_splits,
-        HEAD_ALIGNED=HEAD_ALIGNED,
-        NOPE_CHUNK=nope_chunk,
-        CHUNK_AXIS=chunk_axis,
-        PART_STORE_CACHE="",
-        Q_CACHE=q_cache,
-        GRID_ORDER="qsh",
+        has_extra,
+        has_sink,
+        main_fmt,
+        extra_fmt,
+        main_block,
+        extra_block,
+        cs0_align,
+        nope_dim,
+        ROPE_DIM,
+        head_dim,
+        False,  # ROPE_SEPARATE
+        BLOCK_M,
+        BLOCK_K,
+        num_splits,
+        HEAD_ALIGNED,
+        nope_chunk,
+        chunk_axis,
+        "",  # PART_STORE_CACHE
         # The partial last tile rides the full-tile body. Gluon inlines, so a peeled
         # masked copy would be a second gather+dequant+MFMA body, and its register
         # demand spills the tile loop.
-        UNI_TILE=True,
-        MAIN_SPLITS=main_splits,
-        ADAPTIVE_SPLITS=adaptive_splits,
-        DEQ=deq,
-        MAIN_USE_BUFFER_LOAD=main_use_buffer_load,
-        EXTRA_USE_BUFFER_LOAD=extra_use_buffer_load,
-        IDX_BUFFER_LOAD=idx_use_buffer_load,
-        HAS_INVALID=has_invalid,
-        num_warps=num_warps,
-        waves_per_eu=waves_per_eu,
+        True,  # UNI_TILE
+        "qsh",  # GRID_ORDER
+        q_cache,
+        main_splits,
+        adaptive_splits,
+        deq,
+        main_use_buffer_load,
+        extra_use_buffer_load,
+        idx_use_buffer_load,
+        has_invalid,
+        False,  # FP8_MFMA
+        None,  # q_scl_ptr
+        False,  # Q_FP8
+        None,  # lse_ptr
+        False,  # HAS_LSE
+        ".cg",  # GATHER_CACHE
+        "",  # IDX_CACHE
+        False,  # ASYNC_LDS
+        True,  # RELAXED_LOAD
+        1024,  # PAD_INTERVAL
     )
 
     if num_splits == 1:
@@ -859,7 +887,10 @@ def _pa_decode_sparse_gfx950_gluon(
 
     # One head per reduce workgroup
     rgrid = (num_queries, num_heads)
-    _sparse_mla_reduce_gfx950[rgrid](
+    _sparse_mla_reduce_gfx950_launch(
+        dev,
+        stream,
+        rgrid,
         part_m,
         part_l,
         part_acc,
@@ -873,12 +904,13 @@ def _pa_decode_sparse_gfx950_gluon(
         pa_stride_s,
         pa_stride_h,
         num_heads,
-        HAS_SINK=has_sink,
-        HEAD_SIZE=head_dim,
-        BLOCK_M=1,
-        NUM_SPLITS=num_splits,
-        HEAD_ALIGNED=True,
-        ADAPTIVE_SPLITS=adaptive_splits,
-        num_warps=1,
+        has_sink,
+        head_dim,
+        1,  # BLOCK_M
+        num_splits,
+        True,  # HEAD_ALIGNED
+        adaptive_splits,
+        None,  # lse_ptr
+        False,  # HAS_LSE
     )
     return out

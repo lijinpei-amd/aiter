@@ -5,18 +5,14 @@ import math
 
 import torch
 
-from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla import (
-    _sparse_mla as _sparse_mla_gfx950,
-)
-from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla import (
-    _sparse_mla_reduce as _sparse_mla_reduce_gfx950,
-)
 from aiter.ops.triton.attention.pa_decode_sparse import (
     _as_int32_contiguous_1d,
+    _sparse_mla_gfx950_launch,
+    _sparse_mla_reduce_gfx950_launch,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import max_addressable_bytes
-from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.ops.triton.utils.device_info import current_device_stream, get_num_sms
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -604,7 +600,13 @@ def sparse_mla_fwd(
     # Q is read once per query without split-K, and re-read by every split
     q_cache = ".cg" if num_splits == 1 else ""
     grid = (num_queries, num_splits, heads_blocks)
-    _sparse_mla_gfx950[grid](
+    dev, stream = current_device_stream()
+    _sparse_mla_gfx950_launch(
+        dev,
+        stream,
+        grid,
+        num_warps,
+        waves_per_eu,
         q,
         cache,
         alt,
@@ -636,43 +638,44 @@ def sparse_mla_fwd(
         pa_stride_s,
         pa_stride_h,
         num_heads,
-        HAS_EXTRA=False,
-        HAS_SINK=has_sink,
-        MAIN_FMT=fmt,
-        EXTRA_FMT=fmt,
-        MAIN_BLOCK_SIZE=block_size,
-        EXTRA_BLOCK_SIZE=block_size,
-        CS0_ALIGN=cs0_align,
-        NOPE_DIM=kv_lora_rank,
-        ROPE_DIM=qk_rope_head_dim,
-        HEAD_SIZE=kv_lora_rank,
-        ROPE_SEPARATE=qk_rope_head_dim > 0,
-        BLOCK_M=block_m,
-        BLOCK_K=block_k,
-        NUM_SPLITS=num_splits,
-        HEAD_ALIGNED=head_aligned,
-        NOPE_CHUNK=nope_chunk,
-        CHUNK_AXIS=chunk_axis,
-        PART_STORE_CACHE="",
-        UNI_TILE=True,
-        GRID_ORDER="qsh",
-        Q_CACHE=q_cache,
-        MAIN_SPLITS=num_splits,
-        ADAPTIVE_SPLITS=num_splits > 1,
-        DEQ="none",
-        MAIN_USE_BUFFER_LOAD=use_buffer_load,
-        EXTRA_USE_BUFFER_LOAD=use_buffer_load,
-        IDX_BUFFER_LOAD=idx_use_buffer_load,
-        HAS_INVALID=has_invalid,
-        FP8_MFMA=fp8_dots,
-        ASYNC_LDS=async_lds_on,
-        GATHER_CACHE="",
-        q_scl_ptr=q_scale,
-        Q_FP8=q_is_fp8,
-        lse_ptr=lse,
-        HAS_LSE=return_lse,
-        num_warps=num_warps,
-        waves_per_eu=waves_per_eu,
+        False,  # HAS_EXTRA
+        has_sink,
+        fmt,
+        fmt,
+        block_size,
+        block_size,
+        cs0_align,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        kv_lora_rank,
+        qk_rope_head_dim > 0,
+        block_m,
+        block_k,
+        num_splits,
+        head_aligned,
+        nope_chunk,
+        chunk_axis,
+        "",  # PART_STORE_CACHE
+        True,  # UNI_TILE
+        "qsh",  # GRID_ORDER
+        q_cache,
+        num_splits,
+        num_splits > 1,
+        "none",  # DEQ
+        use_buffer_load,
+        use_buffer_load,
+        idx_use_buffer_load,
+        has_invalid,
+        fp8_dots,
+        q_scale,
+        q_is_fp8,
+        lse,
+        return_lse,
+        "",  # GATHER_CACHE
+        "",  # IDX_CACHE
+        async_lds_on,
+        True,  # RELAXED_LOAD
+        1024,  # PAD_INTERVAL
     )
 
     if num_splits == 1:
@@ -682,7 +685,10 @@ def sparse_mla_fwd(
 
     # One head per reduce workgroup
     rgrid = (num_queries, num_heads)
-    _sparse_mla_reduce_gfx950[rgrid](
+    _sparse_mla_reduce_gfx950_launch(
+        dev,
+        stream,
+        rgrid,
         part_m,
         part_l,
         part_acc,
@@ -696,14 +702,13 @@ def sparse_mla_fwd(
         pa_stride_s,
         pa_stride_h,
         num_heads,
-        HAS_SINK=has_sink,
-        HEAD_SIZE=kv_lora_rank,
-        BLOCK_M=1,
-        NUM_SPLITS=num_splits,
-        HEAD_ALIGNED=True,
-        ADAPTIVE_SPLITS=num_splits > 1,
-        lse_ptr=lse,
-        HAS_LSE=return_lse,
-        num_warps=1,
+        has_sink,
+        kv_lora_rank,
+        1,  # BLOCK_M
+        num_splits,
+        True,  # HEAD_ALIGNED
+        num_splits > 1,
+        lse,
+        return_lse,
     )
     return out, (lse if return_lse else None)
