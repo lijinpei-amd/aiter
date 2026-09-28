@@ -14,6 +14,7 @@ import os
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     IS_TMA_SUPPORTED,
@@ -26,7 +27,7 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.index import (
 from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.op import (
     make_tensor_descriptor,
 )
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 FLA_TRIL_PRECISION = os.environ.get("FLA_TRIL_PRECISION", "ieee")
@@ -624,11 +625,11 @@ def merge_16x16_to_64x64_inverse_kernel(
         desc_o.store([i_t * BT + 32, 48], z16.to(desc_o.dtype))
 
 
-_solve_tril_16x16_launch = intj_handle(solve_tril_16x16_kernel, grid_arg=2)
-_merge_16x16_to_32x32_inverse_launch = intj_handle(
+_solve_tril_16x16_launch = make_launcher(solve_tril_16x16_kernel, grid_arg=2)
+_merge_16x16_to_32x32_inverse_launch = make_launcher(
     merge_16x16_to_32x32_inverse_kernel, grid_arg=2
 )
-_merge_16x16_to_64x64_inverse_launch = intj_handle(
+_merge_16x16_to_64x64_inverse_launch = make_launcher(
     merge_16x16_to_64x64_inverse_kernel, grid_arg=2
 )
 
@@ -710,7 +711,8 @@ def solve_tril(
         merge_fn = _merge_16x16_to_64x64_inverse_launch
 
     dev, stream = current_device_stream()
-    merge_fn(dev)(
+    merge_fn(
+        dev,
         stream,
         NT,
         B * H,

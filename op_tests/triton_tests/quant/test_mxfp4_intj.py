@@ -44,24 +44,21 @@ def _raw_bracket_launch(kernel, grid, *args, **kwargs):
 
 
 def _bracket_handle(kernel, grid_arg=None):
-    """An intj_handle stand-in that launches ``kernel[grid](...)`` instead."""
+    """A launcher stand-in that launches ``kernel[grid](...)`` instead."""
     jit, assigned = kernel, set()
     while not isinstance(jit, JITFunction):
         assigned.update(jit.values)
         jit = jit.fn
     names = [p.name for p in jit.params if p.name not in assigned]
 
-    def bound(_device):
-        def launch(_stream, *args):
-            if grid_arg:
-                grid, args = args[:grid_arg], args[grid_arg:]
-            else:
-                grid, args = args[0], args[1:]
-            kernel[grid](**dict(zip(names, args)))
+    def launch(_device, _stream, *args):
+        if grid_arg:
+            grid, args = args[:grid_arg], args[grid_arg:]
+        else:
+            grid, args = args[0], args[1:]
+        kernel[grid](**dict(zip(names, args)))
 
-        return launch
-
-    return bound
+    return launch
 
 
 def test_dynamic_mxfp4_quant_uses_intj():

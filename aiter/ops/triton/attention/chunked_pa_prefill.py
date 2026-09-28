@@ -11,13 +11,14 @@
 
 
 import triton
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.attention.chunked_pa_prefill import (
     _kernel_paged_attention_2d,
 )
 from aiter.ops.triton.attention.pa_prefill import context_attention_fwd
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 # gfx942 and gfx1250 keep Triton's defaults
 # For gfx950: tuned launch for the decode kernel.
@@ -27,7 +28,7 @@ decode_launch = (
 )
 
 
-_kernel_paged_attention_2d_launch = intj_handle(
+_kernel_paged_attention_2d_launch = make_launcher(
     _kernel_paged_attention_2d,
     grid_arg=2,
     options=decode_launch,
@@ -112,7 +113,8 @@ def chunked_prefill_paged_decode(
     head_size = query.shape[2]
 
     dev, stream = current_device_stream()
-    _kernel_paged_attention_2d_launch(dev)(
+    _kernel_paged_attention_2d_launch(
+        dev,
         stream,
         num_seqs,
         num_query_heads,

@@ -6,13 +6,14 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 from jinja2 import Template
 
 import aiter
 from aiter.ops.triton.gluon.pa_decode_gluon import (
     paged_attention_decode_v2_reduce_kernel,
 )
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.test_common import perftest
 from csrc.cpp_itfs.gluon_aot_tools.compile import (
     CompileArgs,
@@ -243,7 +244,7 @@ def run_compiled_kernel(
     )
 
 
-_reduce_kernel_launch = intj_handle(paged_attention_decode_v2_reduce_kernel)
+_reduce_kernel_launch = make_launcher(paged_attention_decode_v2_reduce_kernel)
 
 
 @perftest()
@@ -270,7 +271,8 @@ def run_direct_kernel(
 
     # Launch the kernel directly
     dev, stream = current_device_stream()
-    _reduce_kernel_launch(dev)(
+    _reduce_kernel_launch(
+        dev,
         stream,
         grid,
         output_5d,

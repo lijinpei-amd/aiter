@@ -11,6 +11,7 @@ This module provides functions for computing the final output in chunk mode.
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     IS_NVIDIA_HOPPER,
@@ -23,7 +24,7 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
     prepare_rebased_cu_seqlens,
 )
 from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.op import exp
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
@@ -191,7 +192,7 @@ def _chunk_fwd_kernel_o_grid(V: int, BV: int, H: int, *, NT: int, B: int):
     return (triton.cdiv(V, BV), NT, B * H)
 
 
-_chunk_fwd_kernel_o_launch = intj_handle(
+_chunk_fwd_kernel_o_launch = make_launcher(
     chunk_fwd_kernel_o,
     grid_cpp=_chunk_fwd_kernel_o_grid,
 )
@@ -398,7 +399,7 @@ def chunk_bwd_kernel_dqkwg(
         )
 
 
-_chunk_bwd_kernel_dqkwg_launch = intj_handle(chunk_bwd_kernel_dqkwg)
+_chunk_bwd_kernel_dqkwg_launch = make_launcher(chunk_bwd_kernel_dqkwg)
 
 
 @triton.heuristics(
@@ -503,7 +504,7 @@ def chunk_bwd_kernel_dv(
     )
 
 
-_chunk_bwd_kernel_dv_launch = intj_handle(chunk_bwd_kernel_dv)
+_chunk_bwd_kernel_dv_launch = make_launcher(chunk_bwd_kernel_dv)
 
 
 @triton.heuristics(
@@ -600,7 +601,7 @@ def chunk_bwd_kernel_dv_local(
         )
 
 
-_chunk_bwd_kernel_dv_local_launch = intj_handle(chunk_bwd_kernel_dv_local)
+_chunk_bwd_kernel_dv_local_launch = make_launcher(chunk_bwd_kernel_dv_local)
 
 
 def chunk_fwd_o(
@@ -626,7 +627,8 @@ def chunk_fwd_o(
     o = torch.empty_like(v)
 
     dev, stream = current_device_stream()
-    _chunk_fwd_kernel_o_launch(dev)(
+    _chunk_fwd_kernel_o_launch(
+        dev,
         stream,
         NT,  # grid
         B,  # grid
@@ -757,7 +759,7 @@ def _chunk_fwd_kernel_o_opt_grid(V: int, BV: int, H: int, *, NT: int, B: int):
     return (triton.cdiv(V, BV), NT, B * H)
 
 
-_chunk_fwd_kernel_o_opt_launch = intj_handle(
+_chunk_fwd_kernel_o_opt_launch = make_launcher(
     chunk_fwd_kernel_o_opt,
     grid_cpp=_chunk_fwd_kernel_o_opt_grid,
 )
@@ -804,7 +806,8 @@ def chunk_fwd_o_opt(
     o = v.new_empty(B, T, H, V)
 
     dev, stream = current_device_stream()
-    _chunk_fwd_kernel_o_opt_launch(dev)(
+    _chunk_fwd_kernel_o_opt_launch(
+        dev,
         stream,
         NT,  # grid
         B,  # grid
@@ -959,7 +962,7 @@ def _chunk_fwd_kernel_o_opt_vk_grid(V: int, BV: int, H: int, *, NT: int, B: int)
     return (triton.cdiv(V, BV), NT, B * H)
 
 
-_chunk_fwd_kernel_o_opt_vk_launch = intj_handle(
+_chunk_fwd_kernel_o_opt_vk_launch = make_launcher(
     chunk_fwd_kernel_o_opt_vk,
     grid_cpp=_chunk_fwd_kernel_o_opt_vk_grid,
 )
@@ -1047,7 +1050,8 @@ def chunk_fwd_o_opt_vk(
     # o = v.new_empty(B, T, H, V)
 
     dev, stream = current_device_stream()
-    _chunk_fwd_kernel_o_opt_vk_launch(dev)(
+    _chunk_fwd_kernel_o_opt_vk_launch(
+        dev,
         stream,
         NT,  # grid
         B,  # grid
@@ -1108,7 +1112,8 @@ def chunk_bwd_dv(
     dv = torch.empty_like(do)
     grid = (NV, NT, B * H)
     dev, stream = current_device_stream()
-    _chunk_bwd_kernel_dv_launch(dev)(
+    _chunk_bwd_kernel_dv_launch(
+        dev,
         stream,
         grid,
         q,
@@ -1162,7 +1167,8 @@ def chunk_bwd_dv_local(
     dv = torch.empty_like(do)
     grid = (NT, B * H)
     dev, stream = current_device_stream()
-    _chunk_bwd_kernel_dv_local_launch(dev)(
+    _chunk_bwd_kernel_dv_local_launch(
+        dev,
         stream,
         grid,
         q,
@@ -1224,7 +1230,8 @@ def chunk_bwd_dqkwg(
 
     grid = (NK, NT, B * H)
     dev, stream = current_device_stream()
-    _chunk_bwd_kernel_dqkwg_launch(dev)(
+    _chunk_bwd_kernel_dqkwg_launch(
+        dev,
         stream,
         grid,
         q,

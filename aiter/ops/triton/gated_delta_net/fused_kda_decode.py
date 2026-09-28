@@ -8,22 +8,22 @@ eliminating q/k/v intermediate HBM traffic and kernel launch overhead.
 """
 
 import torch
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_conv_recurrent_norm import (
     fused_conv_recurrent_norm_kernel,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 
-def _decode_options():
-    # Evaluated on the device when the handle is built.
-    return {"num_warps": 2 if get_arch() == "gfx942" else 4}
+def _decode_num_warps():
+    return 2 if get_arch() == "gfx942" else 4
 
 
-_fused_conv_recurrent_norm_kernel_launch = intj_handle(
+_fused_conv_recurrent_norm_kernel_launch = make_launcher(
     fused_conv_recurrent_norm_kernel,
-    options=_decode_options,
+    dynamic_options=("num_warps",),
 )
 
 
@@ -93,9 +93,11 @@ def fused_kda_decode(
 
     grid = (batch, H)
     dev, stream = current_device_stream()
-    _fused_conv_recurrent_norm_kernel_launch(dev)(
+    _fused_conv_recurrent_norm_kernel_launch(
+        dev,
         stream,
         grid,
+        _decode_num_warps(),
         mixed_qkv,
         conv_weight,
         conv_state,

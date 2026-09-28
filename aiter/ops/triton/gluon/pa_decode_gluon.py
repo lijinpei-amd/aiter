@@ -6,11 +6,12 @@ from functools import lru_cache
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 from triton.language.extra.hip import libdevice as hip_libdevice
 
 import aiter
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 _FLYDSL_REDUCE_DTYPE_NAMES = {
     torch.float32: "f32",
@@ -4032,7 +4033,7 @@ def paged_attention_decode_ps_reduce_kernel(
     )
 
 
-_paged_attention_decode_ps_reduce_kernel_launch = intj_handle(
+_paged_attention_decode_ps_reduce_kernel_launch = make_launcher(
     paged_attention_decode_ps_reduce_kernel,
 )
 
@@ -4271,7 +4272,7 @@ def paged_attention_decode_v2_reduce_kernel(
     )
 
 
-_paged_attention_decode_v2_reduce_kernel_launch = intj_handle(
+_paged_attention_decode_v2_reduce_kernel_launch = make_launcher(
     paged_attention_decode_v2_reduce_kernel,
 )
 
@@ -4601,7 +4602,8 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
             return
         ps_reduce_grid = (grid[0], grid[1], query_seq_len * query_group_size)
         dev, stream = current_device_stream()
-        _paged_attention_decode_ps_reduce_kernel_launch(dev)(
+        _paged_attention_decode_ps_reduce_kernel_launch(
+            dev,
             stream,
             ps_reduce_grid,
             output_ptr,
@@ -4629,7 +4631,8 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
         )
     else:
         dev, stream = current_device_stream()
-        _paged_attention_decode_v2_reduce_kernel_launch(dev)(
+        _paged_attention_decode_v2_reduce_kernel_launch(
+            dev,
             stream,
             grid,
             output_ptr,

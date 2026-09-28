@@ -5,6 +5,7 @@ import itertools
 
 import torch
 import triton
+from intj import make_launcher
 from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._gluon_kernels.gfx942.moe.moe_op_gemm_int8_smoothquant import (
@@ -16,8 +17,7 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_int8_smoothquant import (
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.device_info import get_num_sms
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream, get_num_sms
 from aiter.ops.triton.utils.shuffle import shuffle_weight
 
 # -----------------------------------------------------------------------------
@@ -142,7 +142,7 @@ def get_kernel_config(m, n, k, routing_data):
 # -----------------------------------------------------------------------------
 
 
-_gluon_moe_gemm_int8_smoothquant_launch = intj_handle(
+_gluon_moe_gemm_int8_smoothquant_launch = make_launcher(
     _gluon_moe_gemm_int8_smoothquant,
     grid_arg=1,
     options={"num_warps": 4},
@@ -267,7 +267,8 @@ def moe_gemm_int8_smoothquant(
     if use_gluon:
         # launch Gluon-optimized kernel
         dev, stream = current_device_stream()
-        _gluon_moe_gemm_int8_smoothquant_launch(dev)(
+        _gluon_moe_gemm_int8_smoothquant_launch(
+            dev,
             stream,
             grid,
             y,

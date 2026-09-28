@@ -3,6 +3,7 @@
 
 import torch
 import triton
+from intj import make_launcher
 from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.normalization.rmsnorm import (
@@ -16,8 +17,7 @@ from aiter.ops.triton._triton_kernels.normalization.rmsnorm import (
     _rmsnorm_kernel_large_m_small_n,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.device_info import get_num_sms
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream, get_num_sms
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.normalization_config_utils import get_normalization_config
 from aiter.ops.triton.utils.types import get_dtype_max
@@ -70,7 +70,7 @@ def num_programs_fwd(x):
         return num_programs(x)
 
 
-_rms_norm_kernel_launch = intj_handle(_rms_norm_kernel)
+_rms_norm_kernel_launch = make_launcher(_rms_norm_kernel)
 
 
 def _rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, epsilon: float):
@@ -86,7 +86,8 @@ def _rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, epsilon: float):
 
     grid = (NUM_PRGMS,)
     dev, stream = current_device_stream()
-    _rms_norm_kernel_launch(dev)(
+    _rms_norm_kernel_launch(
+        dev,
         stream,
         grid,
         x,
@@ -106,7 +107,7 @@ def _rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, epsilon: float):
     return y, rsigma
 
 
-_fused_add_rmsnorm_kernel_launch = intj_handle(_fused_add_rmsnorm_kernel)
+_fused_add_rmsnorm_kernel_launch = make_launcher(_fused_add_rmsnorm_kernel)
 
 
 def _rmsnorm_forward_with_add(
@@ -127,7 +128,8 @@ def _rmsnorm_forward_with_add(
 
     grid = (NUM_PRGMS,)
     dev, stream = current_device_stream()
-    _fused_add_rmsnorm_kernel_launch(dev)(
+    _fused_add_rmsnorm_kernel_launch(
+        dev,
         stream,
         grid,
         x,
@@ -147,18 +149,17 @@ def _rmsnorm_forward_with_add(
     )
 
 
-_rmsnorm_bwd_triton_launch = intj_handle(_rmsnorm_bwd_triton, options={"num_warps": 8})
-_rmsnorm_bwd_dg_reduce_triton_launch = intj_handle(_rmsnorm_bwd_dg_reduce_triton)
-
-
-def _dg_reduce_options():
-    # Widening the workgroup helps on gfx950. Left at default otherwise
-    return {"num_warps": 8} if get_arch() == "gfx950" else {}
-
-
-_rmsnorm_bwd_dg_reduce_gfx950_launch = intj_handle(
-    _rmsnorm_bwd_dg_reduce_triton, options=_dg_reduce_options
+_rmsnorm_bwd_triton_launch = make_launcher(
+    _rmsnorm_bwd_triton, options={"num_warps": 8}
 )
+_rmsnorm_bwd_dg_reduce_triton_launch = make_launcher(
+    _rmsnorm_bwd_dg_reduce_triton, dynamic_options=("num_warps",)
+)
+
+
+def _dg_reduce_num_warps():
+    # Widening the workgroup helps on gfx950. Left at default otherwise
+    return 8 if get_arch() == "gfx950" else 4
 
 
 def _rmsnorm_backward(dz, x, gamma, rsigma):
@@ -202,9 +203,11 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
         )
         grid_reduce = (triton.cdiv(N, 64),)
         dev, stream = current_device_stream()
-        _rmsnorm_bwd_dg_reduce_triton_launch(dev)(
+        _rmsnorm_bwd_dg_reduce_triton_launch(
+            dev,
             stream,
             grid_reduce,
+            4,
             dg_tmp,
             dgamma,
             dg_tmp.stride(0),
@@ -234,7 +237,8 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
 
     grid_bwd = (NUM_PRGMS,)
     dev, stream = current_device_stream()
-    _rmsnorm_bwd_triton_launch(dev)(
+    _rmsnorm_bwd_triton_launch(
+        dev,
         stream,
         grid_bwd,
         dz_,
@@ -255,9 +259,11 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
     if need_reduction:
         grid_reduce = (triton.cdiv(N, 64),)
         dev, stream = current_device_stream()
-        _rmsnorm_bwd_dg_reduce_gfx950_launch(dev)(
+        _rmsnorm_bwd_dg_reduce_triton_launch(
+            dev,
             stream,
             grid_reduce,
+            _dg_reduce_num_warps(),
             dg_tmp,
             dgamma,
             dg_tmp.stride(0),
@@ -418,7 +424,7 @@ def rmsnorm2d_fwd_with_add(
     )
 
 
-_quant_rms_norm_kernel_launch = intj_handle(_quant_rms_norm_kernel)
+_quant_rms_norm_kernel_launch = make_launcher(_quant_rms_norm_kernel)
 
 
 def rmsnorm2d_fwd_with_smoothquant(
@@ -469,7 +475,8 @@ def rmsnorm2d_fwd_with_smoothquant(
 
     grid = (NUM_PRGMS,)
     dev, stream = current_device_stream()
-    _quant_rms_norm_kernel_launch(dev)(
+    _quant_rms_norm_kernel_launch(
+        dev,
         stream,
         grid,
         input,
@@ -545,7 +552,8 @@ def rmsnorm2d_fwd_with_dynamicquant(
 
     grid = (NUM_PRGMS,)
     dev, stream = current_device_stream()
-    _quant_rms_norm_kernel_launch(dev)(
+    _quant_rms_norm_kernel_launch(
+        dev,
         stream,
         grid,
         input,
@@ -575,7 +583,7 @@ def rmsnorm2d_fwd_with_dynamicquant(
     return out_rms_norm
 
 
-_quant_fused_add_rmsnorm_kernel_launch = intj_handle(_quant_fused_add_rmsnorm_kernel)
+_quant_fused_add_rmsnorm_kernel_launch = make_launcher(_quant_fused_add_rmsnorm_kernel)
 
 
 def rmsnorm2d_fwd_with_add_smoothquant(
@@ -626,7 +634,8 @@ def rmsnorm2d_fwd_with_add_smoothquant(
 
     grid = (NUM_PRGMS,)
     dev, stream = current_device_stream()
-    _quant_fused_add_rmsnorm_kernel_launch(dev)(
+    _quant_fused_add_rmsnorm_kernel_launch(
+        dev,
         stream,
         grid,
         input,
@@ -697,7 +706,8 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
 
     grid = (NUM_PRGMS,)
     dev, stream = current_device_stream()
-    _quant_fused_add_rmsnorm_kernel_launch(dev)(
+    _quant_fused_add_rmsnorm_kernel_launch(
+        dev,
         stream,
         grid,
         input,

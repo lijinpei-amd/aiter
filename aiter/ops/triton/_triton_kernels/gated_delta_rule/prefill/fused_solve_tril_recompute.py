@@ -14,6 +14,7 @@ import os
 import torch
 import triton
 import triton.language as tl
+from intj import Constexpr, make_launcher
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     IS_AMD,
@@ -29,7 +30,7 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.solve_tril import (
     FLA_TRIL_PRECISION,
     solve_tril,
 )
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 # solve_tril + recompute_w_u dispatch threshold in chunks (NT). At or below
@@ -458,10 +459,10 @@ def fused_solve_tril_recompute_w_u_kernel(
         )
 
 
-_fused_solve_tril_recompute_w_u_kernel_launch = intj_handle(
+_fused_solve_tril_recompute_w_u_kernel_launch = make_launcher(
     fused_solve_tril_recompute_w_u_kernel,
     grid_arg=2,
-    baked={"DOT_PRECISION": FLA_TRIL_PRECISION},
+    extra_annotation={"DOT_PRECISION": Constexpr(value=FLA_TRIL_PRECISION)},
 )
 
 
@@ -595,7 +596,7 @@ def recompute_w_u_head_major_kernel(
         )
 
 
-_recompute_w_u_head_major_kernel_launch = intj_handle(
+_recompute_w_u_head_major_kernel_launch = make_launcher(
     recompute_w_u_head_major_kernel,
     grid_arg=2,
 )
@@ -637,7 +638,8 @@ def _run_split_path(
     u_out = v.new_empty(B, H, T, V)
     w_out = k.new_empty(B, H, T, K)
     dev, stream = current_device_stream()
-    _recompute_w_u_head_major_kernel_launch(dev)(
+    _recompute_w_u_head_major_kernel_launch(
+        dev,
         stream,
         NT,
         B * H,
@@ -773,7 +775,8 @@ def fused_solve_tril_recompute_w_u(
     w_out = k.new_empty(B, H, T, K)
 
     dev, stream = current_device_stream()
-    _fused_solve_tril_recompute_w_u_kernel_launch(dev)(
+    _fused_solve_tril_recompute_w_u_kernel_launch(
+        dev,
         stream,
         NT,
         B * H,

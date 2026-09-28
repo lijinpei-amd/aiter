@@ -7,13 +7,14 @@
 
 import torch
 import triton
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.fusions.fused_routing_from_topk import (
     _fused_routing_from_topk_hist_kernel,
     _fused_routing_from_topk_offset_kernel,
     _fused_routing_from_topk_place_kernel,
 )
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -26,17 +27,17 @@ _LOGGER = AiterTritonLogger()
 # sizes is well within this budget.
 
 
-_fused_routing_from_topk_hist_kernel_launch = intj_handle(
+_fused_routing_from_topk_hist_kernel_launch = make_launcher(
     _fused_routing_from_topk_hist_kernel,
     grid_arg=1,
     options={"num_warps": 1},
 )
-_fused_routing_from_topk_offset_kernel_launch = intj_handle(
+_fused_routing_from_topk_offset_kernel_launch = make_launcher(
     _fused_routing_from_topk_offset_kernel,
     grid_arg=1,
     options={"num_warps": 1},
 )
-_fused_routing_from_topk_place_kernel_launch = intj_handle(
+_fused_routing_from_topk_place_kernel_launch = make_launcher(
     _fused_routing_from_topk_place_kernel,
     grid_arg=1,
     options={"num_warps": 1},
@@ -145,7 +146,8 @@ def fused_routing_from_topk(
     # shared-memory reduction). num_warps=1 keeps the reduction within a
     # single wave, matching the CTA-local design of the original kernel.
     dev, stream = current_device_stream()
-    _fused_routing_from_topk_hist_kernel_launch(dev)(
+    _fused_routing_from_topk_hist_kernel_launch(
+        dev,
         stream,
         1,
         topk_ids_flat,
@@ -161,7 +163,8 @@ def fused_routing_from_topk(
 
     # Kernel 2 (Phase B): exclusive prefix-sum hist → offset. The kernel
     # boundary above publishes hist without an explicit barrier.
-    _fused_routing_from_topk_offset_kernel_launch(dev)(
+    _fused_routing_from_topk_offset_kernel_launch(
+        dev,
         stream,
         1,
         hist,
@@ -172,7 +175,8 @@ def fused_routing_from_topk(
 
     # Kernel 3 (Phase C): placement. The kernel boundary publishes the
     # prefix-sum offsets without an explicit barrier or atomic_xchg.
-    _fused_routing_from_topk_place_kernel_launch(dev)(
+    _fused_routing_from_topk_place_kernel_launch(
+        dev,
         stream,
         1,
         topk_ids_flat,

@@ -18,10 +18,11 @@ interface is converted to the ExptData routing format internally.
 
 import torch
 import triton
+from intj import Constexpr, make_launcher
 
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w8 import _moe_gemm_a8w8
 from aiter.ops.triton.moe.moe_utils import group_sizes_to_expt_tensors
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.tuned_config_utils import get_tuned_kernel_config
 
@@ -33,10 +34,10 @@ _LOGGER = AiterTritonLogger()
 _MXFP8_FALLBACK = triton.Config({}, num_warps=4, num_stages=1)
 
 
-_moe_gemm_a8w8_launch = intj_handle(
+_moe_gemm_a8w8_launch = make_launcher(
     _moe_gemm_a8w8,
     grid_arg=1,
-    baked={"W_CACHE_MODIFIER": ""},
+    extra_annotation={"W_CACHE_MODIFIER": Constexpr(value="")},
 )
 
 
@@ -119,7 +120,8 @@ def moe_gemm_mxfp8(
     bias_stride = N if bias is not None else 0
 
     dev, stream = current_device_stream()
-    _moe_gemm_a8w8_launch(dev)(
+    _moe_gemm_a8w8_launch(
+        dev,
         stream,
         grid_m * grid_n,
         # output

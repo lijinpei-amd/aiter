@@ -12,6 +12,7 @@ chunk-based gated delta rule operations.
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     autotune_cache_kwargs,
@@ -20,7 +21,7 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.index import (
     prepare_chunk_indices,
 )
 from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.op import exp
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 
@@ -106,7 +107,7 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     )
 
 
-_chunk_scaled_dot_kkt_fwd_kernel_launch = intj_handle(
+_chunk_scaled_dot_kkt_fwd_kernel_launch = make_launcher(
     chunk_scaled_dot_kkt_fwd_kernel,
     grid_arg=2,
 )
@@ -148,7 +149,8 @@ def chunk_scaled_dot_kkt_fwd(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     A = torch.empty(B, T, H, BT, device=k.device, dtype=output_dtype)
     dev, stream = current_device_stream()
-    _chunk_scaled_dot_kkt_fwd_kernel_launch(dev)(
+    _chunk_scaled_dot_kkt_fwd_kernel_launch(
+        dev,
         stream,
         NT,
         B * H,
@@ -274,7 +276,7 @@ def recompute_w_u_fwd_kernel(
         )
 
 
-_recompute_w_u_fwd_kernel_launch = intj_handle(recompute_w_u_fwd_kernel, grid_arg=2)
+_recompute_w_u_fwd_kernel_launch = make_launcher(recompute_w_u_fwd_kernel, grid_arg=2)
 
 
 def recompute_w_u_fwd(
@@ -313,7 +315,8 @@ def recompute_w_u_fwd(
     w = torch.empty_like(k)
     u = torch.empty_like(v)
     dev, stream = current_device_stream()
-    _recompute_w_u_fwd_kernel_launch(dev)(
+    _recompute_w_u_fwd_kernel_launch(
+        dev,
         stream,
         NT,
         B * H,

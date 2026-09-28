@@ -3,10 +3,11 @@
 
 import torch
 import triton
+from intj import make_launcher
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.kv_cache import _cat_and_cache_mla_kernel
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import e4m3_dtype
 
@@ -25,7 +26,7 @@ def cat_and_cache_mla_fake_tensor(
     return None
 
 
-_cat_and_cache_mla_kernel_launch = intj_handle(
+_cat_and_cache_mla_kernel_launch = make_launcher(
     _cat_and_cache_mla_kernel,
     grid_arg=1,
     options={"num_warps": 1},
@@ -128,7 +129,8 @@ def cat_and_cache_mla(
     ), "The stride of the last dimension of KV cache must be 1"
 
     dev, stream = current_device_stream()
-    _cat_and_cache_mla_kernel_launch(dev)(
+    _cat_and_cache_mla_kernel_launch(
+        dev,
         stream,
         b * kh,
         k_nope,

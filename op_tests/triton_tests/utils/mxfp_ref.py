@@ -13,9 +13,10 @@ it. It lived in ``aiter/ops/triton/moe/quant_moe.py`` until it was moved here.
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 _upcast_from_mxfp_repr = make_kernel_repr(
     "_upcast_from_mxfp",
@@ -181,7 +182,7 @@ def _upcast_from_mxfp(
     tl.store(out_ptr + out_offsets, out_tensor, mask=full_mask_out)
 
 
-_upcast_from_mxfp_launch = intj_handle(
+_upcast_from_mxfp_launch = make_launcher(
     _upcast_from_mxfp,
     grid_arg=2,
     options={"num_warps": 8},
@@ -229,7 +230,8 @@ def upcast_from_mxfp(
     blocks_out_dim = triton.cdiv(reshaped_out.shape[0], BLOCK_OUT_DIM)
     blocks_quant_dim = triton.cdiv(reshaped_out.shape[1], BLOCK_QUANT_DIM)
     dev, stream = current_device_stream()
-    _upcast_from_mxfp_launch(dev)(
+    _upcast_from_mxfp_launch(
+        dev,
         stream,
         blocks_out_dim,
         blocks_quant_dim,

@@ -9,9 +9,10 @@ attention mask without using nonzero or argsort.
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 _block_attn_mask_to_lut_kernel_repr = make_kernel_repr(
     "_block_attn_mask_to_lut_kernel",
@@ -82,7 +83,7 @@ def _block_attn_mask_to_lut_kernel(
     # No return; kv_block_indices is written in place
 
 
-_block_attn_mask_to_lut_kernel_launch = intj_handle(_block_attn_mask_to_lut_kernel)
+_block_attn_mask_to_lut_kernel_launch = make_launcher(_block_attn_mask_to_lut_kernel)
 
 
 def block_attn_mask_to_lut_kernel(
@@ -102,7 +103,8 @@ def block_attn_mask_to_lut_kernel(
 
     grid = (num_programs,)
     dev, stream = current_device_stream()
-    _block_attn_mask_to_lut_kernel_launch(dev)(
+    _block_attn_mask_to_lut_kernel_launch(
+        dev,
         stream,
         grid,
         block_attn_mask,

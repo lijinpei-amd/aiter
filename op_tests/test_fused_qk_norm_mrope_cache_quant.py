@@ -6,11 +6,12 @@ import argparse
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 from torch import Tensor
 
 import aiter
 from aiter import per_tensor_quant
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import dtypes
 
@@ -123,7 +124,7 @@ def set_kv_cache_shuffle_kernel(
     tl.store(value_cache_ptr + dst_v_shuffle_offset, v_val)
 
 
-_set_kv_cache_shuffle_kernel_launch = intj_handle(set_kv_cache_shuffle_kernel)
+_set_kv_cache_shuffle_kernel_launch = make_launcher(set_kv_cache_shuffle_kernel)
 
 
 def set_kv_cache_shuffle_layout(
@@ -161,7 +162,8 @@ def set_kv_cache_shuffle_layout(
 
     grid = (num_tokens, num_kv_heads)
     dev, stream = current_device_stream()
-    _set_kv_cache_shuffle_kernel_launch(dev)(
+    _set_kv_cache_shuffle_kernel_launch(
+        dev,
         stream,
         grid,
         k_quantized,

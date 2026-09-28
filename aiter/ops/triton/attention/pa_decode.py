@@ -5,6 +5,7 @@ import math
 
 import torch
 import triton
+from intj import make_launcher
 from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.attention.pa_decode import (
@@ -21,7 +22,7 @@ from aiter.ops.triton._triton_kernels.attention.pa_decode import (
     _paged_attn_decode_v2_wo_dot_reduce_kernel,
     _paged_attn_decode_v2_wo_dot_reduce_kernel_per_token_quant,
 )
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -263,10 +264,10 @@ def paged_attn_decode_v1(
         )
 
 
-_paged_attn_decode_v2_wo_dot_reduce_kernel_launch = intj_handle(
+_paged_attn_decode_v2_wo_dot_reduce_kernel_launch = make_launcher(
     _paged_attn_decode_v2_wo_dot_reduce_kernel,
 )
-_paged_attn_decode_v2_w_dot_reduce_kernel_launch = intj_handle(
+_paged_attn_decode_v2_w_dot_reduce_kernel_launch = make_launcher(
     _paged_attn_decode_v2_w_dot_reduce_kernel,
 )
 
@@ -364,7 +365,8 @@ def paged_attn_decode_v2(
         )
         grid = (num_q_heads, num_seqs, 1)
         dev, stream = current_device_stream()
-        _paged_attn_decode_v2_wo_dot_reduce_kernel_launch(dev)(
+        _paged_attn_decode_v2_wo_dot_reduce_kernel_launch(
+            dev,
             stream,
             grid,
             output,
@@ -436,7 +438,8 @@ def paged_attn_decode_v2(
         )
         grid = (num_seqs, num_kv_heads, 1)
         dev, stream = current_device_stream()
-        _paged_attn_decode_v2_w_dot_reduce_kernel_launch(dev)(
+        _paged_attn_decode_v2_w_dot_reduce_kernel_launch(
+            dev,
             stream,
             grid,
             output,
@@ -576,10 +579,10 @@ def paged_attn_decode_v1_per_token_quant(
         )
 
 
-_paged_attn_decode_v2_wo_dot_reduce_kernel_per_token_quant_launch = intj_handle(
+_paged_attn_decode_v2_wo_dot_reduce_kernel_per_token_quant_launch = make_launcher(
     _paged_attn_decode_v2_wo_dot_reduce_kernel_per_token_quant,
 )
-_paged_attn_decode_v2_w_dot_reduce_kernel_per_token_quant_launch = intj_handle(
+_paged_attn_decode_v2_w_dot_reduce_kernel_per_token_quant_launch = make_launcher(
     _paged_attn_decode_v2_w_dot_reduce_kernel_per_token_quant,
 )
 
@@ -680,7 +683,8 @@ def paged_attn_decode_v2_per_token_quant(
         )
         grid = (num_q_heads, num_seqs, 1)
         dev, stream = current_device_stream()
-        _paged_attn_decode_v2_wo_dot_reduce_kernel_per_token_quant_launch(dev)(
+        _paged_attn_decode_v2_wo_dot_reduce_kernel_per_token_quant_launch(
+            dev,
             stream,
             grid,
             output,
@@ -755,7 +759,8 @@ def paged_attn_decode_v2_per_token_quant(
         )
         grid = (num_seqs, num_kv_heads, 1)
         dev, stream = current_device_stream()
-        _paged_attn_decode_v2_w_dot_reduce_kernel_per_token_quant_launch(dev)(
+        _paged_attn_decode_v2_w_dot_reduce_kernel_per_token_quant_launch(
+            dev,
             stream,
             grid,
             output,

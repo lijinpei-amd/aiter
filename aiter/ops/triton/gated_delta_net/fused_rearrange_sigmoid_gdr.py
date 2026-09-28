@@ -11,11 +11,12 @@ import os
 
 import torch
 import triton
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_rearrange_sigmoid_gdr import (
     fused_rearrange_sigmoid_gated_delta_rule_update_kernel,
 )
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 
 def _flydsl_gdr_enabled() -> bool:
@@ -184,7 +185,7 @@ def _try_flydsl_mtp(
     return out.view(1, total_tokens, HV, head_v_dim), initial_state
 
 
-_fused_rearrange_sigmoid_gated_delta_rule_update_kernel_launch = intj_handle(
+_fused_rearrange_sigmoid_gated_delta_rule_update_kernel_launch = make_launcher(
     fused_rearrange_sigmoid_gated_delta_rule_update_kernel,
     options={"num_stages": 3, "num_warps": 4},
 )
@@ -319,7 +320,8 @@ def fused_rearrange_sigmoid_gated_delta_rule(
 
     grid = (NK, NV, N * HV)
     dev, stream = current_device_stream()
-    _fused_rearrange_sigmoid_gated_delta_rule_update_kernel_launch(dev)(
+    _fused_rearrange_sigmoid_gated_delta_rule_update_kernel_launch(
+        dev,
         stream,
         grid,
         A_log,

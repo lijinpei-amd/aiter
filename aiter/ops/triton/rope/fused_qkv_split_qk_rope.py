@@ -1,12 +1,13 @@
 import torch
 import triton
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.rope.fused_qkv_split_qk_rope import (
     _fused_qkv_split_qk_rope_kernel,
 )
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 
-_fused_qkv_split_qk_rope_kernel_launch = intj_handle(
+_fused_qkv_split_qk_rope_kernel_launch = make_launcher(
     _fused_qkv_split_qk_rope_kernel,
     options={"num_warps": 4, "waves_per_eu": 0},
 )
@@ -61,7 +62,8 @@ def fused_qkv_split_qk_rope(
     grid = (triton.cdiv(T, BLOCK_T), qh, 1)
 
     dev, stream = current_device_stream()
-    _fused_qkv_split_qk_rope_kernel_launch(dev)(
+    _fused_qkv_split_qk_rope_kernel_launch(
+        dev,
         stream,
         grid,
         qkv,

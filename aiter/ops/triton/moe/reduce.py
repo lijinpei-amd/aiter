@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 import torch
 import triton
+from intj import make_launcher
 from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.moe.reduce import (
@@ -9,7 +10,7 @@ from aiter.ops.triton._triton_kernels.moe.reduce import (
     _scatter_grouped,
 )
 from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 try:
     from aiter.ops.triton._gluon_kernels.gfx1250.moe.reduce import (
@@ -60,7 +61,7 @@ class EpCombineScatter:
             raise ValueError("dst_row must be contiguous int32")
 
 
-_scatter_grouped_launch = intj_handle(
+_scatter_grouped_launch = make_launcher(
     _scatter_grouped,
     grid_arg=1,
     options={"num_warps": 2},
@@ -94,7 +95,8 @@ def scatter_grouped(
     BLOCK_N = 512
     num_blocks = triton.cdiv(x.shape[-1], BLOCK_N)
     dev, stream = current_device_stream()
-    _scatter_grouped_launch(dev)(
+    _scatter_grouped_launch(
+        dev,
         stream,
         num_blocks * m_rows,
         x,
@@ -150,7 +152,7 @@ def validate_reduce_out(out, shape, dtype, device):
     return out
 
 
-_reduce_grouped_launch = intj_handle(
+_reduce_grouped_launch = make_launcher(
     _reduce_grouped,
     grid_arg=1,
     options={"num_warps": 2},
@@ -267,7 +269,8 @@ def reduce_grouped(
         res_stride_n = 0
         has_ext_residual = False
     dev, stream = current_device_stream()
-    _reduce_grouped_launch(dev)(
+    _reduce_grouped_launch(
+        dev,
         stream,
         num_blocks * num_groups,
         x,

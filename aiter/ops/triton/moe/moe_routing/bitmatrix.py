@@ -2,12 +2,13 @@ from dataclasses import dataclass
 
 import torch
 import triton
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.moe.moe_routing.bitmatrix import (
     _sum_bitmatrix_memset,
     _sum_bitmatrix_rows,
 )
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 
 @dataclass
@@ -40,7 +41,7 @@ class Bitmatrix:
         return sum_bitmatrix_rows(self, out_ret, partials_block_size)
 
 
-_sum_bitmatrix_memset_launch = intj_handle(_sum_bitmatrix_memset, grid_arg=1)
+_sum_bitmatrix_memset_launch = make_launcher(_sum_bitmatrix_memset, grid_arg=1)
 
 
 def clear_sums(n_cols, device, MEMSET_BLOCK=512):
@@ -48,7 +49,8 @@ def clear_sums(n_cols, device, MEMSET_BLOCK=512):
     blocks = cdiv(n_cols, MEMSET_BLOCK)
     out_ret = torch.empty((blocks * MEMSET_BLOCK,), device=device, dtype=torch.int32)
     dev, stream = current_device_stream()
-    _sum_bitmatrix_memset_launch(dev)(
+    _sum_bitmatrix_memset_launch(
+        dev,
         stream,
         blocks,
         out_ret,
@@ -57,7 +59,7 @@ def clear_sums(n_cols, device, MEMSET_BLOCK=512):
     return out_ret
 
 
-_sum_bitmatrix_rows_launch = intj_handle(
+_sum_bitmatrix_rows_launch = make_launcher(
     _sum_bitmatrix_rows,
     grid_arg=2,
     options={"num_warps": 8},
@@ -80,7 +82,8 @@ def sum_bitmatrix_rows(x, out_ret, partials_block_size=None):
 
     # output tensors
     dev, stream = current_device_stream()
-    _sum_bitmatrix_rows_launch(dev)(
+    _sum_bitmatrix_rows_launch(
+        dev,
         stream,
         pids_x,
         pids_y,

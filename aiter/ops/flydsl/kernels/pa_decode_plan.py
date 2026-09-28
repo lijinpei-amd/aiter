@@ -8,8 +8,9 @@ from dataclasses import dataclass
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 
 @triton.jit
@@ -74,7 +75,7 @@ def _plan_pa_decode(
         tl.store(work + pad * 4 + field, 0, padding)
 
 
-_plan_pa_decode_launch = intj_handle(
+_plan_pa_decode_launch = make_launcher(
     _plan_pa_decode,
     grid_arg=1,
     options={"num_warps": 4},
@@ -199,7 +200,8 @@ def plan_pa_decode(
     plan.validate(batch, num_kv_heads, dev)
     with torch.cuda.device(dev):
         intj_dev, intj_stream = current_device_stream()
-        _plan_pa_decode_launch(intj_dev)(
+        _plan_pa_decode_launch(
+            intj_dev,
             intj_stream,
             batch,
             context_lengths,

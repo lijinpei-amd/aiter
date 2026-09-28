@@ -1,5 +1,7 @@
 import functools
 
+import torch
+
 
 @functools.lru_cache(maxsize=1)
 def get_num_sms():
@@ -25,3 +27,13 @@ def get_num_sms():
 def get_num_xcds():
     # Currently, you can't query this programmatically. For gfx942/gfx950 it's 8, so we hardcode that here.
     return 8
+
+
+_raw_stream = torch._C._cuda_getCurrentRawStream  # what Triton's driver reads
+
+
+def current_device_stream():
+    """The current device ordinal and its raw stream, as Triton launches on:
+    the first two arguments of an intj launcher call."""
+    device = torch.cuda.current_device()
+    return device, _raw_stream(device)

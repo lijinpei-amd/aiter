@@ -16,6 +16,7 @@ Recompute W and U tensors for chunk_delta_attn forward pass.
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils import (
     autotune_cache_kwargs,
@@ -25,7 +26,7 @@ from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils im
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.index import (
     prepare_chunk_indices,
 )
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 _BK_DEFAULT = 64
@@ -167,7 +168,7 @@ def recompute_w_u_fwd_kernel(
         tl.store(p_w, b_w.to(p_w.dtype.element_ty), mask=m_tk)
 
 
-_recompute_w_u_fwd_kernel_launch = intj_handle(recompute_w_u_fwd_kernel, grid_arg=2)
+_recompute_w_u_fwd_kernel_launch = make_launcher(recompute_w_u_fwd_kernel, grid_arg=2)
 
 
 @input_guard
@@ -220,7 +221,8 @@ def recompute_w_u_fwd(
     kg = torch.empty(B, T, HV, K, device=k.device, dtype=k.dtype)
 
     dev, stream = current_device_stream()
-    _recompute_w_u_fwd_kernel_launch(dev)(
+    _recompute_w_u_fwd_kernel_launch(
+        dev,
         stream,
         NT,
         B * HV,

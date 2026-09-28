@@ -7,10 +7,11 @@ import os
 import numpy as np
 import pandas as pd
 import torch
+from intj import make_launcher
 from torch import Tensor
 
 from aiter import logger
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 from ..jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG, compile_ops
 from ..jit.utils.chip_info import get_cu_num
@@ -345,7 +346,7 @@ if _HAS_TRITON:
         scaddr = (t * NK_PAD + step) * 1024 + su * 512 + kg * 128 + r16 * 8 + sub
         tl.store(s_ptr + scaddr, e8, mask=rm)
 
-    _quant_pack_kernel_launch = intj_handle(_quant_pack_kernel)
+    _quant_pack_kernel_launch = make_launcher(_quant_pack_kernel)
 
     @triton.jit
     def _quant_pack_4block_kernel(
@@ -431,7 +432,7 @@ if _HAS_TRITON:
         scaddr = (t * NK_PAD + step) * 1024 + su * 512 + kg * 128 + r16 * 8 + sub
         tl.store(s_ptr + scaddr, e8, mask=rm)
 
-    _quant_pack_4block_kernel_launch = intj_handle(
+    _quant_pack_4block_kernel_launch = make_launcher(
         _quant_pack_4block_kernel,
         options={"num_warps": 4},
     )
@@ -913,7 +914,8 @@ def _launch_quant_mxfp6_gemm_triton(
         NSTEP = NB // _BATCHED_PACK_K_BLOCKS
         grid = ((rows + BM - 1) // BM * NSTEP,)
         dev, stream = current_device_stream()
-        _quant_pack_4block_kernel_launch(dev)(
+        _quant_pack_4block_kernel_launch(
+            dev,
             stream,
             grid,
             x,
@@ -930,7 +932,8 @@ def _launch_quant_mxfp6_gemm_triton(
         BM = 128
         grid = ((rows + BM - 1) // BM * NB,)
         dev, stream = current_device_stream()
-        _quant_pack_kernel_launch(dev)(
+        _quant_pack_kernel_launch(
+            dev,
             stream,
             grid,
             x,

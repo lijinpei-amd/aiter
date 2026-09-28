@@ -189,6 +189,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 import aiter
 from aiter import ActivationType, QuantType, dtypes
@@ -210,7 +211,7 @@ from aiter.ops.shuffle import (
     shuffle_weight,
     shuffle_weight_a16w4,
 )
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.test_common import checkAllclose
 from aiter.utility import fp4_utils
 
@@ -242,7 +243,7 @@ def _append_fake_route_kernel(
     tl.store(dst_ids + offsets, ids, mask=valid)
 
 
-_append_fake_route_kernel_launch = intj_handle(_append_fake_route_kernel, grid_arg=1)
+_append_fake_route_kernel_launch = make_launcher(_append_fake_route_kernel, grid_arg=1)
 
 
 @torch.library.custom_op("aiter::test_wide_ep_forward", mutates_args=())
@@ -453,7 +454,8 @@ class TestWideEpMoe:
             )
         total = route_shape[0] * route_shape[1]
         dev, stream = current_device_stream()
-        _append_fake_route_kernel_launch(dev)(
+        _append_fake_route_kernel_launch(
+            dev,
             stream,
             triton.cdiv(total, 256),
             recv[1],

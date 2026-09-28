@@ -2,6 +2,7 @@ from enum import Enum
 
 import torch
 import triton
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.moe.quant_moe import (
     _downcast_to_mxfp,
@@ -10,7 +11,7 @@ from aiter.ops.triton._triton_kernels.moe.quant_moe import (
 )
 from aiter.ops.triton.quant.quant import static_per_tensor_quant_fp8_i8
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 
 def downcast_to_static_fp8_3d(x: torch.Tensor, scale: torch.Tensor):
@@ -39,7 +40,7 @@ class DequantScaleRoundingMode(Enum):
     ROUND_DOWN = 1
 
 
-_downcast_to_mxfp_launch = intj_handle(
+_downcast_to_mxfp_launch = make_launcher(
     _downcast_to_mxfp,
     grid_arg=2,
     options={"num_warps": 8},
@@ -108,7 +109,8 @@ def downcast_to_mxfp(
     grid_quant = triton.cdiv(kernel_src_tensor.shape[1], BLOCK_QUANT_DIM)
 
     dev, stream = current_device_stream()
-    _downcast_to_mxfp_launch(dev)(
+    _downcast_to_mxfp_launch(
+        dev,
         stream,
         grid_out,
         grid_quant,
@@ -188,11 +190,11 @@ def dequant_w_blockscale(w, w_scales, group_shape):
     return w
 
 
-_smoothquant_fuse_quant_kernel_single_pass_launch = intj_handle(
+_smoothquant_fuse_quant_kernel_single_pass_launch = make_launcher(
     _smoothquant_fuse_quant_kernel_single_pass,
     options={"num_warps": 4},
 )
-_smoothquant_fuse_quant_kernel_launch = intj_handle(
+_smoothquant_fuse_quant_kernel_launch = make_launcher(
     _smoothquant_fuse_quant_kernel,
     options={"num_warps": 4},
 )
@@ -241,7 +243,8 @@ def smoothquant_quantize(
         grid = (triton.cdiv(M, BLOCK_M),)
 
         dev, stream = current_device_stream()
-        _smoothquant_fuse_quant_kernel_single_pass_launch(dev)(
+        _smoothquant_fuse_quant_kernel_single_pass_launch(
+            dev,
             stream,
             grid,
             x,
@@ -262,7 +265,8 @@ def smoothquant_quantize(
         BLOCK_K = 256
         grid = (triton.cdiv(M, BLOCK_M),)
         dev, stream = current_device_stream()
-        _smoothquant_fuse_quant_kernel_launch(dev)(
+        _smoothquant_fuse_quant_kernel_launch(
+            dev,
             stream,
             grid,
             x,

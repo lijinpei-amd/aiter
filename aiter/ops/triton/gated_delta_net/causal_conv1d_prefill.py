@@ -25,6 +25,7 @@ concatenation ``[Q | K | V]`` (``dim == 2*k_dim + v_dim``).
 
 import torch
 import triton
+from intj import make_launcher
 from intj.compat import launch as _intj_launch
 
 from aiter.ops.prefill_batch_metadata import CausalConvPrefillMetadata
@@ -33,7 +34,7 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.causal_conv1d_fwd
     _causal_conv1d_fwd_split_qkv_kernel,
     _causal_conv1d_fwd_split_qkv_tile_kernel,
 )
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 __all__ = [
     "PAD_SLOT_ID",
@@ -42,7 +43,7 @@ __all__ = [
 ]
 
 
-_causal_conv1d_fwd_split_qkv_kernel_launch = intj_handle(
+_causal_conv1d_fwd_split_qkv_kernel_launch = make_launcher(
     _causal_conv1d_fwd_split_qkv_kernel,
     options={"num_stages": 2},
 )
@@ -99,7 +100,8 @@ def causal_conv1d_split_qkv_triton_fn(
     )
 
     dev, stream = current_device_stream()
-    _causal_conv1d_fwd_split_qkv_kernel_launch(dev)(
+    _causal_conv1d_fwd_split_qkv_kernel_launch(
+        dev,
         stream,
         grid,
         x,

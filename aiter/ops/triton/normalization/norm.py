@@ -3,6 +3,7 @@
 
 import torch
 import triton
+from intj import make_launcher
 from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.normalization.norm import (
@@ -14,14 +15,14 @@ from aiter.ops.triton._triton_kernels.normalization.norm import (
     _quant_fused_add_layernorm_kernel,
     _quant_layernorm_kernel,
 )
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import get_dtype_max
 
 _LOGGER = AiterTritonLogger()
 
 
-_layernorm_kernel_launch = intj_handle(_layernorm_kernel, grid_arg=1)
+_layernorm_kernel_launch = make_launcher(_layernorm_kernel, grid_arg=1)
 
 
 def _layernorm_forward(
@@ -41,7 +42,8 @@ def _layernorm_forward(
     BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
 
     dev, stream = current_device_stream()
-    _layernorm_kernel_launch(dev)(
+    _layernorm_kernel_launch(
+        dev,
         stream,
         M,
         x,
@@ -59,7 +61,7 @@ def _layernorm_forward(
     )
 
 
-_fused_add_layernorm_kernel_launch = intj_handle(
+_fused_add_layernorm_kernel_launch = make_launcher(
     _fused_add_layernorm_kernel,
     grid_arg=1,
 )
@@ -84,7 +86,8 @@ def _layernorm_forward_with_add(
     BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
 
     dev, stream = current_device_stream()
-    _fused_add_layernorm_kernel_launch(dev)(
+    _fused_add_layernorm_kernel_launch(
+        dev,
         stream,
         M,
         x,
@@ -104,8 +107,8 @@ def _layernorm_forward_with_add(
     )
 
 
-_layernorm_bwd_dwdb_triton_launch = intj_handle(_layernorm_bwd_dwdb_triton)
-_layernorm_bwd_dwdb_triton_v2_launch = intj_handle(_layernorm_bwd_dwdb_triton_v2)
+_layernorm_bwd_dwdb_triton_launch = make_launcher(_layernorm_bwd_dwdb_triton)
+_layernorm_bwd_dwdb_triton_v2_launch = make_launcher(_layernorm_bwd_dwdb_triton_v2)
 
 
 def _layernorm_backward(
@@ -173,7 +176,8 @@ def _layernorm_backward(
         dwdb_block_m = min(triton.next_power_of_2(tile_num), dwdb_block_m)
         grid_reduce = (triton.cdiv(N, dwdb_block_n),)
         dev, stream = current_device_stream()
-        _layernorm_bwd_dwdb_triton_launch(dev)(
+        _layernorm_bwd_dwdb_triton_launch(
+            dev,
             stream,
             grid_reduce,
             _dw,
@@ -192,7 +196,8 @@ def _layernorm_backward(
         dwdb_block_m = min(triton.next_power_of_2(M), dwdb_block_m)
         grid_reduce = (triton.cdiv(N, dwdb_block_n),)
         dev, stream = current_device_stream()
-        _layernorm_bwd_dwdb_triton_v2_launch(dev)(
+        _layernorm_bwd_dwdb_triton_v2_launch(
+            dev,
             stream,
             grid_reduce,
             x,
@@ -351,7 +356,7 @@ def layernorm2d_fwd_with_add(
     )
 
 
-_quant_layernorm_kernel_launch = intj_handle(_quant_layernorm_kernel, grid_arg=1)
+_quant_layernorm_kernel_launch = make_launcher(_quant_layernorm_kernel, grid_arg=1)
 
 
 def layernorm2d_fwd_with_dynamicquant(
@@ -398,7 +403,8 @@ def layernorm2d_fwd_with_dynamicquant(
     aux = torch.empty(M, N, dtype=torch.float32, device=input.device)
 
     dev, stream = current_device_stream()
-    _quant_layernorm_kernel_launch(dev)(
+    _quant_layernorm_kernel_launch(
+        dev,
         stream,
         M,
         input,
@@ -466,7 +472,8 @@ def layernorm2d_fwd_with_smoothquant(
     aux = torch.empty(M, N, dtype=torch.float32, device=input.device)
 
     dev, stream = current_device_stream()
-    _quant_layernorm_kernel_launch(dev)(
+    _quant_layernorm_kernel_launch(
+        dev,
         stream,
         M,
         input,
@@ -490,7 +497,7 @@ def layernorm2d_fwd_with_smoothquant(
     return
 
 
-_quant_fused_add_layernorm_kernel_launch = intj_handle(
+_quant_fused_add_layernorm_kernel_launch = make_launcher(
     _quant_fused_add_layernorm_kernel,
     grid_arg=1,
 )
@@ -545,7 +552,8 @@ def layernorm2d_fwd_with_add_dynamicquant(
     aux = torch.empty(M, N, dtype=torch.float32, device=input.device)
 
     dev, stream = current_device_stream()
-    _quant_fused_add_layernorm_kernel_launch(dev)(
+    _quant_fused_add_layernorm_kernel_launch(
+        dev,
         stream,
         M,
         input,
@@ -622,7 +630,8 @@ def layernorm2d_fwd_with_add_smoothquant(
     aux = torch.empty(M, N, dtype=torch.float32, device=input.device)
 
     dev, stream = current_device_stream()
-    _quant_fused_add_layernorm_kernel_launch(dev)(
+    _quant_fused_add_layernorm_kernel_launch(
+        dev,
         stream,
         M,
         input,

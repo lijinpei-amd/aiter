@@ -28,16 +28,18 @@ except:  # noqa: E722
     gluon_fused_qk_rope_cat_and_cache_mla_kernel = None
     gluon_fused_qk_rope_reshape_and_cache_kernel = None
 
+from intj import make_launcher
+
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import e4m3_dtype
 
-_triton_cat_and_cache_mla_launch = intj_handle(
+_triton_cat_and_cache_mla_launch = make_launcher(
     triton_fused_qk_rope_cat_and_cache_mla_kernel, options={"num_warps": 1}
 )
-_gluon_cat_and_cache_mla_launch = intj_handle(
+_gluon_cat_and_cache_mla_launch = make_launcher(
     gluon_fused_qk_rope_cat_and_cache_mla_kernel, options={"num_warps": 1}
 )
 
@@ -285,7 +287,8 @@ def fused_qk_rope_cat_and_cache_mla(
         _kernel = _triton_cat_and_cache_mla_launch
 
     dev, stream = current_device_stream()
-    _kernel(dev)(
+    _kernel(
+        dev,
         stream,
         grid,
         q_nope,
@@ -653,7 +656,7 @@ def fused_qk_rope_reshape_and_cache(
     return q_out, k_out, key_cache, value_cache
 
 
-_fused_qk_rope_cosine_cache_llama_kernel_launch = intj_handle(
+_fused_qk_rope_cosine_cache_llama_kernel_launch = make_launcher(
     _fused_qk_rope_cosine_cache_llama_kernel,
     options={"num_warps": 1},
 )
@@ -759,7 +762,8 @@ def fused_qk_rope_cosine_cache_llama(
     n_pid = t * qh + (t_slot - t) * kh
     grid = (n_pid, 1, 1)
     dev, stream = current_device_stream()
-    _fused_qk_rope_cosine_cache_llama_kernel_launch(dev)(
+    _fused_qk_rope_cosine_cache_llama_kernel_launch(
+        dev,
         stream,
         grid,
         q,

@@ -1,5 +1,6 @@
 import torch
 import triton
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.moe.moe_routing.minunique import _keepk_sort0
 from aiter.ops.triton._triton_kernels.moe.moe_routing.routing import _combined_routing
@@ -10,9 +11,9 @@ from aiter.ops.triton.moe.moe_routing.routing import (
 )
 from aiter.ops.triton.moe.moe_routing.topk import topk
 from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 
-_keepk_sort0_launch = intj_handle(_keepk_sort0, grid_arg=1, options={"num_warps": 1})
+_keepk_sort0_launch = make_launcher(_keepk_sort0, grid_arg=1, options={"num_warps": 1})
 
 
 def keepk_sort0(
@@ -37,7 +38,8 @@ def keepk_sort0(
     Vout = torch.empty((M, k), dtype=expt_scal.dtype, device=dev)
     Iout = torch.empty((M, k), dtype=torch.int16, device=dev)
     intj_dev, intj_stream = current_device_stream()
-    _keepk_sort0_launch(intj_dev)(
+    _keepk_sort0_launch(
+        intj_dev,
         intj_stream,
         M,
         expt_scal,
@@ -65,7 +67,7 @@ def keepk_sort0(
     return Vout, Iout
 
 
-_combined_routing_launch = intj_handle(
+_combined_routing_launch = make_launcher(
     _combined_routing,
     grid_arg=1,
     options={"num_warps": 1},
@@ -120,7 +122,8 @@ def _minunique_common(
     )
     blocks1b = triton.cdiv(num_tokens, HIST_BLOCK_M)
     intj_dev, intj_stream = current_device_stream()
-    _combined_routing_launch(intj_dev)(
+    _combined_routing_launch(
+        intj_dev,
         intj_stream,
         blocks1a + blocks1b,
         topk_indx,

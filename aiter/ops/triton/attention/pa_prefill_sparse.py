@@ -20,6 +20,7 @@ take a 1-D ``(kv_indices, kv_indptr)`` pair over one pool.
 
 import torch
 import triton
+from intj import make_launcher
 from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_prefill_sparse import (
@@ -32,7 +33,7 @@ from aiter.ops.triton.gluon.mla_gluon import (
     mla_gluon as gluon_mla_sparse_prefill,
 )
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 DEVICE_ARCH = arch_info.get_arch()
@@ -45,7 +46,7 @@ def _sparse_attn_prefill_kernel_grid(num_heads: int, BLOCK_H: int, *, num_querie
     return (num_queries, triton.cdiv(num_heads, BLOCK_H))
 
 
-_sparse_attn_prefill_kernel_launch = intj_handle(
+_sparse_attn_prefill_kernel_launch = make_launcher(
     _sparse_attn_prefill_kernel,
     grid_cpp=_sparse_attn_prefill_kernel_grid,
 )
@@ -228,7 +229,8 @@ def pa_prefill_sparse(
             triton.cdiv(num_heads, META["BLOCK_H"]),
         )
         dev, stream = current_device_stream()
-        _sparse_attn_prefill_kernel_launch(dev)(
+        _sparse_attn_prefill_kernel_launch(
+            dev,
             stream,
             num_queries,  # grid
             q,

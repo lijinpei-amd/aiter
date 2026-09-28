@@ -1,12 +1,13 @@
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     autotune_cache_kwargs,
     input_guard,
 )
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 
@@ -200,7 +201,7 @@ def _fused_sigmoid_gating_delta_rule_update_kernel_grid(
     return (NK, triton.cdiv(V, BV), N * HV)
 
 
-_fused_sigmoid_gating_delta_rule_update_kernel_launch = intj_handle(
+_fused_sigmoid_gating_delta_rule_update_kernel_launch = make_launcher(
     fused_sigmoid_gating_delta_rule_update_kernel,
     grid_cpp=_fused_sigmoid_gating_delta_rule_update_kernel_grid,
 )
@@ -243,7 +244,8 @@ def fused_sigmoid_gating_delta_rule_update(
     o = q.new_empty(NK, *v.shape)
 
     dev, stream = current_device_stream()
-    _fused_sigmoid_gating_delta_rule_update_kernel_launch(dev)(
+    _fused_sigmoid_gating_delta_rule_update_kernel_launch(
+        dev,
         stream,
         NK,  # grid
         N,  # grid

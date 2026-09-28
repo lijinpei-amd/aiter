@@ -9,10 +9,11 @@ import pandas as pd
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 import aiter
 from aiter import dtypes
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -253,7 +254,7 @@ def _convert_req_index_to_global_index_kernel(
     tl.store(out_ptr_ij, out_val)
 
 
-_convert_req_index_to_global_index_kernel_launch = intj_handle(
+_convert_req_index_to_global_index_kernel_launch = make_launcher(
     _convert_req_index_to_global_index_kernel,
 )
 
@@ -307,7 +308,8 @@ def triton_convert_req_index_to_global_index(
     grid = (num_tokens, tiles_per_row)
 
     dev, stream = current_device_stream()
-    _convert_req_index_to_global_index_kernel_launch(dev)(
+    _convert_req_index_to_global_index_kernel_launch(
+        dev,
         stream,
         grid,
         kv_indptr_c,

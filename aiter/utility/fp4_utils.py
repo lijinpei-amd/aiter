@@ -3,9 +3,10 @@
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 from torch import Tensor
 
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 from . import dtypes
 from .mx_types import (
@@ -535,7 +536,7 @@ def _dynamic_mxfp4_quant_kernel_asm_layout(
         tl.store(bs_ptr + bs_offs, bs_e8m0, mask=bs_mask)
 
 
-_dynamic_mxfp4_quant_kernel_asm_layout_launch = intj_handle(
+_dynamic_mxfp4_quant_kernel_asm_layout_launch = make_launcher(
     _dynamic_mxfp4_quant_kernel_asm_layout,
 )
 
@@ -580,7 +581,8 @@ def dynamic_mxfp4_quant(
     BLOCK_SIZE = 128
     grid = (triton.cdiv(M, BLOCK_SIZE), scaleN)
     dev, stream = current_device_stream()
-    _dynamic_mxfp4_quant_kernel_asm_layout_launch(dev)(
+    _dynamic_mxfp4_quant_kernel_asm_layout_launch(
+        dev,
         stream,
         grid,
         x,
@@ -765,10 +767,10 @@ def _moe_mxfp4_sort_kernel_fused_n(
         tl.store(blockscale_e8m0_sorted_ptr + store_offs, out)
 
 
-_moe_mxfp4_sort_kernel_fused_n_launch = intj_handle(
+_moe_mxfp4_sort_kernel_fused_n_launch = make_launcher(
     _moe_mxfp4_sort_kernel_fused_n, grid_arg=1
 )
-_moe_mxfp4_sort_kernel_launch = intj_handle(_moe_mxfp4_sort_kernel, grid_arg=2)
+_moe_mxfp4_sort_kernel_launch = make_launcher(_moe_mxfp4_sort_kernel, grid_arg=2)
 
 
 def moe_mxfp4_sort(
@@ -851,11 +853,12 @@ def moe_mxfp4_sort(
     dev, stream = current_device_stream()
     if token_num > _FUSED_N_THRESHOLD:
         N_TILES = triton.cdiv(N_i, BLOCK_SIZE_N)
-        _moe_mxfp4_sort_kernel_fused_n_launch(dev)(
-            stream, triton.cdiv(M_o, BLOCK_SIZE_M), *common_args, N_TILES
+        _moe_mxfp4_sort_kernel_fused_n_launch(
+            dev, stream, triton.cdiv(M_o, BLOCK_SIZE_M), *common_args, N_TILES
         )
     else:
-        _moe_mxfp4_sort_kernel_launch(dev)(
+        _moe_mxfp4_sort_kernel_launch(
+            dev,
             stream,
             triton.cdiv(M_o, BLOCK_SIZE_M),
             triton.cdiv(N_i, BLOCK_SIZE_N),

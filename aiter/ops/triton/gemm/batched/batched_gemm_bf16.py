@@ -3,6 +3,7 @@
 
 import torch
 import triton
+from intj import Constexpr, make_launcher
 from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
@@ -13,8 +14,8 @@ from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_bf16 import (
     _get_config,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -30,9 +31,12 @@ def _is_gluon_available():
         return False
 
 
-_batched_gemm_splitk_reduce_kernel_launch = intj_handle(
+_batched_gemm_splitk_reduce_kernel_launch = make_launcher(
     _batched_gemm_splitk_reduce_kernel,
-    baked={"KERNEL_NAME": "_batched_gemm_bf16_reduce_kernel", "activation": ""},
+    extra_annotation={
+        "KERNEL_NAME": Constexpr(value="_batched_gemm_bf16_reduce_kernel"),
+        "activation": Constexpr(value=""),
+    },
 )
 
 
@@ -303,7 +307,8 @@ def batched_gemm_bf16(
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
         dev, stream = current_device_stream()
-        _batched_gemm_splitk_reduce_kernel_launch(dev)(
+        _batched_gemm_splitk_reduce_kernel_launch(
+            dev,
             stream,
             grid_reduce,
             y_pp,

@@ -1,5 +1,6 @@
 import torch
 import triton
+from intj import make_launcher
 from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._gluon_kernels.gfx1250.norm.fused_add_rmsnorm_pad import (
@@ -10,7 +11,7 @@ from aiter.ops.triton._triton_kernels.normalization.fused_add_rmsnorm_pad import
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -27,7 +28,7 @@ def _get_config(block_size_n: int, backend: str) -> dict:
     return dict(raw["any"])
 
 
-_fused_add_rmsnorm_pad_launch = intj_handle(_fused_add_rmsnorm_pad, grid_arg=1)
+_fused_add_rmsnorm_pad_launch = make_launcher(_fused_add_rmsnorm_pad, grid_arg=1)
 
 
 def fused_add_rmsnorm_pad(
@@ -133,7 +134,8 @@ def fused_add_rmsnorm_pad(
     BLOCK_SIZE_N = triton.next_power_of_2(N_out)
 
     dev, stream = current_device_stream()
-    _fused_add_rmsnorm_pad_launch(dev)(
+    _fused_add_rmsnorm_pad_launch(
+        dev,
         stream,
         M,
         x,

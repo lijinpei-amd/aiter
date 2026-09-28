@@ -1,3 +1,5 @@
+import functools
+
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -25,10 +27,11 @@ It supports page size = 1.
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 
 def is_hip():
@@ -394,7 +397,7 @@ def _fwd_grouped_kernel_stage1(
 
 
 def _stage1_options():
-    # Evaluated on the device when the handle is built.
+    # Evaluated when the launcher is first used (get_arch() needs a GPU).
     if not is_hip_:
         return {"num_warps": 4, "num_stages": 2}
     # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
@@ -409,9 +412,9 @@ def _stage1_options():
     }
 
 
-_fwd_grouped_kernel_stage1_launch = intj_handle(
-    _fwd_grouped_kernel_stage1, options=_stage1_options
-)
+@functools.cache
+def _fwd_grouped_kernel_stage1_launch():
+    return make_launcher(_fwd_grouped_kernel_stage1, options=_stage1_options())
 
 
 def _decode_grouped_att_m_fwd(
@@ -456,7 +459,8 @@ def _decode_grouped_att_m_fwd(
     )
 
     dev, stream = current_device_stream()
-    _fwd_grouped_kernel_stage1_launch(dev)(
+    _fwd_grouped_kernel_stage1_launch()(
+        dev,
         stream,
         grid,
         q,
@@ -548,7 +552,7 @@ def _fwd_kernel_stage2(
 
 
 def _stage2_options():
-    # Evaluated on the device when the handle is built.
+    # Evaluated when the launcher is first used (get_arch() needs a GPU).
     if not is_hip_:
         return {"num_warps": 4, "num_stages": 2}
     kpack = 1 if get_arch() == "gfx950" else 2
@@ -561,7 +565,9 @@ def _stage2_options():
     }
 
 
-_fwd_kernel_stage2_launch = intj_handle(_fwd_kernel_stage2, options=_stage2_options)
+@functools.cache
+def _fwd_kernel_stage2_launch():
+    return make_launcher(_fwd_kernel_stage2, options=_stage2_options())
 
 
 def _decode_softmax_reducev_fwd(
@@ -580,7 +586,8 @@ def _decode_softmax_reducev_fwd(
 
     grid = (batch, head_num)
     dev, stream = current_device_stream()
-    _fwd_kernel_stage2_launch(dev)(
+    _fwd_kernel_stage2_launch()(
+        dev,
         stream,
         grid,
         logits,

@@ -11,6 +11,7 @@ from typing import Literal
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
     DEBUG,
@@ -18,7 +19,7 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
     get_stride_from_layout,
     is_fp8,
 )
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 
 @triton.jit
@@ -156,7 +157,7 @@ def _cast_varlen_to_fp8_kernel_2d(
         tl.store(X_fp8 + addr_out, x_fp8_block, mask=mask_seq)
 
 
-_cast_varlen_to_fp8_kernel_2d_launch = intj_handle(_cast_varlen_to_fp8_kernel_2d)
+_cast_varlen_to_fp8_kernel_2d_launch = make_launcher(_cast_varlen_to_fp8_kernel_2d)
 
 
 @triton.jit
@@ -325,7 +326,8 @@ def cast_to_fp8(
 
     grid = (batch, num_heads)
     dev, stream = current_device_stream()
-    _cast_varlen_to_fp8_kernel_2d_launch(dev)(
+    _cast_varlen_to_fp8_kernel_2d_launch(
+        dev,
         stream,
         grid,
         x,

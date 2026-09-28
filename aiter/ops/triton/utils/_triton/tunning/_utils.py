@@ -4,9 +4,10 @@ from collections.abc import Callable
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 from triton.testing import runtime
 
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 
 @triton.jit
@@ -17,7 +18,7 @@ def split_dummy(d_ptr):
     tl.store(d_ptr + pid, x)
 
 
-_split_dummy_launch = intj_handle(split_dummy, grid_arg=1)
+_split_dummy_launch = make_launcher(split_dummy, grid_arg=1)
 
 
 def run_profile(fn: Callable, n_run: int = 250):
@@ -32,7 +33,8 @@ def run_profile(fn: Callable, n_run: int = 250):
     cache.zero_()
     di.synchronize()
     dev, stream = current_device_stream()
-    _split_dummy_launch(dev)(
+    _split_dummy_launch(
+        dev,
         stream,
         128,
         d,

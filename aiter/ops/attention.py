@@ -7,11 +7,12 @@ import os
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter import dtypes
 from aiter.ops.enum import Enum, MlaVersion, QuantType
 from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.utility.dtypes import _aiter_dtype_id
 from csrc.cpp_itfs.pa.pa import paged_attention_rocm as paged_attention_rocm_core
 from csrc.cpp_itfs.pa.pa_ragged import (
@@ -1620,7 +1621,7 @@ def decode_update_mla_metadata_v1_kernel(
                     found_partial_index = True
 
 
-_decode_update_mla_metadata_v1_kernel_launch = intj_handle(
+_decode_update_mla_metadata_v1_kernel_launch = make_launcher(
     decode_update_mla_metadata_v1_kernel,
 )
 
@@ -1706,7 +1707,8 @@ def decode_update_mla_metadata_v1(
         batch_size *= qk_batch_ratio
     grid = (max_work,)
     dev, stream = current_device_stream()
-    _decode_update_mla_metadata_v1_kernel_launch(dev)(
+    _decode_update_mla_metadata_v1_kernel_launch(
+        dev,
         stream,
         grid,
         seqlens_qo_indptr,

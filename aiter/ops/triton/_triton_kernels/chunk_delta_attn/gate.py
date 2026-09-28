@@ -14,6 +14,7 @@ Provides:
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils import (
     autotune_cache_kwargs,
@@ -21,7 +22,7 @@ from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils im
     input_guard,
     softplus,
 )
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 _BETA_SIGMOID_BLOCK_SIZE = 2048
@@ -46,7 +47,7 @@ def beta_sigmoid_fwd_kernel(
     tl.store(y + offs, b_y.to(y.dtype.element_ty), mask=mask)
 
 
-_beta_sigmoid_fwd_kernel_launch = intj_handle(
+_beta_sigmoid_fwd_kernel_launch = make_launcher(
     beta_sigmoid_fwd_kernel,
     options={"num_warps": _BETA_SIGMOID_NUM_WARPS},
 )
@@ -59,7 +60,8 @@ def beta_sigmoid_fwd(x: torch.Tensor) -> torch.Tensor:
     n = x.numel()
     grid = (triton.cdiv(n, _BETA_SIGMOID_BLOCK_SIZE),)
     dev, stream = current_device_stream()
-    _beta_sigmoid_fwd_kernel_launch(dev)(
+    _beta_sigmoid_fwd_kernel_launch(
+        dev,
         stream,
         grid,
         x,
@@ -135,7 +137,7 @@ def _chunk_delta_attn_gate_fwd_kernel_grid(T: int, BT: int, H: int):
     return (triton.cdiv(T, BT), H)
 
 
-_chunk_delta_attn_gate_fwd_kernel_launch = intj_handle(
+_chunk_delta_attn_gate_fwd_kernel_launch = make_launcher(
     chunk_delta_attn_gate_fwd_kernel,
     grid_cpp=_chunk_delta_attn_gate_fwd_kernel_grid,
 )
@@ -168,7 +170,8 @@ def chunk_delta_attn_gate_fwd(
     yg = torch.empty_like(g, dtype=output_dtype)
 
     dev, stream = current_device_stream()
-    _chunk_delta_attn_gate_fwd_kernel_launch(dev)(
+    _chunk_delta_attn_gate_fwd_kernel_launch(
+        dev,
         stream,
         g,
         A_log,

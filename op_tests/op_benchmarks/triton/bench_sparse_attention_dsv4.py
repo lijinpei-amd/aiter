@@ -18,11 +18,12 @@ import argparse
 
 import torch
 import triton
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
     _sparse_attn_prefill_kernel as csa_prefill_tl,
 )
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 # The Gluon prefill kernel is opt-in (gfx950 + Triton >= 3.6). Probe it once at
 # import time; the benchmark falls back to Triton-only when unavailable.
@@ -44,7 +45,7 @@ def _sparse_attn_prefill_grid(num_heads: int, BLOCK_H: int, *, num_queries: int)
     return (num_queries, triton.cdiv(num_heads, BLOCK_H))
 
 
-_sparse_attn_prefill_kernel_launch = intj_handle(
+_sparse_attn_prefill_kernel_launch = make_launcher(
     sparse_attn_prefill_kernel, grid_cpp=_sparse_attn_prefill_grid
 )
 
@@ -128,7 +129,8 @@ def _launch_prefill(
         return
     else:  # default triton backend
         dev, stream = current_device_stream()
-        _sparse_attn_prefill_kernel_launch(dev)(
+        _sparse_attn_prefill_kernel_launch(
+            dev,
             stream,
             num_queries,
             q,

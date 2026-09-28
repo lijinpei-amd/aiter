@@ -4,6 +4,7 @@ from typing import Literal
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.common import (
     apply_rotary,
@@ -19,7 +20,7 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
     is_fp8,
     remap_xcd,
 )
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 FWD_PREFILL_AUTOTUNE_KEYS = [
@@ -1478,7 +1479,7 @@ def _attn_fwd_grid(BLOCK_M: int, *, nheads_q: int, max_seqlens_q: int, batch: in
     return (nheads_q, triton.cdiv(max_seqlens_q, BLOCK_M), batch)
 
 
-_attn_fwd_launch = intj_handle(attn_fwd, grid_cpp=_attn_fwd_grid)
+_attn_fwd_launch = make_launcher(attn_fwd, grid_cpp=_attn_fwd_grid)
 
 
 def attention_forward_prefill_triton_impl(
@@ -1884,7 +1885,8 @@ def attention_forward_prefill_triton_impl(
     # launch kernel
 
     dev, stream = current_device_stream()
-    _attn_fwd_launch(dev)(
+    _attn_fwd_launch(
+        dev,
         stream,
         nheads_q,  # grid
         max_seqlens_q,  # grid

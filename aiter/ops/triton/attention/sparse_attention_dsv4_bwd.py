@@ -41,6 +41,7 @@ from dataclasses import dataclass
 
 import torch
 import triton
+from intj import make_launcher
 from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_attention_dsv4_bwd import (
@@ -52,7 +53,7 @@ from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4_bwd import
     _delta_v4_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 _BLOCK_H_DQ = 64
 _TILE_K_DQ = 32
@@ -60,7 +61,7 @@ _BD_DKV = 256
 _TILE_K_DKV = 128
 
 
-_dq_v4_kernel_launch = intj_handle(
+_dq_v4_kernel_launch = make_launcher(
     _dq_v4_kernel,
     grid_arg=2,
     options={"num_warps": 4, "waves_per_eu": 1},
@@ -88,7 +89,8 @@ def sparse_mla_bwd_dq(
     plus this chunk's ``chunk_dS`` / ``chunk_P``."""
     T, H, D = q.shape
     dev, stream = current_device_stream()
-    _dq_v4_kernel_launch(dev)(
+    _dq_v4_kernel_launch(
+        dev,
         stream,
         T,
         triton.cdiv(H, BLOCK_H),

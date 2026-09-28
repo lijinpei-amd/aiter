@@ -4,6 +4,7 @@ from typing import Literal
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.common import apply_rotary
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
@@ -16,7 +17,7 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
     get_stride_from_layout,
     is_fp8,
 )
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 FWD_DECODE_AUTOTUNE_KEYS = [
@@ -701,7 +702,7 @@ def _fwd_kernel_splitK_grid(BLOCK_M: int, *, seqlen_q: int, gy: int, split_k: in
     return (triton.cdiv(seqlen_q, BLOCK_M), gy, split_k)
 
 
-_fwd_kernel_splitK_launch = intj_handle(
+_fwd_kernel_splitK_launch = make_launcher(
     _fwd_kernel_splitK,
     grid_cpp=_fwd_kernel_splitK_grid,
 )
@@ -828,7 +829,7 @@ def _splitK_reduce(
     tl.store(l_ptrs, lse_val)
 
 
-_splitK_reduce_launch = intj_handle(_splitK_reduce)
+_splitK_reduce_launch = make_launcher(_splitK_reduce)
 
 
 @triton.jit
@@ -1317,7 +1318,8 @@ def attention_forward_decode_triton_impl(
         print("stride_lse_zhg, stride_lse_m", (stride_lse_zhg, stride_lse_m))
 
     dev, stream = current_device_stream()
-    _fwd_kernel_splitK_launch(dev)(
+    _fwd_kernel_splitK_launch(
+        dev,
         stream,
         seqlen_q,  # grid
         batch_size * n_group_q * heads_per_group_q,  # grid
@@ -1444,7 +1446,8 @@ def attention_forward_decode_triton_impl(
         print("k_block_size:", k_block_size)
         print("grid:", reduce_grid)
 
-    _splitK_reduce_launch(dev)(
+    _splitK_reduce_launch(
+        dev,
         stream,
         reduce_grid,
         out_splitk,

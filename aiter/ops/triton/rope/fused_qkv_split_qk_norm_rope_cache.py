@@ -1,10 +1,11 @@
 import torch
 import triton
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.rope.fused_qkv_split_qk_norm_rope_cache import (
     _fused_qkv_split_qk_norm_rope_cache_kernel,
 )
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 
 def infer_rope_cache_triton_block_t(T: int, device: torch.device) -> int:
@@ -32,7 +33,7 @@ def infer_rope_cache_triton_block_t(T: int, device: torch.device) -> int:
     return max(1, min(int(block_t), 32))
 
 
-_fused_qkv_split_qk_norm_rope_cache_kernel_launch = intj_handle(
+_fused_qkv_split_qk_norm_rope_cache_kernel_launch = make_launcher(
     _fused_qkv_split_qk_norm_rope_cache_kernel,
     options={"num_warps": 4},
 )
@@ -186,7 +187,8 @@ def fused_qkv_split_qk_norm_rope_cache(
     grid = (triton.cdiv(T, BLOCK_T), qh)
 
     dev, stream = current_device_stream()
-    _fused_qkv_split_qk_norm_rope_cache_kernel_launch(dev)(
+    _fused_qkv_split_qk_norm_rope_cache_kernel_launch(
+        dev,
         stream,
         grid,
         qkv,  # qkv_ptr

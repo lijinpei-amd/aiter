@@ -29,10 +29,11 @@ Supports both MHA (kv_group_num==1) and GQA/MQA/MLA (kv_group_num>1).
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 is_hip_ = hasattr(torch.version, "hip") and torch.version.hip is not None
 
@@ -661,7 +662,7 @@ def _fwd_kernel_stage2(
 _STAGE2_OPTIONS = {"num_warps": 4, "num_stages": 2}
 if is_hip_:
     _STAGE2_OPTIONS.update(waves_per_eu=4, matrix_instr_nonkdim=16, kpack=2)
-_fwd_kernel_stage2_launch = intj_handle(_fwd_kernel_stage2, options=_STAGE2_OPTIONS)
+_fwd_kernel_stage2_launch = make_launcher(_fwd_kernel_stage2, options=_STAGE2_OPTIONS)
 
 
 def _decode_softmax_reducev_fwd(
@@ -681,7 +682,8 @@ def _decode_softmax_reducev_fwd(
 
     grid = (batch, head_num)
     dev, stream = current_device_stream()
-    _fwd_kernel_stage2_launch(dev)(
+    _fwd_kernel_stage2_launch(
+        dev,
         stream,
         grid,
         logits,
@@ -735,7 +737,7 @@ def _csr_to_dense_kernel(
     )
 
 
-_csr_to_dense_kernel_launch = intj_handle(_csr_to_dense_kernel)
+_csr_to_dense_kernel_launch = make_launcher(_csr_to_dense_kernel)
 
 
 def csr_to_dense_block_table(kv_indices, kv_indptr, dense_table, max_ctx, bs):
@@ -743,7 +745,8 @@ def csr_to_dense_block_table(kv_indices, kv_indptr, dense_table, max_ctx, bs):
     BLOCK_N = 128
     grid = (bs, triton.cdiv(max_ctx, BLOCK_N))
     dev, stream = current_device_stream()
-    _csr_to_dense_kernel_launch(dev)(
+    _csr_to_dense_kernel_launch(
+        dev,
         stream,
         grid,
         kv_indices,

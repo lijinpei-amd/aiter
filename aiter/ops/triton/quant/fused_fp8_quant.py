@@ -2,6 +2,7 @@ from functools import cache
 
 import torch
 import triton
+from intj import make_launcher
 
 import aiter
 from aiter.ops.triton._triton_kernels.activation import (
@@ -15,7 +16,7 @@ from aiter.ops.triton._triton_kernels.quant.fused_fp8_quant import (
     _fused_rms_fp8_per_tensor_static_quant_kernel,
     _fused_silu_mul_fp8_per_tensor_static_quant_kernel,
 )
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
@@ -543,7 +544,7 @@ def fused_rms_gated_fp8_group_quant(
     return x_quant, scales
 
 
-_fused_flatten_fp8_group_quant_kernel_launch = intj_handle(
+_fused_flatten_fp8_group_quant_kernel_launch = make_launcher(
     _fused_flatten_fp8_group_quant_kernel,
 )
 
@@ -606,7 +607,8 @@ def fused_flatten_fp8_group_quant(
     )
 
     dev, stream = current_device_stream()
-    _fused_flatten_fp8_group_quant_kernel_launch(dev)(
+    _fused_flatten_fp8_group_quant_kernel_launch(
+        dev,
         stream,
         grid,
         x,

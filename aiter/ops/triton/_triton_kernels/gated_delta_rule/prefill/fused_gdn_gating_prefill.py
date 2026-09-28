@@ -3,8 +3,9 @@
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 
 @triton.jit
@@ -49,7 +50,7 @@ def fused_gdn_gating_sigmoid_kernel(
     tl.store(beta_ptr + off, blk_beta.to(beta_ptr.dtype.element_ty), mask=mask)
 
 
-_fused_gdn_gating_sigmoid_kernel_launch = intj_handle(
+_fused_gdn_gating_sigmoid_kernel_launch = make_launcher(
     fused_gdn_gating_sigmoid_kernel,
     options={"num_warps": 2},
 )
@@ -72,7 +73,8 @@ def fused_gdn_gating_and_sigmoid(
     grid = (seq_len,)
 
     dev, stream = current_device_stream()
-    _fused_gdn_gating_sigmoid_kernel_launch(dev)(
+    _fused_gdn_gating_sigmoid_kernel_launch(
+        dev,
         stream,
         grid,
         g,

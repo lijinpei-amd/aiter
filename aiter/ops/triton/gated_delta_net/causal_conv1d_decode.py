@@ -11,6 +11,7 @@ q/k/v. The ``@triton.jit`` / Gluon kernels live in
 
 import torch
 import triton
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.causal_conv1d_update_split_qkv import (
     PAD_SLOT_ID,
@@ -18,17 +19,17 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.causal_conv1d_upda
     gluon_causal_conv1d_update_split_qkv_kernel,
     gluon_causal_conv1d_update_split_qkv_kernel_notuple,
 )
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 __all__ = ["PAD_SLOT_ID", "causal_conv1d_update_split_qkv"]
 
-_triton_kernel_launch = intj_handle(
+_triton_kernel_launch = make_launcher(
     _causal_conv1d_update_split_qkv_kernel, options={"num_warps": 4}
 )
-_gluon_kernel_launch = intj_handle(
+_gluon_kernel_launch = make_launcher(
     gluon_causal_conv1d_update_split_qkv_kernel, options={"num_warps": 2}
 )
-_gluon_notuple_kernel_launch = intj_handle(
+_gluon_notuple_kernel_launch = make_launcher(
     gluon_causal_conv1d_update_split_qkv_kernel_notuple, options={"num_warps": 2}
 )
 
@@ -113,7 +114,8 @@ def causal_conv1d_update_split_qkv(
         kernel_fn = _triton_kernel_launch
 
     dev, stream = current_device_stream()
-    kernel_fn(dev)(
+    kernel_fn(
+        dev,
         stream,
         grid,
         x,  # x_ptr

@@ -14,6 +14,7 @@ matrix (Aqk).
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils import (
     autotune_cache_kwargs,
@@ -25,7 +26,7 @@ from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils im
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.index import (
     prepare_chunk_indices,
 )
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 # The BV=128 / num_stages=3 tile this kernel came with wants up to 123KB of LDS,
@@ -170,7 +171,7 @@ def _chunk_gla_fwd_kernel_o_grid(V: int, BV: int, HV: int, *, NT: int, B: int):
     return (triton.cdiv(V, BV), NT, B * HV)
 
 
-_chunk_gla_fwd_kernel_o_launch = intj_handle(
+_chunk_gla_fwd_kernel_o_launch = make_launcher(
     chunk_gla_fwd_kernel_o,
     grid_cpp=_chunk_gla_fwd_kernel_o_grid,
 )
@@ -221,7 +222,8 @@ def chunk_gla_fwd_o(
     o = torch.zeros_like(v)
 
     dev, stream = current_device_stream()
-    _chunk_gla_fwd_kernel_o_launch(dev)(
+    _chunk_gla_fwd_kernel_o_launch(
+        dev,
         stream,
         NT,  # grid
         B,  # grid

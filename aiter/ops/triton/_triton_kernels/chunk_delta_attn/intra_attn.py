@@ -18,6 +18,7 @@ and returns w, u, qg, kg, Aqk, Akk as required by the top-level forward.
 import torch
 import triton
 import triton.language as tl
+from intj import Constexpr, make_launcher
 
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils import (
     IS_GATHER_SUPPORTED,
@@ -32,7 +33,7 @@ from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.index import (
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.wy_fast import (
     recompute_w_u_fwd,
 )
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 if IS_TF32_SUPPORTED:
@@ -187,7 +188,7 @@ def _chunk_delta_attn_fwd_kernel_intra_token_parallel_grid(
     return (B * T, triton.cdiv(HV, BH))
 
 
-_chunk_delta_attn_fwd_kernel_intra_token_parallel_launch = intj_handle(
+_chunk_delta_attn_fwd_kernel_intra_token_parallel_launch = make_launcher(
     chunk_delta_attn_fwd_kernel_intra_token_parallel,
     grid_cpp=_chunk_delta_attn_fwd_kernel_intra_token_parallel_grid,
 )
@@ -212,7 +213,8 @@ def _chunk_delta_attn_fwd_intra_token_parallel(
     BC = sub_chunk_size
 
     dev, stream = current_device_stream()
-    _chunk_delta_attn_fwd_kernel_intra_token_parallel_launch(dev)(
+    _chunk_delta_attn_fwd_kernel_intra_token_parallel_launch(
+        dev,
         stream,
         B,  # grid
         q,
@@ -378,7 +380,7 @@ def chunk_delta_attn_fwd_kernel_intra_sub_chunk(
     tl.store(p_Akk, b_Ai.to(Akk.dtype.element_ty), mask=m_Akk_st)
 
 
-_chunk_delta_attn_fwd_kernel_intra_sub_chunk_launch = intj_handle(
+_chunk_delta_attn_fwd_kernel_intra_sub_chunk_launch = make_launcher(
     chunk_delta_attn_fwd_kernel_intra_sub_chunk,
 )
 
@@ -704,9 +706,9 @@ def chunk_delta_attn_fwd_kernel_inter_solve_fused(
         tl.store(p_Akk33, b_Ai33.to(Akk.dtype.element_ty), mask=m_A3)
 
 
-_chunk_delta_attn_fwd_kernel_inter_solve_fused_launch = intj_handle(
+_chunk_delta_attn_fwd_kernel_inter_solve_fused_launch = make_launcher(
     chunk_delta_attn_fwd_kernel_inter_solve_fused,
-    baked={"DOT_PRECISION": SOLVE_TRIL_DOT_PRECISION.value},
+    extra_annotation={"DOT_PRECISION": Constexpr(value=SOLVE_TRIL_DOT_PRECISION.value)},
 )
 
 
@@ -746,7 +748,8 @@ def chunk_delta_attn_fwd_intra(
         BK = min(64, triton.next_power_of_2(K))
         grid = (NT, NC, B * HV)
         dev, stream = current_device_stream()
-        _chunk_delta_attn_fwd_kernel_intra_sub_chunk_launch(dev)(
+        _chunk_delta_attn_fwd_kernel_intra_sub_chunk_launch(
+            dev,
             stream,
             grid,
             q,
@@ -783,7 +786,8 @@ def chunk_delta_attn_fwd_intra(
 
     grid = (NT, B * HV)
     dev, stream = current_device_stream()
-    _chunk_delta_attn_fwd_kernel_inter_solve_fused_launch(dev)(
+    _chunk_delta_attn_fwd_kernel_inter_solve_fused_launch(
+        dev,
         stream,
         grid,
         q,

@@ -12,6 +12,7 @@ including local and global cumsum for both scalar and vector inputs.
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     autotune_cache_kwargs,
@@ -21,7 +22,7 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils im
 from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.index import (
     prepare_chunk_indices,
 )
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
@@ -93,7 +94,9 @@ def chunk_local_cumsum_scalar_kernel(
     tl.store(o_base + o_t * stride_t, b_o.to(o_base.dtype.element_ty), mask=m_t)
 
 
-_chunk_local_cumsum_scalar_kernel_launch = intj_handle(chunk_local_cumsum_scalar_kernel)
+_chunk_local_cumsum_scalar_kernel_launch = make_launcher(
+    chunk_local_cumsum_scalar_kernel
+)
 
 
 @triton.heuristics(
@@ -175,7 +178,7 @@ def _chunk_local_cumsum_vector_kernel_grid(S: int, BS: int, B: int, H: int, *, N
     return (triton.cdiv(S, BS), NT, B * H)
 
 
-_chunk_local_cumsum_vector_kernel_launch = intj_handle(
+_chunk_local_cumsum_vector_kernel_launch = make_launcher(
     chunk_local_cumsum_vector_kernel,
     grid_cpp=_chunk_local_cumsum_vector_kernel_grid,
 )
@@ -205,7 +208,8 @@ def chunk_local_cumsum_scalar(
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
     grid = (NT, B * H)
     dev, stream = current_device_stream()
-    _chunk_local_cumsum_scalar_kernel_launch(dev)(
+    _chunk_local_cumsum_scalar_kernel_launch(
+        dev,
         stream,
         grid,
         g_org,  # s
@@ -251,7 +255,8 @@ def chunk_local_cumsum_vector(
     # this kernel is equivalent to
     # g = g.view(B, H, NT, BT, -1).cumsum(-2).view(B, H, T, -1)
     dev, stream = current_device_stream()
-    _chunk_local_cumsum_vector_kernel_launch(dev)(
+    _chunk_local_cumsum_vector_kernel_launch(
+        dev,
         stream,
         NT,  # grid
         g_org,  # s

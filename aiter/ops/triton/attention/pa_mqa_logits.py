@@ -26,6 +26,7 @@ from functools import cache
 
 import torch
 import triton
+from intj import make_launcher
 from intj.compat import launch as _intj_launch
 from packaging.version import Version
 from triton.backends.compiler import GPUTarget
@@ -33,8 +34,7 @@ from triton.backends.compiler import GPUTarget
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.triton.utils.config_utils import AITER_TRITON_CONFIGS_PATH
-from aiter.ops.triton.utils.device_info import get_num_sms
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream, get_num_sms
 from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
 
 enable_aot_gluon_pa_mqa_logits = os.environ.get(
@@ -433,7 +433,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     return kernel
 
 
-_deepgemm_fp8_paged_mqa_logits_varctx_schedule_launch = intj_handle(
+_deepgemm_fp8_paged_mqa_logits_varctx_schedule_launch = make_launcher(
     _deepgemm_fp8_paged_mqa_logits_varctx_schedule,
     options={"waves_per_eu": 4},
 )
@@ -464,7 +464,8 @@ def deepgemm_fp8_paged_mqa_logits_schedule(
         dtype=torch.int32,
     )
     dev, stream = current_device_stream()
-    _deepgemm_fp8_paged_mqa_logits_varctx_schedule_launch(dev)(
+    _deepgemm_fp8_paged_mqa_logits_varctx_schedule_launch(
+        dev,
         stream,
         grid,
         batch_size,

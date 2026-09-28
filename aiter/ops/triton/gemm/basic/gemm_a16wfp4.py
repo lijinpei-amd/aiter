@@ -3,6 +3,7 @@
 
 import torch
 import triton
+from intj import Constexpr, make_launcher
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
@@ -18,7 +19,7 @@ from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -41,9 +42,12 @@ def gemm_a16wfp4_fake_tensor(
     return y
 
 
-_gemm_splitk_reduce_kernel_launch = intj_handle(
+_gemm_splitk_reduce_kernel_launch = make_launcher(
     _gemm_splitk_reduce_kernel,
-    baked={"KERNEL_NAME": "_gemm_afp4wfp4_reduce_kernel", "activation": ""},
+    extra_annotation={
+        "KERNEL_NAME": Constexpr(value="_gemm_afp4wfp4_reduce_kernel"),
+        "activation": Constexpr(value=""),
+    },
 )
 
 
@@ -168,7 +172,8 @@ def gemm_a16wfp4_(
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
         dev, stream = current_device_stream()
-        _gemm_splitk_reduce_kernel_launch(dev)(
+        _gemm_splitk_reduce_kernel_launch(
+            dev,
             stream,
             grid_reduce,
             y_pp,
@@ -358,7 +363,8 @@ def gemm_a16wfp4_preshuffle_(
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
         dev, stream = current_device_stream()
-        _gemm_splitk_reduce_kernel_launch(dev)(
+        _gemm_splitk_reduce_kernel_launch(
+            dev,
             stream,
             grid_reduce,
             y_pp,

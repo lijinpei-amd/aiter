@@ -12,6 +12,7 @@ supporting both forward and backward passes.
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 from torch import nn
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
@@ -19,7 +20,7 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils im
     autotune_cache_kwargs,
     input_guard,
 )
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 # Backward-pass autotune config space. Forward kernels deliberately do not
@@ -67,7 +68,7 @@ def l2norm_fwd_kernel1(
         tl.store(Rstd + i_t, b_rstd)
 
 
-_l2norm_fwd_kernel1_launch = intj_handle(l2norm_fwd_kernel1, grid_arg=1)
+_l2norm_fwd_kernel1_launch = make_launcher(l2norm_fwd_kernel1, grid_arg=1)
 
 
 @triton.autotune(
@@ -102,7 +103,7 @@ def l2norm_bwd_kernel1(
     tl.store(dx + cols, b_dx, mask=mask)
 
 
-_l2norm_bwd_kernel1_launch = intj_handle(l2norm_bwd_kernel1, grid_arg=1)
+_l2norm_bwd_kernel1_launch = make_launcher(l2norm_bwd_kernel1, grid_arg=1)
 
 
 @triton.jit
@@ -146,7 +147,7 @@ def l2norm_fwd_kernel(
         tl.store(Rstd + row1d, rstd, mask=row1d < T)
 
 
-_l2norm_fwd_kernel_launch = intj_handle(
+_l2norm_fwd_kernel_launch = make_launcher(
     l2norm_fwd_kernel,
     grid_arg=1,
     options={"num_warps": _L2NORM_FWD_NUM_WARPS},
@@ -215,7 +216,7 @@ def _l2norm_bwd_kernel_grid(T: int, BT: int):
     return (triton.cdiv(T, BT),)
 
 
-_l2norm_bwd_kernel_launch = intj_handle(
+_l2norm_bwd_kernel_launch = make_launcher(
     l2norm_bwd_kernel,
     grid_cpp=_l2norm_bwd_kernel_grid,
 )
@@ -279,7 +280,8 @@ def l2norm_fwd(
     if D <= 512:
         BT = _L2NORM_FWD_BT
         dev, stream = current_device_stream()
-        _l2norm_fwd_kernel_launch(dev)(
+        _l2norm_fwd_kernel_launch(
+            dev,
             stream,
             triton.cdiv(T, BT),
             x,
@@ -294,7 +296,8 @@ def l2norm_fwd(
         )
     else:
         dev, stream = current_device_stream()
-        _l2norm_fwd_kernel1_launch(dev)(
+        _l2norm_fwd_kernel1_launch(
+            dev,
             stream,
             T,
             x,
@@ -346,7 +349,8 @@ def l2norm_bwd(
         NB = triton.cdiv(T, 2048)
 
         dev, stream = current_device_stream()
-        _l2norm_bwd_kernel_launch(dev)(
+        _l2norm_bwd_kernel_launch(
+            dev,
             stream,
             y,
             rstd,
@@ -360,7 +364,8 @@ def l2norm_bwd(
         )
     else:
         dev, stream = current_device_stream()
-        _l2norm_bwd_kernel1_launch(dev)(
+        _l2norm_bwd_kernel1_launch(
+            dev,
             stream,
             T,
             y,

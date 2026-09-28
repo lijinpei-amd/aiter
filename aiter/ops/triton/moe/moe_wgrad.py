@@ -5,10 +5,10 @@
 
 import torch
 import triton
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.moe.moe_wgrad import _moe_wgrad_kernel
-from aiter.ops.triton.utils.device_info import get_num_xcds
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream, get_num_xcds
 
 __all__ = ["moe_wgrad"]
 
@@ -20,7 +20,7 @@ def _moe_wgrad_kernel_grid(
     return (gx, triton.cdiv(N, BLOCK_SIZE_N) * triton.cdiv(K, BLOCK_SIZE_K))
 
 
-_moe_wgrad_kernel_launch = intj_handle(
+_moe_wgrad_kernel_launch = make_launcher(
     _moe_wgrad_kernel,
     grid_cpp=_moe_wgrad_kernel_grid,
 )
@@ -76,7 +76,8 @@ def moe_wgrad(
     )
 
     dev, stream = current_device_stream()
-    _moe_wgrad_kernel_launch(dev)(
+    _moe_wgrad_kernel_launch(
+        dev,
         stream,
         num_sorted // block_size_m,  # grid
         grad,

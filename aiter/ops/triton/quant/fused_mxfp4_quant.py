@@ -3,6 +3,7 @@ from typing import Literal
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton._gluon_kernels.gfx1250.quant.fused_mxfp4_quant import (
     _gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel,
@@ -21,7 +22,7 @@ from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.intj_tuned import launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.utility import dtypes
@@ -29,7 +30,7 @@ from aiter.utility import dtypes
 _LOGGER = AiterTritonLogger()
 
 
-_fused_rms_mxfp4_quant_launch = intj_handle(_fused_rms_mxfp4_quant_kernel, grid_arg=1)
+_fused_rms_mxfp4_quant_launch = make_launcher(_fused_rms_mxfp4_quant_kernel, grid_arg=1)
 
 
 def fused_rms_mxfp4_quant(
@@ -188,7 +189,8 @@ def fused_rms_mxfp4_quant(
         )
     else:
         dev, stream = current_device_stream()
-        _fused_rms_mxfp4_quant_launch(dev)(
+        _fused_rms_mxfp4_quant_launch(
+            dev,
             stream,
             M * (1 if x2 is None else 2),
             *_common_args,
@@ -198,7 +200,7 @@ def fused_rms_mxfp4_quant(
     return (out1_fp4, out1_bs), out1, out2, out_res1
 
 
-_fused_flatten_mxfp4_quant_launch = intj_handle(_fused_flatten_mxfp4_quant)
+_fused_flatten_mxfp4_quant_launch = make_launcher(_fused_flatten_mxfp4_quant)
 
 
 def fused_flatten_mxfp4_quant(
@@ -233,7 +235,8 @@ def fused_flatten_mxfp4_quant(
     )
 
     dev, stream = current_device_stream()
-    _fused_flatten_mxfp4_quant_launch(dev)(
+    _fused_flatten_mxfp4_quant_launch(
+        dev,
         stream,
         grid,
         x,
@@ -431,8 +434,8 @@ def fused_reduce_act_mul_and_mxfp4_quant(
     return (y, y_scale), y2
 
 
-_reduce_rms_mxfp4_quant_launch = intj_handle(_fused_reduce_rms_mxfp4_quant_kernel)
-_gluon_reduce_rms_mxfp4_quant_launch = intj_handle(
+_reduce_rms_mxfp4_quant_launch = make_launcher(_fused_reduce_rms_mxfp4_quant_kernel)
+_gluon_reduce_rms_mxfp4_quant_launch = make_launcher(
     _gluon_fused_reduce_rms_mxfp4_quant_kernel
 )
 
@@ -591,7 +594,8 @@ def fused_reduce_rms_mxfp4_quant(
     )
 
     dev, stream = current_device_stream()
-    kernel(dev)(
+    kernel(
+        dev,
         stream,
         grid,
         x1,
@@ -646,8 +650,8 @@ def fused_reduce_rms_mxfp4_quant(
     return (out1_fp4, out1_bs), out1, out2, out_res1, out3
 
 
-_moe_sort_launch = intj_handle(_fused_dynamic_mxfp4_quant_moe_sort_kernel, grid_arg=1)
-_gluon_moe_sort_launch = intj_handle(
+_moe_sort_launch = make_launcher(_fused_dynamic_mxfp4_quant_moe_sort_kernel, grid_arg=1)
+_gluon_moe_sort_launch = make_launcher(
     _gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel, grid_arg=1
 )
 
@@ -734,7 +738,8 @@ def fused_dynamic_mxfp4_quant_moe_sort(
     )
 
     dev, stream = current_device_stream()
-    kernel(dev)(
+    kernel(
+        dev,
         stream,
         num_pid,
         x,
@@ -897,7 +902,7 @@ def _fused_quant_fp8_sort_kernel(
     tl.store(scale_sorted_ptr + offs, out)
 
 
-_fused_quant_fp8_sort_kernel_launch = intj_handle(_fused_quant_fp8_sort_kernel)
+_fused_quant_fp8_sort_kernel_launch = make_launcher(_fused_quant_fp8_sort_kernel)
 
 
 def fused_quant_fp8_sort(
@@ -950,7 +955,8 @@ def fused_quant_fp8_sort(
     )
 
     dev, stream = current_device_stream()
-    _fused_quant_fp8_sort_kernel_launch(dev)(
+    _fused_quant_fp8_sort_kernel_launch(
+        dev,
         stream,
         grid,
         input,

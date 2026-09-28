@@ -13,20 +13,21 @@ from __future__ import annotations
 
 import torch
 import triton
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.conv.causal_conv1d import PAD_SLOT_ID
 from aiter.ops.triton._triton_kernels.conv.causal_conv1d_update_single_token import (
     _causal_conv1d_update_single_token_kernel,
     _reshape_causal_conv1d_update_single_token_kernel,
 )
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 
 def _default_conv_state_indices(batch: int, device: torch.device) -> torch.Tensor:
     return torch.arange(batch, device=device, dtype=torch.int32)
 
 
-_causal_conv1d_update_single_token_kernel_launch = intj_handle(
+_causal_conv1d_update_single_token_kernel_launch = make_launcher(
     _causal_conv1d_update_single_token_kernel,
 )
 
@@ -117,7 +118,8 @@ def causal_conv1d_update_single_token(
     grid = (batch, triton.cdiv(dim, BLOCK_N))
 
     dev, stream = current_device_stream()
-    _causal_conv1d_update_single_token_kernel_launch(dev)(
+    _causal_conv1d_update_single_token_kernel_launch(
+        dev,
         stream,
         grid,
         x,
@@ -159,7 +161,7 @@ def causal_conv1d_update_single_token(
     return out.to(original_x_dtype)
 
 
-_reshape_causal_conv1d_update_single_token_kernel_launch = intj_handle(
+_reshape_causal_conv1d_update_single_token_kernel_launch = make_launcher(
     _reshape_causal_conv1d_update_single_token_kernel,
 )
 
@@ -300,7 +302,8 @@ def fused_reshape_causal_conv1d_update_single_token(
     grid = (batch, 1 + num_program_write_z + triton.cdiv(dim, BLOCK_N))
 
     dev, stream = current_device_stream()
-    _reshape_causal_conv1d_update_single_token_kernel_launch(dev)(
+    _reshape_causal_conv1d_update_single_token_kernel_launch(
+        dev,
         stream,
         grid,
         x,

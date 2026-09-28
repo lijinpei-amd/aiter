@@ -73,7 +73,8 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from intj import make_launcher
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 # vLLM's `.op` module binds these to the plain Triton ops unless the
 # `FLA_USE_FAST_OPS` env var is set, which neither aiter nor its CI sets.
@@ -122,7 +123,7 @@ def fused_gdn_gating_kernel_vllm(
     )
 
 
-_fused_gdn_gating_kernel_vllm_launch = intj_handle(
+_fused_gdn_gating_kernel_vllm_launch = make_launcher(
     fused_gdn_gating_kernel_vllm,
     options={"num_warps": 1},
 )
@@ -148,7 +149,8 @@ def fused_gdn_gating_vllm(
     g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
     beta_output = torch.empty(1, batch, num_heads, dtype=b.dtype, device=b.device)
     dev, stream = current_device_stream()
-    _fused_gdn_gating_kernel_vllm_launch(dev)(
+    _fused_gdn_gating_kernel_vllm_launch(
+        dev,
         stream,
         grid,
         g,
@@ -332,7 +334,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel_vllm(
         p_beta += HV * (V if IS_BETA_HEADWISE else 1)
 
 
-_fused_recurrent_gated_delta_rule_fwd_kernel_vllm_launch = intj_handle(
+_fused_recurrent_gated_delta_rule_fwd_kernel_vllm_launch = make_launcher(
     fused_recurrent_gated_delta_rule_fwd_kernel_vllm,
     options={"num_stages": 3, "num_warps": 1},
 )
@@ -379,7 +381,8 @@ def fused_recurrent_gated_delta_rule_fwd_vllm(
 
     grid = (NK, NV, N * HV)
     dev, stream = current_device_stream()
-    _fused_recurrent_gated_delta_rule_fwd_kernel_vllm_launch(dev)(
+    _fused_recurrent_gated_delta_rule_fwd_kernel_vllm_launch(
+        dev,
         stream,
         grid,
         q,
@@ -898,7 +901,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel_sglang(
                 tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
 
-_fused_sigmoid_gating_delta_rule_update_kernel_sglang_launch = intj_handle(
+_fused_sigmoid_gating_delta_rule_update_kernel_sglang_launch = make_launcher(
     fused_sigmoid_gating_delta_rule_update_kernel_sglang,
     options={"num_stages": 3, "num_warps": 1},
 )
@@ -1018,7 +1021,8 @@ def fused_sigmoid_gating_delta_rule_update_sglang(
         stride_rawv_slot = stride_rawk_slot = stride_g_slot = stride_beta_slot = 0
 
     dev, stream = current_device_stream()
-    _fused_sigmoid_gating_delta_rule_update_kernel_sglang_launch(dev)(
+    _fused_sigmoid_gating_delta_rule_update_kernel_sglang_launch(
+        dev,
         stream,
         grid,
         A_log,

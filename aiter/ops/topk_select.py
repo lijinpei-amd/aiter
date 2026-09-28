@@ -37,6 +37,7 @@ from functools import lru_cache
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, wave_size_of
@@ -57,7 +58,7 @@ from aiter.ops.flydsl.topk.topk_per_row_small_k import (
     topk_per_row_small_k_serves,
 )
 from aiter.ops.topk_plain import topk_plain, topk_plain_batches_ragged_rows
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 __all__ = ["topk_select", "topk_select_backend"]
 
@@ -205,7 +206,7 @@ def _gather_selected_kernel(
     tl.store(out_ptr + row * out_stride0 + offs, val, mask=live)
 
 
-_gather_selected_kernel_launch = intj_handle(_gather_selected_kernel, grid_arg=1)
+_gather_selected_kernel_launch = make_launcher(_gather_selected_kernel, grid_arg=1)
 
 
 def _gather_selected(scores, idx, fill):
@@ -220,7 +221,8 @@ def _gather_selected(scores, idx, fill):
     rows, topk = idx.shape
     out = torch.empty((rows, topk), dtype=scores.dtype, device=scores.device)
     dev, stream = current_device_stream()
-    _gather_selected_kernel_launch(dev)(
+    _gather_selected_kernel_launch(
+        dev,
         stream,
         rows,
         scores,

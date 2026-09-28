@@ -49,13 +49,13 @@
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 from intj.compat import launch as _intj_launch
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.device_info import get_num_xcds
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream, get_num_xcds
 
 
 # fmt: off
@@ -822,7 +822,7 @@ def _mla_softmax_reducev_kernel(
         )
 
 
-_mla_softmax_reducev_kernel_launch = intj_handle(
+_mla_softmax_reducev_kernel_launch = make_launcher(
     _mla_softmax_reducev_kernel,
     options={"num_warps": 8},
 )
@@ -1114,7 +1114,8 @@ def mla_gluon(
     grid_reduce = (batch_size, nhead, qlen)
     sl_b, sl_qs, sl_h, sl_split, _ = logits_buf.stride()
     dev, stream = current_device_stream()
-    _mla_softmax_reducev_kernel_launch(dev)(
+    _mla_softmax_reducev_kernel_launch(
+        dev,
         stream,
         grid_reduce,
         logits_buf,

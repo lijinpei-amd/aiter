@@ -3,14 +3,15 @@
 
 import torch
 import triton
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_a8w8_blockscale_mul_add import (
     _fused_gemm_a8w8_blockscale_mul_add_kernel,
     _fused_gemm_a8w8_blockscale_mul_add_reduce_kernel,
     _get_config,
 )
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
 from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -61,7 +62,7 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
     return SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT
 
 
-_fused_gemm_a8w8_blockscale_mul_add_reduce_kernel_launch = intj_handle(
+_fused_gemm_a8w8_blockscale_mul_add_reduce_kernel_launch = make_launcher(
     _fused_gemm_a8w8_blockscale_mul_add_reduce_kernel,
 )
 
@@ -226,7 +227,8 @@ def fused_gemm_a8w8_blockscale_mul_add(
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
         dev, stream = current_device_stream()
-        _fused_gemm_a8w8_blockscale_mul_add_reduce_kernel_launch(dev)(
+        _fused_gemm_a8w8_blockscale_mul_add_reduce_kernel_launch(
+            dev,
             stream,
             grid_reduce,
             y_pp,

@@ -1,8 +1,9 @@
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 
 @triton.jit
@@ -72,7 +73,7 @@ def _ragged_trans_kernel(
             )
 
 
-_ragged_trans_kernel_launch = intj_handle(_ragged_trans_kernel)
+_ragged_trans_kernel_launch = make_launcher(_ragged_trans_kernel)
 
 
 def ragged_layout_trans(kv_indptr, kv_indices, k_buffer, v_buffer):
@@ -93,7 +94,8 @@ def ragged_layout_trans(kv_indptr, kv_indices, k_buffer, v_buffer):
     grid = (token_blocks,)
 
     dev, stream = current_device_stream()
-    _ragged_trans_kernel_launch(dev)(
+    _ragged_trans_kernel_launch(
+        dev,
         stream,
         grid,
         k_buffer,

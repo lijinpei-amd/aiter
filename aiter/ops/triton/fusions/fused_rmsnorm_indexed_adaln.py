@@ -4,17 +4,18 @@
 
 import torch
 import triton
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.fusions.fused_rmsnorm_indexed_adaln import (
     _fused_rmsnorm_indexed_adaln_kernel,
 )
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
 
-_fused_rmsnorm_indexed_adaln_kernel_launch = intj_handle(
+_fused_rmsnorm_indexed_adaln_kernel_launch = make_launcher(
     _fused_rmsnorm_indexed_adaln_kernel,
     grid_arg=1,
     options={"num_warps": 4},
@@ -92,7 +93,8 @@ def fused_rmsnorm_indexed_adaln(
     BLOCK_M = 8 if M >= 8 else 1
 
     dev, stream = current_device_stream()
-    _fused_rmsnorm_indexed_adaln_kernel_launch(dev)(
+    _fused_rmsnorm_indexed_adaln_kernel_launch(
+        dev,
         stream,
         triton.cdiv(M, BLOCK_M),
         out,

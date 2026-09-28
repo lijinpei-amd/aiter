@@ -11,6 +11,7 @@ import math
 
 import torch
 import triton
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.topk import (
     _topk_kernel,
@@ -18,7 +19,7 @@ from aiter.ops.triton._triton_kernels.topk import (
     topk_stage2_kernel,
 )
 from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -31,7 +32,7 @@ def _pick_block(m: int, k: int) -> int:
     return blk
 
 
-_topk_kernel_launch = intj_handle(
+_topk_kernel_launch = make_launcher(
     _topk_kernel,
     grid_arg=1,
     options={"num_stages": 2, "num_warps": 4},
@@ -50,7 +51,8 @@ def one_stage_topk(
     out_v = torch.empty((B, k), device=x.device, dtype=x.dtype)
     out_i = torch.empty((B, k), device=x.device, dtype=torch.int64)
     dev, stream = current_device_stream()
-    _topk_kernel_launch(dev)(
+    _topk_kernel_launch(
+        dev,
         stream,
         B,
         x.contiguous(),
@@ -68,8 +70,8 @@ def one_stage_topk(
     return out_v, out_i
 
 
-_topk_stage1_kernel_launch = intj_handle(topk_stage1_kernel, grid_arg=2)
-_topk_stage2_kernel_launch = intj_handle(topk_stage2_kernel, grid_arg=1)
+_topk_stage1_kernel_launch = make_launcher(topk_stage1_kernel, grid_arg=2)
+_topk_stage2_kernel_launch = make_launcher(topk_stage2_kernel, grid_arg=1)
 
 
 def two_stage_topk(x, k, dim=-1, largest=True):
@@ -100,7 +102,8 @@ def two_stage_topk(x, k, dim=-1, largest=True):
     stage2_out_idx = torch.empty(out_shape, device=x.device, dtype=torch.int64)
 
     dev, stream = current_device_stream()
-    _topk_stage1_kernel_launch(dev)(
+    _topk_stage1_kernel_launch(
+        dev,
         stream,
         batch_size,
         chunk_num,
@@ -124,7 +127,8 @@ def two_stage_topk(x, k, dim=-1, largest=True):
     # The stage-2 launch only runs when ``descending`` (unchanged upstream behavior).
     if descending:
         dev, stream = current_device_stream()
-        _topk_stage2_kernel_launch(dev)(
+        _topk_stage2_kernel_launch(
+            dev,
             stream,
             batch_size,
             stage2_out,

@@ -9,6 +9,7 @@ import os
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 import aiter
 from aiter import dtypes
@@ -16,7 +17,7 @@ from aiter.jit.core import is_experimental_enabled
 from aiter.jit.utils.asm_guard import require_gfx1250_asm
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.attention import get_mla_decode_fwd_max_splits
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 _FLYDSL_MLA_REDUCE_TARGET_GFX = ("gfx942", "gfx950")
 _FLYDSL_MLA_REDUCE_TARGET_H = 16
@@ -266,7 +267,7 @@ def _fwd_kernel_stage2_asm(
 # One (token, head) per CTA, no cross-lane reduction: the merge is
 # memory-latency bound, so max occupancy (num_warps=1) beats wider
 # tiles. Measured 1.7-1.9x over num_warps=4 on gfx950 decode shapes.
-_fwd_kernel_stage2_asm_launch = intj_handle(
+_fwd_kernel_stage2_asm_launch = make_launcher(
     _fwd_kernel_stage2_asm,
     grid_arg=2,
     options={"num_stages": 2, "num_warps": 1, "waves_per_eu": 4},
@@ -722,7 +723,8 @@ def mla_decode_fwd(
         )
 
         dev, stream = current_device_stream()
-        _fwd_kernel_stage2_asm_launch(dev)(
+        _fwd_kernel_stage2_asm_launch(
+            dev,
             stream,
             bs,
             nhead,
@@ -1483,7 +1485,7 @@ def _mla_prefill_reduce_kernel(
         )
 
 
-_mla_prefill_reduce_kernel_launch = intj_handle(
+_mla_prefill_reduce_kernel_launch = make_launcher(
     _mla_prefill_reduce_kernel,
     options={"num_warps": 4},
 )
@@ -1535,7 +1537,8 @@ def mla_prefill_reduce_triton(
     grid = (num_reduce_groups, num_heads, tile_q)
 
     dev, stream = current_device_stream()
-    _mla_prefill_reduce_kernel_launch(dev)(
+    _mla_prefill_reduce_kernel_launch(
+        dev,
         stream,
         grid,
         partial_output,
@@ -1919,7 +1922,8 @@ def mla_decode_fwd_v4_nm(
         final_lse_buf = torch.empty((1,), dtype=dtypes.fp32, device=device)
 
         dev, stream = current_device_stream()
-        _fwd_kernel_stage2_asm_launch(dev)(
+        _fwd_kernel_stage2_asm_launch(
+            dev,
             stream,
             num_seqs,
             num_heads,

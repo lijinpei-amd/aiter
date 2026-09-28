@@ -13,6 +13,7 @@ the `[K, V]` and the transposed `[V, K]` hidden-state layouts.
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     IS_AMD,
@@ -28,7 +29,7 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
     prepare_rebased_cu_seqlens,
 )
 from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.op import exp
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8, 16]
@@ -315,7 +316,7 @@ def _chunk_gated_delta_rule_fwd_kernel_h_blockdim64_grid(
     return (triton.cdiv(V, BV), N * H)
 
 
-_chunk_gated_delta_rule_fwd_kernel_h_blockdim64_launch = intj_handle(
+_chunk_gated_delta_rule_fwd_kernel_h_blockdim64_launch = make_launcher(
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64,
     grid_cpp=_chunk_gated_delta_rule_fwd_kernel_h_blockdim64_grid,
 )
@@ -586,7 +587,7 @@ def _chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64_grid(
     return (triton.cdiv(V, BV), N * H)
 
 
-_chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64_launch = intj_handle(
+_chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64_launch = make_launcher(
     chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64,
     grid_cpp=_chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64_grid,
 )
@@ -650,7 +651,8 @@ def chunk_gated_delta_rule_fwd_h(
     v_new = torch.empty_like(u) if save_new_value else None
 
     dev, stream = current_device_stream()
-    _chunk_gated_delta_rule_fwd_kernel_h_blockdim64_launch(dev)(
+    _chunk_gated_delta_rule_fwd_kernel_h_blockdim64_launch(
+        dev,
         stream,
         N,  # grid
         k,
@@ -920,7 +922,7 @@ def _chunk_gated_delta_rule_fwd_kernel_h_opt_grid(V: int, BV: int, H: int, *, N:
     return (triton.cdiv(V, BV), N * H)
 
 
-_chunk_gated_delta_rule_fwd_kernel_h_opt_launch = intj_handle(
+_chunk_gated_delta_rule_fwd_kernel_h_opt_launch = make_launcher(
     chunk_gated_delta_rule_fwd_kernel_h_opt,
     grid_cpp=_chunk_gated_delta_rule_fwd_kernel_h_opt_grid,
 )
@@ -968,7 +970,8 @@ def chunk_gated_delta_rule_fwd_h_opt(
     v_new = k.new_empty(B, H, T_flat, V, dtype=u.dtype) if save_new_value else None
 
     dev, stream = current_device_stream()
-    _chunk_gated_delta_rule_fwd_kernel_h_opt_launch(dev)(
+    _chunk_gated_delta_rule_fwd_kernel_h_opt_launch(
+        dev,
         stream,
         N,  # grid
         k,
@@ -1278,7 +1281,7 @@ def _chunk_gated_delta_rule_fwd_kernel_h_opt_vk_grid(
     return (triton.cdiv(V, BV), N * H)
 
 
-_chunk_gated_delta_rule_fwd_kernel_h_opt_vk_launch = intj_handle(
+_chunk_gated_delta_rule_fwd_kernel_h_opt_vk_launch = make_launcher(
     chunk_gated_delta_rule_fwd_kernel_h_opt_vk,
     grid_cpp=_chunk_gated_delta_rule_fwd_kernel_h_opt_vk_grid,
 )
@@ -1442,7 +1445,8 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
     v_new = k.new_empty(B, H, T_flat, V, dtype=u.dtype) if save_new_value else None
 
     dev, stream = current_device_stream()
-    _chunk_gated_delta_rule_fwd_kernel_h_opt_vk_launch(dev)(
+    _chunk_gated_delta_rule_fwd_kernel_h_opt_vk_launch(
+        dev,
         stream,
         N,  # grid
         k,
@@ -1507,7 +1511,8 @@ def chunk_gated_delta_rule_bwd_dhu(
     dv2 = torch.empty_like(dv)
 
     dev, stream = current_device_stream()
-    _chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64_launch(dev)(
+    _chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64_launch(
+        dev,
         stream,
         N,  # grid
         q,

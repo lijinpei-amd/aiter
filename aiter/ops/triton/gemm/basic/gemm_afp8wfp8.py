@@ -6,6 +6,7 @@ import math
 
 import torch
 import triton
+from intj import Constexpr, make_launcher
 
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
@@ -16,7 +17,7 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp8wfp8 import (
     _get_config,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -71,9 +72,9 @@ def _resolve_x_scale_strides(
     return x_scales.stride(0), x_scales.stride(1)
 
 
-_gemm_splitk_reduce_kernel_launch = intj_handle(
+_gemm_splitk_reduce_kernel_launch = make_launcher(
     _gemm_splitk_reduce_kernel,
-    baked={"KERNEL_NAME": "_gemm_afp8wfp8_reduce_kernel"},
+    extra_annotation={"KERNEL_NAME": Constexpr(value="_gemm_afp8wfp8_reduce_kernel")},
 )
 
 
@@ -193,7 +194,8 @@ def gemm_afp8wfp8(
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
         dev, stream = current_device_stream()
-        _gemm_splitk_reduce_kernel_launch(dev)(
+        _gemm_splitk_reduce_kernel_launch(
+            dev,
             stream,
             grid_reduce,
             y_pp,
@@ -218,9 +220,11 @@ def gemm_afp8wfp8(
     return y
 
 
-_gemm_splitk_reduce_kernel_launch2 = intj_handle(
+_gemm_splitk_reduce_kernel_launch2 = make_launcher(
     _gemm_splitk_reduce_kernel,
-    baked={"KERNEL_NAME": "_gemm_afp8wfp8_preshuffle_reduce_kernel"},
+    extra_annotation={
+        "KERNEL_NAME": Constexpr(value="_gemm_afp8wfp8_preshuffle_reduce_kernel")
+    },
 )
 
 
@@ -475,7 +479,8 @@ def gemm_afp8wfp8_preshuffle(
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
         dev, stream = current_device_stream()
-        _gemm_splitk_reduce_kernel_launch2(dev)(
+        _gemm_splitk_reduce_kernel_launch2(
+            dev,
             stream,
             grid_reduce,
             y_pp,

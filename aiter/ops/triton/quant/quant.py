@@ -4,6 +4,7 @@
 
 import torch
 import triton
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.quant.quant import (
     _dynamic_mxfp4_quant_blockscale_kernel,
@@ -20,7 +21,7 @@ from aiter.ops.triton._triton_kernels.quant.quant import (
     _static_per_tensor_quant_fp8_i8_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import e4m3_dtype
@@ -47,7 +48,7 @@ _MXFP8_LEGACY_BLOCK_SIZE = 128
 _LOGGER = AiterTritonLogger()
 
 
-_static_per_tensor_quant_fp8_i8_kernel_launch = intj_handle(
+_static_per_tensor_quant_fp8_i8_kernel_launch = make_launcher(
     _static_per_tensor_quant_fp8_i8_kernel,
     options={"num_warps": 4},
 )
@@ -92,7 +93,8 @@ def static_per_tensor_quant_fp8_i8(
     grid = (triton.cdiv(rows, BLOCK_M), triton.cdiv(cols, BLOCK_N))
 
     dev, stream = current_device_stream()
-    _static_per_tensor_quant_fp8_i8_kernel_launch(dev)(
+    _static_per_tensor_quant_fp8_i8_kernel_launch(
+        dev,
         stream,
         grid,
         q2d,
@@ -110,7 +112,7 @@ def static_per_tensor_quant_fp8_i8(
     return qx
 
 
-_dynamic_per_tensor_quant_fp8_i8_kernel_launch = intj_handle(
+_dynamic_per_tensor_quant_fp8_i8_kernel_launch = make_launcher(
     _dynamic_per_tensor_quant_fp8_i8_kernel,
     grid_arg=1,
 )
@@ -137,7 +139,8 @@ def dynamic_per_tensor_quant_fp8_i8(
     NUM_COL_POW2 = triton.next_power_of_2(cols)
 
     dev, stream = current_device_stream()
-    _dynamic_per_tensor_quant_fp8_i8_kernel_launch(dev)(
+    _dynamic_per_tensor_quant_fp8_i8_kernel_launch(
+        dev,
         stream,
         rows,
         x_in,
@@ -157,7 +160,7 @@ def dynamic_per_tensor_quant_fp8_i8(
     return qx, scale_out
 
 
-_dynamic_per_token_quant_fp8_i8_kernel_launch = intj_handle(
+_dynamic_per_token_quant_fp8_i8_kernel_launch = make_launcher(
     _dynamic_per_token_quant_fp8_i8_kernel,
 )
 
@@ -187,7 +190,8 @@ def dynamic_per_token_quant_fp8_i8(
     grid = (rows,)
 
     dev, stream = current_device_stream()
-    _dynamic_per_token_quant_fp8_i8_kernel_launch(dev)(
+    _dynamic_per_token_quant_fp8_i8_kernel_launch(
+        dev,
         stream,
         grid,
         qx,
@@ -370,7 +374,7 @@ def dynamic_mxfp4_quant(
     return (x_fp4, blockscale_e8m0)
 
 
-_dynamic_mxfp4_quant_blockscale_kernel_launch = intj_handle(
+_dynamic_mxfp4_quant_blockscale_kernel_launch = make_launcher(
     _dynamic_mxfp4_quant_blockscale_kernel,
 )
 
@@ -425,7 +429,8 @@ def dynamic_mxfp4_quant_blockscale(
     grid = (M // block_size, N // block_size)
 
     dev, stream = current_device_stream()
-    _dynamic_mxfp4_quant_blockscale_kernel_launch(dev)(
+    _dynamic_mxfp4_quant_blockscale_kernel_launch(
+        dev,
         stream,
         grid,
         x,
@@ -440,7 +445,7 @@ def dynamic_mxfp4_quant_blockscale(
     return x_fp4, blockscale_e8m0
 
 
-_dynamic_mxfp8_quant_kernel_launch = intj_handle(_dynamic_mxfp8_quant_kernel)
+_dynamic_mxfp8_quant_kernel_launch = make_launcher(_dynamic_mxfp8_quant_kernel)
 
 
 def dynamic_mxfp8_quant(
@@ -487,7 +492,8 @@ def dynamic_mxfp8_quant(
     grid = (NUM_PRGMS,)
 
     dev, stream = current_device_stream()
-    _dynamic_mxfp8_quant_kernel_launch(dev)(
+    _dynamic_mxfp8_quant_kernel_launch(
+        dev,
         stream,
         grid,
         x2d,
@@ -511,7 +517,7 @@ def dynamic_mxfp8_quant(
     return y, s
 
 
-_dynamic_mxfp8_quant_n32k4_mbn_kernel_launch = intj_handle(
+_dynamic_mxfp8_quant_n32k4_mbn_kernel_launch = make_launcher(
     _dynamic_mxfp8_quant_n32k4_mbn_kernel,
 )
 
@@ -557,7 +563,8 @@ def dynamic_mxfp8_quant_n32k4_mbn(
     grid = (R,)
 
     dev, stream = current_device_stream()
-    _dynamic_mxfp8_quant_n32k4_mbn_kernel_launch(dev)(
+    _dynamic_mxfp8_quant_n32k4_mbn_kernel_launch(
+        dev,
         stream,
         grid,
         x2d,
@@ -579,7 +586,7 @@ def dynamic_mxfp8_quant_n32k4_mbn(
     return y.view(M, B, K), scale
 
 
-_fp8_legacy_to_mxfp8_kernel_launch = intj_handle(_fp8_legacy_to_mxfp8_kernel)
+_fp8_legacy_to_mxfp8_kernel_launch = make_launcher(_fp8_legacy_to_mxfp8_kernel)
 
 
 def fp8_legacy_to_mxfp8(
@@ -621,7 +628,8 @@ def fp8_legacy_to_mxfp8(
     grid = (triton.cdiv(M, BLOCK_SIZE_M), Ns)
 
     dev, stream = current_device_stream()
-    _fp8_legacy_to_mxfp8_kernel_launch(dev)(
+    _fp8_legacy_to_mxfp8_kernel_launch(
+        dev,
         stream,
         grid,
         x_fnuz,

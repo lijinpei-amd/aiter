@@ -15,8 +15,9 @@ import triton.language as tl
 from flydsl.expr import gpu, rocdl
 from flydsl.expr.primitive import range_constexpr
 from flydsl.expr.typing import Float4E2M1FN, Int32, T
+from intj import make_launcher
 
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 from .pa_mqa_logits_fp4_common import (
     _NON_WRITER_LANE_OFF,
@@ -92,7 +93,8 @@ def compute_prefill_schedule(
     BLOCK_P = 256
     grid = (triton.cdiv(P, BLOCK_P),)
     dev, stream = current_device_stream()
-    _prefill_cta_info_kernel_launch(dev)(
+    _prefill_cta_info_kernel_launch(
+        dev,
         stream,
         grid,
         plan.incl,
@@ -178,7 +180,8 @@ def _row_plan(le, block_k, P, s_max) -> _RowPlan:
     )
     # Named, not `*plan`: field ORDER should not become load-bearing.
     dev, stream = current_device_stream()
-    _prefill_row_plan_kernel_launch(dev)(
+    _prefill_row_plan_kernel_launch(
+        dev,
         stream,
         1,
         le,
@@ -301,7 +304,7 @@ def _prefill_row_plan_kernel(
     tl.store(total_splits_ptr, tl.sum(ctas, axis=0))
 
 
-_prefill_row_plan_kernel_launch = intj_handle(_prefill_row_plan_kernel, grid_arg=1)
+_prefill_row_plan_kernel_launch = make_launcher(_prefill_row_plan_kernel, grid_arg=1)
 
 
 @triton.jit(do_not_specialize=["T", "P"])
@@ -367,7 +370,7 @@ def _prefill_cta_info_kernel(
     tl.store(cta_info_ptr + base + 5, le_out, mask=smask)
 
 
-_prefill_cta_info_kernel_launch = intj_handle(_prefill_cta_info_kernel)
+_prefill_cta_info_kernel_launch = make_launcher(_prefill_cta_info_kernel)
 
 
 def build_pa_mqa_logits_fp4_prefill_module(
@@ -1006,7 +1009,7 @@ def _varqlen_windows_kernel(
     tl.store(local_ends_ptr + r, le, mask=rmask)
 
 
-_varqlen_windows_kernel_launch = intj_handle(_varqlen_windows_kernel)
+_varqlen_windows_kernel_launch = make_launcher(_varqlen_windows_kernel)
 
 
 def compute_varqlen_windows(cu_seq_q, context_lens, total_q, *, out=None):
@@ -1032,7 +1035,8 @@ def compute_varqlen_windows(cu_seq_q, context_lens, total_q, *, out=None):
         BLOCK = 256
         grid = (triton.cdiv(total_q, BLOCK),)
         intj_dev, intj_stream = current_device_stream()
-        _varqlen_windows_kernel_launch(intj_dev)(
+        _varqlen_windows_kernel_launch(
+            intj_dev,
             intj_stream,
             grid,
             cu,

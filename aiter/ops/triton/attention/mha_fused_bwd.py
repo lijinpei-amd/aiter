@@ -3,6 +3,7 @@
 
 import torch
 import triton
+from intj import make_launcher
 from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.attention.mha_fused_bwd import (
@@ -11,15 +12,14 @@ from aiter.ops.triton._triton_kernels.attention.mha_fused_bwd import (
     _bwd_preprocess,
     _get_config,
 )
-from aiter.ops.triton.utils.device_info import get_num_xcds
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream, get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import _is_fp8
 
 _LOGGER = AiterTritonLogger()
 
 
-_bwd_preprocess_launch = intj_handle(_bwd_preprocess)
+_bwd_preprocess_launch = make_launcher(_bwd_preprocess)
 
 
 def flash_attn_fused_backward(
@@ -187,7 +187,8 @@ def flash_attn_fused_backward(
     )
 
     dev, stream = current_device_stream()
-    _bwd_preprocess_launch(dev)(
+    _bwd_preprocess_launch(
+        dev,
         stream,
         pre_grid,
         o,

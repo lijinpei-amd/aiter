@@ -3,20 +3,21 @@
 
 import torch
 import triton
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_a8w8_blockscale_a16w16 import (
     _fused_gemm_a8w8_blockscale_a16w16_kernel,
     _fused_gemm_a8w8_blockscale_a16w16_reduce_kernel,
     _get_config,
 )
-from aiter.ops.triton.utils.intj_handle import current_device_stream, intj_handle
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
 
-_fused_gemm_a8w8_blockscale_a16w16_reduce_kernel_launch = intj_handle(
+_fused_gemm_a8w8_blockscale_a16w16_reduce_kernel_launch = make_launcher(
     _fused_gemm_a8w8_blockscale_a16w16_reduce_kernel,
 )
 
@@ -192,7 +193,8 @@ def fused_gemm_a8w8_blockscale_a16w16(
             + triton.cdiv(N_bf16, REDUCE_BLOCK_SIZE_N),
         )
         dev, stream = current_device_stream()
-        _fused_gemm_a8w8_blockscale_a16w16_reduce_kernel_launch(dev)(
+        _fused_gemm_a8w8_blockscale_a16w16_reduce_kernel_launch(
+            dev,
             stream,
             grid_reduce,
             bias_fp8,
