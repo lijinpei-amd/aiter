@@ -3,8 +3,14 @@
 
 import pytest
 import torch
+from triton import knobs
+from triton.runtime.jit import JITFunction
 
 import aiter.ops.triton.fusions.attn_res as attn_res_module
+from aiter.ops.triton._triton_kernels.fusions.attn_res import (
+    ATTN_RES_TRITON_AUTOTUNE,
+    attnres_fwd_kernel,
+)
 from aiter.ops.triton.fusions.attn_res import attn_res_fwd, attn_res_gate
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
@@ -595,7 +601,7 @@ def test_attn_res_gate_out_quant_requires_output_rms_weight():
 
 
 def _gate_all_variants(prefix, block_residual, score_weight, orw, fp8_dtype):
-    """Every axis attn_res_gate keys its launch cache on, one call per setting.
+    """Every axis attn_res_gate's launch specializes on, one call per setting.
 
     Deliberately includes settings that do not change the result but DO change
     the kernel Triton compiles: eps/out_eps/scale values (a scalar that happens
@@ -648,19 +654,47 @@ def _gate_all_variants(prefix, block_residual, score_weight, orw, fp8_dtype):
         ), kwargs
 
 
+def _triton_launch(dev, stream, grid, *args):
+    """attnres_fwd_kernel through Triton's own launch, taking the arguments of
+    attn_res_gate's intj launcher (_attnres_fwd_kernel_launch)."""
+    names = attnres_fwd_kernel.arg_names
+    options = {}
+    if ATTN_RES_TRITON_AUTOTUNE:
+        names = [n for n in names if n != "BL"]  # the tuner assigns BL
+    else:
+        num_warps, num_stages, *args = args
+        options = {"num_warps": num_warps, "num_stages": num_stages}
+    assert len(names) == len(args)
+    attnres_fwd_kernel[grid](**dict(zip(names, args)), **options)
+
+
+def _gate_outputs(out):
+    y = out[0]
+    tensors = list(y) if isinstance(y, tuple) else [y]
+    return tensors + [t.clone() for t in out[1:] if t is not None]
+
+
+def _assert_gate_matches_triton(monkeypatch, *args, **kwargs):
+    """attn_res_gate returns bitwise what a Triton launch of the same kernel
+    returns, on its first call and on a repeated one (a launcher cache hit)."""
+    with monkeypatch.context() as m:
+        m.setattr(attn_res_module, "_attnres_fwd_kernel_launch", _triton_launch)
+        expected = _gate_outputs(attn_res_gate(*args, **kwargs))
+    for _ in range(2):
+        got = _gate_outputs(attn_res_gate(*args, **kwargs))
+        assert len(got) == len(expected)
+        for a, b in zip(got, expected):
+            assert a.dtype == b.dtype and a.shape == b.shape
+            assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+
+
 @pytest.mark.parametrize("B", [1, 8])
 @pytest.mark.parametrize("N", [1, 128])
-def test_attn_res_gate_launch_cache_matches_triton(monkeypatch, B, N):
-    """The cached launch must resolve to the kernel Triton itself would pick.
-
-    attn_res_gate skips Triton's per-launch argument specialization by caching
-    the resolved kernel under a key it derives itself (decode is host-bound, and
-    that specialization is the single largest cost in the launch). Getting the
-    key too coarse would silently run a kernel compiled for different arguments,
-    so the module can re-resolve through Triton on every hit and assert it got
-    the same object back; this turns that check on across the flag matrix.
-    """
-    monkeypatch.setattr(attn_res_module, "_LAUNCH_CACHE_VERIFY", True)
+def test_attn_res_gate_matches_triton_launch(monkeypatch, B, N):
+    """Across every setting the launch specializes on, the launch returns what
+    Triton's launch of the same kernel returns, bit for bit. A launch that
+    picked a binary compiled for other arguments (an unaligned prefix, a scalar
+    equal to 1.0, another flag) would differ here."""
     D = 256
     dtype, fp8_dtype = torch.bfloat16, get_fp8_e4m3_dtype()
     prefix, block_residual, score_weight, _, _ = generate_attn_res_gate_inputs(
@@ -671,69 +705,38 @@ def test_attn_res_gate_launch_cache_matches_triton(monkeypatch, B, N):
     for args, kwargs in _gate_all_variants(
         prefix, block_residual, score_weight, orw, fp8_dtype
     ):
-        # Twice: the first call populates the cache, the second is the hit that
-        # the verification actually checks.
-        attn_res_gate(*args, **kwargs)
-        attn_res_gate(*args, **kwargs)
+        _assert_gate_matches_triton(monkeypatch, *args, **kwargs)
 
 
-@pytest.mark.parametrize("close_block", [False, True])
-@pytest.mark.parametrize("quant", [False, True])
-def test_attn_res_gate_launch_cache_bit_identical(monkeypatch, quant, close_block):
-    """Cached and uncached launches must produce bit-identical results."""
-    N, D, B = 64, 256, 3
-    dtype, fp8_dtype = torch.bfloat16, get_fp8_e4m3_dtype()
-    prefix, block_residual, score_weight, add_hidden, _ = generate_attn_res_gate_inputs(
-        N, D, B, dtype, with_add=True
-    )
-    orw = torch.randn(D, dtype=dtype, device="cuda")
-    kwargs = {
-        "output_rms_weight": orw,
-        "output_rms_eps": 1e-5,
-        "close_block": close_block,
-        "out_quant_dtype": fp8_dtype if quant else None,
-    }
-
-    def run():
-        return attn_res_gate(
-            prefix, block_residual, score_weight, 1e-6, add_hidden, **kwargs
-        )
-
-    monkeypatch.setattr(attn_res_module, "_LAUNCH_CACHE_ENABLED", False)
-    uncached = run()
-    monkeypatch.setattr(attn_res_module, "_LAUNCH_CACHE_ENABLED", True)
-    run()  # populate
-    cached = run()
-
-    def flat(out):
-        y = out[0]
-        tensors = list(y) if isinstance(y, tuple) else [y]
-        return tensors + [t for t in out[1:] if t is not None]
-
-    for a, b in zip(flat(uncached), flat(cached)):
-        torch.testing.assert_close(a.float(), b.float(), atol=0, rtol=0)
-
-
-def test_attn_res_gate_launch_cache_is_bounded_in_token_count():
-    """Token count must not be a cache axis, or decode would leak an entry a step.
-
-    N reaches the key only through the properties Triton specializes on
-    (16-divisibility, being 1, fitting in i32), not by value.
-    """
+def test_attn_res_gate_compiles_are_bounded_in_token_count():
+    """Token count must not be a compile axis, or decode would compile a kernel
+    a step. Counted through Triton's compilation listener, which sees every
+    compile a launch misses into."""
     D, B = 256, 3
     dtype = torch.bfloat16
-    attn_res_module._LAUNCH_CACHE.clear()
-    for N in range(17, 49):
-        prefix, block_residual, score_weight, _, _ = generate_attn_res_gate_inputs(
-            N, D, B, dtype, with_add=False
-        )
-        attn_res_gate(prefix, block_residual, score_weight, 1e-6)
+    compiles = []
+    jit = attnres_fwd_kernel
+    while not isinstance(jit, JITFunction):  # under @triton.autotune
+        jit = jit.fn
 
-    entries = sum(len(v) for v in attn_res_module._LAUNCH_CACHE.values())
-    # N in [17, 48] spans both 16-divisibility classes and two launch-config
-    # buckets (<=64 vs the N<=8 bucket is not reached here), so a handful of
-    # entries is expected -- 32 would mean N leaked in by value.
-    assert entries <= 8, f"launch cache grew to {entries} entries over 32 token counts"
+    def listener(*, src, **_):
+        if getattr(src, "fn", None) is jit:
+            compiles.append(src)
+
+    previous = knobs.compilation.listener
+    knobs.compilation.listener = listener
+    try:
+        for N in range(17, 49):
+            prefix, block_residual, score_weight, _, _ = generate_attn_res_gate_inputs(
+                N, D, B, dtype, with_add=False
+            )
+            attn_res_gate(prefix, block_residual, score_weight, 1e-6)
+    finally:
+        knobs.compilation.listener = previous
+    # N in [17, 48] spans both 16-divisibility classes and the N<=64 launch
+    # config bucket, so a handful of compiles is expected -- 32 would mean N
+    # reached the specialization by value.
+    assert len(compiles) <= 8, f"{len(compiles)} compiles over 32 token counts"
 
 
 def test_attn_res_separate_bl_table_matches_documented_buckets():
@@ -835,24 +838,22 @@ def test_attn_res_gate_separate_bl_buckets_match_reference(N, B):
 
 
 @pytest.mark.parametrize("N", [16384, 32768])
-def test_attn_res_gate_launch_cache_separates_separate_bl_buckets(monkeypatch, N):
-    """Two token counts in different BL buckets must not share a cache entry.
+def test_attn_res_gate_separate_bl_buckets_match_triton(monkeypatch, N):
+    """Two token counts in different BL buckets must not share a binary.
 
-    BL is a constexpr, and the only trace N leaves in the key is _int_spec,
-    which records 16-divisibility rather than a value. Now that the table keys
-    BL on the candidate count, _ATTN_RES_SEPARATE_BL_MAX_T is the only boundary N
-    still crosses, so 16384 and 32768 are the pair that isolates it: both land
-    in the _ATTN_RES_PACKED_CONFIGS catchall (same num_warps/num_stages) and
-    both are 16-divisible, leaving BL as the sole difference.
+    BL is a constexpr, and N itself only reaches the specialization through
+    16-divisibility. Now that the table keys BL on the candidate count,
+    _ATTN_RES_SEPARATE_BL_MAX_T is the only boundary N still crosses, so 16384
+    and 32768 are the pair that isolates it: both land in the
+    _ATTN_RES_PACKED_CONFIGS catchall (same num_warps/num_stages) and both are
+    16-divisible, leaving BL as the sole difference.
 
     close_block must be on: BL>1 is gated on it, so with the default off both N
     would pick BL=1 and this would pass without testing anything.
 
-    Verification mode re-resolves through Triton on every hit, so a key that
-    dropped BL would fail here rather than silently launching a kernel compiled
-    for the other tile width.
+    The other bucket launches first, so a launch that dropped BL from its key
+    would reuse that binary; comparing against Triton's launch catches it.
     """
-    monkeypatch.setattr(attn_res_module, "_LAUNCH_CACHE_VERIFY", True)
     D, B = 256, 8
     dtype = torch.bfloat16
     # The separated loop covers L-1 = B rows, matching the wrapper's l2 argument.
@@ -866,14 +867,13 @@ def test_attn_res_gate_launch_cache_separates_separate_bl_buckets(monkeypatch, N
     prefix, block_residual, score_weight, _, _ = generate_attn_res_gate_inputs(
         N, D, B, dtype, with_add=False
     )
-    # Prime with the other bucket first, so a too-coarse key would hit that
-    # entry rather than compiling fresh.
     other_n = 32768 if N == 16384 else 16384
     other = generate_attn_res_gate_inputs(other_n, D, B, dtype, with_add=False)
     attn_res_gate(other[0], other[1], other[2], 1e-6, close_block=True)
 
-    attn_res_gate(prefix, block_residual, score_weight, 1e-6, close_block=True)
-    attn_res_gate(prefix, block_residual, score_weight, 1e-6, close_block=True)
+    _assert_gate_matches_triton(
+        monkeypatch, prefix, block_residual, score_weight, 1e-6, close_block=True
+    )
 
 
 def test_attn_res_sequence_requires_d_multiple_of_16():

@@ -38,14 +38,11 @@ which is what lets several consumers of the same normed row share one quant.
 """
 
 import logging
-import os
 from collections.abc import Sequence
 
 import torch
 import triton
 from intj import make_launcher
-from triton import knobs
-from triton.runtime import driver
 
 from aiter.ops.triton._triton_kernels.fusions.attn_res import (
     ATTN_RES_TRITON_AUTOTUNE,
@@ -57,77 +54,12 @@ from aiter.ops.triton.utils.types import get_dtype_max
 
 _LOGGER = AiterTritonLogger()
 
-_TRUTHY = ("1", "true", "yes")
-
-# Decode is host-bound: at N=1..128 attn_res_gate spends ~50us of Python per
-# call against ~10-25us of device work, so whoever calls it in a per-layer decode
-# loop is paying for Triton's launch path, not for the kernel. Measured split
-# (MI350X/gfx950, N=1 B=8 H=7168, quant + close_block, scratch/
-# probe_gate_launch_floor.py): 20.7us wrapper prologue, 26.5us JITFunction.run
-# argument binding + specialization + cache lookup, 5.2us actual driver launch.
-#
-# _LAUNCH_CACHE removes the middle term. JITFunction.run re-derives the
-# specialization of all 42 kernel parameters on every call (11 live tensors, each
-# costing a dtype/alignment/2GB probe plus a knobs lookup) only to arrive at a
-# cache key it already computed on the previous, identically-shaped call. We
-# compute an equivalent key ourselves from the handful of things that can
-# actually vary here, and on a hit invoke the CompiledKernel directly the same
-# way JITFunction.run would.
-#
-# Set AITER_ATTN_RES_NO_LAUNCH_CACHE=1 to force every call back through
-# JITFunction.run. Set AITER_ATTN_RES_VERIFY_LAUNCH_CACHE=1 to additionally
-# resolve the kernel through Triton on every hit and assert it is the object the
-# cache handed out -- that is the invariant the key has to satisfy, and it is
-# what the launch-cache test asserts across the full flag matrix.
-_LAUNCH_CACHE_ENABLED: bool = (
-    os.getenv("AITER_ATTN_RES_NO_LAUNCH_CACHE", "0").lower() not in _TRUTHY
-)
-_LAUNCH_CACHE_VERIFY: bool = (
-    os.getenv("AITER_ATTN_RES_VERIFY_LAUNCH_CACHE", "0").lower() in _TRUTHY
-)
-_LAUNCH_CACHE: dict = {}
-
-_MAX_INT32 = 2**31 - 1
-
-
-def _tensor_spec(t: torch.Tensor | None):
-    """The properties of ``t`` that Triton specializes the compiled kernel on.
-
-    Mirrors HIPBackend.get_tensor_specialization: the element type picks the
-    pointer type, 16-byte alignment gates the ``tt.divisibility`` attribute, and
-    a storage that fits in 32 bits gates ``tt.pointer_range`` (buffer ops). A
-    tensor's own size is not enough for the last one -- a small view into a large
-    KV/activation pool is over the limit -- so this has to look at the storage.
-    """
-    if t is None:
-        return None
-    return (
-        t.dtype,
-        t.data_ptr() % 16 == 0,
-        t.untyped_storage().size() <= _MAX_INT32,
-    )
-
-
-def _fresh_tensor_spec(t: torch.Tensor | None):
-    """:func:`_tensor_spec` for a tensor this module just allocated.
-
-    Such a tensor owns its whole storage, so ``nbytes`` (one attribute) answers
-    the 2GB question that would otherwise cost an UntypedStorage round trip, and
-    the CUDA caching allocator hands back 512-byte-aligned blocks, so the
-    divisibility bit is known. The launch-cache verification exercises this on
-    every output tensor, so a wrong assumption here fails loudly rather than
-    silently reusing the wrong kernel.
-    """
-    if t is None:
-        return None
-    return (t.dtype, True, t.nbytes <= _MAX_INT32)
-
-
-def _int_spec(v: int):
-    # Triton specializes integers on 16-divisibility and on being 1, and picks
-    # i32 vs i64 by magnitude. Only the token count is unbounded enough to need
-    # this; the other integer arguments are folded into the key by value.
-    return (v % 16 == 0, v == 1, -(2**31) <= v <= _MAX_INT32)
+# Decode is host-bound: at N=1..128 attn_res_gate spent ~50us of Python per
+# call against ~10-25us of device work, ~26us of it in JITFunction.run's
+# argument binding, specialization and cache lookup (MI350X/gfx950, N=1 B=8
+# H=7168, quant + close_block). attn_res_gate and the packed layout launch
+# through an intj launcher (_attnres_fwd_kernel_launch), which does that part
+# in C; the sequence layout's tuple argument keeps it on Triton.
 
 
 _POW2_CACHE: dict[int, int] = {}
@@ -321,146 +253,6 @@ def _launch_tune_kwargs(num_warps: int, num_stages: int, bl: int | None = None) 
     if bl is not None:
         kwargs["BL"] = bl
     return kwargs
-
-
-# Positional order of attnres_fwd_kernel's parameters, so the cached-launch path
-# can hand the CompiledKernel a tuple instead of rebuilding a 42-entry keyword
-# dict. Asserted against the kernel below rather than trusted.
-_KERNEL_ARG_ORDER = (
-    "q",
-    "res",
-    "w",
-    "ow",
-    "o",
-    "o_pre",
-    "rstd",
-    "logit",
-    "lse",
-    "res_packed",
-    "prefix",
-    "add_hidden",
-    "add_hidden2",
-    "prefix_out",
-    "block_out",
-    "o_scale",
-    "N",
-    "L",
-    "stride_res_n",
-    "stride_res_l",
-    "stride_bo_n",
-    "stride_bo_l",
-    "L2",
-    "D",
-    "eps",
-    "out_eps",
-    "scale",
-    "BL",
-    "BD",
-    "HAS_ONORM",
-    "SAVE_OPRE",
-    "SAVE_STATS",
-    "IS_PACKED",
-    "HAS_PREFIX",
-    "DO_ADD",
-    "DO_ADD2",
-    "WRITE_PREF",
-    "WRITE_BLOCK_CAT",
-    "HAS_W",
-    "QUANT_FP8",
-    "FP8_MAX",
-    "SEPARATE",
-)
-
-if ATTN_RES_TRITON_AUTOTUNE:
-    # The kernel is wrapped by @triton.autotune, which owns BL and the launch
-    # config; there is no single CompiledKernel to cache per key.
-    _LAUNCH_CACHE_ENABLED = False
-elif tuple(attnres_fwd_kernel.arg_names) != _KERNEL_ARG_ORDER:
-    _LAUNCH_CACHE_ENABLED = False
-    _LOGGER.info(
-        "ATTN_RES_GATE: attnres_fwd_kernel signature changed, launch cache off"
-    )
-
-
-def _assert_launch_cache_key(cached, grid_n: int, kwargs: dict) -> None:
-    # warmup() resolves the kernel through Triton's own specialization and cache
-    # without launching, so it answers exactly the question the key has to get
-    # right: would Triton have picked this same CompiledKernel?
-    resolved = attnres_fwd_kernel.warmup(grid=(grid_n,), **kwargs)
-    if resolved is not cached:
-        raise AssertionError(
-            "attn_res launch cache returned a different kernel than Triton would "
-            f"have for grid={grid_n}; the cache key is too coarse"
-        )
-
-
-def _launch_hooks_idle() -> bool:
-    # Triton keeps launch_enter_hook/launch_exit_hook as HookChain objects that
-    # are non-None but empty until someone (a profiler, typically) registers a
-    # callback, so "is None" is not the test. An empty chain has nothing to
-    # receive launch metadata, which is what lets the fast path skip building it.
-    enter = knobs.runtime.launch_enter_hook
-    if getattr(enter, "calls", enter):
-        return False
-    exit_ = knobs.runtime.launch_exit_hook
-    return not getattr(exit_, "calls", exit_)
-
-
-def _launch_attn_res(key, grid_n: int, argv: tuple, tune_kwargs: dict) -> None:
-    """Launch attnres_fwd_kernel, reusing the resolved kernel when we can.
-
-    ``key`` is None when the cache is off, in which case this is just the plain
-    ``attnres_fwd_kernel[grid](...)`` call. The fast path mirrors the tail of
-    JITFunction.run; it is skipped whenever a launch hook is installed, since
-    those need the launch metadata that only the full path builds.
-    """
-    if key is not None and _launch_hooks_idle():
-        device = driver.active.get_current_device()
-        per_device = _LAUNCH_CACHE.get(device)
-        cached = per_device.get(key) if per_device is not None else None
-        if cached is not None:
-            if _LAUNCH_CACHE_VERIFY:
-                _assert_launch_cache_key(
-                    cached, grid_n, dict(zip(_KERNEL_ARG_ORDER, argv), **tune_kwargs)
-                )
-            try:
-                cached.run(
-                    grid_n,
-                    1,
-                    1,
-                    driver.active.get_current_stream(device),
-                    cached.function,
-                    cached.packed_metadata,
-                    None,  # launch_metadata: only built for hooks, excluded above
-                    None,  # launch_enter_hook
-                    None,  # launch_exit_hook
-                    *argv,
-                )
-                return
-            except TypeError:
-                # CompiledKernel.run's parameter list is Triton's internal launcher
-                # ABI, stable across every version this has been built against but
-                # not a public contract. If it ever moves, an arity/type mismatch
-                # here means nothing was launched, so retire the fast path for the
-                # process and fall through to Triton's own launch.
-                global _LAUNCH_CACHE_ENABLED
-                _LAUNCH_CACHE_ENABLED = False
-                _LAUNCH_CACHE.clear()
-                _LOGGER.info(
-                    "ATTN_RES_GATE: CompiledKernel launch ABI mismatch, launch cache off"
-                )
-                key = None
-    else:
-        device = None
-
-    kwargs = dict(zip(_KERNEL_ARG_ORDER, argv))
-    if ATTN_RES_TRITON_AUTOTUNE:
-        del kwargs["BL"]  # supplied by the autotuner's config search
-    kernel = attnres_fwd_kernel[(grid_n,)](**kwargs, **tune_kwargs)
-    if key is not None:
-        if device is None:
-            device = driver.active.get_current_device()
-        _LAUNCH_CACHE.setdefault(device, {})[key] = kernel
 
 
 def _build_ptr_table(tensors: Sequence[torch.Tensor]) -> tuple[torch.Tensor, ...]:
@@ -811,7 +603,16 @@ def attn_res_gate(
     res_stride_n, res_stride_l, _ = br.stride()
     bo_stride_n, bo_stride_l, _ = bo.stride()
     fp8_max = _dtype_max(out_quant_dtype) if quant else 1.0
-    argv = (
+    # With ATTN_RES_TRITON_AUTOTUNE the tuner owns these (see _launch_tune_kwargs).
+    tune, bl_arg = (
+        ((), ()) if ATTN_RES_TRITON_AUTOTUNE else ((num_warps, num_stages), (bl,))
+    )
+    dev, stream = current_device_stream()
+    _attnres_fwd_kernel_launch(
+        dev,
+        stream,
+        (N,),
+        *tune,
         sw,  # q
         None,  # res: unused when IS_PACKED (sequence branch is dead); None keeps
         # the L2 dead pointer slots out of the kernarg segment
@@ -840,7 +641,7 @@ def attn_res_gate(
         eps,
         output_rms_eps,  # out_eps
         scale,
-        bl,  # BL
+        *bl_arg,
         _next_pow2(D),  # BD
         has_onorm,  # HAS_ONORM
         False,  # SAVE_OPRE
@@ -856,51 +657,6 @@ def attn_res_gate(
         fp8_max,  # FP8_MAX
         separate,  # SEPARATE
     )
-    if _LAUNCH_CACHE_ENABLED:
-        # Everything Triton would specialize on. The aliased slots (q/w, and the
-        # hs/hs2/prefix_out/bo reuse of pf/br when their flags are off) are
-        # covered by the flags already in the key, so they are not probed twice.
-        key = (
-            _tensor_spec(sw),
-            _tensor_spec(ow),
-            _fresh_tensor_spec(y),
-            _fresh_tensor_spec(y_scale),
-            _tensor_spec(br),
-            _tensor_spec(pf),
-            _tensor_spec(hs) if do_add else None,
-            _tensor_spec(hs2) if do_add2 else None,
-            _fresh_tensor_spec(prefix_out) if do_add else None,
-            _fresh_tensor_spec(bo) if close_block else None,
-            _int_spec(N),
-            L,
-            res_stride_n,
-            res_stride_l,
-            bo_stride_n,
-            bo_stride_l,
-            L2,
-            D,
-            # Triton specializes scalars too -- a float that happens to be 1.0
-            # compiles to a different kernel than one that is not -- so the
-            # scalars go in by value rather than by any derived property. They
-            # are model constants, so this does not grow the cache.
-            eps,
-            output_rms_eps,
-            scale,
-            bl,
-            has_onorm,
-            do_add,
-            do_add2,
-            close_block,
-            quant,
-            fp8_max,
-            separate,
-            num_warps,
-            num_stages,
-        )
-    else:
-        key = None
-    # BL rides in argv at its signature position, so it must not be repeated here.
-    _launch_attn_res(key, N, argv, _launch_tune_kwargs(num_warps, num_stages))
 
     # prefix is [.., D] and the kernel writes [N, D], so the view is a no-op
     # whenever the caller already handed us a 2-D batch -- the decode case.
