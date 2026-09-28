@@ -2,13 +2,12 @@
 
 Triton and Gluon `JITFunction` launches in this branch go through intj's
 `make_launcher` (see [Launchers](#launchers)). This branch needs the sibling
-intj checkout, `develop` at or after `e2e75eb` (lazy build, `dynamic_options`,
+intj checkout, `develop` at or after `0ec6835` (lazy build, `dynamic_options`,
 object constexprs looked up in C, `assume_constant_globals`, `torch.Tensor`
-annotations, Triton's conversion of annotated scalars), installed or on
-`PYTHONPATH`; Aiter
-does not yet publish an intj dependency. Declaring a launcher does no GPU
-work, but needs a host C compiler once per interpreter (intj builds its
-generic lazy stub).
+and `torch.Tensor | None` annotations, Triton's conversion of annotated
+scalars), installed or on `PYTHONPATH`; Aiter does not yet publish an intj
+dependency. Declaring a launcher does no GPU work, but needs a host C
+compiler once per interpreter (intj builds its generic lazy stub).
 
 What still launches through Triton, and why: the 16 tracked Triton bracket
 launches in the table below, each needing a runtime capability or launch
@@ -17,18 +16,18 @@ last eight, gfx1250 Gluon paths that passed a tuple or a Gluon layout object
 as a constexpr, now build those values in the kernel (see
 [gfx1250 Gluon kernels](#gfx1250-gluon-kernels)).
 
-Line numbers refer to this branch. The direct Iris kernels also have
-unsupported `tl.tensor` annotations; the fused Iris path remains pending
-Iris-enabled multi-GPU validation.
+Line numbers refer to this branch. The three Iris kernels are blocked only
+by their Iris helpers (intj takes their `tl.tensor` annotations) and remain
+pending Iris-enabled multi-GPU validation.
 
 | Site | Target | Reason |
 | --- | --- | --- |
 | `aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/common.py:409` | `torch.library.wrap_triton(_rotary_kernel)` | `torch.library.wrap_triton` is required for `torch.compile` behavior. |
 | `aiter/ops/triton/attention/pa_mqa_logits.py:779` | `kernel` | A precompiled Gluon/AOT kernel, not a `JITFunction`. |
 | `aiter/ops/triton/attention/pod_attention.py:199` | `pod_persistent` | Caller prints the returned kernel's `n_regs` and `n_spills`. |
-| `aiter/ops/triton/comms/all_gather.py:226` | `_all_gather_kernel` | intj cannot resolve `heap_bases: tl.tensor`; its nested JIT helper also calls Iris `put`. |
+| `aiter/ops/triton/comms/all_gather.py:226` | `_all_gather_kernel` | Blocked by Iris helpers only: its nested JIT helper calls Iris `put`; intj compatibility lacks Iris-enabled validation. |
 | `aiter/ops/triton/comms/fused/reduce_scatter_rmsnorm_quant_all_gather.py:368` | `fused_pipeline_kernel` | Nested JIT helpers call Iris `load` and `put`; intj compatibility lacks Iris-enabled validation. |
-| `aiter/ops/triton/comms/reduce_scatter.py:236` | `_reduce_scatter_kernel` | intj cannot resolve `heap_bases: tl.tensor`; its nested JIT helper also calls Iris `load`. |
+| `aiter/ops/triton/comms/reduce_scatter.py:236` | `_reduce_scatter_kernel` | Blocked by Iris helpers only: its nested JIT helper calls Iris `load`; intj compatibility lacks Iris-enabled validation. |
 | `aiter/ops/triton/fusions/attn_res.py:336` | `attnres_fwd_kernel` | `_run_sequence` passes `res`, a tuple of residual tensors; intj raises `TypeError: unsupported argument 'res' of type tuple` (tuple arguments are unsupported, with or without `ATTN_RES_TRITON_AUTOTUNE`). |
 | `aiter/ops/triton/gemm/basic/gemm_afp8wfp8.py:438` | `_PRESHUFFLE_KERNEL_MAP[kernel_type]` | gfx1250 preshuffle can use `num_ctas > 1` (CGA multicast); intj refuses it. |
 | `aiter/ops/triton/moe/moe_op_gemm_a4w4.py:614` | `_moe_gemm_a4w4_prefill` | Selected config can use `num_ctas > 1`; intj refuses it. |
@@ -138,7 +137,8 @@ device and its raw stream, as Triton launches on.
   the prebuilt hsaco/json, as `triton.compile` did.
 - **`torch.Tensor` / `tl.tensor` annotations** mean "exactly a tensor" to
   intj (Triton ignores them). A parameter that can be `None` (MHA forward's
-  descale, alibi, dropout-mask and sink pointers) is left unannotated.
+  descale, alibi, dropout-mask and sink pointers) is annotated
+  `torch.Tensor | None`: a tensor or `None`, keyed as Triton keys it.
 - **Tuned kernels.** The values a tuning layer assigns (`BL`, `num_warps`
   and `num_stages` under `ATTN_RES_TRITON_AUTOTUNE`, the chunk-delta
   autotune spaces) come from the tuner; they are neither passed nor
