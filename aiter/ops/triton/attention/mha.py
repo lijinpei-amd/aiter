@@ -492,6 +492,7 @@ def _gluon_flash_attn_forward(
         descale_q.stride(0) if descale_q is not None else 0,
         descale_k.stride(0) if descale_k is not None else 0,
         descale_v.stride(0) if descale_v is not None else 0,
+        num_q_heads,
         num_k_heads,
         causal,
         varlen,
