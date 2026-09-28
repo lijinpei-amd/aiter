@@ -6,6 +6,7 @@ import functools
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
@@ -298,19 +299,29 @@ _attn_fwd_repr = make_kernel_repr(
 )
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+        "num_ctas",
+    )
+)
 @triton.jit(repr=_attn_fwd_repr)
 def _attn_fwd(
     q_ptr: torch.Tensor,
     k_ptr: torch.Tensor,
     v_ptr: torch.Tensor,
-    descale_q_ptr: torch.Tensor,
-    descale_k_ptr: torch.Tensor,
-    descale_v_ptr: torch.Tensor,
+    descale_q_ptr,  # torch.Tensor | None: None is a constexpr the kernel tests
+    descale_k_ptr,  # torch.Tensor | None: None is a constexpr the kernel tests
+    descale_v_ptr,  # torch.Tensor | None: None is a constexpr the kernel tests
     out_ptr: torch.Tensor,
-    alibi_slopes_ptr: torch.Tensor,
-    s_dmask_ptr: torch.Tensor,
+    alibi_slopes_ptr,  # torch.Tensor | None: None is a constexpr the kernel tests
+    s_dmask_ptr,  # torch.Tensor | None: None is a constexpr the kernel tests
     softmax_lse_ptr: torch.Tensor,
-    sink_ptr: torch.Tensor,
+    sink_ptr,  # torch.Tensor | None: None is a constexpr the kernel tests
     stride_qz_in,
     stride_qh_in,
     stride_qm_in,

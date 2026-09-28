@@ -738,11 +738,18 @@ def _flash_attn_forward(
                 config.get("num_stages", 1),
             )
 
-        grid = lambda META: (
-            batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),
-        )
-
-        _attn_fwd[grid](
+        grid = (batch * num_q_heads * triton.cdiv(seqlen_q, config["BLOCK_M"]),)
+        dev, stream = current_device_stream()
+        _attn_fwd(
+            dev,
+            stream,
+            grid,
+            config.get("num_warps", 4),
+            config.get("num_stages", 2),
+            config.get("waves_per_eu", 0),
+            config.get("matrix_instr_nonkdim", 0),
+            config.get("kpack", 1),
+            config.get("num_ctas", 1),
             q,
             k,
             v,
@@ -776,35 +783,37 @@ def _flash_attn_forward(
             dropout_p,
             philox_seed,
             philox_offset,
-            SEQLEN_Q=max_seqlen_q,
-            SEQLEN_K=max_seqlen_k,
-            IS_CAUSAL=causal,
-            NUM_Q_HEADS=num_q_heads,
-            NUM_K_HEADS=num_k_heads,
-            BLOCK_DMODEL=v_head_dim,
-            BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
-            BLOCK_DMODEL_PE=pe_head_dim,
-            RETURN_SCORES=return_softmax,
-            ENABLE_DROPOUT=enable_dropout,
-            IS_FP8=IS_FP8,
-            FP8_MAX=FP8_MAX,
-            VARLEN=is_varlen,
-            BATCH=batch,
-            NUM_XCD=get_num_xcds(),
-            SWIZZLE=_MHA_SWIZZLE,
-            USE_INT64_STRIDES=use_int64_strides,
-            ENABLE_SINK=sink is not None,
-            SLIDING_WINDOW=sliding_window,
+            max_seqlen_q,
+            max_seqlen_k,
+            causal,
+            num_q_heads,
+            num_k_heads,
+            config["PRELOAD_V"],
+            config["BLOCK_M"],
+            config["BLOCK_N"],
+            v_head_dim,
+            BLOCK_DMODEL_POW2,
+            pe_head_dim,
+            return_softmax,
+            enable_dropout,
+            IS_FP8,
+            FP8_MAX,
+            is_varlen,
+            batch,
+            get_num_xcds(),
+            _MHA_SWIZZLE,
+            use_int64_strides,
+            sink is not None,
+            sliding_window,
             # Soundness precondition: only set when every Q/K/V head-axis
             # stride is a multiple of 8 elements. q_strides[1]/k_strides[1]/
             # v_strides[1] are the head-axis strides in both thd and bshd
             # layouts (see q_strides assembly above).
-            HEAD_STRIDE_ALIGNED_8=(
+            (
                 q_strides[1] % 8 == 0
                 and k_strides[1] % 8 == 0
                 and v_strides[1] % 8 == 0
-            ),
-            **config,
+            ),  # HEAD_STRIDE_ALIGNED_8
         )
 
     return o, softmax_lse, s_dmask, philox_seed, philox_offset
