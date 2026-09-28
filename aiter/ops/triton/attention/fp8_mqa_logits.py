@@ -1,3 +1,4 @@
+import functools
 import inspect
 
 import torch
@@ -106,16 +107,19 @@ _fp8_mqa_logits_kernel_launch = make_launcher(
 )
 
 
-_gluon_fp8_mqa_logits_kernel_launch = make_launcher(
-    _gluon_fp8_mqa_logits_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
+@functools.cache
+def _gluon_fp8_mqa_logits_kernel_launch():
+    # Built on first use: the Gluon kernel is None when its import fails.
+    return make_launcher(
+        _gluon_fp8_mqa_logits_kernel,
+        dynamic_options=(
+            "num_warps",
+            "num_stages",
+            "waves_per_eu",
+            "matrix_instr_nonkdim",
+            "kpack",
+        ),
+    )
 
 
 def fp8_mqa_logits(
@@ -328,7 +332,7 @@ def fp8_mqa_logits(
             grid = ((seq_len + block_m - 1) // block_m,)
 
         dev, stream = current_device_stream()
-        _gluon_fp8_mqa_logits_kernel_launch(
+        _gluon_fp8_mqa_logits_kernel_launch()(
             dev,
             stream,
             grid,

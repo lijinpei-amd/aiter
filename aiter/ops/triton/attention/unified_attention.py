@@ -956,16 +956,19 @@ def _unified_attention_3d_gfx1250(
     )
 
 
-_reduce_segments_gluon_launch = make_launcher(
-    _reduce_segments_kernel_gfx1250,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
+@functools.cache
+def _reduce_segments_gluon_launch():
+    # Built on first use: the Gluon kernel is None when its import fails.
+    return make_launcher(
+        _reduce_segments_kernel_gfx1250,
+        dynamic_options=(
+            "num_warps",
+            "num_stages",
+            "waves_per_eu",
+            "matrix_instr_nonkdim",
+            "kpack",
+        ),
+    )
 
 
 def _reduce_segments_gfx1250(
@@ -981,7 +984,7 @@ def _reduce_segments_gfx1250(
     config = get_unified_attention_config("reduce", params, backend="gluon")
 
     dev, stream = current_device_stream()
-    _reduce_segments_gluon_launch(
+    _reduce_segments_gluon_launch()(
         dev,
         stream,
         (params.num_tokens,),

@@ -1,3 +1,4 @@
+import functools
 from dataclasses import dataclass
 
 import torch
@@ -158,9 +159,10 @@ _reduce_grouped_launch = make_launcher(
 )
 
 
-_reduce_grouped_gluon_launch = make_launcher(
-    _reduce_grouped_gluon, dynamic_options=("num_warps",)
-)
+@functools.cache
+def _reduce_grouped_gluon_launch():
+    # Built on first use: the Gluon kernel is None when its import fails.
+    return make_launcher(_reduce_grouped_gluon, dynamic_options=("num_warps",))
 
 
 def reduce_grouped(
@@ -235,7 +237,7 @@ def reduce_grouped(
             )
         gluon_num_warps = _reduce_grouped_gluon_num_warps(npad)
         dev, stream = current_device_stream()
-        _reduce_grouped_gluon_launch(
+        _reduce_grouped_gluon_launch()(
             dev,
             stream,
             (num_groups,),
