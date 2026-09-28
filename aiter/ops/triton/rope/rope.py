@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
 from enum import IntEnum
 
 import torch
 import triton
 import triton.language as tl
 from intj import make_launcher
-from intj.compat import launch as _intj_launch
 from torch import autograd
 
 from aiter.ops.triton._triton_kernels.rope.rope import (
@@ -925,6 +925,30 @@ _rope_kernel_cached_thd_2c_gqa_onehead_fwd_launch = make_launcher(
 )
 
 
+@functools.cache
+def _rope_kernel_thd_cached_2c_fwd_launch(num_stages):
+    return make_launcher(
+        _rope_kernel_thd_cached_2c_fwd,
+        dynamic_options=(
+            "num_warps",
+            "waves_per_eu",
+        ),
+        options={"num_stages": num_stages},
+    )
+
+
+@functools.cache
+def _rope_kernel_cached_thd_2c_gqa_fwd_launch(num_stages):
+    return make_launcher(
+        _rope_kernel_cached_thd_2c_gqa_fwd,
+        dynamic_options=(
+            "num_warps",
+            "waves_per_eu",
+        ),
+        options={"num_stages": num_stages},
+    )
+
+
 def _rope_cached_thd_2c_fwd(
     x: torch.Tensor,
     y: torch.Tensor,
@@ -994,9 +1018,13 @@ def _rope_cached_thd_2c_fwd(
         waves_per_eu = 0
         num_stages = 2 if SPLIT_H_SIZE > 1 else 1
 
-        _intj_launch(
-            _rope_kernel_thd_cached_2c_fwd,
+        dev, stream = current_device_stream()
+        _rope_kernel_thd_cached_2c_fwd_launch(num_stages)(
+            dev,
+            stream,
             grid,
+            num_warps,
+            waves_per_eu,
             x,
             y,
             cos,
@@ -1012,20 +1040,18 @@ def _rope_cached_thd_2c_fwd(
             *out_x.stride(),
             *out_y.stride(),
             t,
-            HAVE_NOPE=have_nope,
-            NOPE_FIRST=nope_first,
-            INPLACE=inplace,
-            REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
-            IS_NEOX=(rotate_style == RotateStyle.NEOX),
-            HAVE_POS=(positions is not None),
-            HAVE_OFFS=(offsets is not None),
-            BLOCK_T=BLOCK_T,
-            SPLIT_H_SIZE=SPLIT_H_SIZE,
-            BLOCK_D=BLOCK_D,
-            BLOCK_D_HALF=BLOCK_D_HALF,
-            num_warps=num_warps,
-            waves_per_eu=waves_per_eu,
-            num_stages=num_stages,
+            have_nope,
+            nope_first,
+            inplace,
+            reuse_freqs_front_part,
+            rotate_style == RotateStyle.NEOX,
+            positions is not None,
+            offsets is not None,
+            BLOCK_T,
+            SPLIT_H_SIZE,
+            BLOCK_D,
+            BLOCK_D_HALF,
+            num_stages,
         )
     else:
         # TODO check boundary
@@ -1038,9 +1064,13 @@ def _rope_cached_thd_2c_fwd(
             waves_per_eu = 0
             num_stages = 2 if QH_per_G > 1 else 1
 
-            _intj_launch(
-                _rope_kernel_cached_thd_2c_gqa_fwd,
+            dev, stream = current_device_stream()
+            _rope_kernel_cached_thd_2c_gqa_fwd_launch(num_stages)(
+                dev,
+                stream,
                 grid,
+                num_warps,
+                waves_per_eu,
                 x,
                 y,
                 cos,
@@ -1056,20 +1086,18 @@ def _rope_cached_thd_2c_fwd(
                 *out_x.stride(),
                 *out_y.stride(),
                 t,
-                HAVE_NOPE=have_nope,
-                NOPE_FIRST=nope_first,
-                INPLACE=inplace,
-                REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
-                IS_NEOX=(rotate_style == RotateStyle.NEOX),
-                HAVE_POS=(positions is not None),
-                HAVE_OFFS=(offsets is not None),
-                BLOCK_T=BLOCK_T,
-                QH_per_G=QH_per_G,
-                BLOCK_D=BLOCK_D,
-                BLOCK_D_HALF=BLOCK_D_HALF,
-                num_warps=num_warps,
-                waves_per_eu=waves_per_eu,
-                num_stages=num_stages,
+                have_nope,
+                nope_first,
+                inplace,
+                reuse_freqs_front_part,
+                rotate_style == RotateStyle.NEOX,
+                positions is not None,
+                offsets is not None,
+                BLOCK_T,
+                QH_per_G,
+                BLOCK_D,
+                BLOCK_D_HALF,
+                num_stages,
             )
         else:
             BLOCK_T = min(max(triton.next_power_of_2(t), 16), 32)
@@ -1253,6 +1281,30 @@ _rope_kernel_cached_thd_2c_gqa_onehead_bwd_launch = make_launcher(
 )
 
 
+@functools.cache
+def _rope_kernel_thd_cached_2c_bwd_launch(num_stages):
+    return make_launcher(
+        _rope_kernel_thd_cached_2c_bwd,
+        dynamic_options=(
+            "num_warps",
+            "waves_per_eu",
+        ),
+        options={"num_stages": num_stages},
+    )
+
+
+@functools.cache
+def _rope_kernel_cached_thd_2c_gqa_bwd_launch(num_stages):
+    return make_launcher(
+        _rope_kernel_cached_thd_2c_gqa_bwd,
+        dynamic_options=(
+            "num_warps",
+            "waves_per_eu",
+        ),
+        options={"num_stages": num_stages},
+    )
+
+
 def _rope_cached_thd_positions_offsets_2c_bwd(
     x: torch.Tensor,
     y: torch.Tensor,
@@ -1322,9 +1374,13 @@ def _rope_cached_thd_positions_offsets_2c_bwd(
         waves_per_eu = 0
         num_stages = 2 if SPLIT_H_SIZE > 1 else 1
 
-        _intj_launch(
-            _rope_kernel_thd_cached_2c_bwd,
+        dev, stream = current_device_stream()
+        _rope_kernel_thd_cached_2c_bwd_launch(num_stages)(
+            dev,
+            stream,
             grid,
+            num_warps,
+            waves_per_eu,
             x,
             y,
             cos,
@@ -1340,20 +1396,18 @@ def _rope_cached_thd_positions_offsets_2c_bwd(
             *out_x.stride(),
             *out_y.stride(),
             t,
-            HAVE_NOPE=have_nope,
-            NOPE_FIRST=nope_first,
-            INPLACE=inplace,
-            REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
-            IS_NEOX=(rotate_style == RotateStyle.NEOX),
-            HAVE_POS=(positions is not None),
-            HAVE_OFFS=(offsets is not None),
-            BLOCK_T=BLOCK_T,
-            SPLIT_H_SIZE=SPLIT_H_SIZE,
-            BLOCK_D=BLOCK_D,
-            BLOCK_D_HALF=BLOCK_D_HALF,
-            num_warps=num_warps,
-            waves_per_eu=waves_per_eu,
-            num_stages=num_stages,
+            have_nope,
+            nope_first,
+            inplace,
+            reuse_freqs_front_part,
+            rotate_style == RotateStyle.NEOX,
+            positions is not None,
+            offsets is not None,
+            BLOCK_T,
+            SPLIT_H_SIZE,
+            BLOCK_D,
+            BLOCK_D_HALF,
+            num_stages,
         )
     else:
         # TODO check boundary
@@ -1366,9 +1420,13 @@ def _rope_cached_thd_positions_offsets_2c_bwd(
             waves_per_eu = 0
             num_stages = 2 if QH_per_G > 1 else 1
 
-            _intj_launch(
-                _rope_kernel_cached_thd_2c_gqa_bwd,
+            dev, stream = current_device_stream()
+            _rope_kernel_cached_thd_2c_gqa_bwd_launch(num_stages)(
+                dev,
+                stream,
                 grid,
+                num_warps,
+                waves_per_eu,
                 x,
                 y,
                 cos,
@@ -1384,20 +1442,18 @@ def _rope_cached_thd_positions_offsets_2c_bwd(
                 *out_x.stride(),
                 *out_y.stride(),
                 t,
-                HAVE_NOPE=have_nope,
-                NOPE_FIRST=nope_first,
-                INPLACE=inplace,
-                REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
-                IS_NEOX=(rotate_style == RotateStyle.NEOX),
-                HAVE_POS=(positions is not None),
-                HAVE_OFFS=(offsets is not None),
-                BLOCK_T=BLOCK_T,
-                QH_per_G=QH_per_G,
-                BLOCK_D=BLOCK_D,
-                BLOCK_D_HALF=BLOCK_D_HALF,
-                num_warps=num_warps,
-                waves_per_eu=waves_per_eu,
-                num_stages=num_stages,
+                have_nope,
+                nope_first,
+                inplace,
+                reuse_freqs_front_part,
+                rotate_style == RotateStyle.NEOX,
+                positions is not None,
+                offsets is not None,
+                BLOCK_T,
+                QH_per_G,
+                BLOCK_D,
+                BLOCK_D_HALF,
+                num_stages,
             )
         else:
             BLOCK_T = min(max(triton.next_power_of_2(t), 16), 32)

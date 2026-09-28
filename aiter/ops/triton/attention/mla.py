@@ -1,10 +1,11 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
+import functools
 import math
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.attention.mla import (
     _mla_decode_fwd_kernel as triton_mla_decode_fwd_kernel,
@@ -15,7 +16,7 @@ from aiter.ops.triton._triton_kernels.attention.mla import (
 from aiter.ops.triton._triton_kernels.attention.mla import (
     _mla_prefill_fwd_kernel as triton_mla_prefill_fwd_kernel,
 )
-from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.ops.triton.utils.device_info import current_device_stream, get_num_sms
 
 try:
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
@@ -127,6 +128,32 @@ def select_3d_config(
     return attn_config, reduce_config
 
 
+@functools.cache
+def _gluon_mla_prefill_fwd_kernel_non_pipelined_launch(num_warps, num_stages):
+    return make_launcher(
+        gluon_mla_prefill_fwd_kernel_non_pipelined,
+        dynamic_options=(
+            "waves_per_eu",
+            "matrix_instr_nonkdim",
+            "kpack",
+        ),
+        options={"num_warps": num_warps, "num_stages": num_stages},
+    )
+
+
+@functools.cache
+def _triton_mla_prefill_fwd_kernel_launch(num_warps, num_stages):
+    return make_launcher(
+        triton_mla_prefill_fwd_kernel,
+        dynamic_options=(
+            "waves_per_eu",
+            "matrix_instr_nonkdim",
+            "kpack",
+        ),
+        options={"num_warps": num_warps, "num_stages": num_stages},
+    )
+
+
 def mla_prefill_fwd(
     q,  # [num_tokens_per_seq * num_seqs, num_query_heads, qk_lora_rank + qk_rope_head_dim]
     kv_buffer,  # [num_blocks, block_size, num_kv_heads, qk_lora_rank + qk_rope_head_dim]
@@ -194,72 +221,152 @@ def mla_prefill_fwd(
     )
 
     if IS_DEVICE_ARCH_GFX12:
-        _intj_launch(gluon_mla_prefill_fwd_kernel_non_pipelined, (num_kv_heads, total_num_q_blocks),
-            output_ptr=out,
-            query_ptr=q,
-            kv_buffer_ptr=kv_buffer,
-            block_tables_ptr=block_tables,
-            seq_lens_ptr=seqused_k,
-            SCALE=softmax_scale,
-            q_scale_ptr=q_descale,
-            kv_scale_ptr=kv_descale,
-            out_scale_ptr=out_scale,
-            num_query_heads=num_query_heads,
-            num_kv_heads=num_kv_heads,
-            block_tables_stride=block_tables.stride(0),
-            query_stride_0=q.stride(0),
-            query_stride_1=q.stride(1),
-            output_stride_0=out.stride(0),
-            output_stride_1=out.stride(1),
-            KV_LORA_RANK=kv_lora_rank,
-            QK_ROPE_HEAD_DIM=qk_rope_head_dim,
-            stride_kv_buffer_0=kv_buffer.stride(0),
-            stride_kv_buffer_1=kv_buffer.stride(1),
-            stride_kv_buffer_2=kv_buffer.stride(2),
-            stride_kv_buffer_3=kv_buffer.stride(3),
-            query_start_len_ptr=cu_seqlens_q,
-            num_seqs=num_seqs,
-            BLOCK_Q=BLOCK_Q,
-            BLOCK_M=BLOCK_M,
-            NUM_HEAD_BLOCKS=NUM_HEAD_BLOCKS,
-            WARP_SIZE=WARP_SIZE,
-            QUERY_DTYPE=QUERY_DTYPE,
-            KV_CACHE_DTYPE=KV_CACHE_DTYPE,
-            K_WIDTH=K_WIDTH,
-            **attn_config,
+        dev, stream = current_device_stream()
+        _gluon_mla_prefill_fwd_kernel_non_pipelined_launch(
+            attn_config.get("num_warps", 4), attn_config.get("num_stages", 2)
+        )(
+            dev,
+            stream,
+            (num_kv_heads, total_num_q_blocks),
+            attn_config.get("waves_per_eu", 0),
+            attn_config.get("matrix_instr_nonkdim", 0),
+            attn_config.get("kpack", 1),
+            out,
+            q,
+            kv_buffer,
+            block_tables,
+            seqused_k,
+            softmax_scale,
+            q_descale,
+            kv_descale,
+            out_scale,
+            num_query_heads,
+            num_kv_heads,
+            block_tables.stride(0),
+            q.stride(0),
+            q.stride(1),
+            out.stride(0),
+            out.stride(1),
+            kv_lora_rank,
+            qk_rope_head_dim,
+            kv_buffer.stride(0),
+            kv_buffer.stride(1),
+            kv_buffer.stride(2),
+            kv_buffer.stride(3),
+            cu_seqlens_q,
+            num_seqs,
+            attn_config["TILE_SIZE"],
+            BLOCK_Q,
+            BLOCK_M,
+            WARP_SIZE,
+            attn_config["num_warps"],
+            attn_config["num_stages"],
+            NUM_HEAD_BLOCKS,
+            QUERY_DTYPE,
+            KV_CACHE_DTYPE,
+            K_WIDTH,
+            attn_config.get("FP8_MIN", -240.0),
+            attn_config.get("FP8_MAX", 240.0),
         )
     else:
-        _intj_launch(triton_mla_prefill_fwd_kernel, (num_kv_heads, total_num_q_blocks),
-            output_ptr=out,
-            query_ptr=q,
-            kv_buffer_ptr=kv_buffer,
-            block_tables_ptr=block_tables,
-            seq_lens_ptr=seqused_k,
-            scale=softmax_scale,
-            q_scale_ptr=q_descale,
-            kv_scale_ptr=kv_descale,
-            out_scale_ptr=out_scale,
-            num_query_heads=num_query_heads,
-            num_kv_heads=num_kv_heads,
-            block_tables_stride=block_tables.stride(0),
-            query_stride_0=q.stride(0),
-            query_stride_1=q.stride(1),
-            output_stride_0=out.stride(0),
-            output_stride_1=out.stride(1),
-            KV_LORA_RANK=kv_lora_rank,
-            QK_ROPE_HEAD_DIM=qk_rope_head_dim,
-            stride_kv_buffer_0=kv_buffer.stride(0),
-            stride_kv_buffer_1=kv_buffer.stride(1),
-            stride_kv_buffer_2=kv_buffer.stride(2),
-            stride_kv_buffer_3=kv_buffer.stride(3),
-            query_start_len_ptr=cu_seqlens_q,
-            num_seqs=num_seqs,
-            BLOCK_Q=BLOCK_Q,
-            BLOCK_M=BLOCK_M,
-            NUM_HEAD_BLOCKS=NUM_HEAD_BLOCKS,
-            **attn_config,
+        dev, stream = current_device_stream()
+        _triton_mla_prefill_fwd_kernel_launch(
+            attn_config.get("num_warps", 4), attn_config.get("num_stages", 2)
+        )(
+            dev,
+            stream,
+            (num_kv_heads, total_num_q_blocks),
+            attn_config.get("waves_per_eu", 0),
+            attn_config.get("matrix_instr_nonkdim", 0),
+            attn_config.get("kpack", 1),
+            out,
+            q,
+            kv_buffer,
+            block_tables,
+            seqused_k,
+            softmax_scale,
+            q_descale,
+            kv_descale,
+            out_scale,
+            num_query_heads,
+            num_kv_heads,
+            block_tables.stride(0),
+            q.stride(0),
+            q.stride(1),
+            out.stride(0),
+            out.stride(1),
+            kv_lora_rank,
+            qk_rope_head_dim,
+            kv_buffer.stride(0),
+            kv_buffer.stride(1),
+            kv_buffer.stride(2),
+            kv_buffer.stride(3),
+            cu_seqlens_q,
+            num_seqs,
+            attn_config["TILE_SIZE"],
+            BLOCK_Q,
+            BLOCK_M,
+            attn_config["num_warps"],
+            attn_config["num_stages"],
+            NUM_HEAD_BLOCKS,
+            attn_config.get("FP8_MIN", -240.0),
+            attn_config.get("FP8_MAX", 240.0),
         )
     return out
+
+
+@functools.cache
+def _gluon_mla_decode_fwd_kernel_launch(num_warps, num_stages):
+    return make_launcher(
+        gluon_mla_decode_fwd_kernel,
+        dynamic_options=(
+            "waves_per_eu",
+            "matrix_instr_nonkdim",
+            "kpack",
+        ),
+        options={"num_warps": num_warps, "num_stages": num_stages},
+    )
+
+
+@functools.cache
+def _gluon_mla_decode_fwd_kernel_non_pipelined_launch(num_warps, num_stages):
+    return make_launcher(
+        gluon_mla_decode_fwd_kernel_non_pipelined,
+        dynamic_options=(
+            "waves_per_eu",
+            "matrix_instr_nonkdim",
+            "kpack",
+        ),
+        options={"num_warps": num_warps, "num_stages": num_stages},
+    )
+
+
+@functools.cache
+def _triton_mla_decode_fwd_kernel_launch(num_warps, num_stages, waves_per_eu):
+    return make_launcher(
+        triton_mla_decode_fwd_kernel,
+        dynamic_options=(
+            "matrix_instr_nonkdim",
+            "kpack",
+        ),
+        options={
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+            "waves_per_eu": waves_per_eu,
+        },
+    )
+
+
+_triton_mla_decode_fwd_reduce_kernel_launch = make_launcher(
+    triton_mla_decode_fwd_reduce_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 def mla_decode_fwd(
@@ -404,91 +511,169 @@ def mla_decode_fwd(
 
     if IS_DEVICE_ARCH_GFX12:
         if shuffled_kv_cache:
-            impl = gluon_mla_decode_fwd_kernel
+            dev, stream = current_device_stream()
+            _gluon_mla_decode_fwd_kernel_launch(
+                attn_config.get("num_warps", 4), attn_config.get("num_stages", 2)
+            )(
+                dev,
+                stream,
+                (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS),
+                attn_config.get("waves_per_eu", 0),
+                attn_config.get("matrix_instr_nonkdim", 0),
+                attn_config.get("kpack", 1),
+                segm_output,
+                segm_max,
+                segm_expsum,
+                q,
+                q_scales,
+                kv_buffer,
+                block_tables,
+                seqused_k,
+                softmax_scale,
+                q_descale,
+                kv_descale,
+                out_scale if (out_scale is not None and NUM_SEGMENTS == 1) else None,
+                num_query_heads,
+                num_kv_heads,
+                block_tables.stride(0),
+                q.stride(0),
+                q.stride(1),
+                q_scales.stride(0) if q_scales is not None else 0,
+                q_scales.stride(1) if q_scales is not None else 0,
+                kv_lora_rank,
+                qk_rope_head_dim,
+                kv_buffer.stride(0),
+                kv_buffer.stride(1),
+                kv_buffer.stride(2),
+                kv_buffer.stride(3),
+                cu_seqlens_q,
+                num_tokens_per_seq,
+                num_blocks,
+                attn_config["TILE_SIZE"],
+                BLOCK_Q,
+                BLOCK_M,
+                attn_config["NUM_SEGMENTS_PER_SEQ"],
+                WARP_SIZE,
+                attn_config["num_warps"],
+                attn_config["num_stages"],
+                shuffled_kv_cache,
+                ALL_DECODE,
+                K_WIDTH,
+                SCALE_K_WIDTH_LORA,
+                SCALE_K_WIDTH_ROPE,
+                QUERY_DTYPE,
+                KV_CACHE_DTYPE,
+                BLOCK_SCALES_SIZE,
+                NUM_HEAD_BLOCKS,
+                attn_config.get("FP8_MIN", -240.0),
+                attn_config.get("FP8_MAX", 240.0),
+            )
         else:
-            impl = gluon_mla_decode_fwd_kernel_non_pipelined
-
-        _intj_launch(impl, (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS),
-            segm_output_ptr=segm_output,
-            segm_max_ptr=segm_max,
-            segm_expsum_ptr=segm_expsum,
-            query_ptr=q,
-            query_scales_ptr=q_scales,
-            kv_buffer_ptr=kv_buffer,
-            block_tables_ptr=block_tables,
-            seq_lens_ptr=seqused_k,
-            SCALE=softmax_scale,
-            q_scale_ptr=q_descale,
-            kv_scale_ptr=kv_descale,
-            out_scale_ptr=(
-                out_scale if (out_scale is not None and NUM_SEGMENTS == 1) else None
-            ),
-            num_query_heads=num_query_heads,
-            num_kv_heads=num_kv_heads,
-            block_tables_stride=block_tables.stride(0),
-            query_stride_0=q.stride(0),
-            query_stride_1=q.stride(1),
-            query_scales_stride_0=q_scales.stride(0) if q_scales is not None else 0,
-            query_scales_stride_1=q_scales.stride(1) if q_scales is not None else 0,
-            KV_LORA_RANK=kv_lora_rank,
-            QK_ROPE_HEAD_DIM=qk_rope_head_dim,
-            stride_kv_buffer_0=kv_buffer.stride(0),
-            stride_kv_buffer_1=kv_buffer.stride(1),
-            stride_kv_buffer_2=kv_buffer.stride(2),
-            stride_kv_buffer_3=kv_buffer.stride(3),
-            query_start_len_ptr=cu_seqlens_q,
-            num_tokens_per_seq=num_tokens_per_seq,
-            num_blocks=num_blocks,
-            WARP_SIZE=WARP_SIZE,
-            BLOCK_Q=BLOCK_Q,
-            BLOCK_M=BLOCK_M,
-            ALL_DECODE=ALL_DECODE,
-            SHUFFLED_KV_CACHE=shuffled_kv_cache,
-            K_WIDTH=K_WIDTH,
-            SCALE_K_WIDTH_LORA=SCALE_K_WIDTH_LORA,
-            SCALE_K_WIDTH_ROPE=SCALE_K_WIDTH_ROPE,
-            QUERY_DTYPE=QUERY_DTYPE,
-            KV_CACHE_DTYPE=KV_CACHE_DTYPE,
-            BLOCK_SCALES_SIZE=BLOCK_SCALES_SIZE,
-            NUM_HEAD_BLOCKS=NUM_HEAD_BLOCKS,
-            **attn_config,
-        )
+            dev, stream = current_device_stream()
+            _gluon_mla_decode_fwd_kernel_non_pipelined_launch(
+                attn_config.get("num_warps", 4), attn_config.get("num_stages", 2)
+            )(
+                dev,
+                stream,
+                (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS),
+                attn_config.get("waves_per_eu", 0),
+                attn_config.get("matrix_instr_nonkdim", 0),
+                attn_config.get("kpack", 1),
+                segm_output,
+                segm_max,
+                segm_expsum,
+                q,
+                q_scales,
+                kv_buffer,
+                block_tables,
+                seqused_k,
+                softmax_scale,
+                q_descale,
+                kv_descale,
+                out_scale if (out_scale is not None and NUM_SEGMENTS == 1) else None,
+                num_query_heads,
+                num_kv_heads,
+                block_tables.stride(0),
+                q.stride(0),
+                q.stride(1),
+                q_scales.stride(0) if q_scales is not None else 0,
+                q_scales.stride(1) if q_scales is not None else 0,
+                kv_lora_rank,
+                qk_rope_head_dim,
+                kv_buffer.stride(0),
+                kv_buffer.stride(1),
+                kv_buffer.stride(2),
+                kv_buffer.stride(3),
+                cu_seqlens_q,
+                num_tokens_per_seq,
+                num_blocks,
+                attn_config["TILE_SIZE"],
+                BLOCK_Q,
+                BLOCK_M,
+                attn_config["NUM_SEGMENTS_PER_SEQ"],
+                WARP_SIZE,
+                attn_config["num_warps"],
+                attn_config["num_stages"],
+                NUM_HEAD_BLOCKS,
+                shuffled_kv_cache,
+                ALL_DECODE,
+                K_WIDTH,
+                SCALE_K_WIDTH_LORA,
+                SCALE_K_WIDTH_ROPE,
+                QUERY_DTYPE,
+                KV_CACHE_DTYPE,
+                BLOCK_SCALES_SIZE,
+            )
     else:
-        _intj_launch(triton_mla_decode_fwd_kernel, (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS),
-            segm_output_ptr=segm_output,
-            segm_max_ptr=segm_max,
-            segm_expsum_ptr=segm_expsum,
-            query_ptr=q,
-            query_scales_ptr=q_scales,
-            kv_buffer_ptr=kv_buffer,
-            block_tables_ptr=block_tables,
-            seq_lens_ptr=seqused_k,
-            scale=softmax_scale,
-            q_scale_ptr=q_descale,
-            kv_scale_ptr=kv_descale,
-            num_query_heads=num_query_heads,
-            num_kv_heads=num_kv_heads,
-            block_tables_stride=block_tables.stride(0),
-            query_stride_0=q.stride(0),
-            query_stride_1=q.stride(1),
-            query_scales_stride_0=q_scales.stride(0) if q_scales is not None else 0,
-            query_scales_stride_1=q_scales.stride(1) if q_scales is not None else 0,
-            KV_LORA_RANK=kv_lora_rank,
-            QK_ROPE_HEAD_DIM=qk_rope_head_dim,
-            stride_kv_buffer_0=kv_buffer.stride(0),
-            stride_kv_buffer_1=kv_buffer.stride(1),
-            stride_kv_buffer_2=kv_buffer.stride(2),
-            stride_kv_buffer_3=kv_buffer.stride(3),
-            query_start_len_ptr=cu_seqlens_q,
-            num_tokens_per_seq=num_tokens_per_seq,
-            BLOCK_Q=BLOCK_Q,
-            BLOCK_M=BLOCK_M,
-            NUM_HEAD_BLOCKS=NUM_HEAD_BLOCKS,
-            ALL_DECODE=ALL_DECODE,
-            SHUFFLED_KV_CACHE=shuffled_kv_cache,
-            IS_Q_FP8=(q_dtype == e4m3_dtype),
-            IS_KV_FP8=(kv_buffer_dtype == e4m3_dtype),
-            **attn_config,
+        dev, stream = current_device_stream()
+        _triton_mla_decode_fwd_kernel_launch(
+            attn_config.get("num_warps", 4),
+            attn_config.get("num_stages", 2),
+            attn_config.get("waves_per_eu", 0),
+        )(
+            dev,
+            stream,
+            (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS),
+            attn_config.get("matrix_instr_nonkdim", 0),
+            attn_config.get("kpack", 1),
+            segm_output,
+            segm_max,
+            segm_expsum,
+            q,
+            q_scales,
+            kv_buffer,
+            block_tables,
+            seqused_k,
+            softmax_scale,
+            q_descale,
+            kv_descale,
+            num_query_heads,
+            num_kv_heads,
+            block_tables.stride(0),
+            q.stride(0),
+            q.stride(1),
+            q_scales.stride(0) if q_scales is not None else 0,
+            q_scales.stride(1) if q_scales is not None else 0,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            kv_buffer.stride(0),
+            kv_buffer.stride(1),
+            kv_buffer.stride(2),
+            kv_buffer.stride(3),
+            cu_seqlens_q,
+            num_tokens_per_seq,
+            attn_config["TILE_SIZE"],
+            BLOCK_Q,
+            BLOCK_M,
+            attn_config["NUM_SEGMENTS_PER_SEQ"],
+            attn_config["num_warps"],
+            attn_config["waves_per_eu"],
+            attn_config["num_stages"],
+            NUM_HEAD_BLOCKS,
+            ALL_DECODE,
+            shuffled_kv_cache,
+            q_dtype == e4m3_dtype,
+            kv_buffer_dtype == e4m3_dtype,
         )
 
     if NUM_SEGMENTS == 1:
@@ -502,26 +687,36 @@ def mla_decode_fwd(
     # else:
     #     _reduce_kernel = triton_mla_decode_fwd_reduce_kernel
 
-    _reduce_kernel = triton_mla_decode_fwd_reduce_kernel
-
-    _intj_launch(_reduce_kernel, (total_num_tokens, num_query_heads),
-        output_ptr=out,
-        segm_output_ptr=segm_output,
-        segm_max_ptr=segm_max,
-        segm_expsum_ptr=segm_expsum,
-        seq_lens_ptr=seqused_k,
-        out_scale_ptr=out_scale,
-        num_seqs=num_seqs,
-        num_query_heads=num_query_heads,
-        output_stride_0=out.stride(0),
-        output_stride_1=out.stride(1),
-        block_tables_stride=block_tables.stride(0),
-        num_tokens_per_seq=num_tokens_per_seq,
-        total_num_tokens=total_num_tokens,
-        KV_LORA_RANK=kv_lora_rank,
-        query_start_len_ptr=cu_seqlens_q,
-        BLOCK_Q=BLOCK_Q,
-        ALL_DECODE=ALL_DECODE,
-        **reduce_config,
+    dev, stream = current_device_stream()
+    _triton_mla_decode_fwd_reduce_kernel_launch(
+        dev,
+        stream,
+        (total_num_tokens, num_query_heads),
+        reduce_config.get("num_warps", 4),
+        reduce_config.get("num_stages", 2),
+        reduce_config.get("waves_per_eu", 0),
+        reduce_config.get("matrix_instr_nonkdim", 0),
+        reduce_config.get("kpack", 1),
+        out,
+        segm_output,
+        segm_max,
+        segm_expsum,
+        seqused_k,
+        out_scale,
+        num_seqs,
+        num_query_heads,
+        out.stride(0),
+        out.stride(1),
+        block_tables.stride(0),
+        num_tokens_per_seq,
+        total_num_tokens,
+        reduce_config["TILE_SIZE"],
+        kv_lora_rank,
+        cu_seqlens_q,
+        BLOCK_Q,
+        reduce_config["NUM_SEGMENTS_PER_SEQ"],
+        ALL_DECODE,
+        reduce_config.get("FP8_MIN", -240.0),
+        reduce_config.get("FP8_MAX", 240.0),
     )
     return out

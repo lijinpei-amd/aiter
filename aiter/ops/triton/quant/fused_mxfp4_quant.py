@@ -23,7 +23,6 @@ from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.device_info import current_device_stream
-from aiter.ops.triton.utils.intj_tuned import launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.utility import dtypes
 
@@ -31,6 +30,7 @@ _LOGGER = AiterTritonLogger()
 
 
 _fused_rms_mxfp4_quant_launch = make_launcher(_fused_rms_mxfp4_quant_kernel, grid_arg=1)
+_gluon_fused_rms_mxfp4_quant_launch = make_launcher(_gluon_fused_rms_mxfp4_quant_kernel)
 
 
 def fused_rms_mxfp4_quant(
@@ -180,12 +180,14 @@ def fused_rms_mxfp4_quant(
         while ROWS_PER_CTA > 1 and M % ROWS_PER_CTA != 0:
             ROWS_PER_CTA //= 2
         grid = (triton.cdiv(M, ROWS_PER_CTA) * (1 if x2 is None else 2),)
-        launch_tuned(
-            _gluon_fused_rms_mxfp4_quant_kernel,
+        dev, stream = current_device_stream()
+        _gluon_fused_rms_mxfp4_quant_launch(
+            dev,
+            stream,
             grid,
             *_common_args,
-            **_common_kwargs,
-            ROWS_PER_CTA=ROWS_PER_CTA,
+            *_common_kwargs.values(),  # built in kernel parameter order
+            ROWS_PER_CTA,
         )
     else:
         dev, stream = current_device_stream()
@@ -251,6 +253,13 @@ def fused_flatten_mxfp4_quant(
     )
 
     return out, out_block_scales
+
+
+_fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel_launch = make_launcher(
+    _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel,
+    dynamic_options=("num_warps",),
+    options={"waves_per_eu": 0, "num_stages": 1},
+)
 
 
 def fused_reduce_act_mul_and_mxfp4_quant(
@@ -387,9 +396,12 @@ def fused_reduce_act_mul_and_mxfp4_quant(
         num_pid += triton.cdiv(M, BLOCK_SIZE_M2) * triton.cdiv(N2, BLOCK_SIZE_N2)
 
     grid = (num_pid,)
-    launch_tuned(
-        _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel,
+    dev, stream = current_device_stream()
+    _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel_launch(
+        dev,
+        stream,
         grid,
+        NUM_WARPS,
         x,
         y,
         y_scale,
@@ -407,28 +419,25 @@ def fused_reduce_act_mul_and_mxfp4_quant(
         0 if not X_HAS_SPLITK else x2.stride(2),
         0 if not X_HAS_SPLITK else y2.stride(0),
         0 if not X_HAS_SPLITK else y2.stride(1),
-        M=M,
-        N1=N_half,
-        N2=N2,
-        BLOCK_SIZE_M1=BLOCK_SIZE_M1,
-        BLOCK_SIZE_N1=BLOCK_SIZE_N1,
-        BLOCK_SIZE_M2=BLOCK_SIZE_M2,
-        BLOCK_SIZE_N2=BLOCK_SIZE_N2,
-        NUM_ITER=NUM_ITER,
-        NUM_STAGES=NUM_STAGES,
-        MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
-        SCALING_MODE=0,
-        ACTIVATION=_get_activation_from_str(activation) if activation else "",
-        scaleN=scaleN_valid,
-        scaleM_pad=(scaleM if use_scale_shuffle_padding else 1),
-        scaleN_pad=scaleN,
-        SHUFFLE=shuffle,
-        X_HAS_SPLITK=X_HAS_SPLITK,
-        X_NUM_KSPLIT=x_num_splitk,
-        X_NUM_KSPLIT_POW2=triton.next_power_of_2(x_num_splitk),
-        num_warps=NUM_WARPS,
-        waves_per_eu=0,
-        num_stages=1,
+        M,
+        N_half,
+        N2,
+        BLOCK_SIZE_M1,
+        BLOCK_SIZE_N1,
+        BLOCK_SIZE_M2,
+        BLOCK_SIZE_N2,
+        NUM_ITER,
+        NUM_STAGES,
+        MXFP4_QUANT_BLOCK_SIZE,
+        0,
+        _get_activation_from_str(activation) if activation else "",
+        scaleN_valid,
+        scaleM if use_scale_shuffle_padding else 1,
+        scaleN,
+        shuffle,
+        X_HAS_SPLITK,
+        x_num_splitk,
+        triton.next_power_of_2(x_num_splitk),
     )
 
     return (y, y_scale), y2

@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
 import os
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
     _fused_qk_rope_cat_and_cache_mla_kernel as triton_fused_qk_rope_cat_and_cache_mla_kernel,
@@ -39,9 +39,15 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 _triton_cat_and_cache_mla_launch = make_launcher(
     triton_fused_qk_rope_cat_and_cache_mla_kernel, options={"num_warps": 1}
 )
-_gluon_cat_and_cache_mla_launch = make_launcher(
-    gluon_fused_qk_rope_cat_and_cache_mla_kernel, options={"num_warps": 1}
-)
+
+
+@functools.cache
+def _gluon_cat_and_cache_mla_launch():
+    # The Gluon kernel is None when its gfx1250 module fails to import.
+    return make_launcher(
+        gluon_fused_qk_rope_cat_and_cache_mla_kernel, options={"num_warps": 1}
+    )
+
 
 _LOGGER = AiterTritonLogger()
 
@@ -282,7 +288,7 @@ def fused_qk_rope_cat_and_cache_mla(
     n_pid = b * qh + (b_slot - b) * kh
     grid = (n_pid, 1, 1)
     if DEVICE_ARCH == "gfx1250":
-        _kernel = _gluon_cat_and_cache_mla_launch
+        _kernel = _gluon_cat_and_cache_mla_launch()
     else:
         _kernel = _triton_cat_and_cache_mla_launch
 
@@ -340,6 +346,18 @@ def fused_qk_rope_cat_and_cache_mla(
     )
 
     return q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out
+
+
+@functools.cache
+def _gluon_fused_qk_rope_reshape_and_cache_kernel_launch():
+    return make_launcher(
+        gluon_fused_qk_rope_reshape_and_cache_kernel, options={"num_warps": 1}
+    )
+
+
+_triton_fused_qk_rope_reshape_and_cache_kernel_launch = make_launcher(
+    triton_fused_qk_rope_reshape_and_cache_kernel, options={"num_warps": 1}
+)
 
 
 def fused_qk_rope_reshape_and_cache(
@@ -570,8 +588,7 @@ def fused_qk_rope_reshape_and_cache(
         else:
             BLOCK_T = 16
         n_pid = triton.cdiv(t, BLOCK_T) * qh + triton.cdiv(t_slot - t, BLOCK_T) * kh
-        _kernel = gluon_fused_qk_rope_reshape_and_cache_kernel
-        _extra_args = {"BLOCK_T": BLOCK_T}
+        use_gluon = True
     else:
         # 1 q-head per program is 2B/lane; tile heads once the grid is big enough.
         BLOCK_H = 1
@@ -582,74 +599,137 @@ def fused_qk_rope_reshape_and_cache(
                     BLOCK_H = cand
                     break
         n_pid = t * (qh // BLOCK_H) + (t_slot - t) * kh
-        _kernel = triton_fused_qk_rope_reshape_and_cache_kernel
-        _extra_args = {
-            "BLOCK_H": BLOCK_H,
-            "KH_BLOCK": max(1, BLOCK_H // (qh // kh)),
-        }
+        use_gluon = False
     grid = (n_pid, 1, 1)
-    _intj_launch(
-        _kernel,
-        grid,
-        q,
-        k,
-        v,
-        pos,
-        cos,
-        sin,
-        offs,
-        key_cache,
-        value_cache,
-        slot_mapping,
-        q_out,
-        k_out,
-        zeros_out,
-        t,
-        t_slot,
-        max_embd_pos,
-        *q.stride(),
-        *k.stride(),
-        *v.stride(),
-        cos.stride(0),
-        cos.stride(-1),
-        *q_out.stride(),
-        *k_out.stride(),
-        key_cache_stride_t,
-        key_cache_stride_h,
-        key_cache_stride_d,
-        key_cache_stride_b,
-        key_cache_stride_x,
-        value_cache_stride_t,
-        value_cache_stride_h,
-        value_cache_stride_d,
-        value_cache_stride_b,
-        value_cache_stride_slot_chunk,
-        value_cache_stride_x,
-        zeros_out.stride(0) if zeros_out is not None else 0,
-        zeros_out.stride(1) if zeros_out is not None else 0,
-        zeros_out.stride(2) if zeros_out is not None else 0,
-        k_scale_ptr=k_scale,
-        v_scale_ptr=v_scale,
-        QH_PER_KH=qh // kh,
-        QH=qh,
-        KH=kh,
-        REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
-        IS_NEOX=is_neox,
-        BLOCK_D_pe=d,
-        BLOCK_D_HALF_pe=d // 2,
-        BLOCK_SIZE=block_size,
-        X_SIZE=x_cache if not flash_layout else 0,
-        SCALE_K_WIDTH=SCALE_K_WIDTH,
-        FLASH_LAYOUT=flash_layout,
-        VALUE_SHUFFLE_LAYOUT=value_shuffle_layout,
-        HAVE_POS=(offs is not None),
-        HAVE_K_SCALE=(k_scale is not None and apply_scale),
-        HAVE_V_SCALE=(v_scale is not None and apply_scale),
-        HAVE_ZEROS=output_zeros,
-        UPCAST_OPERAND=upcast_operand,
-        num_warps=1,
-        **_extra_args,
-    )
+    if use_gluon:
+        dev, stream = current_device_stream()
+        _gluon_fused_qk_rope_reshape_and_cache_kernel_launch()(
+            dev,
+            stream,
+            grid,
+            q,
+            k,
+            v,
+            pos,
+            cos,
+            sin,
+            offs,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            q_out,
+            k_out,
+            zeros_out,
+            t,
+            t_slot,
+            max_embd_pos,
+            *q.stride(),
+            *k.stride(),
+            *v.stride(),
+            cos.stride(0),
+            cos.stride(-1),
+            *q_out.stride(),
+            *k_out.stride(),
+            key_cache_stride_t,
+            key_cache_stride_h,
+            key_cache_stride_d,
+            key_cache_stride_b,
+            key_cache_stride_x,
+            value_cache_stride_t,
+            value_cache_stride_h,
+            value_cache_stride_d,
+            value_cache_stride_b,
+            value_cache_stride_slot_chunk,
+            value_cache_stride_x,
+            zeros_out.stride(0) if zeros_out is not None else 0,
+            zeros_out.stride(1) if zeros_out is not None else 0,
+            zeros_out.stride(2) if zeros_out is not None else 0,
+            k_scale,
+            v_scale,
+            qh // kh,
+            qh,
+            kh,
+            reuse_freqs_front_part,
+            is_neox,
+            d,
+            d // 2,
+            block_size,
+            x_cache if not flash_layout else 0,
+            SCALE_K_WIDTH,
+            flash_layout,
+            value_shuffle_layout,
+            offs is not None,
+            k_scale is not None and apply_scale,
+            v_scale is not None and apply_scale,
+            output_zeros,
+            upcast_operand,
+            BLOCK_T,
+        )
+    else:
+        dev, stream = current_device_stream()
+        _triton_fused_qk_rope_reshape_and_cache_kernel_launch(
+            dev,
+            stream,
+            grid,
+            q,
+            k,
+            v,
+            pos,
+            cos,
+            sin,
+            offs,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            q_out,
+            k_out,
+            zeros_out,
+            t,
+            t_slot,
+            max_embd_pos,
+            *q.stride(),
+            *k.stride(),
+            *v.stride(),
+            cos.stride(0),
+            cos.stride(-1),
+            *q_out.stride(),
+            *k_out.stride(),
+            key_cache_stride_t,
+            key_cache_stride_h,
+            key_cache_stride_d,
+            key_cache_stride_b,
+            key_cache_stride_x,
+            value_cache_stride_t,
+            value_cache_stride_h,
+            value_cache_stride_d,
+            value_cache_stride_b,
+            value_cache_stride_slot_chunk,
+            value_cache_stride_x,
+            zeros_out.stride(0) if zeros_out is not None else 0,
+            zeros_out.stride(1) if zeros_out is not None else 0,
+            zeros_out.stride(2) if zeros_out is not None else 0,
+            k_scale,
+            v_scale,
+            qh // kh,
+            qh,
+            kh,
+            reuse_freqs_front_part,
+            is_neox,
+            d,
+            d // 2,
+            block_size,
+            x_cache if not flash_layout else 0,
+            SCALE_K_WIDTH,
+            flash_layout,
+            value_shuffle_layout,
+            offs is not None,
+            k_scale is not None and apply_scale,
+            v_scale is not None and apply_scale,
+            output_zeros,
+            upcast_operand,
+            BLOCK_H,
+            max(1, BLOCK_H // (qh // kh)),
+        )
 
     if zeros_out is not None:
         return q_out, k_out, key_cache, value_cache, zeros_out

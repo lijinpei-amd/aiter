@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
 import os
 
 import torch
 import triton
 from intj import make_launcher
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_a16w16 import (
     _fused_gemm_afp4wfp4_a16w16_kernel,
@@ -27,6 +27,38 @@ _LOGGER = AiterTritonLogger()
 _fused_gemm_afp4wfp4_a16w16_reduce_kernel_launch = make_launcher(
     _fused_gemm_afp4wfp4_a16w16_reduce_kernel,
 )
+
+
+@functools.cache
+def _fused_gemm_afp4wfp4_preshuffle_a16w16_kernel_launch(
+    num_warps, num_stages, waves_per_eu, matrix_instr_nonkdim
+):
+    return make_launcher(
+        _fused_gemm_afp4wfp4_preshuffle_a16w16_kernel,
+        dynamic_options=("kpack",),
+        options={
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+            "waves_per_eu": waves_per_eu,
+            "matrix_instr_nonkdim": matrix_instr_nonkdim,
+        },
+    )
+
+
+@functools.cache
+def _fused_gemm_afp4wfp4_a16w16_kernel_launch(
+    num_warps, num_stages, waves_per_eu, matrix_instr_nonkdim
+):
+    return make_launcher(
+        _fused_gemm_afp4wfp4_a16w16_kernel,
+        dynamic_options=("kpack",),
+        options={
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+            "waves_per_eu": waves_per_eu,
+            "matrix_instr_nonkdim": matrix_instr_nonkdim,
+        },
+    )
 
 
 def fused_gemm_afp4wfp4_a16w16(
@@ -176,46 +208,124 @@ def fused_gemm_afp4wfp4_a16w16(
     )
 
     def selected_kernel_wrapper():
-        _intj_launch(
-            selected_kernel,
-            grid,
-            x_fp4,
-            w_fp4,
-            bias_fp4,
-            x_fp4_scale,
-            w_fp4_scale,
-            y_fp4 if config["NUM_KSPLIT"] == 1 else y_fp4_pp,
-            x_bf16,
-            w_bf16,
-            bias_bf16,
-            y_bf16 if config["NUM_KSPLIT"] == 1 else y_bf16_pp,
-            M,
-            N_fp4,
-            N_bf16,
-            K,
-            x_fp4.stride(0),
-            x_fp4.stride(1),
-            w_fp4.stride(0),
-            w_fp4.stride(1),
-            x_fp4_scale.stride(0),
-            x_fp4_scale.stride(1),
-            w_fp4_scale.stride(0),
-            w_fp4_scale.stride(1),
-            0 if config["NUM_KSPLIT"] == 1 else y_fp4_pp.stride(0),
-            y_fp4.stride(0) if config["NUM_KSPLIT"] == 1 else y_fp4_pp.stride(1),
-            y_fp4.stride(1) if config["NUM_KSPLIT"] == 1 else y_fp4_pp.stride(2),
-            x_bf16.stride(0),
-            x_bf16.stride(1),
-            w_bf16.stride(0),
-            w_bf16.stride(1),
-            0 if config["NUM_KSPLIT"] == 1 else y_bf16_pp.stride(0),
-            y_bf16.stride(0) if config["NUM_KSPLIT"] == 1 else y_bf16_pp.stride(1),
-            y_bf16.stride(1) if config["NUM_KSPLIT"] == 1 else y_bf16_pp.stride(2),
-            ADD_BIAS_FP4=(bias_fp4 is not None),
-            ADD_BIAS_BF16=(bias_bf16 is not None),
-            SKIP_REDUCE=skip_reduce,
-            **config,
-        )
+        if is_fp4_preshuffled:
+            dev, stream = current_device_stream()
+            _fused_gemm_afp4wfp4_preshuffle_a16w16_kernel_launch(
+                config.get("num_warps", 4),
+                config.get("num_stages", 2),
+                config.get("waves_per_eu", 0),
+                config.get("matrix_instr_nonkdim", 0),
+            )(
+                dev,
+                stream,
+                grid,
+                config.get("kpack", 1),
+                x_fp4,
+                w_fp4,
+                bias_fp4,
+                x_fp4_scale,
+                w_fp4_scale,
+                y_fp4 if config["NUM_KSPLIT"] == 1 else y_fp4_pp,
+                x_bf16,
+                w_bf16,
+                bias_bf16,
+                y_bf16 if config["NUM_KSPLIT"] == 1 else y_bf16_pp,
+                M,
+                N_fp4,
+                N_bf16,
+                K,
+                x_fp4.stride(0),
+                x_fp4.stride(1),
+                w_fp4.stride(0),
+                w_fp4.stride(1),
+                x_fp4_scale.stride(0),
+                x_fp4_scale.stride(1),
+                w_fp4_scale.stride(0),
+                w_fp4_scale.stride(1),
+                0 if config["NUM_KSPLIT"] == 1 else y_fp4_pp.stride(0),
+                y_fp4.stride(0) if config["NUM_KSPLIT"] == 1 else y_fp4_pp.stride(1),
+                y_fp4.stride(1) if config["NUM_KSPLIT"] == 1 else y_fp4_pp.stride(2),
+                x_bf16.stride(0),
+                x_bf16.stride(1),
+                w_bf16.stride(0),
+                w_bf16.stride(1),
+                0 if config["NUM_KSPLIT"] == 1 else y_bf16_pp.stride(0),
+                y_bf16.stride(0) if config["NUM_KSPLIT"] == 1 else y_bf16_pp.stride(1),
+                y_bf16.stride(1) if config["NUM_KSPLIT"] == 1 else y_bf16_pp.stride(2),
+                config["BLOCK_SIZE_M"],
+                config["BLOCK_SIZE_N"],
+                config["BLOCK_SIZE_K"],
+                config["GROUP_SIZE_M"],
+                config["NUM_KSPLIT"],
+                config["SPLITK_BLOCK_SIZE"],
+                bias_fp4 is not None,
+                bias_bf16 is not None,
+                config["num_warps"],
+                config["num_stages"],
+                config["waves_per_eu"],
+                config["matrix_instr_nonkdim"],
+                skip_reduce,
+                config["cache_modifier"],
+            )
+        else:
+            dev, stream = current_device_stream()
+            _fused_gemm_afp4wfp4_a16w16_kernel_launch(
+                config.get("num_warps", 4),
+                config.get("num_stages", 2),
+                config.get("waves_per_eu", 0),
+                config.get("matrix_instr_nonkdim", 0),
+            )(
+                dev,
+                stream,
+                grid,
+                config.get("kpack", 1),
+                x_fp4,
+                w_fp4,
+                bias_fp4,
+                x_fp4_scale,
+                w_fp4_scale,
+                y_fp4 if config["NUM_KSPLIT"] == 1 else y_fp4_pp,
+                x_bf16,
+                w_bf16,
+                bias_bf16,
+                y_bf16 if config["NUM_KSPLIT"] == 1 else y_bf16_pp,
+                M,
+                N_fp4,
+                N_bf16,
+                K,
+                x_fp4.stride(0),
+                x_fp4.stride(1),
+                w_fp4.stride(0),
+                w_fp4.stride(1),
+                x_fp4_scale.stride(0),
+                x_fp4_scale.stride(1),
+                w_fp4_scale.stride(0),
+                w_fp4_scale.stride(1),
+                0 if config["NUM_KSPLIT"] == 1 else y_fp4_pp.stride(0),
+                y_fp4.stride(0) if config["NUM_KSPLIT"] == 1 else y_fp4_pp.stride(1),
+                y_fp4.stride(1) if config["NUM_KSPLIT"] == 1 else y_fp4_pp.stride(2),
+                x_bf16.stride(0),
+                x_bf16.stride(1),
+                w_bf16.stride(0),
+                w_bf16.stride(1),
+                0 if config["NUM_KSPLIT"] == 1 else y_bf16_pp.stride(0),
+                y_bf16.stride(0) if config["NUM_KSPLIT"] == 1 else y_bf16_pp.stride(1),
+                y_bf16.stride(1) if config["NUM_KSPLIT"] == 1 else y_bf16_pp.stride(2),
+                config["BLOCK_SIZE_M"],
+                config["BLOCK_SIZE_N"],
+                config["BLOCK_SIZE_K"],
+                config["GROUP_SIZE_M"],
+                config["NUM_KSPLIT"],
+                config["SPLITK_BLOCK_SIZE"],
+                bias_fp4 is not None,
+                bias_bf16 is not None,
+                config["num_warps"],
+                config["num_stages"],
+                config["waves_per_eu"],
+                config["matrix_instr_nonkdim"],
+                skip_reduce,
+                config["cache_modifier"],
+            )
 
     M_POW2 = triton.next_power_of_2(M)
     if M < 32 and M_POW2 > 16:

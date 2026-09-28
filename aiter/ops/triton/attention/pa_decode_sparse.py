@@ -7,11 +7,12 @@ indices.
 TODO: add details once API has settled
 """
 
+import functools
 import math
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
+from intj import make_launcher
 
 from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla import (
     _sparse_mla as _sparse_mla_gfx950,
@@ -33,7 +34,7 @@ from aiter.ops.triton._triton_kernels.attention.pa_decode_sparse import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import max_addressable_bytes
-from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.ops.triton.utils.device_info import current_device_stream, get_num_sms
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
@@ -63,6 +64,48 @@ def _check_out(out, q, dtype):
     assert out.dtype == dtype, f"out dtype {out.dtype} != {dtype}"
     assert out.device == q.device
     return out
+
+
+@functools.cache
+def _gluon_pa_decode_sparse_launch(num_warps):
+    return make_launcher(
+        gluon_pa_decode_sparse,
+        dynamic_options=(
+            "num_stages",
+            "waves_per_eu",
+        ),
+        options={"num_warps": num_warps},
+    )
+
+
+@functools.cache
+def _triton_pa_decode_sparse_launch(num_warps):
+    return make_launcher(
+        triton_pa_decode_sparse,
+        dynamic_options=(
+            "num_stages",
+            "waves_per_eu",
+        ),
+        options={"num_warps": num_warps},
+    )
+
+
+@functools.cache
+def _gluon_pa_decode_sparse_reduce_launch(num_warps):
+    return make_launcher(
+        gluon_pa_decode_sparse_reduce,
+        dynamic_options=("waves_per_eu",),
+        options={"num_warps": num_warps},
+    )
+
+
+_triton_pa_decode_sparse_reduce_launch = make_launcher(
+    triton_pa_decode_sparse_reduce,
+    dynamic_options=(
+        "num_warps",
+        "waves_per_eu",
+    ),
+)
 
 
 def pa_decode_sparse(
@@ -331,61 +374,111 @@ def pa_decode_sparse(
         ks_stride_n_arg = 1
         num_groups_arg = 1
 
-    if use_gluon:
-        impl = gluon_pa_decode_sparse
-        reduce_impl = gluon_pa_decode_sparse_reduce
-    else:
-        impl = triton_pa_decode_sparse
-        reduce_impl = triton_pa_decode_sparse_reduce
-
     grid_attn = (T, n_head_blocks, kv_splits)
-    _intj_launch(impl, grid_attn,
-        q,
-        unified_kv,
-        kv_scales_arg,
-        kv_indices,
-        kv_indptr,
-        m_partial,
-        l_partial,
-        acc_partial,
-        attn_sink,
-        out,
-        unified_kv.shape[0],
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        unified_kv.stride(0),
-        unified_kv.stride(1),
-        ks_stride_n_arg,
-        mp_strides[0],
-        mp_strides[1],
-        mp_strides[2],
-        lp_strides[0],
-        lp_strides[1],
-        lp_strides[2],
-        ap_strides[0],
-        ap_strides[1],
-        ap_strides[2],
-        ap_strides[3],
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        H,
-        D,
-        kv_splits,
-        float(softmax_scale),
-        BLOCK_H=block_h,
-        BLOCK_D=block_d,
-        BLOCK_K=block_k,
-        HAS_INVALID=has_invalid,
-        QUANT_KV=quant_kv,
-        GROUP_SIZE=_FP8_GROUP_SIZE,
-        NUM_GROUPS=num_groups_arg,
-        USE_EXP2=USE_EXP2,
-        num_warps=attn_num_warps,
-        num_stages=num_stages,
-        waves_per_eu=waves_per_eu,
-    )
+    if use_gluon:
+        dev, stream = current_device_stream()
+        _gluon_pa_decode_sparse_launch(attn_num_warps)(
+            dev,
+            stream,
+            grid_attn,
+            num_stages,
+            waves_per_eu,
+            q,
+            unified_kv,
+            kv_scales_arg,
+            kv_indices,
+            kv_indptr,
+            m_partial,
+            l_partial,
+            acc_partial,
+            attn_sink,
+            out,
+            unified_kv.shape[0],
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            unified_kv.stride(0),
+            unified_kv.stride(1),
+            ks_stride_n_arg,
+            mp_strides[0],
+            mp_strides[1],
+            mp_strides[2],
+            lp_strides[0],
+            lp_strides[1],
+            lp_strides[2],
+            ap_strides[0],
+            ap_strides[1],
+            ap_strides[2],
+            ap_strides[3],
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            H,
+            D,
+            kv_splits,
+            float(softmax_scale),
+            block_h,
+            block_d,
+            block_k,
+            has_invalid,
+            quant_kv,
+            _FP8_GROUP_SIZE,
+            num_groups_arg,
+            USE_EXP2,
+            attn_num_warps,
+        )
+    else:
+        dev, stream = current_device_stream()
+        _triton_pa_decode_sparse_launch(attn_num_warps)(
+            dev,
+            stream,
+            grid_attn,
+            num_stages,
+            waves_per_eu,
+            q,
+            unified_kv,
+            kv_scales_arg,
+            kv_indices,
+            kv_indptr,
+            m_partial,
+            l_partial,
+            acc_partial,
+            attn_sink,
+            out,
+            unified_kv.shape[0],
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            unified_kv.stride(0),
+            unified_kv.stride(1),
+            ks_stride_n_arg,
+            mp_strides[0],
+            mp_strides[1],
+            mp_strides[2],
+            lp_strides[0],
+            lp_strides[1],
+            lp_strides[2],
+            ap_strides[0],
+            ap_strides[1],
+            ap_strides[2],
+            ap_strides[3],
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            H,
+            D,
+            kv_splits,
+            float(softmax_scale),
+            block_h,
+            block_d,
+            block_k,
+            has_invalid,
+            quant_kv,
+            _FP8_GROUP_SIZE,
+            num_groups_arg,
+            USE_EXP2,
+            attn_num_warps,
+        )
 
     if kv_splits == 1:
         return out
@@ -402,36 +495,76 @@ def pa_decode_sparse(
     block_h_reduce = 1
     grid_reduce = (T, triton.cdiv(H, block_h_reduce))
 
-    _intj_launch(reduce_impl, grid_reduce,
-        m_partial,
-        l_partial,
-        acc_partial,
-        attn_sink,
-        kv_indptr,
-        out,
-        m_partial.stride(0),
-        m_partial.stride(1),
-        m_partial.stride(2),
-        l_partial.stride(0),
-        l_partial.stride(1),
-        l_partial.stride(2),
-        acc_partial.stride(0),
-        acc_partial.stride(1),
-        acc_partial.stride(2),
-        acc_partial.stride(3),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        H,
-        D,
-        kv_splits,
-        BLOCK_H=block_h_reduce,
-        BLOCK_D=block_d,
-        BLOCK_K=block_k,
-        USE_EXP2=USE_EXP2,
-        num_warps=reduce_num_warps,
-        waves_per_eu=reduce_waves_per_eu,
-    )
+    if use_gluon:
+        dev, stream = current_device_stream()
+        _gluon_pa_decode_sparse_reduce_launch(reduce_num_warps)(
+            dev,
+            stream,
+            grid_reduce,
+            reduce_waves_per_eu,
+            m_partial,
+            l_partial,
+            acc_partial,
+            attn_sink,
+            kv_indptr,
+            out,
+            m_partial.stride(0),
+            m_partial.stride(1),
+            m_partial.stride(2),
+            l_partial.stride(0),
+            l_partial.stride(1),
+            l_partial.stride(2),
+            acc_partial.stride(0),
+            acc_partial.stride(1),
+            acc_partial.stride(2),
+            acc_partial.stride(3),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            H,
+            D,
+            kv_splits,
+            block_h_reduce,
+            block_d,
+            block_k,
+            USE_EXP2,
+            reduce_num_warps,
+        )
+    else:
+        dev, stream = current_device_stream()
+        _triton_pa_decode_sparse_reduce_launch(
+            dev,
+            stream,
+            grid_reduce,
+            reduce_num_warps,
+            reduce_waves_per_eu,
+            m_partial,
+            l_partial,
+            acc_partial,
+            attn_sink,
+            kv_indptr,
+            out,
+            m_partial.stride(0),
+            m_partial.stride(1),
+            m_partial.stride(2),
+            l_partial.stride(0),
+            l_partial.stride(1),
+            l_partial.stride(2),
+            acc_partial.stride(0),
+            acc_partial.stride(1),
+            acc_partial.stride(2),
+            acc_partial.stride(3),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            H,
+            D,
+            kv_splits,
+            block_h_reduce,
+            block_d,
+            block_k,
+            USE_EXP2,
+        )
     return out
 
 

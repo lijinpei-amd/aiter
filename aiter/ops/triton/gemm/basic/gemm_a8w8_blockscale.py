@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
 import math
 import os
 
 import torch
 import triton
 from intj import Constexpr, make_launcher
+from intj.compat import launch as _intj_launch
 from packaging.version import Version
 
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
@@ -24,7 +26,6 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -44,6 +45,38 @@ _gemm_splitk_reduce_kernel_launch = make_launcher(
         "activation": Constexpr(value=""),
     },
 )
+
+
+@functools.cache
+def _gluon_gemm_a8w8_blockscale_launch():
+    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a8w8_blockscale import (
+        _gemm_a8w8_blockscale_kernel as gluon_kernel,
+    )
+
+    return make_launcher(
+        gluon_kernel,
+        dynamic_options=(
+            "num_warps",
+            "num_stages",
+            "waves_per_eu",
+            "matrix_instr_nonkdim",
+            "kpack",
+        ),
+    )
+
+
+@functools.cache
+def _triton_gemm_a8w8_blockscale_kernel_launch(num_stages):
+    return make_launcher(
+        triton_gemm_a8w8_blockscale_kernel,
+        dynamic_options=(
+            "num_warps",
+            "waves_per_eu",
+            "matrix_instr_nonkdim",
+            "kpack",
+        ),
+        options={"num_stages": num_stages},
+    )
 
 
 def gemm_a8w8_blockscale(
@@ -191,31 +224,114 @@ def gemm_a8w8_blockscale(
     else:
         impl = triton_gemm_a8w8_blockscale_kernel
 
-    _intj_launch_tuned(
-        impl,
-        grid,
-        x,
-        w,
-        y if config["NUM_KSPLIT"] == 1 else y_pp,
-        x_scale,
-        w_scale,
-        M,
-        N,
-        K,
-        x.stride(0),
-        x.stride(1),
-        w.stride(0),
-        w.stride(1),
-        0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
-        y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
-        y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
-        x_scale.stride(0),
-        x_scale.stride(1),
-        w_scale.stride(0),
-        w_scale.stride(1),
-        **config,
-        **extra_constexpr,
-    )
+    if backend == "gluon" and arch == "gfx950":
+        dev, stream = current_device_stream()
+        _gluon_gemm_a8w8_blockscale_launch()(
+            dev,
+            stream,
+            grid,
+            config.get("num_warps", 4),
+            config.get("num_stages", 2),
+            config.get("waves_per_eu", 0),
+            config.get("matrix_instr_nonkdim", 0),
+            config.get("kpack", 1),
+            x,
+            w,
+            y if config["NUM_KSPLIT"] == 1 else y_pp,
+            x_scale,
+            w_scale,
+            M,
+            N,
+            K,
+            x.stride(0),
+            x.stride(1),
+            w.stride(0),
+            w.stride(1),
+            0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
+            y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
+            y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
+            x_scale.stride(0),
+            x_scale.stride(1),
+            w_scale.stride(0),
+            w_scale.stride(1),
+            config["GROUP_K"],
+            config["GROUP_N"],
+            config["BLOCK_SIZE_M"],
+            config["BLOCK_SIZE_N"],
+            config["BLOCK_SIZE_K"],
+            config["GROUP_SIZE_M"],
+            config["NUM_KSPLIT"],
+            config["SPLITK_BLOCK_SIZE"],
+            max(config.get("num_stages", 2), 2),
+            config["num_warps"],
+            config["cache_modifier"],
+        )
+    elif backend == "gluon":
+        _intj_launch(
+            impl,
+            grid,
+            x,
+            w,
+            y if config["NUM_KSPLIT"] == 1 else y_pp,
+            x_scale,
+            w_scale,
+            M,
+            N,
+            K,
+            x.stride(0),
+            x.stride(1),
+            w.stride(0),
+            w.stride(1),
+            0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
+            y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
+            y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
+            x_scale.stride(0),
+            x_scale.stride(1),
+            w_scale.stride(0),
+            w_scale.stride(1),
+            **config,
+            **extra_constexpr,
+        )
+    else:
+        dev, stream = current_device_stream()
+        _triton_gemm_a8w8_blockscale_kernel_launch(config.get("num_stages", 2))(
+            dev,
+            stream,
+            grid,
+            config.get("num_warps", 4),
+            config.get("waves_per_eu", 0),
+            config.get("matrix_instr_nonkdim", 0),
+            config.get("kpack", 1),
+            x,
+            w,
+            y if config["NUM_KSPLIT"] == 1 else y_pp,
+            x_scale,
+            w_scale,
+            M,
+            N,
+            K,
+            x.stride(0),
+            x.stride(1),
+            w.stride(0),
+            w.stride(1),
+            0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
+            y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
+            y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
+            x_scale.stride(0),
+            x_scale.stride(1),
+            w_scale.stride(0),
+            w_scale.stride(1),
+            config["GROUP_K"],
+            config["GROUP_N"],
+            config["BLOCK_SIZE_M"],
+            config["BLOCK_SIZE_N"],
+            config["BLOCK_SIZE_K"],
+            config["GROUP_SIZE_M"],
+            config["NUM_KSPLIT"],
+            config["SPLITK_BLOCK_SIZE"],
+            config["cache_modifier"],
+            config["num_stages"],
+        )
 
     if config["NUM_KSPLIT"] > 1:
         if skip_reduce:
@@ -253,6 +369,18 @@ def gemm_a8w8_blockscale(
         )
 
     return y
+
+
+_triton_gemm_a8w8_blockscale_preshuffle_kernel_launch = make_launcher(
+    triton_gemm_a8w8_blockscale_preshuffle_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 def gemm_a8w8_blockscale_preshuffle(
@@ -412,35 +540,80 @@ def gemm_a8w8_blockscale_preshuffle(
     else:
         impl = triton_gemm_a8w8_blockscale_preshuffle_kernel
 
-    _intj_launch_tuned(
-        impl,
-        grid,
-        x,
-        w,
-        y if config["NUM_KSPLIT"] == 1 else y_pp,
-        x_scale,
-        w_scale,
-        M,
-        N,
-        K,
-        x.stride(0),
-        x.stride(1),
-        w.stride(0),
-        w.stride(1),
-        0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
-        y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
-        y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
-        x_scale.stride(1) if is_x_scale_tranposed else x_scale.stride(0),
-        (
-            (x_scale.numel() // x_scale.stride(0))
-            if is_x_scale_tranposed
-            else x_scale.stride(1)
-        ),
-        w_scale.stride(0),
-        w_scale.stride(1),
-        **config,
-        **extra_constexpr,
-    )
+    if backend == "gluon":
+        _intj_launch(
+            impl,
+            grid,
+            x,
+            w,
+            y if config["NUM_KSPLIT"] == 1 else y_pp,
+            x_scale,
+            w_scale,
+            M,
+            N,
+            K,
+            x.stride(0),
+            x.stride(1),
+            w.stride(0),
+            w.stride(1),
+            0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
+            y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
+            y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
+            x_scale.stride(1) if is_x_scale_tranposed else x_scale.stride(0),
+            (
+                (x_scale.numel() // x_scale.stride(0))
+                if is_x_scale_tranposed
+                else x_scale.stride(1)
+            ),
+            w_scale.stride(0),
+            w_scale.stride(1),
+            **config,
+            **extra_constexpr,
+        )
+    else:
+        dev, stream = current_device_stream()
+        _triton_gemm_a8w8_blockscale_preshuffle_kernel_launch(
+            dev,
+            stream,
+            grid,
+            config.get("num_warps", 4),
+            config.get("num_stages", 2),
+            config.get("waves_per_eu", 0),
+            config.get("matrix_instr_nonkdim", 0),
+            config.get("kpack", 1),
+            x,
+            w,
+            y if config["NUM_KSPLIT"] == 1 else y_pp,
+            x_scale,
+            w_scale,
+            M,
+            N,
+            K,
+            x.stride(0),
+            x.stride(1),
+            w.stride(0),
+            w.stride(1),
+            0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
+            y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
+            y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
+            x_scale.stride(1) if is_x_scale_tranposed else x_scale.stride(0),
+            (
+                (x_scale.numel() // x_scale.stride(0))
+                if is_x_scale_tranposed
+                else x_scale.stride(1)
+            ),
+            w_scale.stride(0),
+            w_scale.stride(1),
+            config["GROUP_K"],
+            config["GROUP_N"],
+            config["BLOCK_SIZE_M"],
+            config["BLOCK_SIZE_N"],
+            config["BLOCK_SIZE_K"],
+            config["GROUP_SIZE_M"],
+            config["NUM_KSPLIT"],
+            config["SPLITK_BLOCK_SIZE"],
+            config["cache_modifier"],
+        )
 
     if config["NUM_KSPLIT"] > 1:
         if skip_reduce:

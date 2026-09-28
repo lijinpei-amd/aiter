@@ -2,8 +2,7 @@ from typing import Literal
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
+from intj import make_launcher
 
 import aiter
 from aiter.ops.triton._triton_kernels.activation import (
@@ -11,11 +10,19 @@ from aiter.ops.triton._triton_kernels.activation import (
     _act_mul_and_dynamic_mxfp4_quant_kernel,
     fused_silu_mul_kernel,
 )
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 fp8_dtype = aiter.dtypes.fp8
 
 _LOGGER = AiterTritonLogger()
+
+
+_act_mul_and_dynamic_mxfp4_quant_kernel_launch = make_launcher(
+    _act_mul_and_dynamic_mxfp4_quant_kernel,
+    dynamic_options=("num_warps",),
+    options={"waves_per_eu": 0, "num_stages": 1},
+)
 
 
 def act_mul_and_mxfp4_quant(
@@ -104,32 +111,39 @@ def act_mul_and_mxfp4_quant(
         triton.cdiv(M, BLOCK_SIZE_M),
         triton.cdiv(N_half, BLOCK_SIZE_N * NUM_ITER),
     )
-    _intj_launch_tuned(_act_mul_and_dynamic_mxfp4_quant_kernel, grid,
+    dev, stream = current_device_stream()
+    _act_mul_and_dynamic_mxfp4_quant_kernel_launch(
+        dev,
+        stream,
+        grid,
+        NUM_WARPS,
         x,
         x_fp4,
         blockscale_e8m0,
         *x.stride(),
         *x_fp4.stride(),
         *blockscale_e8m0.stride(),
-        M=M,
-        N=N_half,
-        MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
-        SCALING_MODE=0,
-        ACTIVATION=activation,
-        scaleN=scaleN_valid,
-        scaleM_pad=(scaleM if use_scale_shuffle_padding else 1),
-        scaleN_pad=scaleN,
-        SHUFFLE=shuffle,
-        NUM_ITER=NUM_ITER,
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        NUM_STAGES=NUM_STAGES,
-        num_warps=NUM_WARPS,
-        waves_per_eu=0,
-        num_stages=1,
+        M,
+        N_half,
+        BLOCK_SIZE_M,
+        BLOCK_SIZE_N,
+        NUM_ITER,
+        NUM_STAGES,
+        MXFP4_QUANT_BLOCK_SIZE,
+        0,
+        activation,
+        scaleN_valid,
+        scaleM if use_scale_shuffle_padding else 1,
+        scaleN,
+        shuffle,
     )
 
     return x_fp4, blockscale_e8m0
+
+
+_act_mul_and_dynamic_fp8_group_quant_kernel_launch = make_launcher(
+    _act_mul_and_dynamic_fp8_group_quant_kernel
+)
 
 
 def act_mul_and_fp8_group_quant(
@@ -184,26 +198,32 @@ def act_mul_and_fp8_group_quant(
         M,
         triton.cdiv(N_half, BLOCK_SIZE_N),
     )
-    _intj_launch_tuned(_act_mul_and_dynamic_fp8_group_quant_kernel, grid,
+    dev, stream = current_device_stream()
+    _act_mul_and_dynamic_fp8_group_quant_kernel_launch(
+        dev,
+        stream,
+        grid,
         x,
         x_fp8,
         out_bs,
         *x.stride(),
         *x_fp8.stride(),
         *out_bs.stride(),
-        N=N_half,
-        ACTIVATION=activation,
-        scaleN=scaleN,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        QUANT_BLOCK_SIZE=group_size,
-        DTYPE_MAX=DTYPE_MAX,
-        DTYPE_MIN=-DTYPE_MAX,
-        # num_warps=NUM_WARPS,
-        # waves_per_eu=0,
-        # num_stages=1,
+        N_half,
+        activation,
+        scaleN,
+        BLOCK_SIZE_N,
+        group_size,
+        DTYPE_MAX,
+        -DTYPE_MAX,
     )
 
     return x_fp8, out_bs
+
+
+_fused_silu_mul_kernel_launch = make_launcher(
+    fused_silu_mul_kernel, dynamic_options=("num_warps",), options={"waves_per_eu": 0}
+)
 
 
 def fused_silu_mul(
@@ -298,7 +318,12 @@ def fused_silu_mul(
     num_warps = _pick_num_warps(n_rows, block_m, block_n)
 
     grid = (grid_m, grid_n)
-    _intj_launch(fused_silu_mul_kernel, grid,
+    dev, stream = current_device_stream()
+    _fused_silu_mul_kernel_launch(
+        dev,
+        stream,
+        grid,
+        num_warps,
         x,
         out,
         n_rows,
@@ -307,9 +332,7 @@ def fused_silu_mul(
         col_stride_in,
         row_stride_out,
         col_stride_out,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        num_warps=num_warps,
-        waves_per_eu=0,
+        block_m,
+        block_n,
     )
     return out

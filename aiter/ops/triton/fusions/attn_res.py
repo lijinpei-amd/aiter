@@ -43,7 +43,7 @@ from collections.abc import Sequence
 
 import torch
 import triton
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
+from intj import make_launcher
 from triton import knobs
 from triton.runtime import driver
 
@@ -51,6 +51,7 @@ from aiter.ops.triton._triton_kernels.fusions.attn_res import (
     ATTN_RES_TRITON_AUTOTUNE,
     attnres_fwd_kernel,
 )
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import get_dtype_max
 
@@ -586,6 +587,15 @@ def _run_sequence(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm)
     return o.view(output_shape)
 
 
+if ATTN_RES_TRITON_AUTOTUNE:
+    # The tuner assigns BL, num_warps and num_stages.
+    _attnres_fwd_kernel_launch = make_launcher(attnres_fwd_kernel)
+else:
+    _attnres_fwd_kernel_launch = make_launcher(
+        attnres_fwd_kernel, dynamic_options=("num_warps", "num_stages")
+    )
+
+
 def _run_packed(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm):
     if isinstance(residuals, (list, tuple)):
         L = len(residuals)
@@ -607,49 +617,59 @@ def _run_packed(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm):
     L2 = max(1, triton.next_power_of_2(L))
     num_warps, num_stages, bl = _pick_attn_res_packed_config(N, L2)
 
-    _intj_launch_tuned(attnres_fwd_kernel, (N,),
-        q=q_flat,
-        res=None,  # unused when IS_PACKED (sequence branch is dead); None keeps
+    # With ATTN_RES_TRITON_AUTOTUNE the tuner owns these (see _launch_tune_kwargs).
+    tune, bl_arg = (
+        ((), ()) if ATTN_RES_TRITON_AUTOTUNE else ((num_warps, num_stages), (bl,))
+    )
+    dev, stream = current_device_stream()
+    _attnres_fwd_kernel_launch(
+        dev,
+        stream,
+        (N,),
+        *tune,
+        q_flat,
+        None,  # res: unused when IS_PACKED (sequence branch is dead); None keeps
         # the L2 dead pointer slots out of the kernarg segment
-        w=w_flat,
-        ow=ow_flat,
-        o=o,
-        o_pre=None,
-        rstd=None,
-        logit=None,
-        lse=None,
-        res_packed=packed,
-        prefix=None,
-        add_hidden=None,
-        add_hidden2=None,
-        prefix_out=None,
-        block_out=None,
-        o_scale=None,
-        N=N,
-        L=L,
-        stride_res_n=packed.stride(0),
-        stride_res_l=packed.stride(1),
-        stride_bo_n=0,
-        stride_bo_l=0,
-        L2=L2,
-        D=D,
-        eps=rms_eps,
-        out_eps=rms_eps,
-        scale=scale,
-        BD=triton.next_power_of_2(D),
-        HAS_ONORM=has_onorm,
-        SAVE_OPRE=False,
-        SAVE_STATS=False,
-        IS_PACKED=True,
-        HAS_PREFIX=False,
-        DO_ADD=False,
-        DO_ADD2=False,
-        WRITE_PREF=False,
-        WRITE_BLOCK_CAT=False,
-        HAS_W=True,
-        QUANT_FP8=False,
-        FP8_MAX=1.0,
-        **_launch_tune_kwargs(num_warps, num_stages, bl),
+        w_flat,
+        ow_flat,
+        o,
+        None,
+        None,
+        None,
+        None,
+        packed,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        N,
+        L,
+        packed.stride(0),
+        packed.stride(1),
+        0,
+        0,
+        L2,
+        D,
+        rms_eps,
+        rms_eps,
+        scale,
+        *bl_arg,
+        triton.next_power_of_2(D),
+        has_onorm,
+        False,
+        False,
+        True,
+        False,
+        False,
+        False,
+        False,
+        False,
+        True,
+        False,
+        1.0,
+        False,
     )
     return o.view(output_shape)
 

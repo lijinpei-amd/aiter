@@ -4,7 +4,6 @@
 import torch
 import triton
 from intj import make_launcher
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.attention.mha_fused_bwd import (
     _bwd_kernel_dkdvdq_causal,
@@ -20,6 +19,30 @@ _LOGGER = AiterTritonLogger()
 
 
 _bwd_preprocess_launch = make_launcher(_bwd_preprocess)
+
+
+_bwd_kernel_dkdvdq_causal_launch = make_launcher(
+    _bwd_kernel_dkdvdq_causal,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
+
+
+_bwd_kernel_dkdvdq_noncausal_launch = make_launcher(
+    _bwd_kernel_dkdvdq_noncausal,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 def flash_attn_fused_backward(
@@ -233,9 +256,16 @@ def flash_attn_fused_backward(
     if causal:
         grid_dkdvdq = (batch * num_q_heads * num_k_pids,)
 
-        _intj_launch(
-            _bwd_kernel_dkdvdq_causal,
+        dev, stream = current_device_stream()
+        _bwd_kernel_dkdvdq_causal_launch(
+            dev,
+            stream,
             grid_dkdvdq,
+            config_dkdvdq.get("num_warps", 4),
+            config_dkdvdq.get("num_stages", 2),
+            config_dkdvdq.get("waves_per_eu", 0),
+            config_dkdvdq.get("matrix_instr_nonkdim", 0),
+            config_dkdvdq.get("kpack", 1),
             q,
             k,
             v,
@@ -267,26 +297,35 @@ def flash_attn_fused_backward(
             descale_k,
             descale_v,
             descale_do,
-            NUM_Q_HEADS=num_q_heads,
-            NUM_K_HEADS=num_k_heads,
-            BATCH=batch,
-            NUM_K_PIDS=num_k_pids,
-            BLOCK_D_MODEL=head_sz,
-            BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
-            ENABLE_DROPOUT=use_dropout,
-            IS_VARLEN=IS_VARLEN,
-            IS_FP8=IS_FP8,
-            FP8_MAX=FP8_MAX,
-            USE_INT64_STRIDES=USE_INT64_STRIDES,
-            NUM_XCD=get_num_xcds(),
-            **config_dkdvdq,
+            num_q_heads,
+            num_k_heads,
+            batch,
+            num_k_pids,
+            config_dkdvdq["BLOCK_M"],
+            config_dkdvdq["BLOCK_N"],
+            config_dkdvdq["BLK_SLICE_FACTOR"],
+            head_sz,
+            BLOCK_D_MODEL_POW2,
+            use_dropout,
+            IS_VARLEN,
+            IS_FP8,
+            FP8_MAX,
+            USE_INT64_STRIDES,
+            get_num_xcds(),
         )
     else:
         # in non causal inner loop over grouped q heads
         grid_dkdvdq = (batch * num_k_heads * num_k_pids,)
-        _intj_launch(
-            _bwd_kernel_dkdvdq_noncausal,
+        dev, stream = current_device_stream()
+        _bwd_kernel_dkdvdq_noncausal_launch(
+            dev,
+            stream,
             grid_dkdvdq,
+            config_dkdvdq.get("num_warps", 4),
+            config_dkdvdq.get("num_stages", 2),
+            config_dkdvdq.get("waves_per_eu", 0),
+            config_dkdvdq.get("matrix_instr_nonkdim", 0),
+            config_dkdvdq.get("kpack", 1),
             q,
             k,
             v,
@@ -318,18 +357,20 @@ def flash_attn_fused_backward(
             descale_k,
             descale_v,
             descale_do,
-            NUM_Q_HEADS=num_q_heads,
-            NUM_K_HEADS=num_k_heads,
-            BATCH=batch,
-            NUM_K_PIDS=num_k_pids,
-            BLOCK_D_MODEL=head_sz,
-            BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
-            ENABLE_DROPOUT=use_dropout,
-            IS_VARLEN=IS_VARLEN,
-            IS_FP8=IS_FP8,
-            FP8_MAX=FP8_MAX,
-            USE_INT64_STRIDES=USE_INT64_STRIDES,
-            **config_dkdvdq,
+            num_q_heads,
+            num_k_heads,
+            batch,
+            num_k_pids,
+            config_dkdvdq["BLOCK_M"],
+            config_dkdvdq["BLOCK_N"],
+            config_dkdvdq["BLK_SLICE_FACTOR"],
+            head_sz,
+            BLOCK_D_MODEL_POW2,
+            use_dropout,
+            IS_VARLEN,
+            IS_FP8,
+            FP8_MAX,
+            USE_INT64_STRIDES,
         )
 
     return delta

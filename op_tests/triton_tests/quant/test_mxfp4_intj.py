@@ -37,13 +37,7 @@ def _input(rows=2, columns=64):
     return torch.ones((rows, columns), dtype=torch.bfloat16, device="cuda")
 
 
-def _raw_bracket_launch(kernel, grid, *args, **kwargs):
-    # A plain Triton bracket launch, used as the reference implementation:
-    # bypasses `launch_tuned`/intj entirely.
-    return kernel[grid](*args, **kwargs)
-
-
-def _bracket_handle(kernel, grid_arg=None):
+def _bracket_handle(kernel, grid_arg=None, dynamic_options=(), options=None):
     """A launcher stand-in that launches ``kernel[grid](...)`` instead."""
     jit, assigned = kernel, set()
     while not isinstance(jit, JITFunction):
@@ -56,7 +50,9 @@ def _bracket_handle(kernel, grid_arg=None):
             grid, args = args[:grid_arg], args[grid_arg:]
         else:
             grid, args = args[0], args[1:]
-        kernel[grid](**dict(zip(names, args)))
+        dynamic = dict(zip(dynamic_options, args))
+        args = args[len(dynamic_options) :]
+        kernel[grid](**dict(zip(names, args)), **dynamic, **(options or {}))
 
     return launch
 
@@ -109,7 +105,15 @@ def test_fused_reduce_act_mul_mxfp4_quant_matches_triton_reference(monkeypatch):
     def _run():
         return fused_reduce_act_mul_and_mxfp4_quant(_input(columns=128), "silu")
 
-    monkeypatch.setattr(_wrapper, "launch_tuned", _raw_bracket_launch)
+    monkeypatch.setattr(
+        _wrapper,
+        "_fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel_launch",
+        _bracket_handle(
+            _kernels._fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel,
+            dynamic_options=("num_warps",),
+            options={"waves_per_eu": 0, "num_stages": 1},
+        ),
+    )
     packed_t, scales_t = _run()[0]
     monkeypatch.undo()
 

@@ -2,6 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
+import functools
+
 import torch
 import triton
 from intj import Constexpr, make_launcher
@@ -26,7 +28,6 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
 from aiter.ops.triton.utils.device_info import current_device_stream
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -128,6 +129,42 @@ _gemm_splitk_reduce_kernel_launch = make_launcher(
 )
 
 
+@functools.cache
+def _gluon_gemm_afp4wfp4_gfx950_kernel_launch(
+    num_warps, num_stages, waves_per_eu, matrix_instr_nonkdim
+):
+    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_afp4wfp4 import (
+        _gemm_afp4wfp4_kernel as _gluon_gemm_afp4wfp4_gfx950_kernel,
+    )
+
+    return make_launcher(
+        _gluon_gemm_afp4wfp4_gfx950_kernel,
+        dynamic_options=("kpack",),
+        options={
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+            "waves_per_eu": waves_per_eu,
+            "matrix_instr_nonkdim": matrix_instr_nonkdim,
+        },
+    )
+
+
+@functools.cache
+def _triton_gemm_afp4wfp4_kernel_launch(
+    num_warps, num_stages, waves_per_eu, matrix_instr_nonkdim
+):
+    return make_launcher(
+        _triton_gemm_afp4wfp4_kernel,
+        dynamic_options=("kpack",),
+        options={
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+            "waves_per_eu": waves_per_eu,
+            "matrix_instr_nonkdim": matrix_instr_nonkdim,
+        },
+    )
+
+
 @torch_compile_guard(gen_fake=gemm_afp4wfp4_fake_tensor)
 def gemm_afp4wfp4_(
     x: torch.Tensor,
@@ -180,13 +217,6 @@ def gemm_afp4wfp4_(
             f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{arch}'. "
             "gfx1250 gluon MXFP4 goes through gemm_afp4wfp4_preshuffle."
         )
-        from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_afp4wfp4 import (
-            _gemm_afp4wfp4_kernel as _gluon_gemm_afp4wfp4_gfx950_kernel,
-        )
-
-        impl = _gluon_gemm_afp4wfp4_gfx950_kernel
-    else:
-        impl = _triton_gemm_afp4wfp4_kernel
 
     M, K = x.shape
     N, K = w.shape
@@ -256,30 +286,92 @@ def gemm_afp4wfp4_(
         ),
     )
 
-    _intj_launch_tuned(
-        impl,
-        grid,
-        x,
-        w,
-        y if config["NUM_KSPLIT"] == 1 else y_pp,
-        x_scales,
-        w_scales,
-        M,
-        N,
-        K,
-        x.stride(0),
-        x.stride(1),
-        w.stride(0),
-        w.stride(1),
-        0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
-        y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
-        y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
-        x_scales.stride(0),
-        x_scales.stride(1),
-        w_scales.stride(0),
-        w_scales.stride(1),
-        **config,
-    )
+    if backend == "gluon":
+        dev, stream = current_device_stream()
+        _gluon_gemm_afp4wfp4_gfx950_kernel_launch(
+            config.get("num_warps", 4),
+            config.get("num_stages", 2),
+            config.get("waves_per_eu", 0),
+            config.get("matrix_instr_nonkdim", 0),
+        )(
+            dev,
+            stream,
+            grid,
+            config.get("kpack", 1),
+            x,
+            w,
+            y if config["NUM_KSPLIT"] == 1 else y_pp,
+            x_scales,
+            w_scales,
+            M,
+            N,
+            K,
+            x.stride(0),
+            x.stride(1),
+            w.stride(0),
+            w.stride(1),
+            0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
+            y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
+            y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
+            x_scales.stride(0),
+            x_scales.stride(1),
+            w_scales.stride(0),
+            w_scales.stride(1),
+            config["BLOCK_SIZE_M"],
+            config["BLOCK_SIZE_N"],
+            config["BLOCK_SIZE_K"],
+            config["GROUP_SIZE_M"],
+            config["NUM_KSPLIT"],
+            config["SPLITK_BLOCK_SIZE"],
+            config["num_warps"],
+            config["num_stages"],
+            config["waves_per_eu"],
+            config["matrix_instr_nonkdim"],
+            config["cache_modifier"],
+        )
+    else:
+        dev, stream = current_device_stream()
+        _triton_gemm_afp4wfp4_kernel_launch(
+            config.get("num_warps", 4),
+            config.get("num_stages", 2),
+            config.get("waves_per_eu", 0),
+            config.get("matrix_instr_nonkdim", 0),
+        )(
+            dev,
+            stream,
+            grid,
+            config.get("kpack", 1),
+            x,
+            w,
+            y if config["NUM_KSPLIT"] == 1 else y_pp,
+            x_scales,
+            w_scales,
+            M,
+            N,
+            K,
+            x.stride(0),
+            x.stride(1),
+            w.stride(0),
+            w.stride(1),
+            0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
+            y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
+            y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
+            x_scales.stride(0),
+            x_scales.stride(1),
+            w_scales.stride(0),
+            w_scales.stride(1),
+            config["BLOCK_SIZE_M"],
+            config["BLOCK_SIZE_N"],
+            config["BLOCK_SIZE_K"],
+            config["GROUP_SIZE_M"],
+            config["NUM_KSPLIT"],
+            config["SPLITK_BLOCK_SIZE"],
+            config["num_warps"],
+            config["num_stages"],
+            config["waves_per_eu"],
+            config["matrix_instr_nonkdim"],
+            config["cache_modifier"],
+        )
 
     if return_y_pp:
         return y_pp
@@ -355,6 +447,22 @@ def gemm_afp4wfp4(
     config_hashable = serialize_dict(config)
     return gemm_afp4wfp4_(
         x, w, x_scales, w_scales, dtype, y, config_hashable, skip_reduce, backend
+    )
+
+
+@functools.cache
+def _triton_gemm_afp4wfp4_kernel_preshuffle_scales_launch(
+    num_warps, num_stages, waves_per_eu, matrix_instr_nonkdim
+):
+    return make_launcher(
+        _triton_gemm_afp4wfp4_kernel_preshuffle_scales,
+        dynamic_options=("kpack",),
+        options={
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+            "waves_per_eu": waves_per_eu,
+            "matrix_instr_nonkdim": matrix_instr_nonkdim,
+        },
     )
 
 
@@ -438,9 +546,17 @@ def gemm_afp4wfp4_preshuffled_scales(
         ),
     )
 
-    _intj_launch_tuned(
-        _triton_gemm_afp4wfp4_kernel_preshuffle_scales,
+    dev, stream = current_device_stream()
+    _triton_gemm_afp4wfp4_kernel_preshuffle_scales_launch(
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+    )(
+        dev,
+        stream,
         grid,
+        config.get("kpack", 1),
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -460,7 +576,17 @@ def gemm_afp4wfp4_preshuffled_scales(
         x_scales.stride(1),
         w_scales.stride(0),
         w_scales.stride(1),
-        **config,
+        config["BLOCK_SIZE_M"],
+        config["BLOCK_SIZE_N"],
+        config["BLOCK_SIZE_K"],
+        config["GROUP_SIZE_M"],
+        config["NUM_KSPLIT"],
+        config["SPLITK_BLOCK_SIZE"],
+        config["num_warps"],
+        config["num_stages"],
+        config["waves_per_eu"],
+        config["matrix_instr_nonkdim"],
+        config["cache_modifier"],
     )
 
     if config["NUM_KSPLIT"] > 1:
@@ -499,6 +625,22 @@ def gemm_afp4wfp4_preshuffled_scales(
         )
 
     return y
+
+
+@functools.cache
+def _triton_gemm_afp4wfp4_preshuffle_kernel_launch(
+    num_warps, num_stages, waves_per_eu, matrix_instr_nonkdim
+):
+    return make_launcher(
+        _triton_gemm_afp4wfp4_preshuffle_kernel,
+        dynamic_options=("kpack",),
+        options={
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+            "waves_per_eu": waves_per_eu,
+            "matrix_instr_nonkdim": matrix_instr_nonkdim,
+        },
+    )
 
 
 def gemm_afp4wfp4_preshuffle(
@@ -684,9 +826,17 @@ def gemm_afp4wfp4_preshuffle(
     )
 
     config.pop("NUM_BUFFERS", None)
-    _intj_launch_tuned(
-        _triton_gemm_afp4wfp4_preshuffle_kernel,
+    dev, stream = current_device_stream()
+    _triton_gemm_afp4wfp4_preshuffle_kernel_launch(
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+    )(
+        dev,
+        stream,
         grid,
+        config.get("kpack", 1),
         x_fp4,
         w_preshuf,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -706,7 +856,17 @@ def gemm_afp4wfp4_preshuffle(
         x_scales.stride(1),
         w_scales.stride(0),
         w_scales.stride(1),
-        **config,
+        config["BLOCK_SIZE_M"],
+        config["BLOCK_SIZE_N"],
+        config["BLOCK_SIZE_K"],
+        config["GROUP_SIZE_M"],
+        config["NUM_KSPLIT"],
+        config["SPLITK_BLOCK_SIZE"],
+        config["num_warps"],
+        config["num_stages"],
+        config["waves_per_eu"],
+        config["matrix_instr_nonkdim"],
+        config["cache_modifier"],
     )
 
     if return_y_pp:

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
+
 import torch
 import triton
 from intj import Constexpr, make_launcher
@@ -16,7 +18,6 @@ from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_bf16 import (
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -38,6 +39,22 @@ _batched_gemm_splitk_reduce_kernel_launch = make_launcher(
         "activation": Constexpr(value=""),
     },
 )
+
+
+@functools.cache
+def _batched_gemm_bf16_kernel_launch(num_warps, num_stages, waves_per_eu):
+    return make_launcher(
+        _batched_gemm_bf16_kernel,
+        dynamic_options=(
+            "matrix_instr_nonkdim",
+            "kpack",
+        ),
+        options={
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+            "waves_per_eu": waves_per_eu,
+        },
+    )
 
 
 def batched_gemm_bf16(
@@ -270,9 +287,17 @@ def batched_gemm_bf16(
             * triton.cdiv(N, config["BLOCK_SIZE_N"]),
         )
 
-        _intj_launch_tuned(
-            _batched_gemm_bf16_kernel,
+        dev, stream = current_device_stream()
+        _batched_gemm_bf16_kernel_launch(
+            config.get("num_warps", 4),
+            config.get("num_stages", 2),
+            config.get("waves_per_eu", 0),
+        )(
+            dev,
+            stream,
             grid,
+            config.get("matrix_instr_nonkdim", 0),
+            config.get("kpack", 1),
             XQ,
             WQ,
             YQ if num_ksplit == 1 else y_pp,
@@ -292,7 +317,16 @@ def batched_gemm_bf16(
             0 if num_ksplit == 1 else y_pp.stride(0),
             bias.stride(0) if has_bias else 0,
             has_bias,
-            **config,
+            config["BLOCK_SIZE_M"],
+            config["BLOCK_SIZE_N"],
+            config["BLOCK_SIZE_K"],
+            config["GROUP_SIZE_M"],
+            config["NUM_KSPLIT"],
+            config["SPLITK_BLOCK_SIZE"],
+            config["cache_modifier"],
+            config["num_warps"],
+            config["num_stages"],
+            config["waves_per_eu"],
         )
 
     # ---- Shared split-K reduction ----

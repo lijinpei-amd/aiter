@@ -5,6 +5,7 @@
 import math
 
 import torch
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.quant.quant_fp8_blockwise import (
     quant_fp8_blockwise_for_weight_kernel,
@@ -12,6 +13,7 @@ from aiter.ops.triton._triton_kernels.quant.quant_fp8_blockwise import (
     quant_fp8_blockwise_segment_m_kernel,
     requant_fp8_row_to_col_kernel,
 )
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 __all__ = [
     "quant_fp8_blockwise",
@@ -29,12 +31,12 @@ _FP8_MAX = torch.finfo(torch.float8_e4m3fnuz).max
 _BLOCK_SIZE = 128
 
 
-def _launch_params(block_size: int) -> dict:
+def _launch_num_warps(block_size: int) -> int:
     # Each program loads a [block_size, block_size] tile promoted to fp32.
     # Benchmarks on MI308X show num_warps=4 is the best stable choice across
     # common shapes (4096/8192 × 7168/8192); larger values hurt weight kernel.
-    num_warps = min(16, max(1, block_size * block_size // 4096))
-    return {"num_warps": num_warps, "waves_per_eu": 2, "num_stages": 2}
+    # The launches also fix waves_per_eu=2, num_stages=2.
+    return min(16, max(1, block_size * block_size // 4096))
 
 
 def _check_block_fp8(
@@ -50,6 +52,13 @@ def _check_block_fp8(
     assert (
         0 < fp8_max <= dtype_max
     ), f"fp8_max must be in (0, {dtype_max}] for {quant_dtype}, got {fp8_max}"
+
+
+_quant_fp8_blockwise_kernel_launch = make_launcher(
+    quant_fp8_blockwise_kernel,
+    dynamic_options=("num_warps",),
+    options={"waves_per_eu": 2, "num_stages": 2},
+)
 
 
 def quant_fp8_blockwise(
@@ -94,11 +103,13 @@ def quant_fp8_blockwise(
         )
 
     grid = (math.ceil(M / block_size), math.ceil(N / block_size))
-    from intj.compat import launch
 
-    launch(
-        quant_fp8_blockwise_kernel,
+    dev, stream = current_device_stream()
+    _quant_fp8_blockwise_kernel_launch(
+        dev,
+        stream,
         grid,
+        _launch_num_warps(block_size),
         x,
         x_fp8,
         scales,
@@ -106,13 +117,19 @@ def quant_fp8_blockwise(
         scales,  # Triton's dead-code elimination prunes the col stores entirely.
         M,
         N,
-        BLOCK_SIZE=block_size,
-        FP8_MAX=fp8_max,
-        AXIS=axis,
-        DUAL=False,
-        **_launch_params(block_size),
+        block_size,
+        fp8_max,
+        axis,
+        False,
     )
     return x_fp8, scales
+
+
+_quant_fp8_blockwise_segment_m_kernel_launch = make_launcher(
+    quant_fp8_blockwise_segment_m_kernel,
+    dynamic_options=("num_warps",),
+    options={"waves_per_eu": 2, "num_stages": 2},
+)
 
 
 def quant_fp8_blockwise_segment_m(
@@ -161,11 +178,13 @@ def quant_fp8_blockwise_segment_m(
         device=x.device,
     )
     grid = (math.ceil(M / block_size) + batch_size, math.ceil(N / block_size))
-    from intj.compat import launch
 
-    launch(
-        quant_fp8_blockwise_segment_m_kernel,
+    dev, stream = current_device_stream()
+    _quant_fp8_blockwise_segment_m_kernel_launch(
+        dev,
+        stream,
         grid,
+        _launch_num_warps(block_size),
         x,
         x_fp8,
         scales,
@@ -173,11 +192,17 @@ def quant_fp8_blockwise_segment_m(
         batch_size,
         seg_indptr,
         scales_seg_indptr,
-        BLOCK_SIZE=block_size,
-        FP8_MAX=fp8_max,
-        **_launch_params(block_size),
+        block_size,
+        fp8_max,
     )
     return x_fp8, scales
+
+
+_quant_fp8_blockwise_for_weight_kernel_launch = make_launcher(
+    quant_fp8_blockwise_for_weight_kernel,
+    dynamic_options=("num_warps",),
+    options={"waves_per_eu": 2, "num_stages": 2},
+)
 
 
 def quant_fp8_blockwise_for_weight(
@@ -216,19 +241,20 @@ def quant_fp8_blockwise_for_weight(
         device=w.device,
     )
     grid = (B, math.ceil(M / block_size), math.ceil(N / block_size))
-    from intj.compat import launch
 
-    launch(
-        quant_fp8_blockwise_for_weight_kernel,
+    dev, stream = current_device_stream()
+    _quant_fp8_blockwise_for_weight_kernel_launch(
+        dev,
+        stream,
         grid,
+        _launch_num_warps(block_size),
         w,
         w_fp8,
         scales,
         M,
         N,
-        BLOCK_SIZE=block_size,
-        FP8_MAX=fp8_max,
-        **_launch_params(block_size),
+        block_size,
+        fp8_max,
     )
     return w_fp8, scales
 
@@ -270,11 +296,13 @@ def quant_fp8_blockwise_for_act_grad(
     # Same kernel as quant_fp8_blockwise, with DUAL=True to emit the col copy
     # (axis=0) alongside the row copy (axis=1) from a single tile load.
     grid = (math.ceil(M / block_size), math.ceil(N / block_size))
-    from intj.compat import launch
 
-    launch(
-        quant_fp8_blockwise_kernel,
+    dev, stream = current_device_stream()
+    _quant_fp8_blockwise_kernel_launch(
+        dev,
+        stream,
         grid,
+        _launch_num_warps(block_size),
         x,
         x_fp8_row,
         scales_row,
@@ -282,13 +310,19 @@ def quant_fp8_blockwise_for_act_grad(
         scales_col,
         M,
         N,
-        BLOCK_SIZE=block_size,
-        FP8_MAX=fp8_max,
-        AXIS=1,
-        DUAL=True,
-        **_launch_params(block_size),
+        block_size,
+        fp8_max,
+        1,
+        True,
     )
     return x_fp8_row, scales_row, x_fp8_col, scales_col
+
+
+_requant_fp8_row_to_col_kernel_launch = make_launcher(
+    requant_fp8_row_to_col_kernel,
+    dynamic_options=("num_warps",),
+    options={"waves_per_eu": 2, "num_stages": 2},
+)
 
 
 def requant_fp8_row_to_col(
@@ -334,19 +368,20 @@ def requant_fp8_row_to_col(
     )
 
     grid = (math.ceil(M / block_size), math.ceil(K / block_size))
-    from intj.compat import launch
 
-    launch(
-        requant_fp8_row_to_col_kernel,
+    dev, stream = current_device_stream()
+    _requant_fp8_row_to_col_kernel_launch(
+        dev,
+        stream,
         grid,
+        _launch_num_warps(block_size),
         x_fp8,
         x_scales,
         y_fp8,
         y_scales,
         M,
         K,
-        BLOCK_SIZE=block_size,
-        FP8_MAX=fp8_max,
-        **_launch_params(block_size),
+        block_size,
+        fp8_max,
     )
     return y_fp8, y_scales

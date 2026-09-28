@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
 import math
 import os
 import warnings
@@ -9,7 +10,7 @@ from typing import Literal
 import torch
 import triton
 import triton.language as tl
-from intj.compat import launch as _intj_launch
+from intj import make_launcher
 from packaging.version import Version
 
 from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
@@ -24,7 +25,7 @@ from aiter.ops.triton.attention.mha_fused_bwd import flash_attn_fused_backward
 from aiter.ops.triton.attention.mha_onekernel_bwd import flash_attn_onekernel_backward
 from aiter.ops.triton.utils import types
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils.device_info import current_device_stream, get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -235,6 +236,21 @@ def _pack_attn_returns(out, softmax_lse, s_dmask, return_lse, return_attn_probs)
     return result[0] if len(result) == 1 else tuple(result)
 
 
+@functools.cache
+def _gluon_attn_fwd_launch(num_warps):
+    return make_launcher(
+        _gluon_attn_fwd,
+        dynamic_options=(
+            "num_stages",
+            "waves_per_eu",
+            "matrix_instr_nonkdim",
+            "kpack",
+            "num_ctas",
+        ),
+        options={"num_warps": num_warps},
+    )
+
+
 def _gluon_flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -442,7 +458,16 @@ def _gluon_flash_attn_forward(
 
     grid = (batch * num_q_heads * triton.cdiv(seqlen_q, BLOCK_M), 1)
 
-    _intj_launch(_gluon_attn_fwd, grid,
+    dev, stream = current_device_stream()
+    _gluon_attn_fwd_launch(config.get("num_warps", 4))(
+        dev,
+        stream,
+        grid,
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
+        config.get("num_ctas", 1),
         q,
         k,
         v,
@@ -467,26 +492,25 @@ def _gluon_flash_attn_forward(
         descale_q.stride(0) if descale_q is not None else 0,
         descale_k.stride(0) if descale_k is not None else 0,
         descale_v.stride(0) if descale_v is not None else 0,
-        NUM_Q_HEADS=num_q_heads,
-        NUM_K_HEADS=num_k_heads,
-        IS_CAUSAL=causal,
-        VARLEN=varlen,
-        BATCH=batch,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_DMODEL=v_head_dim,
-        BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
-        BLOCK_DMODEL_PE=pe_head_dim,
-        BLOCK_DMODEL_OUT=head_size_og,
-        NUM_XCD=get_num_xcds(),
-        USE_INT64_STRIDES=_USE_INT64_STRIDES,
-        IS_FP8=IS_FP8,
-        FP8_MAX=FP8_MAX,
-        ENABLE_SINK=sink is not None,
-        SLIDING_WINDOW=sliding_window,
-        RETURN_SCORES=return_softmax,
-        HEAD_STRIDE_ALIGN=head_stride_align,
-        **config,
+        num_k_heads,
+        causal,
+        varlen,
+        batch,
+        BLOCK_M,
+        BLOCK_N,
+        v_head_dim,
+        BLOCK_DMODEL_POW2,
+        pe_head_dim,
+        head_size_og,
+        get_num_xcds(),
+        _USE_INT64_STRIDES,
+        IS_FP8,
+        FP8_MAX,
+        sink is not None,
+        sliding_window,
+        return_softmax,
+        head_stride_align,
+        config.get("num_warps", 4),
     )
 
     return o, softmax_lse, s_dmask

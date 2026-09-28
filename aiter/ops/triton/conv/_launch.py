@@ -3,7 +3,7 @@
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.conv.conv_1x1 import (
     _conv2d_1x1_kernel,
@@ -50,6 +50,7 @@ from aiter.ops.triton.utils.conv_config_utils import (
     format_prepack_shape_key,
     format_shape_key,
 )
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 
 def _kernel_activation(activation):
@@ -57,49 +58,45 @@ def _kernel_activation(activation):
     return "gelu_tanh" if activation == "gelu" else activation
 
 
-def _make_mn_grid(M_total, K_out):
+def _mn_grid(M_total, K_out, config):
     """Grid for the GEMM-style conv kernels (1x1, 3x3 nhwc/cblocked, general):
     one program per (BLOCK_M tile of M_total) x (BLOCK_N tile of K_out)."""
-
-    def grid(meta):
-        return (
-            triton.cdiv(M_total, meta["BLOCK_M"]) * triton.cdiv(K_out, meta["BLOCK_N"]),
-        )
-
-    return grid
+    return (
+        triton.cdiv(M_total, config["BLOCK_M"]) * triton.cdiv(K_out, config["BLOCK_N"]),
+    )
 
 
-def _make_wino_input_grid(T, C_pad):
+def _wino_input_grid(T, C_pad, config):
     """Grid for the Winograd F(4,3) input-transform kernels: one program per
     tile T x (BLOCK_C tile of C_pad)."""
-
-    def grid(meta):
-        return (T, triton.cdiv(C_pad, meta["BLOCK_C"]))
-
-    return grid
+    return (T, triton.cdiv(C_pad, config["BLOCK_C"]))
 
 
-def _make_wino_gemm_grid(T, K_out):
+def _wino_gemm_grid(T, K_out, config):
     """Grid for the Winograd F(4,3) batched GEMM: (BLOCK_M tile of T) x
     (BLOCK_N tile of K_out) program blocks, batched over the 36 tile elements."""
-
-    def grid(meta):
-        return (
-            triton.cdiv(T, meta["BLOCK_M"]) * triton.cdiv(K_out, meta["BLOCK_N"]),
-            36,
-        )
-
-    return grid
+    return (
+        triton.cdiv(T, config["BLOCK_M"]) * triton.cdiv(K_out, config["BLOCK_N"]),
+        36,
+    )
 
 
-def _make_wino_output_grid(T, K_out):
+def _wino_output_grid(T, K_out, config):
     """Grid for the Winograd F(4,3) output-transform kernels: one program per
     tile T x (BLOCK_K tile of K_out)."""
+    return (T, triton.cdiv(K_out, config["BLOCK_K"]))
 
-    def grid(meta):
-        return (T, triton.cdiv(K_out, meta["BLOCK_K"]))
 
-    return grid
+_nchw_to_cblocked_kernel_launch = make_launcher(
+    _nchw_to_cblocked_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 def _launch_nchw_to_cblocked(x, x_blocked, N, C, H, W, C_pad, block_c):
@@ -107,20 +104,42 @@ def _launch_nchw_to_cblocked(x, x_blocked, N, C, H, W, C_pad, block_c):
     HW = H * W
     shape_key = format_prepack_shape_key(N, C, H, W, block_c)
     config = _get_config_prepack(shape_key=shape_key, M=HW)
-    grid = lambda meta: (
-        triton.cdiv(HW, meta["BLOCK_M"]),
-        triton.cdiv(C_pad, meta["BLOCK_C"]),
+    grid = (
+        triton.cdiv(HW, config["BLOCK_M"]),
+        triton.cdiv(C_pad, config["BLOCK_C"]),
         N,
     )
-    _intj_launch(_nchw_to_cblocked_kernel, grid,
+    dev, stream = current_device_stream()
+    _nchw_to_cblocked_kernel_launch(
+        dev,
+        stream,
+        grid,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
         x,
         x_blocked,
         C,
         HW,
-        C_PAD=C_pad,
-        CB=block_c,
-        **config,
+        C_pad,
+        block_c,
+        config["BLOCK_C"],
+        config["BLOCK_M"],
     )
+
+
+_conv2d_1x1_kernel_launch = make_launcher(
+    _conv2d_1x1_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 def _launch_1x1(
@@ -171,7 +190,16 @@ def _launch_1x1(
         variants=(layout,),
     )
 
-    _intj_launch(_conv2d_1x1_kernel, _make_mn_grid(M_total, K_out),
+    dev, stream = current_device_stream()
+    _conv2d_1x1_kernel_launch(
+        dev,
+        stream,
+        _mn_grid(M_total, K_out, config),
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
         x,
         w,
         bias_fp32,
@@ -188,11 +216,26 @@ def _launch_1x1(
         ph,
         pw,
         M_total,
-        HAS_BIAS=bias_fp32 is not None,
-        ACTIVATION=_kernel_activation(activation),
-        LAYOUT=layout,
-        **config,
+        config["BLOCK_M"],
+        config["BLOCK_N"],
+        config["BLOCK_K"],
+        config["GROUP_SIZE_M"],
+        bias_fp32 is not None,
+        _kernel_activation(activation),
+        layout,
     )
+
+
+_conv2d_3x3_nhwc_kernel_launch = make_launcher(
+    _conv2d_3x3_nhwc_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 def _launch_3x3_nhwc(
@@ -240,7 +283,16 @@ def _launch_3x3_nhwc(
         M=M_total,
     )
 
-    _intj_launch(_conv2d_3x3_nhwc_kernel, _make_mn_grid(M_total, K_out),
+    dev, stream = current_device_stream()
+    _conv2d_3x3_nhwc_kernel_launch(
+        dev,
+        stream,
+        _mn_grid(M_total, K_out, config),
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
         x,
         w_3x3,
         bias_fp32,
@@ -260,10 +312,25 @@ def _launch_3x3_nhwc(
         dh,
         dw,
         M_total,
-        HAS_BIAS=bias_fp32 is not None,
-        ACTIVATION=_kernel_activation(activation),
-        **config,
+        config["BLOCK_M"],
+        config["BLOCK_N"],
+        config["BLOCK_K"],
+        config["GROUP_SIZE_M"],
+        bias_fp32 is not None,
+        _kernel_activation(activation),
     )
+
+
+_conv2d_3x3_cblocked_kernel_launch = make_launcher(
+    _conv2d_3x3_cblocked_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 def _launch_3x3_cblocked(
@@ -312,7 +379,16 @@ def _launch_3x3_cblocked(
         M=M_total,
     )
 
-    _intj_launch(_conv2d_3x3_cblocked_kernel, _make_mn_grid(M_total, K_out),
+    dev, stream = current_device_stream()
+    _conv2d_3x3_cblocked_kernel_launch(
+        dev,
+        stream,
+        _mn_grid(M_total, K_out, config),
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
         x_blocked,
         w_3x3,
         bias_fp32,
@@ -333,10 +409,25 @@ def _launch_3x3_cblocked(
         dh,
         dw,
         M_total,
-        HAS_BIAS=bias_fp32 is not None,
-        ACTIVATION=_kernel_activation(activation),
-        **config,
+        config["BLOCK_M"],
+        config["BLOCK_N"],
+        config["BLOCK_K"],
+        config["GROUP_SIZE_M"],
+        bias_fp32 is not None,
+        _kernel_activation(activation),
     )
+
+
+_conv2d_3x3_nchw_kernel_launch = make_launcher(
+    _conv2d_3x3_nchw_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 def _launch_3x3_nchw(
@@ -380,7 +471,16 @@ def _launch_3x3_nchw(
     config = _get_config_nchw(shape_key=shape_key, M=M_total)
     row_aligned = "BLOCK_M" in config and Q % config["BLOCK_M"] == 0
 
-    _intj_launch(_conv2d_3x3_nchw_kernel, _make_mn_grid(M_total, K_out),
+    dev, stream = current_device_stream()
+    _conv2d_3x3_nchw_kernel_launch(
+        dev,
+        stream,
+        _mn_grid(M_total, K_out, config),
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
         x,
         w_3x3,
         bias,
@@ -400,11 +500,26 @@ def _launch_3x3_nchw(
         dh,
         dw,
         M_total,
-        HAS_BIAS=bias is not None,
-        ACTIVATION=_kernel_activation(activation),
-        ROW_ALIGNED=row_aligned,
-        **config,
+        config["BLOCK_M"],
+        config["BLOCK_N"],
+        config["BLOCK_K"],
+        config["GROUP_SIZE_M"],
+        bias is not None,
+        _kernel_activation(activation),
+        row_aligned,
     )
+
+
+_conv2d_general_kernel_launch = make_launcher(
+    _conv2d_general_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 def _launch_general(
@@ -459,7 +574,16 @@ def _launch_general(
         variants=(layout,),
     )
 
-    _intj_launch(_conv2d_general_kernel, _make_mn_grid(M_total, K_out),
+    dev, stream = current_device_stream()
+    _conv2d_general_kernel_launch(
+        dev,
+        stream,
+        _mn_grid(M_total, K_out, config),
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
         x,
         w_k,
         bias_fp32,
@@ -481,11 +605,50 @@ def _launch_general(
         dh,
         dw,
         M_total,
-        HAS_BIAS=bias_fp32 is not None,
-        ACTIVATION=_kernel_activation(activation),
-        LAYOUT=layout,
-        **config,
+        config["BLOCK_M"],
+        config["BLOCK_N"],
+        config["BLOCK_K"],
+        config["GROUP_SIZE_M"],
+        bias_fp32 is not None,
+        _kernel_activation(activation),
+        layout,
     )
+
+
+_winograd_f4x3_input_transform_kernel_launch = make_launcher(
+    _winograd_f4x3_input_transform_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
+
+
+_winograd_f4x3_batched_gemm_kernel_launch = make_launcher(
+    _winograd_f4x3_batched_gemm_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
+
+
+_winograd_f4x3_output_transform_kernel_launch = make_launcher(
+    _winograd_f4x3_output_transform_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 def _launch_winograd_f4x3(
@@ -535,7 +698,16 @@ def _launch_winograd_f4x3(
     output_config = _get_config_wino_output(shape_key=shape_key, M=T)
 
     # 1. Input transform
-    _intj_launch(_winograd_f4x3_input_transform_kernel, _make_wino_input_grid(T, C_pad),
+    dev, stream = current_device_stream()
+    _winograd_f4x3_input_transform_kernel_launch(
+        dev,
+        stream,
+        _wino_input_grid(T, C_pad, input_config),
+        input_config.get("num_warps", 4),
+        input_config.get("num_stages", 2),
+        input_config.get("waves_per_eu", 0),
+        input_config.get("matrix_instr_nonkdim", 0),
+        input_config.get("kpack", 1),
         x,
         V,
         N,
@@ -548,23 +720,44 @@ def _launch_winograd_f4x3(
         T,
         ph,
         pw,
-        LAYOUT=layout,
-        **input_config,
+        input_config["BLOCK_C"],
+        layout,
     )
 
     # 2. Batched GEMM
-    _intj_launch(_winograd_f4x3_batched_gemm_kernel, _make_wino_gemm_grid(T, K_out),
+    dev, stream = current_device_stream()
+    _winograd_f4x3_batched_gemm_kernel_launch(
+        dev,
+        stream,
+        _wino_gemm_grid(T, K_out, gemm_config),
+        gemm_config.get("num_warps", 4),
+        gemm_config.get("num_stages", 2),
+        gemm_config.get("waves_per_eu", 0),
+        gemm_config.get("matrix_instr_nonkdim", 0),
+        gemm_config.get("kpack", 1),
         V,
         U,
         M,
         T,
         K_out,
         C_pad,
-        **gemm_config,
+        gemm_config["BLOCK_M"],
+        gemm_config["BLOCK_N"],
+        gemm_config["BLOCK_K"],
+        gemm_config["GROUP_SIZE_M"],
     )
 
     # 3. Output transform
-    _intj_launch(_winograd_f4x3_output_transform_kernel, _make_wino_output_grid(T, K_out),
+    dev, stream = current_device_stream()
+    _winograd_f4x3_output_transform_kernel_launch(
+        dev,
+        stream,
+        _wino_output_grid(T, K_out, output_config),
+        output_config.get("num_warps", 4),
+        output_config.get("num_stages", 2),
+        output_config.get("waves_per_eu", 0),
+        output_config.get("matrix_instr_nonkdim", 0),
+        output_config.get("kpack", 1),
         M,
         bias_fp32,
         y,
@@ -575,11 +768,23 @@ def _launch_winograd_f4x3(
         tile_H,
         tile_W,
         T,
-        HAS_BIAS=bias_fp32 is not None,
-        ACTIVATION=_kernel_activation(activation),
-        LAYOUT=layout,
-        **output_config,
+        output_config["BLOCK_K"],
+        bias_fp32 is not None,
+        _kernel_activation(activation),
+        layout,
     )
+
+
+_winograd_f4x3_cblocked_input_transform_kernel_launch = make_launcher(
+    _winograd_f4x3_cblocked_input_transform_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 def _launch_winograd_f4x3_cblocked(
@@ -631,7 +836,16 @@ def _launch_winograd_f4x3_cblocked(
     output_config = _get_config_wino_output(shape_key=shape_key, M=T)
 
     # 1. Cblocked input transform
-    _intj_launch(_winograd_f4x3_cblocked_input_transform_kernel, _make_wino_input_grid(T, C_pad),
+    dev, stream = current_device_stream()
+    _winograd_f4x3_cblocked_input_transform_kernel_launch(
+        dev,
+        stream,
+        _wino_input_grid(T, C_pad, input_config),
+        input_config.get("num_warps", 4),
+        input_config.get("num_stages", 2),
+        input_config.get("waves_per_eu", 0),
+        input_config.get("matrix_instr_nonkdim", 0),
+        input_config.get("kpack", 1),
         x_blocked,
         V,
         N,
@@ -645,20 +859,41 @@ def _launch_winograd_f4x3_cblocked(
         ph,
         pw,
         Cb,
-        **input_config,
+        input_config["BLOCK_C"],
     )
 
-    _intj_launch(_winograd_f4x3_batched_gemm_kernel, _make_wino_gemm_grid(T, K_out),
+    dev, stream = current_device_stream()
+    _winograd_f4x3_batched_gemm_kernel_launch(
+        dev,
+        stream,
+        _wino_gemm_grid(T, K_out, gemm_config),
+        gemm_config.get("num_warps", 4),
+        gemm_config.get("num_stages", 2),
+        gemm_config.get("waves_per_eu", 0),
+        gemm_config.get("matrix_instr_nonkdim", 0),
+        gemm_config.get("kpack", 1),
         V,
         U,
         M,
         T,
         K_out,
         C_pad,
-        **gemm_config,
+        gemm_config["BLOCK_M"],
+        gemm_config["BLOCK_N"],
+        gemm_config["BLOCK_K"],
+        gemm_config["GROUP_SIZE_M"],
     )
 
-    _intj_launch(_winograd_f4x3_output_transform_kernel, _make_wino_output_grid(T, K_out),
+    dev, stream = current_device_stream()
+    _winograd_f4x3_output_transform_kernel_launch(
+        dev,
+        stream,
+        _wino_output_grid(T, K_out, output_config),
+        output_config.get("num_warps", 4),
+        output_config.get("num_stages", 2),
+        output_config.get("waves_per_eu", 0),
+        output_config.get("matrix_instr_nonkdim", 0),
+        output_config.get("kpack", 1),
         M,
         bias_fp32,
         y,
@@ -669,7 +904,8 @@ def _launch_winograd_f4x3_cblocked(
         tile_H,
         tile_W,
         T,
-        HAS_BIAS=bias_fp32 is not None,
-        ACTIVATION=_kernel_activation(activation),
-        **output_config,
+        output_config["BLOCK_K"],
+        bias_fp32 is not None,
+        _kernel_activation(activation),
+        output_config.get("LAYOUT", "nchw"),
     )

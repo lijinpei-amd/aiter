@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
+
 import torch
 import triton
+from intj import make_launcher
 from intj.compat import launch as _intj_launch
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
@@ -22,6 +24,7 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16_persistent import (
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.gemm_config_utils import (
     compute_splitk_params,
     get_gemm_config,
@@ -66,6 +69,34 @@ def gemm_a16w16_fake_tensor(
     if y is not None:
         return y
     return torch.empty((M, N), dtype=dtype, device=x.device)
+
+
+_gemm_splitk_reduce_kernel_launch = make_launcher(_gemm_splitk_reduce_kernel)
+
+
+@functools.cache
+def _triton_persistent_kernel_launch(num_stages, waves_per_eu):
+    return make_launcher(
+        _triton_persistent_kernel,
+        dynamic_options=(
+            "num_warps",
+            "matrix_instr_nonkdim",
+            "kpack",
+        ),
+        options={"num_stages": num_stages, "waves_per_eu": waves_per_eu},
+    )
+
+
+_gemm_a16_w16_kernel_launch = make_launcher(
+    _gemm_a16_w16_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 @torch_compile_guard(gen_fake=gemm_a16w16_fake_tensor)
@@ -238,7 +269,9 @@ def gemm_a16w16_(
 
             out_ptr = y if NUM_KSPLIT == 1 else y_pp
 
-            _intj_launch(_GLUON_PERSISTENT_KERNEL_MAP[kernel_type], (NUM_WGS,),
+            _intj_launch(
+                _GLUON_PERSISTENT_KERNEL_MAP[kernel_type],
+                (NUM_WGS,),
                 x,
                 w,
                 bias,
@@ -286,7 +319,11 @@ def gemm_a16w16_(
                     triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
                     triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
                 )
-                _intj_launch(_gemm_splitk_reduce_kernel, grid_reduce,
+                dev, stream = current_device_stream()
+                _gemm_splitk_reduce_kernel_launch(
+                    dev,
+                    stream,
+                    grid_reduce,
                     y_pp,
                     y,
                     bias,
@@ -301,12 +338,10 @@ def gemm_a16w16_(
                     REDUCE_BLOCK_SIZE_N,
                     ACTUAL_KSPLIT,
                     triton.next_power_of_2(NUM_KSPLIT),
-                    ADD_BIAS=(bias is not None),
-                    activation=(
-                        _get_activation_from_str(activation) if activation else ""
-                    ),
-                    use_activation=activation is not None,
-                    KERNEL_NAME="_gemm_a16w16_persistent_reduce_kernel",
+                    bias is not None,
+                    _get_activation_from_str(activation) if activation else "",
+                    activation is not None,
+                    "_gemm_a16w16_persistent_reduce_kernel",
                 )
 
             return y
@@ -326,7 +361,16 @@ def gemm_a16w16_(
         num_tiles = triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(
             N, config["BLOCK_SIZE_N"]
         )
-        _intj_launch_tuned(_triton_persistent_kernel, (min(NUM_WGS, num_tiles),),
+        dev, stream = current_device_stream()
+        _triton_persistent_kernel_launch(
+            config.get("num_stages", 2), config.get("waves_per_eu", 0)
+        )(
+            dev,
+            stream,
+            (min(NUM_WGS, num_tiles),),
+            config.get("num_warps", 4),
+            config.get("matrix_instr_nonkdim", 0),
+            config.get("kpack", 1),
             x,
             w,
             bias,
@@ -342,12 +386,20 @@ def gemm_a16w16_(
             0,  # stride_ck
             y.stride(0),
             y.stride(1),
-            activation=_get_activation_from_str(activation) if activation else "",
-            use_activation=activation is not None,
-            ADD_BIAS=(bias is not None),
-            SKIP_REDUCE=False,
-            NUM_WGS=NUM_WGS,
-            **config,
+            config["BLOCK_SIZE_M"],
+            config["BLOCK_SIZE_N"],
+            config["BLOCK_SIZE_K"],
+            config["GROUP_SIZE_M"],
+            config["NUM_KSPLIT"],
+            config["SPLITK_BLOCK_SIZE"],
+            config["cache_modifier"],
+            _get_activation_from_str(activation) if activation else "",
+            activation is not None,
+            bias is not None,
+            False,
+            NUM_WGS,
+            config.get("num_stages", 0),
+            config.get("waves_per_eu", 0),
         )
 
         return y
@@ -447,7 +499,9 @@ def gemm_a16w16_(
             w.shape,
         )
 
-        _intj_launch(_KERNEL_MAP[kernel_type], grid,
+        _intj_launch(
+            _KERNEL_MAP[kernel_type],
+            grid,
             x,
             w,
             y,
@@ -507,7 +561,16 @@ def gemm_a16w16_(
             * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
-    _intj_launch_tuned(_gemm_a16_w16_kernel, grid,
+    dev, stream = current_device_stream()
+    _gemm_a16_w16_kernel_launch(
+        dev,
+        stream,
+        grid,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
         x,
         w,
         bias,
@@ -522,11 +585,17 @@ def gemm_a16w16_(
         0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
         y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
         y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
-        activation=_get_activation_from_str(activation) if activation else "",
-        use_activation=activation is not None,
-        ADD_BIAS=(bias is not None),
-        SKIP_REDUCE=skip_reduce,
-        **config,
+        config["BLOCK_SIZE_M"],
+        config["BLOCK_SIZE_N"],
+        config["BLOCK_SIZE_K"],
+        config["GROUP_SIZE_M"],
+        config["NUM_KSPLIT"],
+        config["SPLITK_BLOCK_SIZE"],
+        config["cache_modifier"],
+        _get_activation_from_str(activation) if activation else "",
+        activation is not None,
+        bias is not None,
+        skip_reduce,
     )
 
     if config["NUM_KSPLIT"] > 1:
@@ -541,7 +610,11 @@ def gemm_a16w16_(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _intj_launch(_gemm_splitk_reduce_kernel, grid_reduce,
+        dev, stream = current_device_stream()
+        _gemm_splitk_reduce_kernel_launch(
+            dev,
+            stream,
+            grid_reduce,
             y_pp,
             y,
             bias,
@@ -556,10 +629,10 @@ def gemm_a16w16_(
             REDUCE_BLOCK_SIZE_N,
             ACTUAL_KSPLIT,
             triton.next_power_of_2(config["NUM_KSPLIT"]),
-            ADD_BIAS=(bias is not None),
-            activation=_get_activation_from_str(activation) if activation else "",
-            use_activation=activation is not None,
-            KERNEL_NAME="_gemm_a16w16_reduce_kernel",
+            bias is not None,
+            _get_activation_from_str(activation) if activation else "",
+            activation is not None,
+            "_gemm_a16w16_reduce_kernel",
         )
 
     return y
