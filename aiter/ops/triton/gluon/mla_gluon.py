@@ -50,7 +50,6 @@ import torch
 import triton
 import triton.language as tl
 from intj import make_launcher
-from intj.compat import launch as _intj_launch
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
@@ -829,6 +828,9 @@ _mla_softmax_reducev_kernel_launch = make_launcher(
 # fmt: on
 
 
+_mla_gluon_launch = make_launcher(_mla_gluon)
+
+
 def mla_gluon(
     q_nope,  # [batch, nhead, kv_lora_rank] or MTP [batch, qlen, nhead, kv_lora_rank]
     q_pe,  # [batch, nhead, qk_rope_head_dim] or MTP [batch, qlen, nhead, qk_rope_head_dim]
@@ -1052,8 +1054,10 @@ def mla_gluon(
         grid = (batch_size, NUM_KV_SPLITS, triton.cdiv(nhead, BLOCK_H) * qlen)
     stride_page_bs = page_table.stride(0) if use_2d_view else 0
 
-    _intj_launch(
-        _mla_gluon,
+    dev, stream = current_device_stream()
+    _mla_gluon_launch(
+        dev,
+        stream,
         grid,
         q_nope,
         q_pe,
@@ -1087,22 +1091,22 @@ def mla_gluon(
         stride_final_lse_b,
         stride_final_lse_s,
         stride_final_lse_h,
-        BLOCK_H=BLOCK_H,
-        BLOCK_N=BLOCK_N,
-        NUM_KV_SPLITS=NUM_KV_SPLITS,
-        PAGE_SIZE=PAGE_SIZE,
-        HEAD_DIM_CKV=head_dim_ckv,
-        HEAD_DIM_KPE=head_dim_kpe,
-        KV_PE_OFFSET=kv_pe_offset,
-        USE_2D_VIEW=use_2d_view,
-        WITHIN_2GB=within_2gb,
-        NUM_XCDS=NUM_XCDS,
-        NHEAD=nhead,
-        REGIME=REGIME,
-        RETURN_LSE=return_lse,
-        QLEN=qlen,
-        HAS_PE=has_pe,
-        HAS_ATTN_SINK=has_attn_sink,
+        BLOCK_H,
+        BLOCK_N,
+        NUM_KV_SPLITS,
+        PAGE_SIZE,
+        head_dim_ckv,
+        head_dim_kpe,
+        kv_pe_offset,
+        use_2d_view,
+        within_2gb,
+        NUM_XCDS,
+        nhead,
+        REGIME,
+        return_lse,
+        qlen,
+        has_pe,
+        has_attn_sink,
     )
 
     if NUM_KV_SPLITS == 1:

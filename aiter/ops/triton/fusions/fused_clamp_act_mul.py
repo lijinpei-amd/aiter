@@ -3,11 +3,12 @@
 
 from __future__ import annotations
 
+import functools
 from typing import Literal
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
+from intj import make_launcher
 
 from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_clamp_act_mul import (
     _fused_clamp_silu_mul_kernel as _fused_clamp_silu_mul_gluon_kernel,
@@ -20,6 +21,7 @@ from aiter.ops.triton.utils.config_utils import (
     AITER_TRITON_CONFIGS_PATH,
     load_config_json,
 )
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -81,6 +83,20 @@ def _get_config(M: int, N: int, block_size_n: int, backend: str) -> dict:
     if config["BLOCK_SIZE_N"] is None:
         config["BLOCK_SIZE_N"] = block_size_n
     return config
+
+
+@functools.cache
+def _fused_clamp_silu_mul_gluon_kernel_launch(num_warps):
+    return make_launcher(
+        _fused_clamp_silu_mul_gluon_kernel,
+        dynamic_options=("waves_per_eu",),
+        options={"num_warps": num_warps},
+    )
+
+
+_fused_clamp_silu_mul_kernel_launch = make_launcher(
+    _fused_clamp_silu_mul_kernel, dynamic_options=("num_warps",)
+)
 
 
 def fused_clamp_act_mul(
@@ -305,10 +321,15 @@ def fused_clamp_act_mul(
         ), f"Gluon backend requires gfx1250, got '{get_arch()}'"
 
         # (M chunks * rows to process, N tiles)
-        _intj_launch(_fused_clamp_silu_mul_gluon_kernel, (
+        dev, stream = current_device_stream()
+        _fused_clamp_silu_mul_gluon_kernel_launch(num_warps)(
+            dev,
+            stream,
+            (
                 triton.cdiv(M, ROWS_PER_PROG * BLOCK_SIZE_M),
                 triton.cdiv(n_half, BLOCK_SIZE_N),
             ),
+            waves_per_eu,
             inp,
             out,
             scale_arg,
@@ -324,29 +345,33 @@ def fused_clamp_act_mul(
             weights.stride(0) if HAVE_WEIGHTS else 0,
             weights.stride(1) if HAVE_WEIGHTS else 0,
             swiglu_limit,
-            BLOCK_SIZE_N=BLOCK_SIZE_N,
-            QUANT_BLOCK_SIZE=quant_block_size,
-            BLOCK_SIZE_M=BLOCK_SIZE_M,
-            SCALE_FMT=scale_dtype_fmt,
-            DTYPE_MAX=DTYPE_MAX,
-            DTYPE_MIN=-DTYPE_MAX,
-            HAVE_WEIGHTS=HAVE_WEIGHTS,
-            WEIGHT_BROADCAST=WEIGHT_BROADCAST,
-            HAVE_SWIGLU_CLAMP=HAVE_SWIGLU_CLAMP,
-            HAS_QUANT=HAS_QUANT,
-            ACTIVATION=activation,
-            SHUFFLE=shuffle_scale,
-            SCALE_N_PAD=scale_n_pad,
-            num_warps=num_warps,
-            waves_per_eu=waves_per_eu,
-            ROWS_PER_PROG=ROWS_PER_PROG,
-            cache_modifier=".cg",
+            ROWS_PER_PROG,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            quant_block_size,
+            scale_dtype_fmt,
+            DTYPE_MAX,
+            -DTYPE_MAX,
+            HAVE_WEIGHTS,
+            WEIGHT_BROADCAST,
+            HAVE_SWIGLU_CLAMP,
+            HAS_QUANT,
+            activation,
+            shuffle_scale,
+            scale_n_pad,
+            num_warps,
+            ".cg",
         )
     else:
         # only for triton
         num_warps = _get_config(M, n_half, BLOCK_SIZE_N, "triton")["num_warps"]
 
-        _intj_launch(_fused_clamp_silu_mul_kernel, (M,),
+        dev, stream = current_device_stream()
+        _fused_clamp_silu_mul_kernel_launch(
+            dev,
+            stream,
+            (M,),
+            num_warps,
             inp,
             out,
             scale_arg,
@@ -362,19 +387,18 @@ def fused_clamp_act_mul(
             weights.stride(0) if HAVE_WEIGHTS else 0,
             weights.stride(1) if HAVE_WEIGHTS else 0,
             swiglu_limit,
-            BLOCK_SIZE_N=BLOCK_SIZE_N,
-            QUANT_BLOCK_SIZE=quant_block_size,
-            SCALE_FMT=scale_dtype_fmt,
-            DTYPE_MAX=DTYPE_MAX,
-            DTYPE_MIN=-DTYPE_MAX,
-            HAVE_WEIGHTS=HAVE_WEIGHTS,
-            WEIGHT_BROADCAST=WEIGHT_BROADCAST,
-            HAVE_SWIGLU_CLAMP=HAVE_SWIGLU_CLAMP,
-            HAS_QUANT=HAS_QUANT,
-            ACTIVATION=activation,
-            SHUFFLE=shuffle_scale,
-            SCALE_N_PAD=scale_n_pad,
-            num_warps=num_warps,
+            BLOCK_SIZE_N,
+            quant_block_size,
+            scale_dtype_fmt,
+            DTYPE_MAX,
+            -DTYPE_MAX,
+            HAVE_WEIGHTS,
+            WEIGHT_BROADCAST,
+            HAVE_SWIGLU_CLAMP,
+            HAS_QUANT,
+            activation,
+            shuffle_scale,
+            scale_n_pad,
         )
 
     if HAS_QUANT:

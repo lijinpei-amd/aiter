@@ -19,17 +19,29 @@ It supports page size = 1 and prefill with KV cache (i.e. extend).
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.attention.extend_attention import (
     _fwd_kernel,
     _get_config,
 )
 from aiter.ops.triton.attention.prefill_attention import context_attention_fwd
-from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils.device_info import current_device_stream, get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+
+_fwd_kernel_launch = make_launcher(
+    _fwd_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 def extend_attention_fwd(
@@ -119,7 +131,16 @@ def extend_attention_fwd(
     num_blocks = triton.cdiv(max_len_extend, config["BLOCK_M"])
     grid = (head_num * num_blocks * batch_size,)
 
-    _intj_launch(_fwd_kernel, grid,
+    dev, stream = current_device_stream()
+    _fwd_kernel_launch(
+        dev,
+        stream,
+        grid,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
         q_extend,
         k_extend,
         v_extend,
@@ -145,20 +166,21 @@ def extend_attention_fwd(
         k_buffer.stride(1),
         v_buffer.stride(0),
         v_buffer.stride(1),
-        logit_cap=logit_cap,
-        BLOCK_DMODEL=BLOCK_DMODEL,
-        BLOCK_DPE=BLOCK_DPE,
-        BLOCK_DV=BLOCK_DV,
-        Lq=Lq,
-        Lv=Lv,
-        USE_CUSTOM_MASK=USE_CUSTOM_MASK,
-        IS_CAUSAL=is_causal,
-        SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
-        STORE_TRANSPOSE=True,
-        NUM_Q_HEADS=head_num,
-        NUM_BLOCKS=num_blocks,
-        NUM_XCDS=get_num_xcds(),
-        **config,
+        logit_cap,
+        Lq,
+        Lv,
+        BLOCK_DMODEL,
+        BLOCK_DPE,
+        BLOCK_DV,
+        config["BLOCK_M"],
+        config["BLOCK_N"],
+        USE_CUSTOM_MASK,
+        is_causal,
+        SKIP_PREFIX_CUSTOM_MASK,
+        True,
+        head_num,
+        num_blocks,
+        get_num_xcds(),
     )
 
 

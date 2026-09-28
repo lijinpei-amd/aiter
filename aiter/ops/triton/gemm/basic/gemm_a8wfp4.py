@@ -14,7 +14,6 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8wfp4 import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import current_device_stream
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -33,6 +32,18 @@ _gemm_splitk_reduce_kernel_launch = make_launcher(
         "KERNEL_NAME": Constexpr(value="_gemm_afp4_wfp4_reduce_kernel"),
         "activation": Constexpr(value=""),
     },
+)
+
+
+_gemm_a8wfp4_kernel_launch = make_launcher(
+    _gemm_a8wfp4_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
 )
 
 
@@ -132,9 +143,16 @@ def gemm_a8wfp4(
     stride_asm, stride_ask = x_scales.stride()
     stride_bsn, stride_bsk = w_scales.stride()
 
-    _intj_launch_tuned(
-        _gemm_a8wfp4_kernel,
+    dev, stream = current_device_stream()
+    _gemm_a8wfp4_kernel_launch(
+        dev,
+        stream,
         grid,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
         x,
         w,
         y_final,
@@ -154,8 +172,14 @@ def gemm_a8wfp4(
         stride_ask,
         stride_bsn,
         stride_bsk,
-        RAW_MASKED_LOADS=True,
-        **config,
+        config["BLOCK_SIZE_M"],
+        config["BLOCK_SIZE_N"],
+        config["BLOCK_SIZE_K"],
+        config["GROUP_SIZE_M"],
+        config["NUM_KSPLIT"],
+        config["SPLITK_BLOCK_SIZE"],
+        True,
+        config["cache_modifier"],
     )
 
     if config["NUM_KSPLIT"] > 1:

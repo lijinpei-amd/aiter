@@ -1,7 +1,8 @@
+import functools
+
 import torch
 import triton
 from intj import make_launcher
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._gluon_kernels.gfx1250.norm.fused_add_rmsnorm_pad import (
     _gluon_fused_add_rmsnorm_pad_kernel,
@@ -29,6 +30,13 @@ def _get_config(block_size_n: int, backend: str) -> dict:
 
 
 _fused_add_rmsnorm_pad_launch = make_launcher(_fused_add_rmsnorm_pad, grid_arg=1)
+
+
+@functools.cache
+def _gluon_fused_add_rmsnorm_pad_kernel_launch(num_warps):
+    return make_launcher(
+        _gluon_fused_add_rmsnorm_pad_kernel, options={"num_warps": num_warps}
+    )
 
 
 def fused_add_rmsnorm_pad(
@@ -85,8 +93,10 @@ def fused_add_rmsnorm_pad(
             BLOCK_SIZE_N = triton.next_power_of_2(N_out)
             config = _get_config(BLOCK_SIZE_N, "gluon")
             NUM_WARPS = config["num_warps"]
-            _intj_launch(
-                _gluon_fused_add_rmsnorm_pad_kernel,
+            dev, stream = current_device_stream()
+            _gluon_fused_add_rmsnorm_pad_kernel_launch(NUM_WARPS)(
+                dev,
+                stream,
                 (M,),
                 x,
                 res,
@@ -105,9 +115,9 @@ def fused_add_rmsnorm_pad(
                 out.stride(1),
                 res_out.stride(0) if res is not None else 0,
                 res_out.stride(1) if res is not None else 0,
-                HAS_RES=(res is not None),
-                BLOCK_SIZE_N=BLOCK_SIZE_N,
-                num_warps=NUM_WARPS,
+                res is not None,
+                BLOCK_SIZE_N,
+                NUM_WARPS,
             )
 
             if res is not None:

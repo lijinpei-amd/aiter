@@ -3,16 +3,29 @@
 
 import torch
 import triton
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16_gated import (
     _gemm_a16_w16_gated_kernel,
     _get_config,
 )
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+
+_gemm_a16_w16_gated_kernel_launch = make_launcher(
+    _gemm_a16_w16_gated_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 def gemm_a16w16_gated(
@@ -60,7 +73,16 @@ def gemm_a16w16_gated(
     grid = (
         triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),
     )
-    _intj_launch_tuned(_gemm_a16_w16_gated_kernel, grid,
+    dev, stream = current_device_stream()
+    _gemm_a16_w16_gated_kernel_launch(
+        dev,
+        stream,
+        grid,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
         x,
         w,
         y,
@@ -73,9 +95,13 @@ def gemm_a16w16_gated(
         w.stride(1),
         y.stride(0),
         y.stride(1),
-        activation=_get_activation_from_str(activation) if activation else "",
-        use_activation=activation is not None,
-        **config,
+        config["BLOCK_SIZE_M"],
+        config["BLOCK_SIZE_N"],
+        config["BLOCK_SIZE_K"],
+        config["GROUP_SIZE_M"],
+        config["cache_modifier"],
+        _get_activation_from_str(activation) if activation else "",
+        activation is not None,
     )
 
     return y

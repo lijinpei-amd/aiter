@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
+
 import torch
 import triton
 from intj import Constexpr, make_launcher
@@ -15,7 +17,6 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8 import (
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.device_info import current_device_stream, get_num_xcds
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import (
     get_scaled_dot_format_string,
@@ -34,6 +35,36 @@ _gemm_splitk_reduce_kernel_launch = make_launcher(
         "activation": Constexpr(value=""),
     },
 )
+
+
+_gemm_a8w8_kernel_launch = make_launcher(
+    _gemm_a8w8_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
+
+
+@functools.cache
+def _gluon_gemm_a8w8_kernel_launch():
+    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a8w8 import (
+        _gemm_a8w8_kernel as _gluon_gemm_a8w8_kernel,
+    )
+
+    return make_launcher(
+        _gluon_gemm_a8w8_kernel,
+        dynamic_options=(
+            "num_warps",
+            "num_stages",
+            "waves_per_eu",
+            "matrix_instr_nonkdim",
+            "kpack",
+        ),
+    )
 
 
 def gemm_a8w8(
@@ -106,10 +137,6 @@ def gemm_a8w8(
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
     if backend == "gluon":
-        from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a8w8 import (
-            _gemm_a8w8_kernel as _gluon_gemm_a8w8_kernel,
-        )
-
         _LOGGER.info(
             "GEMM_A8W8 [gluon/%s]: x=%s w=%s",
             get_arch(),
@@ -126,9 +153,16 @@ def gemm_a8w8(
             triton.cdiv(M, config["BLOCK_SIZE_M"])
             * triton.cdiv(N, config["BLOCK_SIZE_N"]),
         )
-        _intj_launch_tuned(
-            _gluon_gemm_a8w8_kernel,
+        dev, stream = current_device_stream()
+        _gluon_gemm_a8w8_kernel_launch()(
+            dev,
+            stream,
             grid,
+            config.get("num_warps", 4),
+            config.get("num_stages", 2),
+            config.get("waves_per_eu", 0),
+            config.get("matrix_instr_nonkdim", 0),
+            config.get("kpack", 1),
             x,
             w,
             x_scale,
@@ -145,10 +179,13 @@ def gemm_a8w8(
             y.stride(0),
             y.stride(1),
             bias is not None,
-            NUM_XCDS=get_num_xcds(),
-            NUM_WARPS=config["num_warps"],
-            **config,
-            FP8_FORMAT=fp8_format,
+            config["BLOCK_SIZE_M"],
+            config["BLOCK_SIZE_N"],
+            config["BLOCK_SIZE_K"],
+            config["GROUP_SIZE_M"],
+            get_num_xcds(),
+            config["num_warps"],
+            fp8_format,
         )
         return y
 
@@ -168,9 +205,16 @@ def gemm_a8w8(
             * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
-    _intj_launch_tuned(
-        _gemm_a8w8_kernel,
+    dev, stream = current_device_stream()
+    _gemm_a8w8_kernel_launch(
+        dev,
+        stream,
         grid,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
         x,
         w,
         x_scale,
@@ -188,7 +232,13 @@ def gemm_a8w8(
         y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
         y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
         (bias is not None) and (config["NUM_KSPLIT"] == 1),
-        **config,
+        config["BLOCK_SIZE_M"],
+        config["BLOCK_SIZE_N"],
+        config["BLOCK_SIZE_K"],
+        config["GROUP_SIZE_M"],
+        config["NUM_KSPLIT"],
+        config["SPLITK_BLOCK_SIZE"],
+        config["cache_modifier"],
     )
 
     if config["NUM_KSPLIT"] > 1:
@@ -229,6 +279,24 @@ def gemm_a8w8(
     return y
 
 
+@functools.cache
+def _gluon_gemm_a8w8_preshuffled_kernel_launch():
+    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a8w8 import (
+        _gemm_a8w8_preshuffled_kernel as _gluon_gemm_a8w8_preshuffled_kernel,
+    )
+
+    return make_launcher(
+        _gluon_gemm_a8w8_preshuffled_kernel,
+        dynamic_options=(
+            "num_warps",
+            "num_stages",
+            "waves_per_eu",
+            "matrix_instr_nonkdim",
+            "kpack",
+        ),
+    )
+
+
 def gemm_a8w8_preshuffle(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -261,9 +329,6 @@ def gemm_a8w8_preshuffle(
     assert (
         get_arch() in _GLUON_SUPPORTED_ARCHS
     ), f"gemm_a8w8_preshuffle requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
-    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a8w8 import (
-        _gemm_a8w8_preshuffled_kernel as _gluon_gemm_a8w8_preshuffled_kernel,
-    )
 
     _LOGGER.info(
         "GEMM_A8W8 PRESHUFFLE [gluon/%s]: x=%s w=%s",
@@ -295,9 +360,16 @@ def gemm_a8w8_preshuffle(
     grid = (
         triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),
     )
-    _intj_launch_tuned(
-        _gluon_gemm_a8w8_preshuffled_kernel,
+    dev, stream = current_device_stream()
+    _gluon_gemm_a8w8_preshuffled_kernel_launch()(
+        dev,
+        stream,
         grid,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
         x,
         w,
         x_scale,
@@ -314,10 +386,13 @@ def gemm_a8w8_preshuffle(
         y.stride(0),
         y.stride(1),
         bias is not None,
-        NUM_XCDS=get_num_xcds(),
-        NUM_WARPS=config["num_warps"],
-        **config,
-        FP8_FORMAT=fp8_format,
+        config["BLOCK_SIZE_M"],
+        config["BLOCK_SIZE_N"],
+        config["BLOCK_SIZE_K"],
+        config["GROUP_SIZE_M"],
+        get_num_xcds(),
+        config["num_warps"],
+        fp8_format,
     )
 
     return y

@@ -5,7 +5,7 @@ import itertools
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w8 import (
     _moe_gemm_a8w8,
@@ -13,6 +13,7 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w8 import (
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
 
 # -----------------------------------------------------------------------------
@@ -131,6 +132,18 @@ def get_kernel_config(m, n, k, routing_data, swizzle_mx_scale=None):
 # -----------------------------------------------------------------------------
 
 
+_moe_gemm_a8w8_launch = make_launcher(
+    _moe_gemm_a8w8,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
+
+
 def moe_gemm_a8w8(
     x,
     w,
@@ -229,7 +242,16 @@ def moe_gemm_a8w8(
     grid_n = triton.cdiv(N, config["block_n"])
     grid = grid_m * grid_n * config["split_k"]
     # launch kernel
-    _intj_launch(_moe_gemm_a8w8, (grid,),
+    dev, stream = current_device_stream()
+    _moe_gemm_a8w8_launch(
+        dev,
+        stream,
+        (grid,),
+        config["num_warps"],
+        config["num_stages"],
+        config["waves_per_eu"],
+        config["matrix_instr_nonkdim"],
+        config["kpack"],
         y,
         y.stride(0),
         y.stride(1),
@@ -273,18 +295,14 @@ def moe_gemm_a8w8(
         config["block_n"],
         config["block_k"],
         config["group_m"],
-        XCD_SWIZZLE=config["xcd_swizzle"],
-        SWIZZLE_MX_SCALE=swizzle_mx_scale,
-        SPLIT_K=config["split_k"],
-        EVEN_K=K % config["block_k"] == 0,
-        MASK_K_LIMIT=K % config["block_k"],
-        W_CACHE_MODIFIER=config["w_cache_modifier"],
-        num_warps=config["num_warps"],
-        num_stages=config["num_stages"],
-        UPCAST_INDICES=should_upcast_indices(x, w, y),
-        waves_per_eu=config["waves_per_eu"],
-        matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
-        kpack=config["kpack"],
+        config["xcd_swizzle"],
+        swizzle_mx_scale,
+        K % config["block_k"] == 0,
+        K % config["block_k"],
+        config["split_k"],
+        config["w_cache_modifier"],
+        should_upcast_indices(x, w, y),
+        False,
     )
     # Build grouped reduction inputs in a uniform way
     group_indx = (

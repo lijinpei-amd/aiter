@@ -8,7 +8,7 @@ a temporary, one multiply pass reading it back) with a single pass
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.fusions.fused_sigmoid_mul import (
     _fused_sigmoid_mul_kernel,
@@ -18,6 +18,7 @@ from aiter.ops.triton.utils.config_utils import (
     AITER_TRITON_CONFIGS_PATH,
     load_config_json,
 )
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -28,6 +29,18 @@ __all__ = ["fused_sigmoid_mul"]
 def _get_config() -> dict:
     base = f"{AITER_TRITON_CONFIGS_PATH}/{get_arch()}/triton/fusions/fused_sigmoid_mul"
     return dict(load_config_json(f"{base}/DEFAULT.json", required=True)["any"])
+
+
+_fused_sigmoid_mul_kernel_launch = make_launcher(
+    _fused_sigmoid_mul_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 def fused_sigmoid_mul(
@@ -78,13 +91,21 @@ def fused_sigmoid_mul(
     config = _get_config()
     BLOCK_SIZE_N = config.pop("BLOCK_SIZE_N")
 
-    _intj_launch(_fused_sigmoid_mul_kernel, (triton.cdiv(N, BLOCK_SIZE_N),),
+    dev, stream = current_device_stream()
+    _fused_sigmoid_mul_kernel_launch(
+        dev,
+        stream,
+        (triton.cdiv(N, BLOCK_SIZE_N),),
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
         x,
         gate,
         out,
         N,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        NEED_MASK=N % BLOCK_SIZE_N != 0,
-        **config,
+        BLOCK_SIZE_N,
+        N % BLOCK_SIZE_N != 0,
     )
     return out

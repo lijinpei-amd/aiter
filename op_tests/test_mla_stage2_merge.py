@@ -33,12 +33,13 @@ import pandas as pd
 import torch
 import triton
 import triton.language as tl
-from intj.compat import launch as _intj_launch
+from intj import make_launcher
 
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.mla import _fwd_kernel_stage2_asm
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -157,6 +158,26 @@ def run_torch(logits, attn_lse, num_valid, out_dtype):
     return out.to(out_dtype)
 
 
+_fwd_kernel_stage2_asm_launch = make_launcher(
+    _fwd_kernel_stage2_asm,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+    ),
+)
+
+
+_stage2_merge_vec_launch = make_launcher(
+    _stage2_merge_vec,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+    ),
+)
+
+
 @benchmark()
 def test_stage2_merge(
     num_seqs, num_heads, num_kv_splits, dv, dtype, warps=1, stages=2, wpe=4
@@ -198,7 +219,14 @@ def test_stage2_merge(
     ref = run_torch(logits, attn_lse, num_valid, out_dtype)
 
     def run_base():
-        _intj_launch(_fwd_kernel_stage2_asm, (T, H),
+        dev, stream = current_device_stream()
+        _fwd_kernel_stage2_asm_launch(
+            dev,
+            stream,
+            (T, H),
+            warps,
+            stages,
+            wpe,
             logits,
             attn_lse,
             out_base,
@@ -214,23 +242,27 @@ def test_stage2_merge(
             out_base.stride(0),  # stride_obs
             out_base.stride(1),  # stride_oh
             0,  # stride_lse_bs (HAS_FINAL_LSE=False)
-            page_size=1,
-            KV_INDPTR_IS_PAGE_LEVEL=False,
-            MAYBE_FINAL_OUT=True,
-            HAS_FINAL_LSE=False,
-            USE_VALID_SPLIT_COUNT_REDUCE=int(N > 1),
-            BATCH_NUM=T,
-            BLOCK_DV=BLOCK_DV,
-            Lv=Lv,
-            mgc=MGC,
-            num_warps=warps,
-            num_stages=stages,
-            waves_per_eu=wpe,
+            1,
+            False,
+            True,
+            False,
+            int(N > 1),
+            T,
+            BLOCK_DV,
+            Lv,
+            MGC,
         )
         return out_base
 
     def run_vec():
-        _intj_launch(_stage2_merge_vec, (T, H),
+        dev, stream = current_device_stream()
+        _stage2_merge_vec_launch(
+            dev,
+            stream,
+            (T, H),
+            warps,
+            stages,
+            wpe,
             logits,
             attn_lse,
             out_vec,
@@ -244,17 +276,14 @@ def test_stage2_merge(
             attn_lse.stride(1),
             out_vec.stride(0),
             out_vec.stride(1),
-            page_size=1,
-            KV_INDPTR_IS_PAGE_LEVEL=False,
-            USE_VALID_SPLIT_COUNT_REDUCE=int(N > 1),
-            BATCH_NUM=T,
-            MAX_KV_SPLITS=max_kv_splits,
-            BLOCK_DV=BLOCK_DV,
-            Lv=Lv,
-            mgc=MGC,
-            num_warps=warps,
-            num_stages=stages,
-            waves_per_eu=wpe,
+            1,
+            False,
+            int(N > 1),
+            T,
+            max_kv_splits,
+            BLOCK_DV,
+            Lv,
+            MGC,
         )
         return out_vec
 

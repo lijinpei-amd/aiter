@@ -21,7 +21,6 @@ from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import get_splitk
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import deserialize_str
 from aiter.ops.triton.utils.device_info import current_device_stream
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -35,6 +34,17 @@ def set_use_gemm_splitk_bf16(value: bool):
 
 
 _fused_fp4_bmm_reduce_kernel_launch = make_launcher(_fused_fp4_bmm_reduce_kernel)
+
+
+_fused_fp4_bmm_rope_cat_and_cache_mla_kernel_launch = make_launcher(
+    _fused_fp4_bmm_rope_cat_and_cache_mla_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+    ),
+)
 
 
 def fused_fp4_bmm_rope_cat_and_cache_mla(
@@ -262,9 +272,15 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
         stride_cm = q_out.stride(0)
         stride_cn = q_out.stride(2)
 
-    _intj_launch_tuned(
-        _fused_fp4_bmm_rope_cat_and_cache_mla_kernel,
+    dev, stream = current_device_stream()
+    _fused_fp4_bmm_rope_cat_and_cache_mla_kernel_launch(
+        dev,
+        stream,
         grid,
+        config["num_warps"],
+        config["num_stages"],
+        config["waves_per_eu"],
+        config["matrix_instr_nonkdim"],
         q_nope,
         w_k,
         w_k_scale,
@@ -334,29 +350,25 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
         kv_cache.stride(0),
         kv_cache.stride(1),
         kv_cache.stride(2),
-        k_scale_ptr=k_scale,
-        BLOCK_SIZE_M=config["BLOCK_SIZE_M"],
-        BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
-        BLOCK_SIZE_K=config["BLOCK_SIZE_K"],
-        GROUP_SIZE_M=config["GROUP_SIZE_M"],
-        NUM_KSPLIT=NUM_KSPLIT,
-        SPLITK_BLOCK_SIZE=config["SPLITK_BLOCK_SIZE"],
-        QH_PER_KH=qh // kh,
-        REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
-        IS_NEOX=is_neox,
-        BLOCK_D_nope=kv_lora_rank,
-        BLOCK_DK_nope=kv_lora_rank,
-        BLOCK_D_pe=d_pe,
-        BLOCK_D_HALF_pe=d_pe // 2,
-        PRE_QUANT=prequant,
-        OUTPUT_Q_NOPE_ZEROS=(q_nope_zeros_out is not None),
-        HAVE_Y_SCALE=(y_scale is not None),
-        HAVE_K_SCALE=(k_scale is not None),
-        num_warps=config["num_warps"],
-        num_stages=config["num_stages"],
-        waves_per_eu=config["waves_per_eu"],
-        matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
-        cache_modifier=config["cache_modifier"],
+        k_scale,
+        config["BLOCK_SIZE_M"],
+        config["BLOCK_SIZE_N"],
+        config["BLOCK_SIZE_K"],
+        config["GROUP_SIZE_M"],
+        NUM_KSPLIT,
+        config["SPLITK_BLOCK_SIZE"],
+        qh // kh,
+        reuse_freqs_front_part,
+        is_neox,
+        kv_lora_rank,
+        kv_lora_rank,
+        d_pe,
+        d_pe // 2,
+        prequant,
+        q_nope_zeros_out is not None,
+        y_scale is not None,
+        k_scale is not None,
+        config["cache_modifier"],
     )
 
     if NUM_KSPLIT > 1:
@@ -395,6 +407,17 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
         )
 
     return q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out
+
+
+_fused_fp8_bmm_rope_cat_and_cache_mla_kernel_launch = make_launcher(
+    _fused_fp8_bmm_rope_cat_and_cache_mla_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+    ),
+)
 
 
 def fused_fp8_bmm_rope_cat_and_cache_mla(
@@ -590,9 +613,15 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
         else torch.iinfo(w_k_t.dtype).max
     )
 
-    _intj_launch_tuned(
-        _fused_fp8_bmm_rope_cat_and_cache_mla_kernel,
+    dev, stream = current_device_stream()
+    _fused_fp8_bmm_rope_cat_and_cache_mla_kernel_launch(
+        dev,
+        stream,
         grid,
+        config["num_warps"],
+        config["num_stages"],
+        config["waves_per_eu"],
+        config["matrix_instr_nonkdim"],
         q_nope,
         w_k_t,
         w_k_scale,
@@ -656,26 +685,22 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
         kv_cache.stride(0),
         kv_cache.stride(1),
         kv_cache.stride(2),
-        k_scale_ptr=k_scale,
-        BLOCK_SIZE_M=config["BLOCK_SIZE_M"],
-        BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
-        BLOCK_SIZE_K=config["BLOCK_SIZE_K"],
-        GROUP_SIZE_M=config["GROUP_SIZE_M"],
-        QH_PER_KH=qh // kh,
-        REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
-        IS_NEOX=is_neox,
-        BLOCK_D_nope=kv_lora_rank,
-        BLOCK_DK_nope=kv_lora_rank,
-        BLOCK_D_pe=d_pe,
-        BLOCK_D_HALF_pe=d_pe // 2,
-        OUTPUT_Q_NOPE_ZEROS=(q_nope_zeros_out is not None),
-        HAVE_K_SCALE=(k_scale is not None),
-        DTYPE_MAX=DTYPE_MAX,
-        num_warps=config["num_warps"],
-        num_stages=config["num_stages"],
-        waves_per_eu=config["waves_per_eu"],
-        matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
-        cache_modifier=config["cache_modifier"],
+        k_scale,
+        config["BLOCK_SIZE_M"],
+        config["BLOCK_SIZE_N"],
+        config["BLOCK_SIZE_K"],
+        config["GROUP_SIZE_M"],
+        qh // kh,
+        reuse_freqs_front_part,
+        is_neox,
+        kv_lora_rank,
+        kv_lora_rank,
+        d_pe,
+        d_pe // 2,
+        q_nope_zeros_out is not None,
+        k_scale is not None,
+        DTYPE_MAX,
+        config["cache_modifier"],
     )
 
     return q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out

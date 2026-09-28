@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
+
 import torch
 import triton
 from intj import Constexpr, make_launcher
@@ -15,7 +17,6 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w8_blockscale import (
 )
 from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -28,6 +29,22 @@ _gemm_splitk_reduce_kernel_launch = make_launcher(
         "activation": Constexpr(value=""),
     },
 )
+
+
+@functools.cache
+def _gemm_a16w8_blockscale_kernel_launch(
+    num_warps, num_stages, waves_per_eu, matrix_instr_nonkdim
+):
+    return make_launcher(
+        _gemm_a16w8_blockscale_kernel,
+        dynamic_options=("kpack",),
+        options={
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+            "waves_per_eu": waves_per_eu,
+            "matrix_instr_nonkdim": matrix_instr_nonkdim,
+        },
+    )
 
 
 def gemm_a16w8_blockscale(
@@ -106,9 +123,17 @@ def gemm_a16w8_blockscale(
             * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
-    _intj_launch_tuned(
-        _gemm_a16w8_blockscale_kernel,
+    dev, stream = current_device_stream()
+    _gemm_a16w8_blockscale_kernel_launch(
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+    )(
+        dev,
+        stream,
         grid,
+        config.get("kpack", 1),
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -125,10 +150,22 @@ def gemm_a16w8_blockscale(
         y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
         w_scale.stride(0),
         w_scale.stride(1),
-        PREQUANT=prequant,
-        DTYPE_MAX=DTYPE_MAX,
-        DTYPE_MIN=-DTYPE_MAX,
-        **config,
+        config["GROUP_K"],
+        config["GROUP_N"],
+        config["BLOCK_SIZE_M"],
+        config["BLOCK_SIZE_N"],
+        config["BLOCK_SIZE_K"],
+        config["GROUP_SIZE_M"],
+        config["NUM_KSPLIT"],
+        config["SPLITK_BLOCK_SIZE"],
+        prequant,
+        DTYPE_MAX,
+        -DTYPE_MAX,
+        config["num_warps"],
+        config["num_stages"],
+        config["waves_per_eu"],
+        config["matrix_instr_nonkdim"],
+        config["cache_modifier"],
     )
 
     if return_y_pp:
@@ -166,6 +203,22 @@ def gemm_a16w8_blockscale(
         )
 
     return y
+
+
+@functools.cache
+def _gemm_a16w8_blockscale_preshuffle_kernel_launch(
+    num_warps, num_stages, waves_per_eu, matrix_instr_nonkdim
+):
+    return make_launcher(
+        _gemm_a16w8_blockscale_preshuffle_kernel,
+        dynamic_options=("kpack",),
+        options={
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+            "waves_per_eu": waves_per_eu,
+            "matrix_instr_nonkdim": matrix_instr_nonkdim,
+        },
+    )
 
 
 def gemm_a16w8_blockscale_preshuffle(
@@ -250,9 +303,17 @@ def gemm_a16w8_blockscale_preshuffle(
             * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
-    _intj_launch_tuned(
-        _gemm_a16w8_blockscale_preshuffle_kernel,
+    dev, stream = current_device_stream()
+    _gemm_a16w8_blockscale_preshuffle_kernel_launch(
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+    )(
+        dev,
+        stream,
         grid,
+        config.get("kpack", 1),
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -269,10 +330,22 @@ def gemm_a16w8_blockscale_preshuffle(
         y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
         w_scale.stride(0),
         w_scale.stride(1),
-        PREQUANT=prequant,
-        DTYPE_MAX=DTYPE_MAX,
-        DTYPE_MIN=-DTYPE_MAX,
-        **config,
+        config["GROUP_K"],
+        config["GROUP_N"],
+        config["BLOCK_SIZE_M"],
+        config["BLOCK_SIZE_N"],
+        config["BLOCK_SIZE_K"],
+        config["GROUP_SIZE_M"],
+        config["NUM_KSPLIT"],
+        config["SPLITK_BLOCK_SIZE"],
+        prequant,
+        DTYPE_MAX,
+        -DTYPE_MAX,
+        config["num_warps"],
+        config["num_stages"],
+        config["waves_per_eu"],
+        config["matrix_instr_nonkdim"],
+        config["cache_modifier"],
     )
 
     if return_y_pp:

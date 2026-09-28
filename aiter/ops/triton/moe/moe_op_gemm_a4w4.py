@@ -1,11 +1,12 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_ogs.py
 
+import functools
 import itertools
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
+from intj import make_launcher
 
 from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a4w4 import (
     _moe_gemm_a4w4_decode,
@@ -24,6 +25,7 @@ from aiter.ops.triton.moe.reduce import (
 from aiter.ops.triton.quant.quant import dynamic_mxfp4_quant
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
 from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
 
@@ -264,6 +266,32 @@ def mxfp4_quant(
     return dynamic_mxfp4_quant(x, x_fp4=x_fp4, blockscale_e8m0=x_scale)
 
 
+@functools.cache
+def _moe_gemm_a4w4_decode_launch(num_warps):
+    return make_launcher(
+        _moe_gemm_a4w4_decode,
+        dynamic_options=(
+            "num_stages",
+            "waves_per_eu",
+            "matrix_instr_nonkdim",
+            "kpack",
+        ),
+        options={"num_warps": num_warps},
+    )
+
+
+_moe_gemm_a4w4_launch = make_launcher(
+    _moe_gemm_a4w4,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
+
+
 def moe_gemm_a4w4(
     x,
     w,
@@ -490,7 +518,15 @@ def moe_gemm_a4w4(
             X_SCALES_TDM=x_scales_tdm,
         )
         # launch gluon kernel
-        _intj_launch(_moe_gemm_a4w4_decode, (grid,),
+        dev, stream = current_device_stream()
+        _moe_gemm_a4w4_decode_launch(config["num_warps"])(
+            dev,
+            stream,
+            (grid,),
+            layouts.get("num_stages", 2),
+            layouts.get("waves_per_eu", 0),
+            layouts.get("matrix_instr_nonkdim", 0),
+            layouts.get("kpack", 1),
             y_ptr,
             stride_y_m,
             stride_y_n,
@@ -530,22 +566,33 @@ def moe_gemm_a4w4(
             config["block_m"],
             config["block_n"],
             config["block_k"],
-            XCD_SWIZZLE=config["xcd_swizzle"],
-            SWIZZLE_MX_SCALE=swizzle_mx_scale,
-            PRESHUFFLE_WEIGHTS=preshuffle_weights,
-            NUM_BUFFERS=config["num_buffers"],
-            UPCAST_INDICES=should_upcast_indices(x, w, y_ptr),
-            X_SCALES_TDM=x_scales_tdm,
-            CLAMP_BOUNDS=K % config["block_k"] != 0,
-            **layouts,
-            YMxScale=y_scale,
-            stride_y_mx_m=stride_y_mx_m,
-            stride_y_mx_n=stride_y_mx_n,
-            HAS_MX_OUT=out_mx_quant,
-            DstRow=dst_row,
-            EP_SCATTER=fused_ep_scatter,
-            Y_ROWS=(ep_scatter.out.shape[0] if fused_ep_scatter else 0),
-            num_warps=config["num_warps"],
+            config["xcd_swizzle"],
+            swizzle_mx_scale,
+            preshuffle_weights,
+            config["num_buffers"],
+            should_upcast_indices(x, w, y_ptr),
+            x_scales_tdm,
+            K % config["block_k"] != 0,
+            layouts["WMMA_LAYOUT"],
+            layouts["DOT_LAYOUT_X"],
+            layouts["DOT_LAYOUT_W"],
+            layouts["DOT_LAYOUT_X_SCALES"],
+            layouts["DOT_LAYOUT_W_SCALES"],
+            layouts["GATHER_IDX_LAYOUT"],
+            layouts["BLOCKED_LAYOUT_X_SCALES"],
+            layouts["SHARED_LAYOUT_X"],
+            layouts["SHARED_LAYOUT_W"],
+            layouts["SHARED_LAYOUT_X_SCALES"],
+            layouts["SHARED_LAYOUT_W_SCALES"],
+            layouts["SHARED_LAYOUT_Y"],
+            config["num_warps"],
+            y_scale,
+            stride_y_mx_m,
+            stride_y_mx_n,
+            out_mx_quant,
+            dst_row,
+            fused_ep_scatter,
+            ep_scatter.out.shape[0] if fused_ep_scatter else 0,
         )
     elif use_gluon:
         # layouts
@@ -664,7 +711,16 @@ def moe_gemm_a4w4(
         )
     else:
         # launch triton kernel
-        _intj_launch(_moe_gemm_a4w4, (grid,),
+        dev, stream = current_device_stream()
+        _moe_gemm_a4w4_launch(
+            dev,
+            stream,
+            (grid,),
+            config["num_warps"],
+            config["num_stages"],
+            config["waves_per_eu"],
+            config["matrix_instr_nonkdim"],
+            config["kpack"],
             y,
             y.stride(0),
             y.stride(1),
@@ -705,18 +761,13 @@ def moe_gemm_a4w4(
             config["block_n"],
             config["block_k"],
             config["group_m"],
-            XCD_SWIZZLE=config["xcd_swizzle"],
-            SWIZZLE_MX_SCALE=swizzle_mx_scale,
-            SPLIT_K=split_k,
-            EVEN_K=K % config["block_k"] == 0,
-            MASK_K_LIMIT=K % config["block_k"],
-            W_CACHE_MODIFIER=config["w_cache_modifier"],
-            num_warps=config["num_warps"],
-            num_stages=config["num_stages"],
-            UPCAST_INDICES=should_upcast_indices(x, w, y),
-            waves_per_eu=config["waves_per_eu"],
-            matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
-            kpack=config["kpack"],
+            config["xcd_swizzle"],
+            swizzle_mx_scale,
+            K % config["block_k"] == 0,
+            K % config["block_k"],
+            split_k,
+            config["w_cache_modifier"],
+            should_upcast_indices(x, w, y),
         )
 
     # Build grouped reduction inputs in a uniform way

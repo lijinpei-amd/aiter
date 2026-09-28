@@ -3,8 +3,7 @@
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
@@ -14,11 +13,27 @@ from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_a16w16_quant_x impor
     _fused_gemm_a16w16_quant_x_kernel,
     _get_config,
 )
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
 _QUANT_BLOCK_SIZE = 32
+
+
+_fused_gemm_a16w16_quant_x_kernel_launch = make_launcher(
+    _fused_gemm_a16w16_quant_x_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
+
+
+_gemm_splitk_reduce_kernel_launch = make_launcher(_gemm_splitk_reduce_kernel)
 
 
 def fused_gemm_a16w16_quant_x(
@@ -114,9 +129,19 @@ def fused_gemm_a16w16_quant_x(
         config["NUM_KSPLIT"]
         * triton.cdiv(M, config["BLOCK_SIZE_M"])
         * triton.cdiv(N, config["BLOCK_SIZE_N"])
-        + triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(K, config["BLOCK_SIZE_K"]),
+        + triton.cdiv(M, config["BLOCK_SIZE_M"])
+        * triton.cdiv(K, config["BLOCK_SIZE_K"]),
     )
-    _intj_launch_tuned(_fused_gemm_a16w16_quant_x_kernel, grid,
+    dev, stream = current_device_stream()
+    _fused_gemm_a16w16_quant_x_kernel_launch(
+        dev,
+        stream,
+        grid,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
         x,
         w,
         bias,
@@ -137,12 +162,18 @@ def fused_gemm_a16w16_quant_x(
         x_quant.stride(1),
         x_scales.stride(0),
         x_scales.stride(1),
-        activation=_get_activation_from_str(activation) if activation else "",
-        use_activation=activation is not None,
-        ADD_BIAS=(bias is not None),
-        SKIP_REDUCE=skip_reduce,
-        QUANT_BLOCK_SIZE=_QUANT_BLOCK_SIZE,
-        **config,
+        config["BLOCK_SIZE_M"],
+        config["BLOCK_SIZE_N"],
+        config["BLOCK_SIZE_K"],
+        config["GROUP_SIZE_M"],
+        config["NUM_KSPLIT"],
+        config["SPLITK_BLOCK_SIZE"],
+        _QUANT_BLOCK_SIZE,
+        config["cache_modifier"],
+        _get_activation_from_str(activation) if activation else "",
+        activation is not None,
+        bias is not None,
+        skip_reduce,
     )
 
     if config["NUM_KSPLIT"] > 1:
@@ -157,7 +188,11 @@ def fused_gemm_a16w16_quant_x(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _intj_launch(_gemm_splitk_reduce_kernel, grid_reduce,
+        dev, stream = current_device_stream()
+        _gemm_splitk_reduce_kernel_launch(
+            dev,
+            stream,
+            grid_reduce,
             y_pp,
             y,
             bias,
@@ -172,10 +207,10 @@ def fused_gemm_a16w16_quant_x(
             REDUCE_BLOCK_SIZE_N,
             ACTUAL_KSPLIT,
             triton.next_power_of_2(config["NUM_KSPLIT"]),
-            ADD_BIAS=(bias is not None),
-            activation=_get_activation_from_str(activation) if activation else "",
-            use_activation=activation is not None,
-            KERNEL_NAME="_fused_gemm_a16w16_quant_x_reduce_kernel",
+            bias is not None,
+            _get_activation_from_str(activation) if activation else "",
+            activation is not None,
+            "_fused_gemm_a16w16_quant_x_reduce_kernel",
         )
 
     return y, x_quant, x_scales

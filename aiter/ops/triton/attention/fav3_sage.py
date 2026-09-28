@@ -7,7 +7,7 @@ import os
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
+from intj import make_launcher
 
 import aiter
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
@@ -21,6 +21,7 @@ from aiter.ops.triton.utils.config_utils import (
     load_config_json,
     resolve_config_dir,
 )
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 _CONFIG_NAME = "FAV3_SAGE"
 # Arches with no tuned fav3_sage table of their own read the gfx942 file
@@ -387,6 +388,18 @@ def fav3_sage_wrapper_func(
     )
 
 
+_sage_fwd_launch = make_launcher(
+    sage_fwd,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
+
+
 def fav3_sage_func(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -538,7 +551,16 @@ def fav3_sage_func(
 
     # --- 7. Kernel Launch ---
     grid = (triton.cdiv(seqlen_q, config["BLOCK_M"]), nheads_q, batch)
-    _intj_launch(sage_fwd, grid,
+    dev, stream = current_device_stream()
+    _sage_fwd_launch(
+        dev,
+        stream,
+        grid,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
         q,
         k,
         v,
@@ -595,31 +617,33 @@ def fav3_sage_func(
         lut_start,
         lut_count,
         num_q_blocks,
-        dropout_p=0.0,
-        philox_seed=None,
-        philox_offset_base=None,
-        RETURN_LSE=return_lse,
-        HQ=nheads_q,
-        HK=nheads_k,
-        ACTUAL_BLOCK_DMODEL_QK=head_size_qk,
-        ACTUAL_BLOCK_DMODEL_V=head_size_v,
-        MAX_SEQLENS_Q=seqlen_q,
-        MAX_SEQLENS_K=seqlen_k,
-        IS_CAUSAL=causal,
-        USE_SLIDING_WINDOW=use_sliding_window,
-        WINDOW_SIZE_LEFT=window_size_left,
-        WINDOW_SIZE_RIGHT=window_size_right,
-        IS_VARLEN=False,
-        BLOCK_DMODEL_QK=padded_d_model_qk,
-        BLOCK_DMODEL_V=padded_d_model_v,
-        USE_BIAS=USE_BIAS,
-        USE_ALIBI=False,
-        ENABLE_DROPOUT=False,
-        USE_EXP2=True,
-        RETURN_SCORES=False,
-        USE_SEQUSED=False,
-        USE_BLOCK_SPARSE=use_block_sparse,
-        **config,
+        0.0,
+        None,
+        None,
+        return_lse,
+        nheads_q,
+        nheads_k,
+        head_size_qk,
+        head_size_v,
+        seqlen_q,
+        seqlen_k,
+        False,
+        causal,
+        use_sliding_window,
+        window_size_left,
+        window_size_right,
+        config["BLOCK_M"],
+        padded_d_model_qk,
+        padded_d_model_v,
+        config["BLOCK_N"],
+        config["PRE_LOAD_V"],
+        USE_BIAS,
+        False,
+        False,
+        False,
+        True,
+        False,
+        use_block_sparse,
     )
 
     if return_lse:

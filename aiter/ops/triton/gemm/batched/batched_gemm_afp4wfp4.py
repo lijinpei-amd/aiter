@@ -12,7 +12,6 @@ from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_afp4wfp4 import 
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import current_device_stream
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -27,6 +26,18 @@ def set_use_gemm_splitk_bf16(value: bool):
 
 _batched_gemm_afp4_wfp4_reduce_kernel_launch = make_launcher(
     _batched_gemm_afp4_wfp4_reduce_kernel,
+)
+
+
+_batched_gemm_afp4_wfp4_kernel_launch = make_launcher(
+    _batched_gemm_afp4_wfp4_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
 )
 
 
@@ -99,9 +110,16 @@ def batched_gemm_afp4wfp4(
             * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
-    _intj_launch_tuned(
-        _batched_gemm_afp4_wfp4_kernel,
+    dev, stream = current_device_stream()
+    _batched_gemm_afp4_wfp4_kernel_launch(
+        dev,
+        stream,
         grid,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -126,7 +144,13 @@ def batched_gemm_afp4wfp4(
         w_scales.stride(0),
         w_scales.stride(1),
         w_scales.stride(2),
-        **config,
+        config["BLOCK_SIZE_M"],
+        config["BLOCK_SIZE_N"],
+        config["BLOCK_SIZE_K"],
+        config["GROUP_SIZE_M"],
+        config["NUM_KSPLIT"],
+        config["SPLITK_BLOCK_SIZE"],
+        config["cache_modifier"],
     )
 
     if config["NUM_KSPLIT"] > 1:

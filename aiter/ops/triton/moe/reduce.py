@@ -3,7 +3,6 @@ from dataclasses import dataclass
 import torch
 import triton
 from intj import make_launcher
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.moe.reduce import (
     _reduce_grouped,
@@ -159,6 +158,11 @@ _reduce_grouped_launch = make_launcher(
 )
 
 
+_reduce_grouped_gluon_launch = make_launcher(
+    _reduce_grouped_gluon, dynamic_options=("num_warps",)
+)
+
+
 def reduce_grouped(
     x: torch.Tensor,
     indx: torch.Tensor,
@@ -230,26 +234,28 @@ def reduce_grouped(
                 f"out.shape {tuple(out.shape)}"
             )
         gluon_num_warps = _reduce_grouped_gluon_num_warps(npad)
-        _intj_launch(
-            _reduce_grouped_gluon,
+        dev, stream = current_device_stream()
+        _reduce_grouped_gluon_launch(
+            dev,
+            stream,
             (num_groups,),
-            X=x,
-            Out=out,
-            InIndx=indx,
-            Residual=residual if has_ext_residual else out,
-            stride_xm=x.stride(1),
-            stride_om=out.stride(0),
-            stride_on=out.stride(1),
-            stride_res_m=residual.stride(0) if has_ext_residual else 0,
-            stride_res_n=residual.stride(1) if has_ext_residual else 0,
-            M=M,
-            N=N,
-            NPAD=npad,
-            B=B,
-            K=K,
-            NUM_WARPS=gluon_num_warps,
-            HAS_EXT_RESIDUAL=has_ext_residual,
-            num_warps=gluon_num_warps,
+            gluon_num_warps,
+            x,
+            out,
+            indx,
+            residual if has_ext_residual else out,
+            x.stride(1),
+            out.stride(0),
+            out.stride(1),
+            residual.stride(0) if has_ext_residual else 0,
+            residual.stride(1) if has_ext_residual else 0,
+            M,
+            N,
+            npad,
+            B,
+            K,
+            gluon_num_warps,
+            has_ext_residual,
         )
         return out
 

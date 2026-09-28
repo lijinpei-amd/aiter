@@ -2,6 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
+import functools
+
 import torch
 import triton
 from intj import make_launcher
@@ -22,7 +24,6 @@ from aiter.ops.triton._triton_kernels.quant.quant import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import current_device_stream
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import e4m3_dtype
 
@@ -210,6 +211,13 @@ def dynamic_per_token_quant_fp8_i8(
     return qx, scale_out
 
 
+@functools.cache
+def _dynamic_mxfp4_quant_kernel_launch(num_warps):
+    return make_launcher(
+        _dynamic_mxfp4_quant_kernel, options={"waves_per_eu": 0, "num_warps": num_warps}
+    )
+
+
 def dynamic_mxfp4_quant(
     x: torch.Tensor,
     scaling_mode: str = "even",
@@ -347,8 +355,10 @@ def dynamic_mxfp4_quant(
         triton.cdiv(N, BLOCK_SIZE_N * NUM_ITER),
     )
 
-    _intj_launch_tuned(
-        _dynamic_mxfp4_quant_kernel,
+    dev, stream = current_device_stream()
+    _dynamic_mxfp4_quant_kernel_launch(NUM_WARPS)(
+        dev,
+        stream,
         grid,
         x,
         x_fp4,
@@ -356,19 +366,18 @@ def dynamic_mxfp4_quant(
         *x.stride(),
         *x_fp4.stride(),
         *blockscale_e8m0.stride(),
-        M=M,
-        N=N,
-        philox_seed=philox_seed if philox_seed is not None else 0,
-        philox_offset=philox_offset,
-        MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
-        SCALING_MODE=0,
-        USE_SR=use_sr,
-        NUM_ITER=NUM_ITER,
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        NUM_STAGES=NUM_STAGES,
-        num_warps=NUM_WARPS,
-        waves_per_eu=0,
+        M,
+        N,
+        philox_seed if philox_seed is not None else 0,
+        philox_offset,
+        BLOCK_SIZE_M,
+        BLOCK_SIZE_N,
+        NUM_ITER,
+        NUM_STAGES,
+        MXFP4_QUANT_BLOCK_SIZE,
+        0,
+        use_sr,
+        NUM_WARPS,
     )
 
     return (x_fp4, blockscale_e8m0)
@@ -654,6 +663,13 @@ def fp8_legacy_to_mxfp8(
     return y_fn, y_scale
 
 
+_dynamic_nvfp4_quant_kernel_launch = make_launcher(
+    _dynamic_nvfp4_quant_kernel,
+    dynamic_options=("num_warps",),
+    options={"waves_per_eu": 0},
+)
+
+
 def dynamic_nvfp4_quant(
     x: torch.Tensor,
     global_scale: torch.Tensor | None = None,
@@ -714,24 +730,25 @@ def dynamic_nvfp4_quant(
         triton.cdiv(N, BLOCK_SIZE_N * NUM_ITER),
     )
 
-    _intj_launch_tuned(
-        _dynamic_nvfp4_quant_kernel,
+    dev, stream = current_device_stream()
+    _dynamic_nvfp4_quant_kernel_launch(
+        dev,
+        stream,
         grid,
+        NUM_WARPS,
         x,
         x_fp4,
         blockscale_e4m3,
         *x.stride(),
         *x_fp4.stride(),
         *blockscale_e4m3.stride(),
-        M=M,
-        N=N,
-        NVFP4_QUANT_BLOCK_SIZE=NVFP4_QUANT_BLOCK_SIZE,
-        NUM_ITER=NUM_ITER,
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        NUM_STAGES=NUM_STAGES,
-        num_warps=NUM_WARPS,
-        waves_per_eu=0,
+        M,
+        N,
+        BLOCK_SIZE_M,
+        BLOCK_SIZE_N,
+        NUM_ITER,
+        NUM_STAGES,
+        NVFP4_QUANT_BLOCK_SIZE,
     )
 
     return x_fp4, blockscale_e4m3

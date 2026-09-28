@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
 import os
 
 import torch
@@ -16,7 +17,6 @@ from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_mul_add imp
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.config_utils import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.device_info import current_device_stream
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
 
@@ -70,6 +70,22 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
 _fused_gemm_afp4wfp4_mul_add_reduce_kernel_launch = make_launcher(
     _fused_gemm_afp4wfp4_mul_add_reduce_kernel,
 )
+
+
+@functools.cache
+def _fused_gemm_afp4wfp4_mul_add_kernel_launch(
+    num_warps, num_stages, waves_per_eu, matrix_instr_nonkdim
+):
+    return make_launcher(
+        _fused_gemm_afp4wfp4_mul_add_kernel,
+        dynamic_options=("kpack",),
+        options={
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+            "waves_per_eu": waves_per_eu,
+            "matrix_instr_nonkdim": matrix_instr_nonkdim,
+        },
+    )
 
 
 def fused_gemm_afp4wfp4_mul_add(
@@ -176,9 +192,17 @@ def fused_gemm_afp4wfp4_mul_add(
             * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
-    _intj_launch_tuned(
-        _fused_gemm_afp4wfp4_mul_add_kernel,
+    dev, stream = current_device_stream()
+    _fused_gemm_afp4wfp4_mul_add_kernel_launch(
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+    )(
+        dev,
+        stream,
         grid,
+        config.get("kpack", 1),
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -204,12 +228,22 @@ def fused_gemm_afp4wfp4_mul_add(
         0 if IS_A_SCALAR else a.stride(1),
         0 if IS_B_SCALAR else b.stride(0),
         0 if IS_B_SCALAR else b.stride(1),
-        IS_A_SCALAR=IS_A_SCALAR,
-        IS_B_SCALAR=IS_B_SCALAR,
-        IS_A_TENSOR=IS_A_TENSOR,
-        IS_B_TENSOR=IS_B_TENSOR,
-        FUSE_TYPE=fuse_type,
-        **config,
+        config["BLOCK_SIZE_M"],
+        config["BLOCK_SIZE_N"],
+        config["BLOCK_SIZE_K"],
+        config["GROUP_SIZE_M"],
+        config["NUM_KSPLIT"],
+        config["SPLITK_BLOCK_SIZE"],
+        IS_A_SCALAR,
+        IS_B_SCALAR,
+        IS_A_TENSOR,
+        IS_B_TENSOR,
+        fuse_type,
+        config["num_warps"],
+        config["num_stages"],
+        config["waves_per_eu"],
+        config["matrix_instr_nonkdim"],
+        config["cache_modifier"],
     )
 
     if config["NUM_KSPLIT"] > 1:
@@ -256,6 +290,22 @@ def fused_gemm_afp4wfp4_mul_add(
         )
 
     return y
+
+
+@functools.cache
+def _fused_gemm_afp4wfp4_preshuffle_mul_add_kernel_launch(
+    num_warps, num_stages, waves_per_eu, matrix_instr_nonkdim
+):
+    return make_launcher(
+        _fused_gemm_afp4wfp4_preshuffle_mul_add_kernel,
+        dynamic_options=("kpack",),
+        options={
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+            "waves_per_eu": waves_per_eu,
+            "matrix_instr_nonkdim": matrix_instr_nonkdim,
+        },
+    )
 
 
 def fused_gemm_afp4wfp4_preshuffle_add_mul(
@@ -373,9 +423,17 @@ def fused_gemm_afp4wfp4_preshuffle_add_mul(
     )
 
     def kernel_wrapper():
-        _intj_launch_tuned(
-            _fused_gemm_afp4wfp4_preshuffle_mul_add_kernel,
+        dev, stream = current_device_stream()
+        _fused_gemm_afp4wfp4_preshuffle_mul_add_kernel_launch(
+            config.get("num_warps", 4),
+            config.get("num_stages", 2),
+            config.get("waves_per_eu", 0),
+            config.get("matrix_instr_nonkdim", 0),
+        )(
+            dev,
+            stream,
             grid,
+            config.get("kpack", 1),
             x,
             w,
             y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -401,12 +459,22 @@ def fused_gemm_afp4wfp4_preshuffle_add_mul(
             0 if IS_A_SCALAR else a.stride(1),
             0 if IS_B_SCALAR else b.stride(0),
             0 if IS_B_SCALAR else b.stride(1),
-            IS_A_SCALAR=IS_A_SCALAR,
-            IS_B_SCALAR=IS_B_SCALAR,
-            IS_A_TENSOR=IS_A_TENSOR,
-            IS_B_TENSOR=IS_B_TENSOR,
-            FUSE_TYPE=fuse_type,
-            **config,
+            config["BLOCK_SIZE_M"],
+            config["BLOCK_SIZE_N"],
+            config["BLOCK_SIZE_K"],
+            config["GROUP_SIZE_M"],
+            config["NUM_KSPLIT"],
+            config["SPLITK_BLOCK_SIZE"],
+            IS_A_SCALAR,
+            IS_B_SCALAR,
+            IS_A_TENSOR,
+            IS_B_TENSOR,
+            fuse_type,
+            config["num_warps"],
+            config["num_stages"],
+            config["waves_per_eu"],
+            config["matrix_instr_nonkdim"],
+            config["cache_modifier"],
         )
 
     M_POW2 = triton.next_power_of_2(M)

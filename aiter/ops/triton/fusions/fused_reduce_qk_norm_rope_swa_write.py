@@ -4,11 +4,12 @@
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.fusions.fused_reduce_qk_norm_rope_swa_write import (
     _fused_reduce_qk_norm_rope_swa_write_kernel,
 )
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -49,6 +50,15 @@ def _pick_block_size_m(M: int, num_local_heads: int, num_splitk: int) -> int:
     waves_per_eu = 1
 
     return bm, num_warps, waves_per_eu
+
+
+_fused_reduce_qk_norm_rope_swa_write_kernel_launch = make_launcher(
+    _fused_reduce_qk_norm_rope_swa_write_kernel,
+    dynamic_options=(
+        "num_warps",
+        "waves_per_eu",
+    ),
+)
 
 
 def fused_reduce_qk_norm_rope_swa_write(
@@ -152,7 +162,13 @@ def fused_reduce_qk_norm_rope_swa_write(
         M, num_local_heads, num_splitk
     )
     grid = (triton.cdiv(M, BLOCK_SIZE_M), num_local_heads + 1)
-    _intj_launch(_fused_reduce_qk_norm_rope_swa_write_kernel, grid,
+    dev, stream = current_device_stream()
+    _fused_reduce_qk_norm_rope_swa_write_kernel_launch(
+        dev,
+        stream,
+        grid,
+        num_warps,
+        waves_per_eu,
         q,
         q_out,
         kv,
@@ -181,15 +197,13 @@ def fused_reduce_qk_norm_rope_swa_write(
         win,
         q_rms_eps,
         kv_rms_eps,
-        HEAD_DIM=head_dim,
-        ROPE_DIM=rope_head_dim,
-        NUM_LOCAL_HEADS=num_local_heads,
-        NUM_SPLITK=num_splitk,
-        HAS_SWA=HAS_SWA,
-        IS_NEOX=is_neox,
-        REUSE_FREQS_FRONT_PART=True,
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        num_warps=num_warps,
-        waves_per_eu=waves_per_eu,
+        BLOCK_SIZE_M,
+        head_dim,
+        rope_head_dim,
+        num_local_heads,
+        num_splitk,
+        HAS_SWA,
+        is_neox,
+        True,
     )
     return q_out

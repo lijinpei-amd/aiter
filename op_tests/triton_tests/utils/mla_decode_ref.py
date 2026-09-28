@@ -28,7 +28,6 @@ It supports page size = 1.
 import triton
 import triton.language as tl
 from intj import make_launcher
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.device_info import current_device_stream
@@ -171,6 +170,11 @@ def _fwd_kernel_stage1(
         )
 
 
+_fwd_kernel_stage1_launch = make_launcher(
+    _fwd_kernel_stage1, dynamic_options=("num_warps",), options={"num_stages": 2}
+)
+
+
 def _decode_att_m_fwd(
     q,
     k_buffer,
@@ -205,9 +209,12 @@ def _decode_att_m_fwd(
     BLOCK_DMODEL = triton.next_power_of_2(Lk)
     BLOCK_DV = triton.next_power_of_2(Lv)
 
-    _intj_launch(
-        _fwd_kernel_stage1,
+    dev, stream = current_device_stream()
+    _fwd_kernel_stage1_launch(
+        dev,
+        stream,
         grid,
+        num_warps,
         q,
         k_buffer,
         v_buffer,
@@ -224,16 +231,14 @@ def _decode_att_m_fwd(
         att_out.stride(0),
         att_out.stride(1),
         att_out.stride(2),
-        kv_group_num=kv_group_num,
-        BLOCK_DMODEL=BLOCK_DMODEL,
-        BLOCK_DV=BLOCK_DV,
-        BLOCK_N=BLOCK,
-        NUM_KV_SPLITS=NUM_KV_SPLITS,
-        logit_cap=logit_cap,
-        num_warps=num_warps,
-        num_stages=2,
-        Lk=Lk,
-        Lv=Lv,
+        kv_group_num,
+        BLOCK_DMODEL,
+        BLOCK_DV,
+        BLOCK,
+        NUM_KV_SPLITS,
+        logit_cap,
+        Lk,
+        Lv,
     )
 
 

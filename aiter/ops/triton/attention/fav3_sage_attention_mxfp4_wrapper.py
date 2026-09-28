@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
+from intj import make_launcher
 
 import aiter
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import map_dims
@@ -15,6 +15,7 @@ from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention_mxfp4 import
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_mxfp4
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 _CONFIG_NAME = "FAV3_SAGE_MXFP4"
 _MXFP4_ARCH = "gfx950"
@@ -228,6 +229,18 @@ def fav3_sage_mxfp4_wrapper(
     )
 
 
+_sage_fwd_mxfp4_launch = make_launcher(
+    sage_fwd_mxfp4,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
+
+
 def fav3_sage_mxfp4_func(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -321,64 +334,75 @@ def fav3_sage_mxfp4_func(
         lut_count = torch.zeros(1, dtype=torch.int32, device=q.device)
 
     grid = (triton.cdiv(seqlen_q, config["BLOCK_M"]), nheads_q, batch)
-    _intj_launch(sage_fwd_mxfp4, grid,
-        Q=q,
-        K=k,
-        V=v,
-        bias=bias,
-        Q_Descale=q_descale,
-        K_Descale=k_descale,
-        V_Descale=v_descale,
-        stride_qsz=stride_qsz,
-        stride_qsh=stride_qsh,
-        stride_qsm=stride_qsm,
-        stride_ksz=stride_ksz,
-        stride_ksh=stride_ksh,
-        stride_ksn=stride_ksn,
-        stride_vsz=stride_vsz,
-        stride_vsh=stride_vsh,
-        Out=out,
-        LSE=softmax_lse,
-        stride_qz=stride_qb,
-        stride_qh=stride_qh,
-        stride_qm=stride_qm,
-        stride_kz=stride_kb,
-        stride_kh=stride_kh,
-        stride_kn=stride_kn,
-        stride_vz=stride_vb,
-        stride_vh=stride_vh,
-        stride_vk=stride_vn,
-        stride_oz=stride_ob,
-        stride_oh=stride_oh,
-        stride_om=stride_om,
-        stride_bz=stride_bz,
-        stride_bh=stride_bh,
-        stride_bm=stride_bm,
-        stride_bn=stride_bn,  # Bias strides
-        stride_lse_z=stride_lse_z,
-        stride_lse_h=stride_lse_h,
-        stride_lse_m=stride_lse_m,
-        cu_seqlens_q=None,
-        cu_seqlens_k=None,
-        kv_block_indices=kv_block_indices,
-        lut_start=lut_start,
-        lut_count=lut_count,
-        Q_DTYPE_STR="e2m1",
-        K_DTYPE_STR="e2m1",
-        HQ=nheads_q,
-        HK=nheads_k,
-        ACTUAL_BLOCK_DMODEL_QK=head_size_qk,
-        ACTUAL_BLOCK_DMODEL_V=head_size_v,
-        MAX_SEQLENS_Q=seqlen_q,
-        MAX_SEQLENS_K=seqlen_k,
-        IS_VARLEN=False,
-        IS_CAUSAL=causal,
-        BLOCK_DMODEL_QK=padded_d_qk,
-        BLOCK_DMODEL_V=padded_d_v,
-        USE_BIAS=USE_BIAS,
-        USE_BLOCK_SPARSE=use_block_sparse,
-        RETURN_LSE=return_lse,
-        **config,
+    dev, stream = current_device_stream()
+    _sage_fwd_mxfp4_launch(
+        dev,
+        stream,
+        grid,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
+        q,
+        k,
+        v,
+        bias,
+        q_descale,
+        k_descale,
+        v_descale,
+        stride_qsz,
+        stride_qsh,
+        stride_qsm,
+        stride_ksz,
+        stride_ksh,
+        stride_ksn,
+        stride_vsz,
+        stride_vsh,
+        out,
+        softmax_lse,
+        stride_qb,
+        stride_qh,
+        stride_qm,
+        stride_kb,
+        stride_kh,
+        stride_kn,
+        stride_vb,
+        stride_vh,
+        stride_vn,
+        stride_ob,
+        stride_oh,
+        stride_om,
+        stride_bz,
+        stride_bh,
+        stride_bm,
+        stride_bn,  # Bias strides
+        stride_lse_z,
+        stride_lse_h,
+        stride_lse_m,
+        None,
+        None,
+        kv_block_indices,
+        lut_start,
+        lut_count,
+        "e2m1",
+        "e2m1",
+        nheads_q,
+        nheads_k,
+        head_size_qk,
+        head_size_v,
+        seqlen_q,
+        seqlen_k,
+        False,
+        causal,
+        config["BLOCK_M"],
+        padded_d_qk,
+        padded_d_v,
+        config["BLOCK_N"],
+        config["PRE_LOAD_V"],
+        USE_BIAS,
+        use_block_sparse,
+        return_lse,
     )
 
     if return_lse:

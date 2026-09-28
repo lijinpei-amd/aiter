@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
+
 import torch
 import triton
 from intj import Constexpr, make_launcher
@@ -20,7 +22,6 @@ from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
 from aiter.ops.triton.utils.device_info import current_device_stream
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -49,6 +50,22 @@ _gemm_splitk_reduce_kernel_launch = make_launcher(
         "activation": Constexpr(value=""),
     },
 )
+
+
+@functools.cache
+def _gemm_a16wfp4_kernel_launch(
+    num_warps, num_stages, waves_per_eu, matrix_instr_nonkdim
+):
+    return make_launcher(
+        _gemm_a16wfp4_kernel,
+        dynamic_options=("kpack",),
+        options={
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+            "waves_per_eu": waves_per_eu,
+            "matrix_instr_nonkdim": matrix_instr_nonkdim,
+        },
+    )
 
 
 @torch_compile_guard(gen_fake=gemm_a16wfp4_fake_tensor)
@@ -136,9 +153,17 @@ def gemm_a16wfp4_(
             * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
-    _intj_launch_tuned(
-        _gemm_a16wfp4_kernel,
+    dev, stream = current_device_stream()
+    _gemm_a16wfp4_kernel_launch(
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+    )(
+        dev,
+        stream,
         grid,
+        config.get("kpack", 1),
         x,
         w,
         y if y_pp is None else y_pp,
@@ -155,8 +180,18 @@ def gemm_a16wfp4_(
         y.stride(1) if y_pp is None else y_pp.stride(2),
         w_scales.stride(0),
         w_scales.stride(1),
-        ATOMIC_ADD=atomic_add,
-        **config,
+        config["BLOCK_SIZE_M"],
+        config["BLOCK_SIZE_N"],
+        config["BLOCK_SIZE_K"],
+        config["GROUP_SIZE_M"],
+        config["NUM_KSPLIT"],
+        config["SPLITK_BLOCK_SIZE"],
+        config["num_warps"],
+        config["num_stages"],
+        config["waves_per_eu"],
+        config["matrix_instr_nonkdim"],
+        atomic_add,
+        config["cache_modifier"],
     )
 
     if config["NUM_KSPLIT"] > 1 and not atomic_add:
@@ -238,6 +273,22 @@ def gemm_a16wfp4_preshuffle_fake_tensor(
         return y_pp
 
     return torch.empty((M, N), dtype=dtype, device=x.device)
+
+
+@functools.cache
+def _gemm_a16wfp4_preshuffle_kernel_launch(
+    num_warps, num_stages, waves_per_eu, matrix_instr_nonkdim
+):
+    return make_launcher(
+        _gemm_a16wfp4_preshuffle_kernel,
+        dynamic_options=("kpack",),
+        options={
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+            "waves_per_eu": waves_per_eu,
+            "matrix_instr_nonkdim": matrix_instr_nonkdim,
+        },
+    )
 
 
 @torch_compile_guard(gen_fake=gemm_a16wfp4_preshuffle_fake_tensor)
@@ -325,9 +376,17 @@ def gemm_a16wfp4_preshuffle_(
             * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
-    _intj_launch_tuned(
-        _gemm_a16wfp4_preshuffle_kernel,
+    dev, stream = current_device_stream()
+    _gemm_a16wfp4_preshuffle_kernel_launch(
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+    )(
+        dev,
+        stream,
         grid,
+        config.get("kpack", 1),
         x,
         w,
         y if y_pp is None else y_pp,
@@ -344,8 +403,18 @@ def gemm_a16wfp4_preshuffle_(
         y.stride(1) if y_pp is None else y_pp.stride(2),
         w_scales.stride(0),
         w_scales.stride(1),
-        PREQUANT=prequant,
-        **config,
+        config["BLOCK_SIZE_M"],
+        config["BLOCK_SIZE_N"],
+        config["BLOCK_SIZE_K"],
+        config["GROUP_SIZE_M"],
+        config["NUM_KSPLIT"],
+        config["SPLITK_BLOCK_SIZE"],
+        config["num_warps"],
+        config["num_stages"],
+        config["waves_per_eu"],
+        config["matrix_instr_nonkdim"],
+        prequant,
+        config["cache_modifier"],
     )
 
     if return_y_pp:

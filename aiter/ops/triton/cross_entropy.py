@@ -12,13 +12,14 @@ call.
 import torch
 import torch.distributed as dist
 import triton
-from intj.compat import launch as _intj_launch
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.cross_entropy import (
     _ce_fused_loss_grad_kernel,
     _ce_grad_scale_kernel,
     _ce_local_softmax_stats_kernel,
 )
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 __all__ = [
@@ -37,6 +38,20 @@ def _block_size_and_warps(element_size: int, n_cols: int) -> tuple[int, int]:
     block_size = min(65536 // element_size, triton.next_power_of_2(n_cols))
     num_warps = min(16, max(1, block_size // 64))
     return block_size, num_warps
+
+
+_ce_local_softmax_stats_kernel_launch = make_launcher(
+    _ce_local_softmax_stats_kernel,
+    dynamic_options=("num_warps",),
+    options={"waves_per_eu": _WAVES_PER_EU, "num_stages": _NUM_STAGES},
+)
+
+
+_ce_fused_loss_grad_kernel_launch = make_launcher(
+    _ce_fused_loss_grad_kernel,
+    dynamic_options=("num_warps",),
+    options={"waves_per_eu": _WAVES_PER_EU, "num_stages": _NUM_STAGES},
+)
 
 
 def cross_entropy_forward(
@@ -127,7 +142,12 @@ def cross_entropy_forward(
     else:
         n_valid = torch.ones((), dtype=torch.int64, device=_input.device)
 
-    _intj_launch(_ce_local_softmax_stats_kernel, (n_rows,),
+    dev, stream = current_device_stream()
+    _ce_local_softmax_stats_kernel_launch(
+        dev,
+        stream,
+        (n_rows,),
+        num_warps,
         _input,
         _input.stride(-2),
         target,
@@ -136,10 +156,7 @@ def cross_entropy_forward(
         m_d_Xy.stride(-1),
         rank,
         V,
-        BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=num_warps,
-        waves_per_eu=_WAVES_PER_EU,
-        num_stages=_NUM_STAGES,
+        BLOCK_SIZE,
     )
 
     if world_size > 1:
@@ -150,7 +167,12 @@ def cross_entropy_forward(
     else:
         gathered = m_d_Xy
 
-    _intj_launch(_ce_fused_loss_grad_kernel, (n_rows,),
+    dev, stream = current_device_stream()
+    _ce_fused_loss_grad_kernel_launch(
+        dev,
+        stream,
+        (n_rows,),
+        num_warps,
         _input,
         _input.stride(-2),
         target,
@@ -165,12 +187,9 @@ def cross_entropy_forward(
         V,
         n_rows,
         n_valid,
-        reduce_loss=reduce_loss,
-        label_smoothing=label_smoothing,
-        BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=num_warps,
-        waves_per_eu=_WAVES_PER_EU,
-        num_stages=_NUM_STAGES,
+        reduce_loss,
+        label_smoothing,
+        BLOCK_SIZE,
     )
 
     loss = loss_1d.reshape(B, SQ) if not reduce_loss else (loss_1d.sum() / n_valid)
@@ -281,7 +300,12 @@ def cross_entropy_forward_chunked(
         chunk_loss = loss_1d[row : row + rows_this]  # view [rows_this]
         m_d_Xy_chunk = m_d_Xy[: rows_this * 3]
 
-        _intj_launch(_ce_local_softmax_stats_kernel, (rows_this,),
+        dev, stream = current_device_stream()
+        _ce_local_softmax_stats_kernel_launch(
+            dev,
+            stream,
+            (rows_this,),
+            num_warps,
             chunk_x,
             chunk_x.stride(0),
             chunk_y,
@@ -290,10 +314,7 @@ def cross_entropy_forward_chunked(
             1,  # stride=1: (m,d,Xy) packed per row
             rank,
             V,
-            BLOCK_SIZE=BLOCK_SIZE,
-            num_warps=num_warps,
-            waves_per_eu=_WAVES_PER_EU,
-            num_stages=_NUM_STAGES,
+            BLOCK_SIZE,
         )
 
         if world_size > 1:
@@ -302,7 +323,12 @@ def cross_entropy_forward_chunked(
         else:
             gathered = m_d_Xy_chunk
 
-        _intj_launch(_ce_fused_loss_grad_kernel, (rows_this,),
+        dev, stream = current_device_stream()
+        _ce_fused_loss_grad_kernel_launch(
+            dev,
+            stream,
+            (rows_this,),
+            num_warps,
             chunk_x,
             chunk_x.stride(0),
             chunk_y,
@@ -317,12 +343,9 @@ def cross_entropy_forward_chunked(
             V,
             rows_this,
             n_valid,  # global denominator, shared across chunks
-            reduce_loss=reduce_loss,
-            label_smoothing=label_smoothing,
-            BLOCK_SIZE=BLOCK_SIZE,
-            num_warps=num_warps,
-            waves_per_eu=_WAVES_PER_EU,
-            num_stages=_NUM_STAGES,
+            reduce_loss,
+            label_smoothing,
+            BLOCK_SIZE,
         )
 
         row += rows_this
@@ -332,6 +355,13 @@ def cross_entropy_forward_chunked(
     else:
         loss = loss_1d.reshape(B, SQ)
     return loss, _input
+
+
+_ce_grad_scale_kernel_launch = make_launcher(
+    _ce_grad_scale_kernel,
+    dynamic_options=("num_warps",),
+    options={"waves_per_eu": _WAVES_PER_EU, "num_stages": _NUM_STAGES},
+)
 
 
 def cross_entropy_backward(
@@ -371,15 +401,17 @@ def cross_entropy_backward(
     grad_output = grad_output.contiguous()
 
     BLOCK_SIZE, num_warps = _block_size_and_warps(_input.element_size(), V)
-    _intj_launch(_ce_grad_scale_kernel, (n_rows,),
+    dev, stream = current_device_stream()
+    _ce_grad_scale_kernel_launch(
+        dev,
+        stream,
+        (n_rows,),
+        num_warps,
         _input,
         _input.stride(-2),
         grad_output,
         1 if grad_output.numel() > 1 else 0,
         V,
-        BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=num_warps,
-        waves_per_eu=_WAVES_PER_EU,
-        num_stages=_NUM_STAGES,
+        BLOCK_SIZE,
     )
     return _input

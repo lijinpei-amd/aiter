@@ -23,7 +23,9 @@ It supports page size = 1 and prefill with KV cache (i.e. extend).
 import torch
 import triton
 import triton.language as tl
-from intj.compat import launch as _intj_launch
+from intj import make_launcher
+
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 # from sglang.srt.layers.attention.triton_ops.prefill_attention import (
 #     context_attention_fwd,
@@ -294,6 +296,18 @@ def _fwd_kernel(
         )
 
 
+_fwd_kernel_launch = make_launcher(
+    _fwd_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
+
+
 def extend_attention_fwd(
     q_extend,
     k_extend,
@@ -382,7 +396,16 @@ def extend_attention_fwd(
     if _is_hip:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
 
-    _intj_launch(_fwd_kernel, grid,
+    dev, stream = current_device_stream()
+    _fwd_kernel_launch(
+        dev,
+        stream,
+        grid,
+        num_warps,
+        num_stages,
+        extra_kargs.get("waves_per_eu", 0),
+        extra_kargs.get("matrix_instr_nonkdim", 0),
+        extra_kargs.get("kpack", 1),
         q_extend,
         k_extend,
         v_extend,
@@ -408,20 +431,17 @@ def extend_attention_fwd(
         k_buffer.stride(1),
         v_buffer.stride(0),
         v_buffer.stride(1),
-        logit_cap=logit_cap,
-        BLOCK_DMODEL=BLOCK_DMODEL,
-        BLOCK_DPE=BLOCK_DPE,
-        BLOCK_DV=BLOCK_DV,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        Lq=Lq,
-        Lv=Lv,
-        USE_CUSTOM_MASK=USE_CUSTOM_MASK,
-        SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
-        STORE_TRANSPOSE=_is_hip,
-        num_warps=num_warps,
-        num_stages=num_stages,
-        **extra_kargs,
+        logit_cap,
+        Lq,
+        Lv,
+        BLOCK_DMODEL,
+        BLOCK_DPE,
+        BLOCK_DV,
+        BLOCK_M,
+        BLOCK_N,
+        USE_CUSTOM_MASK,
+        SKIP_PREFIX_CUSTOM_MASK,
+        _is_hip,
     )
 
 

@@ -5,16 +5,29 @@ import warnings
 
 import torch
 import triton
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
 from aiter.ops.triton._triton_kernels.gemm.feed_forward.ff_a16w16_fused_ungated import (
     _ff_a16w16_fused_ungated,
     _get_config,
 )
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+
+_ff_a16w16_fused_ungated_launch = make_launcher(
+    _ff_a16w16_fused_ungated,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 def ff_a16w16_fused_ungated(
@@ -78,7 +91,16 @@ def ff_a16w16_fused_ungated(
     grid = (
         triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),
     )
-    _intj_launch_tuned(_ff_a16w16_fused_ungated, grid,
+    dev, stream = current_device_stream()
+    _ff_a16w16_fused_ungated_launch(
+        dev,
+        stream,
+        grid,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
         x,
         w_up,
         w_down,
@@ -94,9 +116,13 @@ def ff_a16w16_fused_ungated(
         w_down.stride(1),
         y.stride(0),
         y.stride(1),
-        activation=_get_activation_from_str(activation) if activation else "",
-        use_activation=activation is not None,
-        **config,
+        config["BLOCK_SIZE_M"],
+        config["BLOCK_SIZE_N"],
+        config["BLOCK_SIZE_K"],
+        config["GROUP_SIZE_M"],
+        config["cache_modifier"],
+        _get_activation_from_str(activation) if activation else "",
+        activation is not None,
     )
 
     return y

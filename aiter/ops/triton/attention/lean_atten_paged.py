@@ -20,14 +20,24 @@ UPDATE:
 import warnings
 
 import torch
-from intj.compat import launch as _intj_launch
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.attention.lean_atten_paged import (
     la_persistent_paged,
 )
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+
+_la_persistent_paged_launch = make_launcher(
+    la_persistent_paged,
+    dynamic_options=(
+        "num_warps",
+        "waves_per_eu",
+    ),
+)
 
 
 def persistent_lean_attention_paged(
@@ -92,7 +102,13 @@ def persistent_lean_attention_paged(
 
     o = torch.empty_like(q, dtype=v.dtype)
 
-    _intj_launch(la_persistent_paged, grid,
+    dev, stream = current_device_stream()
+    _la_persistent_paged_launch(
+        dev,
+        stream,
+        grid,
+        waves_per_eu,
+        waves_per_eu,
         q,
         k,
         v,
@@ -119,18 +135,15 @@ def persistent_lean_attention_paged(
         Op.stride(0),
         Op.stride(1),
         Op.stride(2),
-        HEAD_DIM=HEAD_DIM_K,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        batch_size=batch_size,
-        num_m_blocks=num_m_blocks,
-        # leanAttention params
-        high_load_wgs=high_load_wgs,
-        max_tiles_per_wg=max_tiles_per_wg,
-        tiles_per_head=tiles_per_head,
-        num_splits=num_splits,
-        waves_per_eu=waves_per_eu,
-        num_warps=waves_per_eu,
+        HEAD_DIM_K,
+        BLOCK_M,
+        BLOCK_N,
+        batch_size,
+        num_m_blocks,
+        high_load_wgs,
+        max_tiles_per_wg,
+        tiles_per_head,
+        num_splits,
     )
 
     return o

@@ -6,7 +6,7 @@
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.attention.sparse_mla_dsv4_train import (
     _FWD_FALLBACK,
@@ -15,6 +15,7 @@ from aiter.ops.triton._triton_kernels.attention.sparse_mla_dsv4_train import (
     _bwd_dq_store_dp_kernel,
     _sparse_mla_fwd_kernel,
 )
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.tuned_config_utils import get_tuned_kernel_config
 
 _BWD_FALLBACK = triton.Config({"BLOCK_H": 16, "BLOCK_K": 32}, num_warps=4, num_stages=1)
@@ -63,6 +64,15 @@ def _build_inverted_topk(indices, num_kv):
 # =====================================================================
 
 
+_sparse_mla_fwd_kernel_launch = make_launcher(
+    _sparse_mla_fwd_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+    ),
+)
+
+
 def sparse_mla_fwd(q, kv, attn_sink, indices, scale=None):
     N, H, D = q.shape
     N_kv = kv.shape[0]
@@ -87,7 +97,13 @@ def sparse_mla_fwd(q, kv, attn_sink, indices, scale=None):
     BLOCK_K_fwd = fwd_cfg.kwargs["BLOCK_K"]
     grid = (N, triton.cdiv(H, BLOCK_H_fwd))
 
-    _intj_launch(_sparse_mla_fwd_kernel, grid,
+    dev, stream = current_device_stream()
+    _sparse_mla_fwd_kernel_launch(
+        dev,
+        stream,
+        grid,
+        fwd_cfg.num_warps,
+        fwd_cfg.num_stages,
         q,
         kv,
         indices,
@@ -106,12 +122,10 @@ def sparse_mla_fwd(q, kv, attn_sink, indices, scale=None):
         N_kv,
         topk,
         scale,
-        HAS_ATTN_SINK=has_sink,
-        BLOCK_D=BLOCK_D,
-        BLOCK_H=BLOCK_H_fwd,
-        BLOCK_K=BLOCK_K_fwd,
-        num_warps=fwd_cfg.num_warps,
-        num_stages=fwd_cfg.num_stages,
+        has_sink,
+        BLOCK_D,
+        BLOCK_H_fwd,
+        BLOCK_K_fwd,
     )
 
     return out, lse
@@ -120,6 +134,21 @@ def sparse_mla_fwd(q, kv, attn_sink, indices, scale=None):
 # =====================================================================
 # Backward wrapper
 # =====================================================================
+
+
+_bwd_dq_store_dp_kernel_launch = make_launcher(
+    _bwd_dq_store_dp_kernel, dynamic_options=("num_warps",)
+)
+
+
+_bwd_dkv_interm_kernel_launch = make_launcher(
+    _bwd_dkv_interm_kernel, dynamic_options=("num_warps",)
+)
+
+
+_bwd_dkv_gather_kernel_launch = make_launcher(
+    _bwd_dkv_gather_kernel, dynamic_options=("num_warps",)
+)
 
 
 def sparse_mla_bwd(q, kv, o, do, indices, lse, attn_sink, scale=None):
@@ -158,7 +187,12 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, attn_sink, scale=None):
     dp_buf = torch.empty(N, H, topk, device=q.device, dtype=torch.bfloat16)
 
     # Kernel 1: dQ + store P/dP — grid (N, num_hg)
-    _intj_launch(_bwd_dq_store_dp_kernel, (N, num_hg),
+    dev, stream = current_device_stream()
+    _bwd_dq_store_dp_kernel_launch(
+        dev,
+        stream,
+        (N, num_hg),
+        num_warps,
         q,
         kv,
         do,
@@ -187,16 +221,20 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, attn_sink, scale=None):
         N_kv,
         topk,
         scale,
-        HAS_ATTN_SINK=has_sink,
-        BLOCK_H=BLOCK_H,
-        BLOCK_D=BLOCK_D,
-        BLOCK_K=BLOCK_K,
-        num_warps=num_warps,
+        has_sink,
+        BLOCK_H,
+        BLOCK_D,
+        BLOCK_K,
     )
 
     # Kernel 2: dKV intermediate — grid (N,)
     interm = torch.empty(N, topk, D, device=q.device, dtype=torch.float32)
-    _intj_launch(_bwd_dkv_interm_kernel, (N,),
+    dev, stream = current_device_stream()
+    _bwd_dkv_interm_kernel_launch(
+        dev,
+        stream,
+        (N,),
+        num_warps,
         q,
         do,
         p_buf,
@@ -213,11 +251,10 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, attn_sink, scale=None):
         H,
         D,
         topk,
-        BLOCK_H=BLOCK_H,
-        BLOCK_D=BLOCK_D,
-        BLOCK_K=BLOCK_K,
-        NUM_HG=num_hg,
-        num_warps=num_warps,
+        BLOCK_H,
+        BLOCK_D,
+        BLOCK_K,
+        num_hg,
     )
 
     # CSR gather into dkv
@@ -225,7 +262,12 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, attn_sink, scale=None):
     dkv = torch.zeros(N_kv, D, device=q.device, dtype=torch.float32)
 
     BLOCK_G = 64
-    _intj_launch(_bwd_dkv_gather_kernel, (N_kv,),
+    dev, stream = current_device_stream()
+    _bwd_dkv_gather_kernel_launch(
+        dev,
+        stream,
+        (N_kv,),
+        num_warps,
         interm,
         inv_ptr,
         inv_data,
@@ -236,9 +278,8 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, attn_sink, scale=None):
         D,
         topk,
         N,
-        BLOCK_D=BLOCK_D,
-        BLOCK_G=BLOCK_G,
-        num_warps=num_warps,
+        BLOCK_D,
+        BLOCK_G,
     )
 
     return dq, dkv, d_sink

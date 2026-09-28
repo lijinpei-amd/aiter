@@ -18,10 +18,11 @@ take a 1-D ``(kv_indices, kv_indptr)`` pair over one pool.
     else    -> triton ``_sparse_attn_prefill_kernel`` (single source)
 """
 
+import functools
+
 import torch
 import triton
 from intj import make_launcher
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_prefill_sparse import (
     _pa_prefill_sparse as gluon_pa_prefill_sparse,
@@ -50,6 +51,15 @@ _sparse_attn_prefill_kernel_launch = make_launcher(
     _sparse_attn_prefill_kernel,
     grid_cpp=_sparse_attn_prefill_kernel_grid,
 )
+
+
+@functools.cache
+def _pa_prefill_sparse_launch(num_warps):
+    return make_launcher(
+        gluon_pa_prefill_sparse,
+        dynamic_options=("waves_per_eu",),
+        options={"num_warps": num_warps},
+    )
 
 
 def pa_prefill_sparse(
@@ -149,9 +159,12 @@ def pa_prefill_sparse(
             waves_per_eu = 1
         grid = (T, triton.cdiv(H, block_h))
 
-        _intj_launch(
-            gluon_pa_prefill_sparse,
+        dev, stream = current_device_stream()
+        _pa_prefill_sparse_launch(num_warps)(
+            dev,
+            stream,
             grid,
+            waves_per_eu,
             q,
             unified_kv,
             kv_indices_prefix,
@@ -176,13 +189,12 @@ def pa_prefill_sparse(
             H,
             D,
             float(softmax_scale),
-            BLOCK_H=block_h,
-            BLOCK_D=block_d,
-            BLOCK_K=block_k,
-            HAS_INVALID=has_invalid,
-            USE_EXP2=USE_EXP2,
-            num_warps=num_warps,
-            waves_per_eu=waves_per_eu,
+            block_h,
+            block_d,
+            block_k,
+            has_invalid,
+            USE_EXP2,
+            num_warps,
         )
         return out
 

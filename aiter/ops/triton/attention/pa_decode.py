@@ -6,7 +6,6 @@ import math
 import torch
 import triton
 from intj import make_launcher
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.attention.pa_decode import (
     _paged_attn_decode_v1_w_dot_kernel,
@@ -158,6 +157,18 @@ def paged_attention_decode(
             )
 
 
+_paged_attn_decode_v1_wo_dot_kernel_launch = make_launcher(
+    _paged_attn_decode_v1_wo_dot_kernel
+)
+
+
+_paged_attn_decode_v1_w_dot_kernel_launch = make_launcher(
+    _paged_attn_decode_v1_w_dot_kernel,
+    dynamic_options=("waves_per_eu",),
+    options={"num_stages": 1},
+)
+
+
 def paged_attn_decode_v1(
     output: torch.Tensor,  # [num_seqs, num_kv_heads*query_grp_sz, head_sz]
     query: torch.Tensor,  # [num_seqs, num_kv_heads*query_grp_sz, head_sz]
@@ -194,8 +205,10 @@ def paged_attn_decode_v1(
     # MHA- Multi-Head Attention
     if query_grp_sz == 1:
         grid = (num_q_heads, num_seqs, 1)
-        _intj_launch(
-            _paged_attn_decode_v1_wo_dot_kernel,
+        dev, stream = current_device_stream()
+        _paged_attn_decode_v1_wo_dot_kernel_launch(
+            dev,
+            stream,
             grid,
             output,
             query,
@@ -215,12 +228,12 @@ def paged_attn_decode_v1(
             key_cache.stride(1),
             key_cache.stride(2),
             block_tables.stride(0),
-            compute_type=compute_type,
-            KV_BLK_SZ=kv_blk_sz,
-            KV_BLK_SZ_POW2=kv_blk_sz_pow2,
-            HEAD_SZ=head_sz,
-            HEAD_SZ_POW2=head_sz_pow2,
-            QUERY_GRP_SZ=query_grp_sz,
+            compute_type,
+            kv_blk_sz,
+            kv_blk_sz_pow2,
+            head_sz,
+            head_sz_pow2,
+            query_grp_sz,
         )
     # GQA - Grouped Query Attention
     else:
@@ -229,9 +242,12 @@ def paged_attn_decode_v1(
             query_grp_sz_pow2 = 16
         else:
             query_grp_sz_pow2 = triton.next_power_of_2(query_grp_sz)
-        _intj_launch(
-            _paged_attn_decode_v1_w_dot_kernel,
+        dev, stream = current_device_stream()
+        _paged_attn_decode_v1_w_dot_kernel_launch(
+            dev,
+            stream,
             grid,
+            3 if query_grp_sz > 1 else 0,
             output,
             query,
             key_cache,
@@ -252,15 +268,13 @@ def paged_attn_decode_v1(
             key_cache.stride(2),
             key_cache.stride(3),
             block_tables.stride(0),
-            compute_type=compute_type,
-            HEAD_SZ=head_sz,
-            HEAD_SZ_POW2=head_sz_pow2,
-            QUERY_GRP_SZ=query_grp_sz,
-            QUERY_GRP_SZ_POW2=query_grp_sz_pow2,
-            KV_BLK_SZ=kv_blk_sz,
-            KV_BLK_SZ_POW2=kv_blk_sz,
-            waves_per_eu=3 if query_grp_sz > 1 else 0,
-            num_stages=1,
+            compute_type,
+            head_sz,
+            head_sz_pow2,
+            query_grp_sz,
+            query_grp_sz_pow2,
+            kv_blk_sz,
+            kv_blk_sz,
         )
 
 
@@ -269,6 +283,16 @@ _paged_attn_decode_v2_wo_dot_reduce_kernel_launch = make_launcher(
 )
 _paged_attn_decode_v2_w_dot_reduce_kernel_launch = make_launcher(
     _paged_attn_decode_v2_w_dot_reduce_kernel,
+)
+
+
+_paged_attn_decode_v2_wo_dot_kernel_launch = make_launcher(
+    _paged_attn_decode_v2_wo_dot_kernel
+)
+
+
+_paged_attn_decode_v2_w_dot_kernel_launch = make_launcher(
+    _paged_attn_decode_v2_w_dot_kernel
 )
 
 
@@ -328,8 +352,10 @@ def paged_attn_decode_v2(
         tmp_output = torch.empty(
             (*shape_info, head_sz), dtype=output.dtype, device=output.device
         )
-        _intj_launch(
-            _paged_attn_decode_v2_wo_dot_kernel,
+        dev, stream = current_device_stream()
+        _paged_attn_decode_v2_wo_dot_kernel_launch(
+            dev,
+            stream,
             grid,
             exp_sums,
             max_logits,
@@ -355,13 +381,13 @@ def paged_attn_decode_v2(
             key_cache.stride(2),
             block_tables.stride(0),
             block_tables.stride(1),
-            compute_type=compute_type,
-            KV_BLK_SZ=kv_blk_sz,
-            KV_BLK_SZ_POW2=kv_blk_sz_pow2,
-            HEAD_SZ=head_sz,
-            HEAD_SZ_POW2=head_sz_pow2,
-            QUERY_GRP_SZ=query_grp_sz,
-            SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
+            compute_type,
+            kv_blk_sz,
+            kv_blk_sz_pow2,
+            head_sz,
+            head_sz_pow2,
+            query_grp_sz,
+            _SEQ_PARTITION_SIZE,
         )
         grid = (num_q_heads, num_seqs, 1)
         dev, stream = current_device_stream()
@@ -399,8 +425,10 @@ def paged_attn_decode_v2(
             query_grp_sz_pow2 = 16
         else:
             query_grp_sz_pow2 = triton.next_power_of_2(query_grp_sz)
-        _intj_launch(
-            _paged_attn_decode_v2_w_dot_kernel,
+        dev, stream = current_device_stream()
+        _paged_attn_decode_v2_w_dot_kernel_launch(
+            dev,
+            stream,
             grid,
             exp_sums,
             max_logits,
@@ -427,14 +455,14 @@ def paged_attn_decode_v2(
             key_cache.stride(1),
             key_cache.stride(2),
             block_tables.stride(0),
-            compute_type=compute_type,
-            HEAD_SZ=head_sz,
-            HEAD_SZ_POW2=head_sz_pow2,
-            QUERY_GRP_SZ=query_grp_sz,
-            QUERY_GRP_SZ_POW2=query_grp_sz_pow2,
-            KV_BLK_SZ=kv_blk_sz,
-            KV_BLK_SZ_POW2=kv_blk_sz_pow2,
-            SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
+            compute_type,
+            head_sz,
+            head_sz_pow2,
+            query_grp_sz,
+            query_grp_sz_pow2,
+            kv_blk_sz,
+            kv_blk_sz_pow2,
+            _SEQ_PARTITION_SIZE,
         )
         grid = (num_seqs, num_kv_heads, 1)
         dev, stream = current_device_stream()
@@ -465,6 +493,18 @@ def paged_attn_decode_v2(
                 triton.next_power_of_2(max_num_partitions)
             ),  # MAX_NUM_SEQ_PARTITIONS_POW2
         )
+
+
+_paged_attn_decode_v1_wo_dot_kernel_per_token_quant_launch = make_launcher(
+    _paged_attn_decode_v1_wo_dot_kernel_per_token_quant
+)
+
+
+_paged_attn_decode_v1_w_dot_kernel_per_token_quant_launch = make_launcher(
+    _paged_attn_decode_v1_w_dot_kernel_per_token_quant,
+    dynamic_options=("waves_per_eu",),
+    options={"num_stages": 1},
+)
 
 
 def paged_attn_decode_v1_per_token_quant(
@@ -503,8 +543,10 @@ def paged_attn_decode_v1_per_token_quant(
     # MHA- Multi-Head Attention
     if query_grp_sz == 1:
         grid = (num_q_heads, num_seqs, 1)
-        _intj_launch(
-            _paged_attn_decode_v1_wo_dot_kernel_per_token_quant,
+        dev, stream = current_device_stream()
+        _paged_attn_decode_v1_wo_dot_kernel_per_token_quant_launch(
+            dev,
+            stream,
             grid,
             output,
             query,
@@ -527,12 +569,12 @@ def paged_attn_decode_v1_per_token_quant(
             k_scale.stride(0),
             k_scale.stride(1),
             k_scale.stride(2),
-            compute_type=compute_type,
-            KV_BLK_SZ=kv_blk_sz,
-            KV_BLK_SZ_POW2=kv_blk_sz_pow2,
-            HEAD_SZ=head_sz,
-            HEAD_SZ_POW2=head_sz_pow2,
-            QUERY_GRP_SZ=query_grp_sz,
+            compute_type,
+            kv_blk_sz,
+            kv_blk_sz_pow2,
+            head_sz,
+            head_sz_pow2,
+            query_grp_sz,
         )
     # GQA - Grouped Query Attention
     else:
@@ -541,9 +583,12 @@ def paged_attn_decode_v1_per_token_quant(
             query_grp_sz_pow2 = 16
         else:
             query_grp_sz_pow2 = triton.next_power_of_2(query_grp_sz)
-        _intj_launch(
-            _paged_attn_decode_v1_w_dot_kernel_per_token_quant,
+        dev, stream = current_device_stream()
+        _paged_attn_decode_v1_w_dot_kernel_per_token_quant_launch(
+            dev,
+            stream,
             grid,
+            3 if query_grp_sz > 1 else 0,
             output,
             query,
             key_cache,
@@ -567,15 +612,13 @@ def paged_attn_decode_v1_per_token_quant(
             k_scale.stride(0),
             k_scale.stride(1),
             k_scale.stride(2),
-            compute_type=compute_type,
-            HEAD_SZ=head_sz,
-            HEAD_SZ_POW2=head_sz_pow2,
-            QUERY_GRP_SZ=query_grp_sz,
-            QUERY_GRP_SZ_POW2=query_grp_sz_pow2,
-            KV_BLK_SZ=kv_blk_sz,
-            KV_BLK_SZ_POW2=kv_blk_sz,
-            waves_per_eu=3 if query_grp_sz > 1 else 0,
-            num_stages=1,
+            compute_type,
+            head_sz,
+            head_sz_pow2,
+            query_grp_sz,
+            query_grp_sz_pow2,
+            kv_blk_sz,
+            kv_blk_sz,
         )
 
 
@@ -584,6 +627,16 @@ _paged_attn_decode_v2_wo_dot_reduce_kernel_per_token_quant_launch = make_launche
 )
 _paged_attn_decode_v2_w_dot_reduce_kernel_per_token_quant_launch = make_launcher(
     _paged_attn_decode_v2_w_dot_reduce_kernel_per_token_quant,
+)
+
+
+_paged_attn_decode_v2_wo_dot_kernel_per_token_quant_launch = make_launcher(
+    _paged_attn_decode_v2_wo_dot_kernel_per_token_quant
+)
+
+
+_paged_attn_decode_v2_w_dot_kernel_per_token_quant_launch = make_launcher(
+    _paged_attn_decode_v2_w_dot_kernel_per_token_quant
 )
 
 
@@ -643,8 +696,10 @@ def paged_attn_decode_v2_per_token_quant(
         tmp_output = torch.empty(
             (*shape_info, head_sz), dtype=output.dtype, device=output.device
         )
-        _intj_launch(
-            _paged_attn_decode_v2_wo_dot_kernel_per_token_quant,
+        dev, stream = current_device_stream()
+        _paged_attn_decode_v2_wo_dot_kernel_per_token_quant_launch(
+            dev,
+            stream,
             grid,
             exp_sums,
             max_logits,
@@ -673,13 +728,13 @@ def paged_attn_decode_v2_per_token_quant(
             k_scale.stride(0),
             k_scale.stride(1),
             k_scale.stride(2),
-            compute_type=compute_type,
-            KV_BLK_SZ=kv_blk_sz,
-            KV_BLK_SZ_POW2=kv_blk_sz_pow2,
-            HEAD_SZ=head_sz,
-            HEAD_SZ_POW2=head_sz_pow2,
-            QUERY_GRP_SZ=query_grp_sz,
-            SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
+            compute_type,
+            kv_blk_sz,
+            kv_blk_sz_pow2,
+            head_sz,
+            head_sz_pow2,
+            query_grp_sz,
+            _SEQ_PARTITION_SIZE,
         )
         grid = (num_q_heads, num_seqs, 1)
         dev, stream = current_device_stream()
@@ -717,8 +772,10 @@ def paged_attn_decode_v2_per_token_quant(
             query_grp_sz_pow2 = 16
         else:
             query_grp_sz_pow2 = triton.next_power_of_2(query_grp_sz)
-        _intj_launch(
-            _paged_attn_decode_v2_w_dot_kernel_per_token_quant,
+        dev, stream = current_device_stream()
+        _paged_attn_decode_v2_w_dot_kernel_per_token_quant_launch(
+            dev,
+            stream,
             grid,
             exp_sums,
             max_logits,
@@ -748,14 +805,14 @@ def paged_attn_decode_v2_per_token_quant(
             k_scale.stride(0),
             k_scale.stride(1),
             k_scale.stride(2),
-            compute_type=compute_type,
-            HEAD_SZ=head_sz,
-            HEAD_SZ_POW2=head_sz_pow2,
-            QUERY_GRP_SZ=query_grp_sz,
-            QUERY_GRP_SZ_POW2=query_grp_sz_pow2,
-            KV_BLK_SZ=kv_blk_sz,
-            KV_BLK_SZ_POW2=kv_blk_sz_pow2,
-            SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
+            compute_type,
+            head_sz,
+            head_sz_pow2,
+            query_grp_sz,
+            query_grp_sz_pow2,
+            kv_blk_sz,
+            kv_blk_sz_pow2,
+            _SEQ_PARTITION_SIZE,
         )
         grid = (num_seqs, num_kv_heads, 1)
         dev, stream = current_device_stream()

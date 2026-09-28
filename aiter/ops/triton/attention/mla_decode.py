@@ -30,7 +30,6 @@ import torch
 import triton
 import triton.language as tl
 from intj import make_launcher
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.device_info import current_device_stream
@@ -218,6 +217,11 @@ def _fwd_kernel_stage1(
         )
 
 
+_fwd_kernel_stage1_launch = make_launcher(
+    _fwd_kernel_stage1, dynamic_options=("num_warps",), options={"num_stages": 2}
+)
+
+
 def _decode_att_m_fwd(
     q,
     k_buffer,
@@ -263,9 +267,12 @@ def _decode_att_m_fwd(
         BLOCK_DPE = 0
     BLOCK_DV = triton.next_power_of_2(Lv)
 
-    _intj_launch(
-        _fwd_kernel_stage1,
+    dev, stream = current_device_stream()
+    _fwd_kernel_stage1_launch(
+        dev,
+        stream,
         grid,
+        num_warps,
         q,
         k_buffer,
         v_buffer,
@@ -285,18 +292,16 @@ def _decode_att_m_fwd(
         att_out.stride(2),
         k_scale,
         v_scale,
-        kv_group_num=kv_group_num,
-        BLOCK_DMODEL=BLOCK_DMODEL,
-        BLOCK_DPE=BLOCK_DPE,
-        BLOCK_DV=BLOCK_DV,
-        BLOCK_N=BLOCK,
-        NUM_KV_SPLITS=NUM_KV_SPLITS,
-        PAGE_SIZE=page_size,
-        logit_cap=logit_cap,
-        num_warps=num_warps,
-        num_stages=2,
-        Lk=Lk,
-        Lv=Lv,
+        kv_group_num,
+        BLOCK_DMODEL,
+        BLOCK_DPE,
+        BLOCK_DV,
+        BLOCK,
+        NUM_KV_SPLITS,
+        page_size,
+        logit_cap,
+        Lk,
+        Lv,
     )
 
 
@@ -488,6 +493,18 @@ def _fwd_grouped_kernel_stage1(
         )
 
 
+_fwd_grouped_kernel_stage1_launch = make_launcher(
+    _fwd_grouped_kernel_stage1,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
+
+
 def _decode_grouped_att_m_fwd(
     q,
     k_buffer,
@@ -546,9 +563,16 @@ def _decode_grouped_att_m_fwd(
         if BLOCK_DMODEL >= 512:
             num_warps = 2
 
-    _intj_launch(
-        _fwd_grouped_kernel_stage1,
+    dev, stream = current_device_stream()
+    _fwd_grouped_kernel_stage1_launch(
+        dev,
+        stream,
         grid,
+        num_warps,
+        num_stages,
+        extra_kargs.get("waves_per_eu", 0),
+        extra_kargs.get("matrix_instr_nonkdim", 0),
+        extra_kargs.get("kpack", 1),
         q,
         k_buffer,
         v_buffer,
@@ -568,21 +592,18 @@ def _decode_grouped_att_m_fwd(
         att_out.stride(2),
         k_scale,
         v_scale,
-        kv_group_num=kv_group_num,
-        q_head_num=head_num,
-        BLOCK_DMODEL=BLOCK_DMODEL,
-        BLOCK_DPE=BLOCK_DPE,
-        BLOCK_DV=BLOCK_DV,
-        BLOCK_N=BLOCK,
-        BLOCK_H=BLOCK_H,
-        NUM_KV_SPLITS=NUM_KV_SPLITS,
-        PAGE_SIZE=page_size,
-        logit_cap=logit_cap,
-        num_warps=num_warps,
-        num_stages=num_stages,
-        Lk=Lk,
-        Lv=Lv,
-        **extra_kargs,
+        kv_group_num,
+        head_num,
+        BLOCK_DMODEL,
+        BLOCK_DPE,
+        BLOCK_DV,
+        BLOCK,
+        BLOCK_H,
+        NUM_KV_SPLITS,
+        page_size,
+        logit_cap,
+        Lk,
+        Lv,
     )
 
 

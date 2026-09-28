@@ -3,15 +3,28 @@
 
 import torch
 import triton
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a8w8 import (
     _batched_gemm_a8w8_kernel,
     _get_config,
 )
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+
+_batched_gemm_a8w8_kernel_launch = make_launcher(
+    _batched_gemm_a8w8_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 def batched_gemm_a8w8(
@@ -85,7 +98,16 @@ def batched_gemm_a8w8(
         triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),
     )
 
-    _intj_launch_tuned(_batched_gemm_a8w8_kernel, grid,
+    dev, stream = current_device_stream()
+    _batched_gemm_a8w8_kernel_launch(
+        dev,
+        stream,
+        grid,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
         XQ,
         WQ,
         YQ,
@@ -108,7 +130,10 @@ def batched_gemm_a8w8(
         w_scale.stride(0),
         bias.stride(0) if has_bias else 0,
         has_bias,
-        **config,
+        config["BLOCK_SIZE_M"],
+        config["BLOCK_SIZE_N"],
+        config["BLOCK_SIZE_K"],
+        config["GROUP_SIZE_M"],
     )
 
     return YQ

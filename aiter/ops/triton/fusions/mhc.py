@@ -4,7 +4,7 @@
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.fusions import (
     _mhc_asymmetric_sinkhorn_kernel,
@@ -17,6 +17,7 @@ from aiter.ops.triton._triton_kernels.fusions import (
     _mhc_reduce_apply_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.mhc_config_utils import (
     get_mhc_config,
@@ -55,6 +56,42 @@ def _validate_dot_config(config: dict, *, name: str) -> None:
             raise ValueError(f"{name} BLOCK_C must be a positive power of two")
     if config.get("NUM_KSPLIT", 1) < 1:
         raise ValueError(f"{name} NUM_KSPLIT must be >= 1")
+
+
+_mhc_fused_split_kernel_launch = make_launcher(
+    _mhc_fused_split_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
+
+
+_mhc_reduce_apply_kernel_launch = make_launcher(
+    _mhc_reduce_apply_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
+
+
+_mhc_fused_kernel_launch = make_launcher(
+    _mhc_fused_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 def mhc(
@@ -263,34 +300,51 @@ def mhc(
         )
 
         grid_split = (triton.cdiv(M, BLOCK_M), num_ksplit)
-        _intj_launch(_mhc_fused_split_kernel, grid_split,
+        dev, stream = current_device_stream()
+        _mhc_fused_split_kernel_launch(
+            dev,
+            stream,
+            grid_split,
+            config.get("num_warps", 4),
+            config.get("num_stages", 2),
+            config.get("waves_per_eu", 0),
+            config.get("matrix_instr_nonkdim", 0),
+            config.get("kpack", 1),
             x,
             phi,
             acc_partial,
             acc_sq_partial,
-            M=M,
-            K=K,
-            N=N_total,
-            n=n,
-            n_squared=n_squared,
-            stride_xm=x.stride(0),
-            stride_xk=x.stride(1),
-            stride_phi_k=stride_phi_k,
-            stride_phi_n=stride_phi_n,
-            stride_acc_k=acc_partial.stride(0),
-            stride_acc_m=acc_partial.stride(1),
-            stride_acc_n=acc_partial.stride(2),
-            stride_acc_sq_k=acc_sq_partial.stride(0),
-            stride_acc_sq_m=acc_sq_partial.stride(1),
-            BLOCK_M=BLOCK_M,
-            N_TOTAL_POW2=N_TOTAL_POW2,
-            BLOCK_K=BLOCK_K,
-            SPLITK_BLOCK_SIZE=splitk_block_size,
-            **config,
+            M,
+            K,
+            N_total,
+            n,
+            n_squared,
+            x.stride(0),
+            x.stride(1),
+            stride_phi_k,
+            stride_phi_n,
+            acc_partial.stride(0),
+            acc_partial.stride(1),
+            acc_partial.stride(2),
+            acc_sq_partial.stride(0),
+            acc_sq_partial.stride(1),
+            BLOCK_M,
+            N_TOTAL_POW2,
+            BLOCK_K,
+            splitk_block_size,
         )
 
         grid_reduce_apply = (triton.cdiv(M, BLOCK_M), triton.cdiv(C, BLOCK_C))
-        _intj_launch(_mhc_reduce_apply_kernel, grid_reduce_apply,
+        dev, stream = current_device_stream()
+        _mhc_reduce_apply_kernel_launch(
+            dev,
+            stream,
+            grid_reduce_apply,
+            config.get("num_warps", 4),
+            config.get("num_stages", 2),
+            config.get("waves_per_eu", 0),
+            config.get("matrix_instr_nonkdim", 0),
+            config.get("kpack", 1),
             acc_partial,
             acc_sq_partial,
             alpha_pre,
@@ -301,38 +355,46 @@ def mhc(
             x,
             out,
             layer_input,
-            M=M,
-            K=K,
-            n=n,
-            n_squared=n_squared,
-            C=C,
-            eps=eps,
-            hc_pre_eps=hc_pre_eps,
-            hc_post_mult_value=hc_post_mult_value,
-            stride_acc_k=acc_partial.stride(0),
-            stride_acc_m=acc_partial.stride(1),
-            stride_acc_n=acc_partial.stride(2),
-            stride_acc_sq_k=acc_sq_partial.stride(0),
-            stride_acc_sq_m=acc_sq_partial.stride(1),
-            stride_xm=x.stride(0),
-            stride_xk=x.stride(1),
-            stride_out_m=out.stride(0),
-            stride_out_n=out.stride(1),
-            stride_li_m=layer_input.stride(0),
-            stride_li_c=layer_input.stride(1),
-            BLOCK_M=BLOCK_M,
-            BLOCK_C=BLOCK_C,
-            N_POW2=N_POW2,
-            N_POW2_RES=N_POW2_RES,
-            ACTUAL_KSPLIT=actual_ksplit,
-            NUM_SINKHORN_ITERS=sinkhorn_iters,
-            RES_PID_C=RES_PID_C,
-            ALPHAS_ARE_POINTER=alphas is not None,
-            **config,
+            M,
+            K,
+            n,
+            n_squared,
+            C,
+            eps,
+            hc_pre_eps,
+            hc_post_mult_value,
+            acc_partial.stride(0),
+            acc_partial.stride(1),
+            acc_partial.stride(2),
+            acc_sq_partial.stride(0),
+            acc_sq_partial.stride(1),
+            x.stride(0),
+            x.stride(1),
+            out.stride(0),
+            out.stride(1),
+            layer_input.stride(0),
+            layer_input.stride(1),
+            BLOCK_M,
+            BLOCK_C,
+            N_POW2,
+            N_POW2_RES,
+            actual_ksplit,
+            sinkhorn_iters,
+            RES_PID_C,
+            alphas is not None,
         )
     else:
         grid = (triton.cdiv(M, BLOCK_M), total_n_blocks)
-        _intj_launch(_mhc_fused_kernel, grid,
+        dev, stream = current_device_stream()
+        _mhc_fused_kernel_launch(
+            dev,
+            stream,
+            grid,
+            config.get("num_warps", 4),
+            config.get("num_stages", 2),
+            config.get("waves_per_eu", 0),
+            config.get("matrix_instr_nonkdim", 0),
+            config.get("kpack", 1),
             x,
             phi,
             alpha_pre,
@@ -342,37 +404,48 @@ def mhc(
             bias,
             out,
             layer_input,
-            M=M,
-            K=K,
-            N=N,
-            n=n,
-            n_squared=n_squared,
-            C=C,
-            eps=eps,
-            hc_pre_eps=hc_pre_eps,
-            hc_post_mult_value=hc_post_mult_value,
-            stride_xm=x.stride(0),
-            stride_xk=x.stride(1),
-            stride_phi_k=stride_phi_k,
-            stride_phi_n=stride_phi_n,
-            stride_out_m=out.stride(0),
-            stride_out_n=out.stride(1),
-            stride_li_m=layer_input.stride(0),
-            stride_li_c=layer_input.stride(1),
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            BLOCK_K=BLOCK_K,
-            BLOCK_C=BLOCK_C,
-            N_POW2=N_POW2,
-            NUM_SINKHORN_ITERS=sinkhorn_iters,
-            ALPHAS_ARE_POINTER=alphas is not None,
-            **config,
+            M,
+            K,
+            N,
+            n,
+            n_squared,
+            C,
+            eps,
+            hc_pre_eps,
+            hc_post_mult_value,
+            x.stride(0),
+            x.stride(1),
+            stride_phi_k,
+            stride_phi_n,
+            out.stride(0),
+            out.stride(1),
+            layer_input.stride(0),
+            layer_input.stride(1),
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K,
+            BLOCK_C,
+            N_POW2,
+            sinkhorn_iters,
+            alphas is not None,
         )
 
     # `out` layout is [post + res]: out[:, :n] is H^post, out[:, n:] is H^res
     h_post = out[:, :n].unsqueeze(-1)  # (M, n, 1)
     h_res = out[:, n:].view(M, n, n)  # (M, n, n)
     return h_post, h_res, layer_input
+
+
+_mhc_post_kernel_launch = make_launcher(
+    _mhc_post_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 def mhc_post(
@@ -479,34 +552,66 @@ def mhc_post(
         ), f"out shape mismatch: expected ({M}, {n}, {C}), got {out.shape}"
 
     grid = (triton.cdiv(M, BLOCK_M),)
-    _intj_launch(_mhc_post_kernel, grid,
+    dev, stream = current_device_stream()
+    _mhc_post_kernel_launch(
+        dev,
+        stream,
+        grid,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
         out,
         layer_input,
         residual,
         post_mix,
         comb_mix,
-        M=M,
-        C=C,
-        stride_x_m=layer_input.stride(0),
-        stride_x_c=layer_input.stride(1),
-        stride_res_m=residual.stride(0),
-        stride_res_n=residual.stride(1),
-        stride_res_c=residual.stride(2),
-        stride_out_m=out.stride(0),
-        stride_out_n=out.stride(1),
-        stride_out_c=out.stride(2),
-        stride_post_m=post_mix.stride(0),
-        stride_post_n=post_mix.stride(1),
-        stride_comb_m=comb_mix.stride(0),
-        stride_comb_src=comb_mix.stride(1),
-        stride_comb_dst=comb_mix.stride(2),
-        n=n,
-        BLOCK_M=BLOCK_M,
-        BLOCK_C=BLOCK_C,
-        **config,
+        M,
+        C,
+        layer_input.stride(0),
+        layer_input.stride(1),
+        residual.stride(0),
+        residual.stride(1),
+        residual.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        post_mix.stride(0),
+        post_mix.stride(1),
+        comb_mix.stride(0),
+        comb_mix.stride(1),
+        comb_mix.stride(2),
+        n,
+        BLOCK_M,
+        BLOCK_C,
     )
 
     return out
+
+
+_mhc_post_pre_split_kernel_launch = make_launcher(
+    _mhc_post_pre_split_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
+
+
+_mhc_post_pre_reduce_apply_kernel_launch = make_launcher(
+    _mhc_post_pre_reduce_apply_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 def mhc_post_pre(
@@ -758,7 +863,16 @@ def mhc_post_pre(
 
     # --- Launch 1: fused post + partial pre GEMM/sqrsum, one CTA per (M-tile, C-tile).
     grid_split = (triton.cdiv(M, BLOCK_M), NUM_KSPLIT)
-    _intj_launch(_mhc_post_pre_split_kernel, grid_split,
+    dev, stream = current_device_stream()
+    _mhc_post_pre_split_kernel_launch(
+        dev,
+        stream,
+        grid_split,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
         layer_input,
         residual_in,
         post_mix,
@@ -767,34 +881,33 @@ def mhc_post_pre(
         phi,
         acc_partial,
         acc_sq_partial,
-        M=M,
-        N=N_total,
-        n=n,
-        C=C,
-        stride_x_m=layer_input.stride(0),
-        stride_x_c=layer_input.stride(1),
-        stride_resin_m=residual_in.stride(0),
-        stride_resin_n=residual_in.stride(1),
-        stride_resin_c=residual_in.stride(2),
-        stride_post_m=post_mix.stride(0),
-        stride_post_n=post_mix.stride(1),
-        stride_comb_m=comb_mix.stride(0),
-        stride_comb_src=comb_mix.stride(1),
-        stride_comb_dst=comb_mix.stride(2),
-        stride_resout_m=residual_out.stride(0),
-        stride_resout_n=residual_out.stride(1),
-        stride_resout_c=residual_out.stride(2),
-        stride_phi_k=phi.stride(0),
-        stride_phi_n=phi.stride(1),
-        stride_acc_k=acc_partial.stride(0),
-        stride_acc_m=acc_partial.stride(1),
-        stride_acc_n=acc_partial.stride(2),
-        stride_acc_sq_k=acc_sq_partial.stride(0),
-        stride_acc_sq_m=acc_sq_partial.stride(1),
-        BLOCK_M=BLOCK_M,
-        BLOCK_C=BLOCK_C_SPLIT,
-        N_TOTAL_POW2=N_TOTAL_POW2,
-        **config,
+        M,
+        N_total,
+        n,
+        C,
+        layer_input.stride(0),
+        layer_input.stride(1),
+        residual_in.stride(0),
+        residual_in.stride(1),
+        residual_in.stride(2),
+        post_mix.stride(0),
+        post_mix.stride(1),
+        comb_mix.stride(0),
+        comb_mix.stride(1),
+        comb_mix.stride(2),
+        residual_out.stride(0),
+        residual_out.stride(1),
+        residual_out.stride(2),
+        phi.stride(0),
+        phi.stride(1),
+        acc_partial.stride(0),
+        acc_partial.stride(1),
+        acc_partial.stride(2),
+        acc_sq_partial.stride(0),
+        acc_sq_partial.stride(1),
+        BLOCK_M,
+        BLOCK_C_SPLIT,
+        N_TOTAL_POW2,
     )
 
     # --- Launch 2: reduce-apply kernel writes h_post and h_res directly.
@@ -845,7 +958,16 @@ def mhc_post_pre(
     grid_reduce_apply = (
         triton.cdiv(M, BLOCK_M) * NUM_C_BLOCKS + triton.cdiv(M, BLOCK_M_POST_RES) * 2,
     )
-    _intj_launch(_mhc_post_pre_reduce_apply_kernel, grid_reduce_apply,
+    dev, stream = current_device_stream()
+    _mhc_post_pre_reduce_apply_kernel_launch(
+        dev,
+        stream,
+        grid_reduce_apply,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
         acc_partial,
         acc_sq_partial,
         alphas,
@@ -854,38 +976,37 @@ def mhc_post_pre(
         h_post_2d,
         h_res_2d,
         layer_input_out,
-        M=M,
-        K=K,
-        n=n,
-        n_squared=n_squared,
-        C=C,
-        eps=eps,
-        hc_pre_eps=hc_pre_eps,
-        hc_post_mult_value=hc_post_mult_value,
-        stride_acc_k=acc_partial.stride(0),
-        stride_acc_m=acc_partial.stride(1),
-        stride_acc_n=acc_partial.stride(2),
-        stride_acc_sq_k=acc_sq_partial.stride(0),
-        stride_acc_sq_m=acc_sq_partial.stride(1),
-        stride_xm=x_flat.stride(0),
-        stride_xk=x_flat.stride(1),
-        stride_hp_m=h_post_2d.stride(0),
-        stride_hp_n=h_post_2d.stride(1),
-        stride_hr_m=h_res_2d.stride(0),
-        stride_hr_n=h_res_2d.stride(1),
-        stride_li_m=layer_input_out.stride(0),
-        stride_li_c=layer_input_out.stride(1),
-        BLOCK_M=BLOCK_M,
-        BLOCK_C=BLOCK_C,
-        N_POW2=N_POW2,
-        N_POW2_RES=N_POW2_RES,
-        ACTUAL_KSPLIT=NUM_KSPLIT,
-        KSPLIT_POW2=KSPLIT_POW2,
-        BLOCK_M_POST_RES=BLOCK_M_POST_RES,
-        NUM_SINKHORN_ITERS=sinkhorn_iters,
-        ASYMMETRIC_EXP_DOMAIN=asymmetric_exp_domain,
-        hc_sinkhorn_eps=hc_sinkhorn_eps,
-        **config,
+        M,
+        K,
+        n,
+        n_squared,
+        C,
+        eps,
+        hc_pre_eps,
+        hc_post_mult_value,
+        acc_partial.stride(0),
+        acc_partial.stride(1),
+        acc_partial.stride(2),
+        acc_sq_partial.stride(0),
+        acc_sq_partial.stride(1),
+        x_flat.stride(0),
+        x_flat.stride(1),
+        h_post_2d.stride(0),
+        h_post_2d.stride(1),
+        h_res_2d.stride(0),
+        h_res_2d.stride(1),
+        layer_input_out.stride(0),
+        layer_input_out.stride(1),
+        BLOCK_M,
+        BLOCK_C,
+        N_POW2,
+        N_POW2_RES,
+        NUM_KSPLIT,
+        KSPLIT_POW2,
+        BLOCK_M_POST_RES,
+        sinkhorn_iters,
+        asymmetric_exp_domain,
+        hc_sinkhorn_eps,
     )
 
     # Reshape h_post to (M, n, 1) on return for compatibility with downstream
@@ -1002,6 +1123,11 @@ def _validate_dsv4_parameters(
     return M, n, C
 
 
+_mhc_asymmetric_sinkhorn_kernel_launch = make_launcher(
+    _mhc_asymmetric_sinkhorn_kernel, dynamic_options=("num_warps",)
+)
+
+
 def _mhc_pre_dsv4_forward(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -1045,19 +1171,23 @@ def _mhc_pre_dsv4_forward(
     sink_cfg = get_tuned_kernel_config(
         "fusions", "MHC_DSV4", "_mhc_asymmetric_sinkhorn_kernel", _SINKHORN_FALLBACK
     )
-    _intj_launch(_mhc_asymmetric_sinkhorn_kernel, (M,),
+    dev, stream = current_device_stream()
+    _mhc_asymmetric_sinkhorn_kernel_launch(
+        dev,
+        stream,
+        (M,),
+        sink_cfg.num_warps,
         raw_comb_flat,
         comb_flat,
-        M=M,
-        stride_logits_m=raw_comb_flat.stride(0),
-        stride_logits_n=raw_comb_flat.stride(1),
-        stride_out_m=comb_flat.stride(0),
-        stride_out_n=comb_flat.stride(1),
-        n=n,
-        N_POW2_RES=triton.next_power_of_2(n * n),
-        NUM_SINKHORN_ITERS=sinkhorn_iters,
-        eps=sinkhorn_eps,
-        num_warps=sink_cfg.num_warps,
+        M,
+        raw_comb_flat.stride(0),
+        raw_comb_flat.stride(1),
+        comb_flat.stride(0),
+        comb_flat.stride(1),
+        n,
+        triton.next_power_of_2(n * n),
+        sinkhorn_iters,
+        sinkhorn_eps,
     )
     return post, comb, layer_input
 
@@ -1186,6 +1316,18 @@ def mhc_post_dsv4(
     return _MHCPostDSV4.apply(layer_input, residual, post_mix, comb_mix, config)
 
 
+_mhc_head_kernel_launch = make_launcher(
+    _mhc_head_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
+
+
 def _mhc_head_dsv4_forward(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -1214,31 +1356,37 @@ def _mhc_head_dsv4_forward(
         "BLOCK_C", head_cfg.kwargs.get("BLOCK_C", min(128, triton.next_power_of_2(C)))
     )
     out = torch.empty(M, C, dtype=residual.dtype, device=residual.device)
-    _intj_launch(_mhc_head_kernel, (triton.cdiv(M, BLOCK_M),),
+    dev, stream = current_device_stream()
+    _mhc_head_kernel_launch(
+        dev,
+        stream,
+        (triton.cdiv(M, BLOCK_M),),
+        head_cfg.num_warps,
+        head_cfg.num_stages,
+        extra.get("waves_per_eu", 0),
+        extra.get("matrix_instr_nonkdim", 0),
+        extra.get("kpack", 1),
         x,
         fn,
         scale,
         base,
         out,
-        M=M,
-        K=n * C,
-        n=n,
-        C=C,
-        eps=eps,
-        pre_eps=pre_eps,
-        stride_xm=x.stride(0),
-        stride_xk=x.stride(1),
-        stride_fn_n=fn.stride(0),
-        stride_fn_k=fn.stride(1),
-        stride_om=out.stride(0),
-        stride_oc=out.stride(1),
-        BLOCK_M=BLOCK_M,
-        BLOCK_K=BLOCK_K,
-        BLOCK_C=BLOCK_C,
-        N_TILE=max(16, triton.next_power_of_2(n)),
-        num_warps=head_cfg.num_warps,
-        num_stages=head_cfg.num_stages,
-        **extra,
+        M,
+        n * C,
+        n,
+        C,
+        eps,
+        pre_eps,
+        x.stride(0),
+        x.stride(1),
+        fn.stride(0),
+        fn.stride(1),
+        out.stride(0),
+        out.stride(1),
+        BLOCK_M,
+        BLOCK_K,
+        BLOCK_C,
+        max(16, triton.next_power_of_2(n)),
     )
     return out
 

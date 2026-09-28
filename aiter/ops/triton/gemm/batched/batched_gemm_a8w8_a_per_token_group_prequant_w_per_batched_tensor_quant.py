@@ -3,11 +3,23 @@
 
 import torch
 import triton
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel,
     _get_config,
+)
+from aiter.ops.triton.utils.device_info import current_device_stream
+
+_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel_launch = make_launcher(
+    _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
 )
 
 
@@ -101,7 +113,16 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         else torch.iinfo(WQ.dtype).max
     )
 
-    _intj_launch_tuned(_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel, grid,
+    dev, stream = current_device_stream()
+    _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel_launch(
+        dev,
+        stream,
+        grid,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
         X,
         WQ,
         YQ,
@@ -121,9 +142,13 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         YQ.stride(2),
         bias.stride(0) if has_bias else 0,
         has_bias,
-        DTYPE_MAX=DTYPE_MAX,
-        DTYPE_MIN=-DTYPE_MAX,
-        **config,
+        DTYPE_MAX,
+        -DTYPE_MAX,
+        config["BLOCK_SIZE_M"],
+        config["BLOCK_SIZE_N"],
+        config["BLOCK_SIZE_K"],
+        config["GROUP_SIZE_M"],
+        config["cache_modifier"],
     )
 
     return YQ

@@ -6,7 +6,6 @@ import itertools
 import torch
 import triton
 from intj import make_launcher
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._gluon_kernels.gfx942.moe.moe_op_gemm_int8_smoothquant import (
     _gluon_moe_gemm_int8_smoothquant,
@@ -146,6 +145,18 @@ _gluon_moe_gemm_int8_smoothquant_launch = make_launcher(
     _gluon_moe_gemm_int8_smoothquant,
     grid_arg=1,
     options={"num_warps": 4},
+)
+
+
+_moe_gemm_int8_smoothquant_launch = make_launcher(
+    _moe_gemm_int8_smoothquant,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
 )
 
 
@@ -315,9 +326,16 @@ def moe_gemm_int8_smoothquant(
         )
     else:
         # launch standard kernel
-        _intj_launch(
-            _moe_gemm_int8_smoothquant,
+        dev, stream = current_device_stream()
+        _moe_gemm_int8_smoothquant_launch(
+            dev,
+            stream,
             (grid,),
+            config["num_warps"],
+            config["num_stages"],
+            config["waves_per_eu"],
+            config["matrix_instr_nonkdim"],
+            config["kpack"],
             y,
             y.stride(0),
             y.stride(1),
@@ -356,17 +374,12 @@ def moe_gemm_int8_smoothquant(
             config["block_n"],
             config["block_k"],
             config["group_m"],
-            PRESHUFFLED=preshuffled,
-            EVEN_K=K % config["block_k"] == 0,
-            MASK_K_LIMIT=K % config["block_k"],
-            SPLIT_K=config["split_k"],
-            W_CACHE_MODIFIER=config["w_cache_modifier"],
-            num_warps=config["num_warps"],
-            num_stages=config["num_stages"],
-            UPCAST_INDICES=should_upcast_indices(x, w, y),
-            waves_per_eu=config["waves_per_eu"],
-            matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
-            kpack=config["kpack"],
+            preshuffled,
+            K % config["block_k"] == 0,
+            K % config["block_k"],
+            config["split_k"],
+            config["w_cache_modifier"],
+            should_upcast_indices(x, w, y),
         )
     # Build grouped reduction inputs in a uniform way
     group_indx = (

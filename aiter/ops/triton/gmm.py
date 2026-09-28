@@ -13,8 +13,7 @@ import torch
 
 # Triton
 import triton
-from intj.compat import launch as _intj_launch
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
+from intj import make_launcher
 from torch import Tensor
 
 # AITER: GMM Triton kernels
@@ -24,6 +23,7 @@ from aiter.ops.triton._triton_kernels.gmm import (
     tgmm_non_persistent_kernel,
     tgmm_persistent_kernel,
 )
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 # AITER: GMM utility functions
 from aiter.ops.triton.utils.gmm_common import (
@@ -99,6 +99,18 @@ def _gmm_grid(
 
     assert num_programs > 0, f"num_programs must be positive, it's {num_programs}."
     return (num_programs,)
+
+
+_gmm_kernel_launch = make_launcher(
+    gmm_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 def gmm(
@@ -261,16 +273,34 @@ def gmm(
     )
 
     # fmt: off
-    _intj_launch_tuned(gmm_kernel, grid,
-        # Tensor pointers:
-        lhs, rhs, group_sizes, out, bias, tile_counter,
-        # Tensor shapes:
-        M, K, N, G,
-        # Meta-parameters:
-        TRANS_RHS=trans_rhs,
-        USE_BIAS=use_bias,
-        WORK_STEALING=work_stealing,
-        **config,
+    dev, stream = current_device_stream()
+    _gmm_kernel_launch(
+        dev,
+        stream,
+        grid,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
+        lhs,
+        rhs,
+        group_sizes,
+        out,
+        bias,
+        tile_counter,
+        M,
+        K,
+        N,
+        G,
+        trans_rhs,
+        config["BLOCK_SIZE_M"],
+        config["BLOCK_SIZE_K"],
+        config["BLOCK_SIZE_N"],
+        config["GROUP_SIZE"],
+        config["GRID_DIM"],
+        use_bias,
+        work_stealing,
     )
     # fmt: on
 
@@ -308,6 +338,18 @@ def _ptgmm_grid(
     num_programs = min(grid_dim, num_tiles)
     assert num_programs > 0, f"num_programs must be positive, it's {num_programs}."
     return (num_programs,)
+
+
+_tgmm_persistent_kernel_launch = make_launcher(
+    tgmm_persistent_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 def ptgmm(
@@ -479,16 +521,33 @@ def ptgmm(
     )
 
     # fmt: off
-    _intj_launch(tgmm_persistent_kernel, grid,
-        # Tensor pointers:
-        lhs, rhs, group_sizes, out, bias_grad_ptr,
-        # Tensor shapes:
-        M, K, N, G,
-        # Meta-parameters:
-        TRANS_LHS=trans_lhs,
-        COMPUTE_BIAS_GRAD=compute_bias_grad,
-        ACCUMULATE=accumulate,
-        **config,
+    dev, stream = current_device_stream()
+    _tgmm_persistent_kernel_launch(
+        dev,
+        stream,
+        grid,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
+        lhs,
+        rhs,
+        group_sizes,
+        out,
+        bias_grad_ptr,
+        M,
+        K,
+        N,
+        G,
+        trans_lhs,
+        config["BLOCK_SIZE_M"],
+        config["BLOCK_SIZE_K"],
+        config["BLOCK_SIZE_N"],
+        config["GROUP_SIZE"],
+        config["GRID_DIM"],
+        compute_bias_grad,
+        accumulate,
     )
     # fmt: on
 
@@ -524,6 +583,18 @@ def _nptgmm_grid(
         num_tiles_per_mm > 0
     ), f"num_tiles_per_mm must be positive, it's {num_tiles_per_mm}."
     return (G, num_tiles_per_mm)
+
+
+_tgmm_non_persistent_kernel_launch = make_launcher(
+    tgmm_non_persistent_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 def nptgmm(
@@ -674,16 +745,32 @@ def nptgmm(
     )
 
     # fmt: off
-    _intj_launch_tuned(tgmm_non_persistent_kernel, grid,
-        # Tensor pointers:
-        lhs, rhs, group_sizes, out, bias_grad_ptr,
-        # Tensor shapes:
-        M, K, N, G,
-        # Meta-parameters:
-        TRANS_LHS=trans_lhs,
-        COMPUTE_BIAS_GRAD=compute_bias_grad,
-        ACCUMULATE=accumulate,
-        **config,
+    dev, stream = current_device_stream()
+    _tgmm_non_persistent_kernel_launch(
+        dev,
+        stream,
+        grid,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
+        lhs,
+        rhs,
+        group_sizes,
+        out,
+        bias_grad_ptr,
+        M,
+        K,
+        N,
+        G,
+        trans_lhs,
+        config["BLOCK_SIZE_M"],
+        config["BLOCK_SIZE_K"],
+        config["BLOCK_SIZE_N"],
+        config["GROUP_SIZE"],
+        compute_bias_grad,
+        accumulate,
     )
     # fmt: on
 

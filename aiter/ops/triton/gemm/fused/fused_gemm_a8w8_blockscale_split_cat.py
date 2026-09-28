@@ -12,7 +12,6 @@ from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_a8w8_blockscale_spli
     _get_config,
 )
 from aiter.ops.triton.utils.device_info import current_device_stream
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -20,6 +19,18 @@ _LOGGER = AiterTritonLogger()
 
 _fused_gemm_a8w8_blockscale_split_cat_reduce_launch = make_launcher(
     _fused_gemm_a8w8_blockscale_split_cat_reduce,
+)
+
+
+_fused_gemm_a8w8_blockscale_split_cat_launch = make_launcher(
+    _fused_gemm_a8w8_blockscale_split_cat,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
 )
 
 
@@ -136,9 +147,16 @@ def fused_gemm_a8w8_blockscale_split_cat(
             * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),  # Effective launch grid dims: [NUM_KSPLIT, NUM_M_BLOCKS, NUM_N_BLOCKS]
     )
-    _intj_launch_tuned(
-        _fused_gemm_a8w8_blockscale_split_cat,
+    dev, stream = current_device_stream()
+    _fused_gemm_a8w8_blockscale_split_cat_launch(
+        dev,
+        stream,
         grid,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
         x,
         w,
         y,
@@ -170,7 +188,16 @@ def fused_gemm_a8w8_blockscale_split_cat(
         x_scale.stride(1),
         w_scale.stride(0),
         w_scale.stride(1),
-        **config,
+        config["GROUP_K"],
+        config["GROUP_N"],
+        config["BLOCK_SIZE_M"],
+        config["BLOCK_SIZE_N"],
+        config["BLOCK_SIZE_K"],
+        config["BLOCK_SIZE_S3"],
+        config["GROUP_SIZE_M"],
+        config["NUM_KSPLIT"],
+        config["SPLITK_BLOCK_SIZE"],
+        config["cache_modifier"],
     )
 
     if config["NUM_KSPLIT"] > 1:
@@ -220,6 +247,18 @@ def fused_gemm_a8w8_blockscale_split_cat(
         )
 
     return c1, c2
+
+
+_fused_gemm_a8w8_blockscale_preshuffle_split_cat_launch = make_launcher(
+    _fused_gemm_a8w8_blockscale_preshuffle_split_cat,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 def fused_gemm_a8w8_blockscale_preshuffle_split_cat(
@@ -338,9 +377,16 @@ def fused_gemm_a8w8_blockscale_preshuffle_split_cat(
             * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),  # Effective launch grid dims: [NUM_KSPLIT, NUM_M_BLOCKS, NUM_N_BLOCKS]
     )
-    _intj_launch_tuned(
-        _fused_gemm_a8w8_blockscale_preshuffle_split_cat,
+    dev, stream = current_device_stream()
+    _fused_gemm_a8w8_blockscale_preshuffle_split_cat_launch(
+        dev,
+        stream,
         grid,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
         x,
         w,
         y,
@@ -376,7 +422,16 @@ def fused_gemm_a8w8_blockscale_preshuffle_split_cat(
         ),
         w_scale.stride(0),
         w_scale.stride(1),
-        **config,
+        config["GROUP_K"],
+        config["GROUP_N"],
+        config["BLOCK_SIZE_M"],
+        config["BLOCK_SIZE_N"],
+        config["BLOCK_SIZE_K"],
+        config["BLOCK_SIZE_S3"],
+        config["GROUP_SIZE_M"],
+        config["NUM_KSPLIT"],
+        config["SPLITK_BLOCK_SIZE"],
+        config["cache_modifier"],
     )
 
     if config["NUM_KSPLIT"] > 1:

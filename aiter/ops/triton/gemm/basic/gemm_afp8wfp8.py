@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
+import functools
 import math
 
 import torch
@@ -18,7 +19,6 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp8wfp8 import (
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.device_info import current_device_stream
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -76,6 +76,22 @@ _gemm_splitk_reduce_kernel_launch = make_launcher(
     _gemm_splitk_reduce_kernel,
     extra_annotation={"KERNEL_NAME": Constexpr(value="_gemm_afp8wfp8_reduce_kernel")},
 )
+
+
+@functools.cache
+def _gemm_afp8wfp8_kernel_launch(
+    num_warps, num_stages, waves_per_eu, matrix_instr_nonkdim
+):
+    return make_launcher(
+        _gemm_afp8wfp8_kernel,
+        dynamic_options=("kpack",),
+        options={
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+            "waves_per_eu": waves_per_eu,
+            "matrix_instr_nonkdim": matrix_instr_nonkdim,
+        },
+    )
 
 
 def gemm_afp8wfp8(
@@ -155,9 +171,17 @@ def gemm_afp8wfp8(
         ),
     )
 
-    _intj_launch_tuned(
-        _gemm_afp8wfp8_kernel,
+    dev, stream = current_device_stream()
+    _gemm_afp8wfp8_kernel_launch(
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+    )(
+        dev,
+        stream,
         grid,
+        config.get("kpack", 1),
         x,
         w_t,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -177,8 +201,18 @@ def gemm_afp8wfp8(
         stride_ask,
         w_scales.stride(0),
         w_scales.stride(1),
-        A_SCALE_K_GROUP=x_scale_group_size,
-        **config,
+        config["BLOCK_SIZE_M"],
+        config["BLOCK_SIZE_N"],
+        config["BLOCK_SIZE_K"],
+        config["GROUP_SIZE_M"],
+        x_scale_group_size,
+        config["NUM_KSPLIT"],
+        config["SPLITK_BLOCK_SIZE"],
+        config["num_warps"],
+        config["num_stages"],
+        config["waves_per_eu"],
+        config["matrix_instr_nonkdim"],
+        config["cache_modifier"],
     )
 
     if config["NUM_KSPLIT"] > 1:
@@ -226,6 +260,22 @@ _gemm_splitk_reduce_kernel_launch2 = make_launcher(
         "KERNEL_NAME": Constexpr(value="_gemm_afp8wfp8_preshuffle_reduce_kernel")
     },
 )
+
+
+@functools.cache
+def _gemm_afp8wfp8_preshuffle_kernel_launch(
+    num_warps, num_stages, waves_per_eu, matrix_instr_nonkdim
+):
+    return make_launcher(
+        _gemm_afp8wfp8_preshuffle_kernel,
+        dynamic_options=("kpack",),
+        options={
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+            "waves_per_eu": waves_per_eu,
+            "matrix_instr_nonkdim": matrix_instr_nonkdim,
+        },
+    )
 
 
 def gemm_afp8wfp8_preshuffle(
@@ -440,9 +490,17 @@ def gemm_afp8wfp8_preshuffle(
             num_ctas=num_ctas,
         )
     else:
-        _intj_launch_tuned(
-            _gemm_afp8wfp8_preshuffle_kernel,
+        dev, stream = current_device_stream()
+        _gemm_afp8wfp8_preshuffle_kernel_launch(
+            config.get("num_warps", 4),
+            config.get("num_stages", 2),
+            config.get("waves_per_eu", 0),
+            config.get("matrix_instr_nonkdim", 0),
+        )(
+            dev,
+            stream,
             grid,
+            config.get("kpack", 1),
             x,
             w_view,
             y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -462,8 +520,18 @@ def gemm_afp8wfp8_preshuffle(
             stride_ask,
             w_scales.stride(0),
             w_scales.stride(1),
-            A_SCALE_K_GROUP=x_scale_group_size,
-            **config,
+            config["BLOCK_SIZE_M"],
+            config["BLOCK_SIZE_N"],
+            config["BLOCK_SIZE_K"],
+            config["GROUP_SIZE_M"],
+            x_scale_group_size,
+            config["NUM_KSPLIT"],
+            config["SPLITK_BLOCK_SIZE"],
+            config["num_warps"],
+            config["num_stages"],
+            config["waves_per_eu"],
+            config["matrix_instr_nonkdim"],
+            config["cache_modifier"],
         )
 
     if config["NUM_KSPLIT"] > 1:

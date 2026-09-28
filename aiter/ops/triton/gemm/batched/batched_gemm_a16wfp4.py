@@ -17,7 +17,6 @@ from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import (
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
 from aiter.ops.triton.utils.device_info import current_device_stream
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -72,6 +71,18 @@ _batched_gemm_a16wfp4_reduce_kernel_launch = make_launcher(
 # memory. Do not remove this argument without re-auditing the kernel's
 # tl.store sites and re-checking the post-grad FX graph of any compiled
 # downstream consumer.
+_batched_gemm_a16wfp4_kernel_launch = make_launcher(
+    _batched_gemm_a16wfp4_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
+
+
 @torch_compile_guard(mutates_args=["y"], gen_fake=batched_gemm_a16wfp4_fake_tensor)
 def batched_gemm_a16wfp4_(
     x: torch.Tensor,
@@ -188,9 +199,16 @@ def batched_gemm_a16wfp4_(
             * triton.cdiv(N, config["BLOCK_SIZE_N"])
         ),
     )
-    _intj_launch_tuned(
-        _batched_gemm_a16wfp4_kernel,
+    dev, stream = current_device_stream()
+    _batched_gemm_a16wfp4_kernel_launch(
+        dev,
+        stream,
         grid,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -212,9 +230,15 @@ def batched_gemm_a16wfp4_(
         w_scales.stride(0),
         w_scales.stride(1),
         w_scales.stride(2),
-        PRE_QUANT=prequant,
-        HAVE_Y_SCALE=(y_scale is not None),
-        **config,
+        config["BLOCK_SIZE_M"],
+        config["BLOCK_SIZE_N"],
+        config["BLOCK_SIZE_K"],
+        config["GROUP_SIZE_M"],
+        config["NUM_KSPLIT"],
+        config["SPLITK_BLOCK_SIZE"],
+        prequant,
+        y_scale is not None,
+        config["cache_modifier"],
     )
 
     if config["NUM_KSPLIT"] > 1:

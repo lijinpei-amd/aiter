@@ -3,7 +3,7 @@
 
 import torch
 import triton
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
+from intj import make_launcher
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16_atomic import (
@@ -11,6 +11,7 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16_atomic import (
     _get_config,
 )
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.gemm_config_utils import add_default_gemm_config_params
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -29,6 +30,18 @@ def gemm_a16w16_atomic_fake_tensor(
         _, N = w.shape
         return torch.zeros((M, N), dtype=dtype, device=x.device)
     return y
+
+
+_gemm_a16_w16_atomic_kernel_launch = make_launcher(
+    _gemm_a16_w16_atomic_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 @torch_compile_guard(gen_fake=gemm_a16w16_atomic_fake_tensor)
@@ -87,7 +100,16 @@ def gemm_a16w16_atomic_(
     # NOTE: if k split doesnt divide K evenly, this will waste compute
     SPLITK_BLOCK_SIZE = triton.cdiv(K, config["NUM_KSPLIT"])
     config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
-    _intj_launch_tuned(_gemm_a16_w16_atomic_kernel, grid,
+    dev, stream = current_device_stream()
+    _gemm_a16_w16_atomic_kernel_launch(
+        dev,
+        stream,
+        grid,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
         x,
         w,
         y,
@@ -100,7 +122,13 @@ def gemm_a16w16_atomic_(
         w.stride(1),
         y.stride(0),
         y.stride(1),
-        **config,
+        config["BLOCK_SIZE_M"],
+        config["BLOCK_SIZE_N"],
+        config["BLOCK_SIZE_K"],
+        config["GROUP_SIZE_M"],
+        config["NUM_KSPLIT"],
+        config["SPLITK_BLOCK_SIZE"],
+        config["cache_modifier"],
     )
 
     return y

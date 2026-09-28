@@ -3,12 +3,14 @@
 
 import torch
 import triton
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.quant.quant_mxfp8 import (
     _convert_from_mxfp8_kernel,
     _convert_to_mxfp8_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 __all__ = [
@@ -17,6 +19,13 @@ __all__ = [
 ]
 
 _LOGGER = AiterTritonLogger()
+
+
+_convert_to_mxfp8_kernel_launch = make_launcher(
+    _convert_to_mxfp8_kernel,
+    dynamic_options=("num_warps",),
+    options={"waves_per_eu": 2, "num_stages": 2},
+)
 
 
 def convert_to_mxfp8(
@@ -101,11 +110,13 @@ def convert_to_mxfp8(
     # differ from the default 64×64 (MI308X benchmark: nw=1/2/4 differ < 1%
     # at default tile, nw≥8 regresses).
     num_warps = min(16, max(1, block_m * block_n // 1024))
-    from intj.compat import launch
 
-    launch(
-        _convert_to_mxfp8_kernel,
+    dev, stream = current_device_stream()
+    _convert_to_mxfp8_kernel_launch(
+        dev,
+        stream,
         grid,
+        num_warps,
         x,
         y,
         s,
@@ -117,17 +128,21 @@ def convert_to_mxfp8(
         s.stride(1),
         0,
         0,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        QUANT_BLOCK_SIZE=quant_block_size,
-        IS_2D_BLOCK=is_2d_block,
-        USE_SR=use_sr,
-        USE_ASM=use_asm,
-        num_warps=num_warps,
-        waves_per_eu=2,
-        num_stages=2,
+        block_m,
+        block_n,
+        quant_block_size,
+        is_2d_block,
+        use_sr,
+        use_asm,
     )
     return y, s
+
+
+_convert_from_mxfp8_kernel_launch = make_launcher(
+    _convert_from_mxfp8_kernel,
+    dynamic_options=("num_warps",),
+    options={"waves_per_eu": 2, "num_stages": 2},
+)
 
 
 def convert_from_mxfp8(
@@ -189,11 +204,13 @@ def convert_from_mxfp8(
 
     grid = (triton.cdiv(M, block_m), triton.cdiv(N, block_n))
     num_warps = min(16, max(1, block_m * block_n // 1024))
-    from intj.compat import launch
 
-    launch(
-        _convert_from_mxfp8_kernel,
+    dev, stream = current_device_stream()
+    _convert_from_mxfp8_kernel_launch(
+        dev,
+        stream,
         grid,
+        num_warps,
         x,
         y,
         s,
@@ -203,13 +220,10 @@ def convert_from_mxfp8(
         y.stride(1),
         s.stride(0),
         s.stride(1),
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        QUANT_BLOCK_SIZE=quant_block_size,
-        IS_2D_BLOCK=is_2d_block,
-        USE_ASM=use_asm,
-        num_warps=num_warps,
-        waves_per_eu=2,
-        num_stages=2,
+        block_m,
+        block_n,
+        quant_block_size,
+        is_2d_block,
+        use_asm,
     )
     return y

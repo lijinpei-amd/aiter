@@ -18,7 +18,7 @@ import torch
 
 # @manual=//triton:triton
 import triton
-from intj.compat import launch as _intj_launch
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.attention.hstu_attention import (
     _get_bwd_config,
@@ -32,9 +32,22 @@ from aiter.ops.triton.utils.common_utils import (
     prev_power_of_2,
     switch_to_contiguous_if_needed,
 )
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+
+_hstu_attn_fwd_launch = make_launcher(
+    _hstu_attn_fwd,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 def triton_hstu_attention_fwd(
@@ -104,41 +117,63 @@ def triton_hstu_attention_fwd(
 
     grid = (triton.cdiv(N, config["BLOCK_M"]), Z * H)
 
-    _intj_launch(_hstu_attn_fwd, grid,
-        Q=q,
-        K=k,
-        V=v,
-        sort_by_length_indices=sort_by_length_indices,
-        seq_offsets=seq_offsets,
-        num_targets=num_targets,
-        Out=out,
-        stride_qm=q.stride(0),
-        stride_qh=q.stride(1),
-        stride_kn=k.stride(0),
-        stride_kh=k.stride(1),
-        stride_vn=v.stride(0),
-        stride_vh=v.stride(1),
-        stride_om=out.stride(0),
-        stride_oh=out.stride(1),
-        alpha=alpha,
-        H=H,
-        MAX_SEQ_LEN=N,
-        DeltaSize=DeltaSize,
-        contextual_seq_len=contextual_seq_len,
-        max_attn_len=max_attn_len,
-        CAUSAL=causal,
-        HAS_MULTIPLE_TARGETS=has_multiple_targets,
-        IS_DELTA_Q=IS_DELTA_Q,
-        ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
-        BLOCK_D_Q=DimQ,
-        BLOCK_D_V=DimV,
-        HAS_CONTEXTUAL_SEQ_LEN=has_contextual_seq_len,
-        HAS_MAX_ATTN_LEN=has_max_attn_len,
-        HAS_SORT_BY_LENGTH_INDICES=has_sort_by_length_indices,
-        **config,
+    dev, stream = current_device_stream()
+    _hstu_attn_fwd_launch(
+        dev,
+        stream,
+        grid,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
+        q,
+        k,
+        v,
+        sort_by_length_indices,
+        seq_offsets,
+        num_targets,
+        out,
+        q.stride(0),
+        q.stride(1),
+        k.stride(0),
+        k.stride(1),
+        v.stride(0),
+        v.stride(1),
+        out.stride(0),
+        out.stride(1),
+        alpha,
+        H,
+        N,
+        DeltaSize,
+        contextual_seq_len,
+        max_attn_len,
+        causal,
+        has_multiple_targets,
+        IS_DELTA_Q,
+        torch.backends.cuda.matmul.allow_tf32,
+        DimQ,
+        DimV,
+        config["BLOCK_M"],
+        config["BLOCK_N"],
+        has_contextual_seq_len,
+        has_max_attn_len,
+        has_sort_by_length_indices,
     )
 
     return out
+
+
+_hstu_attn_bwd_launch = make_launcher(
+    _hstu_attn_bwd,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 def triton_hstu_attention_bwd(
@@ -226,46 +261,58 @@ def triton_hstu_attention_bwd(
     if config["SEQUENCE_PARALLEL"] == 1:
         lock.zero_()
 
-    _intj_launch(_hstu_attn_bwd, grid,
-        Q=q,
-        K=k,
-        V=v,
-        sort_by_length_indices=sort_by_length_indices,
-        seq_offsets=seq_offsets,
-        num_targets=num_targets,
-        DOut=dout,
-        DQ=dq,
-        DK=dk,
-        DV=dv,
-        LOCK=lock,
-        stride_qm=q.stride(0),
-        stride_qh=q.stride(1),
-        stride_kn=k.stride(0),
-        stride_kh=k.stride(1),
-        stride_vn=v.stride(0),
-        stride_vh=v.stride(1),
-        stride_dom=dout.stride(0),
-        stride_doh=dout.stride(1),
-        stride_dqm=dq.stride(0),
-        stride_dqh=dq.stride(1),
-        stride_dkn=dk.stride(0),
-        stride_dkh=dk.stride(1),
-        stride_dvn=dv.stride(0),
-        stride_dvh=dv.stride(1),
-        alpha=alpha,
-        contextual_seq_len=contextual_seq_len,
-        max_attn_len=max_attn_len,
-        H=H,
-        MAX_SEQ_LEN=N,
-        CAUSAL=causal,
-        HAS_MULTIPLE_TARGETS=num_targets is not None,
-        HAS_CONTEXTUAL_SEQ_LEN=contextual_seq_len > 0,
-        HAS_MAX_ATTN_LEN=max_attn_len > 0,
-        ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
-        BLOCK_D_Q=DimQ,
-        BLOCK_D_V=DimV,
-        HAS_SORT_BY_LENGTH_INDICES=sort_by_length_indices is not None,
-        **config,
+    dev, stream = current_device_stream()
+    _hstu_attn_bwd_launch(
+        dev,
+        stream,
+        grid,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
+        q,
+        k,
+        v,
+        sort_by_length_indices,
+        seq_offsets,
+        num_targets,
+        dout,
+        dq,
+        dk,
+        dv,
+        lock,
+        q.stride(0),
+        q.stride(1),
+        k.stride(0),
+        k.stride(1),
+        v.stride(0),
+        v.stride(1),
+        dout.stride(0),
+        dout.stride(1),
+        dq.stride(0),
+        dq.stride(1),
+        dk.stride(0),
+        dk.stride(1),
+        dv.stride(0),
+        dv.stride(1),
+        alpha,
+        contextual_seq_len,
+        max_attn_len,
+        H,
+        N,
+        causal,
+        num_targets is not None,
+        contextual_seq_len > 0,
+        max_attn_len > 0,
+        torch.backends.cuda.matmul.allow_tf32,
+        DimQ,
+        DimV,
+        config["SEQUENCE_PARALLEL"],
+        config["BLOCK_M"],
+        config["BLOCK_N"],
+        config["UNROLL"],
+        sort_by_length_indices is not None,
     )
 
     return dq, dk, dv

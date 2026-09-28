@@ -5,7 +5,6 @@ import torch
 import triton
 import triton.language as tl
 from intj import make_launcher
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
     AUTOTUNE,
@@ -4453,6 +4452,30 @@ DEBUG_TRITON: bool = DEBUG >= 1
 DEBUG_TRITON_DETAIL: bool = DEBUG >= 2
 
 
+_bwd_kernel_fused_atomic_causal_launch = make_launcher(
+    _bwd_kernel_fused_atomic_causal,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
+
+
+_bwd_kernel_fused_atomic_noncausal_launch = make_launcher(
+    _bwd_kernel_fused_atomic_noncausal,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
+
+
 def attention_backward_triton_impl(
     *,
     do: torch.Tensor,
@@ -5078,9 +5101,16 @@ def attention_backward_triton_impl(
         grid_dkdvdq = (batch * nheads_k * num_k_pids,)
 
         if causal:
-            _intj_launch(
-                _bwd_kernel_fused_atomic_causal,
+            dev, stream = current_device_stream()
+            _bwd_kernel_fused_atomic_causal_launch(
+                dev,
+                stream,
                 grid_dkdvdq,
+                config.get("num_warps", 4),
+                config.get("num_stages", 2),
+                config.get("waves_per_eu", 0),
+                config.get("matrix_instr_nonkdim", 0),
+                config.get("kpack", 1),
                 q,
                 k,
                 v,
@@ -5132,22 +5162,35 @@ def attention_backward_triton_impl(
                 descale_q,
                 descale_k,
                 descale_v,
-                NUM_Q_HEADS=nheads_q,
-                NUM_K_HEADS=nheads_k,
-                BATCH=batch,
-                NUM_K_PIDS=num_k_pids,
-                BLOCK_D_MODEL=HEAD_DIM_QK,
-                BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
-                ENABLE_DROPOUT=use_dropout,
-                IS_VARLEN=IS_VARLEN,
-                IS_FP8=IS_FP8,
-                FP8_MAX=FP8_MAX,
-                **config,
+                config["philox_offset_base"],
+                config["descale_q_ptr"],
+                config["descale_k_ptr"],
+                config["descale_v_ptr"],
+                nheads_q,
+                nheads_k,
+                batch,
+                num_k_pids,
+                config["BLOCK_M"],
+                config["BLOCK_N"],
+                config["BLK_SLICE_FACTOR"],
+                HEAD_DIM_QK,
+                BLOCK_D_MODEL_POW2,
+                use_dropout,
+                IS_VARLEN,
+                IS_FP8,
+                FP8_MAX,
             )
         else:
-            _intj_launch(
-                _bwd_kernel_fused_atomic_noncausal,
+            dev, stream = current_device_stream()
+            _bwd_kernel_fused_atomic_noncausal_launch(
+                dev,
+                stream,
                 grid_dkdvdq,
+                config.get("num_warps", 4),
+                config.get("num_stages", 2),
+                config.get("waves_per_eu", 0),
+                config.get("matrix_instr_nonkdim", 0),
+                config.get("kpack", 1),
                 q,
                 k,
                 v,
@@ -5199,17 +5242,23 @@ def attention_backward_triton_impl(
                 descale_q,
                 descale_k,
                 descale_v,
-                NUM_Q_HEADS=nheads_q,
-                NUM_K_HEADS=nheads_k,
-                BATCH=batch,
-                NUM_K_PIDS=num_k_pids,
-                BLOCK_D_MODEL=HEAD_DIM_QK,
-                BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
-                ENABLE_DROPOUT=use_dropout,
-                IS_VARLEN=IS_VARLEN,
-                IS_FP8=IS_FP8,
-                FP8_MAX=FP8_MAX,
-                **config,
+                config["philox_offset"],
+                config["descale_q_ptr"],
+                config["descale_k_ptr"],
+                config["descale_v_ptr"],
+                nheads_q,
+                nheads_k,
+                batch,
+                num_k_pids,
+                config["BLOCK_M"],
+                config["BLOCK_N"],
+                config["BLK_SLICE_FACTOR"],
+                HEAD_DIM_QK,
+                BLOCK_D_MODEL_POW2,
+                use_dropout,
+                IS_VARLEN,
+                IS_FP8,
+                FP8_MAX,
             )
     elif mode == "split":
         BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 64, 64, 64, 16

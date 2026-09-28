@@ -2,7 +2,7 @@
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-from intj.compat import launch as _intj_launch
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.gather_kv_b_proj import (
     _next_pow2,
@@ -10,7 +10,16 @@ from aiter.ops.triton._triton_kernels.gather_kv_b_proj import (
     _triton_gather_kv_b_proj_flat,
 )
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.ops.triton.utils.device_info import current_device_stream, get_num_sms
+
+_triton_gather_kv_b_proj_launch = make_launcher(
+    _triton_gather_kv_b_proj, dynamic_options=("num_stages",)
+)
+
+
+_triton_gather_kv_b_proj_flat_launch = make_launcher(
+    _triton_gather_kv_b_proj_flat, dynamic_options=("num_stages",)
+)
 
 
 def gather_kv_b_proj(
@@ -127,7 +136,12 @@ def gather_kv_b_proj(
             max_kv_chunks,
             max(1, (get_num_sms() * 6 + tp_k_head_num_k - 1) // tp_k_head_num_k),
         )
-        _intj_launch(_triton_gather_kv_b_proj_flat, (tp_k_head_num_k * chunk_workers,),
+        dev, stream = current_device_stream()
+        _triton_gather_kv_b_proj_flat_launch(
+            dev,
+            stream,
+            (tp_k_head_num_k * chunk_workers,),
+            num_stages,
             total_kv_k,
             k_buffer,
             k_scale,
@@ -136,26 +150,30 @@ def gather_kv_b_proj(
             kv_proj_scale,
             k_prefix,
             v_prefix,
-            TpNumHeads=tp_k_head_num_k,
-            QkNopeHeadDim=qk_nope_head_dim,
-            VHeadDim=v_head_dim,
-            KV_CDim=weight_k,
-            KV_PeDim=qk_nope_pe_dim - qk_nope_head_dim,
-            ChunkK=ChunkK,
-            PaddedK=padded_k,
-            PaddedV=padded_v,
-            WEIGHT_PRESHUFFLE=weight_preshuffle,
-            PER_ROW_SCALE=per_row_scale,
-            NO_SCALE=no_scale,
-            GRID_STRIDE=chunk_workers < max_kv_chunks,
-            num_stages=num_stages,
+            tp_k_head_num_k,
+            qk_nope_head_dim,
+            v_head_dim,
+            weight_k,
+            qk_nope_pe_dim - qk_nope_head_dim,
+            ChunkK,
+            padded_k,
+            padded_v,
+            weight_preshuffle,
+            per_row_scale,
+            no_scale,
+            chunk_workers < max_kv_chunks,
         )
         return
 
     if is_fp4_weight:
         grid = (batch_size * tp_k_head_num_k * max_kv_chunks,)
         fp4_scale_k_granularity = 32 if weight_preshuffle else 128
-        _intj_launch(_triton_gather_kv_b_proj, grid,
+        dev, stream = current_device_stream()
+        _triton_gather_kv_b_proj_launch(
+            dev,
+            stream,
+            grid,
+            num_stages,
             batch_size,
             k_buffer,
             k_scale,
@@ -166,26 +184,32 @@ def gather_kv_b_proj(
             kv_proj_scale.view(torch.uint8),
             k_prefix,
             v_prefix,
-            KBlockSize=block_size,
-            TpNumHeads=tp_k_head_num_k,
-            QkNopeHeadDim=qk_nope_head_dim,
-            VHeadDim=v_head_dim,
-            KV_CDim=weight_k,
-            KV_PeDim=qk_nope_pe_dim - qk_nope_head_dim,
-            ChunkK=ChunkK,
-            PaddedK=padded_k,
-            PaddedV=padded_v,
-            ScaleCols=scale_k if not no_scale and not per_row_scale else 1,
-            IS_FP4=True,
-            Fp4ScaleKGranularity=fp4_scale_k_granularity,
-            WEIGHT_PRESHUFFLE=weight_preshuffle,
-            SHUFFLED_KV_CACHE=shuffled_kv_cache,
-            num_stages=num_stages,
+            block_size,
+            tp_k_head_num_k,
+            qk_nope_head_dim,
+            v_head_dim,
+            weight_k,
+            qk_nope_pe_dim - qk_nope_head_dim,
+            ChunkK,
+            padded_k,
+            padded_v,
+            scale_k if not no_scale and not per_row_scale else 1,
+            True,
+            fp4_scale_k_granularity,
+            weight_preshuffle,
+            False,
+            False,
+            shuffled_kv_cache,
         )
         return
 
     grid = (batch_size * tp_k_head_num_k,)
-    _intj_launch(_triton_gather_kv_b_proj, grid,
+    dev, stream = current_device_stream()
+    _triton_gather_kv_b_proj_launch(
+        dev,
+        stream,
+        grid,
+        num_stages,
         batch_size,
         k_buffer,
         k_scale,
@@ -196,19 +220,20 @@ def gather_kv_b_proj(
         kv_proj_scale,
         k_prefix,
         v_prefix,
-        KBlockSize=block_size,
-        TpNumHeads=tp_k_head_num_k,
-        QkNopeHeadDim=qk_nope_head_dim,
-        VHeadDim=v_head_dim,
-        KV_CDim=weight_k,
-        KV_PeDim=qk_nope_pe_dim - qk_nope_head_dim,
-        ChunkK=ChunkK,
-        PaddedK=padded_k,
-        PaddedV=padded_v,
-        IS_FP4=False,
-        WEIGHT_PRESHUFFLE=weight_preshuffle,
-        PER_ROW_SCALE=per_row_scale,
-        NO_SCALE=no_scale,
-        SHUFFLED_KV_CACHE=shuffled_kv_cache,
-        num_stages=num_stages,
+        block_size,
+        tp_k_head_num_k,
+        qk_nope_head_dim,
+        v_head_dim,
+        weight_k,
+        qk_nope_pe_dim - qk_nope_head_dim,
+        ChunkK,
+        padded_k,
+        padded_v,
+        1,
+        False,
+        32,
+        weight_preshuffle,
+        per_row_scale,
+        no_scale,
+        shuffled_kv_cache,
     )

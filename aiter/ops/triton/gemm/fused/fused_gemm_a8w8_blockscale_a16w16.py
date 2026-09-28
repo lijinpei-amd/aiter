@@ -11,7 +11,6 @@ from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_a8w8_blockscale_a16w
     _get_config,
 )
 from aiter.ops.triton.utils.device_info import current_device_stream
-from aiter.ops.triton.utils.intj_tuned import launch_tuned as _intj_launch_tuned
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -19,6 +18,18 @@ _LOGGER = AiterTritonLogger()
 
 _fused_gemm_a8w8_blockscale_a16w16_reduce_kernel_launch = make_launcher(
     _fused_gemm_a8w8_blockscale_a16w16_reduce_kernel,
+)
+
+
+_fused_gemm_a8w8_blockscale_a16w16_kernel_launch = make_launcher(
+    _fused_gemm_a8w8_blockscale_a16w16_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
 )
 
 
@@ -139,9 +150,16 @@ def fused_gemm_a8w8_blockscale_a16w16(
             )
         ),
     )
-    _intj_launch_tuned(
-        _fused_gemm_a8w8_blockscale_a16w16_kernel,
+    dev, stream = current_device_stream()
+    _fused_gemm_a8w8_blockscale_a16w16_kernel_launch(
+        dev,
+        stream,
         grid,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
         x_fp8,
         w_fp8,
         bias_fp8,
@@ -174,10 +192,18 @@ def fused_gemm_a8w8_blockscale_a16w16(
         0 if config["NUM_KSPLIT"] == 1 else y_bf16_pp.stride(0),
         y_bf16.stride(0) if config["NUM_KSPLIT"] == 1 else y_bf16_pp.stride(1),
         y_bf16.stride(1) if config["NUM_KSPLIT"] == 1 else y_bf16_pp.stride(2),
-        ADD_BIAS_FP8=(bias_fp8 is not None),
-        ADD_BIAS_BF16=(bias_bf16 is not None),
-        SKIP_REDUCE=skip_reduce,
-        **config,
+        config["GROUP_K"],
+        config["GROUP_N"],
+        config["BLOCK_SIZE_M"],
+        config["BLOCK_SIZE_N"],
+        config["BLOCK_SIZE_K"],
+        config["GROUP_SIZE_M"],
+        config["NUM_KSPLIT"],
+        config["SPLITK_BLOCK_SIZE"],
+        bias_fp8 is not None,
+        bias_bf16 is not None,
+        skip_reduce,
+        config["cache_modifier"],
     )
 
     if config["NUM_KSPLIT"] > 1:

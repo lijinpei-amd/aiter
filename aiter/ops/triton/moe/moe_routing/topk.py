@@ -1,6 +1,6 @@
 import torch
 import triton
-from intj.compat import launch as _intj_launch
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.moe.moe_routing.topk import (
     _grouped_topk,
@@ -8,6 +8,9 @@ from aiter.ops.triton._triton_kernels.moe.moe_routing.topk import (
     _topk,
 )
 from aiter.ops.triton.moe.moe_routing.bitmatrix import Bitmatrix
+from aiter.ops.triton.utils.device_info import current_device_stream
+
+_grouped_topk_launch = make_launcher(_grouped_topk, options={"num_warps": 4})
 
 
 def grouped_topk(
@@ -122,7 +125,11 @@ def grouped_topk(
 
     pids = max(triton.cdiv(n_rows, BLOCK_M), s_blocks + sp_blocks)
 
-    _intj_launch(_grouped_topk, (pids,),
+    dev, stream = current_device_stream()
+    _grouped_topk_launch(
+        dev,
+        stream,
+        (pids,),
         x,
         x.stride(0),
         expert_group,
@@ -141,19 +148,18 @@ def grouped_topk(
         BLOCK_SP,
         sp_blocks,
         sp_size,
-        BLOCK_M=BLOCK_M,
-        N_EXPTS_PAD=N_EXPTS_PAD,
-        BLOCK_N=BLOCK_N,
-        N_EXPTS_ACT=k,
-        N_EXPTS_ACT_PAD=N_EXPTS_ACT_PAD,
-        NUM_EXPERT_GROUP=num_expert_group,
-        TOPK_GROUP=topk_group,
-        Bias=bias,
-        SCORE_MODE=score_mode,
-        HAS_BIAS=has_bias,
-        APPLY_RENORM=renorm,
-        ROUTED_SCALING=routed_scaling_factor,
-        num_warps=4,
+        BLOCK_M,
+        N_EXPTS_PAD,
+        BLOCK_N,
+        k,
+        N_EXPTS_ACT_PAD,
+        num_expert_group,
+        topk_group,
+        bias,
+        score_mode,
+        has_bias,
+        renorm,
+        routed_scaling_factor,
     )
 
     bitmatrix = Bitmatrix(
@@ -163,6 +169,9 @@ def grouped_topk(
         scratchpad_partials=scratchpad_partials,
     )
     return y_vals, y_indx, bitmatrix
+
+
+_topk_launch = make_launcher(_topk, options={"num_warps": 8})
 
 
 def topk(
@@ -255,7 +264,11 @@ def topk(
     sp_size = torch.numel(scratchpad_partials)
     sp_blocks = triton.cdiv(sp_size, BLOCK_SP)
     pids = max(triton.cdiv(n_rows, BLOCK_M), s_blocks + sp_blocks)
-    _intj_launch(_topk, (pids,),
+    dev, stream = current_device_stream()
+    _topk_launch(
+        dev,
+        stream,
+        (pids,),
         x,
         x.stride(0),  # inputs
         y_vals,  # output [topk]
@@ -273,20 +286,19 @@ def topk(
         BLOCK_SP,
         sp_blocks,
         sp_size,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,  # tunable parameter
-        APPLY_SOFTMAX=apply_softmax,
-        N_EXPTS_PAD=n_cols_pad,
-        N_EXPTS_ACT=k,  # constants
-        N_EXPTS_ACT_PAD=k_pow2,
-        num_warps=8,
-        Bias=bias,
-        SCORE_MODE=score_mode,
-        HAS_BIAS=has_bias,
-        APPLY_RENORM=renorm,
-        ROUTED_SCALING=routed_scaling_factor,
-        Pop=pop_out,
-        WRITE_POP=pop_out is not None,
+        apply_softmax,
+        BLOCK_M,
+        n_cols_pad,
+        k,  # constants
+        k_pow2,
+        BLOCK_N,  # tunable parameter
+        bias,
+        score_mode,
+        has_bias,
+        renorm,
+        routed_scaling_factor,
+        pop_out,
+        pop_out is not None,
     )
     bitmatrix_shape = [n_rows, n_cols_words * 32]
     bitmatrix = Bitmatrix(
@@ -296,6 +308,9 @@ def topk(
         scratchpad_partials=scratchpad_partials,
     )
     return y_vals, y_indx, bitmatrix
+
+
+_hash_routing_launch = make_launcher(_hash_routing, options={"num_warps": 8})
 
 
 def hash_routing(
@@ -365,7 +380,11 @@ def hash_routing(
         input_ids.to(torch.int32) if input_ids.dtype != torch.int32 else input_ids
     )
 
-    _intj_launch(_hash_routing, (pids,),
+    dev, stream = current_device_stream()
+    _hash_routing_launch(
+        dev,
+        stream,
+        (pids,),
         input_ids_i32,
         tid2eid,
         tid2eid.stride(0),
@@ -386,15 +405,14 @@ def hash_routing(
         BLOCK_SP,
         sp_blocks,
         sp_size,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        N_EXPTS_PAD=n_cols_pad,
-        N_EXPTS_ACT=k,
-        N_EXPTS_ACT_PAD=k_pow2,
-        SCORE_MODE=score_mode,
-        APPLY_RENORM=renorm,
-        ROUTED_SCALING=routed_scaling_factor,
-        num_warps=8,
+        BLOCK_M,
+        n_cols_pad,
+        k,
+        k_pow2,
+        BLOCK_N,
+        score_mode,
+        renorm,
+        routed_scaling_factor,
     )
 
     bitmatrix_shape = [n_rows, n_cols_words * 32]

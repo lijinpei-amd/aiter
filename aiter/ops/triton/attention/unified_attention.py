@@ -1,10 +1,11 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
+import functools
 from typing import NamedTuple
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     kernel_unified_attention_2d,
@@ -13,7 +14,7 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
 )
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.ops.triton.utils.device_info import current_device_stream, get_num_sms
 from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.ops.triton.utils.unified_attention_utils import (
     get_dtype_str,
@@ -447,6 +448,18 @@ def is_reduce_gluon_available(params: _UAParams, NUM_SEGMENTS, backend: str):
     return use_gluon and use_gluon_arch
 
 
+_kernel_unified_attention_2d_launch = make_launcher(
+    kernel_unified_attention_2d,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
+
+
 def _unified_attention_2d_triton(params: _UAParams):
     if params.shuffled_kv_cache and (
         params.q_dtype == e4m3_dtype and params.kv_cache_dtype == e4m3_dtype
@@ -468,55 +481,85 @@ def _unified_attention_2d_triton(params: _UAParams):
     else:
         total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
 
-    _intj_launch(kernel_unified_attention_2d, (
+    dev, stream = current_device_stream()
+    _kernel_unified_attention_2d_launch(
+        dev,
+        stream,
+        (
             params.num_kv_heads,
             total_num_q_blocks,
         ),
-        output_ptr=params.out,
-        query_ptr=params.q,
-        key_cache_ptr=params.k,
-        value_cache_ptr=params.v,
-        sink_ptr=params.sinks,
-        block_tables_ptr=params.block_table,
-        seq_lens_ptr=params.seqused_k,
-        alibi_slopes_ptr=params.alibi_slopes,
-        qq_bias_ptr=params.qq_bias,
-        scale=params.softmax_scale,
-        q_descale_ptr=params.q_descale,
-        k_descale_ptr=params.k_descale,
-        v_descale_ptr=params.v_descale,
-        out_scale_ptr=params.output_scale,
-        softcap=params.softcap,
-        num_query_heads=params.num_query_heads,
-        num_queries_per_kv=params.num_queries_per_kv,
-        block_table_stride=params.block_table.stride(0),
-        query_stride_0=params.q.stride(0),
-        query_stride_1=params.q.stride(1),
-        output_stride_0=params.out.stride(0),
-        output_stride_1=params.out.stride(1),
-        qq_bias_stride_0=params.qq_bias.stride(0) if params.use_qq_bias else 0,
-        BLOCK_SIZE=params.block_size,
-        HEAD_SIZE=params.head_size,
-        HEAD_SIZE_PADDED=triton.next_power_of_2(params.head_size),
-        USE_ALIBI_SLOPES=params.use_alibi_slopes,
-        USE_QQ_BIAS=params.use_qq_bias,
-        USE_SOFTCAP=(params.softcap > 0),
-        USE_SINKS=(params.sinks is not None),
-        SLIDING_WINDOW=params.sliding_window,
-        stride_k_cache_0=params.k.stride(0),
-        stride_k_cache_1=params.k.stride(1),
-        stride_k_cache_2=params.k.stride(2),
-        stride_k_cache_3=params.k.stride(3),
-        stride_v_cache_0=params.v.stride(0),
-        stride_v_cache_1=params.v.stride(1),
-        stride_v_cache_2=params.v.stride(2),
-        stride_v_cache_3=params.v.stride(3),
-        query_start_len_ptr=params.cu_seqlens_q,
-        num_seqs=params.num_seqs,
-        ALL_DECODE=params.all_decode,
-        SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
-        K_WIDTH=params.k_width,
-        **config,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
+        params.out,
+        params.q,
+        params.k,
+        params.v,
+        params.sinks,
+        params.block_table,
+        params.seqused_k,
+        params.alibi_slopes,
+        params.qq_bias,
+        params.softmax_scale,
+        params.q_descale,
+        params.k_descale,
+        params.v_descale,
+        params.output_scale,
+        params.softcap,
+        params.num_query_heads,
+        params.num_queries_per_kv,
+        params.block_table.stride(0),
+        params.q.stride(0),
+        params.q.stride(1),
+        params.out.stride(0),
+        params.out.stride(1),
+        params.qq_bias.stride(0) if params.use_qq_bias else 0,
+        params.block_size,
+        config["TILE_SIZE"],
+        params.head_size,
+        triton.next_power_of_2(params.head_size),
+        params.use_alibi_slopes,
+        params.use_qq_bias,
+        params.softcap > 0,
+        params.sinks is not None,
+        params.sliding_window,
+        params.k.stride(0),
+        params.k.stride(1),
+        params.k.stride(2),
+        params.k.stride(3),
+        params.v.stride(0),
+        params.v.stride(1),
+        params.v.stride(2),
+        params.v.stride(3),
+        params.cu_seqlens_q,
+        config["BLOCK_Q"],
+        params.num_seqs,
+        config["BLOCK_M"],
+        config.get("FP8_MIN", -240.0),
+        config.get("FP8_MAX", 240.0),
+        params.all_decode,
+        params.shuffled_kv_cache,
+        config.get("SPLIT_UNMASKED_LOOP", False),
+        params.k_width,
+    )
+
+
+@functools.cache
+def _kernel_unified_attention_3d_launch(num_warps, num_stages, waves_per_eu):
+    return make_launcher(
+        kernel_unified_attention_3d,
+        dynamic_options=(
+            "matrix_instr_nonkdim",
+            "kpack",
+        ),
+        options={
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+            "waves_per_eu": waves_per_eu,
+        },
     )
 
 
@@ -540,61 +583,87 @@ def _unified_attention_3d_triton(
     else:
         total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
 
-    _intj_launch(kernel_unified_attention_3d, (total_num_q_blocks, params.num_kv_heads, NUM_SEGMENTS),
-        segm_output_ptr=segm_output,
-        segm_max_ptr=segm_max,
-        segm_expsum_ptr=segm_expsum,
-        query_ptr=params.q,
-        key_cache_ptr=params.k,
-        value_cache_ptr=params.v,
-        sink_ptr=params.sinks,
-        block_tables_ptr=params.block_table,
-        seq_lens_ptr=params.seqused_k,
-        alibi_slopes_ptr=params.alibi_slopes,
-        qq_bias_ptr=params.qq_bias,
-        scale=params.softmax_scale,
-        q_descale_ptr=params.q_descale,
-        k_descale_ptr=params.k_descale,
-        v_descale_ptr=params.v_descale,
-        out_scale_ptr=(
+    dev, stream = current_device_stream()
+    _kernel_unified_attention_3d_launch(
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+    )(
+        dev,
+        stream,
+        (total_num_q_blocks, params.num_kv_heads, NUM_SEGMENTS),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
+        segm_output,
+        segm_max,
+        segm_expsum,
+        params.q,
+        params.k,
+        params.v,
+        params.sinks,
+        params.block_table,
+        params.seqused_k,
+        params.alibi_slopes,
+        params.qq_bias,
+        params.softmax_scale,
+        params.q_descale,
+        params.k_descale,
+        params.v_descale,
+        (
             params.output_scale
             if (params.output_scale is not None and NUM_SEGMENTS == 1)
             else None
         ),
-        softcap=params.softcap,
-        num_query_heads=params.num_query_heads,
-        num_queries_per_kv=params.num_queries_per_kv,
-        block_table_stride=params.block_table.stride(0),
-        query_stride_0=params.q.stride(0),
-        query_stride_1=params.q.stride(1),
-        qq_bias_stride_0=params.qq_bias.stride(0) if params.use_qq_bias else 0,
-        BLOCK_SIZE=params.block_size,
-        HEAD_SIZE=params.head_size,
-        HEAD_SIZE_PADDED=triton.next_power_of_2(params.head_size),
-        USE_ALIBI_SLOPES=params.use_alibi_slopes,
-        USE_QQ_BIAS=params.use_qq_bias,
-        USE_SOFTCAP=(params.softcap > 0),
-        USE_SINKS=(params.sinks is not None),
-        SLIDING_WINDOW=params.sliding_window,
-        stride_k_cache_0=params.k.stride(0),
-        stride_k_cache_1=params.k.stride(1),
-        stride_k_cache_2=params.k.stride(2),
-        stride_k_cache_3=params.k.stride(3),
-        stride_v_cache_0=params.v.stride(0),
-        stride_v_cache_1=params.v.stride(1),
-        stride_v_cache_2=params.v.stride(2),
-        stride_v_cache_3=params.v.stride(3),
-        query_start_len_ptr=params.cu_seqlens_q,
-        num_seqs=params.num_seqs,
-        ALL_DECODE=params.all_decode,
-        SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
-        K_WIDTH=params.k_width,
-        IS_Q_FP8=(params.q_dtype == e4m3_dtype),
-        IS_KV_FP8=(params.kv_cache_dtype == e4m3_dtype),
-        NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
-        TILE_SIZE=TILE_SIZE,
-        **config,
+        params.softcap,
+        params.num_query_heads,
+        params.num_queries_per_kv,
+        params.block_table.stride(0),
+        params.q.stride(0),
+        params.q.stride(1),
+        params.qq_bias.stride(0) if params.use_qq_bias else 0,
+        params.block_size,
+        TILE_SIZE,
+        params.head_size,
+        triton.next_power_of_2(params.head_size),
+        params.use_alibi_slopes,
+        params.use_qq_bias,
+        params.softcap > 0,
+        params.sinks is not None,
+        params.sliding_window,
+        params.k.stride(0),
+        params.k.stride(1),
+        params.k.stride(2),
+        params.k.stride(3),
+        params.v.stride(0),
+        params.v.stride(1),
+        params.v.stride(2),
+        params.v.stride(3),
+        params.cu_seqlens_q,
+        config["BLOCK_Q"],
+        params.num_seqs,
+        config["BLOCK_M"],
+        config["num_warps"],
+        config["waves_per_eu"],
+        config["num_stages"],
+        NUM_SEGMENTS,
+        params.all_decode,
+        params.shuffled_kv_cache,
+        params.k_width,
+        params.q_dtype == e4m3_dtype,
+        params.kv_cache_dtype == e4m3_dtype,
     )
+
+
+_reduce_segments_launch = make_launcher(
+    reduce_segments,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 def _reduce_segments_triton(
@@ -608,25 +677,35 @@ def _reduce_segments_triton(
     head_size_padded = triton.next_power_of_2(params.head_size)
     config = get_unified_attention_config("reduce", params, backend="triton")
 
-    _intj_launch(reduce_segments, (params.num_tokens, params.num_query_heads),
-        output_ptr=params.out,
-        segm_output_ptr=segm_output,
-        segm_max_ptr=segm_max,
-        segm_expsum_ptr=segm_expsum,
-        seq_lens_ptr=params.seqused_k,
-        num_seqs=params.num_seqs,
-        num_query_heads=params.num_query_heads,
-        out_scale_ptr=params.output_scale,
-        output_stride_0=params.out.stride(0),
-        output_stride_1=params.out.stride(1),
-        block_table_stride=params.block_table.stride(0),
-        HEAD_SIZE=params.head_size,
-        HEAD_SIZE_PADDED=head_size_padded,
-        query_start_len_ptr=params.cu_seqlens_q,
-        NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
-        TILE_SIZE=TILE_SIZE,
-        BLOCK_Q=None,
-        **config,
+    dev, stream = current_device_stream()
+    _reduce_segments_launch(
+        dev,
+        stream,
+        (params.num_tokens, params.num_query_heads),
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
+        params.out,
+        segm_output,
+        segm_max,
+        segm_expsum,
+        params.seqused_k,
+        params.num_seqs,
+        params.num_query_heads,
+        params.output_scale,
+        params.out.stride(0),
+        params.out.stride(1),
+        params.block_table.stride(0),
+        TILE_SIZE,
+        params.head_size,
+        head_size_padded,
+        params.cu_seqlens_q,
+        None,
+        NUM_SEGMENTS,
+        config.get("FP8_MIN", -240.0),
+        config.get("FP8_MAX", 240.0),
     )
 
 
@@ -754,6 +833,22 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
     )
 
 
+@functools.cache
+def _unified_attention_gluon_kernel_3d_launch(num_warps, num_stages, waves_per_eu):
+    return make_launcher(
+        _unified_attention_kernel_3d_gfx1250,
+        dynamic_options=(
+            "matrix_instr_nonkdim",
+            "kpack",
+        ),
+        options={
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+            "waves_per_eu": waves_per_eu,
+        },
+    )
+
+
 def _unified_attention_3d_gfx1250(
     params: _UAParams,
     segm_output,
@@ -777,73 +872,100 @@ def _unified_attention_3d_gfx1250(
     else:
         total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
 
-    _intj_launch(_unified_attention_kernel_3d_gfx1250, (total_num_q_blocks, params.num_kv_heads, NUM_SEGMENTS),
-        segm_output_ptr=segm_output,
-        segm_max_ptr=segm_max,
-        segm_expsum_ptr=segm_expsum,
-        query_ptr=params.q,
-        query_scales_ptr=params.q_scales,
-        key_cache_ptr=params.k,
-        value_cache_ptr=params.v,
-        sink_ptr=params.sinks,
-        block_tables_ptr=params.block_table,
-        seq_lens_ptr=params.seqused_k,
-        alibi_slopes_ptr=params.alibi_slopes,
-        qq_bias_ptr=params.qq_bias,
-        q_scale_ptr=params.q_descale,
-        k_scale_ptr=params.k_descale,
-        v_scale_ptr=params.v_descale,
-        out_scale_ptr=(
+    dev, stream = current_device_stream()
+    _unified_attention_gluon_kernel_3d_launch(
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+    )(
+        dev,
+        stream,
+        (total_num_q_blocks, params.num_kv_heads, NUM_SEGMENTS),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
+        segm_output,
+        segm_max,
+        segm_expsum,
+        params.q,
+        params.q_scales,
+        params.k,
+        params.v,
+        params.sinks,
+        params.block_table,
+        params.seqused_k,
+        params.alibi_slopes,
+        params.qq_bias,
+        params.q_descale,
+        params.k_descale,
+        params.v_descale,
+        (
             params.output_scale
             if (params.output_scale is not None and NUM_SEGMENTS == 1)
             else None
         ),
-        softcap=params.softcap,
-        num_seqs=params.num_seqs,
-        num_blocks=params.num_blocks,
-        block_table_stride=params.block_table.stride(0),
-        max_num_blocks_per_seq=params.block_table.shape[1],
-        query_stride_0=params.q.stride(0),
-        query_stride_1=params.q.stride(1),
-        query_scales_stride_0=(
-            params.q_scales.stride(0) if params.q_scales is not None else 0
-        ),
-        query_scales_stride_1=(
-            params.q_scales.stride(1) if params.q_scales is not None else 0
-        ),
-        qq_bias_stride_0=params.qq_bias.stride(0) if params.use_qq_bias else 0,
-        BLOCK_SIZE=params.block_size,
-        HEAD_SIZE=params.head_size,
-        USE_ALIBI_SLOPES=params.use_alibi_slopes,
-        USE_QQ_BIAS=params.use_qq_bias,
-        USE_SOFTCAP=(params.softcap > 0),
-        USE_SINKS=(params.sinks is not None),
-        SLIDING_WINDOW=params.sliding_window,
-        stride_k_cache_0=params.k.stride(0),
-        stride_k_cache_1=params.k.stride(1),
-        stride_k_cache_2=params.k.stride(2),
-        stride_k_cache_3=params.k.stride(3),
-        stride_v_cache_0=params.v.stride(0),
-        stride_v_cache_1=params.v.stride(1),
-        stride_v_cache_2=params.v.stride(2),
-        stride_v_cache_3=params.v.stride(3),
-        query_start_len_ptr=params.cu_seqlens_q,
-        SCALE=params.softmax_scale,
-        NUM_QUERY_HEADS=params.num_query_heads,
-        NUM_KV_HEADS=params.num_kv_heads,
-        ALL_DECODE=params.all_decode,
-        SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
-        K_WIDTH=params.k_width,
-        SCALE_K_WIDTH=params.scale_k_width,
-        WARP_SIZE=WARP_SIZE,
-        NUM_BLOCKS_GATHER_PER_TILE=NUM_BLOCKS_GATHER_PER_TILE,
-        QUERY_DTYPE=QUERY_DTYPE,
-        KV_CACHE_DTYPE=KV_CACHE_DTYPE,
-        BLOCK_SCALES_SIZE=params.block_scales_size,
-        NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
-        TILE_SIZE=TILE_SIZE,
-        **config,
+        params.softcap,
+        params.num_seqs,
+        params.num_blocks,
+        params.q.stride(0),
+        params.q.stride(1),
+        params.q_scales.stride(0) if params.q_scales is not None else 0,
+        params.q_scales.stride(1) if params.q_scales is not None else 0,
+        params.qq_bias.stride(0) if params.use_qq_bias else 0,
+        params.use_alibi_slopes,
+        params.use_qq_bias,
+        params.softcap > 0,
+        params.sinks is not None,
+        params.sliding_window,
+        params.k.stride(0),
+        params.k.stride(1),
+        params.k.stride(2),
+        params.k.stride(3),
+        params.v.stride(0),
+        params.v.stride(1),
+        params.v.stride(2),
+        params.v.stride(3),
+        params.block_table.stride(0),
+        params.block_table.shape[1],
+        params.cu_seqlens_q,
+        params.softmax_scale,
+        params.num_query_heads,
+        params.num_kv_heads,
+        params.block_size,
+        TILE_SIZE,
+        params.head_size,
+        config["BLOCK_Q"],
+        config["BLOCK_M"],
+        NUM_SEGMENTS,
+        WARP_SIZE,
+        config["num_warps"],
+        config["waves_per_eu"],
+        config["num_stages"],
+        config.get("num_ctas", 1),
+        NUM_BLOCKS_GATHER_PER_TILE,
+        params.all_decode,
+        params.shuffled_kv_cache,
+        params.k_width,
+        params.scale_k_width,
+        config.get("USE_LOAD_BUFFER_OP", False),
+        config.get("USE_STORE_BUFFER_OP", False),
+        QUERY_DTYPE,
+        KV_CACHE_DTYPE,
+        params.block_scales_size,
+        config.get("FP8_MIN", -240.0),
+        config.get("FP8_MAX", 240.0),
     )
+
+
+_reduce_segments_gluon_launch = make_launcher(
+    _reduce_segments_kernel_gfx1250,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 def _reduce_segments_gfx1250(
@@ -858,25 +980,32 @@ def _reduce_segments_gfx1250(
     gluon_num_warps = 8 if params.num_query_heads % 8 == 0 else 4
     config = get_unified_attention_config("reduce", params, backend="gluon")
 
-    _intj_launch(_reduce_segments_kernel_gfx1250, (params.num_tokens,),
-        output_ptr=params.out,
-        segm_output_ptr=segm_output,
-        segm_max_ptr=segm_max,
-        segm_expsum_ptr=segm_expsum,
-        seq_lens_ptr=params.seqused_k,
-        num_query_heads=params.num_query_heads,
-        out_scale_ptr=params.output_scale,
-        output_stride_0=params.out.stride(0),
-        output_stride_1=params.out.stride(1),
-        H=params.num_query_heads,
-        S=NUM_SEGMENTS,
-        D=params.head_size,
-        D_PAD=head_size_padded,
-        TILE_SIZE=TILE_SIZE,
-        IS_FP8_OUT=(params.out.dtype == e4m3_dtype),
-        FP8_MIN=torch.finfo(e4m3_dtype).min,
-        FP8_MAX=torch.finfo(e4m3_dtype).max,
-        NUM_WARPS=gluon_num_warps,
-        num_warps=gluon_num_warps,
-        **config,
+    dev, stream = current_device_stream()
+    _reduce_segments_gluon_launch(
+        dev,
+        stream,
+        (params.num_tokens,),
+        gluon_num_warps,
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
+        params.out,
+        segm_output,
+        segm_max,
+        segm_expsum,
+        params.seqused_k,
+        params.num_query_heads,
+        params.output_scale,
+        params.out.stride(0),
+        params.out.stride(1),
+        params.num_query_heads,
+        NUM_SEGMENTS,
+        params.head_size,
+        head_size_padded,
+        TILE_SIZE,
+        gluon_num_warps,
+        params.out.dtype == e4m3_dtype,
+        torch.finfo(e4m3_dtype).min,
+        torch.finfo(e4m3_dtype).max,
     )

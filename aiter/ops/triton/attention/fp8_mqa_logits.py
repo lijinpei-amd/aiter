@@ -2,13 +2,14 @@ import inspect
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
+from intj import make_launcher
 from packaging.version import Version
 
 from aiter.ops.triton._triton_kernels.attention.fp8_mqa_logits import (
     _fp8_mqa_logits_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.device_info import current_device_stream
 
 TRITON_VERSION = Version(triton.__version__)
 TRITON_GE_36 = TRITON_VERSION >= Version("3.6.0")
@@ -93,6 +94,28 @@ def _gfx942_tile_fits_lds(
     # If a future Triton spills Q or scores to LDS, re-add a `q + kv + scores <= 64 KB` upper-bound term here to avoid re-triggering the JIT abort.
     lds_bytes = occupancy * num_stages * block_kv * head_size
     return lds_bytes <= 0.9 * _GFX942_CU_LDS_BYTES
+
+
+_fp8_mqa_logits_kernel_launch = make_launcher(
+    _fp8_mqa_logits_kernel,
+    dynamic_options=(
+        "num_stages",
+        "matrix_instr_nonkdim",
+    ),
+    options={"num_warps": 4, "waves_per_eu": 2},
+)
+
+
+_gluon_fp8_mqa_logits_kernel_launch = make_launcher(
+    _gluon_fp8_mqa_logits_kernel,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 def fp8_mqa_logits(
@@ -182,32 +205,34 @@ def fp8_mqa_logits(
         if scale_mul != 1.0:
             kv_scales = kv_scales.to(torch.float32) * scale_mul
 
-        _intj_launch(_fp8_mqa_logits_kernel, (seq_len,),
-            Q_ptr=Q,
-            KV_ptr=KV,
-            kv_scales_ptr=kv_scales,
-            weights_ptr=weights,
-            cu_start_ptr=cu_starts,
-            cu_end_ptr=cu_ends,
-            logits_ptr=logits,
-            seq_len=seq_len,
-            seq_len_kv=seq_len_kv,
-            NUM_HEADS=num_heads,
-            HEAD_SIZE=head_size,
-            stride_q_s=stride_q_s,
-            stride_q_h=stride_q_h,
-            stride_q_d=stride_q_d,
-            stride_kv_s=stride_kv_s,
-            stride_kv_d=stride_kv_d,
-            stride_w_s=stride_w_s,
-            stride_w_h=stride_w_h,
-            stride_logits_s=stride_logits_s,
-            stride_logits_k=stride_logits_k,
-            BLOCK_KV=block_kv,
-            num_warps=4,
-            num_stages=num_stages,
-            waves_per_eu=2,
-            matrix_instr_nonkdim=matrix_instr_nonkdim,
+        dev, stream = current_device_stream()
+        _fp8_mqa_logits_kernel_launch(
+            dev,
+            stream,
+            (seq_len,),
+            num_stages,
+            matrix_instr_nonkdim,
+            Q,
+            KV,
+            kv_scales,
+            weights,
+            cu_starts,
+            cu_ends,
+            logits,
+            seq_len,
+            seq_len_kv,
+            num_heads,
+            head_size,
+            stride_q_s,
+            stride_q_h,
+            stride_q_d,
+            stride_kv_s,
+            stride_kv_d,
+            stride_w_s,
+            stride_w_h,
+            stride_logits_s,
+            stride_logits_k,
+            block_kv,
         )
     else:
         # The buffer path keeps the row strides 32-bit and re-bases the pointer
@@ -302,36 +327,50 @@ def fp8_mqa_logits(
             other = {"LOOP_VARIANT": loop_variant}
             grid = ((seq_len + block_m - 1) // block_m,)
 
-        _intj_launch(_gluon_fp8_mqa_logits_kernel, grid,
-            Q_ptr=Q,
-            KV_ptr=KV,
-            kv_scales_ptr=kv_scales,
-            weights_ptr=weights,
-            cu_start_ptr=cu_starts,
-            cu_end_ptr=cu_ends,
-            logits_ptr=logits,
-            seq_len=seq_len,
-            seq_len_kv=seq_len_kv,
-            NUM_HEADS=num_heads,
-            HEAD_SIZE=head_size,
-            stride_q_s=stride_q_s,
-            stride_q_h=stride_q_h,
-            stride_q_d=stride_q_d,
-            stride_kv_s=stride_kv_s,
-            stride_kv_d=stride_kv_d,
-            stride_w_s=stride_w_s,
-            stride_w_h=stride_w_h,
-            stride_logits_s=stride_logits_s,
-            stride_logits_k=stride_logits_k,
-            BLOCK_KV=block_kv,
-            NUM_WARPS=num_warps,
-            NUM_BUFFERS=num_buffers,
-            NUM_CHAINS=num_chains,
-            USE_BUFFER_LOAD=use_buffer_load,
-            USE_BUFFER_STORE=use_buffer_store,
-            num_warps=num_warps,
-            waves_per_eu=waves_per_eu,
-            **other,
+        dev, stream = current_device_stream()
+        _gluon_fp8_mqa_logits_kernel_launch(
+            dev,
+            stream,
+            grid,
+            num_warps,
+            other.get("num_stages", 2),
+            waves_per_eu,
+            other.get("matrix_instr_nonkdim", 0),
+            other.get("kpack", 1),
+            Q,
+            KV,
+            kv_scales,
+            weights,
+            cu_starts,
+            cu_ends,
+            logits,
+            seq_len,
+            seq_len_kv,
+            other["num_kv_splits"],
+            num_heads,
+            head_size,
+            stride_q_s,
+            stride_q_h,
+            stride_q_d,
+            stride_kv_s,
+            stride_kv_d,
+            stride_w_s,
+            stride_w_h,
+            stride_logits_s,
+            stride_logits_k,
+            block_kv,
+            num_warps,
+            num_buffers,
+            num_chains,
+            use_buffer_load,
+            use_buffer_store,
+            other["USE_PADDED_SHARED_LAYOUT"],
+            other.get("BLOCK_M", 1),
+            other.get("MFMA_NONK_DIM", 32),
+            other.get("M_CHUNK", 0),
+            other.get("UNROLL", 1),
+            other.get("RELAXED_STORE", 0),
+            other.get("HAS_KV_SPLIT", 0),
         )
 
     return logits

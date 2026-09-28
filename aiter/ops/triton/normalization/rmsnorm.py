@@ -4,7 +4,6 @@
 import torch
 import triton
 from intj import make_launcher
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.normalization.rmsnorm import (
     _fused_add_rmsnorm_kernel,
@@ -162,6 +161,15 @@ def _dg_reduce_num_warps():
     return 8 if get_arch() == "gfx950" else 4
 
 
+_rmsnorm_bwd_kernel_large_m_small_n_launch = make_launcher(
+    _rmsnorm_bwd_kernel_large_m_small_n,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+    ),
+)
+
+
 def _rmsnorm_backward(dz, x, gamma, rsigma):
     dz_ = dz.contiguous()
     x_ = x.contiguous()
@@ -181,9 +189,13 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
         num_prgms = triton.cdiv(M, BLOCK_M)
         dg_tmp = torch.empty(num_prgms, N, device=x_.device, dtype=torch.float32)
         _cfg = get_normalization_config("rmsnorm_large_m_small_n", get_arch())
-        _intj_launch(
-            _rmsnorm_bwd_kernel_large_m_small_n,
+        dev, stream = current_device_stream()
+        _rmsnorm_bwd_kernel_large_m_small_n_launch(
+            dev,
+            stream,
             (num_prgms,),
+            _cfg["num_warps"],
+            _cfg["num_stages"],
             dz_,
             x_,
             gamma_,
@@ -194,12 +206,10 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
             dz_.stride(0),
             M,
             N,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            NUM_WARPS=_cfg["num_warps"],
-            NUM_STAGES=_cfg["num_stages"],
-            num_warps=_cfg["num_warps"],
-            num_stages=_cfg["num_stages"],
+            BLOCK_M,
+            BLOCK_N,
+            _cfg["num_warps"],
+            _cfg["num_stages"],
         )
         grid_reduce = (triton.cdiv(N, 64),)
         dev, stream = current_device_stream()
@@ -732,6 +742,15 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
     )
 
 
+_rmsnorm_kernel_large_m_small_n_launch = make_launcher(
+    _rmsnorm_kernel_large_m_small_n,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+    ),
+)
+
+
 def _rmsnorm_forward_large_m_small_n(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -752,9 +771,13 @@ def _rmsnorm_forward_large_m_small_n(
 
     _cfg = get_normalization_config("rmsnorm_large_m_small_n", get_arch())
     grid = (triton.cdiv(M, BLOCK_M),)
-    _intj_launch(
-        _rmsnorm_kernel_large_m_small_n,
+    dev, stream = current_device_stream()
+    _rmsnorm_kernel_large_m_small_n_launch(
+        dev,
+        stream,
         grid,
+        _cfg["num_warps"],
+        _cfg["num_stages"],
         x,
         y,
         weight,
@@ -766,11 +789,9 @@ def _rmsnorm_forward_large_m_small_n(
         x.stride(1),
         y.stride(0),
         y.stride(1),
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        NUM_WARPS=_cfg["num_warps"],
-        NUM_STAGES=_cfg["num_stages"],
-        num_warps=_cfg["num_warps"],
-        num_stages=_cfg["num_stages"],
+        BLOCK_M,
+        BLOCK_N,
+        _cfg["num_warps"],
+        _cfg["num_stages"],
     )
     return (y, rsigma) if return_rsigma else y

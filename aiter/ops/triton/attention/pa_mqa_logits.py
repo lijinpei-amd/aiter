@@ -27,7 +27,6 @@ from functools import cache
 import torch
 import triton
 from intj import make_launcher
-from intj.compat import launch as _intj_launch
 from packaging.version import Version
 from triton.backends.compiler import GPUTarget
 
@@ -82,6 +81,18 @@ else:
     enable_jit_gluon_pa_mqa_logits_kernel = False
 
 
+_deepgemm_fp8_paged_mqa_logits_ragged_k_launch = make_launcher(
+    _deepgemm_fp8_paged_mqa_logits_ragged_k,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
+
+
 def deepgemm_fp8_paged_mqa_logits_ragged_k(
     q_fp8: torch.Tensor,  # dtype = float8
     kv_cache_fp8: torch.Tensor,  # dtype = float8
@@ -110,9 +121,16 @@ def deepgemm_fp8_paged_mqa_logits_ragged_k(
     }
 
     grid = (batch_size * next_n * config["SplitKV"],)
-    _intj_launch(
-        _deepgemm_fp8_paged_mqa_logits_ragged_k,
+    dev, stream = current_device_stream()
+    _deepgemm_fp8_paged_mqa_logits_ragged_k_launch(
+        dev,
+        stream,
         grid,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
         batch_size,
         next_n,
         heads,
@@ -131,8 +149,23 @@ def deepgemm_fp8_paged_mqa_logits_ragged_k(
         out_logits,
         out_logits.stride(0),
         max_model_len,
-        **config,
+        config["ChunkQ"],
+        config["ChunkK"],
+        config["HiddenDim"],
+        config.get("SplitKV", 1),
     )
+
+
+_deepgemm_fp8_paged_mqa_logits_stage1_ragged_k_launch = make_launcher(
+    _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 def deepgemm_fp8_paged_mqa_logits_stage1_ragged_k(
@@ -162,9 +195,16 @@ def deepgemm_fp8_paged_mqa_logits_stage1_ragged_k(
     assert heads % config["ChunkQ"] == 0
 
     grid = (batch_size * next_n * (heads // config["ChunkQ"] * config["SplitKV"]),)
-    _intj_launch(
-        _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k,
+    dev, stream = current_device_stream()
+    _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k_launch(
+        dev,
+        stream,
         grid,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
         batch_size,
         next_n,
         heads,
@@ -184,8 +224,23 @@ def deepgemm_fp8_paged_mqa_logits_stage1_ragged_k(
         out_qk.stride(0),
         out_qk.stride(1),
         max_model_len,
-        **config,
+        config["ChunkQ"],
+        config["ChunkK"],
+        config["HiddenDim"],
+        config.get("SplitKV", 1),
     )
+
+
+_deepgemm_fp8_paged_mqa_logits_stage1_launch = make_launcher(
+    _deepgemm_fp8_paged_mqa_logits_stage1,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 def deepgemm_fp8_paged_mqa_logits_stage1(
@@ -233,9 +288,16 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
     assert heads % config["ChunkQ"] == 0
 
     grid = (batch_size * next_n * (heads // config["ChunkQ"] * SplitKV),)
-    _intj_launch(
-        _deepgemm_fp8_paged_mqa_logits_stage1,
+    dev, stream = current_device_stream()
+    _deepgemm_fp8_paged_mqa_logits_stage1_launch(
+        dev,
+        stream,
         grid,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        WavePerEU,
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
         batch_size,
         next_n,
         heads,
@@ -258,9 +320,11 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
         out_qk.stride(1),
         max_model_len,
         max_blk_len,
-        waves_per_eu=WavePerEU,
-        **config,
-        KVBlockSize=block_size,
+        config["ChunkQ"],
+        config["ChunkK"],
+        config["HiddenDim"],
+        block_size,
+        config.get("SplitKV", 1),
     )
 
 

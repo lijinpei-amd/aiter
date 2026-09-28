@@ -26,6 +26,11 @@ _LOGGER = AiterTritonLogger()
 fp8_dtype = aiter.dtypes.fp8
 
 
+_fused_rms_fp8_per_tensor_static_quant_kernel_launch = make_launcher(
+    _fused_rms_fp8_per_tensor_static_quant_kernel, dynamic_options=("num_warps",)
+)
+
+
 def fused_rms_fp8_per_tensor_static_quant(
     inp1,
     inp1_weight,
@@ -120,11 +125,12 @@ def fused_rms_fp8_per_tensor_static_quant(
         else torch.iinfo(out1_fp8.dtype).max
     )
 
-    from intj.compat import launch
-
-    launch(
-        _fused_rms_fp8_per_tensor_static_quant_kernel,
+    dev, stream = current_device_stream()
+    _fused_rms_fp8_per_tensor_static_quant_kernel_launch(
+        dev,
+        stream,
         (M,),
+        num_warps,
         inp1,
         inp1_weight,
         inp2,
@@ -154,17 +160,21 @@ def fused_rms_fp8_per_tensor_static_quant(
         out_res1_col_stride,
         out1_row_stride,
         out1_col_stride,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        DTYPE_MAX=DTYPE_MAX,
-        DTYPE_MIN=-DTYPE_MAX,
-        HAVE_SECOND_INPUT=(inp2 is not None),
-        FIRST_INPUT_RES=(res1 is not None),
-        FIRST_INPUT_OUT=output_unquantized_inp1,
-        RMSNORM_CONVERT_TO_INP1_TYPE=rmsnorm_convert_to_inp1_type,
-        num_warps=num_warps,
+        BLOCK_SIZE_N,
+        DTYPE_MAX,
+        -DTYPE_MAX,
+        inp2 is not None,
+        res1 is not None,
+        output_unquantized_inp1,
+        rmsnorm_convert_to_inp1_type,
     )
 
     return out1_fp8, out1, out2, out_res1
+
+
+_fused_rms_fp8_group_quant_kernel_launch = make_launcher(
+    _fused_rms_fp8_group_quant_kernel, dynamic_options=("num_warps",)
+)
 
 
 def fused_rms_fp8_group_quant(
@@ -297,67 +307,67 @@ def fused_rms_fp8_group_quant(
         out1_bs_row_stride = out1_bs.stride(0)
         out1_bs_col_stride = out1_bs.stride(1)
 
-    from intj.compat import launch
-
-    launch(
-        _fused_rms_fp8_group_quant_kernel,
+    dev, stream = current_device_stream()
+    _fused_rms_fp8_group_quant_kernel_launch(
+        dev,
+        stream,
         (M,),
-        inp1_ptr=inp1,
-        weight1_ptr=inp1_weight,
-        inp2_ptr=inp2,
-        weight2_ptr=inp2_weight,
-        res1_ptr=res1,
-        out1_fp8_ptr=out1_fp8,
-        out1_bs_ptr=out1_bs,
-        out2_ptr=out2,
-        out_res1_ptr=out_res1,
-        out1_ptr=out1,
-        eps1=inp1_epsilon,
-        eps2=inp2_epsilon,
-        n_rows=M,
-        inp1_n_cols=N1,
-        inp2_n_cols=N2,
-        inp1_row_stride=inp1.stride(0),
-        inp2_row_stride=inp2_row_stride,
-        inp1_col_stride=inp1.stride(1),
-        inp2_col_stride=inp2_col_stride,
-        res1_row_stride=res1_row_stride,
-        res1_col_stride=res1_col_stride,
-        out1_fp8_row_stride=out1_fp8.stride(0),
-        out1_fp8_col_stride=out1_fp8.stride(1),
-        out1_bs_row_stride=out1_bs_row_stride,
-        out1_bs_col_stride=out1_bs_col_stride,
-        out2_row_stride=out2_row_stride,
-        out2_col_stride=out2_col_stride,
-        out_res1_row_stride=out_res1_row_stride,
-        out_res1_col_stride=out_res1_col_stride,
-        out1_row_stride=out1_row_stride,
-        out1_col_stride=out1_col_stride,
-        gate_ptr=inp1,
-        linear_bias_ptr=inp1_weight,
-        stride_gate_row=inp1.stride(0),
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        QUANT_BLOCK_SIZE=group_size,
-        DTYPE_MAX=DTYPE_MAX,
-        DTYPE_MIN=-DTYPE_MAX,
-        HAVE_SECOND_INPUT=(inp2 is not None),
-        FIRST_INPUT_RES=(res1 is not None),
-        FIRST_INPUT_OUT=output_unquantized_inp1,
-        GATED_RMS_FP8=False,
-        RMS_TILE=512,
-        ROWS_PER_BLOCK=1,
-        GROUP_SIZE_GATED=1,
-        NUM_GROUPS_GATED=1,
-        BLOCK_G=1,
-        HAS_BIAS_GATED=False,
-        HAS_Z_GATED=False,
-        NORM_BEFORE_GATE=False,
-        FP8_MIN=-DTYPE_MAX,
-        FP8_MAX=DTYPE_MAX,
-        USE_UE8M0=False,
-        FP8_MIN_SCALING_FACTOR=1.0,
-        ACTIVATION="silu",
-        num_warps=num_warps,
+        num_warps,
+        inp1,
+        inp1_weight,
+        inp2,
+        inp2_weight,
+        res1,
+        out1_fp8,
+        out1_bs,
+        out2,
+        out_res1,
+        out1,
+        inp1_epsilon,
+        inp2_epsilon,
+        M,
+        N1,
+        N2,
+        inp1.stride(0),
+        inp2_row_stride,
+        inp1.stride(1),
+        inp2_col_stride,
+        res1_row_stride,
+        res1_col_stride,
+        out1_fp8.stride(0),
+        out1_fp8.stride(1),
+        out1_bs_row_stride,
+        out1_bs_col_stride,
+        out2_row_stride,
+        out2_col_stride,
+        out_res1_row_stride,
+        out_res1_col_stride,
+        out1_row_stride,
+        out1_col_stride,
+        inp1,
+        inp1_weight,
+        inp1.stride(0),
+        BLOCK_SIZE_N,
+        group_size,
+        DTYPE_MAX,
+        -DTYPE_MAX,
+        inp2 is not None,
+        res1 is not None,
+        output_unquantized_inp1,
+        False,
+        512,
+        1,
+        1,
+        1,
+        1,
+        False,
+        False,
+        False,
+        -DTYPE_MAX,
+        DTYPE_MAX,
+        False,
+        1.0,
+        "silu",
     )
     # When transpose_scale=True, re-present the [num_bs_cols, M] column-major
     # buffer the kernel wrote as (M, num_bs_cols). Both branches return the same
@@ -479,67 +489,67 @@ def fused_rms_gated_fp8_group_quant(
     grid = (triton.cdiv(M, rows_per_block),)
     BLOCK_SIZE_PAD = max(triton.next_power_of_2(N), effective_gs)
 
-    from intj.compat import launch
-
-    launch(
-        _fused_rms_fp8_group_quant_kernel,
+    dev, stream = current_device_stream()
+    _fused_rms_fp8_group_quant_kernel_launch(
+        dev,
+        stream,
         grid,
-        inp1_ptr=x,
-        weight1_ptr=weight,
-        inp2_ptr=dummy,
-        weight2_ptr=dummy,
-        res1_ptr=dummy,
-        out1_fp8_ptr=x_quant,
-        out1_bs_ptr=scales,
-        out2_ptr=dummy,
-        out_res1_ptr=dummy,
-        out1_ptr=dummy,
-        eps1=eps,
-        eps2=0.0,
-        n_rows=M,
-        inp1_n_cols=N,
-        inp2_n_cols=0,
-        inp1_row_stride=x.stride(0),
-        inp2_row_stride=1,
-        inp1_col_stride=x.stride(1),
-        inp2_col_stride=1,
-        res1_row_stride=1,
-        res1_col_stride=1,
-        out1_fp8_row_stride=x_quant.stride(0),
-        out1_fp8_col_stride=x_quant.stride(1),
-        out1_bs_row_stride=stride_s_row,
-        out1_bs_col_stride=stride_s_g,
-        out2_row_stride=1,
-        out2_col_stride=1,
-        out_res1_row_stride=1,
-        out_res1_col_stride=1,
-        out1_row_stride=1,
-        out1_col_stride=1,
-        gate_ptr=z,
-        linear_bias_ptr=bias_ptr,
-        stride_gate_row=z.stride(0),
-        BLOCK_SIZE_N=BLOCK_SIZE_PAD,
-        QUANT_BLOCK_SIZE=effective_gs,
-        DTYPE_MAX=fp8_max,
-        DTYPE_MIN=-fp8_max,
-        HAVE_SECOND_INPUT=False,
-        FIRST_INPUT_RES=False,
-        FIRST_INPUT_OUT=False,
-        GATED_RMS_FP8=True,
-        RMS_TILE=rms_tile,
-        ROWS_PER_BLOCK=rows_per_block,
-        GROUP_SIZE_GATED=effective_gs,
-        NUM_GROUPS_GATED=num_groups,
-        BLOCK_G=block_g,
-        HAS_BIAS_GATED=(bias is not None),
-        HAS_Z_GATED=True,
-        NORM_BEFORE_GATE=norm_before_gate,
-        FP8_MIN=fp8_min,
-        FP8_MAX=fp8_max,
-        USE_UE8M0=use_ue8m0,
-        FP8_MIN_SCALING_FACTOR=fp8_min_scaling_factor,
-        ACTIVATION=activation,
-        num_warps=num_warps,
+        num_warps,
+        x,
+        weight,
+        dummy,
+        dummy,
+        dummy,
+        x_quant,
+        scales,
+        dummy,
+        dummy,
+        dummy,
+        eps,
+        0.0,
+        M,
+        N,
+        0,
+        x.stride(0),
+        1,
+        x.stride(1),
+        1,
+        1,
+        1,
+        x_quant.stride(0),
+        x_quant.stride(1),
+        stride_s_row,
+        stride_s_g,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        z,
+        bias_ptr,
+        z.stride(0),
+        BLOCK_SIZE_PAD,
+        effective_gs,
+        fp8_max,
+        -fp8_max,
+        False,
+        False,
+        False,
+        True,
+        rms_tile,
+        rows_per_block,
+        effective_gs,
+        num_groups,
+        block_g,
+        bias is not None,
+        True,
+        norm_before_gate,
+        fp8_min,
+        fp8_max,
+        use_ue8m0,
+        fp8_min_scaling_factor,
+        activation,
     )
     return x_quant, scales
 
@@ -625,6 +635,11 @@ def fused_flatten_fp8_group_quant(
     )
 
     return out, out_block_scales
+
+
+_fused_reduce_act_mul_fp8_group_quant_launch = make_launcher(
+    _fused_reduce_act_mul_fp8_group_quant, dynamic_options=("num_warps",)
+)
 
 
 def fused_reduce_act_mul_fp8_group_quant(
@@ -717,11 +732,13 @@ def fused_reduce_act_mul_fp8_group_quant(
     if X_HAS_SPLITK:
         num_pid += triton.cdiv(M, BLOCK_SIZE_M2) * triton.cdiv(N2, BLOCK_SIZE_N2)
     grid = (num_pid,)
-    from intj.compat import launch
 
-    launch(
-        _fused_reduce_act_mul_fp8_group_quant,
+    dev, stream = current_device_stream()
+    _fused_reduce_act_mul_fp8_group_quant_launch(
+        dev,
+        stream,
         grid,
+        1 if max(BLOCK_SIZE_N1, BLOCK_SIZE_N2) <= 512 else 4,
         x,
         y,
         y_scale,
@@ -742,21 +759,25 @@ def fused_reduce_act_mul_fp8_group_quant(
         0 if not X_HAS_SPLITK else x2.stride(2),
         0 if not X_HAS_SPLITK else y2.stride(0),
         0 if not X_HAS_SPLITK else y2.stride(1),
-        ACTIVATION=_get_activation_from_str(activation) if activation else "",
-        BLOCK_SIZE_M2=BLOCK_SIZE_M2,
-        BLOCK_SIZE_N1=BLOCK_SIZE_N1,
-        BLOCK_SIZE_N2=BLOCK_SIZE_N2,
-        QUANT_BLOCK_SIZE=group_size,
-        DTYPE_MAX=DTYPE_MAX,
-        DTYPE_MIN=-DTYPE_MAX,
-        X_HAS_SPLITK=X_HAS_SPLITK,
-        X_NUM_KSPLIT=x_num_splitk,
-        X_NUM_KSPLIT_POW2=triton.next_power_of_2(x_num_splitk),
-        X_MASK=X_MASK,
-        num_warps=1 if max(BLOCK_SIZE_N1, BLOCK_SIZE_N2) <= 512 else 4,
+        _get_activation_from_str(activation) if activation else "",
+        BLOCK_SIZE_M2,
+        BLOCK_SIZE_N1,
+        BLOCK_SIZE_N2,
+        group_size,
+        DTYPE_MAX,
+        -DTYPE_MAX,
+        X_HAS_SPLITK,
+        x_num_splitk,
+        triton.next_power_of_2(x_num_splitk),
+        X_MASK,
     )
 
     return (y, y_scale), y2
+
+
+_fused_reduce_rms_fp8_group_quant_kernel_launch = make_launcher(
+    _fused_reduce_rms_fp8_group_quant_kernel, dynamic_options=("num_warps",)
+)
 
 
 def fused_reduce_rms_fp8_group_quant(
@@ -943,11 +964,13 @@ def fused_reduce_rms_fp8_group_quant(
         if torch.is_floating_point(out1_fp8)
         else torch.iinfo(out1_fp8.dtype).max
     )
-    from intj.compat import launch
 
-    launch(
-        _fused_reduce_rms_fp8_group_quant_kernel,
+    dev, stream = current_device_stream()
+    _fused_reduce_rms_fp8_group_quant_kernel_launch(
+        dev,
+        stream,
         (3 * M if HAS_SPLITK else 2 * M,),
+        num_warps,
         inp1,
         inp1_weight,
         inp2,
@@ -989,22 +1012,21 @@ def fused_reduce_rms_fp8_group_quant(
         out1_col_stride,
         out3_row_stride,
         out3_col_stride,
-        BLOCK_SIZE_N1=BLOCK_SIZE_N1,
-        BLOCK_SIZE_N2=BLOCK_SIZE_N2,
-        BLOCK_SIZE_N3=BLOCK_SIZE_N3,
-        N_MASK1=(BLOCK_SIZE_N1 != N1),
-        N_MASK2=(BLOCK_SIZE_N2 != N2),
-        N_MASK3=(BLOCK_SIZE_N3 != N3),
-        QUANT_BLOCK_SIZE=group_size,
-        DTYPE_MAX=DTYPE_MAX,
-        DTYPE_MIN=-DTYPE_MAX,
-        HAVE_SECOND_INPUT=(inp2 is not None),
-        FIRST_INPUT_RES=(res1 is not None),
-        FIRST_INPUT_OUT=output_unquantized_inp1,
-        HAS_SPLITK=HAS_SPLITK,
-        NUM_SPLITK=SPK,
-        NUM_SPLITK_POW2=triton.next_power_of_2(SPK),
-        num_warps=num_warps,
+        BLOCK_SIZE_N1,
+        BLOCK_SIZE_N2,
+        BLOCK_SIZE_N3,
+        BLOCK_SIZE_N1 != N1,
+        BLOCK_SIZE_N2 != N2,
+        BLOCK_SIZE_N3 != N3,
+        group_size,
+        DTYPE_MAX,
+        -DTYPE_MAX,
+        inp2 is not None,
+        res1 is not None,
+        output_unquantized_inp1,
+        HAS_SPLITK,
+        SPK,
+        triton.next_power_of_2(SPK),
     )
     # When transpose_scale=True, re-present the [num_bs_cols, M] column-major
     # buffer the kernel wrote as (M, num_bs_cols). Both branches return the same
@@ -1019,6 +1041,11 @@ def fused_reduce_rms_fp8_group_quant(
             out1_bs = out1_bs.view(M, num_bs_cols)
 
     return (out1_fp8, out1_bs), out1, out2, out_res1, out3
+
+
+_fused_silu_mul_fp8_per_tensor_static_quant_kernel_launch = make_launcher(
+    _fused_silu_mul_fp8_per_tensor_static_quant_kernel, dynamic_options=("num_warps",)
+)
 
 
 def fused_silu_mul_fp8_per_tensor_static_quant(
@@ -1060,11 +1087,12 @@ def fused_silu_mul_fp8_per_tensor_static_quant(
         else torch.iinfo(out_fp8.dtype).max
     )
 
-    from intj.compat import launch
-
-    launch(
-        _fused_silu_mul_fp8_per_tensor_static_quant_kernel,
+    dev, stream = current_device_stream()
+    _fused_silu_mul_fp8_per_tensor_static_quant_kernel_launch(
+        dev,
+        stream,
         (M,),
+        num_warps,
         inp,
         out_fp8,
         inp_scale,
@@ -1074,11 +1102,10 @@ def fused_silu_mul_fp8_per_tensor_static_quant(
         inp.stride(1),
         out_fp8.stride(0),
         out_fp8.stride(1),
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        DTYPE_MAX=DTYPE_MAX,
-        DTYPE_MIN=-DTYPE_MAX,
-        SILU_CONVERT_TO_INP_TYPE=silu_convert_to_inp_type,
-        num_warps=num_warps,
+        BLOCK_SIZE_N,
+        DTYPE_MAX,
+        -DTYPE_MAX,
+        silu_convert_to_inp_type,
     )
 
     return out_fp8

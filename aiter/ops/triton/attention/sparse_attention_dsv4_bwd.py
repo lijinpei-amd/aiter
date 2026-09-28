@@ -42,7 +42,6 @@ from dataclasses import dataclass
 import torch
 import triton
 from intj import make_launcher
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_attention_dsv4_bwd import (
     _dkv_interm_v4_kernel,
@@ -124,6 +123,11 @@ def sparse_mla_bwd_dq(
     )
 
 
+_dkv_interm_v4_kernel_launch = make_launcher(
+    _dkv_interm_v4_kernel, dynamic_options=("num_warps",)
+)
+
+
 def sparse_mla_bwd_dkv_interm_v4(
     q,
     do,
@@ -149,9 +153,12 @@ def sparse_mla_bwd_dkv_interm_v4(
     h_pow2 = H_POW2 or triton.next_power_of_2(H)
     if interm is None:
         interm = torch.empty(T, R_CHUNK, D, dtype=torch.bfloat16, device=q.device)
-    _intj_launch(
-        _dkv_interm_v4_kernel,
+    dev, stream = current_device_stream()
+    _dkv_interm_v4_kernel_launch(
+        dev,
+        stream,
         (T, D // BD),
+        num_warps,
         q,
         do,
         chunk_dS,
@@ -166,16 +173,20 @@ def sparse_mla_bwd_dkv_interm_v4(
         interm.stride(0),
         interm.stride(1),
         H,
-        R_CHUNK=R_CHUNK,
-        TILE_K=TILE_K,
-        NH=h_pow2,
-        BD=BD,
-        D=D,
-        MFMA_K=MFMA_K,
-        DUAL_STAGE=DUAL_STAGE,
-        num_warps=num_warps,
+        R_CHUNK,
+        TILE_K,
+        h_pow2,
+        BD,
+        D,
+        MFMA_K,
+        DUAL_STAGE,
     )
     return interm
+
+
+_delta_v4_kernel_launch = make_launcher(
+    _delta_v4_kernel, dynamic_options=("num_warps",)
+)
 
 
 def delta_v4(o, do, out=None, BLOCK_R=8, num_warps=8):
@@ -190,16 +201,18 @@ def delta_v4(o, do, out=None, BLOCK_R=8, num_warps=8):
     n_rows = T * H
     if out is None:
         out = torch.empty(T, H, dtype=torch.float32, device=o.device)
-    _intj_launch(
-        _delta_v4_kernel,
+    dev, stream = current_device_stream()
+    _delta_v4_kernel_launch(
+        dev,
+        stream,
         (triton.cdiv(n_rows, BLOCK_R),),
+        num_warps,
         o,
         do,
         out,
         n_rows,
-        D=D,
-        BLOCK_R=BLOCK_R,
-        num_warps=num_warps,
+        D,
+        BLOCK_R,
     )
     return out
 
@@ -234,6 +247,11 @@ def build_inverted_topk(topk_indices_slice, num_kv):
     return inv_ptr, inv_data.to(torch.int32)
 
 
+_bwd_dkv_gather_acc_v4_launch = make_launcher(
+    _bwd_dkv_gather_acc_v4, dynamic_options=("num_warps",)
+)
+
+
 def dkv_gather_acc(
     interm, inv_ptr, inv_data, dkv_acc, BLOCK_E=64, num_warps=8, accumulate=True
 ):
@@ -243,19 +261,21 @@ def dkv_gather_acc(
     """
     _, _, D = interm.shape
     num_kv = dkv_acc.shape[0]
-    _intj_launch(
-        _bwd_dkv_gather_acc_v4,
+    dev, stream = current_device_stream()
+    _bwd_dkv_gather_acc_v4_launch(
+        dev,
+        stream,
         (num_kv,),
+        num_warps,
         interm,
         inv_ptr,
         inv_data,
         dkv_acc,
         interm.stride(1),
         dkv_acc.stride(0),
-        D=D,
-        BLOCK_E=BLOCK_E,
-        ACCUMULATE=accumulate,
-        num_warps=num_warps,
+        D,
+        BLOCK_E,
+        accumulate,
     )
 
 

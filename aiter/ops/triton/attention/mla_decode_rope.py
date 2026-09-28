@@ -27,19 +27,32 @@ import copy
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.attention.mla_decode_rope import (
     _fwd_grouped_kernel_stage1_rope,
     _fwd_kernel_stage2,
     _get_config,
 )
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
 
 # TODO rope offset
+_fwd_grouped_kernel_stage1_rope_launch = make_launcher(
+    _fwd_grouped_kernel_stage1_rope,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
+
+
 def _decode_grouped_att_m_fwd_rope(
     q,
     k_buffer,
@@ -78,7 +91,16 @@ def _decode_grouped_att_m_fwd_rope(
         * config["NUM_KV_SPLITS"],
     )
 
-    _intj_launch(_fwd_grouped_kernel_stage1_rope, grid,
+    dev, stream = current_device_stream()
+    _fwd_grouped_kernel_stage1_rope_launch(
+        dev,
+        stream,
+        grid,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
         q,
         k_buffer,
         v_buffer,
@@ -102,14 +124,30 @@ def _decode_grouped_att_m_fwd_rope(
         rotary_dim,
         kv_lora_rank,
         qk_rope_head_dim,
-        kv_group_num=kv_group_num,
-        q_head_num=head_num,
-        batch=batch,
-        logit_cap=logit_cap,
-        USE_ROPE=use_rope,
-        IS_NEOX_STYLE=is_neox_style,
-        **config,
+        kv_group_num,
+        head_num,
+        batch,
+        config["BLOCK_C"],
+        config["BLOCK_R"],
+        config["BLOCK_N"],
+        config["BLOCK_H"],
+        config["NUM_KV_SPLITS"],
+        logit_cap,
+        use_rope,
+        is_neox_style,
     )
+
+
+_fwd_kernel_stage2_launch = make_launcher(
+    _fwd_kernel_stage2,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 
 
 def _decode_softmax_reducev_fwd(
@@ -128,7 +166,16 @@ def _decode_softmax_reducev_fwd(
     config["NUM_KV_SPLITS"] = num_kv_splits
 
     grid = (batch * head_num,)
-    _intj_launch(_fwd_kernel_stage2, grid,
+    dev, stream = current_device_stream()
+    _fwd_kernel_stage2_launch(
+        dev,
+        stream,
+        grid,
+        config.get("num_warps", 4),
+        config.get("num_stages", 2),
+        config.get("waves_per_eu", 0),
+        config.get("matrix_instr_nonkdim", 0),
+        config.get("kpack", 1),
         logits,
         o,
         kv_indptr,
@@ -137,10 +184,11 @@ def _decode_softmax_reducev_fwd(
         logits.stride(2),
         o.stride(0),
         o.stride(1),
-        Lv=Lv,
-        head_num=head_num,
-        batch=batch,
-        **config,
+        config["NUM_KV_SPLITS"],
+        config["BLOCK_DV"],
+        Lv,
+        batch,
+        head_num,
     )
 
 

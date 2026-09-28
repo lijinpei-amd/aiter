@@ -1,11 +1,12 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_ogs.py
 
+import functools
 import itertools
 
 import torch
 import triton
-from intj.compat import launch as _intj_launch
+from intj import make_launcher
 
 from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a8w4 import (
     _moe_gemm_a8w4_decode as _moe_gemm_a8w4_decode_gluon,
@@ -30,7 +31,7 @@ from aiter.ops.triton.moe.reduce import (
     validate_reduce_out,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.ops.triton.utils.device_info import current_device_stream, get_num_sms
 from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
 from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
 
@@ -342,6 +343,36 @@ def get_kernel_config_gluon(m, n, k, routing_data, out_mx_quant=False):
 # -----------------------------------------------------------------------------
 
 
+@functools.cache
+def _moe_gemm_a8w4_decode_persistent_launch(num_warps):
+    return make_launcher(
+        _moe_gemm_a8w4_decode_persistent_gluon,
+        dynamic_options=("waves_per_eu",),
+        options={"num_warps": num_warps},
+    )
+
+
+@functools.cache
+def _moe_gemm_a8w4_decode_launch(num_warps):
+    return make_launcher(
+        _moe_gemm_a8w4_decode_gluon,
+        dynamic_options=("waves_per_eu",),
+        options={"num_warps": num_warps},
+    )
+
+
+_moe_gemm_a8w4_launch = make_launcher(
+    _moe_gemm_a8w4_triton,
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
+
+
 def moe_gemm_a8w4(
     x,
     w,
@@ -572,7 +603,12 @@ def moe_gemm_a8w4(
     grid = grid_m * grid_n * config["split_k"]
     # launch kernel
     if use_gluon and config["persistent_iters"] > 1:
-        _intj_launch(_moe_gemm_a8w4_decode_persistent_gluon, (grid,),
+        dev, stream = current_device_stream()
+        _moe_gemm_a8w4_decode_persistent_launch(config["num_warps"])(
+            dev,
+            stream,
+            (grid,),
+            config["waves_per_eu"],
             y,
             y.stride(1),
             y.stride(2),
@@ -614,23 +650,27 @@ def moe_gemm_a8w4(
             config["block_m"],
             config["block_n"],
             config["block_k"],
-            XCD_SWIZZLE=config["xcd_swizzle"],
-            NUM_BUFFERS=config["num_buffers"],
-            SWIZZLE_MX_SCALE=swizzle_mx_scale,
-            X_SCALE_TDM=X_SCALE_TDM,
-            PRESHUFFLED=preshuffled,
-            CLAMP_BOUNDS=K % config["block_k"] != 0,
-            N_ITERS=config["persistent_iters"],
-            num_warps=config["num_warps"],
-            UPCAST_INDICES=should_upcast_indices(x, w, y_ptr),
-            waves_per_eu=config["waves_per_eu"],
-            YMxScale=y_scale,
-            stride_y_mx_m=stride_y_mx_m,
-            stride_y_mx_n=stride_y_mx_n,
-            HAS_MX_OUT=out_mx_quant,
+            config["xcd_swizzle"],
+            config["num_buffers"],
+            swizzle_mx_scale,
+            X_SCALE_TDM,
+            preshuffled,
+            K % config["block_k"] != 0,
+            config["persistent_iters"],
+            config["num_warps"],
+            should_upcast_indices(x, w, y_ptr),
+            y_scale,
+            stride_y_mx_m,
+            stride_y_mx_n,
+            out_mx_quant,
         )
     elif use_gluon and block_m == 16:
-        _intj_launch(_moe_gemm_a8w4_decode_gluon, (grid,),
+        dev, stream = current_device_stream()
+        _moe_gemm_a8w4_decode_launch(config["num_warps"])(
+            dev,
+            stream,
+            (grid,),
+            config["waves_per_eu"],
             y_ptr,
             stride_y_m,
             stride_y_n,
@@ -672,22 +712,21 @@ def moe_gemm_a8w4(
             config["block_m"],
             config["block_n"],
             config["block_k"],
-            XCD_SWIZZLE=config["xcd_swizzle"],
-            NUM_BUFFERS=config["num_buffers"],
-            SWIZZLE_MX_SCALE=swizzle_mx_scale,
-            X_SCALE_TDM=X_SCALE_TDM,
-            PRESHUFFLED=preshuffled,
-            CLAMP_BOUNDS=K % config["block_k"] != 0,
-            num_warps=config["num_warps"],
-            UPCAST_INDICES=should_upcast_indices(x, w, y_ptr),
-            waves_per_eu=config["waves_per_eu"],
-            YMxScale=y_scale,
-            stride_y_mx_m=stride_y_mx_m,
-            stride_y_mx_n=stride_y_mx_n,
-            HAS_MX_OUT=out_mx_quant,
-            DstRow=dst_row,
-            EP_SCATTER=fused_ep_scatter,
-            Y_ROWS=(ep_scatter.out.shape[0] if fused_ep_scatter else 0),
+            config["xcd_swizzle"],
+            config["num_buffers"],
+            swizzle_mx_scale,
+            X_SCALE_TDM,
+            preshuffled,
+            K % config["block_k"] != 0,
+            config["num_warps"],
+            should_upcast_indices(x, w, y_ptr),
+            y_scale,
+            stride_y_mx_m,
+            stride_y_mx_n,
+            out_mx_quant,
+            dst_row,
+            fused_ep_scatter,
+            ep_scatter.out.shape[0] if fused_ep_scatter else 0,
         )
     elif use_gluon:
         layouts = get_moe_a8w4_layouts(
@@ -769,7 +808,16 @@ def moe_gemm_a8w4(
             **layouts,
         )
     else:
-        _intj_launch(_moe_gemm_a8w4_triton, (grid,),
+        dev, stream = current_device_stream()
+        _moe_gemm_a8w4_launch(
+            dev,
+            stream,
+            (grid,),
+            config["num_warps"],
+            config["num_stages"],
+            config["waves_per_eu"],
+            config["matrix_instr_nonkdim"],
+            config["kpack"],
             y,
             y.stride(0),
             y.stride(1),
@@ -812,22 +860,17 @@ def moe_gemm_a8w4(
             config["block_n"],
             config["block_k"],
             config["group_m"],
-            XCD_SWIZZLE=config["xcd_swizzle"],
-            SWIZZLE_MX_SCALE=swizzle_mx_scale,
-            SPLIT_K=config["split_k"],
-            EVEN_K=K % config["block_k"] == 0,
-            MASK_K_LIMIT=K % config["block_k"],
-            W_CACHE_MODIFIER=config["w_cache_modifier"],
-            num_warps=config["num_warps"],
-            num_stages=config["num_stages"],
-            UPCAST_INDICES=should_upcast_indices(x, w, y_ptr),
-            waves_per_eu=config["waves_per_eu"],
-            matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
-            kpack=config["kpack"],
-            YMxScale=y_scale,
-            stride_y_mx_m=stride_y_mx_m,
-            stride_y_mx_n=stride_y_mx_n,
-            HAS_MX_OUT=out_mx_quant,
+            config["xcd_swizzle"],
+            swizzle_mx_scale,
+            K % config["block_k"] == 0,
+            K % config["block_k"],
+            config["split_k"],
+            config["w_cache_modifier"],
+            should_upcast_indices(x, w, y_ptr),
+            y_scale,
+            stride_y_mx_m,
+            stride_y_mx_n,
+            out_mx_quant,
         )
 
     # MXFP8 emit path: scatter_indx is None and split_k==1, so we bypass

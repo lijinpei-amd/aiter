@@ -4,7 +4,6 @@
 import torch
 import triton
 from intj import make_launcher
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.normalization.norm import (
     _fused_add_layernorm_kernel,
@@ -111,6 +110,11 @@ _layernorm_bwd_dwdb_triton_launch = make_launcher(_layernorm_bwd_dwdb_triton)
 _layernorm_bwd_dwdb_triton_v2_launch = make_launcher(_layernorm_bwd_dwdb_triton_v2)
 
 
+_layernorm_bwd_dx_fused_triton_launch = make_launcher(
+    _layernorm_bwd_dx_fused_triton, dynamic_options=("num_warps",)
+)
+
+
 def _layernorm_backward(
     dy: torch.Tensor,
     dx: torch.Tensor,
@@ -150,9 +154,12 @@ def _layernorm_backward(
         _db = None
 
     grid_bwd = (tile_num,)
-    _intj_launch(
-        _layernorm_bwd_dx_fused_triton,
+    dev, stream = current_device_stream()
+    _layernorm_bwd_dx_fused_triton_launch(
+        dev,
+        stream,
         grid_bwd,
+        num_warps,
         dx,
         dy,
         _dw,
@@ -163,11 +170,10 @@ def _layernorm_backward(
         rsigma,
         x.stride(0),
         N,
-        NUM_ROWS=M,
-        BLOCK_SIZE_N=BLOCK_SIZE,
-        USE_BLOCKED=USE_BLOCKED,
-        num_warps=num_warps,
-        IGNORE_DW_DB=IGNORE_DW_DB_IN_FUSED,
+        M,
+        BLOCK_SIZE,
+        USE_BLOCKED,
+        IGNORE_DW_DB_IN_FUSED,
     )
     if not IGNORE_DW_DB_IN_FUSED:
         dwdb_block_n = max(16, N // 256)
