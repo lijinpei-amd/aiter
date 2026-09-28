@@ -81,7 +81,10 @@ def paged_attention_decode(
     num_q_heads = query.shape[1]
     num_kv_heads = key_cache.shape[1]
 
-    max_num_partitions = (max_seq_len + _SEQ_PARTITION_SIZE - 1) // _SEQ_PARTITION_SIZE
+    # int(): callers pass max(tensor) too, and intj grids take only exact ints
+    max_num_partitions = int(
+        (max_seq_len + _SEQ_PARTITION_SIZE - 1) // _SEQ_PARTITION_SIZE
+    )
 
     use_v1 = max_seq_len <= 8192 and (
         max_num_partitions == 1 or num_seqs * num_q_heads > 512
