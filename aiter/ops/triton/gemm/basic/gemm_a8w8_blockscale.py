@@ -60,6 +60,26 @@ def _triton_gemm_a8w8_blockscale_kernel_launch(num_stages):
 
 
 @functools.cache
+def _gluon_gfx950_gemm_a8w8_blockscale_launch():
+    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a8w8_blockscale import (
+        _gemm_a8w8_blockscale_kernel,
+    )
+
+    # The kernel reads the import-time constant _SUPPORTED_TILES.
+    return make_launcher(
+        _gemm_a8w8_blockscale_kernel,
+        dynamic_options=(
+            "num_warps",
+            "num_stages",
+            "waves_per_eu",
+            "matrix_instr_nonkdim",
+            "kpack",
+        ),
+        assume_constant_globals=True,
+    )
+
+
+@functools.cache
 def _gluon_gfx1250_gemm_a8w8_blockscale_launch(preshuffle, kernel_type, num_warps):
     from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a8w8_blockscale import (
         _KERNEL_MAP,
@@ -178,24 +198,14 @@ def gemm_a8w8_blockscale(
         ),  # Effective launch grid dims: [NUM_KSPLIT, NUM_M_BLOCKS, NUM_N_BLOCKS]
     )
 
-    extra_constexpr = {}
     if backend == "gluon":
         arch = get_arch()
         assert (
             kernel_type in _GLUON_KERNEL_TYPES
         ), f"Unknown kernel_type '{kernel_type}', must be one of {list(_GLUON_KERNEL_TYPES)}"
-        if arch == "gfx950":
-            from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a8w8_blockscale import (
-                _gemm_a8w8_blockscale_kernel as gluon_kernel,
-            )
-
-            # gfx950 has one blockscale kernel, which serves both kernel types.
-            impl = gluon_kernel
-            extra_constexpr["NUM_WARPS"] = config["num_warps"]
-            extra_constexpr["NUM_STAGES"] = max(config.get("num_stages", 2), 2)
-        elif arch == "gfx1250":
+        if arch == "gfx1250":
             config["NUM_BUFFERS"] = config.pop("num_stages", 1)
-        else:
+        elif arch != "gfx950":  # gfx950: one kernel serves both kernel types
             raise AssertionError(
                 f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{arch}'"
             )
@@ -207,13 +217,19 @@ def gemm_a8w8_blockscale(
             tuple(w.shape),
             kernel_type,
         )
-    else:
-        impl = triton_gemm_a8w8_blockscale_kernel
 
     if backend == "gluon" and arch == "gfx950":
-        # Triton launch: intj refuses the kernel's used_global_vals reference
-        # to _SUPPORTED_TILES (see docs/intj_launch_exceptions.md).
-        impl[grid](
+        # gfx950 has one blockscale kernel, which serves both kernel types.
+        dev, stream = current_device_stream()
+        _gluon_gfx950_gemm_a8w8_blockscale_launch()(
+            dev,
+            stream,
+            grid,
+            config["num_warps"],
+            config.get("num_stages", 2),
+            config.get("waves_per_eu", 0),
+            config.get("matrix_instr_nonkdim", 0),
+            config.get("kpack", 1),
             x,
             w,
             y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -233,8 +249,17 @@ def gemm_a8w8_blockscale(
             x_scale.stride(1),
             w_scale.stride(0),
             w_scale.stride(1),
-            **config,
-            **extra_constexpr,
+            config["GROUP_K"],
+            config["GROUP_N"],
+            config["BLOCK_SIZE_M"],
+            config["BLOCK_SIZE_N"],
+            config["BLOCK_SIZE_K"],
+            config["GROUP_SIZE_M"],
+            config["NUM_KSPLIT"],
+            config["SPLITK_BLOCK_SIZE"],
+            max(config.get("num_stages", 2), 2),  # NUM_STAGES
+            config["num_warps"],  # NUM_WARPS
+            config["cache_modifier"],
         )
     elif backend == "gluon":
         dev, stream = current_device_stream()
