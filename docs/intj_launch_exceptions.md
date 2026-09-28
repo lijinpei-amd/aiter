@@ -9,12 +9,14 @@ scalars), installed or on `PYTHONPATH`; Aiter does not yet publish an intj
 dependency. Declaring a launcher does no GPU work, but needs a host C
 compiler once per interpreter (intj builds its generic lazy stub).
 
-What still launches through Triton, and why: the 16 tracked Triton bracket
+What still launches through Triton, and why: the 14 tracked Triton bracket
 launches in the table below, each needing a runtime capability or launch
 behavior intj cannot preserve. No `intj.compat.launch` call is left; the
 last eight, gfx1250 Gluon paths that passed a tuple or a Gluon layout object
 as a constexpr, now build those values in the kernel (see
-[gfx1250 Gluon kernels](#gfx1250-gluon-kernels)).
+[gfx1250 Gluon kernels](#gfx1250-gluon-kernels)). pod_attention and the metadata-redirect
+test's `empty_kernel`, which read the returned `CompiledKernel`, now use a
+`return_compiled=True` launcher.
 
 Line numbers refer to this branch. The three Iris kernels are blocked only
 by their Iris helpers (intj takes their `tl.tensor` annotations) and remain
@@ -24,18 +26,16 @@ pending Iris-enabled multi-GPU validation.
 | --- | --- | --- |
 | `aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/common.py:409` | `torch.library.wrap_triton(_rotary_kernel)` | `torch.library.wrap_triton` is required for `torch.compile` behavior. |
 | `aiter/ops/triton/attention/pa_mqa_logits.py:779` | `kernel` | A precompiled Gluon/AOT kernel, not a `JITFunction`. |
-| `aiter/ops/triton/attention/pod_attention.py:199` | `pod_persistent` | Caller prints the returned kernel's `n_regs` and `n_spills`. |
 | `aiter/ops/triton/comms/all_gather.py:226` | `_all_gather_kernel` | Blocked by Iris helpers only: its nested JIT helper calls Iris `put`; intj compatibility lacks Iris-enabled validation. |
 | `aiter/ops/triton/comms/fused/reduce_scatter_rmsnorm_quant_all_gather.py:368` | `fused_pipeline_kernel` | Nested JIT helpers call Iris `load` and `put`; intj compatibility lacks Iris-enabled validation. |
 | `aiter/ops/triton/comms/reduce_scatter.py:236` | `_reduce_scatter_kernel` | Blocked by Iris helpers only: its nested JIT helper calls Iris `load`; intj compatibility lacks Iris-enabled validation. |
 | `aiter/ops/triton/fusions/attn_res.py:336` | `attnres_fwd_kernel` | `_run_sequence` passes `res`, a tuple of residual tensors; intj raises `TypeError: unsupported argument 'res' of type tuple` (tuple arguments are unsupported, with or without `ATTN_RES_TRITON_AUTOTUNE`). |
-| `aiter/ops/triton/gemm/basic/gemm_afp8wfp8.py:438` | `_PRESHUFFLE_KERNEL_MAP[kernel_type]` | gfx1250 preshuffle can use `num_ctas > 1` (CGA multicast); intj refuses it. |
-| `aiter/ops/triton/moe/moe_op_gemm_a4w4.py:614` | `_moe_gemm_a4w4_prefill` | Selected config can use `num_ctas > 1`; intj refuses it. |
-| `aiter/ops/triton/moe/moe_op_gemm_a8w4.py:749` | `_moe_gemm_a8w4_prefill_gluon` | Selected config can use `num_ctas > 1`; intj refuses it. |
+| `aiter/ops/triton/gemm/basic/gemm_afp8wfp8.py:425` | `_PRESHUFFLE_KERNEL_MAP[kernel_type]` | gfx1250 preshuffle can use `num_ctas > 1` (CGA multicast); intj refuses it. |
+| `aiter/ops/triton/moe/moe_op_gemm_a4w4.py:602` | `_moe_gemm_a4w4_prefill` | Selected config can use `num_ctas > 1`; intj refuses it. |
+| `aiter/ops/triton/moe/moe_op_gemm_a8w4.py:737` | `_moe_gemm_a8w4_prefill_gluon` | Selected config can use `num_ctas > 1`; intj refuses it. |
 | `csrc/cpp_itfs/utils.py:515` | `self.triton_kernel` | `HsacoKernel._call` preserves the returned kernel alongside its separate HSACO path. |
 | `op_tests/triton_tests/torch_compile/test_compile_constexpr_mutation.py:37` | `_rmsnorm_constexpr_kernel` | Test checks Triton launch behavior under `torch.compile`. |
-| `op_tests/triton_tests/triton_metadata_redirect/test_metadata_redirect.py:5828` | `empty_kernel` | Test asserts the returned `CompiledKernel.metadata.hash`. |
-| `op_tests/triton_tests/triton_metadata_redirect/test_metadata_redirect.py:5866` | `kernel` | Explicit precompiled `triton.compile` result, not a `JITFunction`. |
+| `op_tests/triton_tests/triton_metadata_redirect/test_metadata_redirect.py:5875` | `kernel` | Explicit precompiled `triton.compile` result, not a `JITFunction`. |
 | `op_tests/triton_tests/utils/causal_conv1d_update_refs.py:656` | `_causal_conv1d_update_kernel_sglang` | `**pdl_kwargs` can include `launch_pdl=True`, which intj cannot launch. |
 | `op_tests/triton_tests/utils/causal_conv1d_update_refs.py:1199` | `_causal_conv1d_update_kernel_vllm` | `launch_pdl=_is_arch_support_pdl()` can request PDL. |
 
@@ -47,46 +47,61 @@ ABI, not Triton/Gluon `JITFunction`s.
 
 `make_launcher` builds nothing until the first call (it validates arguments,
 resolves annotations and analyzes `@triton.autotune`/`@triton.heuristics`
-at declaration), so launchers are declared at module level, in modules that
-Aiter imports without a GPU. Three forms, in order of preference:
+at declaration), so a kernel can carry its launcher as a decorator in a
+module Aiter imports without a GPU. That is the default form:
 
 ```python
-@make_launcher(grid_arg=1, options={"num_warps": 4})   # 248 kernels
+@make_launcher(grid_arg=1, options={"num_warps": 4})   # 352 kernels
 @triton.jit
 def _foo_kernel(...): ...
 
-_bar_launch = make_launcher(_bar_kernel, dynamic_options=("num_warps",))  # 96
-
-@functools.cache                                        # 60 factories
-def _baz_launch(num_warps):
-    return make_launcher(_baz_kernel, options={"num_warps": num_warps})
+_foo_kernel(dev, stream, grid_x, *public_args)          # the kernel name launches
 ```
 
-- **Decorator** on the kernel when that kernel has one launcher and nothing
-  else uses it (no second launch configuration, test, re-export or
-  `getattr` by name). The kernel name is then the launcher. A `grid_cpp`
-  function sits above the kernel it decorates.
-- **Named launcher** next to the wrapper that launches it otherwise, or when
-  its arguments (a module constant, a `grid_cpp` def) live in the wrapper's
-  module.
-- **`functools.cache` factory** in three cases: a kernel parameter doubles as
-  a compile option (`num_warps: tl.constexpr`, see below); the kernel is
-  imported inside the wrapper (gfx950/gfx1250 Gluon modules); the kernel can
-  be `None` when its Gluon module fails to import.
+The kernel's name is then the launcher; its `JITFunction` is no longer
+reachable. Arguments the decorator needs (a `grid_cpp` def, an option
+constant, an arch-dependent option dict) sit above the kernel. A kernel
+that is `None` when its Gluon module fails to import is decorated inside
+that module, so the imported name is a launcher or `None`. Launchers that
+used to differ only in something now passed per call are one decorated
+kernel: the split-K reduce takes `KERNEL_NAME` and `activation` as str
+constexprs; sage_quant_v, `_combined_routing`, `_moe_gemm_a8w8` and
+`_sparse_attn_prefill_kernel` each serve two call sites.
 
-Every call is positional:
+Two other forms remain, 13 named launchers and 51 `functools.cache`
+factories, only where one kernel needs something a decorator cannot give:
 
 ```python
-dev, stream = current_device_stream()   # aiter/ops/triton/utils/device_info.py
-_foo_kernel(dev, stream, grid_x, *public_args)
-_bar_launch(dev, stream, grid, num_warps, *public_args)
+_bar_launch = make_launcher(_bar_kernel, ...)          # the JIT function is needed elsewhere
+
+@functools.cache                                        # an option is also a kernel parameter
+def _baz_launch(num_warps):
+    return make_launcher(_baz_kernel, options={"num_warps": num_warps})
+
+_bar_launch(dev, stream, grid, *public_args)
 _baz_launch(num_warps)(dev, stream, grid, *public_args)
 ```
 
+| Launcher | Why not a decorator |
+| --- | --- |
+| 46 factories: mla (5), pa_decode_sparse (3), unified_attention 3d (Triton and gfx1250), rope's thd-cached kernels (4), the gfx950/gfx1250 and Triton afp4wfp4 (5), afp8wfp8 (2), a16wfp4 (2), a16w8_blockscale (2), a8w8_blockscale Triton and gfx1250, a16w16 persistent (Triton and gfx1250), batched bf16 (Triton and gfx1250), the fused GEMMs (5), MoE decode Gluon (4), mha gfx950 Gluon, pa_prefill_sparse Gluon, fused_clamp_act_mul Gluon, fused_add_rmsnorm_pad Gluon, `_dynamic_mxfp4_quant_kernel`, `bench_cache_copy`'s `simple_tdm_kernel` | A compile option (`num_warps`, `num_stages`, `waves_per_eu`, `matrix_instr_nonkdim`, `num_ctas`) is also a kernel parameter. intj refuses it as a dynamic option (`dynamic option 'num_warps' is a kernel parameter`), so `options=` fixes it per launcher, keyed by the factory. |
+| `pa_mqa_logits` `_gluon_paged_mqa_logits_launch` | One launcher per (Preshuffle, VarCtx, KV-padded) mode, each with a different baked `extra_annotation` (the hand-written types and `Assume` facts); `return_compiled=True`. |
+| FlashKDA `_cached_intj_launcher` (5 kernels) | Its handles key on the `JITFunction`'s `debug` attribute and source key, which a decorator fixes at the first call (knobs could be `dynamic_options`; `jit.debug` cannot), and `test_intj_launch.py` needs the JIT functions for its Triton-parity adapter and for retuning with new configs. |
+| `mla_decode_ref` stage-1 grouped and stage-2 factories | `kpack` depends on `get_arch()`; the factory defers that GPU query to the first launch, so `op_tests.triton_tests.utils` (which star-imports this module) imports without a GPU. A dynamic `kpack` would be an unknown option on CUDA. |
+| `pa_attention_kernel_test` `_direct_launch` | Launches pa_decode_gluon's dot kernels with other options (`num_stages=1`, per-call `waves_per_eu`) than pa_decode_gluon's own launchers; the kernel is picked at runtime. |
+| `aiter/mla.py` `_fwd_kernel_stage2_asm_launch`, `test_mla_stage2_merge.py` | `asm_mla_decode_fwd.py` and `aot/triton/decode_mla.py` compile the JIT function ahead of time by name; the test sweeps options on it. |
+| pa_decode_gluon dot, large-block dot and reduce launchers | `pa_decode_gluon_aot.py` and the AOT tests compile and `warmup` the same JIT functions through Triton. |
+| `attn_res` `_attnres_fwd_kernel_launch` (two, by `ATTN_RES_TRITON_AUTOTUNE`) | `_run_sequence` still launches the JIT function through Triton (tuple argument, table above), and `test_attn_res.py` reads its `arg_names` and launches it as the reference. |
+| `rmsnorm` `_rms_norm_kernel_launch` | The kernel is also a device function: the Iris `reduce_scatter_rmsnorm_quant_all_gather` kernel calls it. |
+| `fused_mxfp4_quant` (5: three Triton, two gfx1250 Gluon) | `test_mxfp4_jit_import.py` (upstream #5572) reads their `Heuristics` predicates and JIT source, and `test_mxfp4_intj.py` launches them through Triton as the reference. |
+
+Every call is positional. `current_device_stream()`
+(`aiter/ops/triton/utils/device_info.py`) returns the current device and
+its raw stream, as Triton launches on.
+
 Defaults are passed explicitly, values that `@triton.autotune` /
 `@triton.heuristics` assign are not passed, and literal arguments carry a
-`# <parameter>` comment. `current_device_stream()` returns the current
-device and its raw stream, as Triton launches on.
+`# <parameter>` comment.
 
 - **Per-call compile options** (`num_warps`, `num_stages`, `waves_per_eu`,
   `matrix_instr_nonkdim`, `kpack`, and `num_ctas` for `mha`) are
@@ -103,9 +118,11 @@ device and its raw stream, as Triton launches on.
   `compat.launch` compiled these sites with the default option instead.
 - **`str` / `tl.dtype` / JIT-function constexprs** (pa_decode's
   `compute_type`, mla_gluon's `REGIME`, the split-K reduce `activation`,
-  moe topk's `SCORE_MODE`, ...) are passed positionally and keyed by value.
-  Values fixed at a site (the split-K reduces' `KERNEL_NAME`) are baked with
-  `extra_annotation={name: Constexpr(value=...)}`.
+  moe topk's `SCORE_MODE`, the split-K reduce's `KERNEL_NAME`, ...) are
+  passed positionally and keyed by value. A value is baked with
+  `extra_annotation={name: Constexpr(value=...)}` only where one decorated
+  kernel has a single caller (the batched split-K reduce, the chunk-delta
+  solves' `DOT_PRECISION`).
 - **Gluon layouts and tuples** are never arguments: intj bakes scalars, not
   layout objects or tuples. A kernel builds them from its constexpr ints and
   strings, inline or through a `gluon.constexpr_function` it calls (the
@@ -134,7 +151,9 @@ device and its raw stream, as Triton launches on.
   pa_mqa_logits returns the kernel's Triton cache key (the AOT benchmark
   zips that directory). With `AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1` the
   launch runs inside `AOTMetadataContext`, so the miss that compiles loads
-  the prebuilt hsaco/json, as `triton.compile` did.
+  the prebuilt hsaco/json, as `triton.compile` did. pod_attention prints
+  the returned kernel's `n_regs`/`n_spills`, and the metadata-redirect
+  test checks its `metadata.hash`, the same way.
 - **`torch.Tensor` / `tl.tensor` annotations** mean "exactly a tensor" to
   intj (Triton ignores them). A parameter that can be `None` (MHA forward's
   descale, alibi, dropout-mask and sink pointers) is annotated
@@ -328,6 +347,49 @@ replacing the kernels' own `torch.finfo(e4m3_dtype)` defaults, so FP8 output
 clamped at +-240 on gfx950/gfx1250 (OCP e4m3, +-448). They default to
 `torch.finfo(e4m3_dtype)` again; a gfx950 output of 400 now comes back as
 416 (its fp8 value) instead of 240.
+
+## Decorators as the default form
+
+100 kernels moved from a named launcher or a factory onto a
+`@make_launcher` decorator (252 decorated kernels before, 352 after), and
+pod_attention and the metadata-redirect test left the exception table
+(intj `develop` `027dacd`, Triton 3.8.0). The remaining named launchers and
+factories, with the reason for each, are listed under
+[Launchers](#launchers).
+
+- **Tests, gfx942.** At most 30 tests per file over all 129 files under
+  `op_tests/triton_tests`: 2058 passed, 19 failed, 1 error; the parent
+  (`490c589f8`): 2054 passed and the same 19 failures and error by test id
+  (`test_fav3_sage_compile.py`, the two pa_decode_gluon sliding-window sets
+  that need CK headers, the HIP-rope import in
+  `test_fused_reduce_qk_norm_rope_swa_write.py`). The extra passes are
+  `test_sage_quant_intj.py`'s new launcher check and `test_gmm.py` cases the
+  parent's run skipped for memory. The FlashKDA, Sage, MXFP6/MXFP8,
+  fast-transpose and metadata-redirect files in full: 226 passed (parent 225).
+- **Tests, gfx950 (MI350X).** At most 20 tests per file, all 129 files:
+  1877 passed, 23 failed, 1 error on this revision (`test_sparse_mla.py`
+  rerun after fixing its import of a removed launcher); 1874 passed with
+  the same failures and error by test id on the parent.
+- **Differential against Triton** (the plugin above), gfx942 and gfx950:
+  89 of the 100 newly decorated kernels ran (with small driver calls for
+  the gated-delta-rule, mla_decode, sparse-prefill, MXFP6-pack and test
+  reference kernels the samples miss), every call bitwise equal with
+  identical ISA. The metadata test's `empty_kernel` runs in its own test.
+  Not run: the 8 gfx1250 Gluon kernels (declared, and their extensions
+  built on gfx942), `_conv2d_3x3_nchw_kernel` (no arch has a
+  `conv_3x3_nchw` config, so the router never picks it; built only) and
+  `pod_persistent` (its module does not import on the parent either).
+- **Arity.** Every call without starred arguments passes exactly the
+  arguments its launcher takes (317 calls, checked against each launcher's
+  grid form, dynamic options and tuned or baked names).
+- **Host time** (gfx942, as above): no change, as expected for the same
+  launcher under another name.
+
+  | Site | before | after |
+  | --- | ---: | ---: |
+  | `fast_transpose_2d` (bound handle → decorator) | 18.7 us | 18.5 us |
+  | `layer_norm` (named → decorator) | 18.8 us | 18.4 us |
+  | `gemm_a8w8`, split-K (baked `KERNEL_NAME` → str constexpr) | 30.8 us | 29.8 us |
 
 ## FlashKDA
 
