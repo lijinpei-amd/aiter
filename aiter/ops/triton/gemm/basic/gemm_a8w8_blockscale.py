@@ -48,24 +48,6 @@ _gemm_splitk_reduce_kernel_launch = make_launcher(
 
 
 @functools.cache
-def _gluon_gemm_a8w8_blockscale_launch():
-    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a8w8_blockscale import (
-        _gemm_a8w8_blockscale_kernel as gluon_kernel,
-    )
-
-    return make_launcher(
-        gluon_kernel,
-        dynamic_options=(
-            "num_warps",
-            "num_stages",
-            "waves_per_eu",
-            "matrix_instr_nonkdim",
-            "kpack",
-        ),
-    )
-
-
-@functools.cache
 def _triton_gemm_a8w8_blockscale_kernel_launch(num_stages):
     return make_launcher(
         triton_gemm_a8w8_blockscale_kernel,
@@ -225,16 +207,9 @@ def gemm_a8w8_blockscale(
         impl = triton_gemm_a8w8_blockscale_kernel
 
     if backend == "gluon" and arch == "gfx950":
-        dev, stream = current_device_stream()
-        _gluon_gemm_a8w8_blockscale_launch()(
-            dev,
-            stream,
-            grid,
-            config.get("num_warps", 4),
-            config.get("num_stages", 2),
-            config.get("waves_per_eu", 0),
-            config.get("matrix_instr_nonkdim", 0),
-            config.get("kpack", 1),
+        # Triton launch: intj refuses the kernel's used_global_vals reference
+        # to _SUPPORTED_TILES (see docs/intj_launch_exceptions.md).
+        impl[grid](
             x,
             w,
             y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -254,17 +229,8 @@ def gemm_a8w8_blockscale(
             x_scale.stride(1),
             w_scale.stride(0),
             w_scale.stride(1),
-            config["GROUP_K"],
-            config["GROUP_N"],
-            config["BLOCK_SIZE_M"],
-            config["BLOCK_SIZE_N"],
-            config["BLOCK_SIZE_K"],
-            config["GROUP_SIZE_M"],
-            config["NUM_KSPLIT"],
-            config["SPLITK_BLOCK_SIZE"],
-            max(config.get("num_stages", 2), 2),
-            config["num_warps"],
-            config["cache_modifier"],
+            **config,
+            **extra_constexpr,
         )
     elif backend == "gluon":
         _intj_launch(
