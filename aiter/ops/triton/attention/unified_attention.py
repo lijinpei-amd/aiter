@@ -715,6 +715,18 @@ _reduce_segments_{arch}(
 """
 
 
+@functools.cache
+def _unified_attention_gluon_kernel_2d_launch():
+    # Built on first use: the Gluon kernel is None when its import fails.
+    return make_launcher(
+        _unified_attention_kernel_2d_gfx1250,
+        dynamic_options=(
+            "num_warps",
+            "waves_per_eu",
+        ),
+    )
+
+
 def _unified_attention_2d_gfx1250(params: _UAParams):
     """
     Internal wrapper for the gfx1250 gluon kernel.
@@ -756,56 +768,69 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
     # buffer ops need the tensor to fit a 32-bit offset; gfx1250 loads through TDM
     MAX_INT32 = 2**31 - 1
     USE_STORE_BUFFER_OP = params.out.nelement() * params.out.element_size() <= MAX_INT32
-    _unified_attention_kernel_2d_gfx1250[(params.num_kv_heads, total_query_blocks)](
-        query_ptr=params.q,
-        key_cache_ptr=params.k,
-        value_cache_ptr=params.v,
-        sink_ptr=params.sinks,
-        output_ptr=params.out,
-        block_tables_ptr=params.block_table,
-        seq_lens_ptr=params.seqused_k,
-        query_start_len_ptr=params.cu_seqlens_q,
-        query_stride_0=params.q.stride(0),
-        query_stride_1=params.q.stride(1),
-        output_stride_0=params.out.stride(0),
-        output_stride_1=params.out.stride(1),
-        k_descale_ptr=params.k_descale,
-        v_descale_ptr=params.v_descale,
-        q_descale_ptr=params.q_descale,
-        out_scale_ptr=params.output_scale,
-        USE_SINKS=(params.sinks is not None),
-        SLIDING_WINDOW=params.sliding_window,
-        num_blocks=params.num_blocks,
-        stride_k_cache_0=params.k.stride(0),
-        stride_k_cache_1=params.k.stride(1),
-        stride_k_cache_2=params.k.stride(2),
-        stride_k_cache_3=params.k.stride(3),
-        stride_v_cache_0=params.v.stride(0),
-        stride_v_cache_1=params.v.stride(1),
-        stride_v_cache_2=params.v.stride(2),
-        stride_v_cache_3=params.v.stride(3),
-        block_table_stride=params.block_table.stride(0),
-        num_seqs=NUM_SEQS,
-        SCALE=params.softmax_scale,
-        NUM_QUERY_HEADS=params.num_query_heads,
-        NUM_KV_HEADS=params.num_kv_heads,
-        BLOCK_SIZE=params.block_size,
-        TILE_SIZE=TILE_SIZE,
-        HEAD_SIZE=params.head_size,
-        BLOCK_Q=BLOCK_Q,
-        BLOCK_M=BLOCK_M,
-        ARCH_NAME=DEVICE_ARCH,
-        waves_per_eu=config["waves_per_eu"],
-        USE_LOAD_BUFFER_OP=False,
-        USE_STORE_BUFFER_OP=USE_STORE_BUFFER_OP,
-        num_warps=config["num_warps"],
-        ALL_DECODE=params.all_decode,
-        SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
-        CAUSAL=params.causal,
+    dev, stream = current_device_stream()
+    _unified_attention_gluon_kernel_2d_launch()(
+        dev,
+        stream,
+        (params.num_kv_heads, total_query_blocks),
+        config["num_warps"],
+        config["waves_per_eu"],
+        params.q,
+        params.k,
+        params.v,
+        params.sinks,
+        params.out,
+        params.block_table,
+        params.seqused_k,
+        params.cu_seqlens_q,
+        params.q.stride(0),
+        params.q.stride(1),
+        params.out.stride(0),
+        params.out.stride(1),
+        params.k_descale,
+        params.v_descale,
+        params.q_descale,
+        params.output_scale,
+        params.sinks is not None,
+        params.sliding_window,
+        params.num_blocks,
+        params.k.stride(0),
+        params.k.stride(1),
+        params.k.stride(2),
+        params.k.stride(3),
+        params.v.stride(0),
+        params.v.stride(1),
+        params.v.stride(2),
+        params.v.stride(3),
+        params.block_table.stride(0),
+        NUM_SEQS,
+        params.softmax_scale,
+        params.num_query_heads,
+        params.num_kv_heads,
+        params.block_size,
+        TILE_SIZE,
+        params.head_size,
+        BLOCK_Q,
+        BLOCK_M,
+        DEVICE_ARCH,
+        False,  # USE_LOAD_BUFFER_OP
+        USE_STORE_BUFFER_OP,
+        params.all_decode,
+        params.shuffled_kv_cache,
+        torch.finfo(e4m3_dtype).min,
+        torch.finfo(e4m3_dtype).max,
+        params.causal,
         # useful for debugging when needed
-        REMOVE_INDIRECT_ACCESS=False,
-        NUM_BUFFERS=config["NUM_BUFFERS"],
-        LOOP_VARIANT=loop_variant,
+        False,  # REMOVE_INDIRECT_ACCESS
+        config["NUM_BUFFERS"],
+        loop_variant,
+        1,  # USE_TDM_STORE
+        1,  # USE_TDM_LOAD
+        0,  # K_WIDTH
+        1,  # NUM_SPLITS
+        None,  # partial_m_ptr
+        None,  # partial_l_ptr
+        None,  # partial_acc_ptr
     )
 
 
