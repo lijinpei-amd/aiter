@@ -2,13 +2,11 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
-import math
 import os
 
 import torch
 import triton
 from intj import Constexpr, make_launcher
-from intj.compat import launch as _intj_launch
 from packaging.version import Version
 
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
@@ -58,6 +56,21 @@ def _triton_gemm_a8w8_blockscale_kernel_launch(num_stages):
             "kpack",
         ),
         options={"num_stages": num_stages},
+    )
+
+
+@functools.cache
+def _gluon_gfx1250_gemm_a8w8_blockscale_launch(preshuffle, kernel_type, num_warps):
+    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a8w8_blockscale import (
+        _KERNEL_MAP,
+        _PRESHUFFLE_KERNEL_MAP,
+    )
+
+    kernel_map = _PRESHUFFLE_KERNEL_MAP if preshuffle else _KERNEL_MAP
+    return make_launcher(
+        kernel_map[kernel_type],
+        dynamic_options=("waves_per_eu", "matrix_instr_nonkdim", "kpack"),
+        options={"num_warps": num_warps},
     )
 
 
@@ -181,15 +194,6 @@ def gemm_a8w8_blockscale(
             extra_constexpr["NUM_WARPS"] = config["num_warps"]
             extra_constexpr["NUM_STAGES"] = max(config.get("num_stages", 2), 2)
         elif arch == "gfx1250":
-            from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a8w8_blockscale import (
-                _KERNEL_MAP,
-            )
-
-            impl = _KERNEL_MAP[kernel_type]
-            warp_bases = [(0, 1)]
-            for i in range(int(math.log2(config["num_warps"] // 2))):
-                warp_bases.append((1 << i, 0))
-            extra_constexpr["warp_bases"] = tuple(warp_bases)
             config["NUM_BUFFERS"] = config.pop("num_stages", 1)
         else:
             raise AssertionError(
@@ -233,9 +237,16 @@ def gemm_a8w8_blockscale(
             **extra_constexpr,
         )
     elif backend == "gluon":
-        _intj_launch(
-            impl,
+        dev, stream = current_device_stream()
+        _gluon_gfx1250_gemm_a8w8_blockscale_launch(
+            False, kernel_type, config["num_warps"]
+        )(
+            dev,
+            stream,
             grid,
+            config.get("waves_per_eu", 0),
+            config.get("matrix_instr_nonkdim", 0),
+            config.get("kpack", 1),
             x,
             w,
             y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -255,8 +266,17 @@ def gemm_a8w8_blockscale(
             x_scale.stride(1),
             w_scale.stride(0),
             w_scale.stride(1),
-            **config,
-            **extra_constexpr,
+            config["GROUP_K"],
+            config["GROUP_N"],
+            config["BLOCK_SIZE_M"],
+            config["BLOCK_SIZE_N"],
+            config["BLOCK_SIZE_K"],
+            config["GROUP_SIZE_M"],
+            config["NUM_KSPLIT"],
+            config["SPLITK_BLOCK_SIZE"],
+            config["num_warps"],
+            config["cache_modifier"],
+            config["NUM_BUFFERS"],
         )
     else:
         dev, stream = current_device_stream()
@@ -473,7 +493,6 @@ def gemm_a8w8_blockscale_preshuffle(
         ),  # Effective launch grid dims: [NUM_KSPLIT, NUM_M_BLOCKS, NUM_N_BLOCKS]
     )
 
-    extra_constexpr = {}
     assert backend in (
         "triton",
         "gluon",
@@ -483,13 +502,9 @@ def gemm_a8w8_blockscale_preshuffle(
         assert (
             get_arch() in _GLUON_PRESHUFFLE_ARCHS
         ), f"Gluon preshuffle requires one of {_GLUON_PRESHUFFLE_ARCHS}, got '{get_arch()}'"
-        from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a8w8_blockscale import (
-            _PRESHUFFLE_KERNEL_MAP,
-        )
-
         assert (
-            kernel_type in _PRESHUFFLE_KERNEL_MAP
-        ), f"Unknown kernel_type '{kernel_type}', must be one of {list(_PRESHUFFLE_KERNEL_MAP.keys())}"
+            kernel_type in _GLUON_KERNEL_TYPES
+        ), f"Unknown kernel_type '{kernel_type}', must be one of {list(_GLUON_KERNEL_TYPES)}"
         _LOGGER.info(
             "GEMM_A8W8 BLOCKSCALE PRESHUFFLE [gluon/gfx1250]: x=%s w=%s kernel=%s",
             tuple(x.shape),
@@ -497,19 +512,19 @@ def gemm_a8w8_blockscale_preshuffle(
             kernel_type,
         )
 
-        impl = _PRESHUFFLE_KERNEL_MAP[kernel_type]
-        warp_bases = [(0, 1)]
-        for i in range(int(math.log2(config["num_warps"] // 2))):
-            warp_bases.append((1 << i, 0))
-        extra_constexpr["warp_bases"] = tuple(warp_bases)
         config["NUM_BUFFERS"] = config.pop("num_stages", 1)
-    else:
-        impl = triton_gemm_a8w8_blockscale_preshuffle_kernel
 
     if backend == "gluon":
-        _intj_launch(
-            impl,
+        dev, stream = current_device_stream()
+        _gluon_gfx1250_gemm_a8w8_blockscale_launch(
+            True, kernel_type, config["num_warps"]
+        )(
+            dev,
+            stream,
             grid,
+            config.get("waves_per_eu", 0),
+            config.get("matrix_instr_nonkdim", 0),
+            config.get("kpack", 1),
             x,
             w,
             y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -533,8 +548,18 @@ def gemm_a8w8_blockscale_preshuffle(
             ),
             w_scale.stride(0),
             w_scale.stride(1),
-            **config,
-            **extra_constexpr,
+            config["GROUP_K"],
+            config["GROUP_N"],
+            config["BLOCK_SIZE_M"],
+            config["BLOCK_SIZE_N"],
+            config["BLOCK_SIZE_K"],
+            config["GROUP_SIZE_M"],
+            config["NUM_KSPLIT"],
+            config["SPLITK_BLOCK_SIZE"],
+            config["num_warps"],
+            config["cache_modifier"],
+            config["NUM_BUFFERS"],
+            False,  # MAYBE_LOOP_UNROLL
         )
     else:
         dev, stream = current_device_stream()

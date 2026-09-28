@@ -334,6 +334,7 @@ def get_moe_a4w4_layouts_prefill(
     return layouts
 
 
+@gluon.constexpr_function
 def get_moe_a4w4_layouts_decode(
     BLOCK_M,
     BLOCK_N,
@@ -342,9 +343,16 @@ def get_moe_a4w4_layouts_decode(
     ACTIVATION_REDUCTION_N,
     PRESHUFFLE_WEIGHTS,
     SWIZZLE_MX_SCALE,
-    GatherIndx,
-    X_SCALES_TDM=False,
+    GATHER_IDX_BITS,
 ):
+    """Layouts of `_moe_gemm_a4w4_decode`, which calls this in the kernel.
+
+    GATHER_IDX_BITS is the bit width of GatherIndx's elements, 0 without one.
+    """
+    # Local import: a global would join the kernel's used_global_vals, which
+    # intj refuses.
+    from types import SimpleNamespace
+
     OUT_BLOCK_N = BLOCK_N // ACTIVATION_REDUCTION_N
     PACKED_BLOCK_M_X = BLOCK_M
     PACKED_BLOCK_K_X = BLOCK_K // 2
@@ -411,13 +419,11 @@ def get_moe_a4w4_layouts_decode(
     )
 
     GATHER_IDX_LAYOUT = None
-    if GatherIndx is not None:
-        assert GatherIndx.dtype == torch.uint16 or GatherIndx.dtype == torch.int32
-        gather_idx_bitwidth = 16 if GatherIndx.dtype == torch.uint16 else 32
+    if GATHER_IDX_BITS:
         GATHER_IDX_LAYOUT = gl.SliceLayout(
             0,
             gl.BlockedLayout(
-                size_per_thread=[1, 256 // gather_idx_bitwidth],
+                size_per_thread=[1, 256 // GATHER_IDX_BITS],
                 threads_per_warp=[32, 1],
                 warps_per_cta=[1, num_warps],
                 order=[0, 1],
@@ -502,7 +508,7 @@ def get_moe_a4w4_layouts_decode(
         "SHARED_LAYOUT_Y": SHARED_LAYOUT_Y,
     }
 
-    return layouts
+    return SimpleNamespace(**layouts)
 
 
 @gluon.jit
@@ -1451,19 +1457,6 @@ def _moe_gemm_a4w4_decode(
     UPCAST_INDICES: gl.constexpr,
     X_SCALES_TDM: gl.constexpr,
     CLAMP_BOUNDS: gl.constexpr,
-    # layouts
-    WMMA_LAYOUT: gl.constexpr,
-    DOT_LAYOUT_X: gl.constexpr,
-    DOT_LAYOUT_W: gl.constexpr,
-    DOT_LAYOUT_X_SCALES: gl.constexpr,
-    DOT_LAYOUT_W_SCALES: gl.constexpr,
-    GATHER_IDX_LAYOUT: gl.constexpr,
-    BLOCKED_LAYOUT_X_SCALES: gl.constexpr,
-    SHARED_LAYOUT_X: gl.constexpr,
-    SHARED_LAYOUT_W: gl.constexpr,
-    SHARED_LAYOUT_X_SCALES: gl.constexpr,
-    SHARED_LAYOUT_W_SCALES: gl.constexpr,
-    SHARED_LAYOUT_Y: gl.constexpr,
     # metaparameters
     num_warps: gl.constexpr,
     # MXFP4 output quant (GEMM1-style): emit e2m1 nibbles + e8m0 scales straight
@@ -1479,6 +1472,38 @@ def _moe_gemm_a4w4_decode(
     # Row extent of the combine window, so an out-of-range index is droppable.
     Y_ROWS=0,
 ):
+    # Layouts are built here, not passed in: intj bakes scalars, not layouts.
+    if GatherIndx is None:
+        GATHER_IDX_BITS: gl.constexpr = 0
+    else:
+        gl.static_assert(
+            (GatherIndx.dtype.element_ty == gl.uint16)
+            or (GatherIndx.dtype.element_ty == gl.int32)
+        )
+        GATHER_IDX_BITS: gl.constexpr = GatherIndx.dtype.element_ty.primitive_bitwidth
+    layouts: gl.constexpr = get_moe_a4w4_layouts_decode(
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+        num_warps,
+        ACTIVATION_REDUCTION_N,
+        PRESHUFFLE_WEIGHTS,
+        SWIZZLE_MX_SCALE,
+        GATHER_IDX_BITS,
+    )
+    WMMA_LAYOUT: gl.constexpr = layouts.WMMA_LAYOUT
+    DOT_LAYOUT_X: gl.constexpr = layouts.DOT_LAYOUT_X
+    DOT_LAYOUT_W: gl.constexpr = layouts.DOT_LAYOUT_W
+    DOT_LAYOUT_X_SCALES: gl.constexpr = layouts.DOT_LAYOUT_X_SCALES
+    DOT_LAYOUT_W_SCALES: gl.constexpr = layouts.DOT_LAYOUT_W_SCALES
+    GATHER_IDX_LAYOUT: gl.constexpr = layouts.GATHER_IDX_LAYOUT
+    BLOCKED_LAYOUT_X_SCALES: gl.constexpr = layouts.BLOCKED_LAYOUT_X_SCALES
+    SHARED_LAYOUT_X: gl.constexpr = layouts.SHARED_LAYOUT_X
+    SHARED_LAYOUT_W: gl.constexpr = layouts.SHARED_LAYOUT_W
+    SHARED_LAYOUT_X_SCALES: gl.constexpr = layouts.SHARED_LAYOUT_X_SCALES
+    SHARED_LAYOUT_W_SCALES: gl.constexpr = layouts.SHARED_LAYOUT_W_SCALES
+    SHARED_LAYOUT_Y: gl.constexpr = layouts.SHARED_LAYOUT_Y
+
     MX_PACK_DIVISOR: gl.constexpr = 32
     gl.static_assert(
         BLOCK_K % MX_PACK_DIVISOR == 0, "BLOCK_K must be a multiple of MX_PACK_DIVISOR"

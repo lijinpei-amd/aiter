@@ -7,7 +7,6 @@ import functools
 import torch
 import triton
 from intj import Constexpr, make_launcher
-from intj.compat import launch as _intj_launch
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
@@ -643,6 +642,24 @@ def _triton_gemm_afp4wfp4_preshuffle_kernel_launch(
     )
 
 
+@functools.cache
+def _gluon_gemm_mxfp4_preshuffle_gfx1250_launch(num_warps):
+    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
+        gemm_mxfp4_preshuffle_gfx1250,
+    )
+
+    return make_launcher(
+        gemm_mxfp4_preshuffle_gfx1250,
+        dynamic_options=(
+            "num_stages",
+            "waves_per_eu",
+            "matrix_instr_nonkdim",
+            "kpack",
+        ),
+        options={"num_warps": num_warps},
+    )
+
+
 def gemm_afp4wfp4_preshuffle(
     x_fp4: torch.Tensor,
     w_preshuf: torch.Tensor,
@@ -727,13 +744,6 @@ def gemm_afp4wfp4_preshuffle(
     )
 
     if use_gluon:
-        from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
-            gemm_mxfp4_preshuffle_gfx1250 as _gluon_gemm_mxfp4_preshuffle_gfx1250,
-        )
-        from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
-            get_gemm_afp4wfp4_preshuffle_layouts,
-        )
-
         grid = (
             (
                 triton.cdiv(M, config["BLOCK_SIZE_M"])
@@ -749,16 +759,15 @@ def gemm_afp4wfp4_preshuffle(
         k_tiles = triton.cdiv(K_bytes, BLOCK_K_BYTES)
         config["NUM_BUFFERS"] = min(config["NUM_BUFFERS"], k_tiles)
 
-        layouts = get_gemm_afp4wfp4_preshuffle_layouts(
-            config["num_warps"],
-            config["BLOCK_SIZE_M"],
-            config["BLOCK_SIZE_N"],
-            config["BLOCK_SIZE_K"],
-        )
-
-        _intj_launch(
-            _gluon_gemm_mxfp4_preshuffle_gfx1250,
+        dev, stream = current_device_stream()
+        _gluon_gemm_mxfp4_preshuffle_gfx1250_launch(config["num_warps"])(
+            dev,
+            stream,
             grid,
+            config.get("num_stages", 2),
+            config.get("waves_per_eu", 0),
+            config.get("matrix_instr_nonkdim", 0),
+            config.get("kpack", 1),
             x_fp4,
             w_preshuf,
             y,
@@ -778,8 +787,11 @@ def gemm_afp4wfp4_preshuffle(
             x_scales.stride(1),
             w_scales.stride(0),
             w_scales.stride(1),
-            **config,
-            **layouts,
+            config["BLOCK_SIZE_M"],
+            config["BLOCK_SIZE_N"],
+            config["BLOCK_SIZE_K"],
+            config["num_warps"],
+            config["NUM_BUFFERS"],
         )
         return y
 

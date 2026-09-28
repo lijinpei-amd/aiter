@@ -11,6 +11,16 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger  # debug
 
 _LOGGER = AiterTritonLogger()
 
+
+@gluon.constexpr_function
+def _wmma_warp_bases(num_warps):
+    """(0, 1), (1, 0), (2, 0), ...: log2(num_warps) WMMA warp bases."""
+    return tuple(
+        (0, 1) if i == 0 else (1 << (i - 1), 0)
+        for i in range(num_warps.bit_length() - 1)
+    )
+
+
 _GLUON_REPR_KEYS = [
     "GROUP_K",
     "GROUP_N",
@@ -82,7 +92,6 @@ def _gemm_a8w8_blockscale_bandwidth_bound_kernel(
     EVEN_K: gl.constexpr,
     # GRID_MN: gl.constexpr,
     num_warps: gl.constexpr,
-    warp_bases: gl.constexpr,
     cache_modifier: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
 ):
@@ -125,7 +134,7 @@ def _gemm_a8w8_blockscale_bandwidth_bound_kernel(
 
     # acc layout
     wmma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
-        3, True, warp_bases, [], [16, 16, 128]
+        3, True, _wmma_warp_bases(num_warps), [], [16, 16, 128]
     )
 
     # TDM Shared Layouts
@@ -470,7 +479,6 @@ def _gemm_a8w8_blockscale_compute_bound_kernel(
     EVEN_K: gl.constexpr,
     # GRID_MN: gl.constexpr,
     num_warps: gl.constexpr,
-    warp_bases: gl.constexpr,
     cache_modifier: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
 ):
@@ -499,7 +507,7 @@ def _gemm_a8w8_blockscale_compute_bound_kernel(
 
     # acc layout
     wmma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
-        3, True, warp_bases, [], [16, 16, 128]
+        3, True, _wmma_warp_bases(num_warps), [], [16, 16, 128]
     )
 
     # TDM Shared Layouts
@@ -864,7 +872,6 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
     EVEN_K: gl.constexpr,
     # GRID_MN: gl.constexpr,
     num_warps: gl.constexpr,
-    warp_bases: gl.constexpr,
     cache_modifier: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     MAYBE_LOOP_UNROLL: gl.constexpr = False,
@@ -938,7 +945,7 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
 
     # acc layout
     wmma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
-        3, True, warp_bases, [], [16, 16, 128]
+        3, True, _wmma_warp_bases(num_warps), [], [16, 16, 128]
     )
 
     # Shared memory layouts
@@ -1370,7 +1377,6 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
     EVEN_K: gl.constexpr,
     # GRID_MN: gl.constexpr,
     num_warps: gl.constexpr,
-    warp_bases: gl.constexpr,
     cache_modifier: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     MAYBE_LOOP_UNROLL: gl.constexpr = False,
@@ -1422,7 +1428,7 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
 
     # acc layout
     wmma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
-        3, True, warp_bases, [], [16, 16, 128]
+        3, True, _wmma_warp_bases(num_warps), [], [16, 16, 128]
     )
 
     # Shared memory layouts

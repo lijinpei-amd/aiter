@@ -1,17 +1,16 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_ogs.py
 
+import functools
 import itertools
 
 import torch
 import triton
 from intj import make_launcher
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a4w4 import (
     _moe_gemm_a4w4_decode,
     _moe_gemm_a4w4_prefill,
-    get_moe_a4w4_layouts_decode,
     get_moe_a4w4_layouts_prefill,
 )
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a4w4 import _moe_gemm_a4w4
@@ -278,6 +277,11 @@ _moe_gemm_a4w4_launch = make_launcher(
 )
 
 
+@functools.cache
+def _moe_gemm_a4w4_decode_launch(num_warps):
+    return make_launcher(_moe_gemm_a4w4_decode, options={"num_warps": num_warps})
+
+
 def moe_gemm_a4w4(
     x,
     w,
@@ -492,21 +496,12 @@ def moe_gemm_a4w4(
 
     # launch kernel
     if use_gluon and block_m == 16:
-        layouts = get_moe_a4w4_layouts_decode(
-            BLOCK_M=config["block_m"],
-            BLOCK_N=config["block_n"],
-            BLOCK_K=config["block_k"],
-            num_warps=config["num_warps"],
-            ACTIVATION_REDUCTION_N=reduction_n_matmul,
-            PRESHUFFLE_WEIGHTS=preshuffle_weights,
-            SWIZZLE_MX_SCALE=swizzle_mx_scale,
-            GatherIndx=gather_indx,
-            X_SCALES_TDM=x_scales_tdm,
-        )
         # launch gluon kernel
-        _intj_launch(
-            _moe_gemm_a4w4_decode,
-            (grid,),
+        dev, stream = current_device_stream()
+        _moe_gemm_a4w4_decode_launch(config["num_warps"])(
+            dev,
+            stream,
+            grid,
             y_ptr,
             stride_y_m,
             stride_y_n,
@@ -546,22 +541,21 @@ def moe_gemm_a4w4(
             config["block_m"],
             config["block_n"],
             config["block_k"],
-            XCD_SWIZZLE=config["xcd_swizzle"],
-            SWIZZLE_MX_SCALE=swizzle_mx_scale,
-            PRESHUFFLE_WEIGHTS=preshuffle_weights,
-            NUM_BUFFERS=config["num_buffers"],
-            UPCAST_INDICES=should_upcast_indices(x, w, y_ptr),
-            X_SCALES_TDM=x_scales_tdm,
-            CLAMP_BOUNDS=K % config["block_k"] != 0,
-            **layouts,
-            YMxScale=y_scale,
-            stride_y_mx_m=stride_y_mx_m,
-            stride_y_mx_n=stride_y_mx_n,
-            HAS_MX_OUT=out_mx_quant,
-            DstRow=dst_row,
-            EP_SCATTER=fused_ep_scatter,
-            Y_ROWS=(ep_scatter.out.shape[0] if fused_ep_scatter else 0),
-            num_warps=config["num_warps"],
+            config["xcd_swizzle"],
+            swizzle_mx_scale,
+            preshuffle_weights,
+            config["num_buffers"],
+            should_upcast_indices(x, w, y_ptr),
+            x_scales_tdm,
+            K % config["block_k"] != 0,  # CLAMP_BOUNDS
+            config["num_warps"],
+            y_scale,
+            stride_y_mx_m,
+            stride_y_mx_n,
+            out_mx_quant,
+            dst_row,
+            fused_ep_scatter,
+            ep_scatter.out.shape[0] if fused_ep_scatter else 0,  # Y_ROWS
         )
     elif use_gluon:
         # layouts

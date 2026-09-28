@@ -6,7 +6,6 @@ import functools
 import torch
 import triton
 from intj import make_launcher
-from intj.compat import launch as _intj_launch
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
@@ -85,6 +84,31 @@ def _triton_persistent_kernel_launch(num_stages, waves_per_eu):
         ),
         options={"num_stages": num_stages, "waves_per_eu": waves_per_eu},
     )
+
+
+@functools.cache
+def _gluon_persistent_kernel_launch(kernel_type, num_warps, num_stages, waves_per_eu):
+    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16_persistent import (
+        _KERNEL_MAP,
+    )
+
+    return make_launcher(
+        _KERNEL_MAP[kernel_type],
+        options={
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+            "waves_per_eu": waves_per_eu,
+        },
+    )
+
+
+@functools.cache
+def _gluon_kernel_launch(kernel_type):
+    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
+        _KERNEL_MAP,
+    )
+
+    return make_launcher(_KERNEL_MAP[kernel_type], dynamic_options=("num_warps",))
 
 
 @torch_compile_guard(gen_fake=gemm_a16w16_fake_tensor)
@@ -239,11 +263,6 @@ def gemm_a16w16_(
                     f"{w.stride()}"
                 )
 
-            warp_bases = tuple(
-                (0, 1) if i == 0 else (1 << (i - 1), 0)
-                for i in range(num_warps.bit_length() - 1)
-            )
-
             _LOGGER.info(
                 "GEMM_A16W16 [gluon, persistent]: x=%s w=%s",
                 x.shape,
@@ -257,9 +276,13 @@ def gemm_a16w16_(
 
             out_ptr = y if NUM_KSPLIT == 1 else y_pp
 
-            _intj_launch(
-                _GLUON_PERSISTENT_KERNEL_MAP[kernel_type],
-                (NUM_WGS,),
+            dev, stream = current_device_stream()
+            _gluon_persistent_kernel_launch(
+                kernel_type, num_warps, num_stages, waves_per_eu
+            )(
+                dev,
+                stream,
+                NUM_WGS,
                 x,
                 w,
                 bias,
@@ -275,24 +298,23 @@ def gemm_a16w16_(
                 0 if NUM_KSPLIT == 1 else y_pp.stride(0),
                 out_ptr.stride(-2),
                 out_ptr.stride(-1),
-                BLOCK_M=BLOCK_M,
-                BLOCK_N=BLOCK_N,
-                BLOCK_K=BLOCK_K,
-                GROUP_SIZE_M=GROUP_SIZE_M,
-                NUM_BUFFERS=NUM_BUFFERS,
-                NUM_KSPLIT=NUM_KSPLIT,
-                SPLITK_BLOCK_SIZE=SPLITK_BLOCK_SIZE,
-                WARP_BASES=warp_bases,
-                TRANSPOSE=TRANSPOSE,
-                activation=_get_activation_from_str(activation) if activation else None,
-                USE_ACTIVATION=activation is not None,
-                ADD_BIAS=(bias is not None),
-                SKIP_REDUCE=bool(skip_reduce),
-                NUM_SMS=NUM_WGS,
-                NUM_PID_N=num_pid_n,
-                num_warps=num_warps,
-                num_stages=num_stages,
-                waves_per_eu=waves_per_eu,
+                BLOCK_M,
+                BLOCK_N,
+                BLOCK_K,
+                GROUP_SIZE_M,
+                NUM_BUFFERS,
+                NUM_KSPLIT,
+                SPLITK_BLOCK_SIZE,
+                TRANSPOSE,
+                _get_activation_from_str(activation) if activation else None,
+                activation is not None,
+                bias is not None,
+                bool(skip_reduce),
+                NUM_WGS,  # NUM_SMS
+                num_pid_n,
+                num_warps,
+                num_stages,
+                waves_per_eu,
             )
 
             if NUM_KSPLIT > 1:
@@ -398,8 +420,6 @@ def gemm_a16w16_(
         ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
             _KERNEL_MAP,
-            create_shared_layouts,
-            create_wmma_layouts,
         )
 
         assert (
@@ -476,9 +496,6 @@ def gemm_a16w16_(
         if y is None:
             y = torch.empty((M, N), dtype=dtype, device=x.device)
 
-        wmma_layout, operand_a, operand_b = create_wmma_layouts(num_warps)
-        shared_a, shared_b = create_shared_layouts(BLOCK_M, BLOCK_N, BLOCK_K, layout)
-
         grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), 1)
 
         _LOGGER.info(
@@ -487,9 +504,12 @@ def gemm_a16w16_(
             w.shape,
         )
 
-        _intj_launch(
-            _KERNEL_MAP[kernel_type],
+        dev, stream = current_device_stream()
+        _gluon_kernel_launch(kernel_type)(
+            dev,
+            stream,
             grid,
+            num_warps,
             x,
             w,
             y,
@@ -503,20 +523,14 @@ def gemm_a16w16_(
             w.stride(1),
             y.stride(0),
             y.stride(1),
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            BLOCK_K=BLOCK_K,
-            NUM_BUFFERS=NUM_BUFFERS,
-            LAYOUT=layout,
-            SHARED_LAYOUT_A=shared_a,
-            SHARED_LAYOUT_B=shared_b,
-            WMMA_LAYOUT=wmma_layout,
-            OPERAND_LAYOUT_A=operand_a,
-            OPERAND_LAYOUT_B=operand_b,
-            activation=_get_activation_from_str(activation) if activation else None,
-            USE_ACTIVATION=activation is not None,
-            ADD_BIAS=(bias is not None),
-            num_warps=num_warps,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K,
+            NUM_BUFFERS,
+            layout,
+            _get_activation_from_str(activation) if activation else None,
+            activation is not None,
+            bias is not None,
         )
 
         return y

@@ -1,13 +1,15 @@
 import argparse
+import functools
 import math
 
 import torch
 import triton
 import triton.experimental.gluon.language as gl
-from intj.compat import launch as _intj_launch
+from intj import make_launcher
 from triton.experimental import gluon
 
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.device_info import current_device_stream
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
 )
@@ -78,6 +80,12 @@ def make_kv_cache_shuffled_layout(
     return layout
 
 
+@gluon.constexpr_function
+def _wmma_warp_bases(num_warps):
+    # [], [[1, 0]], [[1, 0], [2, 0]], ...: log2(num_warps) bases.
+    return [[1 << i, 0] for i in range(num_warps.bit_length() - 1)]
+
+
 @gluon.jit
 def simple_tdm_kernel(
     key_cache_ptr,
@@ -89,12 +97,28 @@ def simple_tdm_kernel(
     key_cache_stride_1: gl.constexpr,
     y_stride_m: gl.constexpr,
     y_stride_d: gl.constexpr,
-    WMMA_LAYOUT: gl.constexpr,
     num_warps: gl.constexpr,
     waves_per_eu: gl.constexpr,
     use_tdm: gl.constexpr,
 ):
     kv_head_idx = gl.program_id(0)
+
+    # use_tdm is set on gfx12 (WMMA); MFMA elsewhere.
+    if use_tdm:
+        WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
+            version=3,
+            transposed=True,
+            warp_bases=_wmma_warp_bases(num_warps),
+            reg_bases=[],
+            instr_shape=[16, 16, 32],
+        )
+    else:
+        WMMA_LAYOUT: gl.constexpr = gl.amd.AMDMFMALayout(
+            version=4,
+            instr_shape=[16, 16, 32],
+            transposed=True,
+            warps_per_cta=[num_warps, 1],
+        )
 
     K_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
         vec=1, per_phase=1, max_phase=1, order=[1, 0]
@@ -276,6 +300,14 @@ def simple_tdm_kernel(
     )
 
 
+@functools.cache
+def _simple_tdm_kernel_launch(num_warps, waves_per_eu):
+    return make_launcher(
+        simple_tdm_kernel,
+        options={"num_warps": num_warps, "waves_per_eu": waves_per_eu},
+    )
+
+
 def benchmark(args):
     num_blocks = args.num_blocks
     block_size = args.block_size
@@ -370,51 +402,30 @@ def benchmark(args):
         key_cache_shuffled = key_cache_shuffled.view(
             -1, num_kv_heads, block_size // 16, head_size * 16
         )
-        if num_warps == 1:
-            warp_bases = []
-        elif num_warps == 2:
-            warp_bases = [[1, 0]]
-        elif num_warps == 4:
-            warp_bases = [[1, 0], [2, 0]]
-        if IS_DEVICE_ARCH_GFX12:
-            WMMA_LAYOUT = gl.constexpr(
-                gl.amd.AMDWMMALayout(
-                    version=3,
-                    transposed=True,
-                    warp_bases=warp_bases,
-                    reg_bases=[],
-                    instr_shape=[16, 16, 32],
-                )
-            )
-        else:
-            WMMA_LAYOUT = gl.constexpr(
-                gl.amd.AMDMFMALayout(
-                    version=4,
-                    instr_shape=[16, 16, 32],
-                    transposed=True,
-                    warps_per_cta=[num_warps, 1],
-                )
-            )
-
         y = torch.empty(
             num_kv_heads, head_size, block_size, dtype=torch.bfloat16, device="cuda"
         )
 
+        launch = _simple_tdm_kernel_launch(num_warps, waves_per_eu)
+        dev, stream = current_device_stream()
+
         def fn():
-            _intj_launch(simple_tdm_kernel, (num_kv_heads,),
-                key_cache_ptr=key_cache_shuffled,
-                y_ptr=y,
-                num_blocks=num_blocks,
-                NUM_KV_HEADS=num_kv_heads,
-                BLOCK_SIZE=block_size,
-                HEAD_SIZE=head_size,
-                key_cache_stride_1=key_cache_shuffled.stride(1),
-                y_stride_m=y.stride(0),
-                y_stride_d=y.stride(1),
-                WMMA_LAYOUT=WMMA_LAYOUT,
-                num_warps=num_warps,
-                waves_per_eu=waves_per_eu,
-                use_tdm=use_tdm,
+            launch(
+                dev,
+                stream,
+                num_kv_heads,
+                key_cache_shuffled,
+                y,
+                num_blocks,
+                num_kv_heads,
+                block_size,
+                head_size,
+                key_cache_shuffled.stride(1),
+                y.stride(0),
+                y.stride(1),
+                num_warps,
+                waves_per_eu,
+                use_tdm,
             )
             # try:
             #     ref = key_cache.sum(dim=0).permute(1, 2, 0)

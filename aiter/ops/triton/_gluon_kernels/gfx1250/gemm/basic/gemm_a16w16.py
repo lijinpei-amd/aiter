@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import math
-
 import triton.experimental.gluon.language as gl
 from triton.experimental import gluon
 
@@ -27,48 +25,38 @@ _gemm_a16w16_compute_bound_repr = make_kernel_repr(
 )
 
 
-def create_shared_layouts(
-    BLOCK_M: gl.constexpr,
-    BLOCK_N: gl.constexpr,
-    BLOCK_K: gl.constexpr,
-    LAYOUT: gl.constexpr,
-):
+@gluon.constexpr_function
+def shared_layout_a(BLOCK_M, BLOCK_K, LAYOUT):
     if LAYOUT[0] == "T":
-        SHARED_LAYOUT_A: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        return gl.PaddedSharedLayout.with_identity_for(
             [[BLOCK_K, 8]], [BLOCK_M, BLOCK_K], [1, 0]
         )
-    else:
-        SHARED_LAYOUT_A: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[BLOCK_M, 8]], [BLOCK_K, BLOCK_M], [1, 0]
-        )
+    return gl.PaddedSharedLayout.with_identity_for(
+        [[BLOCK_M, 8]], [BLOCK_K, BLOCK_M], [1, 0]
+    )
 
+
+@gluon.constexpr_function
+def shared_layout_b(BLOCK_N, BLOCK_K, LAYOUT):
     if LAYOUT[1] == "T":
-        SHARED_LAYOUT_B: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        return gl.PaddedSharedLayout.with_identity_for(
             [[BLOCK_N, 16]], [BLOCK_K, BLOCK_N], [1, 0]
         )
-    else:
-        SHARED_LAYOUT_B: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[BLOCK_K, 8]], [BLOCK_N, BLOCK_K], [1, 0]
-        )
-
-    return (SHARED_LAYOUT_A, SHARED_LAYOUT_B)
+    return gl.PaddedSharedLayout.with_identity_for(
+        [[BLOCK_K, 8]], [BLOCK_N, BLOCK_K], [1, 0]
+    )
 
 
-def create_wmma_layouts(num_warps):
-    warp_bases = []
-    for i in range(int(math.log2(num_warps))):
-        if i == 0:
-            warp_bases.append((0, 1))
-        else:
-            warp_bases.append((1 << (i - 1), 0))
-    warp_bases = tuple(warp_bases)
-
-    wmma_layout = gl.amd.AMDWMMALayout(
+@gluon.constexpr_function
+def wmma_layout(num_warps):
+    # Warp bases (0, 1), (1, 0), (2, 0), ...: log2(num_warps) of them.
+    warp_bases = tuple(
+        (0, 1) if i == 0 else (1 << (i - 1), 0)
+        for i in range(num_warps.bit_length() - 1)
+    )
+    return gl.amd.AMDWMMALayout(
         version=3, transposed=True, warp_bases=warp_bases, instr_shape=[16, 16, 32]
     )
-    operand_a = gl.DotOperandLayout(operand_index=0, parent=wmma_layout, k_width=8)
-    operand_b = gl.DotOperandLayout(operand_index=1, parent=wmma_layout, k_width=8)
-    return (wmma_layout, operand_a, operand_b)
 
 
 @gluon.jit(repr=_gemm_a16w16_bandwidth_bound_repr)
@@ -91,15 +79,21 @@ def _gemm_a16w16_bandwidth_bound_kernel(
     BLOCK_K: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     LAYOUT: gl.constexpr,
-    SHARED_LAYOUT_A: gl.constexpr,
-    SHARED_LAYOUT_B: gl.constexpr,
-    WMMA_LAYOUT: gl.constexpr,
-    OPERAND_LAYOUT_A: gl.constexpr,
-    OPERAND_LAYOUT_B: gl.constexpr,
     activation: gl.constexpr,
     USE_ACTIVATION: gl.constexpr,
     ADD_BIAS: gl.constexpr,
 ):
+    # Layouts are built here, not passed in: intj bakes scalars, not layouts.
+    SHARED_LAYOUT_A: gl.constexpr = shared_layout_a(BLOCK_M, BLOCK_K, LAYOUT)
+    SHARED_LAYOUT_B: gl.constexpr = shared_layout_b(BLOCK_N, BLOCK_K, LAYOUT)
+    WMMA_LAYOUT: gl.constexpr = wmma_layout(gl.num_warps())
+    OPERAND_LAYOUT_A: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=WMMA_LAYOUT, k_width=8
+    )
+    OPERAND_LAYOUT_B: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=WMMA_LAYOUT, k_width=8
+    )
+
     pid = gl.program_id(axis=0)
     num_pid_m = gl.cdiv(M, BLOCK_M)
     pid_m = pid % num_pid_m
@@ -403,15 +397,20 @@ def _gemm_a16w16_compute_bound_kernel(
     BLOCK_K: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     LAYOUT: gl.constexpr,
-    SHARED_LAYOUT_A: gl.constexpr,
-    SHARED_LAYOUT_B: gl.constexpr,
-    WMMA_LAYOUT: gl.constexpr,
-    OPERAND_LAYOUT_A: gl.constexpr,
-    OPERAND_LAYOUT_B: gl.constexpr,
     activation: gl.constexpr,
     USE_ACTIVATION: gl.constexpr,
     ADD_BIAS: gl.constexpr,
 ):
+    # Layouts are built here, not passed in: intj bakes scalars, not layouts.
+    SHARED_LAYOUT_A: gl.constexpr = shared_layout_a(BLOCK_M, BLOCK_K, LAYOUT)
+    SHARED_LAYOUT_B: gl.constexpr = shared_layout_b(BLOCK_N, BLOCK_K, LAYOUT)
+    WMMA_LAYOUT: gl.constexpr = wmma_layout(gl.num_warps())
+    OPERAND_LAYOUT_A: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=WMMA_LAYOUT, k_width=8
+    )
+    OPERAND_LAYOUT_B: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=WMMA_LAYOUT, k_width=8
+    )
     """Local-load pipelining across K-tiles.
 
     Manually places load_shared_relaxed for tile i+1 *before* the wmma for

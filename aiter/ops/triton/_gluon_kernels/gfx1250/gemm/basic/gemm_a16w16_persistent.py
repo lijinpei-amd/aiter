@@ -12,6 +12,16 @@ from triton.experimental import gluon
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
 
+
+@gluon.constexpr_function
+def _wmma_warp_bases(num_warps):
+    """(0, 1), (1, 0), (2, 0), ...: log2(num_warps) WMMA warp bases."""
+    return tuple(
+        (0, 1) if i == 0 else (1 << (i - 1), 0)
+        for i in range(num_warps.bit_length() - 1)
+    )
+
+
 _GLUON_REPR_KEYS = [
     "BLOCK_M",
     "BLOCK_N",
@@ -65,7 +75,6 @@ def gemm_a16w16_persistent_kernel_(
     NUM_BUFFERS: gl.constexpr,
     NUM_KSPLIT: gl.constexpr,
     SPLITK_BLOCK_SIZE: gl.constexpr,
-    WARP_BASES: gl.constexpr,
     TRANSPOSE: gl.constexpr,
     activation: gl.constexpr,
     USE_ACTIVATION: gl.constexpr,
@@ -79,6 +88,7 @@ def gemm_a16w16_persistent_kernel_(
 ):
 
     WRITES_FINAL: gl.constexpr = NUM_KSPLIT == 1
+    WARP_BASES: gl.constexpr = _wmma_warp_bases(num_warps)
 
     SHARED_LAYOUT_A: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_K, 8]], [BLOCK_M, BLOCK_K], [1, 0]
@@ -366,7 +376,6 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
     NUM_BUFFERS: gl.constexpr,
     NUM_KSPLIT: gl.constexpr,
     SPLITK_BLOCK_SIZE: gl.constexpr,
-    WARP_BASES: gl.constexpr,
     TRANSPOSE: gl.constexpr,
     activation: gl.constexpr,
     USE_ACTIVATION: gl.constexpr,
@@ -380,6 +389,7 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
 ):
 
     WRITES_FINAL: gl.constexpr = NUM_KSPLIT == 1
+    WARP_BASES: gl.constexpr = _wmma_warp_bases(num_warps)
     # prefetch depth is derived from the buffer count
     PD: gl.constexpr = NUM_BUFFERS - 1
 

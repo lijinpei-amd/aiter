@@ -9,15 +9,12 @@ does not yet publish an intj dependency. Declaring a launcher does no GPU
 work, but needs a host C compiler once per interpreter (intj builds its
 generic lazy stub).
 
-What still launches through Triton, and why:
-
-- 32 tracked Triton bracket launches (table below): a runtime capability or
-  launch behavior intj cannot preserve.
-- 8 `intj.compat.launch` sites, all gfx1250 (or a gfx1250 benchmark) Gluon
-  paths that pass a tuple or a Gluon layout object as a constexpr (see
-  [Left on compat.launch](#left-on-compatlaunch)). No intj entry point
-  accepts those values, so these paths raise today, as they did before this
-  change.
+What still launches through Triton, and why: the 32 tracked Triton bracket
+launches in the table below, each needing a runtime capability or launch
+behavior intj cannot preserve. No `intj.compat.launch` call is left; the
+last eight, gfx1250 Gluon paths that passed a tuple or a Gluon layout object
+as a constexpr, now build those values in the kernel (see
+[gfx1250 Gluon kernels](#gfx1250-gluon-kernels)).
 
 Line numbers refer to this branch. The direct Iris kernels also have
 unsupported `tl.tensor` annotations; the fused Iris path remains pending
@@ -78,7 +75,7 @@ def _foo_kernel(...): ...
 
 _bar_launch = make_launcher(_bar_kernel, dynamic_options=("num_warps",))  # 96
 
-@functools.cache                                        # 53 factories
+@functools.cache                                        # 60 factories
 def _baz_launch(num_warps):
     return make_launcher(_baz_kernel, options={"num_warps": num_warps})
 ```
@@ -127,6 +124,13 @@ device and its raw stream, as Triton launches on.
   moe topk's `SCORE_MODE`, ...) are passed positionally and keyed by value.
   Values fixed at a site (the split-K reduces' `KERNEL_NAME`) are baked with
   `extra_annotation={name: Constexpr(value=...)}`.
+- **Gluon layouts and tuples** are never arguments: intj bakes scalars, not
+  layout objects or tuples. A kernel builds them from its constexpr ints and
+  strings, inline or through a `gluon.constexpr_function` it calls (the
+  gfx1250 GEMMs' warp bases from `num_warps`, the MXFP4 and MoE decode layout
+  sets returned as a `SimpleNamespace`). Such a function imports what it
+  needs locally: a global it reads (a class, a module constant) joins the
+  kernel's `used_global_vals`, which intj refuses.
 - **Tuned kernels.** The values a tuning layer assigns (`BL`, `num_warps`
   and `num_stages` under `ATTN_RES_TRITON_AUTOTUNE`, the chunk-delta
   autotune spaces) come from the tuner; they are neither passed nor
@@ -147,23 +151,60 @@ Triton's debug/instrumentation/fpsan knobs once, at its first call. Like
 `compat.launch`, a launch graph-breaks under `torch.compile` (Dynamo cannot
 trace `_cuda_getCurrentRawStream`).
 
-## Left on compat.launch
+## gfx1250 Gluon kernels
 
-| Site | Target | Unsupported value |
-| --- | --- | --- |
-| `aiter/ops/triton/gemm/basic/gemm_a16w16.py:260` | `_GLUON_PERSISTENT_KERNEL_MAP[kernel_type]` (gfx1250) | tuple constexpr `WARP_BASES` |
-| `aiter/ops/triton/gemm/basic/gemm_a16w16.py:490` | `_KERNEL_MAP[kernel_type]` (gfx1250) | Gluon layouts (`SHARED_LAYOUT_*`, `WMMA_LAYOUT`, ...) |
-| `aiter/ops/triton/gemm/basic/gemm_a8w8_blockscale.py:236` | `_KERNEL_MAP[kernel_type]` (gfx1250, `@triton.heuristics`) | tuple constexpr `warp_bases` |
-| `aiter/ops/triton/gemm/basic/gemm_a8w8_blockscale.py:510` | `_PRESHUFFLE_KERNEL_MAP[kernel_type]` (gfx1250, `@triton.heuristics`) | tuple constexpr `warp_bases` |
-| `aiter/ops/triton/gemm/basic/gemm_afp4wfp4.py:759` | `gemm_mxfp4_preshuffle_gfx1250` | Gluon layouts (`**layouts`) |
-| `aiter/ops/triton/gemm/batched/batched_gemm_bf16.py:215` | `_KERNEL_MAP[kernel_type]` (gfx1250) | Gluon layouts (`SHARED_LAYOUT_A`, ...) |
-| `aiter/ops/triton/moe/moe_op_gemm_a4w4.py:507` | `_moe_gemm_a4w4_decode` (gfx1250 Gluon) | Gluon layouts (`**layouts`) |
-| `op_tests/op_benchmarks/triton/bench_cache_copy.py:404` | `simple_tdm_kernel` (gfx1250 benchmark) | Gluon layout `WMMA_LAYOUT` |
+The eight gfx1250 sites that stayed on `intj.compat.launch` now use
+factories (`num_warps` is a parameter of most of these kernels), with the
+compile options the old call passed and nothing else:
 
-These are the only `intj.compat.launch` calls left. Both bridges that
-preceded this layout, `utils/intj_handle.py` (lazily built device-bound
-handles) and `utils/intj_tuned.py` (`launch_tuned`, per-call options for
-decorated kernels), are gone.
+| Site | Kernels | Was passed | Now built in the kernel from |
+| --- | --- | --- | --- |
+| `gemm_a16w16.py` persistent | `gemm_a16w16_persistent{,_compute_bound}_kernel_` | tuple `WARP_BASES` | `num_warps` |
+| `gemm_a8w8_blockscale.py` (plain and preshuffle) | four `_gemm_a8w8_blockscale*_kernel`s | tuple `warp_bases` | `num_warps` |
+| `gemm_a16w16.py` | `_gemm_a16w16_{bandwidth,compute}_bound_kernel` | 5 layouts | `LAYOUT`, tiles, `gl.num_warps()` |
+| `batched_gemm_bf16.py` | `_batched_gemm_bf16_{bandwidth,compute}_bound_kernel` | 5 layouts | `LAYOUT`, tiles, `num_warps` (shares the a16w16 helpers) |
+| `gemm_afp4wfp4.py` preshuffle | `gemm_mxfp4_preshuffle_gfx1250` | 10 layouts | tiles, `num_warps` |
+| `moe_op_gemm_a4w4.py` decode | `_moe_gemm_a4w4_decode` | 12 layouts | tiles, `num_warps`, swizzle/preshuffle flags, `GatherIndx`'s element width |
+| `bench_cache_copy.py` | `simple_tdm_kernel` | `WMMA_LAYOUT` | `use_tdm` (WMMA on gfx1250, MFMA elsewhere), `num_warps` |
+
+The host-side layout helpers became those constexpr functions
+(`create_*_layouts` → `shared_layout_a/b`, `wmma_layout`), so nothing
+outside the kernels builds these layouts any more.
+
+No gfx1250 GPU was available. Verified instead (Triton 3.8.0, intj
+`develop` `9075eaa`):
+
+- **Identical code.** A pytest plugin made Aiter report gfx1250 and turned
+  every launch of a `_gluon_kernels/gfx1250` kernel (and `simple_tdm_kernel`)
+  into a warmup compile with the target forced to `hip:gfx1250`, leaving
+  every other kernel to launch on the local gfx942. Run on this revision and
+  its parent over the gluon cases of `test_gemm_a16w16.py`,
+  `test_gemm_a8w8_blockscale.py`, `test_batched_gemm_bf16.py`,
+  `test_moe_gemm_a4w4.py` and the preshuffle cases of `test_gemm_afp4wfp4.py`,
+  plus sweeps the tests do not reach (batched and plain blockscale
+  `compute_bound`; MoE decode over `num_warps`, swizzle, preshuffle, gather
+  width, SwiGLU and tiles; MXFP4 over `num_warps`, tiles and buffers;
+  `bench_cache_copy` configs): 1,475 compiles, 600 distinct gfx1250 binaries
+  across the 13 kernels. The ttgir, LLVM IR and AMDGCN of every one are
+  identical to the parent's once locations and debug info are stripped, and
+  so are the compiled options.
+- **Construction.** Every new launcher is declared without
+  `UnsupportedKernel`, and its extension builds and decodes the test and
+  sweep calls that go through a launcher on the host (`no_gpu=True`,
+  heuristics applied by hand). Each call
+  passes exactly the parameters the kernel takes, bound to the values the
+  old call bound, plus compile options now passed at Triton's default
+  (`kpack=1`, ...) and `MAYBE_LOOP_UNROLL=False`.
+- **gfx950 (MI350X).** Only `simple_tdm_kernel` has a non-gfx1250 path
+  (MFMA, async copy). Its intj launch returns bitwise the output of the
+  parent's kernel under a plain Triton launch (the parent's `compat.launch`
+  raised on the layout), within bf16 rounding of an fp32 reference, and the
+  benchmark script runs.
+
+Untested: running any of these kernels on gfx1250 hardware (outputs,
+performance). The compile comparison covers the constexpr values the tests
+and sweeps produce; the MoE decode tests mostly fail before launching on
+both revisions (`moe_shuffle_scale` asserts a 2-D scale).
 
 ## Verification
 

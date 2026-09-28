@@ -4,6 +4,11 @@
 import triton.experimental.gluon.language as gl
 from triton.experimental import gluon
 
+from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
+    shared_layout_a,
+    shared_layout_b,
+    wmma_layout,
+)
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _GLUON_REPR_KEYS = [
@@ -52,11 +57,6 @@ def _batched_gemm_bf16_bandwidth_bound_kernel(
     BLOCK_K: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     LAYOUT: gl.constexpr,
-    SHARED_LAYOUT_A: gl.constexpr,
-    SHARED_LAYOUT_B: gl.constexpr,
-    WMMA_LAYOUT: gl.constexpr,
-    OPERAND_LAYOUT_A: gl.constexpr,
-    OPERAND_LAYOUT_B: gl.constexpr,
     ADD_BIAS: gl.constexpr,
     NUM_KSPLIT: gl.constexpr,
     SPLITK_BLOCK_SIZE: gl.constexpr,
@@ -64,6 +64,17 @@ def _batched_gemm_bf16_bandwidth_bound_kernel(
     waves_per_eu: gl.constexpr,
     cache_modifier: gl.constexpr,
 ):
+    # Layouts are built here, not passed in: intj bakes scalars, not layouts.
+    SHARED_LAYOUT_A: gl.constexpr = shared_layout_a(BLOCK_M, BLOCK_K, LAYOUT)
+    SHARED_LAYOUT_B: gl.constexpr = shared_layout_b(BLOCK_N, BLOCK_K, LAYOUT)
+    WMMA_LAYOUT: gl.constexpr = wmma_layout(num_warps)
+    OPERAND_LAYOUT_A: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=WMMA_LAYOUT, k_width=8
+    )
+    OPERAND_LAYOUT_B: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=WMMA_LAYOUT, k_width=8
+    )
+
     batch_id = gl.program_id(axis=0)
     pid_unified = gl.program_id(axis=1)
 
@@ -384,11 +395,6 @@ def _batched_gemm_bf16_compute_bound_kernel(
     BLOCK_K: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     LAYOUT: gl.constexpr,
-    SHARED_LAYOUT_A: gl.constexpr,
-    SHARED_LAYOUT_B: gl.constexpr,
-    WMMA_LAYOUT: gl.constexpr,
-    OPERAND_LAYOUT_A: gl.constexpr,
-    OPERAND_LAYOUT_B: gl.constexpr,
     ADD_BIAS: gl.constexpr,
     NUM_KSPLIT: gl.constexpr,
     SPLITK_BLOCK_SIZE: gl.constexpr,
@@ -396,6 +402,16 @@ def _batched_gemm_bf16_compute_bound_kernel(
     waves_per_eu: gl.constexpr,
     cache_modifier: gl.constexpr,
 ):
+    # Layouts are built here, not passed in: intj bakes scalars, not layouts.
+    SHARED_LAYOUT_A: gl.constexpr = shared_layout_a(BLOCK_M, BLOCK_K, LAYOUT)
+    SHARED_LAYOUT_B: gl.constexpr = shared_layout_b(BLOCK_N, BLOCK_K, LAYOUT)
+    WMMA_LAYOUT: gl.constexpr = wmma_layout(num_warps)
+    OPERAND_LAYOUT_A: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=WMMA_LAYOUT, k_width=8
+    )
+    OPERAND_LAYOUT_B: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=WMMA_LAYOUT, k_width=8
+    )
     gl.static_assert(NUM_BUFFERS >= 2, "compute_bound kernel requires NUM_BUFFERS >= 2")
 
     batch_id = gl.program_id(axis=0)

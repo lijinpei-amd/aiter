@@ -3,11 +3,15 @@ from triton.experimental import gluon
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-SCALE_GROUP_ELEMS = 32
-PRESHUFFLE_FACTOR = 32  # rows packed per scale-preshuffle stripe
 
-
+@gluon.constexpr_function
 def get_gemm_afp4wfp4_preshuffle_layouts(num_warps, BLOCK_M, BLOCK_N, BLOCK_K):
+    # Called in the kernel: intj bakes scalars, not layout objects. The import
+    # is local: a global would join the kernel's used_global_vals, which intj
+    # refuses.
+    from types import SimpleNamespace
+
+    SCALE_GROUP_ELEMS = 32
     K_GROUPS = BLOCK_K // SCALE_GROUP_ELEMS
     BLOCK_K_BYTES = BLOCK_K // 2
 
@@ -62,18 +66,18 @@ def get_gemm_afp4wfp4_preshuffle_layouts(num_warps, BLOCK_M, BLOCK_N, BLOCK_K):
         dot_b, [BLOCK_N, K_GROUPS], scale_factor=SCALE_GROUP_ELEMS
     )
 
-    return {
-        "wmma_layout": wmma_layout,
-        "wmma_acc_layout": wmma_acc_layout,
-        "shared_A": shared_A,
-        "shared_B": shared_B,
-        "shared_S": shared_S,
-        "shared_C": shared_C,
-        "dot_a_layout": dot_a,
-        "dot_b_layout": dot_b,
-        "a_scale_layout": scale_a,
-        "b_scale_layout": scale_b,
-    }
+    return SimpleNamespace(
+        wmma_layout=wmma_layout,
+        wmma_acc_layout=wmma_acc_layout,
+        shared_A=shared_A,
+        shared_B=shared_B,
+        shared_S=shared_S,
+        shared_C=shared_C,
+        dot_a_layout=dot_a,
+        dot_b_layout=dot_b,
+        a_scale_layout=scale_a,
+        b_scale_layout=scale_b,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -168,17 +172,20 @@ def gemm_mxfp4_preshuffle_gfx1250(
     BLOCK_SIZE_K: gl.constexpr,
     num_warps: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
-    wmma_layout: gl.constexpr,
-    wmma_acc_layout: gl.constexpr,
-    shared_A: gl.constexpr,
-    shared_B: gl.constexpr,
-    shared_S: gl.constexpr,
-    shared_C: gl.constexpr,
-    dot_a_layout: gl.constexpr,
-    dot_b_layout: gl.constexpr,
-    a_scale_layout: gl.constexpr,
-    b_scale_layout: gl.constexpr,
 ):
+    layouts: gl.constexpr = get_gemm_afp4wfp4_preshuffle_layouts(
+        num_warps, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K
+    )
+    wmma_acc_layout: gl.constexpr = layouts.wmma_acc_layout
+    shared_A: gl.constexpr = layouts.shared_A
+    shared_B: gl.constexpr = layouts.shared_B
+    shared_S: gl.constexpr = layouts.shared_S
+    shared_C: gl.constexpr = layouts.shared_C
+    dot_a_layout: gl.constexpr = layouts.dot_a_layout
+    dot_b_layout: gl.constexpr = layouts.dot_b_layout
+    a_scale_layout: gl.constexpr = layouts.a_scale_layout
+    b_scale_layout: gl.constexpr = layouts.b_scale_layout
+
     # Compile-time constants
     FP4_ELEMS_PER_BYTE: gl.constexpr = 2
     SCALE_GROUP_ELEMS: gl.constexpr = 32

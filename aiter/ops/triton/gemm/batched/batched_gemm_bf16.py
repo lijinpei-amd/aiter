@@ -6,7 +6,6 @@ import functools
 import torch
 import triton
 from intj import make_launcher
-from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _batched_gemm_splitk_reduce_kernel,
@@ -45,6 +44,18 @@ def _batched_gemm_bf16_kernel_launch(num_warps, num_stages, waves_per_eu):
             "num_stages": num_stages,
             "waves_per_eu": waves_per_eu,
         },
+    )
+
+
+@functools.cache
+def _gluon_batched_gemm_bf16_kernel_launch(kernel_type, num_warps, waves_per_eu):
+    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.batched.batched_gemm_bf16 import (
+        _KERNEL_MAP,
+    )
+
+    return make_launcher(
+        _KERNEL_MAP[kernel_type],
+        options={"num_warps": num_warps, "waves_per_eu": waves_per_eu},
     )
 
 
@@ -108,10 +119,6 @@ def batched_gemm_bf16(
         assert (
             _is_gluon_available()
         ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
-        from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
-            create_shared_layouts,
-            create_wmma_layouts,
-        )
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.batched.batched_gemm_bf16 import (
             _KERNEL_MAP,
         )
@@ -199,9 +206,6 @@ def batched_gemm_bf16(
                 f"WQ must be contiguous in at least one of K/N dims, got strides {WQ.stride()}"
             )
 
-        wmma_layout, operand_a, operand_b = create_wmma_layouts(num_warps)
-        shared_a, shared_b = create_shared_layouts(BLOCK_M, BLOCK_N, BLOCK_K, layout)
-
         out_tensor = YQ if NUM_KSPLIT == 1 else y_pp
 
         grid = (
@@ -212,8 +216,10 @@ def batched_gemm_bf16(
         num_ksplit = NUM_KSPLIT
         splitk_block_size = SPLITK_BLOCK_SIZE
 
-        _intj_launch(
-            _KERNEL_MAP[kernel_type],
+        dev, stream = current_device_stream()
+        _gluon_batched_gemm_bf16_kernel_launch(kernel_type, num_warps, waves_per_eu)(
+            dev,
+            stream,
             grid,
             XQ,
             WQ,
@@ -233,22 +239,17 @@ def batched_gemm_bf16(
             YQ.stride(2) if num_ksplit == 1 else y_pp.stride(3),
             0 if num_ksplit == 1 else y_pp.stride(0),
             bias.stride(0) if has_bias else 0,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            BLOCK_K=BLOCK_K,
-            NUM_BUFFERS=NUM_BUFFERS,
-            LAYOUT=layout,
-            SHARED_LAYOUT_A=shared_a,
-            SHARED_LAYOUT_B=shared_b,
-            WMMA_LAYOUT=wmma_layout,
-            OPERAND_LAYOUT_A=operand_a,
-            OPERAND_LAYOUT_B=operand_b,
-            ADD_BIAS=has_bias,
-            NUM_KSPLIT=num_ksplit,
-            SPLITK_BLOCK_SIZE=splitk_block_size,
-            num_warps=num_warps,
-            waves_per_eu=waves_per_eu,
-            cache_modifier=cache_modifier,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K,
+            NUM_BUFFERS,
+            layout,
+            has_bias,
+            num_ksplit,
+            splitk_block_size,
+            num_warps,
+            waves_per_eu,
+            cache_modifier,
         )
 
     else:
