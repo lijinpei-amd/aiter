@@ -1,15 +1,7 @@
-from intj import make_launcher
-
 from aiter.ops.triton._triton_kernels.attention.unified_attention_sparse_mla import (
     _kernel_unified_attention_sparse_mla_2d,
 )
 from aiter.ops.triton.utils.device_info import current_device_stream
-
-_kernel_unified_attention_sparse_mla_2d_launch = make_launcher(
-    _kernel_unified_attention_sparse_mla_2d,
-    grid_arg=1,
-    options={"num_stages": 1, "num_warps": 4},
-)
 
 
 def unified_attention_sparse_mla(
@@ -65,7 +57,7 @@ def unified_attention_sparse_mla(
     KV_LORA_RANK = kv_lora_rank
     TILE_SIZE = block_size
     dev, stream = current_device_stream()
-    _kernel_unified_attention_sparse_mla_2d_launch(
+    _kernel_unified_attention_sparse_mla_2d(
         dev,
         stream,
         total_num_q_blocks,

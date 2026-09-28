@@ -2,7 +2,6 @@ from typing import Literal
 
 import torch
 import triton
-from intj import make_launcher
 
 import aiter
 from aiter.ops.triton._triton_kernels.activation import (
@@ -16,13 +15,6 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 fp8_dtype = aiter.dtypes.fp8
 
 _LOGGER = AiterTritonLogger()
-
-
-_act_mul_and_dynamic_mxfp4_quant_kernel_launch = make_launcher(
-    _act_mul_and_dynamic_mxfp4_quant_kernel,
-    dynamic_options=("num_warps",),
-    options={"waves_per_eu": 0, "num_stages": 1},
-)
 
 
 def act_mul_and_mxfp4_quant(
@@ -112,7 +104,7 @@ def act_mul_and_mxfp4_quant(
         triton.cdiv(N_half, BLOCK_SIZE_N * NUM_ITER),
     )
     dev, stream = current_device_stream()
-    _act_mul_and_dynamic_mxfp4_quant_kernel_launch(
+    _act_mul_and_dynamic_mxfp4_quant_kernel(
         dev,
         stream,
         grid,
@@ -139,11 +131,6 @@ def act_mul_and_mxfp4_quant(
     )
 
     return x_fp4, blockscale_e8m0
-
-
-_act_mul_and_dynamic_fp8_group_quant_kernel_launch = make_launcher(
-    _act_mul_and_dynamic_fp8_group_quant_kernel
-)
 
 
 def act_mul_and_fp8_group_quant(
@@ -199,7 +186,7 @@ def act_mul_and_fp8_group_quant(
         triton.cdiv(N_half, BLOCK_SIZE_N),
     )
     dev, stream = current_device_stream()
-    _act_mul_and_dynamic_fp8_group_quant_kernel_launch(
+    _act_mul_and_dynamic_fp8_group_quant_kernel(
         dev,
         stream,
         grid,
@@ -219,11 +206,6 @@ def act_mul_and_fp8_group_quant(
     )
 
     return x_fp8, out_bs
-
-
-_fused_silu_mul_kernel_launch = make_launcher(
-    fused_silu_mul_kernel, dynamic_options=("num_warps",), options={"waves_per_eu": 0}
-)
 
 
 def fused_silu_mul(
@@ -319,7 +301,7 @@ def fused_silu_mul(
 
     grid = (grid_m, grid_n)
     dev, stream = current_device_stream()
-    _fused_silu_mul_kernel_launch(
+    fused_silu_mul_kernel(
         dev,
         stream,
         grid,

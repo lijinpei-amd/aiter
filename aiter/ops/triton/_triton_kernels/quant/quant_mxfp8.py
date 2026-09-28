@@ -16,6 +16,7 @@
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -331,6 +332,9 @@ def _unpack_fp8(
     return y
 
 
+@make_launcher(
+    dynamic_options=("num_warps",), options={"waves_per_eu": 2, "num_stages": 2}
+)
 @triton.jit(repr=_convert_to_mxfp8_kernel_repr)
 def _convert_to_mxfp8_kernel(
     x_ptr,
@@ -403,6 +407,9 @@ def _convert_to_mxfp8_kernel(
     tl.store(s_ptr + offs_s, scales)
 
 
+@make_launcher(
+    dynamic_options=("num_warps",), options={"waves_per_eu": 2, "num_stages": 2}
+)
 @triton.jit(repr=_convert_from_mxfp8_kernel_repr)
 def _convert_from_mxfp8_kernel(
     x_ptr,

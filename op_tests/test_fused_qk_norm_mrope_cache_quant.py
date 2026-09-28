@@ -77,6 +77,7 @@ def apply_rotary_emb_dispatch(
     return apply_rotary_emb_torch(x, cos, sin, is_neox_style)
 
 
+@make_launcher
 @triton.jit
 def set_kv_cache_shuffle_kernel(
     key_ptr,  # [num_tokens, num_kv_heads, head_size]
@@ -124,9 +125,6 @@ def set_kv_cache_shuffle_kernel(
     tl.store(value_cache_ptr + dst_v_shuffle_offset, v_val)
 
 
-_set_kv_cache_shuffle_kernel_launch = make_launcher(set_kv_cache_shuffle_kernel)
-
-
 def set_kv_cache_shuffle_layout(
     k_quantized: Tensor,  # [num_tokens, num_kv_heads, head_size] - already quantized
     v_quantized: Tensor,  # [num_tokens, num_kv_heads, head_size] - already quantized
@@ -162,7 +160,7 @@ def set_kv_cache_shuffle_layout(
 
     grid = (num_tokens, num_kv_heads)
     dev, stream = current_device_stream()
-    _set_kv_cache_shuffle_kernel_launch(
+    set_kv_cache_shuffle_kernel(
         dev,
         stream,
         grid,

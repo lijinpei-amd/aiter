@@ -4,6 +4,7 @@
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 from aiter.ops.triton._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
@@ -114,6 +115,15 @@ _moe_gemm_a8w8_blockscale_repr = make_kernel_repr(
 )
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    )
+)
 @triton.jit(repr=_moe_gemm_a8w8_blockscale_repr, launch_metadata=matmul_launch_metadata)
 def _moe_gemm_a8w8_blockscale(
     Y,

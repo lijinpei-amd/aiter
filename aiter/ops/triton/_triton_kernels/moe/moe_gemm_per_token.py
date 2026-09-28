@@ -14,6 +14,7 @@ table (``block_expert_ids``, ``block_token_offsets``).
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -28,6 +29,7 @@ _repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_K"] == 0,

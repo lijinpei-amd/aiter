@@ -3,6 +3,7 @@
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -185,6 +186,7 @@ _quant_rms_norm_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_quant_rms_norm_kernel_repr)
 def _quant_rms_norm_kernel(
     # Pointers to matrices
@@ -426,6 +428,7 @@ _fused_add_rmsnorm_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_fused_add_rmsnorm_kernel_repr)
 def _fused_add_rmsnorm_kernel(
     # Pointers to matrices
@@ -587,6 +590,7 @@ _quant_fused_add_rmsnorm_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_quant_fused_add_rmsnorm_kernel_repr)
 def _quant_fused_add_rmsnorm_kernel(
     # Pointers to matrices
@@ -826,6 +830,7 @@ _rmsnorm_bwd_triton_repr = make_kernel_repr(
 )
 
 
+@make_launcher(options={"num_warps": 8})
 @triton.jit(repr=_rmsnorm_bwd_triton_repr)
 def _rmsnorm_bwd_triton(
     grad_output_ptr,
@@ -977,6 +982,7 @@ _rmsnorm_bwd_dg_reduce_triton_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("num_warps",))
 @triton.jit(repr=_rmsnorm_bwd_dg_reduce_triton_repr)
 def _rmsnorm_bwd_dg_reduce_triton(
     dg_in_ptr,
@@ -1018,6 +1024,12 @@ _rmsnorm_kernel_large_m_small_n_repr = make_kernel_repr(
 )
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+    )
+)
 @triton.jit(repr=_rmsnorm_kernel_large_m_small_n_repr)
 def _rmsnorm_kernel_large_m_small_n(
     X,
@@ -1073,6 +1085,12 @@ _rmsnorm_bwd_kernel_large_m_small_n_repr = make_kernel_repr(
 )
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+    )
+)
 @triton.jit(repr=_rmsnorm_bwd_kernel_large_m_small_n_repr)
 def _rmsnorm_bwd_kernel_large_m_small_n(
     grad_output_ptr,  # [M, N]

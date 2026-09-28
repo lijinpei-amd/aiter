@@ -106,15 +106,6 @@ def _layernorm_forward_with_add(
     )
 
 
-_layernorm_bwd_dwdb_triton_launch = make_launcher(_layernorm_bwd_dwdb_triton)
-_layernorm_bwd_dwdb_triton_v2_launch = make_launcher(_layernorm_bwd_dwdb_triton_v2)
-
-
-_layernorm_bwd_dx_fused_triton_launch = make_launcher(
-    _layernorm_bwd_dx_fused_triton, dynamic_options=("num_warps",)
-)
-
-
 def _layernorm_backward(
     dy: torch.Tensor,
     dx: torch.Tensor,
@@ -155,7 +146,7 @@ def _layernorm_backward(
 
     grid_bwd = (tile_num,)
     dev, stream = current_device_stream()
-    _layernorm_bwd_dx_fused_triton_launch(
+    _layernorm_bwd_dx_fused_triton(
         dev,
         stream,
         grid_bwd,
@@ -182,7 +173,7 @@ def _layernorm_backward(
         dwdb_block_m = min(triton.next_power_of_2(tile_num), dwdb_block_m)
         grid_reduce = (triton.cdiv(N, dwdb_block_n),)
         dev, stream = current_device_stream()
-        _layernorm_bwd_dwdb_triton_launch(
+        _layernorm_bwd_dwdb_triton(
             dev,
             stream,
             grid_reduce,
@@ -202,7 +193,7 @@ def _layernorm_backward(
         dwdb_block_m = min(triton.next_power_of_2(M), dwdb_block_m)
         grid_reduce = (triton.cdiv(N, dwdb_block_n),)
         dev, stream = current_device_stream()
-        _layernorm_bwd_dwdb_triton_v2_launch(
+        _layernorm_bwd_dwdb_triton_v2(
             dev,
             stream,
             grid_reduce,
@@ -362,9 +353,6 @@ def layernorm2d_fwd_with_add(
     )
 
 
-_quant_layernorm_kernel_launch = make_launcher(_quant_layernorm_kernel, grid_arg=1)
-
-
 def layernorm2d_fwd_with_dynamicquant(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -409,7 +397,7 @@ def layernorm2d_fwd_with_dynamicquant(
     aux = torch.empty(M, N, dtype=torch.float32, device=input.device)
 
     dev, stream = current_device_stream()
-    _quant_layernorm_kernel_launch(
+    _quant_layernorm_kernel(
         dev,
         stream,
         M,
@@ -478,7 +466,7 @@ def layernorm2d_fwd_with_smoothquant(
     aux = torch.empty(M, N, dtype=torch.float32, device=input.device)
 
     dev, stream = current_device_stream()
-    _quant_layernorm_kernel_launch(
+    _quant_layernorm_kernel(
         dev,
         stream,
         M,
@@ -501,12 +489,6 @@ def layernorm2d_fwd_with_smoothquant(
     )
 
     return
-
-
-_quant_fused_add_layernorm_kernel_launch = make_launcher(
-    _quant_fused_add_layernorm_kernel,
-    grid_arg=1,
-)
 
 
 def layernorm2d_fwd_with_add_dynamicquant(
@@ -558,7 +540,7 @@ def layernorm2d_fwd_with_add_dynamicquant(
     aux = torch.empty(M, N, dtype=torch.float32, device=input.device)
 
     dev, stream = current_device_stream()
-    _quant_fused_add_layernorm_kernel_launch(
+    _quant_fused_add_layernorm_kernel(
         dev,
         stream,
         M,
@@ -636,7 +618,7 @@ def layernorm2d_fwd_with_add_smoothquant(
     aux = torch.empty(M, N, dtype=torch.float32, device=input.device)
 
     dev, stream = current_device_stream()
-    _quant_fused_add_layernorm_kernel_launch(
+    _quant_fused_add_layernorm_kernel(
         dev,
         stream,
         M,

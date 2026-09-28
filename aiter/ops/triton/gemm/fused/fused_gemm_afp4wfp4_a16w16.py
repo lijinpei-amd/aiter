@@ -24,11 +24,6 @@ from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
 _LOGGER = AiterTritonLogger()
 
 
-_fused_gemm_afp4wfp4_a16w16_reduce_kernel_launch = make_launcher(
-    _fused_gemm_afp4wfp4_a16w16_reduce_kernel,
-)
-
-
 @functools.cache
 def _fused_gemm_afp4wfp4_preshuffle_a16w16_kernel_launch(
     num_warps, num_stages, waves_per_eu, matrix_instr_nonkdim
@@ -353,7 +348,7 @@ def fused_gemm_afp4wfp4_a16w16(
             + triton.cdiv(N_bf16, REDUCE_BLOCK_SIZE_N),
         )
         dev, stream = current_device_stream()
-        _fused_gemm_afp4wfp4_a16w16_reduce_kernel_launch(
+        _fused_gemm_afp4wfp4_a16w16_reduce_kernel(
             dev,
             stream,
             grid_reduce,

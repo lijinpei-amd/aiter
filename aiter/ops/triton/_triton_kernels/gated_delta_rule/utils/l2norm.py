@@ -71,6 +71,7 @@ def l2norm_fwd_kernel1(
 _l2norm_fwd_kernel1_launch = make_launcher(l2norm_fwd_kernel1, grid_arg=1)
 
 
+@make_launcher(grid_arg=1)
 @triton.autotune(
     configs=autotune_configs(
         "GATED_DELTA_RULE",
@@ -101,9 +102,6 @@ def l2norm_bwd_kernel1(
     b_dy = tl.load(dy + cols, mask=mask, other=0.0).to(tl.float32)
     b_dx = b_dy * b_rstd - tl.sum(b_dy * b_y) * b_y * b_rstd
     tl.store(dx + cols, b_dx, mask=mask)
-
-
-_l2norm_bwd_kernel1_launch = make_launcher(l2norm_bwd_kernel1, grid_arg=1)
 
 
 @triton.jit
@@ -154,6 +152,12 @@ _l2norm_fwd_kernel_launch = make_launcher(
 )
 
 
+def _l2norm_bwd_kernel_grid(T: int, BT: int):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (triton.cdiv(T, BT),)
+
+
+@make_launcher(grid_cpp=_l2norm_bwd_kernel_grid)
 @triton.autotune(
     configs=autotune_configs(
         "GATED_DELTA_RULE",
@@ -209,17 +213,6 @@ def l2norm_bwd_kernel(
         b_dx.to(dx.dtype.element_ty),
         mask=(_p_dx_0[:, None] < (T)) & (_p_dx_1[None, :] < (D)),
     )
-
-
-def _l2norm_bwd_kernel_grid(T: int, BT: int):
-    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
-    return (triton.cdiv(T, BT),)
-
-
-_l2norm_bwd_kernel_launch = make_launcher(
-    l2norm_bwd_kernel,
-    grid_cpp=_l2norm_bwd_kernel_grid,
-)
 
 
 def l2norm_fwd(
@@ -349,7 +342,7 @@ def l2norm_bwd(
         NB = triton.cdiv(T, 2048)
 
         dev, stream = current_device_stream()
-        _l2norm_bwd_kernel_launch(
+        l2norm_bwd_kernel(
             dev,
             stream,
             y,
@@ -364,7 +357,7 @@ def l2norm_bwd(
         )
     else:
         dev, stream = current_device_stream()
-        _l2norm_bwd_kernel1_launch(
+        l2norm_bwd_kernel1(
             dev,
             stream,
             T,

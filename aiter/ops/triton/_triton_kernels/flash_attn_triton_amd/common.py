@@ -53,6 +53,7 @@ def compute_fp8_scaling_factors(x, fp8_max: tl.constexpr):
     return scale_x, descale_x
 
 
+@make_launcher
 @triton.jit
 def _cast_varlen_to_fp8_kernel_2d(
     X,
@@ -155,9 +156,6 @@ def _cast_varlen_to_fp8_kernel_2d(
             + offs_dim[None, :] * stride_out_dim
         )
         tl.store(X_fp8 + addr_out, x_fp8_block, mask=mask_seq)
-
-
-_cast_varlen_to_fp8_kernel_2d_launch = make_launcher(_cast_varlen_to_fp8_kernel_2d)
 
 
 @triton.jit
@@ -326,7 +324,7 @@ def cast_to_fp8(
 
     grid = (batch, num_heads)
     dev, stream = current_device_stream()
-    _cast_varlen_to_fp8_kernel_2d_launch(
+    _cast_varlen_to_fp8_kernel_2d(
         dev,
         stream,
         grid,

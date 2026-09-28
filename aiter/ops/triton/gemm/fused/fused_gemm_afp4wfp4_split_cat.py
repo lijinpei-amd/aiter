@@ -3,7 +3,6 @@
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import _get_config
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
@@ -16,23 +15,6 @@ from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
-
-
-_fused_gemm_afp4wfp4_split_cat_reduce_launch = make_launcher(
-    _fused_gemm_afp4wfp4_split_cat_reduce,
-)
-
-
-_fused_gemm_afp4wfp4_split_cat_launch = make_launcher(
-    _fused_gemm_afp4wfp4_split_cat,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
 
 
 def fused_gemm_afp4wfp4_split_cat(
@@ -141,7 +123,7 @@ def fused_gemm_afp4wfp4_split_cat(
         ),  # Effective launch grid dims: [NUM_KSPLIT, NUM_M_BLOCKS, NUM_N_BLOCKS]
     )
     dev, stream = current_device_stream()
-    _fused_gemm_afp4wfp4_split_cat_launch(
+    _fused_gemm_afp4wfp4_split_cat(
         dev,
         stream,
         grid,
@@ -204,7 +186,7 @@ def fused_gemm_afp4wfp4_split_cat(
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
         dev, stream = current_device_stream()
-        _fused_gemm_afp4wfp4_split_cat_reduce_launch(
+        _fused_gemm_afp4wfp4_split_cat_reduce(
             dev,
             stream,
             grid_reduce,
@@ -238,18 +220,6 @@ def fused_gemm_afp4wfp4_split_cat(
         )
 
     return c1, c2
-
-
-_fused_gemm_afp4wfp4_preshuffle_split_cat_launch = make_launcher(
-    _fused_gemm_afp4wfp4_preshuffle_split_cat,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
 
 
 def fused_gemm_afp4wfp4_preshuffle_split_cat(
@@ -357,7 +327,7 @@ def fused_gemm_afp4wfp4_preshuffle_split_cat(
         ),  # Effective launch grid dims: [NUM_KSPLIT, NUM_M_BLOCKS, NUM_N_BLOCKS]
     )
     dev, stream = current_device_stream()
-    _fused_gemm_afp4wfp4_preshuffle_split_cat_launch(
+    _fused_gemm_afp4wfp4_preshuffle_split_cat(
         dev,
         stream,
         grid,
@@ -420,7 +390,7 @@ def fused_gemm_afp4wfp4_preshuffle_split_cat(
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
         dev, stream = current_device_stream()
-        _fused_gemm_afp4wfp4_split_cat_reduce_launch(
+        _fused_gemm_afp4wfp4_split_cat_reduce(
             dev,
             stream,
             grid_reduce,

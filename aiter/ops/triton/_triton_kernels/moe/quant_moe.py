@@ -1,5 +1,6 @@
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.quant.quant import (
     _mxfp4_quant_op,
@@ -164,6 +165,7 @@ _downcast_to_mxfp_repr = make_kernel_repr(
 )
 
 
+@make_launcher(grid_arg=2, options={"num_warps": 8})
 @triton.jit(repr=_downcast_to_mxfp_repr)
 def _downcast_to_mxfp(
     mx_tensor_ptr,
@@ -275,6 +277,7 @@ _smoothquant_fuse_quant_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(options={"num_warps": 4})
 @triton.jit(repr=_smoothquant_fuse_quant_kernel_repr)
 def _smoothquant_fuse_quant_kernel(
     # Input tensors
@@ -404,6 +407,7 @@ _smoothquant_fuse_quant_kernel_single_pass_repr = make_kernel_repr(
 )
 
 
+@make_launcher(options={"num_warps": 4})
 @triton.jit(repr=_smoothquant_fuse_quant_kernel_single_pass_repr)
 def _smoothquant_fuse_quant_kernel_single_pass(
     # Input tensors

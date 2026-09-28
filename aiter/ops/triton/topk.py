@@ -11,7 +11,6 @@ import math
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.topk import (
     _topk_kernel,
@@ -32,13 +31,6 @@ def _pick_block(m: int, k: int) -> int:
     return blk
 
 
-_topk_kernel_launch = make_launcher(
-    _topk_kernel,
-    grid_arg=1,
-    options={"num_stages": 2, "num_warps": 4},
-)
-
-
 def one_stage_topk(
     x: torch.Tensor,
     k: int,
@@ -51,7 +43,7 @@ def one_stage_topk(
     out_v = torch.empty((B, k), device=x.device, dtype=x.dtype)
     out_i = torch.empty((B, k), device=x.device, dtype=torch.int64)
     dev, stream = current_device_stream()
-    _topk_kernel_launch(
+    _topk_kernel(
         dev,
         stream,
         B,
@@ -68,10 +60,6 @@ def one_stage_topk(
         is_tdm_avail(),  # USE_TDM
     )
     return out_v, out_i
-
-
-_topk_stage1_kernel_launch = make_launcher(topk_stage1_kernel, grid_arg=2)
-_topk_stage2_kernel_launch = make_launcher(topk_stage2_kernel, grid_arg=1)
 
 
 def two_stage_topk(x, k, dim=-1, largest=True):
@@ -102,7 +90,7 @@ def two_stage_topk(x, k, dim=-1, largest=True):
     stage2_out_idx = torch.empty(out_shape, device=x.device, dtype=torch.int64)
 
     dev, stream = current_device_stream()
-    _topk_stage1_kernel_launch(
+    topk_stage1_kernel(
         dev,
         stream,
         batch_size,
@@ -127,7 +115,7 @@ def two_stage_topk(x, k, dim=-1, largest=True):
     # The stage-2 launch only runs when ``descending`` (unchanged upstream behavior).
     if descending:
         dev, stream = current_device_stream()
-        _topk_stage2_kernel_launch(
+        topk_stage2_kernel(
             dev,
             stream,
             batch_size,

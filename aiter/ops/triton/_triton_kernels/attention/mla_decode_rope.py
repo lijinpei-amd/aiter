@@ -27,6 +27,7 @@ import functools
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.activation import _tanh
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
@@ -54,6 +55,15 @@ _fwd_grouped_kernel_stage1_rope_repr = make_kernel_repr(
 )
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    )
+)
 @triton.jit(repr=_fwd_grouped_kernel_stage1_rope_repr)
 def _fwd_grouped_kernel_stage1_rope(
     Q,  # Holds [Q_NOPE; Q_PE], b x h x (d+r)

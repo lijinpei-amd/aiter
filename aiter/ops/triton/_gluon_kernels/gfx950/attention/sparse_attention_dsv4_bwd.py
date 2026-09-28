@@ -24,6 +24,7 @@ free of torch so the kernels can be called without it.
 """
 
 import triton.language as tl
+from intj import make_launcher
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
@@ -41,6 +42,7 @@ _dq_v4_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(grid_arg=2, options={"num_warps": 4, "waves_per_eu": 1})
 @gluon.jit(repr=_dq_v4_kernel_repr)
 def _dq_v4_kernel(
     Q_ptr,  # [T, H, D] bf16
@@ -364,6 +366,7 @@ _dkv_interm_v4_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("num_warps",))
 @gluon.jit(repr=_dkv_interm_v4_kernel_repr)
 def _dkv_interm_v4_kernel(
     Q_ptr,  # [T, H, D] bf16

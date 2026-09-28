@@ -4,7 +4,6 @@
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._gluon_kernels.gfx1250.norm.fused_rmsnorm_add import (
@@ -15,9 +14,6 @@ from aiter.ops.triton._triton_kernels.normalization.fused_rmsnorm_add import (
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.device_info import current_device_stream
-
-_gluon_fused_rms_kernel_launch = make_launcher(_gluon_fused_rms_kernel)
-_triton_fused_rms_kernel_launch = make_launcher(_triton_fused_rms_kernel)
 
 
 def _fused_rmsnorm_add_core(x, weight, epsilon, res1):
@@ -67,7 +63,7 @@ def _fused_rmsnorm_add_core(x, weight, epsilon, res1):
         BLOCK_SIZE_M = 1
         grid = (triton.cdiv(M, BLOCK_SIZE_M),)
         dev, stream = current_device_stream()
-        _gluon_fused_rms_kernel_launch(
+        _gluon_fused_rms_kernel(
             dev,
             stream,
             grid,
@@ -91,7 +87,7 @@ def _fused_rmsnorm_add_core(x, weight, epsilon, res1):
 
         grid = (M,)
         dev, stream = current_device_stream()
-        _triton_fused_rms_kernel_launch(
+        _triton_fused_rms_kernel(
             dev,
             stream,
             grid,

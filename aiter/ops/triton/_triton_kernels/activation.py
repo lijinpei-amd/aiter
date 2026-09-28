@@ -1,5 +1,6 @@
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.quant.fused_fp8_quant import _fp8_quant_op
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
@@ -25,6 +26,7 @@ def _sigmoid(x):
     return _sigmoid_exp2(x)
 
 
+@make_launcher(dynamic_options=("num_warps",), options={"waves_per_eu": 0})
 @triton.jit
 def fused_silu_mul_kernel(
     inp_ptr,
@@ -136,6 +138,9 @@ def _apply_activation_from_str(x, activation: tl.constexpr):
         return x  # No activation if it is not recognized
 
 
+@make_launcher(
+    dynamic_options=("num_warps",), options={"waves_per_eu": 0, "num_stages": 1}
+)
 @triton.heuristics(
     {
         "EVEN_M_N": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
@@ -258,6 +263,7 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
             )
 
 
+@make_launcher
 @triton.heuristics(
     {
         "EVEN_N": lambda args: args["N"] % args["BLOCK_SIZE_N"] == 0,

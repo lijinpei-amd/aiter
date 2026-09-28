@@ -2,7 +2,6 @@
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.gather_kv_b_proj import (
     _next_pow2,
@@ -11,15 +10,6 @@ from aiter.ops.triton._triton_kernels.gather_kv_b_proj import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import current_device_stream, get_num_sms
-
-_triton_gather_kv_b_proj_launch = make_launcher(
-    _triton_gather_kv_b_proj, dynamic_options=("num_stages",)
-)
-
-
-_triton_gather_kv_b_proj_flat_launch = make_launcher(
-    _triton_gather_kv_b_proj_flat, dynamic_options=("num_stages",)
-)
 
 
 def gather_kv_b_proj(
@@ -137,7 +127,7 @@ def gather_kv_b_proj(
             max(1, (get_num_sms() * 6 + tp_k_head_num_k - 1) // tp_k_head_num_k),
         )
         dev, stream = current_device_stream()
-        _triton_gather_kv_b_proj_flat_launch(
+        _triton_gather_kv_b_proj_flat(
             dev,
             stream,
             (tp_k_head_num_k * chunk_workers,),
@@ -169,7 +159,7 @@ def gather_kv_b_proj(
         grid = (batch_size * tp_k_head_num_k * max_kv_chunks,)
         fp4_scale_k_granularity = 32 if weight_preshuffle else 128
         dev, stream = current_device_stream()
-        _triton_gather_kv_b_proj_launch(
+        _triton_gather_kv_b_proj(
             dev,
             stream,
             grid,
@@ -205,7 +195,7 @@ def gather_kv_b_proj(
 
     grid = (batch_size * tp_k_head_num_k,)
     dev, stream = current_device_stream()
-    _triton_gather_kv_b_proj_launch(
+    _triton_gather_kv_b_proj(
         dev,
         stream,
         grid,

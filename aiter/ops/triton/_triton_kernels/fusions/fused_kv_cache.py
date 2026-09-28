@@ -1,5 +1,6 @@
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.kv_cache import _store_mla_kv_cache
 from aiter.ops.triton._triton_kernels.quant.quant import _nvfp4_quant_op
@@ -988,6 +989,7 @@ _fused_qk_rope_cosine_cache_llama_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(options={"num_warps": 1})
 @triton.jit(repr=_fused_qk_rope_cosine_cache_llama_kernel_repr)
 def _fused_qk_rope_cosine_cache_llama_kernel(
     q_ptr,

@@ -1,5 +1,6 @@
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -13,6 +14,13 @@ _fp8_mqa_logits_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_stages",
+        "matrix_instr_nonkdim",
+    ),
+    options={"num_warps": 4, "waves_per_eu": 2},
+)
 @triton.jit(repr=_fp8_mqa_logits_kernel_repr)
 def _fp8_mqa_logits_kernel(
     Q_ptr,  # fp8e4m3 [seq_len, H, D]

@@ -8,6 +8,7 @@
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -90,6 +91,7 @@ _causal_conv1d_update_single_token_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_causal_conv1d_update_single_token_kernel_repr)
 def _causal_conv1d_update_single_token_kernel(
     # Pointers to matrices
@@ -303,6 +305,7 @@ _reshape_causal_conv1d_update_single_token_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_reshape_causal_conv1d_update_single_token_kernel_repr)
 def _reshape_causal_conv1d_update_single_token_kernel(
     # Pointers to matrices

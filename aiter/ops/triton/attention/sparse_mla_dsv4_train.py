@@ -136,21 +136,6 @@ def sparse_mla_fwd(q, kv, attn_sink, indices, scale=None):
 # =====================================================================
 
 
-_bwd_dq_store_dp_kernel_launch = make_launcher(
-    _bwd_dq_store_dp_kernel, dynamic_options=("num_warps",)
-)
-
-
-_bwd_dkv_interm_kernel_launch = make_launcher(
-    _bwd_dkv_interm_kernel, dynamic_options=("num_warps",)
-)
-
-
-_bwd_dkv_gather_kernel_launch = make_launcher(
-    _bwd_dkv_gather_kernel, dynamic_options=("num_warps",)
-)
-
-
 def sparse_mla_bwd(q, kv, o, do, indices, lse, attn_sink, scale=None):
     N, H, D = q.shape
     N_kv = kv.shape[0]
@@ -188,7 +173,7 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, attn_sink, scale=None):
 
     # Kernel 1: dQ + store P/dP — grid (N, num_hg)
     dev, stream = current_device_stream()
-    _bwd_dq_store_dp_kernel_launch(
+    _bwd_dq_store_dp_kernel(
         dev,
         stream,
         (N, num_hg),
@@ -230,7 +215,7 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, attn_sink, scale=None):
     # Kernel 2: dKV intermediate — grid (N,)
     interm = torch.empty(N, topk, D, device=q.device, dtype=torch.float32)
     dev, stream = current_device_stream()
-    _bwd_dkv_interm_kernel_launch(
+    _bwd_dkv_interm_kernel(
         dev,
         stream,
         (N,),
@@ -263,7 +248,7 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, attn_sink, scale=None):
 
     BLOCK_G = 64
     dev, stream = current_device_stream()
-    _bwd_dkv_gather_kernel_launch(
+    _bwd_dkv_gather_kernel(
         dev,
         stream,
         (N_kv,),

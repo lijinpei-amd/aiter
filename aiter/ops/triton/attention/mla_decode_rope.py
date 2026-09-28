@@ -41,16 +41,6 @@ _LOGGER = AiterTritonLogger()
 
 
 # TODO rope offset
-_fwd_grouped_kernel_stage1_rope_launch = make_launcher(
-    _fwd_grouped_kernel_stage1_rope,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
 
 
 def _decode_grouped_att_m_fwd_rope(
@@ -92,7 +82,7 @@ def _decode_grouped_att_m_fwd_rope(
     )
 
     dev, stream = current_device_stream()
-    _fwd_grouped_kernel_stage1_rope_launch(
+    _fwd_grouped_kernel_stage1_rope(
         dev,
         stream,
         grid,

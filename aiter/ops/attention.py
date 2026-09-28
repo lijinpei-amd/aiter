@@ -1527,6 +1527,7 @@ def mla_reduce_v1(
     """
 
 
+@make_launcher
 @triton.jit(do_not_specialize=["tile_reduce_cnt"])
 def decode_update_mla_metadata_v1_kernel(
     seqlens_qo_indptr,
@@ -1621,11 +1622,6 @@ def decode_update_mla_metadata_v1_kernel(
                     found_partial_index = True
 
 
-_decode_update_mla_metadata_v1_kernel_launch = make_launcher(
-    decode_update_mla_metadata_v1_kernel,
-)
-
-
 def decode_update_mla_metadata_v1(
     seqlens_qo_indptr: torch.Tensor,
     seqlens_kv_indptr: torch.Tensor,
@@ -1707,7 +1703,7 @@ def decode_update_mla_metadata_v1(
         batch_size *= qk_batch_ratio
     grid = (max_work,)
     dev, stream = current_device_stream()
-    _decode_update_mla_metadata_v1_kernel_launch(
+    decode_update_mla_metadata_v1_kernel(
         dev,
         stream,
         grid,

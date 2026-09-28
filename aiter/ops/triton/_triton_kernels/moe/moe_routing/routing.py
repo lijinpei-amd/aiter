@@ -1,5 +1,6 @@
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.moe.moe_routing.bitmatrix import (
     _sum_bitmatrix_rows_fused,
@@ -289,6 +290,7 @@ _combined_routing_fused_repr = make_kernel_repr(
 )
 
 
+@make_launcher(grid_arg=1, options={"num_warps": 1})
 @triton.jit(repr=_combined_routing_fused_repr)
 def _combined_routing_fused(
     GatherIndx,
@@ -382,6 +384,7 @@ def _combined_routing_fused(
 # -----------------------------------------------------------------------------
 
 
+@make_launcher(grid_arg=1)
 @triton.jit
 def _ep_gate_prep_scan_kernel(
     DispatchIds,  # (M, topk) int32, GLOBAL expert ids
@@ -514,6 +517,7 @@ def _ep_gate_prep_scan_kernel(
         )
 
 
+@make_launcher(grid_arg=1)
 @triton.jit
 def _ep_scatter_atomic_expt_data_kernel(
     ExptIndx,  # (G,) int32 in

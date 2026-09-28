@@ -1,5 +1,6 @@
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -23,6 +24,7 @@ _causal_conv1d_fwd_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(options={"num_stages": 2})
 @triton.jit(repr=_causal_conv1d_fwd_kernel_repr)
 def _causal_conv1d_fwd_kernel(  # continuous batching
     # Pointers to matrices
@@ -403,6 +405,7 @@ _causal_conv1d_update_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_causal_conv1d_update_kernel_repr)
 def _causal_conv1d_update_kernel(
     # Pointers to matrices

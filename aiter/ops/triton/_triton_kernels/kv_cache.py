@@ -1,5 +1,6 @@
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.quant.quant import _nvfp4_quant_op
 
@@ -144,6 +145,7 @@ def _store_mla_kv_cache(
         )
 
 
+@make_launcher(grid_arg=1, options={"num_warps": 1})
 @triton.jit
 def _cat_and_cache_mla_kernel(
     k_nope_ptr,

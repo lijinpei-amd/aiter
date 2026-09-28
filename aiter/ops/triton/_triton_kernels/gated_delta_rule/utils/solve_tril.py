@@ -67,6 +67,7 @@ def _bp_st2d(base, R, C, rs, r0, c0, val, BR: tl.constexpr, BC: tl.constexpr):
     )
 
 
+@make_launcher(grid_arg=2)
 @triton.heuristics(
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
@@ -157,6 +158,7 @@ def solve_tril_16x16_kernel(
         desc_o.store([i_t * 16, 0], b_A.to(desc_o.dtype, fp_downcast_rounding="rtne"))
 
 
+@make_launcher(grid_arg=2)
 @triton.heuristics(
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
@@ -304,6 +306,7 @@ def merge_16x16_to_32x32_inverse_kernel(
         desc_o.store([i_t * BT + 0, 16], z16.to(desc_o.dtype))
 
 
+@make_launcher(grid_arg=2)
 @triton.heuristics(
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
@@ -625,15 +628,6 @@ def merge_16x16_to_64x64_inverse_kernel(
         desc_o.store([i_t * BT + 32, 48], z16.to(desc_o.dtype))
 
 
-_solve_tril_16x16_launch = make_launcher(solve_tril_16x16_kernel, grid_arg=2)
-_merge_16x16_to_32x32_inverse_launch = make_launcher(
-    merge_16x16_to_32x32_inverse_kernel, grid_arg=2
-)
-_merge_16x16_to_64x64_inverse_launch = make_launcher(
-    merge_16x16_to_64x64_inverse_kernel, grid_arg=2
-)
-
-
 @input_guard
 def solve_tril(
     A: torch.Tensor,
@@ -704,11 +698,11 @@ def solve_tril(
     # uses boundary_check.
     Ai = torch.empty_like(A, dtype=output_dtype)
     if BT == 16:
-        merge_fn = _solve_tril_16x16_launch
+        merge_fn = solve_tril_16x16_kernel
     elif BT == 32:
-        merge_fn = _merge_16x16_to_32x32_inverse_launch
+        merge_fn = merge_16x16_to_32x32_inverse_kernel
     elif BT == 64:
-        merge_fn = _merge_16x16_to_64x64_inverse_launch
+        merge_fn = merge_16x16_to_64x64_inverse_kernel
 
     dev, stream = current_device_stream()
     merge_fn(

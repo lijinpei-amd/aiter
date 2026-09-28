@@ -7,7 +7,6 @@ import os
 
 import torch
 import triton
-from intj import make_launcher
 
 import aiter
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
@@ -388,18 +387,6 @@ def fav3_sage_wrapper_func(
     )
 
 
-_sage_fwd_launch = make_launcher(
-    sage_fwd,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
-
-
 def fav3_sage_func(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -552,7 +539,7 @@ def fav3_sage_func(
     # --- 7. Kernel Launch ---
     grid = (triton.cdiv(seqlen_q, config["BLOCK_M"]), nheads_q, batch)
     dev, stream = current_device_stream()
-    _sage_fwd_launch(
+    sage_fwd(
         dev,
         stream,
         grid,

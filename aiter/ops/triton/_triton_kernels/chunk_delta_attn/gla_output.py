@@ -37,6 +37,12 @@ from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 _FALLBACK_O_CONFIG = triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=1)
 
 
+def _chunk_gla_fwd_kernel_o_grid(V: int, BV: int, HV: int, *, NT: int, B: int):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (triton.cdiv(V, BV), NT, B * HV)
+
+
+@make_launcher(grid_cpp=_chunk_gla_fwd_kernel_o_grid)
 @triton.heuristics(
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
@@ -166,17 +172,6 @@ def chunk_gla_fwd_kernel_o(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=m_tv)
 
 
-def _chunk_gla_fwd_kernel_o_grid(V: int, BV: int, HV: int, *, NT: int, B: int):
-    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
-    return (triton.cdiv(V, BV), NT, B * HV)
-
-
-_chunk_gla_fwd_kernel_o_launch = make_launcher(
-    chunk_gla_fwd_kernel_o,
-    grid_cpp=_chunk_gla_fwd_kernel_o_grid,
-)
-
-
 @input_guard
 def chunk_gla_fwd_o(
     q: torch.Tensor,
@@ -222,7 +217,7 @@ def chunk_gla_fwd_o(
     o = torch.zeros_like(v)
 
     dev, stream = current_device_stream()
-    _chunk_gla_fwd_kernel_o_launch(
+    chunk_gla_fwd_kernel_o(
         dev,
         stream,
         NT,  # grid

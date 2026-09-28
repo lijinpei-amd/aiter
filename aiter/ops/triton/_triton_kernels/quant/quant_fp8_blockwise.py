@@ -3,6 +3,7 @@
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.common.segment_tile import (
     _find_segment_tile_range,
@@ -44,6 +45,9 @@ def _compute_scale_and_quant(x_tile, x_tile_abs, axis, FP8_MAX):
 # Blockwise quantize. AXIS selects the scale axis (1 = row-wise 1xBLOCK,
 # 0 = col-wise BLOCKx1). When DUAL, also emit the col-wise (axis=0) copy from
 # the same loaded tile — the activation-gradient path needs both directions.
+@make_launcher(
+    dynamic_options=("num_warps",), options={"waves_per_eu": 2, "num_stages": 2}
+)
 @triton.jit(repr=_quant_fp8_blockwise_kernel_repr)
 def quant_fp8_blockwise_kernel(
     x_ptr,
@@ -108,6 +112,9 @@ def quant_fp8_blockwise_kernel(
 
 
 # Blockwise for Segment M
+@make_launcher(
+    dynamic_options=("num_warps",), options={"waves_per_eu": 2, "num_stages": 2}
+)
 @triton.jit(repr=_quant_fp8_blockwise_segment_m_kernel_repr)
 def quant_fp8_blockwise_segment_m_kernel(
     x_ptr,
@@ -162,6 +169,9 @@ def quant_fp8_blockwise_segment_m_kernel(
 # w_ptr         [B, M, N]
 # w_fp8_ptr     [B, M, N] FP8
 # w_scales_ptr  [B, M // BLOCK_SIZE, N // BLOCK_SIZE] FP32
+@make_launcher(
+    dynamic_options=("num_warps",), options={"waves_per_eu": 2, "num_stages": 2}
+)
 @triton.jit(repr=_quant_fp8_blockwise_for_weight_kernel_repr)
 def quant_fp8_blockwise_for_weight_kernel(
     w_ptr,
@@ -216,6 +226,9 @@ def quant_fp8_blockwise_for_weight_kernel(
 # x_scales_ptr [M, K//BLOCK_SIZE]  float32 dequant row scales
 # y_fp8_ptr    [M, K]              FP8 output, col-wise BLOCK×1 quantized
 # y_scales_ptr [M//BLOCK_SIZE, K]  float32 dequant col scales
+@make_launcher(
+    dynamic_options=("num_warps",), options={"waves_per_eu": 2, "num_stages": 2}
+)
 @triton.jit(repr=_requant_fp8_row_to_col_kernel_repr)
 def requant_fp8_row_to_col_kernel(
     x_fp8_ptr,

@@ -23,18 +23,6 @@ _gemm_splitk_reduce_kernel_launch = make_launcher(
 )
 
 
-_gemm_a8w8_per_token_scale_kernel_launch = make_launcher(
-    _gemm_a8w8_per_token_scale_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
-
-
 def gemm_a8w8_per_token_scale(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -99,7 +87,7 @@ def gemm_a8w8_per_token_scale(
         ),
     )
     dev, stream = current_device_stream()
-    _gemm_a8w8_per_token_scale_kernel_launch(
+    _gemm_a8w8_per_token_scale_kernel(
         dev,
         stream,
         grid,

@@ -1,5 +1,6 @@
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.rope.rope import (
     _get_gptj_rotated_x_1D,
@@ -49,6 +50,7 @@ _qk_cat_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_qk_cat_kernel_repr)
 def _qk_cat_kernel(
     q1_ptr,
@@ -192,6 +194,7 @@ _qk_rope_cat_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_qk_rope_cat_kernel_repr)
 def _qk_rope_cat_kernel(
     q_nope_ptr,

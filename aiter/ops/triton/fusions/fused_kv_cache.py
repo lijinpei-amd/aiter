@@ -736,12 +736,6 @@ def fused_qk_rope_reshape_and_cache(
     return q_out, k_out, key_cache, value_cache
 
 
-_fused_qk_rope_cosine_cache_llama_kernel_launch = make_launcher(
-    _fused_qk_rope_cosine_cache_llama_kernel,
-    options={"num_warps": 1},
-)
-
-
 def fused_qk_rope_cosine_cache_llama(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -842,7 +836,7 @@ def fused_qk_rope_cosine_cache_llama(
     n_pid = t * qh + (t_slot - t) * kh
     grid = (n_pid, 1, 1)
     dev, stream = current_device_stream()
-    _fused_qk_rope_cosine_cache_llama_kernel_launch(
+    _fused_qk_rope_cosine_cache_llama_kernel(
         dev,
         stream,
         grid,

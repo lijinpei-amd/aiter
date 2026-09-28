@@ -1,4 +1,5 @@
 import triton
+from intj import make_launcher
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
@@ -20,6 +21,7 @@ _gluon_moe_gemm_int8_smoothquant_repr = make_kernel_repr(
 )
 
 
+@make_launcher(grid_arg=1, options={"num_warps": 4})
 @triton.heuristics(
     {
         "UNROLL_TIMES": lambda args: triton.cdiv(args["K"], args["BLOCK_K"]),

@@ -493,6 +493,7 @@ _RECOMPUTE_WU_HM_DEFAULT_CONFIG = triton.Config(
 )
 
 
+@make_launcher(grid_arg=2)
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
     configs=autotune_configs(
@@ -596,12 +597,6 @@ def recompute_w_u_head_major_kernel(
         )
 
 
-_recompute_w_u_head_major_kernel_launch = make_launcher(
-    recompute_w_u_head_major_kernel,
-    grid_arg=2,
-)
-
-
 def _run_split_path(
     A_raw: torch.Tensor,
     k: torch.Tensor,
@@ -638,7 +633,7 @@ def _run_split_path(
     u_out = v.new_empty(B, H, T, V)
     w_out = k.new_empty(B, H, T, K)
     dev, stream = current_device_stream()
-    _recompute_w_u_head_major_kernel_launch(
+    recompute_w_u_head_major_kernel(
         dev,
         stream,
         NT,

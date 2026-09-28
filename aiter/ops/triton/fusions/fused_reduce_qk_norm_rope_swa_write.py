@@ -4,7 +4,6 @@
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.fusions.fused_reduce_qk_norm_rope_swa_write import (
     _fused_reduce_qk_norm_rope_swa_write_kernel,
@@ -50,15 +49,6 @@ def _pick_block_size_m(M: int, num_local_heads: int, num_splitk: int) -> int:
     waves_per_eu = 1
 
     return bm, num_warps, waves_per_eu
-
-
-_fused_reduce_qk_norm_rope_swa_write_kernel_launch = make_launcher(
-    _fused_reduce_qk_norm_rope_swa_write_kernel,
-    dynamic_options=(
-        "num_warps",
-        "waves_per_eu",
-    ),
-)
 
 
 def fused_reduce_qk_norm_rope_swa_write(
@@ -163,7 +153,7 @@ def fused_reduce_qk_norm_rope_swa_write(
     )
     grid = (triton.cdiv(M, BLOCK_SIZE_M), num_local_heads + 1)
     dev, stream = current_device_stream()
-    _fused_reduce_qk_norm_rope_swa_write_kernel_launch(
+    _fused_reduce_qk_norm_rope_swa_write_kernel(
         dev,
         stream,
         grid,

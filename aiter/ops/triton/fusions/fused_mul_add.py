@@ -1,18 +1,11 @@
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.fusions.fused_mul_add import _fused_mul_add_kernel
 from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
-
-
-_fused_mul_add_kernel_launch = make_launcher(
-    _fused_mul_add_kernel,
-    options={"num_warps": 4, "waves_per_eu": 0},
-)
 
 
 def fused_mul_add(
@@ -81,7 +74,7 @@ def fused_mul_add(
     BLOCK_SIZE_N = max(min(triton.next_power_of_2(N), 32), 1024)
     grid = (triton.cdiv(N, BLOCK_SIZE_N),)
     dev, stream = current_device_stream()
-    _fused_mul_add_kernel_launch(
+    _fused_mul_add_kernel(
         dev,
         stream,
         grid,

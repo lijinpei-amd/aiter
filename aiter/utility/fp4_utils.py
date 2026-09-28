@@ -373,6 +373,7 @@ def _f32_to_floatx_unpacked(x: Tensor, ebits: int, mbits: int) -> Tensor:
     return x.to(torch.uint8)
 
 
+@make_launcher
 @triton.jit
 def _dynamic_mxfp4_quant_kernel_asm_layout(
     x_ptr,
@@ -536,11 +537,6 @@ def _dynamic_mxfp4_quant_kernel_asm_layout(
         tl.store(bs_ptr + bs_offs, bs_e8m0, mask=bs_mask)
 
 
-_dynamic_mxfp4_quant_kernel_asm_layout_launch = make_launcher(
-    _dynamic_mxfp4_quant_kernel_asm_layout,
-)
-
-
 def dynamic_mxfp4_quant(
     x: torch.Tensor, scaling_mode: str = "even", shuffle: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -581,7 +577,7 @@ def dynamic_mxfp4_quant(
     BLOCK_SIZE = 128
     grid = (triton.cdiv(M, BLOCK_SIZE), scaleN)
     dev, stream = current_device_stream()
-    _dynamic_mxfp4_quant_kernel_asm_layout_launch(
+    _dynamic_mxfp4_quant_kernel_asm_layout(
         dev,
         stream,
         grid,
@@ -609,6 +605,7 @@ def dynamic_mxfp4_quant(
     return (x_fp4.view(dtypes.fp4x2), blockscale_e8m0.view(dtypes.fp8_e8m0))
 
 
+@make_launcher(grid_arg=2)
 @triton.jit
 def _moe_mxfp4_sort_kernel(
     blockscale_e8m0_ptr,
@@ -675,6 +672,7 @@ def _moe_mxfp4_sort_kernel(
     tl.store(blockscale_e8m0_sorted_ptr + offs, out)
 
 
+@make_launcher(grid_arg=1)
 @triton.jit
 def _moe_mxfp4_sort_kernel_fused_n(
     blockscale_e8m0_ptr,
@@ -767,12 +765,6 @@ def _moe_mxfp4_sort_kernel_fused_n(
         tl.store(blockscale_e8m0_sorted_ptr + store_offs, out)
 
 
-_moe_mxfp4_sort_kernel_fused_n_launch = make_launcher(
-    _moe_mxfp4_sort_kernel_fused_n, grid_arg=1
-)
-_moe_mxfp4_sort_kernel_launch = make_launcher(_moe_mxfp4_sort_kernel, grid_arg=2)
-
-
 def moe_mxfp4_sort(
     blockscale_e8m0: torch.Tensor,
     sorted_ids: torch.Tensor,
@@ -853,11 +845,11 @@ def moe_mxfp4_sort(
     dev, stream = current_device_stream()
     if token_num > _FUSED_N_THRESHOLD:
         N_TILES = triton.cdiv(N_i, BLOCK_SIZE_N)
-        _moe_mxfp4_sort_kernel_fused_n_launch(
+        _moe_mxfp4_sort_kernel_fused_n(
             dev, stream, triton.cdiv(M_o, BLOCK_SIZE_M), *common_args, N_TILES
         )
     else:
-        _moe_mxfp4_sort_kernel_launch(
+        _moe_mxfp4_sort_kernel(
             dev,
             stream,
             triton.cdiv(M_o, BLOCK_SIZE_M),

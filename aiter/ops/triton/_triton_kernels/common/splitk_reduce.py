@@ -1,5 +1,6 @@
 import triton
 import triton.language as tl
+from intj import Constexpr, make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -104,6 +105,12 @@ _batched_gemm_splitk_reduce_repr = make_kernel_repr(
 )
 
 
+@make_launcher(
+    extra_annotation={
+        "KERNEL_NAME": Constexpr(value="_batched_gemm_bf16_reduce_kernel"),
+        "activation": Constexpr(value=""),
+    }
+)
 @triton.jit(repr=_batched_gemm_splitk_reduce_repr)
 def _batched_gemm_splitk_reduce_kernel(
     c_in_ptr,

@@ -1,5 +1,6 @@
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
@@ -12,6 +13,7 @@ _mha_v4_per_tensor_amax_repr = make_kernel_repr(
 )
 
 
+@make_launcher(grid_arg=1, options={"num_warps": 8})
 @triton.jit(repr=_mha_v4_per_tensor_amax_repr)
 def mha_v4_per_tensor_amax_kernel(
     input_ptr,
@@ -35,6 +37,7 @@ _mha_v4_per_tensor_scale_repr = make_kernel_repr(
 )
 
 
+@make_launcher(grid_arg=1, options={"num_warps": 8})
 @triton.jit(repr=_mha_v4_per_tensor_scale_repr)
 def mha_v4_per_tensor_scale_kernel(
     partial_ptr,
@@ -60,6 +63,7 @@ _mha_v4_per_tensor_quant_repr = make_kernel_repr(
 )
 
 
+@make_launcher(grid_arg=1, options={"num_warps": 8})
 @triton.jit(repr=_mha_v4_per_tensor_quant_repr)
 def mha_v4_per_tensor_quant_kernel(
     input_ptr,
@@ -272,6 +276,7 @@ _sage_quant_v_amax_partial_repr = make_kernel_repr(
 )
 
 
+@make_launcher(grid_arg=1, options={"num_warps": 8})
 @triton.jit(repr=_sage_quant_v_amax_partial_repr)
 def sage_quant_v_amax_partial_kernel(
     V_Input,
@@ -319,6 +324,7 @@ _sage_quant_v_amax_finalize_repr = make_kernel_repr(
 )
 
 
+@make_launcher(grid_arg=2, options={"num_warps": 4})
 @triton.jit(repr=_sage_quant_v_amax_finalize_repr)
 def sage_quant_v_amax_finalize_kernel(
     Partial_Max,

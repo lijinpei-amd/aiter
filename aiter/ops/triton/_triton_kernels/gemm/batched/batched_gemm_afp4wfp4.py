@@ -3,6 +3,7 @@
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
@@ -33,6 +34,15 @@ _batched_gemm_afp4_wfp4_reduce_repr = make_kernel_repr(
 )
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    )
+)
 @triton.heuristics(
     {
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
@@ -235,6 +245,7 @@ def _batched_gemm_afp4_wfp4_kernel(
         tl.store(c_ptrs, c, mask=c_mask)
 
 
+@make_launcher
 @triton.jit(repr=_batched_gemm_afp4_wfp4_reduce_repr)
 def _batched_gemm_afp4_wfp4_reduce_kernel(
     c_in_ptr,

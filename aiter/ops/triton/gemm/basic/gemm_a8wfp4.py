@@ -35,18 +35,6 @@ _gemm_splitk_reduce_kernel_launch = make_launcher(
 )
 
 
-_gemm_a8wfp4_kernel_launch = make_launcher(
-    _gemm_a8wfp4_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
-
-
 def gemm_a8wfp4(
     x,
     w,
@@ -144,7 +132,7 @@ def gemm_a8wfp4(
     stride_bsn, stride_bsk = w_scales.stride()
 
     dev, stream = current_device_stream()
-    _gemm_a8wfp4_kernel_launch(
+    _gemm_a8wfp4_kernel(
         dev,
         stream,
         grid,

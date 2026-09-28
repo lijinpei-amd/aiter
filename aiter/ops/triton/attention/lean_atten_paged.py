@@ -20,7 +20,6 @@ UPDATE:
 import warnings
 
 import torch
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.attention.lean_atten_paged import (
     la_persistent_paged,
@@ -29,15 +28,6 @@ from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
-
-
-_la_persistent_paged_launch = make_launcher(
-    la_persistent_paged,
-    dynamic_options=(
-        "num_warps",
-        "waves_per_eu",
-    ),
-)
 
 
 def persistent_lean_attention_paged(
@@ -103,7 +93,7 @@ def persistent_lean_attention_paged(
     o = torch.empty_like(q, dtype=v.dtype)
 
     dev, stream = current_device_stream()
-    _la_persistent_paged_launch(
+    la_persistent_paged(
         dev,
         stream,
         grid,

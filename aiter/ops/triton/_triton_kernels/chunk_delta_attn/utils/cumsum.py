@@ -25,6 +25,12 @@ from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 
 
+def _chunk_gate_cumsum_kernel_grid(S: int, BS: int, H: int, *, NT: int, B: int):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (triton.cdiv(S, BS), NT, B * H)
+
+
+@make_launcher(grid_cpp=_chunk_gate_cumsum_kernel_grid)
 @triton.heuristics(
     {
         "HAS_BIAS": lambda args: args["dt_bias"] is not None,
@@ -110,17 +116,6 @@ def chunk_gate_cumsum_kernel(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=m_s)
 
 
-def _chunk_gate_cumsum_kernel_grid(S: int, BS: int, H: int, *, NT: int, B: int):
-    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
-    return (triton.cdiv(S, BS), NT, B * H)
-
-
-_chunk_gate_cumsum_kernel_launch = make_launcher(
-    chunk_gate_cumsum_kernel,
-    grid_cpp=_chunk_gate_cumsum_kernel_grid,
-)
-
-
 @input_guard
 def chunk_gate_cumsum(
     g: torch.Tensor,
@@ -147,7 +142,7 @@ def chunk_gate_cumsum(
     g_out = torch.empty_like(g, dtype=output_dtype or g.dtype)
 
     dev, stream = current_device_stream()
-    _chunk_gate_cumsum_kernel_launch(
+    chunk_gate_cumsum_kernel(
         dev,
         stream,
         NT,  # grid

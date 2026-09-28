@@ -3,24 +3,12 @@
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel,
     _get_config,
 )
 from aiter.ops.triton.utils.device_info import current_device_stream
-
-_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel_launch = make_launcher(
-    _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
 
 
 def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
@@ -114,7 +102,7 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
     )
 
     dev, stream = current_device_stream()
-    _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel_launch(
+    _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel(
         dev,
         stream,
         grid,

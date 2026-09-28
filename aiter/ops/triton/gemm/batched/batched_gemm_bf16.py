@@ -5,7 +5,7 @@ import functools
 
 import torch
 import triton
-from intj import Constexpr, make_launcher
+from intj import make_launcher
 from intj.compat import launch as _intj_launch
 
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
@@ -30,15 +30,6 @@ def _is_gluon_available():
         return any(supported in get_arch() for supported in _GLUON_SUPPORTED_ARCHS)
     except Exception:  # noqa: BLE001
         return False
-
-
-_batched_gemm_splitk_reduce_kernel_launch = make_launcher(
-    _batched_gemm_splitk_reduce_kernel,
-    extra_annotation={
-        "KERNEL_NAME": Constexpr(value="_batched_gemm_bf16_reduce_kernel"),
-        "activation": Constexpr(value=""),
-    },
-)
 
 
 @functools.cache
@@ -341,7 +332,7 @@ def batched_gemm_bf16(
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
         dev, stream = current_device_stream()
-        _batched_gemm_splitk_reduce_kernel_launch(
+        _batched_gemm_splitk_reduce_kernel(
             dev,
             stream,
             grid_reduce,

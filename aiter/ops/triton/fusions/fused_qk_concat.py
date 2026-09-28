@@ -1,5 +1,4 @@
 import torch
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.fusions.fused_qk_concat import (
     _qk_cat_kernel,
@@ -9,9 +8,6 @@ from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
-
-
-_qk_cat_kernel_launch = make_launcher(_qk_cat_kernel)
 
 
 def fused_qk_cat(
@@ -61,7 +57,7 @@ def fused_qk_cat(
     grid = (b, qh, 1)
 
     dev, stream = current_device_stream()
-    _qk_cat_kernel_launch(
+    _qk_cat_kernel(
         dev,
         stream,
         grid,
@@ -83,9 +79,6 @@ def fused_qk_cat(
     )
 
     return q_out, k_out
-
-
-_qk_rope_cat_kernel_launch = make_launcher(_qk_rope_cat_kernel)
 
 
 def fused_qk_rope_cat(
@@ -152,7 +145,7 @@ def fused_qk_rope_cat(
     grid = (b, qh, 1)
 
     dev, stream = current_device_stream()
-    _qk_rope_cat_kernel_launch(
+    _qk_rope_cat_kernel(
         dev,
         stream,
         grid,

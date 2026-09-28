@@ -33,6 +33,7 @@ WARP_SIZE = 64
 DEFAULT_BLOCK_THREADS = DEFAULT_NUM_WARPS * WARP_SIZE  # 256
 
 
+@make_launcher
 @triton.jit
 def _varctx_cta_info_kernel(
     ctx_ptr,  # [B] int32
@@ -106,9 +107,6 @@ def _varctx_cta_info_kernel(
         tl.store(cta_info_ptr + row * 4 + 3, ctx_slot, mask=rmask)
 
 
-_varctx_cta_info_kernel_launch = make_launcher(_varctx_cta_info_kernel)
-
-
 def compute_varctx_schedule(
     context_lens,
     block_k,
@@ -146,7 +144,7 @@ def compute_varctx_schedule(
     BLOCK_S = 256
     grid = (triton.cdiv(S, BLOCK_S),)
     intj_dev, intj_stream = current_device_stream()
-    _varctx_cta_info_kernel_launch(
+    _varctx_cta_info_kernel(
         intj_dev,
         intj_stream,
         grid,

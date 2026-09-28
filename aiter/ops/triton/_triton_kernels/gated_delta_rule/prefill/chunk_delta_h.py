@@ -43,6 +43,14 @@ def _gate_exp(x, USE_EXP2: tl.constexpr):
     return tl.math.exp2(x) if USE_EXP2 else exp(x)
 
 
+def _chunk_gated_delta_rule_fwd_kernel_h_blockdim64_grid(
+    V: int, BV: int, H: int, *, N: int
+):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (triton.cdiv(V, BV), N * H)
+
+
+@make_launcher(grid_cpp=_chunk_gated_delta_rule_fwd_kernel_h_blockdim64_grid)
 @triton.heuristics(
     {
         "USE_G": lambda args: args["g"] is not None,
@@ -309,19 +317,14 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), mask=m_h4)
 
 
-def _chunk_gated_delta_rule_fwd_kernel_h_blockdim64_grid(
+def _chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64_grid(
     V: int, BV: int, H: int, *, N: int
 ):
     # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
     return (triton.cdiv(V, BV), N * H)
 
 
-_chunk_gated_delta_rule_fwd_kernel_h_blockdim64_launch = make_launcher(
-    chunk_gated_delta_rule_fwd_kernel_h_blockdim64,
-    grid_cpp=_chunk_gated_delta_rule_fwd_kernel_h_blockdim64_grid,
-)
-
-
+@make_launcher(grid_cpp=_chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64_grid)
 @triton.heuristics(
     {
         "USE_G": lambda args: args["g"] is not None,
@@ -580,19 +583,6 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
             tl.store(p_dh3, b_dh4.to(p_dh3.dtype.element_ty), mask=m_h4)
 
 
-def _chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64_grid(
-    V: int, BV: int, H: int, *, N: int
-):
-    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
-    return (triton.cdiv(V, BV), N * H)
-
-
-_chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64_launch = make_launcher(
-    chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64,
-    grid_cpp=_chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64_grid,
-)
-
-
 def chunk_gated_delta_rule_fwd_h(
     k: torch.Tensor,
     w: torch.Tensor,
@@ -651,7 +641,7 @@ def chunk_gated_delta_rule_fwd_h(
     v_new = torch.empty_like(u) if save_new_value else None
 
     dev, stream = current_device_stream()
-    _chunk_gated_delta_rule_fwd_kernel_h_blockdim64_launch(
+    chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         dev,
         stream,
         N,  # grid
@@ -677,6 +667,12 @@ def chunk_gated_delta_rule_fwd_h(
     return h, v_new, final_state
 
 
+def _chunk_gated_delta_rule_fwd_kernel_h_opt_grid(V: int, BV: int, H: int, *, N: int):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (triton.cdiv(V, BV), N * H)
+
+
+@make_launcher(grid_cpp=_chunk_gated_delta_rule_fwd_kernel_h_opt_grid)
 @triton.heuristics(
     {
         "USE_G": lambda args: args["g"] is not None,
@@ -917,17 +913,6 @@ def chunk_gated_delta_rule_fwd_kernel_h_opt(
             tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), mask=m_h4)
 
 
-def _chunk_gated_delta_rule_fwd_kernel_h_opt_grid(V: int, BV: int, H: int, *, N: int):
-    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
-    return (triton.cdiv(V, BV), N * H)
-
-
-_chunk_gated_delta_rule_fwd_kernel_h_opt_launch = make_launcher(
-    chunk_gated_delta_rule_fwd_kernel_h_opt,
-    grid_cpp=_chunk_gated_delta_rule_fwd_kernel_h_opt_grid,
-)
-
-
 def chunk_gated_delta_rule_fwd_h_opt(
     k: torch.Tensor,
     w: torch.Tensor,
@@ -970,7 +955,7 @@ def chunk_gated_delta_rule_fwd_h_opt(
     v_new = k.new_empty(B, H, T_flat, V, dtype=u.dtype) if save_new_value else None
 
     dev, stream = current_device_stream()
-    _chunk_gated_delta_rule_fwd_kernel_h_opt_launch(
+    chunk_gated_delta_rule_fwd_kernel_h_opt(
         dev,
         stream,
         N,  # grid
@@ -1002,6 +987,14 @@ def chunk_gated_delta_rule_fwd_h_opt(
 # =====================================================================
 
 
+def _chunk_gated_delta_rule_fwd_kernel_h_opt_vk_grid(
+    V: int, BV: int, H: int, *, N: int
+):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (triton.cdiv(V, BV), N * H)
+
+
+@make_launcher(grid_cpp=_chunk_gated_delta_rule_fwd_kernel_h_opt_vk_grid)
 @triton.heuristics(
     {
         "USE_G": lambda args: args["g"] is not None,
@@ -1274,19 +1267,6 @@ def chunk_gated_delta_rule_fwd_kernel_h_opt_vk(
             tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), mask=m_h4)
 
 
-def _chunk_gated_delta_rule_fwd_kernel_h_opt_vk_grid(
-    V: int, BV: int, H: int, *, N: int
-):
-    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
-    return (triton.cdiv(V, BV), N * H)
-
-
-_chunk_gated_delta_rule_fwd_kernel_h_opt_vk_launch = make_launcher(
-    chunk_gated_delta_rule_fwd_kernel_h_opt_vk,
-    grid_cpp=_chunk_gated_delta_rule_fwd_kernel_h_opt_vk_grid,
-)
-
-
 def chunk_gated_delta_rule_fwd_h_opt_vk(
     k: torch.Tensor,
     w: torch.Tensor,
@@ -1445,7 +1425,7 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
     v_new = k.new_empty(B, H, T_flat, V, dtype=u.dtype) if save_new_value else None
 
     dev, stream = current_device_stream()
-    _chunk_gated_delta_rule_fwd_kernel_h_opt_vk_launch(
+    chunk_gated_delta_rule_fwd_kernel_h_opt_vk(
         dev,
         stream,
         N,  # grid
@@ -1511,7 +1491,7 @@ def chunk_gated_delta_rule_bwd_dhu(
     dv2 = torch.empty_like(dv)
 
     dev, stream = current_device_stream()
-    _chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64_launch(
+    chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
         dev,
         stream,
         N,  # grid

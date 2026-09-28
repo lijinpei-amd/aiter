@@ -1,5 +1,6 @@
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
@@ -255,6 +256,7 @@ _fused_flatten_mxfp4_quant_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_fused_flatten_mxfp4_quant_repr)
 def _fused_flatten_mxfp4_quant(
     x_ptr,
@@ -910,6 +912,7 @@ _fused_dynamic_mxfp4_quant_moe_sort_repr = make_kernel_repr(
 )
 
 
+@make_launcher(grid_arg=1)
 @triton.jit(repr=_fused_dynamic_mxfp4_quant_moe_sort_repr)
 def _fused_dynamic_mxfp4_quant_moe_sort_kernel(
     x_ptr,

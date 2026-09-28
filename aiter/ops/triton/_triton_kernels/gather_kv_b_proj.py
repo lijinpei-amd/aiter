@@ -3,6 +3,7 @@
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 
 def _next_pow2(n):
@@ -772,6 +773,7 @@ def _triton_gather_kv_b_proj_impl(
         )
 
 
+@make_launcher(dynamic_options=("num_stages",))
 @triton.jit
 def _triton_gather_kv_b_proj_flat(
     total_kv,
@@ -1070,6 +1072,7 @@ def _triton_gather_kv_b_proj_flat(
         chunk_id += chunk_stride
 
 
+@make_launcher(dynamic_options=("num_stages",))
 @triton.jit
 def _triton_gather_kv_b_proj(
     batch_size,

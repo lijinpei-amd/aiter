@@ -3,7 +3,6 @@
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16_gated import (
@@ -14,18 +13,6 @@ from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
-
-
-_gemm_a16_w16_gated_kernel_launch = make_launcher(
-    _gemm_a16_w16_gated_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
 
 
 def gemm_a16w16_gated(
@@ -74,7 +61,7 @@ def gemm_a16w16_gated(
         triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),
     )
     dev, stream = current_device_stream()
-    _gemm_a16_w16_gated_kernel_launch(
+    _gemm_a16_w16_gated_kernel(
         dev,
         stream,
         grid,

@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 # RMSNorm + residual add.
+from intj import make_launcher
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
@@ -14,6 +15,7 @@ def _rmsnorm_op(row, weights, n_cols, epsilon):
     return row * norm_factor * weights
 
 
+@make_launcher
 @gluon.jit
 def _gluon_fused_rms_kernel(
     x1_ptr,

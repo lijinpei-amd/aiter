@@ -3,6 +3,7 @@
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -21,6 +22,7 @@ _paged_attn_decode_v1_wo_dot_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_paged_attn_decode_v1_wo_dot_repr)
 def _paged_attn_decode_v1_wo_dot_kernel(
     out,  # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
@@ -155,6 +157,7 @@ _paged_attn_decode_v1_w_dot_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("waves_per_eu",), options={"num_stages": 1})
 @triton.jit(repr=_paged_attn_decode_v1_w_dot_repr)
 def _paged_attn_decode_v1_w_dot_kernel(
     out_ptr,  # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
@@ -310,6 +313,7 @@ _paged_attn_decode_v2_wo_dot_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_paged_attn_decode_v2_wo_dot_repr)
 def _paged_attn_decode_v2_wo_dot_kernel(
     exp_sums_ptr,
@@ -464,6 +468,7 @@ _paged_attn_decode_v2_wo_dot_reduce_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_paged_attn_decode_v2_wo_dot_reduce_repr)
 def _paged_attn_decode_v2_wo_dot_reduce_kernel(
     out,
@@ -564,6 +569,7 @@ _paged_attn_decode_v2_w_dot_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_paged_attn_decode_v2_w_dot_repr)
 def _paged_attn_decode_v2_w_dot_kernel(
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
@@ -745,6 +751,7 @@ _paged_attn_decode_v2_w_dot_reduce_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_paged_attn_decode_v2_w_dot_reduce_repr)
 def _paged_attn_decode_v2_w_dot_reduce_kernel(
     out_ptr,  # [num_seqs, num_kv_heads, q_grp_sz, head_sz]
@@ -857,6 +864,7 @@ _paged_attn_decode_v1_wo_dot_per_token_quant_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_paged_attn_decode_v1_wo_dot_per_token_quant_repr)
 def _paged_attn_decode_v1_wo_dot_kernel_per_token_quant(
     out,  # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
@@ -998,6 +1006,7 @@ _paged_attn_decode_v1_w_dot_per_token_quant_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("waves_per_eu",), options={"num_stages": 1})
 @triton.jit(repr=_paged_attn_decode_v1_w_dot_per_token_quant_repr)
 def _paged_attn_decode_v1_w_dot_kernel_per_token_quant(
     out_ptr,  # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
@@ -1164,6 +1173,7 @@ _paged_attn_decode_v2_wo_dot_per_token_quant_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_paged_attn_decode_v2_wo_dot_per_token_quant_repr)
 def _paged_attn_decode_v2_wo_dot_kernel_per_token_quant(
     exp_sums_ptr,
@@ -1328,6 +1338,7 @@ _paged_attn_decode_v2_wo_dot_reduce_per_token_quant_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_paged_attn_decode_v2_wo_dot_reduce_per_token_quant_repr)
 def _paged_attn_decode_v2_wo_dot_reduce_kernel_per_token_quant(
     out,
@@ -1430,6 +1441,7 @@ _paged_attn_decode_v2_w_dot_per_token_quant_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_paged_attn_decode_v2_w_dot_per_token_quant_repr)
 def _paged_attn_decode_v2_w_dot_kernel_per_token_quant(
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
@@ -1620,6 +1632,7 @@ _paged_attn_decode_v2_w_dot_reduce_per_token_quant_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_paged_attn_decode_v2_w_dot_reduce_per_token_quant_repr)
 def _paged_attn_decode_v2_w_dot_reduce_kernel_per_token_quant(
     out_ptr,  # [num_seqs, num_kv_heads, q_grp_sz, head_sz]

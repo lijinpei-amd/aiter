@@ -8,7 +8,6 @@ a temporary, one multiply pass reading it back) with a single pass
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.fusions.fused_sigmoid_mul import (
     _fused_sigmoid_mul_kernel,
@@ -29,18 +28,6 @@ __all__ = ["fused_sigmoid_mul"]
 def _get_config() -> dict:
     base = f"{AITER_TRITON_CONFIGS_PATH}/{get_arch()}/triton/fusions/fused_sigmoid_mul"
     return dict(load_config_json(f"{base}/DEFAULT.json", required=True)["any"])
-
-
-_fused_sigmoid_mul_kernel_launch = make_launcher(
-    _fused_sigmoid_mul_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
 
 
 def fused_sigmoid_mul(
@@ -92,7 +79,7 @@ def fused_sigmoid_mul(
     BLOCK_SIZE_N = config.pop("BLOCK_SIZE_N")
 
     dev, stream = current_device_stream()
-    _fused_sigmoid_mul_kernel_launch(
+    _fused_sigmoid_mul_kernel(
         dev,
         stream,
         (triton.cdiv(N, BLOCK_SIZE_N),),

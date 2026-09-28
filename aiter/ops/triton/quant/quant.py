@@ -49,12 +49,6 @@ _MXFP8_LEGACY_BLOCK_SIZE = 128
 _LOGGER = AiterTritonLogger()
 
 
-_static_per_tensor_quant_fp8_i8_kernel_launch = make_launcher(
-    _static_per_tensor_quant_fp8_i8_kernel,
-    options={"num_warps": 4},
-)
-
-
 def static_per_tensor_quant_fp8_i8(
     qx: torch.Tensor,
     x_in: torch.Tensor,
@@ -94,7 +88,7 @@ def static_per_tensor_quant_fp8_i8(
     grid = (triton.cdiv(rows, BLOCK_M), triton.cdiv(cols, BLOCK_N))
 
     dev, stream = current_device_stream()
-    _static_per_tensor_quant_fp8_i8_kernel_launch(
+    _static_per_tensor_quant_fp8_i8_kernel(
         dev,
         stream,
         grid,
@@ -111,12 +105,6 @@ def static_per_tensor_quant_fp8_i8(
         BLOCK_N,
     )
     return qx
-
-
-_dynamic_per_tensor_quant_fp8_i8_kernel_launch = make_launcher(
-    _dynamic_per_tensor_quant_fp8_i8_kernel,
-    grid_arg=1,
-)
 
 
 def dynamic_per_tensor_quant_fp8_i8(
@@ -140,7 +128,7 @@ def dynamic_per_tensor_quant_fp8_i8(
     NUM_COL_POW2 = triton.next_power_of_2(cols)
 
     dev, stream = current_device_stream()
-    _dynamic_per_tensor_quant_fp8_i8_kernel_launch(
+    _dynamic_per_tensor_quant_fp8_i8_kernel(
         dev,
         stream,
         rows,
@@ -159,11 +147,6 @@ def dynamic_per_tensor_quant_fp8_i8(
     static_per_tensor_quant_fp8_i8(qx, x_in, scale_out)
 
     return qx, scale_out
-
-
-_dynamic_per_token_quant_fp8_i8_kernel_launch = make_launcher(
-    _dynamic_per_token_quant_fp8_i8_kernel,
-)
 
 
 def dynamic_per_token_quant_fp8_i8(
@@ -191,7 +174,7 @@ def dynamic_per_token_quant_fp8_i8(
     grid = (rows,)
 
     dev, stream = current_device_stream()
-    _dynamic_per_token_quant_fp8_i8_kernel_launch(
+    _dynamic_per_token_quant_fp8_i8_kernel(
         dev,
         stream,
         grid,
@@ -383,11 +366,6 @@ def dynamic_mxfp4_quant(
     return (x_fp4, blockscale_e8m0)
 
 
-_dynamic_mxfp4_quant_blockscale_kernel_launch = make_launcher(
-    _dynamic_mxfp4_quant_blockscale_kernel,
-)
-
-
 def dynamic_mxfp4_quant_blockscale(
     x: torch.Tensor, scaling_mode: str = "even"
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -438,7 +416,7 @@ def dynamic_mxfp4_quant_blockscale(
     grid = (M // block_size, N // block_size)
 
     dev, stream = current_device_stream()
-    _dynamic_mxfp4_quant_blockscale_kernel_launch(
+    _dynamic_mxfp4_quant_blockscale_kernel(
         dev,
         stream,
         grid,
@@ -452,9 +430,6 @@ def dynamic_mxfp4_quant_blockscale(
     )
 
     return x_fp4, blockscale_e8m0
-
-
-_dynamic_mxfp8_quant_kernel_launch = make_launcher(_dynamic_mxfp8_quant_kernel)
 
 
 def dynamic_mxfp8_quant(
@@ -501,7 +476,7 @@ def dynamic_mxfp8_quant(
     grid = (NUM_PRGMS,)
 
     dev, stream = current_device_stream()
-    _dynamic_mxfp8_quant_kernel_launch(
+    _dynamic_mxfp8_quant_kernel(
         dev,
         stream,
         grid,
@@ -524,11 +499,6 @@ def dynamic_mxfp8_quant(
     y = y.view(*orig_shape[:-1], K)
     s = scale.view(*orig_shape[:-1], Ns)
     return y, s
-
-
-_dynamic_mxfp8_quant_n32k4_mbn_kernel_launch = make_launcher(
-    _dynamic_mxfp8_quant_n32k4_mbn_kernel,
-)
 
 
 def dynamic_mxfp8_quant_n32k4_mbn(
@@ -572,7 +542,7 @@ def dynamic_mxfp8_quant_n32k4_mbn(
     grid = (R,)
 
     dev, stream = current_device_stream()
-    _dynamic_mxfp8_quant_n32k4_mbn_kernel_launch(
+    _dynamic_mxfp8_quant_n32k4_mbn_kernel(
         dev,
         stream,
         grid,
@@ -593,9 +563,6 @@ def dynamic_mxfp8_quant_n32k4_mbn(
     )
 
     return y.view(M, B, K), scale
-
-
-_fp8_legacy_to_mxfp8_kernel_launch = make_launcher(_fp8_legacy_to_mxfp8_kernel)
 
 
 def fp8_legacy_to_mxfp8(
@@ -637,7 +604,7 @@ def fp8_legacy_to_mxfp8(
     grid = (triton.cdiv(M, BLOCK_SIZE_M), Ns)
 
     dev, stream = current_device_stream()
-    _fp8_legacy_to_mxfp8_kernel_launch(
+    _fp8_legacy_to_mxfp8_kernel(
         dev,
         stream,
         grid,
@@ -661,13 +628,6 @@ def fp8_legacy_to_mxfp8(
     )
 
     return y_fn, y_scale
-
-
-_dynamic_nvfp4_quant_kernel_launch = make_launcher(
-    _dynamic_nvfp4_quant_kernel,
-    dynamic_options=("num_warps",),
-    options={"waves_per_eu": 0},
-)
 
 
 def dynamic_nvfp4_quant(
@@ -731,7 +691,7 @@ def dynamic_nvfp4_quant(
     )
 
     dev, stream = current_device_stream()
-    _dynamic_nvfp4_quant_kernel_launch(
+    _dynamic_nvfp4_quant_kernel(
         dev,
         stream,
         grid,

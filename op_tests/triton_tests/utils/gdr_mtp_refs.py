@@ -87,6 +87,7 @@ log = tl.log
 # ==============================================================================
 
 
+@make_launcher(options={"num_warps": 1})
 @triton.jit
 def fused_gdn_gating_kernel_vllm(
     g,
@@ -123,12 +124,6 @@ def fused_gdn_gating_kernel_vllm(
     )
 
 
-_fused_gdn_gating_kernel_vllm_launch = make_launcher(
-    fused_gdn_gating_kernel_vllm,
-    options={"num_warps": 1},
-)
-
-
 def fused_gdn_gating_vllm(
     A_log: torch.Tensor,
     a: torch.Tensor,
@@ -149,7 +144,7 @@ def fused_gdn_gating_vllm(
     g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
     beta_output = torch.empty(1, batch, num_heads, dtype=b.dtype, device=b.device)
     dev, stream = current_device_stream()
-    _fused_gdn_gating_kernel_vllm_launch(
+    fused_gdn_gating_kernel_vllm(
         dev,
         stream,
         grid,
@@ -174,6 +169,7 @@ def fused_gdn_gating_vllm(
 # ==============================================================================
 
 
+@make_launcher(options={"num_stages": 3, "num_warps": 1})
 @triton.heuristics(
     {
         "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
@@ -334,12 +330,6 @@ def fused_recurrent_gated_delta_rule_fwd_kernel_vllm(
         p_beta += HV * (V if IS_BETA_HEADWISE else 1)
 
 
-_fused_recurrent_gated_delta_rule_fwd_kernel_vllm_launch = make_launcher(
-    fused_recurrent_gated_delta_rule_fwd_kernel_vllm,
-    options={"num_stages": 3, "num_warps": 1},
-)
-
-
 def fused_recurrent_gated_delta_rule_fwd_vllm(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -381,7 +371,7 @@ def fused_recurrent_gated_delta_rule_fwd_vllm(
 
     grid = (NK, NV, N * HV)
     dev, stream = current_device_stream()
-    _fused_recurrent_gated_delta_rule_fwd_kernel_vllm_launch(
+    fused_recurrent_gated_delta_rule_fwd_kernel_vllm(
         dev,
         stream,
         grid,
@@ -579,6 +569,7 @@ def fused_recurrent_gated_delta_rule_vllm(
 # 3
 # When calculating token 3's attention, it should attend to token 1 (parent) and token 0 (grand-parent)
 # When calculating token 2's attention, it should attend to token 0 (parent)
+@make_launcher(options={"num_stages": 3, "num_warps": 1})
 @triton.jit(do_not_specialize=["T"])
 def fused_sigmoid_gating_delta_rule_update_kernel_sglang(
     A_log,
@@ -901,12 +892,6 @@ def fused_sigmoid_gating_delta_rule_update_kernel_sglang(
                 tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
 
-_fused_sigmoid_gating_delta_rule_update_kernel_sglang_launch = make_launcher(
-    fused_sigmoid_gating_delta_rule_update_kernel_sglang,
-    options={"num_stages": 3, "num_warps": 1},
-)
-
-
 def fused_sigmoid_gating_delta_rule_update_sglang(
     A_log: torch.Tensor,
     a: torch.Tensor,
@@ -1021,7 +1006,7 @@ def fused_sigmoid_gating_delta_rule_update_sglang(
         stride_rawv_slot = stride_rawk_slot = stride_g_slot = stride_beta_slot = 0
 
     dev, stream = current_device_stream()
-    _fused_sigmoid_gating_delta_rule_update_kernel_sglang_launch(
+    fused_sigmoid_gating_delta_rule_update_kernel_sglang(
         dev,
         stream,
         grid,

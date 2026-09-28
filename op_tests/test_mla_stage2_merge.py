@@ -56,6 +56,13 @@ V_HEAD_DIM = 512
 MGC = 16
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+    )
+)
 @triton.jit
 def _stage2_merge_vec(
     Mid_O,  # [T, N, H, Lv] fp32
@@ -168,16 +175,6 @@ _fwd_kernel_stage2_asm_launch = make_launcher(
 )
 
 
-_stage2_merge_vec_launch = make_launcher(
-    _stage2_merge_vec,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-    ),
-)
-
-
 @benchmark()
 def test_stage2_merge(
     num_seqs, num_heads, num_kv_splits, dv, dtype, warps=1, stages=2, wpe=4
@@ -256,7 +253,7 @@ def test_stage2_merge(
 
     def run_vec():
         dev, stream = current_device_stream()
-        _stage2_merge_vec_launch(
+        _stage2_merge_vec(
             dev,
             stream,
             (T, H),

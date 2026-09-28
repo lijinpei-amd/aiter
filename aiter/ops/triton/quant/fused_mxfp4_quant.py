@@ -202,9 +202,6 @@ def fused_rms_mxfp4_quant(
     return (out1_fp4, out1_bs), out1, out2, out_res1
 
 
-_fused_flatten_mxfp4_quant_launch = make_launcher(_fused_flatten_mxfp4_quant)
-
-
 def fused_flatten_mxfp4_quant(
     x: torch.Tensor,
 ):
@@ -237,7 +234,7 @@ def fused_flatten_mxfp4_quant(
     )
 
     dev, stream = current_device_stream()
-    _fused_flatten_mxfp4_quant_launch(
+    _fused_flatten_mxfp4_quant(
         dev,
         stream,
         grid,
@@ -659,12 +656,6 @@ def fused_reduce_rms_mxfp4_quant(
     return (out1_fp4, out1_bs), out1, out2, out_res1, out3
 
 
-_moe_sort_launch = make_launcher(_fused_dynamic_mxfp4_quant_moe_sort_kernel, grid_arg=1)
-_gluon_moe_sort_launch = make_launcher(
-    _gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel, grid_arg=1
-)
-
-
 def fused_dynamic_mxfp4_quant_moe_sort(
     x: torch.Tensor,
     sorted_ids: torch.Tensor,
@@ -741,9 +732,9 @@ def fused_dynamic_mxfp4_quant_moe_sort(
         raise ValueError("Gluon is only supported on gfx1250")
 
     kernel = (
-        _gluon_moe_sort_launch
+        _gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel
         if (args in ["gluon", "auto"] and get_arch() == "gfx1250")
-        else _moe_sort_launch
+        else _fused_dynamic_mxfp4_quant_moe_sort_kernel
     )
 
     dev, stream = current_device_stream()
@@ -794,6 +785,7 @@ _fused_quant_fp8_sort_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_fused_quant_fp8_sort_repr)
 def _fused_quant_fp8_sort_kernel(
     # Pointers
@@ -911,9 +903,6 @@ def _fused_quant_fp8_sort_kernel(
     tl.store(scale_sorted_ptr + offs, out)
 
 
-_fused_quant_fp8_sort_kernel_launch = make_launcher(_fused_quant_fp8_sort_kernel)
-
-
 def fused_quant_fp8_sort(
     input: torch.Tensor,
     sorted_ids: torch.Tensor,
@@ -964,7 +953,7 @@ def fused_quant_fp8_sort(
     )
 
     dev, stream = current_device_stream()
-    _fused_quant_fp8_sort_kernel_launch(
+    _fused_quant_fp8_sort_kernel(
         dev,
         stream,
         grid,

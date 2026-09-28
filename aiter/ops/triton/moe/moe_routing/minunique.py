@@ -13,8 +13,6 @@ from aiter.ops.triton.moe.moe_routing.topk import topk
 from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
 from aiter.ops.triton.utils.device_info import current_device_stream
 
-_keepk_sort0_launch = make_launcher(_keepk_sort0, grid_arg=1, options={"num_warps": 1})
-
 
 def keepk_sort0(
     expt_scal,
@@ -38,7 +36,7 @@ def keepk_sort0(
     Vout = torch.empty((M, k), dtype=expt_scal.dtype, device=dev)
     Iout = torch.empty((M, k), dtype=torch.int16, device=dev)
     intj_dev, intj_stream = current_device_stream()
-    _keepk_sort0_launch(
+    _keepk_sort0(
         intj_dev,
         intj_stream,
         M,

@@ -29,9 +29,6 @@ def _get_config(block_size_n: int, backend: str) -> dict:
     return dict(raw["any"])
 
 
-_fused_add_rmsnorm_pad_launch = make_launcher(_fused_add_rmsnorm_pad, grid_arg=1)
-
-
 @functools.cache
 def _gluon_fused_add_rmsnorm_pad_kernel_launch(num_warps):
     return make_launcher(
@@ -144,7 +141,7 @@ def fused_add_rmsnorm_pad(
     BLOCK_SIZE_N = triton.next_power_of_2(N_out)
 
     dev, stream = current_device_stream()
-    _fused_add_rmsnorm_pad_launch(
+    _fused_add_rmsnorm_pad(
         dev,
         stream,
         M,

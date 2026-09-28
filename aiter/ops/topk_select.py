@@ -176,6 +176,7 @@ def _no_range(device: torch.device) -> torch.Tensor:
     return torch.empty(0, dtype=torch.int32, device=device)
 
 
+@make_launcher(grid_arg=1)
 @triton.jit
 def _gather_selected_kernel(
     scores_ptr,
@@ -206,9 +207,6 @@ def _gather_selected_kernel(
     tl.store(out_ptr + row * out_stride0 + offs, val, mask=live)
 
 
-_gather_selected_kernel_launch = make_launcher(_gather_selected_kernel, grid_arg=1)
-
-
 def _gather_selected(scores, idx, fill):
     """The selected scores, padded slots filled, in one launch.
 
@@ -221,7 +219,7 @@ def _gather_selected(scores, idx, fill):
     rows, topk = idx.shape
     out = torch.empty((rows, topk), dtype=scores.dtype, device=scores.device)
     dev, stream = current_device_stream()
-    _gather_selected_kernel_launch(
+    _gather_selected_kernel(
         dev,
         stream,
         rows,

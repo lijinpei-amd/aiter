@@ -2,7 +2,6 @@ from functools import cache
 
 import torch
 import triton
-from intj import make_launcher
 
 import aiter
 from aiter.ops.triton._triton_kernels.activation import (
@@ -24,11 +23,6 @@ _LOGGER = AiterTritonLogger()
 
 
 fp8_dtype = aiter.dtypes.fp8
-
-
-_fused_rms_fp8_per_tensor_static_quant_kernel_launch = make_launcher(
-    _fused_rms_fp8_per_tensor_static_quant_kernel, dynamic_options=("num_warps",)
-)
 
 
 def fused_rms_fp8_per_tensor_static_quant(
@@ -126,7 +120,7 @@ def fused_rms_fp8_per_tensor_static_quant(
     )
 
     dev, stream = current_device_stream()
-    _fused_rms_fp8_per_tensor_static_quant_kernel_launch(
+    _fused_rms_fp8_per_tensor_static_quant_kernel(
         dev,
         stream,
         (M,),
@@ -170,11 +164,6 @@ def fused_rms_fp8_per_tensor_static_quant(
     )
 
     return out1_fp8, out1, out2, out_res1
-
-
-_fused_rms_fp8_group_quant_kernel_launch = make_launcher(
-    _fused_rms_fp8_group_quant_kernel, dynamic_options=("num_warps",)
-)
 
 
 def fused_rms_fp8_group_quant(
@@ -308,7 +297,7 @@ def fused_rms_fp8_group_quant(
         out1_bs_col_stride = out1_bs.stride(1)
 
     dev, stream = current_device_stream()
-    _fused_rms_fp8_group_quant_kernel_launch(
+    _fused_rms_fp8_group_quant_kernel(
         dev,
         stream,
         (M,),
@@ -490,7 +479,7 @@ def fused_rms_gated_fp8_group_quant(
     BLOCK_SIZE_PAD = max(triton.next_power_of_2(N), effective_gs)
 
     dev, stream = current_device_stream()
-    _fused_rms_fp8_group_quant_kernel_launch(
+    _fused_rms_fp8_group_quant_kernel(
         dev,
         stream,
         grid,
@@ -554,11 +543,6 @@ def fused_rms_gated_fp8_group_quant(
     return x_quant, scales
 
 
-_fused_flatten_fp8_group_quant_kernel_launch = make_launcher(
-    _fused_flatten_fp8_group_quant_kernel,
-)
-
-
 def fused_flatten_fp8_group_quant(
     x: torch.Tensor,
     group_size,
@@ -617,7 +601,7 @@ def fused_flatten_fp8_group_quant(
     )
 
     dev, stream = current_device_stream()
-    _fused_flatten_fp8_group_quant_kernel_launch(
+    _fused_flatten_fp8_group_quant_kernel(
         dev,
         stream,
         grid,
@@ -635,11 +619,6 @@ def fused_flatten_fp8_group_quant(
     )
 
     return out, out_block_scales
-
-
-_fused_reduce_act_mul_fp8_group_quant_launch = make_launcher(
-    _fused_reduce_act_mul_fp8_group_quant, dynamic_options=("num_warps",)
-)
 
 
 def fused_reduce_act_mul_fp8_group_quant(
@@ -734,7 +713,7 @@ def fused_reduce_act_mul_fp8_group_quant(
     grid = (num_pid,)
 
     dev, stream = current_device_stream()
-    _fused_reduce_act_mul_fp8_group_quant_launch(
+    _fused_reduce_act_mul_fp8_group_quant(
         dev,
         stream,
         grid,
@@ -773,11 +752,6 @@ def fused_reduce_act_mul_fp8_group_quant(
     )
 
     return (y, y_scale), y2
-
-
-_fused_reduce_rms_fp8_group_quant_kernel_launch = make_launcher(
-    _fused_reduce_rms_fp8_group_quant_kernel, dynamic_options=("num_warps",)
-)
 
 
 def fused_reduce_rms_fp8_group_quant(
@@ -966,7 +940,7 @@ def fused_reduce_rms_fp8_group_quant(
     )
 
     dev, stream = current_device_stream()
-    _fused_reduce_rms_fp8_group_quant_kernel_launch(
+    _fused_reduce_rms_fp8_group_quant_kernel(
         dev,
         stream,
         (3 * M if HAS_SPLITK else 2 * M,),
@@ -1043,11 +1017,6 @@ def fused_reduce_rms_fp8_group_quant(
     return (out1_fp8, out1_bs), out1, out2, out_res1, out3
 
 
-_fused_silu_mul_fp8_per_tensor_static_quant_kernel_launch = make_launcher(
-    _fused_silu_mul_fp8_per_tensor_static_quant_kernel, dynamic_options=("num_warps",)
-)
-
-
 def fused_silu_mul_fp8_per_tensor_static_quant(
     inp,
     inp_scale,
@@ -1088,7 +1057,7 @@ def fused_silu_mul_fp8_per_tensor_static_quant(
     )
 
     dev, stream = current_device_stream()
-    _fused_silu_mul_fp8_per_tensor_static_quant_kernel_launch(
+    _fused_silu_mul_fp8_per_tensor_static_quant_kernel(
         dev,
         stream,
         (M,),

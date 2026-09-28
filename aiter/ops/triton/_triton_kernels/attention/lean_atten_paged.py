@@ -16,6 +16,7 @@ TO be added features:
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -47,6 +48,12 @@ _la_persistent_paged_repr = make_kernel_repr(
 )
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "waves_per_eu",
+    )
+)
 @triton.jit(repr=_la_persistent_paged_repr)
 def la_persistent_paged(
     Q,

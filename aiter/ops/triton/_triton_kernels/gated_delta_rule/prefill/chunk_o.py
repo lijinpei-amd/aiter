@@ -198,6 +198,7 @@ _chunk_fwd_kernel_o_launch = make_launcher(
 )
 
 
+@make_launcher
 @triton.heuristics(
     {
         "USE_G": lambda args: args["g"] is not None,
@@ -399,9 +400,7 @@ def chunk_bwd_kernel_dqkwg(
         )
 
 
-_chunk_bwd_kernel_dqkwg_launch = make_launcher(chunk_bwd_kernel_dqkwg)
-
-
+@make_launcher
 @triton.heuristics(
     {
         "USE_G": lambda args: args["g"] is not None,
@@ -504,9 +503,7 @@ def chunk_bwd_kernel_dv(
     )
 
 
-_chunk_bwd_kernel_dv_launch = make_launcher(chunk_bwd_kernel_dv)
-
-
+@make_launcher
 @triton.heuristics(
     {
         "USE_G": lambda args: args["g"] is not None,
@@ -601,9 +598,6 @@ def chunk_bwd_kernel_dv_local(
         )
 
 
-_chunk_bwd_kernel_dv_local_launch = make_launcher(chunk_bwd_kernel_dv_local)
-
-
 def chunk_fwd_o(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -651,6 +645,12 @@ def chunk_fwd_o(
     return o
 
 
+def _chunk_fwd_kernel_o_opt_grid(V: int, BV: int, H: int, *, NT: int, B: int):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (triton.cdiv(V, BV), NT, B * H)
+
+
+@make_launcher(grid_cpp=_chunk_fwd_kernel_o_opt_grid)
 @triton.heuristics(
     {
         "USE_G": lambda args: args["g"] is not None,
@@ -754,17 +754,6 @@ def chunk_fwd_kernel_o_opt(
     _bp_st2d(o, T, V, H * V, 1, i_t * BT, i_v * BV, b_o.to(o.dtype.element_ty), BT, BV)
 
 
-def _chunk_fwd_kernel_o_opt_grid(V: int, BV: int, H: int, *, NT: int, B: int):
-    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
-    return (triton.cdiv(V, BV), NT, B * H)
-
-
-_chunk_fwd_kernel_o_opt_launch = make_launcher(
-    chunk_fwd_kernel_o_opt,
-    grid_cpp=_chunk_fwd_kernel_o_opt_grid,
-)
-
-
 def chunk_fwd_o_opt(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -806,7 +795,7 @@ def chunk_fwd_o_opt(
     o = v.new_empty(B, T, H, V)
 
     dev, stream = current_device_stream()
-    _chunk_fwd_kernel_o_opt_launch(
+    chunk_fwd_kernel_o_opt(
         dev,
         stream,
         NT,  # grid
@@ -837,6 +826,12 @@ def chunk_fwd_o_opt(
 # =====================================================================
 
 
+def _chunk_fwd_kernel_o_opt_vk_grid(V: int, BV: int, H: int, *, NT: int, B: int):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (triton.cdiv(V, BV), NT, B * H)
+
+
+@make_launcher(grid_cpp=_chunk_fwd_kernel_o_opt_vk_grid)
 @triton.heuristics(
     {
         "USE_G": lambda args: args["g"] is not None,
@@ -957,17 +952,6 @@ def chunk_fwd_kernel_o_opt_vk(
     _bp_st2d(o, T, V, H * V, 1, i_t * BT, i_v * BV, b_o.to(o.dtype.element_ty), BT, BV)
 
 
-def _chunk_fwd_kernel_o_opt_vk_grid(V: int, BV: int, H: int, *, NT: int, B: int):
-    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
-    return (triton.cdiv(V, BV), NT, B * H)
-
-
-_chunk_fwd_kernel_o_opt_vk_launch = make_launcher(
-    chunk_fwd_kernel_o_opt_vk,
-    grid_cpp=_chunk_fwd_kernel_o_opt_vk_grid,
-)
-
-
 def chunk_fwd_o_opt_vk(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1050,7 +1034,7 @@ def chunk_fwd_o_opt_vk(
     # o = v.new_empty(B, T, H, V)
 
     dev, stream = current_device_stream()
-    _chunk_fwd_kernel_o_opt_vk_launch(
+    chunk_fwd_kernel_o_opt_vk(
         dev,
         stream,
         NT,  # grid
@@ -1112,7 +1096,7 @@ def chunk_bwd_dv(
     dv = torch.empty_like(do)
     grid = (NV, NT, B * H)
     dev, stream = current_device_stream()
-    _chunk_bwd_kernel_dv_launch(
+    chunk_bwd_kernel_dv(
         dev,
         stream,
         grid,
@@ -1167,7 +1151,7 @@ def chunk_bwd_dv_local(
     dv = torch.empty_like(do)
     grid = (NT, B * H)
     dev, stream = current_device_stream()
-    _chunk_bwd_kernel_dv_local_launch(
+    chunk_bwd_kernel_dv_local(
         dev,
         stream,
         grid,
@@ -1230,7 +1214,7 @@ def chunk_bwd_dqkwg(
 
     grid = (NK, NT, B * H)
     dev, stream = current_device_stream()
-    _chunk_bwd_kernel_dqkwg_launch(
+    chunk_bwd_kernel_dqkwg(
         dev,
         stream,
         grid,

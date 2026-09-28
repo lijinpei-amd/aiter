@@ -87,18 +87,6 @@ def _wino_output_grid(T, K_out, config):
     return (T, triton.cdiv(K_out, config["BLOCK_K"]))
 
 
-_nchw_to_cblocked_kernel_launch = make_launcher(
-    _nchw_to_cblocked_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
-
-
 def _launch_nchw_to_cblocked(x, x_blocked, N, C, H, W, C_pad, block_c):
     """Launch the fused NCHW-to-NCHWc activation pack."""
     HW = H * W
@@ -110,7 +98,7 @@ def _launch_nchw_to_cblocked(x, x_blocked, N, C, H, W, C_pad, block_c):
         N,
     )
     dev, stream = current_device_stream()
-    _nchw_to_cblocked_kernel_launch(
+    _nchw_to_cblocked_kernel(
         dev,
         stream,
         grid,
@@ -615,42 +603,6 @@ def _launch_general(
     )
 
 
-_winograd_f4x3_input_transform_kernel_launch = make_launcher(
-    _winograd_f4x3_input_transform_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
-
-
-_winograd_f4x3_batched_gemm_kernel_launch = make_launcher(
-    _winograd_f4x3_batched_gemm_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
-
-
-_winograd_f4x3_output_transform_kernel_launch = make_launcher(
-    _winograd_f4x3_output_transform_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
-
-
 def _launch_winograd_f4x3(
     x,
     U,
@@ -699,7 +651,7 @@ def _launch_winograd_f4x3(
 
     # 1. Input transform
     dev, stream = current_device_stream()
-    _winograd_f4x3_input_transform_kernel_launch(
+    _winograd_f4x3_input_transform_kernel(
         dev,
         stream,
         _wino_input_grid(T, C_pad, input_config),
@@ -726,7 +678,7 @@ def _launch_winograd_f4x3(
 
     # 2. Batched GEMM
     dev, stream = current_device_stream()
-    _winograd_f4x3_batched_gemm_kernel_launch(
+    _winograd_f4x3_batched_gemm_kernel(
         dev,
         stream,
         _wino_gemm_grid(T, K_out, gemm_config),
@@ -749,7 +701,7 @@ def _launch_winograd_f4x3(
 
     # 3. Output transform
     dev, stream = current_device_stream()
-    _winograd_f4x3_output_transform_kernel_launch(
+    _winograd_f4x3_output_transform_kernel(
         dev,
         stream,
         _wino_output_grid(T, K_out, output_config),
@@ -773,18 +725,6 @@ def _launch_winograd_f4x3(
         _kernel_activation(activation),
         layout,
     )
-
-
-_winograd_f4x3_cblocked_input_transform_kernel_launch = make_launcher(
-    _winograd_f4x3_cblocked_input_transform_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
 
 
 def _launch_winograd_f4x3_cblocked(
@@ -837,7 +777,7 @@ def _launch_winograd_f4x3_cblocked(
 
     # 1. Cblocked input transform
     dev, stream = current_device_stream()
-    _winograd_f4x3_cblocked_input_transform_kernel_launch(
+    _winograd_f4x3_cblocked_input_transform_kernel(
         dev,
         stream,
         _wino_input_grid(T, C_pad, input_config),
@@ -863,7 +803,7 @@ def _launch_winograd_f4x3_cblocked(
     )
 
     dev, stream = current_device_stream()
-    _winograd_f4x3_batched_gemm_kernel_launch(
+    _winograd_f4x3_batched_gemm_kernel(
         dev,
         stream,
         _wino_gemm_grid(T, K_out, gemm_config),
@@ -885,7 +825,7 @@ def _launch_winograd_f4x3_cblocked(
     )
 
     dev, stream = current_device_stream()
-    _winograd_f4x3_output_transform_kernel_launch(
+    _winograd_f4x3_output_transform_kernel(
         dev,
         stream,
         _wino_output_grid(T, K_out, output_config),

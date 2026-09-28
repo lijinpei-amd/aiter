@@ -3,6 +3,7 @@
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
@@ -251,6 +252,7 @@ _fused_gemm_a8w8_blockscale_mul_add_reduce_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.heuristics({})  # dummy heuristics to invoke kernel re-naming
 @triton.jit(repr=_fused_gemm_a8w8_blockscale_mul_add_reduce_repr)
 def _fused_gemm_a8w8_blockscale_mul_add_reduce_kernel(

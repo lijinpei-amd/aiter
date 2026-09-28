@@ -1,5 +1,6 @@
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -53,6 +54,7 @@ _fused_rms_fp8_per_tensor_static_quant_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("num_warps",))
 @triton.jit(repr=_fused_rms_fp8_per_tensor_static_quant_repr)
 def _fused_rms_fp8_per_tensor_static_quant_kernel(
     inp1_ptr,
@@ -185,6 +187,7 @@ _fused_rms_fp8_group_quant_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("num_warps",))
 @triton.jit(repr=_fused_rms_fp8_group_quant_repr)
 def _fused_rms_fp8_group_quant_kernel(
     inp1_ptr,
@@ -432,6 +435,7 @@ _fused_flatten_fp8_group_quant_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_fused_flatten_fp8_group_quant_repr)
 def _fused_flatten_fp8_group_quant_kernel(
     x_ptr,
@@ -501,6 +505,7 @@ _fused_reduce_act_mul_fp8_group_quant_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("num_warps",))
 @triton.jit(repr=_fused_reduce_act_mul_fp8_group_quant_repr)
 def _fused_reduce_act_mul_fp8_group_quant(
     x_ptr,
@@ -670,6 +675,7 @@ _fused_reduce_rms_fp8_group_quant_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("num_warps",))
 @triton.jit(repr=_fused_reduce_rms_fp8_group_quant_repr)
 def _fused_reduce_rms_fp8_group_quant_kernel(
     inp1_ptr,
@@ -927,6 +933,7 @@ _fused_silu_mul_fp8_per_tensor_static_quant_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("num_warps",))
 @triton.jit(repr=_fused_silu_mul_fp8_per_tensor_static_quant_repr)
 def _fused_silu_mul_fp8_per_tensor_static_quant_kernel(
     inp_ptr,

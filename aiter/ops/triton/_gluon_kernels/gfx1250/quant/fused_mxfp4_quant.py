@@ -1,5 +1,6 @@
 import triton
 import triton.language as tl
+from intj import make_launcher
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
@@ -916,6 +917,7 @@ _gluon_fused_dynamic_mxfp4_quant_moe_sort_repr = make_kernel_repr(
 )
 
 
+@make_launcher(grid_arg=1)
 @gluon.jit(repr=_gluon_fused_dynamic_mxfp4_quant_moe_sort_repr)
 def _gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel(
     x_ptr,

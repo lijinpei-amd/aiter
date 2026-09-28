@@ -34,6 +34,14 @@ def get_autotune_config():
         return get_hip_autotune_config()
 
 
+def _fused_sigmoid_gating_delta_rule_update_kernel_grid(
+    V: int, BV: int, HV: int, *, NK: int, N: int
+):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (NK, triton.cdiv(V, BV), N * HV)
+
+
+@make_launcher(grid_cpp=_fused_sigmoid_gating_delta_rule_update_kernel_grid)
 @triton.heuristics(
     {
         "USE_INITIAL_STATE": lambda args: args["h0_source"] is not None,
@@ -194,19 +202,6 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
 
-def _fused_sigmoid_gating_delta_rule_update_kernel_grid(
-    V: int, BV: int, HV: int, *, NK: int, N: int
-):
-    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
-    return (NK, triton.cdiv(V, BV), N * HV)
-
-
-_fused_sigmoid_gating_delta_rule_update_kernel_launch = make_launcher(
-    fused_sigmoid_gating_delta_rule_update_kernel,
-    grid_cpp=_fused_sigmoid_gating_delta_rule_update_kernel_grid,
-)
-
-
 @input_guard
 def fused_sigmoid_gating_delta_rule_update(
     A_log: torch.Tensor,
@@ -244,7 +239,7 @@ def fused_sigmoid_gating_delta_rule_update(
     o = q.new_empty(NK, *v.shape)
 
     dev, stream = current_device_stream()
-    _fused_sigmoid_gating_delta_rule_update_kernel_launch(
+    fused_sigmoid_gating_delta_rule_update_kernel(
         dev,
         stream,
         NK,  # grid

@@ -11,6 +11,7 @@ import functools
 # Triton
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
@@ -379,6 +380,15 @@ def _work_stealing_gmm(
         tile = tl.atomic_add(tile_counter_ptr, 1, sem="relaxed").to(INT_TYPE)
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    )
+)
 @triton.heuristics(
     {
         "BLOCK_SIZE_G": lambda META: triton.next_power_of_2(META["G"]),
@@ -478,6 +488,15 @@ def gmm_kernel(
 # ------------------------------------------------------------------------------
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    )
+)
 @triton.jit
 def tgmm_persistent_kernel(
     # Tensor pointers:
@@ -667,6 +686,15 @@ def tgmm_persistent_kernel(
 # ------------------------------------------------------------------------------
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    )
+)
 @triton.heuristics({"BLOCK_SIZE_G": lambda META: triton.next_power_of_2(META["G"])})
 @triton.jit
 def tgmm_non_persistent_kernel(

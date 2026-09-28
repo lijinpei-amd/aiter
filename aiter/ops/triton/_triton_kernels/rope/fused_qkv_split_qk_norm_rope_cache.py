@@ -1,5 +1,6 @@
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.rope.rope import _get_gptj_rotated_x, _get_neox_rotated_x
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
@@ -148,6 +149,7 @@ _fused_qkv_split_qk_norm_rope_cache_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(options={"num_warps": 4})
 @triton.jit(repr=_fused_qkv_split_qk_norm_rope_cache_kernel_repr)
 def _fused_qkv_split_qk_norm_rope_cache_kernel(
     qkv_ptr,

@@ -5,6 +5,7 @@ import functools
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
@@ -349,6 +350,15 @@ _bwd_kernel_dkdvdq_causal_repr = make_kernel_repr(
 )
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    )
+)
 @triton.jit(repr=_bwd_kernel_dkdvdq_causal_repr)
 def _bwd_kernel_dkdvdq_causal(
     q_ptr,
@@ -766,6 +776,15 @@ _bwd_kernel_dkdvdq_noncausal_repr = make_kernel_repr(
 )
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    )
+)
 @triton.jit(repr=_bwd_kernel_dkdvdq_noncausal_repr)
 def _bwd_kernel_dkdvdq_noncausal(
     Q,

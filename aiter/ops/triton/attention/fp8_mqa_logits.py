@@ -97,16 +97,6 @@ def _gfx942_tile_fits_lds(
     return lds_bytes <= 0.9 * _GFX942_CU_LDS_BYTES
 
 
-_fp8_mqa_logits_kernel_launch = make_launcher(
-    _fp8_mqa_logits_kernel,
-    dynamic_options=(
-        "num_stages",
-        "matrix_instr_nonkdim",
-    ),
-    options={"num_warps": 4, "waves_per_eu": 2},
-)
-
-
 @functools.cache
 def _gluon_fp8_mqa_logits_kernel_launch():
     # Built on first use: the Gluon kernel is None when its import fails.
@@ -210,7 +200,7 @@ def fp8_mqa_logits(
             kv_scales = kv_scales.to(torch.float32) * scale_mul
 
         dev, stream = current_device_stream()
-        _fp8_mqa_logits_kernel_launch(
+        _fp8_mqa_logits_kernel(
             dev,
             stream,
             (seq_len,),

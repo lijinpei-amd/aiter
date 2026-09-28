@@ -25,7 +25,6 @@ concatenation ``[Q | K | V]`` (``dim == 2*k_dim + v_dim``).
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.prefill_batch_metadata import CausalConvPrefillMetadata
 from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.causal_conv1d_fwd_split_qkv import (
@@ -40,12 +39,6 @@ __all__ = [
     "causal_conv1d_split_qkv_triton_fn",
     "causal_conv1d_split_qkv_triton_tile_fn",
 ]
-
-
-_causal_conv1d_fwd_split_qkv_kernel_launch = make_launcher(
-    _causal_conv1d_fwd_split_qkv_kernel,
-    options={"num_stages": 2},
-)
 
 
 def causal_conv1d_split_qkv_triton_fn(
@@ -99,7 +92,7 @@ def causal_conv1d_split_qkv_triton_fn(
     )
 
     dev, stream = current_device_stream()
-    _causal_conv1d_fwd_split_qkv_kernel_launch(
+    _causal_conv1d_fwd_split_qkv_kernel(
         dev,
         stream,
         grid,
@@ -171,13 +164,6 @@ def _build_chunk_schedule(
     base = torch.repeat_interleave(starts, nums)
     tco = (torch.arange(tot, dtype=torch.int64) - base).to(torch.int32)
     return tot, batch_ptr.to(device), tco.to(device)
-
-
-_causal_conv1d_fwd_split_qkv_tile_kernel_launch = make_launcher(
-    _causal_conv1d_fwd_split_qkv_tile_kernel,
-    dynamic_options=("num_warps",),
-    options={"num_stages": 1},
-)
 
 
 def causal_conv1d_split_qkv_triton_tile_fn(
@@ -286,7 +272,7 @@ def causal_conv1d_split_qkv_triton_tile_fn(
 
     grid = (tot, triton.cdiv(dim, BLOCK_N))
     dev, stream = current_device_stream()
-    _causal_conv1d_fwd_split_qkv_tile_kernel_launch(
+    _causal_conv1d_fwd_split_qkv_tile_kernel(
         dev,
         stream,
         grid,

@@ -165,13 +165,6 @@ def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOC
     )
 
 
-_combined_routing_fused_launch = make_launcher(
-    _combined_routing_fused,
-    grid_arg=1,
-    options={"num_warps": 1},
-)
-
-
 def sort_tokens_fused(
     expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M
 ):
@@ -204,7 +197,7 @@ def sort_tokens_fused(
     blocks1b = cdiv(n_tokens, HIST_BLOCK_M)
 
     dev, stream = current_device_stream()
-    _combined_routing_fused_launch(
+    _combined_routing_fused(
         dev,
         stream,
         blocks1a + blocks1b,
@@ -569,13 +562,6 @@ def _ep_sort_scratch(device, n_bins):
     return bufs
 
 
-_ep_gate_prep_scan_kernel_launch = make_launcher(_ep_gate_prep_scan_kernel, grid_arg=1)
-_ep_scatter_atomic_expt_data_kernel_launch = make_launcher(
-    _ep_scatter_atomic_expt_data_kernel,
-    grid_arg=1,
-)
-
-
 def ep_sort_routing(
     dispatch_weights,
     dispatch_ids,
@@ -651,7 +637,7 @@ def ep_sort_routing(
         dst_row = torch.empty(n_gates, dtype=torch.int32, device=device)
         src_token_map = ep_scatter_geometry.src_token_map
     dev, stream = current_device_stream()
-    _ep_gate_prep_scan_kernel_launch(
+    _ep_gate_prep_scan_kernel(
         dev,
         stream,
         n_ctas,
@@ -686,7 +672,7 @@ def ep_sort_routing(
     topk_indx = torch.empty(n_gates, dtype=torch.int32, device=device)
     gate_indx = torch.empty(n_gates, dtype=torch.int32, device=device)
     gate_scal = torch.empty(n_gates, dtype=torch.float32, device=device)
-    _ep_scatter_atomic_expt_data_kernel_launch(
+    _ep_scatter_atomic_expt_data_kernel(
         dev,
         stream,
         num_local_experts + n_ctas,

@@ -3,6 +3,7 @@
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -280,6 +281,7 @@ _quant_layernorm_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(grid_arg=1)
 @triton.jit(repr=_quant_layernorm_kernel_repr)
 def _quant_layernorm_kernel(
     # Pointers to matrices
@@ -444,6 +446,7 @@ _quant_fused_add_layernorm_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(grid_arg=1)
 @triton.jit(repr=_quant_fused_add_layernorm_kernel_repr)
 def _quant_fused_add_layernorm_kernel(
     # Pointers to matrices
@@ -627,6 +630,7 @@ _layernorm_bwd_dx_fused_triton_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("num_warps",))
 @triton.jit(repr=_layernorm_bwd_dx_fused_triton_repr)
 def _layernorm_bwd_dx_fused_triton(
     DX,  # pointer to the input gradient
@@ -809,6 +813,7 @@ _layernorm_bwd_dwdb_triton_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_layernorm_bwd_dwdb_triton_repr)
 def _layernorm_bwd_dwdb_triton(
     DW,  # pointer to the partial sum of weights gradient
@@ -848,6 +853,7 @@ _layernorm_bwd_dwdb_triton_v2_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_layernorm_bwd_dwdb_triton_v2_repr)
 def _layernorm_bwd_dwdb_triton_v2(
     X,  # pointer to the input

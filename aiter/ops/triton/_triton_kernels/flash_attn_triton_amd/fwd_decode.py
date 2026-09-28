@@ -267,6 +267,12 @@ def _attn_fwd_inner(
     return m_i, l_i, acc
 
 
+def _fwd_kernel_splitK_grid(BLOCK_M: int, *, seqlen_q: int, gy: int, split_k: int):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (triton.cdiv(seqlen_q, BLOCK_M), gy, split_k)
+
+
+@make_launcher(grid_cpp=_fwd_kernel_splitK_grid)
 @triton.autotune(
     configs=fwd_decode_splitk_configs,
     key=FWD_DECODE_AUTOTUNE_KEYS,
@@ -697,23 +703,13 @@ def _fwd_kernel_splitK(
     tl.store(metadata_ptr + stride_m2_i64, l_i)
 
 
-def _fwd_kernel_splitK_grid(BLOCK_M: int, *, seqlen_q: int, gy: int, split_k: int):
-    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
-    return (triton.cdiv(seqlen_q, BLOCK_M), gy, split_k)
-
-
-_fwd_kernel_splitK_launch = make_launcher(
-    _fwd_kernel_splitK,
-    grid_cpp=_fwd_kernel_splitK_grid,
-)
-
-
 FWD_DECODE_REDUCE_AUTOTUNE_KEYS = [
     "BLOCK_DMODEL",
     "split_k",
 ]
 
 
+@make_launcher
 @triton.autotune(
     configs=fwd_decode_reduce_configs,
     key=FWD_DECODE_REDUCE_AUTOTUNE_KEYS,
@@ -827,9 +823,6 @@ def _splitK_reduce(
     l_ptrs = LSE + pid_zhg * stride_lse_zhg_i64 + pid_m
     lse_val = tl.where(g_sum > 0, (g_m + tl.math.log2(g_sum)) / 1.44269504, g_m)
     tl.store(l_ptrs, lse_val)
-
-
-_splitK_reduce_launch = make_launcher(_splitK_reduce)
 
 
 @triton.jit
@@ -1318,7 +1311,7 @@ def attention_forward_decode_triton_impl(
         print("stride_lse_zhg, stride_lse_m", (stride_lse_zhg, stride_lse_m))
 
     dev, stream = current_device_stream()
-    _fwd_kernel_splitK_launch(
+    _fwd_kernel_splitK(
         dev,
         stream,
         seqlen_q,  # grid
@@ -1446,7 +1439,7 @@ def attention_forward_decode_triton_impl(
         print("k_block_size:", k_block_size)
         print("grid:", reduce_grid)
 
-    _splitK_reduce_launch(
+    _splitK_reduce(
         dev,
         stream,
         reduce_grid,

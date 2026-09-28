@@ -58,6 +58,7 @@ from aiter.ops.triton.utils.device_info import current_device_stream, get_num_xc
 
 
 # fmt: off
+@make_launcher
 @gluon.jit
 def _mla_gluon(
     Q_nope,
@@ -723,6 +724,7 @@ def _mla_gluon(
 
 
 # fmt: off
+@make_launcher(options={"num_warps": 8})
 @triton.jit
 def _mla_softmax_reducev_kernel(
     Logits,
@@ -819,16 +821,7 @@ def _mla_softmax_reducev_kernel(
             Final_lse + cur_batch * stride_fl_b + q_pos * stride_fl_qs + cur_head * stride_fl_h,
             e_max + tl.log(e_sum),
         )
-
-
-_mla_softmax_reducev_kernel_launch = make_launcher(
-    _mla_softmax_reducev_kernel,
-    options={"num_warps": 8},
-)
 # fmt: on
-
-
-_mla_gluon_launch = make_launcher(_mla_gluon)
 
 
 def mla_gluon(
@@ -1055,7 +1048,7 @@ def mla_gluon(
     stride_page_bs = page_table.stride(0) if use_2d_view else 0
 
     dev, stream = current_device_stream()
-    _mla_gluon_launch(
+    _mla_gluon(
         dev,
         stream,
         grid,
@@ -1118,7 +1111,7 @@ def mla_gluon(
     grid_reduce = (batch_size, nhead, qlen)
     sl_b, sl_qs, sl_h, sl_split, _ = logits_buf.stride()
     dev, stream = current_device_stream()
-    _mla_softmax_reducev_kernel_launch(
+    _mla_softmax_reducev_kernel(
         dev,
         stream,
         grid_reduce,

@@ -3930,6 +3930,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
     )
 
 
+@make_launcher
 @triton.jit
 def paged_attention_decode_ps_reduce_kernel(
     output_ptr,  # [num_seqs, query_seq_len, num_kv_heads, query_group_size, head_size]
@@ -4031,11 +4032,6 @@ def paged_attention_decode_ps_reduce_kernel(
         final_output.to(output_ptr.dtype.element_ty),
         mask=head_mask,
     )
-
-
-_paged_attention_decode_ps_reduce_kernel_launch = make_launcher(
-    paged_attention_decode_ps_reduce_kernel,
-)
 
 
 @triton.jit
@@ -4602,7 +4598,7 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
             return
         ps_reduce_grid = (grid[0], grid[1], query_seq_len * query_group_size)
         dev, stream = current_device_stream()
-        _paged_attention_decode_ps_reduce_kernel_launch(
+        paged_attention_decode_ps_reduce_kernel(
             dev,
             stream,
             ps_reduce_grid,

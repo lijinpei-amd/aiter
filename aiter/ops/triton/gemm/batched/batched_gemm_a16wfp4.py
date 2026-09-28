@@ -3,7 +3,6 @@
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
@@ -55,11 +54,6 @@ def batched_gemm_a16wfp4_fake_tensor(
     return y
 
 
-_batched_gemm_a16wfp4_reduce_kernel_launch = make_launcher(
-    _batched_gemm_a16wfp4_reduce_kernel,
-)
-
-
 # Explicit ``mutates_args=["y"]`` rather than the ``torch_compile_guard``
 # default ("unknown"). Without this, ``torch.library.infer_schema`` marks
 # every Tensor argument as in-place mutated (``Tensor(aN!)`` for
@@ -71,16 +65,6 @@ _batched_gemm_a16wfp4_reduce_kernel_launch = make_launcher(
 # memory. Do not remove this argument without re-auditing the kernel's
 # tl.store sites and re-checking the post-grad FX graph of any compiled
 # downstream consumer.
-_batched_gemm_a16wfp4_kernel_launch = make_launcher(
-    _batched_gemm_a16wfp4_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
 
 
 @torch_compile_guard(mutates_args=["y"], gen_fake=batched_gemm_a16wfp4_fake_tensor)
@@ -200,7 +184,7 @@ def batched_gemm_a16wfp4_(
         ),
     )
     dev, stream = current_device_stream()
-    _batched_gemm_a16wfp4_kernel_launch(
+    _batched_gemm_a16wfp4_kernel(
         dev,
         stream,
         grid,
@@ -255,7 +239,7 @@ def batched_gemm_a16wfp4_(
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
         dev, stream = current_device_stream()
-        _batched_gemm_a16wfp4_reduce_kernel_launch(
+        _batched_gemm_a16wfp4_reduce_kernel(
             dev,
             stream,
             grid_reduce,

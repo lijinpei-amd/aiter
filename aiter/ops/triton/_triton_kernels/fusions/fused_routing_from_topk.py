@@ -9,6 +9,7 @@
 # histc, plus dtype casts) with three kernel launches.
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -39,6 +40,7 @@ _fused_routing_from_topk_place_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(grid_arg=1, options={"num_warps": 1})
 @triton.jit(repr=_fused_routing_from_topk_hist_kernel_repr)
 def _fused_routing_from_topk_hist_kernel(
     # inputs
@@ -89,6 +91,7 @@ def _fused_routing_from_topk_hist_kernel(
     tl.store(hist_ptr + e_offs, hist, mask=e_offs < E)
 
 
+@make_launcher(grid_arg=1, options={"num_warps": 1})
 @triton.jit(repr=_fused_routing_from_topk_offset_kernel_repr)
 def _fused_routing_from_topk_offset_kernel(
     # inputs
@@ -113,6 +116,7 @@ def _fused_routing_from_topk_offset_kernel(
     tl.store(offset_ptr + safe_e, excl, mask=e_mask)
 
 
+@make_launcher(grid_arg=1, options={"num_warps": 1})
 @triton.jit(repr=_fused_routing_from_topk_place_kernel_repr)
 def _fused_routing_from_topk_place_kernel(
     # inputs

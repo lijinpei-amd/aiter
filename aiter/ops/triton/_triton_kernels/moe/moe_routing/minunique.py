@@ -1,5 +1,6 @@
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -16,6 +17,7 @@ _keepk_sort0_repr = make_kernel_repr(
 )
 
 
+@make_launcher(grid_arg=1, options={"num_warps": 1})
 @triton.jit(repr=_keepk_sort0_repr)
 def _keepk_sort0(
     Vin,

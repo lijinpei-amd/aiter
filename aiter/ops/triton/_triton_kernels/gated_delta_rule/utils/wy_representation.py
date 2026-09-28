@@ -25,6 +25,7 @@ from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 
+@make_launcher(grid_arg=2)
 @triton.heuristics(
     {
         "USE_G": lambda args: args["g"] is not None,
@@ -107,12 +108,6 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     )
 
 
-_chunk_scaled_dot_kkt_fwd_kernel_launch = make_launcher(
-    chunk_scaled_dot_kkt_fwd_kernel,
-    grid_arg=2,
-)
-
-
 def chunk_scaled_dot_kkt_fwd(
     k: torch.Tensor,
     g: torch.Tensor | None = None,
@@ -149,7 +144,7 @@ def chunk_scaled_dot_kkt_fwd(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     A = torch.empty(B, T, H, BT, device=k.device, dtype=output_dtype)
     dev, stream = current_device_stream()
-    _chunk_scaled_dot_kkt_fwd_kernel_launch(
+    chunk_scaled_dot_kkt_fwd_kernel(
         dev,
         stream,
         NT,

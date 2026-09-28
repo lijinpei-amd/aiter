@@ -87,18 +87,6 @@ def _triton_persistent_kernel_launch(num_stages, waves_per_eu):
     )
 
 
-_gemm_a16_w16_kernel_launch = make_launcher(
-    _gemm_a16_w16_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
-
-
 @torch_compile_guard(gen_fake=gemm_a16w16_fake_tensor)
 def gemm_a16w16_(
     x: torch.Tensor,
@@ -562,7 +550,7 @@ def gemm_a16w16_(
         ),
     )
     dev, stream = current_device_stream()
-    _gemm_a16_w16_kernel_launch(
+    _gemm_a16_w16_kernel(
         dev,
         stream,
         grid,

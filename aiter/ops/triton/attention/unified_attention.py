@@ -448,18 +448,6 @@ def is_reduce_gluon_available(params: _UAParams, NUM_SEGMENTS, backend: str):
     return use_gluon and use_gluon_arch
 
 
-_kernel_unified_attention_2d_launch = make_launcher(
-    kernel_unified_attention_2d,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
-
-
 def _unified_attention_2d_triton(params: _UAParams):
     if params.shuffled_kv_cache and (
         params.q_dtype == e4m3_dtype and params.kv_cache_dtype == e4m3_dtype
@@ -482,7 +470,7 @@ def _unified_attention_2d_triton(params: _UAParams):
         total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
 
     dev, stream = current_device_stream()
-    _kernel_unified_attention_2d_launch(
+    kernel_unified_attention_2d(
         dev,
         stream,
         (
@@ -654,18 +642,6 @@ def _unified_attention_3d_triton(
     )
 
 
-_reduce_segments_launch = make_launcher(
-    reduce_segments,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
-
-
 def _reduce_segments_triton(
     params: _UAParams,
     segm_output,
@@ -678,7 +654,7 @@ def _reduce_segments_triton(
     config = get_unified_attention_config("reduce", params, backend="triton")
 
     dev, stream = current_device_stream()
-    _reduce_segments_launch(
+    reduce_segments(
         dev,
         stream,
         (params.num_tokens, params.num_query_heads),

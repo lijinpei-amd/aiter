@@ -21,6 +21,7 @@ free of torch so the kernels can be called without it.
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -33,6 +34,7 @@ _delta_v4_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("num_warps",))
 @triton.jit(repr=_delta_v4_kernel_repr)
 def _delta_v4_kernel(
     O_ptr,  # [n_rows, D] bf16   (rows = T*H, contiguous)
@@ -62,6 +64,7 @@ _bwd_dkv_gather_acc_v4_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("num_warps",))
 @triton.jit(repr=_bwd_dkv_gather_acc_v4_repr)
 def _bwd_dkv_gather_acc_v4(
     Interm_ptr,  # [T, R_CHUNK, D] bf16, flat [T*R_CHUNK, D]

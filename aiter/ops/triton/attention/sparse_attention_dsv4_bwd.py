@@ -41,7 +41,6 @@ from dataclasses import dataclass
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_attention_dsv4_bwd import (
     _dkv_interm_v4_kernel,
@@ -58,13 +57,6 @@ _BLOCK_H_DQ = 64
 _TILE_K_DQ = 32
 _BD_DKV = 256
 _TILE_K_DKV = 128
-
-
-_dq_v4_kernel_launch = make_launcher(
-    _dq_v4_kernel,
-    grid_arg=2,
-    options={"num_warps": 4, "waves_per_eu": 1},
-)
 
 
 def sparse_mla_bwd_dq(
@@ -88,7 +80,7 @@ def sparse_mla_bwd_dq(
     plus this chunk's ``chunk_dS`` / ``chunk_P``."""
     T, H, D = q.shape
     dev, stream = current_device_stream()
-    _dq_v4_kernel_launch(
+    _dq_v4_kernel(
         dev,
         stream,
         T,
@@ -123,11 +115,6 @@ def sparse_mla_bwd_dq(
     )
 
 
-_dkv_interm_v4_kernel_launch = make_launcher(
-    _dkv_interm_v4_kernel, dynamic_options=("num_warps",)
-)
-
-
 def sparse_mla_bwd_dkv_interm_v4(
     q,
     do,
@@ -154,7 +141,7 @@ def sparse_mla_bwd_dkv_interm_v4(
     if interm is None:
         interm = torch.empty(T, R_CHUNK, D, dtype=torch.bfloat16, device=q.device)
     dev, stream = current_device_stream()
-    _dkv_interm_v4_kernel_launch(
+    _dkv_interm_v4_kernel(
         dev,
         stream,
         (T, D // BD),
@@ -184,11 +171,6 @@ def sparse_mla_bwd_dkv_interm_v4(
     return interm
 
 
-_delta_v4_kernel_launch = make_launcher(
-    _delta_v4_kernel, dynamic_options=("num_warps",)
-)
-
-
 def delta_v4(o, do, out=None, BLOCK_R=8, num_warps=8):
     # BLOCK_R=8 keeps each lane loading >= 8 bf16, i.e. a dwordx4; narrower blocks drop to a
     # dword and the kernel loses most of its bandwidth.
@@ -202,7 +184,7 @@ def delta_v4(o, do, out=None, BLOCK_R=8, num_warps=8):
     if out is None:
         out = torch.empty(T, H, dtype=torch.float32, device=o.device)
     dev, stream = current_device_stream()
-    _delta_v4_kernel_launch(
+    _delta_v4_kernel(
         dev,
         stream,
         (triton.cdiv(n_rows, BLOCK_R),),
@@ -247,11 +229,6 @@ def build_inverted_topk(topk_indices_slice, num_kv):
     return inv_ptr, inv_data.to(torch.int32)
 
 
-_bwd_dkv_gather_acc_v4_launch = make_launcher(
-    _bwd_dkv_gather_acc_v4, dynamic_options=("num_warps",)
-)
-
-
 def dkv_gather_acc(
     interm, inv_ptr, inv_data, dkv_acc, BLOCK_E=64, num_warps=8, accumulate=True
 ):
@@ -262,7 +239,7 @@ def dkv_gather_acc(
     _, _, D = interm.shape
     num_kv = dkv_acc.shape[0]
     dev, stream = current_device_stream()
-    _bwd_dkv_gather_acc_v4_launch(
+    _bwd_dkv_gather_acc_v4(
         dev,
         stream,
         (num_kv,),

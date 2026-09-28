@@ -13,7 +13,6 @@ import torch
 
 # Triton
 import triton
-from intj import make_launcher
 from torch import Tensor
 
 # AITER: GMM Triton kernels
@@ -99,18 +98,6 @@ def _gmm_grid(
 
     assert num_programs > 0, f"num_programs must be positive, it's {num_programs}."
     return (num_programs,)
-
-
-_gmm_kernel_launch = make_launcher(
-    gmm_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
 
 
 def gmm(
@@ -274,7 +261,7 @@ def gmm(
 
     # fmt: off
     dev, stream = current_device_stream()
-    _gmm_kernel_launch(
+    gmm_kernel(
         dev,
         stream,
         grid,
@@ -338,18 +325,6 @@ def _ptgmm_grid(
     num_programs = min(grid_dim, num_tiles)
     assert num_programs > 0, f"num_programs must be positive, it's {num_programs}."
     return (num_programs,)
-
-
-_tgmm_persistent_kernel_launch = make_launcher(
-    tgmm_persistent_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
 
 
 def ptgmm(
@@ -522,7 +497,7 @@ def ptgmm(
 
     # fmt: off
     dev, stream = current_device_stream()
-    _tgmm_persistent_kernel_launch(
+    tgmm_persistent_kernel(
         dev,
         stream,
         grid,
@@ -583,18 +558,6 @@ def _nptgmm_grid(
         num_tiles_per_mm > 0
     ), f"num_tiles_per_mm must be positive, it's {num_tiles_per_mm}."
     return (G, num_tiles_per_mm)
-
-
-_tgmm_non_persistent_kernel_launch = make_launcher(
-    tgmm_non_persistent_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
 
 
 def nptgmm(
@@ -746,7 +709,7 @@ def nptgmm(
 
     # fmt: off
     dev, stream = current_device_stream()
-    _tgmm_non_persistent_kernel_launch(
+    tgmm_non_persistent_kernel(
         dev,
         stream,
         grid,

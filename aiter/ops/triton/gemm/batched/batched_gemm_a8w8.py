@@ -3,7 +3,6 @@
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a8w8 import (
     _batched_gemm_a8w8_kernel,
@@ -13,18 +12,6 @@ from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
-
-
-_batched_gemm_a8w8_kernel_launch = make_launcher(
-    _batched_gemm_a8w8_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
 
 
 def batched_gemm_a8w8(
@@ -99,7 +86,7 @@ def batched_gemm_a8w8(
     )
 
     dev, stream = current_device_stream()
-    _batched_gemm_a8w8_kernel_launch(
+    _batched_gemm_a8w8_kernel(
         dev,
         stream,
         grid,

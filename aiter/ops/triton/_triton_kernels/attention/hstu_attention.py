@@ -20,6 +20,7 @@ import triton
 
 # @manual=//triton:triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
@@ -321,6 +322,15 @@ _hstu_attn_fwd_repr = make_kernel_repr(
 )
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    )
+)
 @triton.jit(repr=_hstu_attn_fwd_repr)
 def _hstu_attn_fwd(
     Q,
@@ -711,6 +721,15 @@ _hstu_attn_bwd_repr = make_kernel_repr(
 )
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    )
+)
 @triton.jit(repr=_hstu_attn_bwd_repr)
 def _hstu_attn_bwd(
     Q,

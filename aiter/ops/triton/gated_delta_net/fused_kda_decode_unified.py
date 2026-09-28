@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_conv_recurrent_norm_unified import (
     _fused_kda_decode_unified_kernel,
@@ -25,12 +24,6 @@ from aiter.ops.triton.utils.device_info import current_device_stream
 
 def _decode_num_warps():
     return 2 if get_arch() == "gfx942" else 4
-
-
-_fused_kda_decode_unified_kernel_launch = make_launcher(
-    _fused_kda_decode_unified_kernel,
-    dynamic_options=("num_warps",),
-)
 
 
 def fused_kda_decode_unified(
@@ -140,7 +133,7 @@ def fused_kda_decode_unified(
 
     grid = (batch, H)
     dev, stream = current_device_stream()
-    _fused_kda_decode_unified_kernel_launch(
+    _fused_kda_decode_unified_kernel(
         dev,
         stream,
         grid,

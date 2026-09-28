@@ -193,6 +193,7 @@ def sparse_kv_indptr_to_dense(
     )
 
 
+@make_launcher
 @triton.jit
 def _convert_req_index_to_global_index_kernel(
     kv_indptr,  # int32 [num_requests]
@@ -254,11 +255,6 @@ def _convert_req_index_to_global_index_kernel(
     tl.store(out_ptr_ij, out_val)
 
 
-_convert_req_index_to_global_index_kernel_launch = make_launcher(
-    _convert_req_index_to_global_index_kernel,
-)
-
-
 def triton_convert_req_index_to_global_index(
     kv_indptr: torch.Tensor,  # int32 [num_tokens + 1]
     kv_indices: torch.Tensor,  # int32 [total_kv_seqlen]
@@ -308,7 +304,7 @@ def triton_convert_req_index_to_global_index(
     grid = (num_tokens, tiles_per_row)
 
     dev, stream = current_device_stream()
-    _convert_req_index_to_global_index_kernel_launch(
+    _convert_req_index_to_global_index_kernel(
         dev,
         stream,
         grid,

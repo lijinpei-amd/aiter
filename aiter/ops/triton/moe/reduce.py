@@ -61,13 +61,6 @@ class EpCombineScatter:
             raise ValueError("dst_row must be contiguous int32")
 
 
-_scatter_grouped_launch = make_launcher(
-    _scatter_grouped,
-    grid_arg=1,
-    options={"num_warps": 2},
-)
-
-
 def scatter_grouped(
     x: torch.Tensor,
     dst_row: torch.Tensor,
@@ -95,7 +88,7 @@ def scatter_grouped(
     BLOCK_N = 512
     num_blocks = triton.cdiv(x.shape[-1], BLOCK_N)
     dev, stream = current_device_stream()
-    _scatter_grouped_launch(
+    _scatter_grouped(
         dev,
         stream,
         num_blocks * m_rows,
@@ -150,13 +143,6 @@ def validate_reduce_out(out, shape, dtype, device):
         f"got strides {tuple(out.stride())}"
     )
     return out
-
-
-_reduce_grouped_launch = make_launcher(
-    _reduce_grouped,
-    grid_arg=1,
-    options={"num_warps": 2},
-)
 
 
 @functools.cache
@@ -277,7 +263,7 @@ def reduce_grouped(
         res_stride_n = 0
         has_ext_residual = False
     dev, stream = current_device_stream()
-    _reduce_grouped_launch(
+    _reduce_grouped(
         dev,
         stream,
         num_blocks * num_groups,

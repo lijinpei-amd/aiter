@@ -7,11 +7,13 @@ Host-side launch wrapper lives in the public namespace
 import triton
 import triton.experimental.gluon.language as gl
 import triton.language as tl
+from intj import make_launcher
 from triton.experimental import gluon
 
 PAD_SLOT_ID = -1
 
 
+@make_launcher(options={"num_warps": 4})
 @triton.jit()
 def _causal_conv1d_update_split_qkv_kernel(
     # Pointers to matrices
@@ -291,6 +293,7 @@ def tuple_combine(a: gl.tuple, b: gl.tensor, _semantic=None) -> gl.tuple:
     return tl.tuple([*a.values, b])
 
 
+@make_launcher(options={"num_warps": 2})
 @gluon.jit()
 def gluon_causal_conv1d_update_split_qkv_kernel(
     # Pointers to matrices
@@ -471,6 +474,7 @@ def gluon_causal_conv1d_update_split_qkv_kernel(
         )
 
 
+@make_launcher(options={"num_warps": 2})
 @gluon.jit()
 def gluon_causal_conv1d_update_split_qkv_kernel_notuple(
     # Pointers to matrices

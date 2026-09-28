@@ -106,9 +106,6 @@ def _rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, epsilon: float):
     return y, rsigma
 
 
-_fused_add_rmsnorm_kernel_launch = make_launcher(_fused_add_rmsnorm_kernel)
-
-
 def _rmsnorm_forward_with_add(
     out: torch.Tensor,
     x: torch.Tensor,
@@ -127,7 +124,7 @@ def _rmsnorm_forward_with_add(
 
     grid = (NUM_PRGMS,)
     dev, stream = current_device_stream()
-    _fused_add_rmsnorm_kernel_launch(
+    _fused_add_rmsnorm_kernel(
         dev,
         stream,
         grid,
@@ -148,26 +145,9 @@ def _rmsnorm_forward_with_add(
     )
 
 
-_rmsnorm_bwd_triton_launch = make_launcher(
-    _rmsnorm_bwd_triton, options={"num_warps": 8}
-)
-_rmsnorm_bwd_dg_reduce_triton_launch = make_launcher(
-    _rmsnorm_bwd_dg_reduce_triton, dynamic_options=("num_warps",)
-)
-
-
 def _dg_reduce_num_warps():
     # Widening the workgroup helps on gfx950. Left at default otherwise
     return 8 if get_arch() == "gfx950" else 4
-
-
-_rmsnorm_bwd_kernel_large_m_small_n_launch = make_launcher(
-    _rmsnorm_bwd_kernel_large_m_small_n,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-    ),
-)
 
 
 def _rmsnorm_backward(dz, x, gamma, rsigma):
@@ -190,7 +170,7 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
         dg_tmp = torch.empty(num_prgms, N, device=x_.device, dtype=torch.float32)
         _cfg = get_normalization_config("rmsnorm_large_m_small_n", get_arch())
         dev, stream = current_device_stream()
-        _rmsnorm_bwd_kernel_large_m_small_n_launch(
+        _rmsnorm_bwd_kernel_large_m_small_n(
             dev,
             stream,
             (num_prgms,),
@@ -213,7 +193,7 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
         )
         grid_reduce = (triton.cdiv(N, 64),)
         dev, stream = current_device_stream()
-        _rmsnorm_bwd_dg_reduce_triton_launch(
+        _rmsnorm_bwd_dg_reduce_triton(
             dev,
             stream,
             grid_reduce,
@@ -247,7 +227,7 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
 
     grid_bwd = (NUM_PRGMS,)
     dev, stream = current_device_stream()
-    _rmsnorm_bwd_triton_launch(
+    _rmsnorm_bwd_triton(
         dev,
         stream,
         grid_bwd,
@@ -269,7 +249,7 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
     if need_reduction:
         grid_reduce = (triton.cdiv(N, 64),)
         dev, stream = current_device_stream()
-        _rmsnorm_bwd_dg_reduce_triton_launch(
+        _rmsnorm_bwd_dg_reduce_triton(
             dev,
             stream,
             grid_reduce,
@@ -434,9 +414,6 @@ def rmsnorm2d_fwd_with_add(
     )
 
 
-_quant_rms_norm_kernel_launch = make_launcher(_quant_rms_norm_kernel)
-
-
 def rmsnorm2d_fwd_with_smoothquant(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -485,7 +462,7 @@ def rmsnorm2d_fwd_with_smoothquant(
 
     grid = (NUM_PRGMS,)
     dev, stream = current_device_stream()
-    _quant_rms_norm_kernel_launch(
+    _quant_rms_norm_kernel(
         dev,
         stream,
         grid,
@@ -562,7 +539,7 @@ def rmsnorm2d_fwd_with_dynamicquant(
 
     grid = (NUM_PRGMS,)
     dev, stream = current_device_stream()
-    _quant_rms_norm_kernel_launch(
+    _quant_rms_norm_kernel(
         dev,
         stream,
         grid,
@@ -591,9 +568,6 @@ def rmsnorm2d_fwd_with_dynamicquant(
     )
 
     return out_rms_norm
-
-
-_quant_fused_add_rmsnorm_kernel_launch = make_launcher(_quant_fused_add_rmsnorm_kernel)
 
 
 def rmsnorm2d_fwd_with_add_smoothquant(
@@ -644,7 +618,7 @@ def rmsnorm2d_fwd_with_add_smoothquant(
 
     grid = (NUM_PRGMS,)
     dev, stream = current_device_stream()
-    _quant_fused_add_rmsnorm_kernel_launch(
+    _quant_fused_add_rmsnorm_kernel(
         dev,
         stream,
         grid,
@@ -716,7 +690,7 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
 
     grid = (NUM_PRGMS,)
     dev, stream = current_device_stream()
-    _quant_fused_add_rmsnorm_kernel_launch(
+    _quant_fused_add_rmsnorm_kernel(
         dev,
         stream,
         grid,
@@ -742,15 +716,6 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
     )
 
 
-_rmsnorm_kernel_large_m_small_n_launch = make_launcher(
-    _rmsnorm_kernel_large_m_small_n,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-    ),
-)
-
-
 def _rmsnorm_forward_large_m_small_n(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -772,7 +737,7 @@ def _rmsnorm_forward_large_m_small_n(
     _cfg = get_normalization_config("rmsnorm_large_m_small_n", get_arch())
     grid = (triton.cdiv(M, BLOCK_M),)
     dev, stream = current_device_stream()
-    _rmsnorm_kernel_large_m_small_n_launch(
+    _rmsnorm_kernel_large_m_small_n(
         dev,
         stream,
         grid,

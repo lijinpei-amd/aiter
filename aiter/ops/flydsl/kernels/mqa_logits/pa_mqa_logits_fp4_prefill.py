@@ -93,7 +93,7 @@ def compute_prefill_schedule(
     BLOCK_P = 256
     grid = (triton.cdiv(P, BLOCK_P),)
     dev, stream = current_device_stream()
-    _prefill_cta_info_kernel_launch(
+    _prefill_cta_info_kernel(
         dev,
         stream,
         grid,
@@ -180,7 +180,7 @@ def _row_plan(le, block_k, P, s_max) -> _RowPlan:
     )
     # Named, not `*plan`: field ORDER should not become load-bearing.
     dev, stream = current_device_stream()
-    _prefill_row_plan_kernel_launch(
+    _prefill_row_plan_kernel(
         dev,
         stream,
         1,
@@ -240,6 +240,7 @@ def _row_plan_torch(le, block_k, P, s_max) -> _RowPlan:
 # gives up the divisibility hint the wide blocks vectorize on, 41.1us -> 52.0us
 # at 16384 lanes. That lands on prefill, one call per ~500ms forward; the widths
 # decode runs stay hidden behind the call's own dispatch either way.
+@make_launcher(grid_arg=1)
 @triton.jit(do_not_specialize=["T", "P"])
 def _prefill_row_plan_kernel(
     le_ptr,  # [T] int32 local_ends
@@ -304,9 +305,7 @@ def _prefill_row_plan_kernel(
     tl.store(total_splits_ptr, tl.sum(ctas, axis=0))
 
 
-_prefill_row_plan_kernel_launch = make_launcher(_prefill_row_plan_kernel, grid_arg=1)
-
-
+@make_launcher
 @triton.jit(do_not_specialize=["T", "P"])
 def _prefill_cta_info_kernel(
     incl_ptr,  # [T] int32 inclusive prefix sum of per-row CTA counts
@@ -368,9 +367,6 @@ def _prefill_cta_info_kernel(
     tl.store(cta_info_ptr + base + 3, count, mask=smask)
     tl.store(cta_info_ptr + base + 4, ls_out, mask=smask)
     tl.store(cta_info_ptr + base + 5, le_out, mask=smask)
-
-
-_prefill_cta_info_kernel_launch = make_launcher(_prefill_cta_info_kernel)
 
 
 def build_pa_mqa_logits_fp4_prefill_module(
@@ -964,6 +960,7 @@ def flydsl_pa_mqa_logits_fp4_prefill(
     return out
 
 
+@make_launcher
 @triton.jit
 def _varqlen_windows_kernel(
     cu_ptr,  # [B+1] int32, prefix-sum of per-batch qlen
@@ -1009,9 +1006,6 @@ def _varqlen_windows_kernel(
     tl.store(local_ends_ptr + r, le, mask=rmask)
 
 
-_varqlen_windows_kernel_launch = make_launcher(_varqlen_windows_kernel)
-
-
 def compute_varqlen_windows(cu_seq_q, context_lens, total_q, *, out=None):
     """Build ragged-row metadata for per-batch variable query length (MTP).
 
@@ -1035,7 +1029,7 @@ def compute_varqlen_windows(cu_seq_q, context_lens, total_q, *, out=None):
         BLOCK = 256
         grid = (triton.cdiv(total_q, BLOCK),)
         intj_dev, intj_stream = current_device_stream()
-        _varqlen_windows_kernel_launch(
+        _varqlen_windows_kernel(
             intj_dev,
             intj_stream,
             grid,

@@ -5,7 +5,6 @@ import warnings
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
 from aiter.ops.triton._triton_kernels.gemm.feed_forward.ff_a16w16_fused_ungated import (
@@ -16,18 +15,6 @@ from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
-
-
-_ff_a16w16_fused_ungated_launch = make_launcher(
-    _ff_a16w16_fused_ungated,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
 
 
 def ff_a16w16_fused_ungated(
@@ -92,7 +79,7 @@ def ff_a16w16_fused_ungated(
         triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),
     )
     dev, stream = current_device_stream()
-    _ff_a16w16_fused_ungated_launch(
+    _ff_a16w16_fused_ungated(
         dev,
         stream,
         grid,

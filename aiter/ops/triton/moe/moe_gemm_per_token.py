@@ -13,7 +13,6 @@ Convention (TN layout):
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.moe.moe_gemm_per_token import (
     _moe_gemm_per_token_kernel,
@@ -29,9 +28,6 @@ _LOGGER = AiterTritonLogger()
 BLOCK_M = 64
 BLOCK_N = 128
 BLOCK_K = 128
-
-
-_moe_gemm_per_token_kernel_launch = make_launcher(_moe_gemm_per_token_kernel)
 
 
 def moe_gemm_per_token(
@@ -91,7 +87,7 @@ def moe_gemm_per_token(
     grid = (total_m_blocks * num_n_blocks,)
 
     dev, stream = current_device_stream()
-    _moe_gemm_per_token_kernel_launch(
+    _moe_gemm_per_token_kernel(
         dev,
         stream,
         grid,

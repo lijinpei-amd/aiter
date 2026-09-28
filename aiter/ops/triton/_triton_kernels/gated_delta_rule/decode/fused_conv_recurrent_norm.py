@@ -8,8 +8,10 @@ Single Triton kernel. Grid: (batch, heads).
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 
+@make_launcher(dynamic_options=("num_warps",))
 @triton.jit
 def fused_conv_recurrent_norm_kernel(
     # Conv1d inputs

@@ -22,6 +22,7 @@ _block_attn_mask_to_lut_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_block_attn_mask_to_lut_kernel_repr)
 def _block_attn_mask_to_lut_kernel(
     mask_ptr,
@@ -83,9 +84,6 @@ def _block_attn_mask_to_lut_kernel(
     # No return; kv_block_indices is written in place
 
 
-_block_attn_mask_to_lut_kernel_launch = make_launcher(_block_attn_mask_to_lut_kernel)
-
-
 def block_attn_mask_to_lut_kernel(
     block_attn_mask: torch.Tensor,
     lut_start: torch.Tensor,
@@ -103,7 +101,7 @@ def block_attn_mask_to_lut_kernel(
 
     grid = (num_programs,)
     dev, stream = current_device_stream()
-    _block_attn_mask_to_lut_kernel_launch(
+    _block_attn_mask_to_lut_kernel(
         dev,
         stream,
         grid,

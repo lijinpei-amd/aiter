@@ -28,6 +28,7 @@ from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 
 
+@make_launcher
 @triton.heuristics(
     {
         "HAS_SCALE": lambda args: args["scale"] is not None,
@@ -94,11 +95,12 @@ def chunk_local_cumsum_scalar_kernel(
     tl.store(o_base + o_t * stride_t, b_o.to(o_base.dtype.element_ty), mask=m_t)
 
 
-_chunk_local_cumsum_scalar_kernel_launch = make_launcher(
-    chunk_local_cumsum_scalar_kernel
-)
+def _chunk_local_cumsum_vector_kernel_grid(S: int, BS: int, B: int, H: int, *, NT: int):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (triton.cdiv(S, BS), NT, B * H)
 
 
+@make_launcher(grid_cpp=_chunk_local_cumsum_vector_kernel_grid)
 @triton.heuristics(
     {
         "HAS_SCALE": lambda args: args["scale"] is not None,
@@ -173,17 +175,6 @@ def chunk_local_cumsum_vector_kernel(
     tl.store(o_base + offs, b_o.to(o_base.dtype.element_ty), mask=msk)
 
 
-def _chunk_local_cumsum_vector_kernel_grid(S: int, BS: int, B: int, H: int, *, NT: int):
-    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
-    return (triton.cdiv(S, BS), NT, B * H)
-
-
-_chunk_local_cumsum_vector_kernel_launch = make_launcher(
-    chunk_local_cumsum_vector_kernel,
-    grid_cpp=_chunk_local_cumsum_vector_kernel_grid,
-)
-
-
 def chunk_local_cumsum_scalar(
     g: torch.Tensor,
     chunk_size: int,
@@ -208,7 +199,7 @@ def chunk_local_cumsum_scalar(
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
     grid = (NT, B * H)
     dev, stream = current_device_stream()
-    _chunk_local_cumsum_scalar_kernel_launch(
+    chunk_local_cumsum_scalar_kernel(
         dev,
         stream,
         grid,
@@ -255,7 +246,7 @@ def chunk_local_cumsum_vector(
     # this kernel is equivalent to
     # g = g.view(B, H, NT, BT, -1).cumsum(-2).view(B, H, T, -1)
     dev, stream = current_device_stream()
-    _chunk_local_cumsum_vector_kernel_launch(
+    chunk_local_cumsum_vector_kernel(
         dev,
         stream,
         NT,  # grid

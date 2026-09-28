@@ -3,7 +3,6 @@
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_a8w8_blockscale_a16w16 import (
     _fused_gemm_a8w8_blockscale_a16w16_kernel,
@@ -14,23 +13,6 @@ from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
-
-
-_fused_gemm_a8w8_blockscale_a16w16_reduce_kernel_launch = make_launcher(
-    _fused_gemm_a8w8_blockscale_a16w16_reduce_kernel,
-)
-
-
-_fused_gemm_a8w8_blockscale_a16w16_kernel_launch = make_launcher(
-    _fused_gemm_a8w8_blockscale_a16w16_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
 
 
 def fused_gemm_a8w8_blockscale_a16w16(
@@ -151,7 +133,7 @@ def fused_gemm_a8w8_blockscale_a16w16(
         ),
     )
     dev, stream = current_device_stream()
-    _fused_gemm_a8w8_blockscale_a16w16_kernel_launch(
+    _fused_gemm_a8w8_blockscale_a16w16_kernel(
         dev,
         stream,
         grid,
@@ -219,7 +201,7 @@ def fused_gemm_a8w8_blockscale_a16w16(
             + triton.cdiv(N_bf16, REDUCE_BLOCK_SIZE_N),
         )
         dev, stream = current_device_stream()
-        _fused_gemm_a8w8_blockscale_a16w16_reduce_kernel_launch(
+        _fused_gemm_a8w8_blockscale_a16w16_reduce_kernel(
             dev,
             stream,
             grid_reduce,

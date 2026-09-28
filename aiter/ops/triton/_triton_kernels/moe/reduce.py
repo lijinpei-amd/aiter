@@ -1,5 +1,6 @@
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
@@ -19,6 +20,7 @@ _reduce_grouped_repr = make_kernel_repr(
 )
 
 
+@make_launcher(grid_arg=1, options={"num_warps": 2})
 @triton.jit
 def _scatter_grouped(
     X,
@@ -82,6 +84,7 @@ def _scatter_grouped(
             tl.store(out_ptr, acc, mask=offs_n < N)
 
 
+@make_launcher(grid_arg=1, options={"num_warps": 2})
 @triton.jit(repr=_reduce_grouped_repr)
 def _reduce_grouped(
     X,

@@ -10,8 +10,6 @@ from aiter.ops.triton._triton_kernels.moe.moe_routing.topk import (
 from aiter.ops.triton.moe.moe_routing.bitmatrix import Bitmatrix
 from aiter.ops.triton.utils.device_info import current_device_stream
 
-_grouped_topk_launch = make_launcher(_grouped_topk, options={"num_warps": 4})
-
 
 def grouped_topk(
     x: torch.Tensor,
@@ -126,7 +124,7 @@ def grouped_topk(
     pids = max(triton.cdiv(n_rows, BLOCK_M), s_blocks + sp_blocks)
 
     dev, stream = current_device_stream()
-    _grouped_topk_launch(
+    _grouped_topk(
         dev,
         stream,
         (pids,),
@@ -310,9 +308,6 @@ def topk(
     return y_vals, y_indx, bitmatrix
 
 
-_hash_routing_launch = make_launcher(_hash_routing, options={"num_warps": 8})
-
-
 def hash_routing(
     router_logits: torch.Tensor,  # [n_rows, n_expts_tot] bf16/fp32
     tid2eid: torch.Tensor,  # [vocab_size, K] int32 per-token-id expert table
@@ -381,7 +376,7 @@ def hash_routing(
     )
 
     dev, stream = current_device_stream()
-    _hash_routing_launch(
+    _hash_routing(
         dev,
         stream,
         (pids,),

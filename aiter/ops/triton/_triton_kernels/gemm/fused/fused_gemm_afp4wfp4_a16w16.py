@@ -3,6 +3,7 @@
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
@@ -693,6 +694,7 @@ _gemm_afp4wfp4_a16w16_reduce_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.heuristics({})  # dummy heuristics to invoke kernel re-naming
 @triton.jit(repr=_gemm_afp4wfp4_a16w16_reduce_repr)
 def _fused_gemm_afp4wfp4_a16w16_reduce_kernel(

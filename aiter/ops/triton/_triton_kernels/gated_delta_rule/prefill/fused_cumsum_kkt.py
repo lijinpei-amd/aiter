@@ -23,6 +23,7 @@ def safe_exp(x):
     return tl.exp(tl.where(x <= 0, x, float("-inf")))
 
 
+@make_launcher(grid_arg=2, options={"num_stages": 3, "num_warps": 4})
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.jit(do_not_specialize=["T"])
 def _fused_cumsum_kkt_kernel(
@@ -92,13 +93,6 @@ def _fused_cumsum_kkt_kernel(
     )
 
 
-_fused_cumsum_kkt_kernel_launch = make_launcher(
-    _fused_cumsum_kkt_kernel,
-    grid_arg=2,
-    options={"num_stages": 3, "num_warps": 4},
-)
-
-
 def fused_cumsum_kkt(
     g: torch.Tensor,
     k: torch.Tensor,
@@ -132,7 +126,7 @@ def fused_cumsum_kkt(
     A = torch.empty(B, T, H, chunk_size, device=k.device, dtype=torch.float32)
 
     dev, stream = current_device_stream()
-    _fused_cumsum_kkt_kernel_launch(
+    _fused_cumsum_kkt_kernel(
         dev,
         stream,
         NT,
@@ -173,6 +167,7 @@ else:
 _CUMSUM_KKT_DEFAULT_CONFIG = triton.Config({"BK": 32}, num_warps=4, num_stages=2)
 
 
+@make_launcher(grid_arg=2)
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
     configs=autotune_configs(
@@ -276,12 +271,6 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel(
     )
 
 
-_fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel_launch = make_launcher(
-    fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel,
-    grid_arg=2,
-)
-
-
 def fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
     k: torch.Tensor,
     beta: torch.Tensor,
@@ -364,7 +353,7 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
     A_out = torch.empty(B, T, H, BT, device=k.device, dtype=A_output_dtype)
 
     dev, stream = current_device_stream()
-    _fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel_launch(
+    fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel(
         dev,
         stream,
         NT,

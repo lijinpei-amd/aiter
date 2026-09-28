@@ -19,8 +19,10 @@ Functional-first — correctness over performance.
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 
+@make_launcher(dynamic_options=("num_warps",))
 @triton.jit
 def _fused_kda_decode_unified_kernel(
     # Conv1d

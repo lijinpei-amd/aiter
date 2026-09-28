@@ -53,6 +53,14 @@ else:
         return tl.sum(src * (tl.arange(0, src.shape[0]) == index)[:, None], 0)[None, :]
 
 
+def _chunk_delta_attn_fwd_kernel_intra_token_parallel_grid(
+    T: int, HV: int, BH: int, *, B: int
+):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (B * T, triton.cdiv(HV, BH))
+
+
+@make_launcher(grid_cpp=_chunk_delta_attn_fwd_kernel_intra_token_parallel_grid)
 @triton.heuristics(
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
@@ -181,19 +189,6 @@ def chunk_delta_attn_fwd_kernel_intra_token_parallel(
         )
 
 
-def _chunk_delta_attn_fwd_kernel_intra_token_parallel_grid(
-    T: int, HV: int, BH: int, *, B: int
-):
-    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
-    return (B * T, triton.cdiv(HV, BH))
-
-
-_chunk_delta_attn_fwd_kernel_intra_token_parallel_launch = make_launcher(
-    chunk_delta_attn_fwd_kernel_intra_token_parallel,
-    grid_cpp=_chunk_delta_attn_fwd_kernel_intra_token_parallel_grid,
-)
-
-
 def _chunk_delta_attn_fwd_intra_token_parallel(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -213,7 +208,7 @@ def _chunk_delta_attn_fwd_intra_token_parallel(
     BC = sub_chunk_size
 
     dev, stream = current_device_stream()
-    _chunk_delta_attn_fwd_kernel_intra_token_parallel_launch(
+    chunk_delta_attn_fwd_kernel_intra_token_parallel(
         dev,
         stream,
         B,  # grid
@@ -236,6 +231,7 @@ def _chunk_delta_attn_fwd_intra_token_parallel(
     return Aqk, Akk
 
 
+@make_launcher
 @triton.heuristics(
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
@@ -378,11 +374,6 @@ def chunk_delta_attn_fwd_kernel_intra_sub_chunk(
         b_Ai = tl.where((o_i == i)[:, None], b_a, b_Ai)
     b_Ai += m_I
     tl.store(p_Akk, b_Ai.to(Akk.dtype.element_ty), mask=m_Akk_st)
-
-
-_chunk_delta_attn_fwd_kernel_intra_sub_chunk_launch = make_launcher(
-    chunk_delta_attn_fwd_kernel_intra_sub_chunk,
-)
 
 
 @triton.heuristics(
@@ -748,7 +739,7 @@ def chunk_delta_attn_fwd_intra(
         BK = min(64, triton.next_power_of_2(K))
         grid = (NT, NC, B * HV)
         dev, stream = current_device_stream()
-        _chunk_delta_attn_fwd_kernel_intra_sub_chunk_launch(
+        chunk_delta_attn_fwd_kernel_intra_sub_chunk(
             dev,
             stream,
             grid,

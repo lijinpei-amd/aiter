@@ -9,6 +9,7 @@
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -145,6 +146,7 @@ _bwd_dq_store_dp_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("num_warps",))
 @triton.jit(repr=_bwd_dq_store_dp_kernel_repr)
 def _bwd_dq_store_dp_kernel(
     q_ptr,
@@ -274,6 +276,7 @@ _bwd_dkv_interm_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("num_warps",))
 @triton.jit(repr=_bwd_dkv_interm_kernel_repr)
 def _bwd_dkv_interm_kernel(
     q_ptr,
@@ -360,6 +363,7 @@ _bwd_dkv_gather_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("num_warps",))
 @triton.jit(repr=_bwd_dkv_gather_kernel_repr)
 def _bwd_dkv_gather_kernel(
     interm_ptr,

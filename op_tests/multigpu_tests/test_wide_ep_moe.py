@@ -218,6 +218,7 @@ from aiter.utility import fp4_utils
 _TEST_WIDE_EP_INSTANCES = {}
 
 
+@make_launcher(grid_arg=1)
 @triton.jit
 def _append_fake_route_kernel(
     src_weights,
@@ -241,9 +242,6 @@ def _append_fake_route_kernel(
     ids = tl.load(src_ids + src_offsets, mask=routed, other=fake_expert_id)
     tl.store(dst_weights + offsets, weights, mask=valid)
     tl.store(dst_ids + offsets, ids, mask=valid)
-
-
-_append_fake_route_kernel_launch = make_launcher(_append_fake_route_kernel, grid_arg=1)
 
 
 @torch.library.custom_op("aiter::test_wide_ep_forward", mutates_args=())
@@ -454,7 +452,7 @@ class TestWideEpMoe:
             )
         total = route_shape[0] * route_shape[1]
         dev, stream = current_device_stream()
-        _append_fake_route_kernel_launch(
+        _append_fake_route_kernel(
             dev,
             stream,
             triton.cdiv(total, 256),

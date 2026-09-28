@@ -3,6 +3,7 @@
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.activation import _apply_activation_from_str
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
@@ -45,6 +46,15 @@ _winograd_f4x3_output_transform_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    )
+)
 @triton.jit(repr=_winograd_f4x3_input_transform_kernel_repr)
 def _winograd_f4x3_input_transform_kernel(
     X,
@@ -394,6 +404,15 @@ def _winograd_f4x3_input_transform_kernel(
     tl.store(v_base + 35 * stride_v_alpha, v55, mask=c_store_mask)
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    )
+)
 @triton.jit(repr=_winograd_f4x3_cblocked_input_transform_kernel_repr)
 def _winograd_f4x3_cblocked_input_transform_kernel(
     X,
@@ -729,6 +748,15 @@ def _winograd_f4x3_cblocked_input_transform_kernel(
     tl.store(v_base + 35 * stride_v_alpha, v55, mask=c_store_mask)
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    )
+)
 @triton.jit(repr=_winograd_f4x3_batched_gemm_kernel_repr)
 def _winograd_f4x3_batched_gemm_kernel(
     V,
@@ -801,6 +829,15 @@ def _winograd_f4x3_batched_gemm_kernel(
     tl.store(m_ptrs, acc, mask=m_mask)
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    )
+)
 @triton.jit(repr=_winograd_f4x3_output_transform_kernel_repr)
 def _winograd_f4x3_output_transform_kernel(
     M_in,

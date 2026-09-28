@@ -3,6 +3,7 @@
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -12,6 +13,7 @@ _fused_qk_norm_rope_cached_repr = make_kernel_repr(
 )
 
 
+@make_launcher(grid_arg=1, options={"num_warps": 4})
 @triton.jit(repr=_fused_qk_norm_rope_cached_repr)
 def _fused_qk_norm_rope_cached_kernel(
     q_ptr,

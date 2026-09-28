@@ -4,7 +4,6 @@
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.fusions.fused_bmm_rope_kv_cache import (
     _fused_fp4_bmm_reduce_kernel,
@@ -31,20 +30,6 @@ _USE_GEMM_SPLITK_BF16 = False
 def set_use_gemm_splitk_bf16(value: bool):
     global _USE_GEMM_SPLITK_BF16
     _USE_GEMM_SPLITK_BF16 = value
-
-
-_fused_fp4_bmm_reduce_kernel_launch = make_launcher(_fused_fp4_bmm_reduce_kernel)
-
-
-_fused_fp4_bmm_rope_cat_and_cache_mla_kernel_launch = make_launcher(
-    _fused_fp4_bmm_rope_cat_and_cache_mla_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-    ),
-)
 
 
 def fused_fp4_bmm_rope_cat_and_cache_mla(
@@ -273,7 +258,7 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
         stride_cn = q_out.stride(2)
 
     dev, stream = current_device_stream()
-    _fused_fp4_bmm_rope_cat_and_cache_mla_kernel_launch(
+    _fused_fp4_bmm_rope_cat_and_cache_mla_kernel(
         dev,
         stream,
         grid,
@@ -383,7 +368,7 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
         )
 
         dev, stream = current_device_stream()
-        _fused_fp4_bmm_reduce_kernel_launch(
+        _fused_fp4_bmm_reduce_kernel(
             dev,
             stream,
             grid_reduce,
@@ -407,17 +392,6 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
         )
 
     return q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out
-
-
-_fused_fp8_bmm_rope_cat_and_cache_mla_kernel_launch = make_launcher(
-    _fused_fp8_bmm_rope_cat_and_cache_mla_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-    ),
-)
 
 
 def fused_fp8_bmm_rope_cat_and_cache_mla(
@@ -614,7 +588,7 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
     )
 
     dev, stream = current_device_stream()
-    _fused_fp8_bmm_rope_cat_and_cache_mla_kernel_launch(
+    _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
         dev,
         stream,
         grid,

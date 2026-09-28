@@ -148,23 +148,6 @@ def _validate_bshd_hd128(input: Tensor, operation: str) -> tuple[int, int, int, 
     return input.shape
 
 
-_mha_v4_per_tensor_amax_kernel_launch = make_launcher(
-    mha_v4_per_tensor_amax_kernel,
-    grid_arg=1,
-    options={"num_warps": 8},
-)
-_mha_v4_per_tensor_scale_kernel_launch = make_launcher(
-    mha_v4_per_tensor_scale_kernel,
-    grid_arg=1,
-    options={"num_warps": 8},
-)
-_mha_v4_per_tensor_quant_kernel_launch = make_launcher(
-    mha_v4_per_tensor_quant_kernel,
-    grid_arg=1,
-    options={"num_warps": 8},
-)
-
-
 def _quantize_per_tensor(
     input: Tensor, output_dtype: torch.dtype, dtype_max: float, clip: float
 ) -> tuple[Tensor, Tensor]:
@@ -176,7 +159,7 @@ def _quantize_per_tensor(
     scale = input.new_empty((1,), dtype=torch.float32)
     output = input.new_empty(input.shape, dtype=output_dtype)
     dev, stream = current_device_stream()
-    _mha_v4_per_tensor_amax_kernel_launch(
+    mha_v4_per_tensor_amax_kernel(
         dev,
         stream,
         blocks,
@@ -186,7 +169,7 @@ def _quantize_per_tensor(
         MHA_V4_PER_TENSOR_BLOCK_SIZE,  # BLOCK_SIZE
     )
     scale_block = triton.next_power_of_2(blocks)
-    _mha_v4_per_tensor_scale_kernel_launch(
+    mha_v4_per_tensor_scale_kernel(
         dev,
         stream,
         1,
@@ -196,7 +179,7 @@ def _quantize_per_tensor(
         dtype_max / clip,  # dtype_max
         scale_block,  # BLOCK_SIZE
     )
-    _mha_v4_per_tensor_quant_kernel_launch(
+    mha_v4_per_tensor_quant_kernel(
         dev,
         stream,
         blocks,
@@ -483,16 +466,6 @@ def _quantize_mxfp6_k_raw_fake(input: Tensor) -> tuple[Tensor, Tensor]:
     )
 
 
-_sage_quant_v_amax_partial_kernel_launch = make_launcher(
-    sage_quant_v_amax_partial_kernel,
-    grid_arg=1,
-    options={"num_warps": 8},
-)
-_sage_quant_v_amax_finalize_kernel_launch = make_launcher(
-    sage_quant_v_amax_finalize_kernel,
-    grid_arg=2,
-    options={"num_warps": 4},
-)
 _sage_quant_v_kernel_launch = make_launcher(
     sage_quant_v_kernel,
     grid_arg=1,
@@ -513,7 +486,7 @@ def quantize_v_fp8(input: Tensor) -> tuple[Tensor, Tensor]:
     )
     scale = input.new_empty((batch, heads, head_dim), dtype=torch.float32)
     dev, stream = current_device_stream()
-    _sage_quant_v_amax_partial_kernel_launch(
+    sage_quant_v_amax_partial_kernel(
         dev,
         stream,
         batch * heads * scale_blocks,
@@ -529,7 +502,7 @@ def quantize_v_fp8(input: Tensor) -> tuple[Tensor, Tensor]:
         head_dim,  # D
         scale_block_k,  # BLOCK_K
     )
-    _sage_quant_v_amax_finalize_kernel_launch(
+    sage_quant_v_amax_finalize_kernel(
         dev,
         stream,
         triton.cdiv(head_dim, 32),

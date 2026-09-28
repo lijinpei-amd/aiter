@@ -731,6 +731,7 @@ _csr_to_dense_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_csr_to_dense_kernel_repr)
 def _csr_to_dense_kernel(
     kv_indices,
@@ -758,15 +759,12 @@ def _csr_to_dense_kernel(
     )
 
 
-_csr_to_dense_kernel_launch = make_launcher(_csr_to_dense_kernel)
-
-
 def csr_to_dense_block_table(kv_indices, kv_indptr, dense_table, max_ctx, bs):
     """Convert CSR (kv_indices + kv_indptr) to dense [B, max_ctx] block table on GPU."""
     BLOCK_N = 128
     grid = (bs, triton.cdiv(max_ctx, BLOCK_N))
     dev, stream = current_device_stream()
-    _csr_to_dense_kernel_launch(
+    _csr_to_dense_kernel(
         dev,
         stream,
         grid,

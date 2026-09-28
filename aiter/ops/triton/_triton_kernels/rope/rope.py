@@ -3,6 +3,7 @@
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -104,6 +105,7 @@ _rope_kernel_sbhd_fwd_repr = make_kernel_repr(
 )
 
 
+@make_launcher(options={"num_warps": 4, "waves_per_eu": 0})
 @triton.jit(repr=_rope_kernel_sbhd_fwd_repr)
 def _rope_kernel_sbhd_fwd(
     x_ptr,
@@ -223,6 +225,7 @@ _rope_kernel_sbhd_bwd_repr = make_kernel_repr(
 )
 
 
+@make_launcher(options={"num_warps": 4, "waves_per_eu": 0})
 @triton.jit(repr=_rope_kernel_sbhd_bwd_repr)
 def _rope_kernel_sbhd_bwd(
     x_ptr,
@@ -347,6 +350,7 @@ _rope_kernel_thd_fwd_repr = make_kernel_repr(
 )
 
 
+@make_launcher(options={"num_warps": 4, "waves_per_eu": 0})
 @triton.jit(repr=_rope_kernel_thd_fwd_repr)
 def _rope_kernel_thd_fwd(
     x_ptr,
@@ -471,6 +475,7 @@ _rope_kernel_thd_bwd_repr = make_kernel_repr(
 )
 
 
+@make_launcher(options={"num_warps": 4, "waves_per_eu": 0})
 @triton.jit(repr=_rope_kernel_thd_bwd_repr)
 def _rope_kernel_thd_bwd(
     x_ptr,
@@ -597,6 +602,7 @@ _rope_kernel_sbhd_cached_fwd_repr = make_kernel_repr(
 )
 
 
+@make_launcher(options={"num_warps": 4, "waves_per_eu": 0})
 @triton.jit(repr=_rope_kernel_sbhd_cached_fwd_repr)
 def _rope_kernel_sbhd_cached_fwd(
     x_ptr,
@@ -737,6 +743,7 @@ _rope_kernel_sbhd_cached_bwd_repr = make_kernel_repr(
 )
 
 
+@make_launcher(options={"num_warps": 4, "waves_per_eu": 0})
 @triton.jit(repr=_rope_kernel_sbhd_cached_bwd_repr)
 def _rope_kernel_sbhd_cached_bwd(
     x_ptr,
@@ -1470,6 +1477,7 @@ _rope_kernel_cached_thd_2c_gqa_onehead_fwd_repr = make_kernel_repr(
 )
 
 
+@make_launcher(options={"num_warps": 4, "waves_per_eu": 0})
 @triton.jit(repr=_rope_kernel_cached_thd_2c_gqa_onehead_fwd_repr)
 def _rope_kernel_cached_thd_2c_gqa_onehead_fwd(
     x_ptr,
@@ -1862,6 +1870,7 @@ _rope_kernel_cached_thd_2c_gqa_onehead_bwd_repr = make_kernel_repr(
 )
 
 
+@make_launcher(options={"num_warps": 4, "waves_per_eu": 0})
 @triton.jit(repr=_rope_kernel_cached_thd_2c_gqa_onehead_bwd_repr)
 def _rope_kernel_cached_thd_2c_gqa_onehead_bwd(
     x_ptr,
@@ -2048,6 +2057,7 @@ _rope_fwd_2d_kernel_neox_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_rope_fwd_2d_kernel_neox_repr)
 def _rope_fwd_2d_kernel_neox(
     x_ptr,
@@ -2177,6 +2187,7 @@ _rope_fwd_3d_repr = make_kernel_repr(
 )
 
 
+@make_launcher(options={"num_warps": 4, "waves_per_eu": 1})
 @triton.jit(repr=_rope_fwd_3d_repr)
 def _rope_fwd_3d(
     x_ptr,

@@ -18,7 +18,6 @@ import torch
 
 # @manual=//triton:triton
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.attention.hstu_attention import (
     _get_bwd_config,
@@ -36,18 +35,6 @@ from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
-
-
-_hstu_attn_fwd_launch = make_launcher(
-    _hstu_attn_fwd,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
 
 
 def triton_hstu_attention_fwd(
@@ -118,7 +105,7 @@ def triton_hstu_attention_fwd(
     grid = (triton.cdiv(N, config["BLOCK_M"]), Z * H)
 
     dev, stream = current_device_stream()
-    _hstu_attn_fwd_launch(
+    _hstu_attn_fwd(
         dev,
         stream,
         grid,
@@ -162,18 +149,6 @@ def triton_hstu_attention_fwd(
     )
 
     return out
-
-
-_hstu_attn_bwd_launch = make_launcher(
-    _hstu_attn_bwd,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
 
 
 def triton_hstu_attention_bwd(
@@ -262,7 +237,7 @@ def triton_hstu_attention_bwd(
         lock.zero_()
 
     dev, stream = current_device_stream()
-    _hstu_attn_bwd_launch(
+    _hstu_attn_bwd(
         dev,
         stream,
         grid,

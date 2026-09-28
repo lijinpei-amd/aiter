@@ -8,10 +8,12 @@ width) and a 2D-tiled kernel (vectorized over feature/token, conv width in
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 PAD_SLOT_ID = -1
 
 
+@make_launcher(options={"num_stages": 2})
 @triton.jit()
 def _causal_conv1d_fwd_split_qkv_kernel(
     x_ptr,
@@ -313,6 +315,7 @@ def _causal_conv1d_fwd_split_qkv_kernel(
 # batch_ptr / token_chunk_offset_ptr; grid.y is the feature block.
 
 
+@make_launcher(dynamic_options=("num_warps",), options={"num_stages": 1})
 @triton.jit()
 def _causal_conv1d_fwd_split_qkv_tile_kernel(
     x_ptr,

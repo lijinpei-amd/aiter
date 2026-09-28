@@ -1,5 +1,6 @@
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -340,6 +341,7 @@ _hash_routing_repr = make_kernel_repr(
 )
 
 
+@make_launcher(options={"num_warps": 8})
 @triton.jit(repr=_hash_routing_repr)
 def _hash_routing(
     InputIds,  # int32 [n_rows] — token-id per row
@@ -512,6 +514,7 @@ _grouped_topk_repr = make_kernel_repr(
 )
 
 
+@make_launcher(options={"num_warps": 4})
 @triton.jit(repr=_grouped_topk_repr)
 def _grouped_topk(
     X,  # router logits [n_rows, n_expts_tot] (bf16/fp32)

@@ -32,6 +32,7 @@ BT_LIST = [32, 64, 128]
 NUM_WARPS_AUTOTUNE = [2, 4, 8, 16]
 
 
+@make_launcher(options={"num_warps": _BETA_SIGMOID_NUM_WARPS})
 @triton.jit
 def beta_sigmoid_fwd_kernel(
     x,
@@ -47,12 +48,6 @@ def beta_sigmoid_fwd_kernel(
     tl.store(y + offs, b_y.to(y.dtype.element_ty), mask=mask)
 
 
-_beta_sigmoid_fwd_kernel_launch = make_launcher(
-    beta_sigmoid_fwd_kernel,
-    options={"num_warps": _BETA_SIGMOID_NUM_WARPS},
-)
-
-
 @input_guard
 def beta_sigmoid_fwd(x: torch.Tensor) -> torch.Tensor:
     """Elementwise sigmoid of ``x``, output in float32."""
@@ -60,7 +55,7 @@ def beta_sigmoid_fwd(x: torch.Tensor) -> torch.Tensor:
     n = x.numel()
     grid = (triton.cdiv(n, _BETA_SIGMOID_BLOCK_SIZE),)
     dev, stream = current_device_stream()
-    _beta_sigmoid_fwd_kernel_launch(
+    beta_sigmoid_fwd_kernel(
         dev,
         stream,
         grid,
@@ -72,6 +67,12 @@ def beta_sigmoid_fwd(x: torch.Tensor) -> torch.Tensor:
     return y
 
 
+def _chunk_delta_attn_gate_fwd_kernel_grid(T: int, BT: int, H: int):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (triton.cdiv(T, BT), H)
+
+
+@make_launcher(grid_cpp=_chunk_delta_attn_gate_fwd_kernel_grid)
 @triton.heuristics(
     {
         "HAS_BIAS": lambda args: args["dt_bias"] is not None,
@@ -132,17 +133,6 @@ def chunk_delta_attn_gate_fwd_kernel(
     tl.store(p_yg, b_yg.to(p_yg.dtype.element_ty), mask=m_g)
 
 
-def _chunk_delta_attn_gate_fwd_kernel_grid(T: int, BT: int, H: int):
-    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
-    return (triton.cdiv(T, BT), H)
-
-
-_chunk_delta_attn_gate_fwd_kernel_launch = make_launcher(
-    chunk_delta_attn_gate_fwd_kernel,
-    grid_cpp=_chunk_delta_attn_gate_fwd_kernel_grid,
-)
-
-
 @input_guard
 def chunk_delta_attn_gate_fwd(
     g: torch.Tensor,
@@ -170,7 +160,7 @@ def chunk_delta_attn_gate_fwd(
     yg = torch.empty_like(g, dtype=output_dtype)
 
     dev, stream = current_device_stream()
-    _chunk_delta_attn_gate_fwd_kernel_launch(
+    chunk_delta_attn_gate_fwd_kernel(
         dev,
         stream,
         g,

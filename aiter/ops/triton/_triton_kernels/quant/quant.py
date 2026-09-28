@@ -3,6 +3,7 @@
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -15,6 +16,7 @@ _static_per_tensor_quant_fp8_i8_repr = make_kernel_repr(
 )
 
 
+@make_launcher(options={"num_warps": 4})
 @triton.jit(repr=_static_per_tensor_quant_fp8_i8_repr)
 def _static_per_tensor_quant_fp8_i8_kernel(
     qx_ptr,
@@ -66,6 +68,7 @@ _dynamic_per_tensor_quant_fp8_i8_repr = make_kernel_repr(
 )
 
 
+@make_launcher(grid_arg=1)
 @triton.jit(repr=_dynamic_per_tensor_quant_fp8_i8_repr)
 def _dynamic_per_tensor_quant_fp8_i8_kernel(
     x_in_ptr,
@@ -95,6 +98,7 @@ _dynamic_per_token_quant_fp8_i8_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_dynamic_per_token_quant_fp8_i8_repr)
 def _dynamic_per_token_quant_fp8_i8_kernel(
     qx_ptr,
@@ -586,6 +590,7 @@ _dynamic_mxfp4_quant_blockscale_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_dynamic_mxfp4_quant_blockscale_repr)
 def _dynamic_mxfp4_quant_blockscale_kernel(
     x_ptr,
@@ -682,6 +687,7 @@ _dynamic_mxfp8_quant_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_dynamic_mxfp8_quant_repr)
 def _dynamic_mxfp8_quant_kernel(
     x_ptr,
@@ -750,6 +756,7 @@ _dynamic_mxfp8_quant_n32k4_mbn_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_dynamic_mxfp8_quant_n32k4_mbn_repr)
 def _dynamic_mxfp8_quant_n32k4_mbn_kernel(
     x_ptr,
@@ -842,6 +849,7 @@ _fp8_legacy_to_mxfp8_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_fp8_legacy_to_mxfp8_repr)
 def _fp8_legacy_to_mxfp8_kernel(
     x_fnuz_ptr,
@@ -916,6 +924,7 @@ _dynamic_nvfp4_quant_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("num_warps",), options={"waves_per_eu": 0})
 @triton.heuristics(
     {
         "EVEN_M_N": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0

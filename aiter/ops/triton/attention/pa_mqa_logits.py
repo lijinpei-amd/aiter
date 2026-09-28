@@ -26,7 +26,6 @@ from functools import cache
 
 import torch
 import triton
-from intj import make_launcher
 from packaging.version import Version
 from triton.backends.compiler import GPUTarget
 
@@ -81,18 +80,6 @@ else:
     enable_jit_gluon_pa_mqa_logits_kernel = False
 
 
-_deepgemm_fp8_paged_mqa_logits_ragged_k_launch = make_launcher(
-    _deepgemm_fp8_paged_mqa_logits_ragged_k,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
-
-
 def deepgemm_fp8_paged_mqa_logits_ragged_k(
     q_fp8: torch.Tensor,  # dtype = float8
     kv_cache_fp8: torch.Tensor,  # dtype = float8
@@ -122,7 +109,7 @@ def deepgemm_fp8_paged_mqa_logits_ragged_k(
 
     grid = (batch_size * next_n * config["SplitKV"],)
     dev, stream = current_device_stream()
-    _deepgemm_fp8_paged_mqa_logits_ragged_k_launch(
+    _deepgemm_fp8_paged_mqa_logits_ragged_k(
         dev,
         stream,
         grid,
@@ -156,18 +143,6 @@ def deepgemm_fp8_paged_mqa_logits_ragged_k(
     )
 
 
-_deepgemm_fp8_paged_mqa_logits_stage1_ragged_k_launch = make_launcher(
-    _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
-
-
 def deepgemm_fp8_paged_mqa_logits_stage1_ragged_k(
     q_fp8: torch.Tensor,  # dtype = float8
     kv_cache_fp8: torch.Tensor,  # dtype = float8
@@ -196,7 +171,7 @@ def deepgemm_fp8_paged_mqa_logits_stage1_ragged_k(
 
     grid = (batch_size * next_n * (heads // config["ChunkQ"] * config["SplitKV"]),)
     dev, stream = current_device_stream()
-    _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k_launch(
+    _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k(
         dev,
         stream,
         grid,
@@ -229,18 +204,6 @@ def deepgemm_fp8_paged_mqa_logits_stage1_ragged_k(
         config["HiddenDim"],
         config.get("SplitKV", 1),
     )
-
-
-_deepgemm_fp8_paged_mqa_logits_stage1_launch = make_launcher(
-    _deepgemm_fp8_paged_mqa_logits_stage1,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
 
 
 def deepgemm_fp8_paged_mqa_logits_stage1(
@@ -289,7 +252,7 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
 
     grid = (batch_size * next_n * (heads // config["ChunkQ"] * SplitKV),)
     dev, stream = current_device_stream()
-    _deepgemm_fp8_paged_mqa_logits_stage1_launch(
+    _deepgemm_fp8_paged_mqa_logits_stage1(
         dev,
         stream,
         grid,
@@ -497,12 +460,6 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     return kernel
 
 
-_deepgemm_fp8_paged_mqa_logits_varctx_schedule_launch = make_launcher(
-    _deepgemm_fp8_paged_mqa_logits_varctx_schedule,
-    options={"waves_per_eu": 4},
-)
-
-
 def deepgemm_fp8_paged_mqa_logits_schedule(
     batch_size,
     next_n,
@@ -528,7 +485,7 @@ def deepgemm_fp8_paged_mqa_logits_schedule(
         dtype=torch.int32,
     )
     dev, stream = current_device_stream()
-    _deepgemm_fp8_paged_mqa_logits_varctx_schedule_launch(
+    _deepgemm_fp8_paged_mqa_logits_varctx_schedule(
         dev,
         stream,
         grid,

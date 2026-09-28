@@ -40,6 +40,7 @@ DTYPE = torch.bfloat16
 # -- Inlined from ATOM's atom/model_ops/kimi_k3/activations.py --
 
 
+@make_launcher(grid_arg=1)
 @triton.jit
 def _rmsnorm_gated_kernel(
     x_ptr,
@@ -68,9 +69,6 @@ def _rmsnorm_gated_kernel(
     tl.store(y_ptr + row * stride_ym + cols, y.to(y_ptr.dtype.element_ty), mask=mask)
 
 
-_rmsnorm_gated_kernel_launch = make_launcher(_rmsnorm_gated_kernel, grid_arg=1)
-
-
 def rmsnorm_gated_bf16(x, weight, gate, eps):
     """Gated RMSNorm -> bf16 (real Triton kernel)."""
     h = x.shape[-1]
@@ -84,7 +82,7 @@ def rmsnorm_gated_bf16(x, weight, gate, eps):
         stride_g_outer, stride_g_head = gate.stride(0), 0
     BLOCK = triton.next_power_of_2(h)
     dev, stream = current_device_stream()
-    _rmsnorm_gated_kernel_launch(
+    _rmsnorm_gated_kernel(
         dev,
         stream,
         m,

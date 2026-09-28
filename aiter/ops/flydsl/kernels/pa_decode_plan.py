@@ -13,6 +13,7 @@ from intj import make_launcher
 from aiter.ops.triton.utils.device_info import current_device_stream
 
 
+@make_launcher(grid_arg=1, options={"num_warps": 4})
 @triton.jit
 def _plan_pa_decode(
     lengths,
@@ -73,13 +74,6 @@ def _plan_pa_decode(
     padding = (pad >= total_tasks) & (pad < CAPACITY)
     for field in tl.static_range(4):
         tl.store(work + pad * 4 + field, 0, padding)
-
-
-_plan_pa_decode_launch = make_launcher(
-    _plan_pa_decode,
-    grid_arg=1,
-    options={"num_warps": 4},
-)
 
 
 @dataclass(frozen=True)
@@ -200,7 +194,7 @@ def plan_pa_decode(
     plan.validate(batch, num_kv_heads, dev)
     with torch.cuda.device(dev):
         intj_dev, intj_stream = current_device_stream()
-        _plan_pa_decode_launch(
+        _plan_pa_decode(
             intj_dev,
             intj_stream,
             batch,

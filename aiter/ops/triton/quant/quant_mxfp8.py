@@ -3,7 +3,6 @@
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.quant.quant_mxfp8 import (
     _convert_from_mxfp8_kernel,
@@ -19,13 +18,6 @@ __all__ = [
 ]
 
 _LOGGER = AiterTritonLogger()
-
-
-_convert_to_mxfp8_kernel_launch = make_launcher(
-    _convert_to_mxfp8_kernel,
-    dynamic_options=("num_warps",),
-    options={"waves_per_eu": 2, "num_stages": 2},
-)
 
 
 def convert_to_mxfp8(
@@ -112,7 +104,7 @@ def convert_to_mxfp8(
     num_warps = min(16, max(1, block_m * block_n // 1024))
 
     dev, stream = current_device_stream()
-    _convert_to_mxfp8_kernel_launch(
+    _convert_to_mxfp8_kernel(
         dev,
         stream,
         grid,
@@ -136,13 +128,6 @@ def convert_to_mxfp8(
         use_asm,
     )
     return y, s
-
-
-_convert_from_mxfp8_kernel_launch = make_launcher(
-    _convert_from_mxfp8_kernel,
-    dynamic_options=("num_warps",),
-    options={"waves_per_eu": 2, "num_stages": 2},
-)
 
 
 def convert_from_mxfp8(
@@ -206,7 +191,7 @@ def convert_from_mxfp8(
     num_warps = min(16, max(1, block_m * block_n // 1024))
 
     dev, stream = current_device_stream()
-    _convert_from_mxfp8_kernel_launch(
+    _convert_from_mxfp8_kernel(
         dev,
         stream,
         grid,

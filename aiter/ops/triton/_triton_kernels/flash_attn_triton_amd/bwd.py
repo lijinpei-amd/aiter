@@ -1265,6 +1265,15 @@ def _bwd_dkdvdq_inner_atomic(
     return dk, dv
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    )
+)
 @triton.jit
 def _bwd_kernel_fused_atomic_causal(
     q_ptr,
@@ -1592,6 +1601,7 @@ def _bwd_kernel_fused_atomic_causal(
     tl.store(dk_ptr + offs_dkdv, dk, mask=mask_kv)
 
 
+@make_launcher(options={"num_stages": 1, "num_warps": 4, "waves_per_eu": 1})
 @triton.jit
 def _bwd_kernel_split_dkdv_causal(
     q_ptr,
@@ -1894,12 +1904,7 @@ def _bwd_kernel_split_dkdv_causal(
     tl.store(dk_ptr + offs_dkdv, dk, mask=mask_kv)
 
 
-_bwd_kernel_split_dkdv_causal_launch = make_launcher(
-    _bwd_kernel_split_dkdv_causal,
-    options={"num_stages": 1, "num_warps": 4, "waves_per_eu": 1},
-)
-
-
+@make_launcher(options={"num_stages": 1, "num_warps": 4, "waves_per_eu": 1})
 @triton.jit
 def _bwd_kernel_split_dq_causal(
     q_ptr,
@@ -2174,12 +2179,15 @@ def _bwd_kernel_split_dq_causal(
         tl.store(dq_ptr + offs_dq, dq, mask=mask_q)
 
 
-_bwd_kernel_split_dq_causal_launch = make_launcher(
-    _bwd_kernel_split_dq_causal,
-    options={"num_stages": 1, "num_warps": 4, "waves_per_eu": 1},
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    )
 )
-
-
 @triton.jit
 def _bwd_kernel_fused_atomic_noncausal(
     Q,
@@ -2395,6 +2403,7 @@ def _bwd_kernel_fused_atomic_noncausal(
     tl.store(DK + adj_dkdv, dk, mask=mask_kv)
 
 
+@make_launcher(options={"num_stages": 1, "num_warps": 4, "waves_per_eu": 1})
 @triton.jit
 def _bwd_kernel_split_dkdv_noncausal(
     Q,
@@ -2589,12 +2598,7 @@ def _bwd_kernel_split_dkdv_noncausal(
     tl.store(DK + adj_dkdv, dk, mask=mask_kv)
 
 
-_bwd_kernel_split_dkdv_noncausal_launch = make_launcher(
-    _bwd_kernel_split_dkdv_noncausal,
-    options={"num_stages": 1, "num_warps": 4, "waves_per_eu": 1},
-)
-
-
+@make_launcher(options={"num_stages": 1, "num_warps": 4, "waves_per_eu": 1})
 @triton.jit
 def _bwd_kernel_split_dq_noncausal(
     Q,
@@ -2775,12 +2779,6 @@ def _bwd_kernel_split_dq_noncausal(
         offs_dq = offs_m[:, None] * stride_dqm + offs_k[None, :] * stride_dqk
         dq *= sm_scale
         tl.store(DQ + adj_dq + offs_dq, dq, mask=mask_q)
-
-
-_bwd_kernel_split_dq_noncausal_launch = make_launcher(
-    _bwd_kernel_split_dq_noncausal,
-    options={"num_stages": 1, "num_warps": 4, "waves_per_eu": 1},
-)
 
 
 # This function computes delta given output Out and gradient DO
@@ -3363,6 +3361,14 @@ def _sliding_window_k_bounds(
     return start_n, num_steps
 
 
+def _bwd_kernel_fused_causal_grid(
+    BLOCK_N1: int, *, nheads_k: int, seqlen: int, batch: int
+):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (nheads_k, (seqlen + BLOCK_N1 - 1) // BLOCK_N1, batch)
+
+
+@make_launcher(grid_cpp=_bwd_kernel_fused_causal_grid)
 @triton.autotune(
     configs=causal_autotune_configs,
     key=CAUSAL_AUTOTUNE_KEYS,
@@ -3984,19 +3990,14 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
             # end of GQA/MQA of dq
 
 
-def _bwd_kernel_fused_causal_grid(
+def _bwd_kernel_fused_noncausal_grid(
     BLOCK_N1: int, *, nheads_k: int, seqlen: int, batch: int
 ):
     # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
     return (nheads_k, (seqlen + BLOCK_N1 - 1) // BLOCK_N1, batch)
 
 
-_bwd_kernel_fused_causal_launch = make_launcher(
-    bwd_kernel_fused_causal,
-    grid_cpp=_bwd_kernel_fused_causal_grid,
-)
-
-
+@make_launcher(grid_cpp=_bwd_kernel_fused_noncausal_grid)
 @triton.autotune(
     configs=noncausal_autotune_configs,
     key=NONCAUSAL_AUTOTUNE_KEYS,
@@ -4423,19 +4424,6 @@ def bwd_kernel_fused_noncausal(
             tl.store(DQ + adj_dq + offs_dq, dq, mask=mask_q)
 
 
-def _bwd_kernel_fused_noncausal_grid(
-    BLOCK_N1: int, *, nheads_k: int, seqlen: int, batch: int
-):
-    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
-    return (nheads_k, (seqlen + BLOCK_N1 - 1) // BLOCK_N1, batch)
-
-
-_bwd_kernel_fused_noncausal_launch = make_launcher(
-    bwd_kernel_fused_noncausal,
-    grid_cpp=_bwd_kernel_fused_noncausal_grid,
-)
-
-
 def is_contiguous(x, name):
     if x.is_contiguous():
         return x
@@ -4450,30 +4438,6 @@ def is_contiguous(x, name):
 # Requires TRITON_INTERPRET=1 to actually print inside kernels.
 DEBUG_TRITON: bool = DEBUG >= 1
 DEBUG_TRITON_DETAIL: bool = DEBUG >= 2
-
-
-_bwd_kernel_fused_atomic_causal_launch = make_launcher(
-    _bwd_kernel_fused_atomic_causal,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
-
-
-_bwd_kernel_fused_atomic_noncausal_launch = make_launcher(
-    _bwd_kernel_fused_atomic_noncausal,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
 
 
 def attention_backward_triton_impl(
@@ -4888,7 +4852,7 @@ def attention_backward_triton_impl(
             if DEBUG_TRITON:
                 print(f"bwd_kernel: grid = {grid}")
             intj_dev, intj_stream = current_device_stream()
-            _bwd_kernel_fused_causal_launch(
+            bwd_kernel_fused_causal(
                 intj_dev,
                 intj_stream,
                 nheads_k,  # grid
@@ -4983,7 +4947,7 @@ def attention_backward_triton_impl(
             )
         else:
             intj_dev, intj_stream = current_device_stream()
-            _bwd_kernel_fused_noncausal_launch(
+            bwd_kernel_fused_noncausal(
                 intj_dev,
                 intj_stream,
                 nheads_k,  # grid
@@ -5102,7 +5066,7 @@ def attention_backward_triton_impl(
 
         if causal:
             dev, stream = current_device_stream()
-            _bwd_kernel_fused_atomic_causal_launch(
+            _bwd_kernel_fused_atomic_causal(
                 dev,
                 stream,
                 grid_dkdvdq,
@@ -5182,7 +5146,7 @@ def attention_backward_triton_impl(
             )
         else:
             dev, stream = current_device_stream()
-            _bwd_kernel_fused_atomic_noncausal_launch(
+            _bwd_kernel_fused_atomic_noncausal(
                 dev,
                 stream,
                 grid_dkdvdq,
@@ -5270,7 +5234,7 @@ def attention_backward_triton_impl(
 
         if causal:
             dev, stream = current_device_stream()
-            _bwd_kernel_split_dkdv_causal_launch(
+            _bwd_kernel_split_dkdv_causal(
                 dev,
                 stream,
                 grid_dkdv,
@@ -5336,7 +5300,7 @@ def attention_backward_triton_impl(
                 IS_FP8,
                 FP8_MAX,
             )
-            _bwd_kernel_split_dq_causal_launch(
+            _bwd_kernel_split_dq_causal(
                 dev,
                 stream,
                 grid_dq,
@@ -5403,7 +5367,7 @@ def attention_backward_triton_impl(
             )
         else:
             dev, stream = current_device_stream()
-            _bwd_kernel_split_dkdv_noncausal_launch(
+            _bwd_kernel_split_dkdv_noncausal(
                 dev,
                 stream,
                 grid_dkdv,
@@ -5470,7 +5434,7 @@ def attention_backward_triton_impl(
                 FP8_MAX,
             )
 
-            _bwd_kernel_split_dq_noncausal_launch(
+            _bwd_kernel_split_dq_noncausal(
                 dev,
                 stream,
                 grid_dq,

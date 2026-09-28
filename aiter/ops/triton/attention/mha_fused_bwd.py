@@ -21,30 +21,6 @@ _LOGGER = AiterTritonLogger()
 _bwd_preprocess_launch = make_launcher(_bwd_preprocess)
 
 
-_bwd_kernel_dkdvdq_causal_launch = make_launcher(
-    _bwd_kernel_dkdvdq_causal,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
-
-
-_bwd_kernel_dkdvdq_noncausal_launch = make_launcher(
-    _bwd_kernel_dkdvdq_noncausal,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
-
-
 def flash_attn_fused_backward(
     do: torch.Tensor,
     q: torch.Tensor,
@@ -257,7 +233,7 @@ def flash_attn_fused_backward(
         grid_dkdvdq = (batch * num_q_heads * num_k_pids,)
 
         dev, stream = current_device_stream()
-        _bwd_kernel_dkdvdq_causal_launch(
+        _bwd_kernel_dkdvdq_causal(
             dev,
             stream,
             grid_dkdvdq,
@@ -317,7 +293,7 @@ def flash_attn_fused_backward(
         # in non causal inner loop over grouped q heads
         grid_dkdvdq = (batch * num_k_heads * num_k_pids,)
         dev, stream = current_device_stream()
-        _bwd_kernel_dkdvdq_noncausal_launch(
+        _bwd_kernel_dkdvdq_noncausal(
             dev,
             stream,
             grid_dkdvdq,

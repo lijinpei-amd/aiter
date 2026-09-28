@@ -1,5 +1,6 @@
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -11,6 +12,7 @@ _softmax_kernel_online_repr = make_kernel_repr(
 )
 
 
+@make_launcher(options={"num_stages": 2, "num_warps": 8, "waves_per_eu": 2})
 @triton.jit(repr=_softmax_kernel_online_repr)
 def _softmax_kernel_online(
     output_ptr,

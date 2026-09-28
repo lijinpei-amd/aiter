@@ -2,7 +2,6 @@ import os
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.conv.causal_conv1d import (
     PAD_SLOT_ID,
@@ -39,12 +38,6 @@ def _assert_implemented_width(width: int, fn: str) -> None:
     """
     if not 2 <= width <= 4:
         raise AssertionError(f"{fn}: width must be 2, 3 or 4, got {width}")
-
-
-_causal_conv1d_fwd_kernel_launch = make_launcher(
-    _causal_conv1d_fwd_kernel,
-    options={"num_stages": 2},
-)
 
 
 def causal_conv1d_fn(
@@ -181,7 +174,7 @@ def causal_conv1d_fn(
     )
 
     dev, stream = current_device_stream()
-    _causal_conv1d_fwd_kernel_launch(
+    _causal_conv1d_fwd_kernel(
         dev,
         stream,
         grid,
@@ -226,9 +219,6 @@ def causal_conv1d_fn(
         BLOCK_N,
     )
     return out
-
-
-_causal_conv1d_update_kernel_launch = make_launcher(_causal_conv1d_update_kernel)
 
 
 def causal_conv1d_update(
@@ -379,7 +369,7 @@ def causal_conv1d_update(
         stride_inter_seq = stride_inter_step = stride_inter_dim = stride_inter_win = 0
 
     dev, stream = current_device_stream()
-    _causal_conv1d_update_kernel_launch(
+    _causal_conv1d_update_kernel(
         dev,
         stream,
         grid,

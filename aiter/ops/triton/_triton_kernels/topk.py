@@ -7,6 +7,7 @@
 #  Top-K on GPU:  1-stage (tiny rows) + 2-stage (large rows) Triton kernels,
 import triton
 import triton.language as tl
+from intj import make_launcher
 from triton.language import core
 from triton.language.standard import _log2, zeros_like
 
@@ -42,6 +43,7 @@ _topk_stage2_kernel_repr = make_kernel_repr(
 
 
 # 1-STAGE KERNEL (tiny rows)
+@make_launcher(grid_arg=1, options={"num_stages": 2, "num_warps": 4})
 @triton.jit(repr=_topk_kernel_repr)
 def _topk_kernel(
     X,
@@ -92,6 +94,7 @@ def _topk_kernel(
 
 
 # 2-STAGE KERNEL (large rows)
+@make_launcher(grid_arg=2)
 @triton.jit(repr=_topk_stage1_kernel_repr)
 def topk_stage1_kernel(
     y_ptr,
@@ -259,6 +262,7 @@ def argsort(x, ids, dim: tl.constexpr, descending: core.constexpr):
     return x, ids
 
 
+@make_launcher(grid_arg=1)
 @triton.jit(repr=_topk_stage2_kernel_repr)
 def topk_stage2_kernel(
     y_ptr,

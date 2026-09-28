@@ -48,12 +48,6 @@ class RotateStyle(IntEnum):
     GPTJ = 1
 
 
-_rope_kernel_sbhd_fwd_launch = make_launcher(
-    _rope_kernel_sbhd_fwd,
-    options={"num_warps": 4, "waves_per_eu": 0},
-)
-
-
 # TODO: For now BLOCK_D is assumed to be power of 2. Expand to handle other value of D.
 def _rope_fwd(
     x: torch.Tensor,
@@ -89,7 +83,7 @@ def _rope_fwd(
     grid = (b, h, triton.cdiv(s, BLOCK_S))
 
     dev, stream = current_device_stream()
-    _rope_kernel_sbhd_fwd_launch(
+    _rope_kernel_sbhd_fwd(
         dev,
         stream,
         grid,
@@ -162,12 +156,6 @@ def rope_fwd_inplace(
     return out
 
 
-_rope_kernel_sbhd_bwd_launch = make_launcher(
-    _rope_kernel_sbhd_bwd,
-    options={"num_warps": 4, "waves_per_eu": 0},
-)
-
-
 def _rope_bwd(
     x: torch.Tensor,
     out: torch.Tensor,
@@ -202,7 +190,7 @@ def _rope_bwd(
     grid = (b, h, triton.cdiv(s, BLOCK_S))
 
     dev, stream = current_device_stream()
-    _rope_kernel_sbhd_bwd_launch(
+    _rope_kernel_sbhd_bwd(
         dev,
         stream,
         grid,
@@ -251,12 +239,6 @@ def rope_bwd(
     return out
 
 
-_rope_kernel_thd_fwd_launch = make_launcher(
-    _rope_kernel_thd_fwd,
-    options={"num_warps": 4, "waves_per_eu": 0},
-)
-
-
 def _rope_thd_fwd(
     x: torch.Tensor,
     out: torch.Tensor,
@@ -293,7 +275,7 @@ def _rope_thd_fwd(
     grid = (b, h, triton.cdiv(t, BLOCK_T))
 
     dev, stream = current_device_stream()
-    _rope_kernel_thd_fwd_launch(
+    _rope_kernel_thd_fwd(
         dev,
         stream,
         grid,
@@ -370,12 +352,6 @@ def rope_thd_fwd_inplace(
     return out
 
 
-_rope_kernel_thd_bwd_launch = make_launcher(
-    _rope_kernel_thd_bwd,
-    options={"num_warps": 4, "waves_per_eu": 0},
-)
-
-
 def _rope_thd_bwd(
     x: torch.Tensor,
     out: torch.Tensor,
@@ -412,7 +388,7 @@ def _rope_thd_bwd(
     grid = (b, h, triton.cdiv(t, BLOCK_T))
 
     dev, stream = current_device_stream()
-    _rope_kernel_thd_bwd_launch(
+    _rope_kernel_thd_bwd(
         dev,
         stream,
         grid,
@@ -463,12 +439,6 @@ def rope_thd_bwd(
     return out
 
 
-_rope_kernel_sbhd_cached_fwd_launch = make_launcher(
-    _rope_kernel_sbhd_cached_fwd,
-    options={"num_warps": 4, "waves_per_eu": 0},
-)
-
-
 # TODO: For now BLOCK_D is assumed to be power of 2. Expand to handle other value of D.
 def _rope_cached_fwd(
     x: torch.Tensor,
@@ -508,7 +478,7 @@ def _rope_cached_fwd(
 
     pos_stride = positions.stride() if positions is not None else (1, 1)
     dev, stream = current_device_stream()
-    _rope_kernel_sbhd_cached_fwd_launch(
+    _rope_kernel_sbhd_cached_fwd(
         dev,
         stream,
         grid,
@@ -715,12 +685,6 @@ def rope_cached_positions_offsets_fwd_inplace(
     return out
 
 
-_rope_kernel_sbhd_cached_bwd_launch = make_launcher(
-    _rope_kernel_sbhd_cached_bwd,
-    options={"num_warps": 4, "waves_per_eu": 0},
-)
-
-
 def _rope_cached_bwd(
     x: torch.Tensor,
     out: torch.Tensor,
@@ -799,7 +763,7 @@ def _rope_cached_bwd(
 
     pos_stride = positions.stride() if positions is not None else (1, 1)
     dev, stream = current_device_stream()
-    _rope_kernel_sbhd_cached_bwd_launch(
+    _rope_kernel_sbhd_cached_bwd(
         dev,
         stream,
         grid,
@@ -917,12 +881,6 @@ def rope_cached_positions_offsets_bwd(
     )
 
     return out
-
-
-_rope_kernel_cached_thd_2c_gqa_onehead_fwd_launch = make_launcher(
-    _rope_kernel_cached_thd_2c_gqa_onehead_fwd,
-    options={"num_warps": 4, "waves_per_eu": 0},
-)
 
 
 @functools.cache
@@ -1106,7 +1064,7 @@ def _rope_cached_thd_2c_fwd(
             num_warps = 4
             waves_per_eu = 0
             dev, stream = current_device_stream()
-            _rope_kernel_cached_thd_2c_gqa_onehead_fwd_launch(
+            _rope_kernel_cached_thd_2c_gqa_onehead_fwd(
                 dev,
                 stream,
                 grid,
@@ -1273,12 +1231,6 @@ def rope_cached_thd_positions_offsets_2c_fwd_inplace(
     )
 
     return out_x, out_y
-
-
-_rope_kernel_cached_thd_2c_gqa_onehead_bwd_launch = make_launcher(
-    _rope_kernel_cached_thd_2c_gqa_onehead_bwd,
-    options={"num_warps": 4, "waves_per_eu": 0},
-)
 
 
 @functools.cache
@@ -1462,7 +1414,7 @@ def _rope_cached_thd_positions_offsets_2c_bwd(
             num_warps = 4
             waves_per_eu = 0
             dev, stream = current_device_stream()
-            _rope_kernel_cached_thd_2c_gqa_onehead_bwd_launch(
+            _rope_kernel_cached_thd_2c_gqa_onehead_bwd(
                 dev,
                 stream,
                 grid,
@@ -1564,9 +1516,6 @@ def rope_cached_thd_positions_offsets_2c_bwd(
     return out_x, out_y
 
 
-_rope_fwd_2d_kernel_neox_launch = make_launcher(_rope_fwd_2d_kernel_neox)
-
-
 def _rope_fwd_2d(
     x: torch.Tensor,
     out: torch.Tensor,
@@ -1586,7 +1535,7 @@ def _rope_fwd_2d(
 
     grid = (b, h, 1)
     dev, stream = current_device_stream()
-    _rope_fwd_2d_kernel_neox_launch(
+    _rope_fwd_2d_kernel_neox(
         dev,
         stream,
         grid,
@@ -1679,12 +1628,6 @@ def rope_fwd_2d_inplace(
     return out
 
 
-_rope_fwd_3d_launch = make_launcher(
-    _rope_fwd_3d,
-    options={"num_warps": 4, "waves_per_eu": 1},
-)
-
-
 def rope_fwd_3d(
     x,
     grid_sizes: tl.constexpr,
@@ -1710,7 +1653,7 @@ def rope_fwd_3d(
     grid = (B, n_heads, triton.cdiv(s, BLOCK_L))
 
     dev, stream = current_device_stream()
-    _rope_fwd_3d_launch(
+    _rope_fwd_3d(
         dev,
         stream,
         grid,

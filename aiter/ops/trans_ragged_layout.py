@@ -23,6 +23,7 @@ def binary_search(value, arr_ptr, arr_length):
     return left - 1
 
 
+@make_launcher
 @triton.jit
 def _ragged_trans_kernel(
     k_buffer_ptr,
@@ -73,9 +74,6 @@ def _ragged_trans_kernel(
             )
 
 
-_ragged_trans_kernel_launch = make_launcher(_ragged_trans_kernel)
-
-
 def ragged_layout_trans(kv_indptr, kv_indices, k_buffer, v_buffer):
     B = kv_indptr.shape[0] - 1
     H_KV = k_buffer.shape[1]
@@ -94,7 +92,7 @@ def ragged_layout_trans(kv_indptr, kv_indices, k_buffer, v_buffer):
     grid = (token_blocks,)
 
     dev, stream = current_device_stream()
-    _ragged_trans_kernel_launch(
+    _ragged_trans_kernel(
         dev,
         stream,
         grid,

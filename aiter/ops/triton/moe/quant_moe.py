@@ -2,7 +2,6 @@ from enum import Enum
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.moe.quant_moe import (
     _downcast_to_mxfp,
@@ -38,13 +37,6 @@ def downcast_to_static_fp8(x: torch.Tensor, scale: torch.Tensor):
 class DequantScaleRoundingMode(Enum):
     ROUND_UP = 0
     ROUND_DOWN = 1
-
-
-_downcast_to_mxfp_launch = make_launcher(
-    _downcast_to_mxfp,
-    grid_arg=2,
-    options={"num_warps": 8},
-)
 
 
 def downcast_to_mxfp(
@@ -109,7 +101,7 @@ def downcast_to_mxfp(
     grid_quant = triton.cdiv(kernel_src_tensor.shape[1], BLOCK_QUANT_DIM)
 
     dev, stream = current_device_stream()
-    _downcast_to_mxfp_launch(
+    _downcast_to_mxfp(
         dev,
         stream,
         grid_out,
@@ -190,16 +182,6 @@ def dequant_w_blockscale(w, w_scales, group_shape):
     return w
 
 
-_smoothquant_fuse_quant_kernel_single_pass_launch = make_launcher(
-    _smoothquant_fuse_quant_kernel_single_pass,
-    options={"num_warps": 4},
-)
-_smoothquant_fuse_quant_kernel_launch = make_launcher(
-    _smoothquant_fuse_quant_kernel,
-    options={"num_warps": 4},
-)
-
-
 def smoothquant_quantize(
     x: torch.Tensor,
     smooth_scale: torch.Tensor,
@@ -243,7 +225,7 @@ def smoothquant_quantize(
         grid = (triton.cdiv(M, BLOCK_M),)
 
         dev, stream = current_device_stream()
-        _smoothquant_fuse_quant_kernel_single_pass_launch(
+        _smoothquant_fuse_quant_kernel_single_pass(
             dev,
             stream,
             grid,
@@ -265,7 +247,7 @@ def smoothquant_quantize(
         BLOCK_K = 256
         grid = (triton.cdiv(M, BLOCK_M),)
         dev, stream = current_device_stream()
-        _smoothquant_fuse_quant_kernel_launch(
+        _smoothquant_fuse_quant_kernel(
             dev,
             stream,
             grid,

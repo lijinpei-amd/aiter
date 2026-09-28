@@ -5,7 +5,6 @@
 import math
 
 import torch
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.quant.quant_fp8_blockwise import (
     quant_fp8_blockwise_for_weight_kernel,
@@ -54,13 +53,6 @@ def _check_block_fp8(
     ), f"fp8_max must be in (0, {dtype_max}] for {quant_dtype}, got {fp8_max}"
 
 
-_quant_fp8_blockwise_kernel_launch = make_launcher(
-    quant_fp8_blockwise_kernel,
-    dynamic_options=("num_warps",),
-    options={"waves_per_eu": 2, "num_stages": 2},
-)
-
-
 def quant_fp8_blockwise(
     x: torch.Tensor,
     block_size: int = _BLOCK_SIZE,
@@ -105,7 +97,7 @@ def quant_fp8_blockwise(
     grid = (math.ceil(M / block_size), math.ceil(N / block_size))
 
     dev, stream = current_device_stream()
-    _quant_fp8_blockwise_kernel_launch(
+    quant_fp8_blockwise_kernel(
         dev,
         stream,
         grid,
@@ -123,13 +115,6 @@ def quant_fp8_blockwise(
         False,
     )
     return x_fp8, scales
-
-
-_quant_fp8_blockwise_segment_m_kernel_launch = make_launcher(
-    quant_fp8_blockwise_segment_m_kernel,
-    dynamic_options=("num_warps",),
-    options={"waves_per_eu": 2, "num_stages": 2},
-)
 
 
 def quant_fp8_blockwise_segment_m(
@@ -180,7 +165,7 @@ def quant_fp8_blockwise_segment_m(
     grid = (math.ceil(M / block_size) + batch_size, math.ceil(N / block_size))
 
     dev, stream = current_device_stream()
-    _quant_fp8_blockwise_segment_m_kernel_launch(
+    quant_fp8_blockwise_segment_m_kernel(
         dev,
         stream,
         grid,
@@ -196,13 +181,6 @@ def quant_fp8_blockwise_segment_m(
         fp8_max,
     )
     return x_fp8, scales
-
-
-_quant_fp8_blockwise_for_weight_kernel_launch = make_launcher(
-    quant_fp8_blockwise_for_weight_kernel,
-    dynamic_options=("num_warps",),
-    options={"waves_per_eu": 2, "num_stages": 2},
-)
 
 
 def quant_fp8_blockwise_for_weight(
@@ -243,7 +221,7 @@ def quant_fp8_blockwise_for_weight(
     grid = (B, math.ceil(M / block_size), math.ceil(N / block_size))
 
     dev, stream = current_device_stream()
-    _quant_fp8_blockwise_for_weight_kernel_launch(
+    quant_fp8_blockwise_for_weight_kernel(
         dev,
         stream,
         grid,
@@ -298,7 +276,7 @@ def quant_fp8_blockwise_for_act_grad(
     grid = (math.ceil(M / block_size), math.ceil(N / block_size))
 
     dev, stream = current_device_stream()
-    _quant_fp8_blockwise_kernel_launch(
+    quant_fp8_blockwise_kernel(
         dev,
         stream,
         grid,
@@ -316,13 +294,6 @@ def quant_fp8_blockwise_for_act_grad(
         True,
     )
     return x_fp8_row, scales_row, x_fp8_col, scales_col
-
-
-_requant_fp8_row_to_col_kernel_launch = make_launcher(
-    requant_fp8_row_to_col_kernel,
-    dynamic_options=("num_warps",),
-    options={"waves_per_eu": 2, "num_stages": 2},
-)
 
 
 def requant_fp8_row_to_col(
@@ -370,7 +341,7 @@ def requant_fp8_row_to_col(
     grid = (math.ceil(M / block_size), math.ceil(K / block_size))
 
     dev, stream = current_device_stream()
-    _requant_fp8_row_to_col_kernel_launch(
+    requant_fp8_row_to_col_kernel(
         dev,
         stream,
         grid,

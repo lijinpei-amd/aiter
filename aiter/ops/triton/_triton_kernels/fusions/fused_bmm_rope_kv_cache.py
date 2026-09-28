@@ -3,6 +3,7 @@
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 from aiter.ops.triton.rope.rope import _get_gptj_rotated_x_1D, _get_neox_rotated_x_1D
@@ -96,6 +97,14 @@ def _unit_rope(
     return x_pe
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+    )
+)
 @triton.heuristics(
     {
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
@@ -555,6 +564,7 @@ def _fused_fp4_bmm_rope_cat_and_cache_mla_kernel(
                 )
 
 
+@make_launcher
 @triton.jit(repr=_fused_fp4_bmm_reduce_repr)
 def _fused_fp4_bmm_reduce_kernel(
     c_in_ptr,
@@ -619,6 +629,14 @@ def _fused_fp4_bmm_reduce_kernel(
     tl.store(c_out_ptrs, c, mask=c_mask)
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+    )
+)
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,

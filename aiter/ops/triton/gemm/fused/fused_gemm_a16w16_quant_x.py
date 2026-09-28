@@ -21,18 +21,6 @@ _LOGGER = AiterTritonLogger()
 _QUANT_BLOCK_SIZE = 32
 
 
-_fused_gemm_a16w16_quant_x_kernel_launch = make_launcher(
-    _fused_gemm_a16w16_quant_x_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
-
-
 _gemm_splitk_reduce_kernel_launch = make_launcher(_gemm_splitk_reduce_kernel)
 
 
@@ -133,7 +121,7 @@ def fused_gemm_a16w16_quant_x(
         * triton.cdiv(K, config["BLOCK_SIZE_K"]),
     )
     dev, stream = current_device_stream()
-    _fused_gemm_a16w16_quant_x_kernel_launch(
+    _fused_gemm_a16w16_quant_x_kernel(
         dev,
         stream,
         grid,

@@ -3,7 +3,6 @@
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16_atomic import (
@@ -30,18 +29,6 @@ def gemm_a16w16_atomic_fake_tensor(
         _, N = w.shape
         return torch.zeros((M, N), dtype=dtype, device=x.device)
     return y
-
-
-_gemm_a16_w16_atomic_kernel_launch = make_launcher(
-    _gemm_a16_w16_atomic_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
 
 
 @torch_compile_guard(gen_fake=gemm_a16w16_atomic_fake_tensor)
@@ -101,7 +88,7 @@ def gemm_a16w16_atomic_(
     SPLITK_BLOCK_SIZE = triton.cdiv(K, config["NUM_KSPLIT"])
     config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
     dev, stream = current_device_stream()
-    _gemm_a16_w16_atomic_kernel_launch(
+    _gemm_a16_w16_atomic_kernel(
         dev,
         stream,
         grid,

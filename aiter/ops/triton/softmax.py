@@ -1,18 +1,11 @@
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.softmax import _softmax_kernel_online
 from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
-
-
-_softmax_kernel_online_launch = make_launcher(
-    _softmax_kernel_online,
-    options={"num_stages": 2, "num_warps": 8, "waves_per_eu": 2},
-)
 
 
 def softmax(x):
@@ -36,7 +29,7 @@ def softmax(x):
 
     grid = (num_programs,)
     dev, stream = current_device_stream()
-    _softmax_kernel_online_launch(
+    _softmax_kernel_online(
         dev,
         stream,
         grid,

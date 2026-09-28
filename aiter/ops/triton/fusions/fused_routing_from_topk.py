@@ -7,7 +7,6 @@
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.fusions.fused_routing_from_topk import (
     _fused_routing_from_topk_hist_kernel,
@@ -25,23 +24,6 @@ _LOGGER = AiterTritonLogger()
 # back to a multi-kernel reference path for prefill-shaped inputs (NK in
 # the tens of thousands). Decode (num_tokens × top_k) at typical batch
 # sizes is well within this budget.
-
-
-_fused_routing_from_topk_hist_kernel_launch = make_launcher(
-    _fused_routing_from_topk_hist_kernel,
-    grid_arg=1,
-    options={"num_warps": 1},
-)
-_fused_routing_from_topk_offset_kernel_launch = make_launcher(
-    _fused_routing_from_topk_offset_kernel,
-    grid_arg=1,
-    options={"num_warps": 1},
-)
-_fused_routing_from_topk_place_kernel_launch = make_launcher(
-    _fused_routing_from_topk_place_kernel,
-    grid_arg=1,
-    options={"num_warps": 1},
-)
 
 
 def fused_routing_from_topk(
@@ -146,7 +128,7 @@ def fused_routing_from_topk(
     # shared-memory reduction). num_warps=1 keeps the reduction within a
     # single wave, matching the CTA-local design of the original kernel.
     dev, stream = current_device_stream()
-    _fused_routing_from_topk_hist_kernel_launch(
+    _fused_routing_from_topk_hist_kernel(
         dev,
         stream,
         1,
@@ -163,7 +145,7 @@ def fused_routing_from_topk(
 
     # Kernel 2 (Phase B): exclusive prefix-sum hist → offset. The kernel
     # boundary above publishes hist without an explicit barrier.
-    _fused_routing_from_topk_offset_kernel_launch(
+    _fused_routing_from_topk_offset_kernel(
         dev,
         stream,
         1,
@@ -175,7 +157,7 @@ def fused_routing_from_topk(
 
     # Kernel 3 (Phase C): placement. The kernel boundary publishes the
     # prefix-sum offsets without an explicit barrier or atomic_xchg.
-    _fused_routing_from_topk_place_kernel_launch(
+    _fused_routing_from_topk_place_kernel(
         dev,
         stream,
         1,

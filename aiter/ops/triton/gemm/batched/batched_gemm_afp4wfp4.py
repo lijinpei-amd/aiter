@@ -3,7 +3,6 @@
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_afp4wfp4 import (
     _batched_gemm_afp4_wfp4_kernel,
@@ -22,23 +21,6 @@ _USE_GEMM_SPLITK_BF16 = False
 def set_use_gemm_splitk_bf16(value: bool):
     global _USE_GEMM_SPLITK_BF16
     _USE_GEMM_SPLITK_BF16 = value
-
-
-_batched_gemm_afp4_wfp4_reduce_kernel_launch = make_launcher(
-    _batched_gemm_afp4_wfp4_reduce_kernel,
-)
-
-
-_batched_gemm_afp4_wfp4_kernel_launch = make_launcher(
-    _batched_gemm_afp4_wfp4_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
 
 
 def batched_gemm_afp4wfp4(
@@ -111,7 +93,7 @@ def batched_gemm_afp4wfp4(
         ),
     )
     dev, stream = current_device_stream()
-    _batched_gemm_afp4_wfp4_kernel_launch(
+    _batched_gemm_afp4_wfp4_kernel(
         dev,
         stream,
         grid,
@@ -167,7 +149,7 @@ def batched_gemm_afp4wfp4(
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
         dev, stream = current_device_stream()
-        _batched_gemm_afp4_wfp4_reduce_kernel_launch(
+        _batched_gemm_afp4_wfp4_reduce_kernel(
             dev,
             stream,
             grid_reduce,

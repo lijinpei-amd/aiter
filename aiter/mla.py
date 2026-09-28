@@ -1348,6 +1348,7 @@ def mla_prefill_ps_fwd(
     return output.view(total_s, nhead, v_head_dim), final_lse
 
 
+@make_launcher(options={"num_warps": 4})
 @triton.jit
 def _mla_prefill_reduce_kernel(
     # Input tensors
@@ -1485,12 +1486,6 @@ def _mla_prefill_reduce_kernel(
         )
 
 
-_mla_prefill_reduce_kernel_launch = make_launcher(
-    _mla_prefill_reduce_kernel,
-    options={"num_warps": 4},
-)
-
-
 def mla_prefill_reduce_triton(
     partial_output: torch.Tensor,  # [padded_num_tokens * available_tgs, num_head_q, v_head_dim]
     partial_lse: torch.Tensor,  # [padded_num_tokens * available_tgs, num_head_q]
@@ -1537,7 +1532,7 @@ def mla_prefill_reduce_triton(
     grid = (num_reduce_groups, num_heads, tile_q)
 
     dev, stream = current_device_stream()
-    _mla_prefill_reduce_kernel_launch(
+    _mla_prefill_reduce_kernel(
         dev,
         stream,
         grid,

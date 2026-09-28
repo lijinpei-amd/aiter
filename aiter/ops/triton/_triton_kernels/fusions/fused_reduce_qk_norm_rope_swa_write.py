@@ -24,6 +24,7 @@ tail, and optionally scatter both parts into ``swa_kv``.
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.rope.rope import _get_gptj_rotated_x, _get_neox_rotated_x
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
@@ -83,6 +84,12 @@ _fused_reduce_qk_norm_rope_swa_write_repr = make_kernel_repr(
 )
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "waves_per_eu",
+    )
+)
 @triton.jit(repr=_fused_reduce_qk_norm_rope_swa_write_repr)
 def _fused_reduce_qk_norm_rope_swa_write_kernel(
     q_in_ptr,
