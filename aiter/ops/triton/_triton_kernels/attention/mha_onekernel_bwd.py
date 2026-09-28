@@ -5,6 +5,7 @@ import functools
 
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
@@ -544,6 +545,17 @@ _bwd_kernel_causal_repr = make_kernel_repr(
 )
 
 
+# Reads the import-time constant tl_DROPOUT_USE_PYTORCH through its helpers.
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "num_ctas",
+    ),
+    assume_constant_globals=True,
+)
 @triton.jit(repr=_bwd_kernel_causal_repr)
 def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nheads_q)
     Q,
@@ -1264,6 +1276,17 @@ _bwd_kernel_noncausal_repr = make_kernel_repr(
 )
 
 
+# Reads the import-time constant tl_DROPOUT_USE_PYTORCH through its helpers.
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "num_ctas",
+    ),
+    assume_constant_globals=True,
+)
 @triton.jit(repr=_bwd_kernel_noncausal_repr)
 def bwd_kernel_noncausal(
     Q,
