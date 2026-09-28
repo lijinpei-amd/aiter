@@ -15,11 +15,16 @@ def even_m_n(args, block_m, n, block_n, num_iter=None):
 # `def` with exactly one parameter, no free variables, reading it as
 # `a["literal"]` -- a `functools.partial` of `even_m_n` above is refused
 # (`UnsupportedKernel: heuristic 'EVEN_M_N' must be a lambda or def`). These
-# four cover every distinct (block_m, n, block_n, num_iter) combination the
-# Triton kernels in `_triton_kernels/quant/fused_mxfp4_quant.py` pass to
+# cover every distinct (block_m, n, block_n, num_iter) combination the Triton
+# kernels in `_triton_kernels/quant/fused_mxfp4_quant.py` and the gfx1250 Gluon
+# kernels in `_gluon_kernels/gfx1250/quant/fused_mxfp4_quant.py` pass to
 # `even_m_n`.
 def even_m_n1(a):
     return a["M"] % a["BLOCK_SIZE_M"] == 0 and a["N1"] % a["BLOCK_SIZE_N"] == 0
+
+
+def even_m_n1_rows(a):
+    return a["M"] % a["ROWS_PER_CTA"] == 0 and a["N1"] % a["BLOCK_SIZE_N"] == 0
 
 
 def even_m_n2(a):

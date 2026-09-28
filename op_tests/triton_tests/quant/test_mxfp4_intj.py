@@ -182,3 +182,20 @@ def test_partial_heuristics_are_accepted_by_intj(name):
     # free variables). They are now module-level defs reading literal keys;
     # construction must succeed.
     make_launcher(getattr(_kernels, name))
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "_gluon_fused_rms_mxfp4_quant_kernel",
+        "_gluon_fused_reduce_rms_mxfp4_quant_kernel",
+    ],
+)
+def test_gluon_partial_heuristics_are_accepted_by_intj(name):
+    # The gfx1250 Gluon kernels got the same module-level defs; the lazy
+    # launcher analyzes their heuristics at construction, without a gfx1250 GPU.
+    from aiter.ops.triton._gluon_kernels.gfx1250.quant import (
+        fused_mxfp4_quant as gluon_kernels,
+    )
+
+    make_launcher(getattr(gluon_kernels, name))
