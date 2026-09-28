@@ -183,10 +183,16 @@ def test_new_heuristics_match_old_partial_style():
                             args, block_m="ROWS_PER_CTA", n="N1", block_n="BLOCK_SIZE_N"
                         )
                         assert even_m_n2(args) == even_m_n(
-                            args, block_m="BLOCK_SIZE_M", n="N2", block_n="BLOCK_SIZE_N2"
+                            args,
+                            block_m="BLOCK_SIZE_M",
+                            n="N2",
+                            block_n="BLOCK_SIZE_N2",
                         )
                         assert even_m_n3(args) == even_m_n(
-                            args, block_m="BLOCK_SIZE_M", n="N3", block_n="BLOCK_SIZE_N3"
+                            args,
+                            block_m="BLOCK_SIZE_M",
+                            n="N3",
+                            block_n="BLOCK_SIZE_N3",
                         )
                         assert even_m_n1_iter(args) == even_m_n(
                             args,
