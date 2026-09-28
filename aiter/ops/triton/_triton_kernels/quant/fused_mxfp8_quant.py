@@ -3,6 +3,7 @@
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp8_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
@@ -29,6 +30,7 @@ _fused_rms_mxfp8_repr = make_kernel_repr(
 )
 
 
+@make_launcher(grid_arg=1)
 @triton.jit(repr=_fused_rms_mxfp8_repr)
 def _fused_rms_mxfp8_kernel(
     x_ptr,
@@ -126,6 +128,7 @@ _fused_dual_rmsnorm_mxfp8_quant_repr = make_kernel_repr(
 )
 
 
+@make_launcher(grid_arg=1)
 @triton.jit(repr=_fused_dual_rmsnorm_mxfp8_quant_repr)
 def _fused_dual_rmsnorm_mxfp8_quant_kernel(
     q_ptr,
@@ -238,6 +241,7 @@ _fused_flatten_mxfp8_quant_repr = make_kernel_repr(
 )
 
 
+@make_launcher(grid_arg=2)
 @triton.jit(repr=_fused_flatten_mxfp8_quant_repr)
 def _fused_flatten_mxfp8_quant_kernel(
     x_ptr,

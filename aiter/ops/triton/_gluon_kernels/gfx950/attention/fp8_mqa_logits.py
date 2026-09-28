@@ -1,4 +1,5 @@
 import triton.language as tl
+from intj import make_launcher
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.language.core import _aggregate as aggregate
@@ -889,6 +890,7 @@ _gluon_fp8_mqa_logits_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("num_warps", "waves_per_eu"))
 @gluon.jit(repr=_gluon_fp8_mqa_logits_kernel_repr)
 def _gluon_fp8_mqa_logits_kernel(
     Q_ptr,  # fp8e4m3 [seq_len, NUM_HEADS, HEAD_SIZE]

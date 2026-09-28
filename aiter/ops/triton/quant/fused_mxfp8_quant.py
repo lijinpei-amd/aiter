@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from functools import cache
-
 import torch
 import triton
 
@@ -19,16 +17,6 @@ __all__ = [
 ]
 
 _QUANT_BLOCK_SIZE = 32
-
-
-@cache
-def _intj_launcher(kernel, device: int, grid_dims: int):
-    from intj import make_launcher
-
-    with torch.cuda.device(device):
-        return make_launcher(
-            kernel, grid_arg=grid_dims, bind_device=True
-        ).bind_device(device)
 
 
 def fused_rms_mxfp8_quant(
@@ -65,7 +53,8 @@ def fused_rms_mxfp8_quant(
 
     NUM_PRGMS = M
     with torch.cuda.device(x.device):
-        _intj_launcher(_fused_rms_mxfp8_kernel, x.get_device(), 1)(
+        _fused_rms_mxfp8_kernel(
+            x.get_device(),
             torch.cuda.current_stream().cuda_stream,
             NUM_PRGMS,
             x,
@@ -146,7 +135,8 @@ def fused_dual_rmsnorm_mxfp8_quant(
 
     NUM_PRGMS = M
     with torch.cuda.device(q.device):
-        _intj_launcher(_fused_dual_rmsnorm_mxfp8_quant_kernel, q.get_device(), 1)(
+        _fused_dual_rmsnorm_mxfp8_quant_kernel(
+            q.get_device(),
             torch.cuda.current_stream().cuda_stream,
             NUM_PRGMS,
             q,
@@ -216,7 +206,8 @@ def fused_flatten_mxfp8_quant(
     )
 
     with torch.cuda.device(x.device):
-        _intj_launcher(_fused_flatten_mxfp8_quant_kernel, x.get_device(), 2)(
+        _fused_flatten_mxfp8_quant_kernel(
+            x.get_device(),
             torch.cuda.current_stream().cuda_stream,
             M,
             N1,

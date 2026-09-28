@@ -8,10 +8,12 @@ in-register, no cross-wave communication) into ``out[g, :N]``, with optional
 external residual fold-in.
 """
 
+from intj import make_launcher
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 
+@make_launcher(dynamic_options=("num_warps",))
 @gluon.jit
 def reduce_grouped_gluon(
     X,  # [B, M, N] (flattened to [B*M, N] in the descriptor)

@@ -10,10 +10,20 @@ all-decode, HEAD_SIZE_PADDED % 32 == 0, num_query_heads % NUM_WARPS == 0, and
 small NUM_SEGMENTS (else the wrapper falls back to Triton).
 """
 
+from intj import make_launcher
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    )
+)
 @gluon.jit
 def reduce_segments_gluon(
     output_ptr,  # [num_tokens, num_query_heads, head_size]

@@ -3,6 +3,7 @@
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -11,6 +12,7 @@ _transpose_2d_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(grid_arg=1, options={"num_warps": 1, "waves_per_eu": 2, "num_stages": 2})
 @triton.jit(repr=_transpose_2d_kernel_repr)
 def _transpose_2d_kernel(
     IN_ptr,

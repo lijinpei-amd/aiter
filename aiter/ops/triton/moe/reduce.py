@@ -1,9 +1,7 @@
-import functools
 from dataclasses import dataclass
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.moe.reduce import (
     _reduce_grouped,
@@ -145,12 +143,6 @@ def validate_reduce_out(out, shape, dtype, device):
     return out
 
 
-@functools.cache
-def _reduce_grouped_gluon_launch():
-    # Built on first use: the Gluon kernel is None when its import fails.
-    return make_launcher(_reduce_grouped_gluon, dynamic_options=("num_warps",))
-
-
 def reduce_grouped(
     x: torch.Tensor,
     indx: torch.Tensor,
@@ -223,7 +215,7 @@ def reduce_grouped(
             )
         gluon_num_warps = _reduce_grouped_gluon_num_warps(npad)
         dev, stream = current_device_stream()
-        _reduce_grouped_gluon_launch()(
+        _reduce_grouped_gluon(
             dev,
             stream,
             (num_groups,),

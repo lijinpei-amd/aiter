@@ -1,9 +1,7 @@
-import functools
 import inspect
 
 import torch
 import triton
-from intj import make_launcher
 from packaging.version import Version
 
 from aiter.ops.triton._triton_kernels.attention.fp8_mqa_logits import (
@@ -95,15 +93,6 @@ def _gfx942_tile_fits_lds(
     # If a future Triton spills Q or scores to LDS, re-add a `q + kv + scores <= 64 KB` upper-bound term here to avoid re-triggering the JIT abort.
     lds_bytes = occupancy * num_stages * block_kv * head_size
     return lds_bytes <= 0.9 * _GFX942_CU_LDS_BYTES
-
-
-@functools.cache
-def _gluon_fp8_mqa_logits_kernel_launch():
-    # Built on first use: the Gluon kernel is None when its import fails.
-    # The gfx950 and gfx1250 kernels share the name, not the signature.
-    return make_launcher(
-        _gluon_fp8_mqa_logits_kernel, dynamic_options=("num_warps", "waves_per_eu")
-    )
 
 
 def fp8_mqa_logits(
@@ -317,7 +306,7 @@ def fp8_mqa_logits(
 
         dev, stream = current_device_stream()
         if arch == "gfx950":
-            _gluon_fp8_mqa_logits_kernel_launch()(
+            _gluon_fp8_mqa_logits_kernel(
                 dev,
                 stream,
                 grid,
@@ -360,7 +349,7 @@ def fp8_mqa_logits(
             )
         else:
             # gfx1250: a different kernel signature (LOOP_VARIANT, no split-K)
-            _gluon_fp8_mqa_logits_kernel_launch()(
+            _gluon_fp8_mqa_logits_kernel(
                 dev,
                 stream,
                 grid,

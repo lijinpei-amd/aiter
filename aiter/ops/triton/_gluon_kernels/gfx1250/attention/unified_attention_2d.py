@@ -1,6 +1,7 @@
 import torch
 import triton.experimental.gluon.language as gl
 import triton.language as tl
+from intj import make_launcher
 from triton.experimental import gluon
 from triton.language.core import _aggregate as aggregate
 
@@ -1838,6 +1839,7 @@ unified_attention_gluon_kernel_2d_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("num_warps", "waves_per_eu"))
 @gluon.jit(repr=unified_attention_gluon_kernel_2d_repr)
 def _unified_attention_gluon_kernel_2d(
     query_ptr,  # [num_tokens, num_query_heads, head_size]
