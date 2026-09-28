@@ -394,7 +394,7 @@ def gemm_afp4wfp4_(
             grid_reduce,
             y_pp,
             y,
-            None,
+            None,  # bias_ptr
             M,
             N,
             y_pp.stride(0),
@@ -608,7 +608,7 @@ def gemm_afp4wfp4_preshuffled_scales(
             grid_reduce,
             y_pp,
             y,
-            None,
+            None,  # bias_ptr
             M,
             N,
             y_pp.stride(0),
@@ -890,7 +890,7 @@ def gemm_afp4wfp4_preshuffle(
             grid_reduce,
             y_pp,
             y,
-            None,
+            None,  # bias_ptr
             M,
             N,
             y_pp.stride(0),

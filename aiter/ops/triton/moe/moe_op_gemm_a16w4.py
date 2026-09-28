@@ -425,7 +425,7 @@ def moe_gemm_a16w4(
             config["block_k"],
             config["group_m"],
             config["xcd_swizzle"],
-            2,
+            2,  # NUM_BUFFERS
             swizzle_mx_scale,
             K % config["block_k"] == 0,
             config["split_k"],

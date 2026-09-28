@@ -166,7 +166,7 @@ def gemm_a8wfp4(
         config["GROUP_SIZE_M"],
         config["NUM_KSPLIT"],
         config["SPLITK_BLOCK_SIZE"],
-        True,
+        True,  # RAW_MASKED_LOADS
         config["cache_modifier"],
     )
 
@@ -189,7 +189,7 @@ def gemm_a8wfp4(
             grid_reduce,
             y_pp,
             y,
-            None,
+            None,  # bias_ptr
             M,
             N,
             y_pp.stride(0),

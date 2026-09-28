@@ -158,7 +158,7 @@ def fused_gdn_gating_vllm(
         num_heads,
         beta,
         threshold,
-        8,
+        8,  # BLK_HEADS
     )
     return g, beta_output
 

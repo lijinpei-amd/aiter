@@ -360,7 +360,7 @@ def fused_clamp_act_mul(
             shuffle_scale,
             scale_n_pad,
             num_warps,
-            ".cg",
+            ".cg",  # cache_modifier
         )
     else:
         # only for triton

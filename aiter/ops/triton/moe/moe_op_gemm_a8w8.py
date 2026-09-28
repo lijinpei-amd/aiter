@@ -302,7 +302,7 @@ def moe_gemm_a8w8(
         config["split_k"],
         config["w_cache_modifier"],
         should_upcast_indices(x, w, y),
-        False,
+        False,  # USE_FNUZ
     )
     # Build grouped reduction inputs in a uniform way
     group_indx = (

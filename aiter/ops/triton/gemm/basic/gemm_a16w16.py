@@ -329,7 +329,7 @@ def gemm_a16w16_(
                     bias is not None,
                     _get_activation_from_str(activation) if activation else "",
                     activation is not None,
-                    "_gemm_a16w16_persistent_reduce_kernel",
+                    "_gemm_a16w16_persistent_reduce_kernel",  # KERNEL_NAME
                 )
 
             return y
@@ -384,7 +384,7 @@ def gemm_a16w16_(
             _get_activation_from_str(activation) if activation else "",
             activation is not None,
             bias is not None,
-            False,
+            False,  # SKIP_REDUCE
             NUM_WGS,
             config.get("num_stages", 0),
             config.get("waves_per_eu", 0),
@@ -620,7 +620,7 @@ def gemm_a16w16_(
             bias is not None,
             _get_activation_from_str(activation) if activation else "",
             activation is not None,
-            "_gemm_a16w16_reduce_kernel",
+            "_gemm_a16w16_reduce_kernel",  # KERNEL_NAME
         )
 
     return y

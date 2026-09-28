@@ -678,7 +678,7 @@ def _reduce_segments_triton(
         params.head_size,
         head_size_padded,
         params.cu_seqlens_q,
-        None,
+        None,  # BLOCK_Q
         NUM_SEGMENTS,
         config.get("FP8_MIN", -240.0),
         config.get("FP8_MAX", 240.0),

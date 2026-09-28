@@ -237,7 +237,7 @@ def smoothquant_quantize(
             x_int8.stride(0),
             x_int8.stride(1),
             x_scale,
-            1,
+            1,  # stride_row_scale
             M,
             K,
             BLOCK_M,
@@ -259,7 +259,7 @@ def smoothquant_quantize(
             x_int8.stride(0),
             x_int8.stride(1),
             x_scale,
-            1,
+            1,  # stride_row_scale
             M,
             K,
             BLOCK_M,

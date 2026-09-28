@@ -198,7 +198,7 @@ def fused_gemm_a16w16_quant_x(
             bias is not None,
             _get_activation_from_str(activation) if activation else "",
             activation is not None,
-            "_fused_gemm_a16w16_quant_x_reduce_kernel",
+            "_fused_gemm_a16w16_quant_x_reduce_kernel",  # KERNEL_NAME
         )
 
     return y, x_quant, x_scales

@@ -148,14 +148,14 @@ def moe_gemm_mxfp8(
         w_scale_kn.stride(1),
         w_scale_kn.stride(2),
         # static scales (not used)
-        None,
-        None,
-        None,
+        None,  # X_static_scale
+        None,  # W_static_scale
+        None,  # Quant_static_scale
         # bias
         bias,
         bias_stride,
         # Gammas (not used)
-        None,
+        None,  # Gammas
         # shapes
         N,
         K,
@@ -170,7 +170,7 @@ def moe_gemm_mxfp8(
         grid_n,
         # fused ops (disabled)
         False,  # APPLY_SWIGLU
-        None,
+        None,  # alpha
         None,  # alpha, limit
         1,  # ACTIVATION_REDUCTION_N
         False,  # SWIGLU_ADD_RESIDUAL

@@ -118,8 +118,8 @@ def convert_to_mxfp8(
         y.stride(1),
         s.stride(0),
         s.stride(1),
-        0,
-        0,
+        0,  # philox_seed
+        0,  # philox_offset
         block_m,
         block_n,
         quant_block_size,

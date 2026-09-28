@@ -367,20 +367,20 @@ def fav3_sage_mxfp4_func(
         stride_lse_z,
         stride_lse_h,
         stride_lse_m,
-        None,
-        None,
+        None,  # cu_seqlens_q
+        None,  # cu_seqlens_k
         kv_block_indices,
         lut_start,
         lut_count,
-        "e2m1",
-        "e2m1",
+        "e2m1",  # Q_DTYPE_STR
+        "e2m1",  # K_DTYPE_STR
         nheads_q,
         nheads_k,
         head_size_qk,
         head_size_v,
         seqlen_q,
         seqlen_k,
-        False,
+        False,  # IS_VARLEN
         causal,
         config["BLOCK_M"],
         padded_d_qk,

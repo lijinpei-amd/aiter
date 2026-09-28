@@ -36,7 +36,7 @@ def run_profile(fn: Callable, n_run: int = 250):
     _split_dummy_launch(
         dev,
         stream,
-        128,
+        128,  # grid0
         d,
     )
     di.synchronize()

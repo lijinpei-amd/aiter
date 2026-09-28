@@ -343,20 +343,20 @@ def fused_rms_fp8_group_quant(
         inp2 is not None,
         res1 is not None,
         output_unquantized_inp1,
-        False,
-        512,
-        1,
-        1,
-        1,
-        1,
-        False,
-        False,
-        False,
+        False,  # GATED_RMS_FP8
+        512,  # RMS_TILE
+        1,  # ROWS_PER_BLOCK
+        1,  # GROUP_SIZE_GATED
+        1,  # NUM_GROUPS_GATED
+        1,  # BLOCK_G
+        False,  # HAS_BIAS_GATED
+        False,  # HAS_Z_GATED
+        False,  # NORM_BEFORE_GATE
         -DTYPE_MAX,
         DTYPE_MAX,
-        False,
-        1.0,
-        "silu",
+        False,  # USE_UE8M0
+        1.0,  # FP8_MIN_SCALING_FACTOR
+        "silu",  # ACTIVATION
     )
     # When transpose_scale=True, re-present the [num_bs_cols, M] column-major
     # buffer the kernel wrote as (M, num_bs_cols). Both branches return the same
@@ -495,26 +495,26 @@ def fused_rms_gated_fp8_group_quant(
         dummy,
         dummy,
         eps,
-        0.0,
+        0.0,  # eps2
         M,
         N,
-        0,
+        0,  # inp2_n_cols
         x.stride(0),
-        1,
+        1,  # inp2_row_stride
         x.stride(1),
-        1,
-        1,
-        1,
+        1,  # inp2_col_stride
+        1,  # res1_row_stride
+        1,  # res1_col_stride
         x_quant.stride(0),
         x_quant.stride(1),
         stride_s_row,
         stride_s_g,
-        1,
-        1,
-        1,
-        1,
-        1,
-        1,
+        1,  # out2_row_stride
+        1,  # out2_col_stride
+        1,  # out_res1_row_stride
+        1,  # out_res1_col_stride
+        1,  # out1_row_stride
+        1,  # out1_col_stride
         z,
         bias_ptr,
         z.stride(0),
@@ -522,17 +522,17 @@ def fused_rms_gated_fp8_group_quant(
         effective_gs,
         fp8_max,
         -fp8_max,
-        False,
-        False,
-        False,
-        True,
+        False,  # HAVE_SECOND_INPUT
+        False,  # FIRST_INPUT_RES
+        False,  # FIRST_INPUT_OUT
+        True,  # GATED_RMS_FP8
         rms_tile,
         rows_per_block,
         effective_gs,
         num_groups,
         block_g,
         bias is not None,
-        True,
+        True,  # HAS_Z_GATED
         norm_before_gate,
         fp8_min,
         fp8_max,

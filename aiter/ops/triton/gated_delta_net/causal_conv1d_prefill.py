@@ -317,7 +317,7 @@ def causal_conv1d_split_qkv_triton_tile_fn(
         bias is not None,
         width,
         activation in ["silu", "swish"],
-        False,
+        False,  # IS_APC_ENABLED
         pad_slot_id is not None,
         np2_statelen,
         BLOCK_M,

@@ -194,6 +194,6 @@ def fused_reduce_qk_norm_rope_swa_write(
         num_splitk,
         HAS_SWA,
         is_neox,
-        True,
+        True,  # REUSE_FREQS_FRONT_PART
     )
     return q_out

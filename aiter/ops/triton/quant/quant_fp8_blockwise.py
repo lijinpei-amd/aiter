@@ -112,7 +112,7 @@ def quant_fp8_blockwise(
         block_size,
         fp8_max,
         axis,
-        False,
+        False,  # DUAL
     )
     return x_fp8, scales
 
@@ -290,8 +290,8 @@ def quant_fp8_blockwise_for_act_grad(
         N,
         block_size,
         fp8_max,
-        1,
-        True,
+        1,  # AXIS
+        True,  # DUAL
     )
     return x_fp8_row, scales_row, x_fp8_col, scales_col
 

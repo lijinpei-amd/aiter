@@ -122,7 +122,7 @@ def act_mul_and_mxfp4_quant(
         NUM_ITER,
         NUM_STAGES,
         MXFP4_QUANT_BLOCK_SIZE,
-        0,
+        0,  # SCALING_MODE
         activation,
         scaleN_valid,
         scaleM if use_scale_shuffle_padding else 1,

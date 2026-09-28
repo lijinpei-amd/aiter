@@ -186,7 +186,7 @@ def gemm_a16w8_blockscale(
             grid_reduce,
             y_pp,
             y,
-            None,
+            None,  # bias_ptr
             M,
             N,
             y_pp.stride(0),
@@ -366,7 +366,7 @@ def gemm_a16w8_blockscale_preshuffle(
             grid_reduce,
             y_pp,
             y,
-            None,
+            None,  # bias_ptr
             M,
             N,
             y_pp.stride(0),

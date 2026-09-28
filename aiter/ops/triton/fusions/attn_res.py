@@ -658,18 +658,18 @@ def _run_packed(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm):
         *bl_arg,
         triton.next_power_of_2(D),
         has_onorm,
-        False,
-        False,
-        True,
-        False,
-        False,
-        False,
-        False,
-        False,
-        True,
-        False,
-        1.0,
-        False,
+        False,  # SAVE_OPRE
+        False,  # SAVE_STATS
+        True,  # IS_PACKED
+        False,  # HAS_PREFIX
+        False,  # DO_ADD
+        False,  # DO_ADD2
+        False,  # WRITE_PREF
+        False,  # WRITE_BLOCK_CAT
+        True,  # HAS_W
+        False,  # QUANT_FP8
+        1.0,  # FP8_MAX
+        False,  # SEPARATE
     )
     return o.view(output_shape)
 

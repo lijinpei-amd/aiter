@@ -426,7 +426,7 @@ def fused_reduce_act_mul_and_mxfp4_quant(
         NUM_ITER,
         NUM_STAGES,
         MXFP4_QUANT_BLOCK_SIZE,
-        0,
+        0,  # SCALING_MODE
         _get_activation_from_str(activation) if activation else "",
         scaleN_valid,
         scaleM if use_scale_shuffle_padding else 1,

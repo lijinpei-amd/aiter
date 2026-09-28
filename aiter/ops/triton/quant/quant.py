@@ -358,7 +358,7 @@ def dynamic_mxfp4_quant(
         NUM_ITER,
         NUM_STAGES,
         MXFP4_QUANT_BLOCK_SIZE,
-        0,
+        0,  # SCALING_MODE
         use_sr,
         NUM_WARPS,
     )

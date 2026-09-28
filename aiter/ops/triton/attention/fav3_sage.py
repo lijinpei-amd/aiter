@@ -565,8 +565,8 @@ def fav3_sage_func(
         stride_vsh,
         softmax_lse,
         out,
-        None,
-        None,
+        None,  # SD_MASK
+        None,  # ALIBI_SLOPES
         stride_qb,
         stride_qh,
         stride_qm,
@@ -587,26 +587,26 @@ def fav3_sage_func(
         stride_bh,
         stride_bm,
         stride_bn,
-        0,
+        0,  # stride_az
         0,  # stride_az, stride_ah
-        0,
-        0,
-        0,
+        0,  # stride_sz
+        0,  # stride_sh
+        0,  # stride_sm
         0,  # stride_sz, stride_sh, stride_sm, stride_sn
         stride_lse_z,
         stride_lse_h,
         stride_lse_m,
-        None,
-        None,
-        None,
-        None,
+        None,  # cu_seqlens_q
+        None,  # cu_seqlens_k
+        None,  # seqused_q
+        None,  # seqused_k
         kv_block_indices,
         lut_start,
         lut_count,
         num_q_blocks,
-        0.0,
-        None,
-        None,
+        0.0,  # dropout_p
+        None,  # philox_seed
+        None,  # philox_offset_base
         return_lse,
         nheads_q,
         nheads_k,
@@ -614,7 +614,7 @@ def fav3_sage_func(
         head_size_v,
         seqlen_q,
         seqlen_k,
-        False,
+        False,  # IS_VARLEN
         causal,
         use_sliding_window,
         window_size_left,
@@ -625,11 +625,11 @@ def fav3_sage_func(
         config["BLOCK_N"],
         config["PRE_LOAD_V"],
         USE_BIAS,
-        False,
-        False,
-        False,
-        True,
-        False,
+        False,  # ENABLE_DROPOUT
+        False,  # RETURN_SCORES
+        False,  # USE_ALIBI
+        True,  # USE_EXP2
+        False,  # USE_SEQUSED
         use_block_sparse,
     )
 

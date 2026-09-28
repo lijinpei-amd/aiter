@@ -172,7 +172,7 @@ def _quantize_per_tensor(
     mha_v4_per_tensor_scale_kernel(
         dev,
         stream,
-        1,
+        1,  # grid0
         partial,
         scale,
         blocks,

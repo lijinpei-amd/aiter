@@ -184,11 +184,11 @@ def gather_kv_b_proj(
             padded_k,
             padded_v,
             scale_k if not no_scale and not per_row_scale else 1,
-            True,
+            True,  # IS_FP4
             fp4_scale_k_granularity,
             weight_preshuffle,
-            False,
-            False,
+            False,  # PER_ROW_SCALE
+            False,  # NO_SCALE
             shuffled_kv_cache,
         )
         return
@@ -219,9 +219,9 @@ def gather_kv_b_proj(
         ChunkK,
         padded_k,
         padded_v,
-        1,
-        False,
-        32,
+        1,  # ScaleCols
+        False,  # IS_FP4
+        32,  # Fp4ScaleKGranularity
         weight_preshuffle,
         per_row_scale,
         no_scale,

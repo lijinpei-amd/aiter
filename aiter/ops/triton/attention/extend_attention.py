@@ -177,7 +177,7 @@ def extend_attention_fwd(
         USE_CUSTOM_MASK,
         is_causal,
         SKIP_PREFIX_CUSTOM_MASK,
-        True,
+        True,  # STORE_TRANSPOSE
         head_num,
         num_blocks,
         get_num_xcds(),

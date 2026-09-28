@@ -197,7 +197,7 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
             dev,
             stream,
             grid_reduce,
-            4,
+            4,  # num_warps
             dg_tmp,
             dgamma,
             dg_tmp.stride(0),

@@ -131,7 +131,7 @@ def fused_routing_from_topk(
     _fused_routing_from_topk_hist_kernel(
         dev,
         stream,
-        1,
+        1,  # grid0
         topk_ids_flat,
         expert_map_flat,
         expert_map_numel,
@@ -148,7 +148,7 @@ def fused_routing_from_topk(
     _fused_routing_from_topk_offset_kernel(
         dev,
         stream,
-        1,
+        1,  # grid0
         hist,
         offset_scratch,
         n_expts_tot,  # E
@@ -160,7 +160,7 @@ def fused_routing_from_topk(
     _fused_routing_from_topk_place_kernel(
         dev,
         stream,
-        1,
+        1,  # grid0
         topk_ids_flat,
         topk_weights_flat,
         expert_map_flat,

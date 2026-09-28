@@ -1675,8 +1675,8 @@ def rope_fwd_3d(
         sp_rank,
         freqs.shape[0],
         s,
-        1.0,
-        0.0,
+        1.0,  # pad_freq_val_r
+        0.0,  # pad_freq_val_i
         BLOCK_L,
         BLOCK_N,
         BLOCK_C,

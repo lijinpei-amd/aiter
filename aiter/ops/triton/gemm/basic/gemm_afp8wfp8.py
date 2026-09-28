@@ -234,7 +234,7 @@ def gemm_afp8wfp8(
             grid_reduce,
             y_pp,
             y,
-            None,
+            None,  # bias_ptr
             M,
             N,
             y_pp.stride(0),
@@ -553,7 +553,7 @@ def gemm_afp8wfp8_preshuffle(
             grid_reduce,
             y_pp,
             y,
-            None,
+            None,  # bias_ptr
             M,
             N,
             y_pp.stride(0),
