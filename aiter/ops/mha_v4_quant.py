@@ -5,7 +5,6 @@
 
 import torch
 import triton
-from intj import make_launcher
 from torch import Tensor
 
 from aiter import dtypes
@@ -466,13 +465,6 @@ def _quantize_mxfp6_k_raw_fake(input: Tensor) -> tuple[Tensor, Tensor]:
     )
 
 
-_sage_quant_v_kernel_launch = make_launcher(
-    sage_quant_v_kernel,
-    grid_arg=1,
-    options={"num_stages": 3, "num_warps": 8},
-)
-
-
 @torch.library.custom_op("aiter::mha_v4_quantize_v_fp8", mutates_args=())
 def quantize_v_fp8(input: Tensor) -> tuple[Tensor, Tensor]:
     """Quantize hd128 BSHD V to FP8 with one FP32 scale per channel."""
@@ -518,7 +510,7 @@ def quantize_v_fp8(input: Tensor) -> tuple[Tensor, Tensor]:
     block_k = 64
     blocks = triton.cdiv(sequence, block_k)
     quantized = torch.empty_like(input, dtype=dtypes.fp8)
-    _sage_quant_v_kernel_launch(
+    sage_quant_v_kernel(
         dev,
         stream,
         batch * heads * blocks,

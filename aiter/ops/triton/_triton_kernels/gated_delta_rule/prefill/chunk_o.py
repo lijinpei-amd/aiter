@@ -69,6 +69,12 @@ def _bp_st2d(base, R, C, rs, cs, r0, c0, val, BR: tl.constexpr, BC: tl.constexpr
     )
 
 
+def _chunk_fwd_kernel_o_grid(V: int, BV: int, H: int, *, NT: int, B: int):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (triton.cdiv(V, BV), NT, B * H)
+
+
+@make_launcher(grid_cpp=_chunk_fwd_kernel_o_grid)
 @triton.heuristics(
     {
         "USE_G": lambda args: args["g"] is not None,
@@ -185,17 +191,6 @@ def chunk_fwd_kernel_o(
         BT,
         BV,
     )
-
-
-def _chunk_fwd_kernel_o_grid(V: int, BV: int, H: int, *, NT: int, B: int):
-    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
-    return (triton.cdiv(V, BV), NT, B * H)
-
-
-_chunk_fwd_kernel_o_launch = make_launcher(
-    chunk_fwd_kernel_o,
-    grid_cpp=_chunk_fwd_kernel_o_grid,
-)
 
 
 @make_launcher
@@ -621,7 +616,7 @@ def chunk_fwd_o(
     o = torch.empty_like(v)
 
     dev, stream = current_device_stream()
-    _chunk_fwd_kernel_o_launch(
+    chunk_fwd_kernel_o(
         dev,
         stream,
         NT,  # grid

@@ -163,6 +163,7 @@ def chunk_scaled_dot_kkt_fwd(
     return A
 
 
+@make_launcher(grid_arg=2)
 @triton.heuristics(
     {
         "USE_G": lambda args: args["g"] is not None,
@@ -271,9 +272,6 @@ def recompute_w_u_fwd_kernel(
         )
 
 
-_recompute_w_u_fwd_kernel_launch = make_launcher(recompute_w_u_fwd_kernel, grid_arg=2)
-
-
 def recompute_w_u_fwd(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -310,7 +308,7 @@ def recompute_w_u_fwd(
     w = torch.empty_like(k)
     u = torch.empty_like(v)
     dev, stream = current_device_stream()
-    _recompute_w_u_fwd_kernel_launch(
+    recompute_w_u_fwd_kernel(
         dev,
         stream,
         NT,

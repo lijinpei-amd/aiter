@@ -4,7 +4,6 @@
 import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.attention.mha_onekernel_bwd import (
     _bwd_preprocess,
@@ -25,9 +24,6 @@ DROPOUT_DUMP = False
 
 tl_DROPOUT_USE_PYTORCH: tl.constexpr = triton.language.constexpr(DROPOUT_USE_PYTORCH)
 tl_DROPOUT_DUMP: tl.constexpr = triton.language.constexpr(DROPOUT_DUMP)
-
-
-_bwd_preprocess_launch = make_launcher(_bwd_preprocess)
 
 
 def flash_attn_onekernel_backward(
@@ -227,7 +223,7 @@ def flash_attn_onekernel_backward(
         num_q_heads,
     )
     dev, stream = current_device_stream()
-    _bwd_preprocess_launch(
+    _bwd_preprocess(
         dev,
         stream,
         pre_grid,

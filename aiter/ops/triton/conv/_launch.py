@@ -3,7 +3,6 @@
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.conv.conv_1x1 import (
     _conv2d_1x1_kernel,
@@ -118,18 +117,6 @@ def _launch_nchw_to_cblocked(x, x_blocked, N, C, H, W, C_pad, block_c):
     )
 
 
-_conv2d_1x1_kernel_launch = make_launcher(
-    _conv2d_1x1_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
-
-
 def _launch_1x1(
     x,
     w_oihw,
@@ -179,7 +166,7 @@ def _launch_1x1(
     )
 
     dev, stream = current_device_stream()
-    _conv2d_1x1_kernel_launch(
+    _conv2d_1x1_kernel(
         dev,
         stream,
         _mn_grid(M_total, K_out, config),
@@ -212,18 +199,6 @@ def _launch_1x1(
         _kernel_activation(activation),
         layout,
     )
-
-
-_conv2d_3x3_nhwc_kernel_launch = make_launcher(
-    _conv2d_3x3_nhwc_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
 
 
 def _launch_3x3_nhwc(
@@ -272,7 +247,7 @@ def _launch_3x3_nhwc(
     )
 
     dev, stream = current_device_stream()
-    _conv2d_3x3_nhwc_kernel_launch(
+    _conv2d_3x3_nhwc_kernel(
         dev,
         stream,
         _mn_grid(M_total, K_out, config),
@@ -307,18 +282,6 @@ def _launch_3x3_nhwc(
         bias_fp32 is not None,
         _kernel_activation(activation),
     )
-
-
-_conv2d_3x3_cblocked_kernel_launch = make_launcher(
-    _conv2d_3x3_cblocked_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
 
 
 def _launch_3x3_cblocked(
@@ -368,7 +331,7 @@ def _launch_3x3_cblocked(
     )
 
     dev, stream = current_device_stream()
-    _conv2d_3x3_cblocked_kernel_launch(
+    _conv2d_3x3_cblocked_kernel(
         dev,
         stream,
         _mn_grid(M_total, K_out, config),
@@ -404,18 +367,6 @@ def _launch_3x3_cblocked(
         bias_fp32 is not None,
         _kernel_activation(activation),
     )
-
-
-_conv2d_3x3_nchw_kernel_launch = make_launcher(
-    _conv2d_3x3_nchw_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
 
 
 def _launch_3x3_nchw(
@@ -460,7 +411,7 @@ def _launch_3x3_nchw(
     row_aligned = "BLOCK_M" in config and Q % config["BLOCK_M"] == 0
 
     dev, stream = current_device_stream()
-    _conv2d_3x3_nchw_kernel_launch(
+    _conv2d_3x3_nchw_kernel(
         dev,
         stream,
         _mn_grid(M_total, K_out, config),
@@ -496,18 +447,6 @@ def _launch_3x3_nchw(
         _kernel_activation(activation),
         row_aligned,
     )
-
-
-_conv2d_general_kernel_launch = make_launcher(
-    _conv2d_general_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
 
 
 def _launch_general(
@@ -563,7 +502,7 @@ def _launch_general(
     )
 
     dev, stream = current_device_stream()
-    _conv2d_general_kernel_launch(
+    _conv2d_general_kernel(
         dev,
         stream,
         _mn_grid(M_total, K_out, config),

@@ -3,7 +3,6 @@
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.attention.mha_fused_bwd import (
     _bwd_kernel_dkdvdq_causal,
@@ -16,9 +15,6 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import _is_fp8
 
 _LOGGER = AiterTritonLogger()
-
-
-_bwd_preprocess_launch = make_launcher(_bwd_preprocess)
 
 
 def flash_attn_fused_backward(
@@ -186,7 +182,7 @@ def flash_attn_fused_backward(
     )
 
     dev, stream = current_device_stream()
-    _bwd_preprocess_launch(
+    _bwd_preprocess(
         dev,
         stream,
         pre_grid,

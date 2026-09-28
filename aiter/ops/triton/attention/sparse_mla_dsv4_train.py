@@ -6,7 +6,6 @@
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.attention.sparse_mla_dsv4_train import (
     _FWD_FALLBACK,
@@ -64,15 +63,6 @@ def _build_inverted_topk(indices, num_kv):
 # =====================================================================
 
 
-_sparse_mla_fwd_kernel_launch = make_launcher(
-    _sparse_mla_fwd_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-    ),
-)
-
-
 def sparse_mla_fwd(q, kv, attn_sink, indices, scale=None):
     N, H, D = q.shape
     N_kv = kv.shape[0]
@@ -98,7 +88,7 @@ def sparse_mla_fwd(q, kv, attn_sink, indices, scale=None):
     grid = (N, triton.cdiv(H, BLOCK_H_fwd))
 
     dev, stream = current_device_stream()
-    _sparse_mla_fwd_kernel_launch(
+    _sparse_mla_fwd_kernel(
         dev,
         stream,
         grid,

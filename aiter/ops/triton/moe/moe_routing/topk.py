@@ -1,6 +1,5 @@
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.moe.moe_routing.topk import (
     _grouped_topk,
@@ -169,9 +168,6 @@ def grouped_topk(
     return y_vals, y_indx, bitmatrix
 
 
-_topk_launch = make_launcher(_topk, options={"num_warps": 8})
-
-
 def topk(
     x,
     k,
@@ -263,7 +259,7 @@ def topk(
     sp_blocks = triton.cdiv(sp_size, BLOCK_SP)
     pids = max(triton.cdiv(n_rows, BLOCK_M), s_blocks + sp_blocks)
     dev, stream = current_device_stream()
-    _topk_launch(
+    _topk(
         dev,
         stream,
         (pids,),

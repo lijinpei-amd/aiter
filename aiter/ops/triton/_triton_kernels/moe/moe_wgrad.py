@@ -9,6 +9,7 @@ using sorted token infrastructure from moe_align_block_size.
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
 from aiter.ops.triton.utils.tuned_config_utils import (
@@ -57,6 +58,14 @@ _MOE_WGRAD_FALLBACK_CONFIG = triton.Config(
 )
 
 
+def _moe_wgrad_kernel_grid(
+    N: int, BLOCK_SIZE_N: int, K: int, BLOCK_SIZE_K: int, *, gx: int
+):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (gx, triton.cdiv(N, BLOCK_SIZE_N) * triton.cdiv(K, BLOCK_SIZE_K))
+
+
+@make_launcher(grid_cpp=_moe_wgrad_kernel_grid)
 @triton.autotune(
     configs=autotune_configs(
         "MOE_WGRAD",

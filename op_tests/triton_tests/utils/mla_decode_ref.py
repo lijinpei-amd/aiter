@@ -46,6 +46,7 @@ def tanh(x):
     return 2 * tl.sigmoid(2 * x) - 1
 
 
+@make_launcher(dynamic_options=("num_warps",), options={"num_stages": 2})
 @triton.jit
 def _fwd_kernel_stage1(
     Q,
@@ -170,11 +171,6 @@ def _fwd_kernel_stage1(
         )
 
 
-_fwd_kernel_stage1_launch = make_launcher(
-    _fwd_kernel_stage1, dynamic_options=("num_warps",), options={"num_stages": 2}
-)
-
-
 def _decode_att_m_fwd(
     q,
     k_buffer,
@@ -210,7 +206,7 @@ def _decode_att_m_fwd(
     BLOCK_DV = triton.next_power_of_2(Lv)
 
     dev, stream = current_device_stream()
-    _fwd_kernel_stage1_launch(
+    _fwd_kernel_stage1(
         dev,
         stream,
         grid,

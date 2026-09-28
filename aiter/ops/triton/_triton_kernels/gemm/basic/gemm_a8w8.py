@@ -3,6 +3,7 @@
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
@@ -29,6 +30,15 @@ _gemm_a8w8_repr = make_kernel_repr(
 )
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 @triton.heuristics(
     {
         "EVEN_K": lambda args: (args["K"] % args["BLOCK_SIZE_K"] == 0)

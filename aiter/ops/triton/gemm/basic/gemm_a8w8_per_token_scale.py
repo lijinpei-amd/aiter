@@ -3,7 +3,6 @@
 
 import torch
 import triton
-from intj import Constexpr, make_launcher
 
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
@@ -13,14 +12,6 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_per_token_scale impor
     _get_config,
 )
 from aiter.ops.triton.utils.device_info import current_device_stream
-
-_gemm_splitk_reduce_kernel_launch = make_launcher(
-    _gemm_splitk_reduce_kernel,
-    extra_annotation={
-        "KERNEL_NAME": Constexpr(value="_gemm_a8w8_per_token_scale_reduce_kernel"),
-        "activation": Constexpr(value=""),
-    },
-)
 
 
 def gemm_a8w8_per_token_scale(
@@ -134,7 +125,7 @@ def gemm_a8w8_per_token_scale(
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
         dev, stream = current_device_stream()
-        _gemm_splitk_reduce_kernel_launch(
+        _gemm_splitk_reduce_kernel(
             dev,
             stream,
             grid_reduce,
@@ -153,7 +144,9 @@ def gemm_a8w8_per_token_scale(
             ACTUAL_KSPLIT,
             triton.next_power_of_2(config["NUM_KSPLIT"]),
             False,  # ADD_BIAS
+            "",  # activation
             False,  # use_activation
+            "_gemm_a8w8_per_token_scale_reduce_kernel",  # KERNEL_NAME
         )
 
     return y

@@ -3,7 +3,6 @@
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
@@ -19,9 +18,6 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 _LOGGER = AiterTritonLogger()
 
 _QUANT_BLOCK_SIZE = 32
-
-
-_gemm_splitk_reduce_kernel_launch = make_launcher(_gemm_splitk_reduce_kernel)
 
 
 def fused_gemm_a16w16_quant_x(
@@ -177,7 +173,7 @@ def fused_gemm_a16w16_quant_x(
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
         dev, stream = current_device_stream()
-        _gemm_splitk_reduce_kernel_launch(
+        _gemm_splitk_reduce_kernel(
             dev,
             stream,
             grid_reduce,

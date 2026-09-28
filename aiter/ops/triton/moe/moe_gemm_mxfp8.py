@@ -18,7 +18,6 @@ interface is converted to the ExptData routing format internally.
 
 import torch
 import triton
-from intj import Constexpr, make_launcher
 
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w8 import _moe_gemm_a8w8
 from aiter.ops.triton.moe.moe_utils import group_sizes_to_expt_tensors
@@ -32,13 +31,6 @@ _LOGGER = AiterTritonLogger()
 
 # Tile values must come from configs/<arch>/triton/moe/mxfp8_fnuz/DEFAULT.json.
 _MXFP8_FALLBACK = triton.Config({}, num_warps=4, num_stages=1)
-
-
-_moe_gemm_a8w8_launch = make_launcher(
-    _moe_gemm_a8w8,
-    grid_arg=1,
-    extra_annotation={"W_CACHE_MODIFIER": Constexpr(value="")},
-)
 
 
 def moe_gemm_mxfp8(
@@ -120,10 +112,15 @@ def moe_gemm_mxfp8(
     bias_stride = N if bias is not None else 0
 
     dev, stream = current_device_stream()
-    _moe_gemm_a8w8_launch(
+    _moe_gemm_a8w8(
         dev,
         stream,
-        grid_m * grid_n,
+        (grid_m * grid_n,),
+        4,  # num_warps (Triton's defaults)
+        2,  # num_stages
+        0,  # waves_per_eu
+        0,  # matrix_instr_nonkdim
+        1,  # kpack
         # output
         out,
         out.stride(0),  # stride_y_k  (SPLIT_K=1, unused)
@@ -185,6 +182,7 @@ def moe_gemm_mxfp8(
         K % BLOCK_K == 0,  # EVEN_K
         K % BLOCK_K or BLOCK_K,  # MASK_K_LIMIT: remainder size of last K block
         1,  # SPLIT_K
+        "",  # W_CACHE_MODIFIER
         False,  # UPCAST_INDICES
         True,  # USE_FNUZ — fnuz FP8 (float8_e4m3fnuz) path
     )

@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import functools
 
 import torch
 import triton
-from intj import Constexpr, make_launcher
 
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
@@ -25,46 +23,18 @@ from aiter.ops.triton.utils.types import (
 
 _LOGGER = AiterTritonLogger()
 
-_GLUON_SUPPORTED_ARCHS = ("gfx950",)
-
-
-_gemm_splitk_reduce_kernel_launch = make_launcher(
-    _gemm_splitk_reduce_kernel,
-    extra_annotation={
-        "KERNEL_NAME": Constexpr(value="_gemm_a8w8_reduce_kernel"),
-        "activation": Constexpr(value=""),
-    },
-)
-
-
-_gemm_a8w8_kernel_launch = make_launcher(
-    _gemm_a8w8_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
-
-
-@functools.cache
-def _gluon_gemm_a8w8_kernel_launch():
+try:  # gfx950 Gluon kernels; unavailable on Triton builds without Gluon.
     from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a8w8 import (
         _gemm_a8w8_kernel as _gluon_gemm_a8w8_kernel,
     )
-
-    return make_launcher(
-        _gluon_gemm_a8w8_kernel,
-        dynamic_options=(
-            "num_warps",
-            "num_stages",
-            "waves_per_eu",
-            "matrix_instr_nonkdim",
-            "kpack",
-        ),
+    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a8w8 import (
+        _gemm_a8w8_preshuffled_kernel as _gluon_gemm_a8w8_preshuffled_kernel,
     )
+except ImportError:
+    _gluon_gemm_a8w8_kernel = None
+    _gluon_gemm_a8w8_preshuffled_kernel = None
+
+_GLUON_SUPPORTED_ARCHS = ("gfx950",)
 
 
 def gemm_a8w8(
@@ -154,7 +124,7 @@ def gemm_a8w8(
             * triton.cdiv(N, config["BLOCK_SIZE_N"]),
         )
         dev, stream = current_device_stream()
-        _gluon_gemm_a8w8_kernel_launch()(
+        _gluon_gemm_a8w8_kernel(
             dev,
             stream,
             grid,
@@ -206,7 +176,7 @@ def gemm_a8w8(
         ),
     )
     dev, stream = current_device_stream()
-    _gemm_a8w8_kernel_launch(
+    _gemm_a8w8_kernel(
         dev,
         stream,
         grid,
@@ -254,7 +224,7 @@ def gemm_a8w8(
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
         dev, stream = current_device_stream()
-        _gemm_splitk_reduce_kernel_launch(
+        _gemm_splitk_reduce_kernel(
             dev,
             stream,
             grid_reduce,
@@ -273,28 +243,12 @@ def gemm_a8w8(
             ACTUAL_KSPLIT,
             triton.next_power_of_2(config["NUM_KSPLIT"]),  # MAX_KSPLIT
             bias is not None,  # ADD_BIAS
+            "",  # activation
             False,  # use_activation
+            "_gemm_a8w8_reduce_kernel",  # KERNEL_NAME
         )
 
     return y
-
-
-@functools.cache
-def _gluon_gemm_a8w8_preshuffled_kernel_launch():
-    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a8w8 import (
-        _gemm_a8w8_preshuffled_kernel as _gluon_gemm_a8w8_preshuffled_kernel,
-    )
-
-    return make_launcher(
-        _gluon_gemm_a8w8_preshuffled_kernel,
-        dynamic_options=(
-            "num_warps",
-            "num_stages",
-            "waves_per_eu",
-            "matrix_instr_nonkdim",
-            "kpack",
-        ),
-    )
 
 
 def gemm_a8w8_preshuffle(
@@ -361,7 +315,7 @@ def gemm_a8w8_preshuffle(
         triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),
     )
     dev, stream = current_device_stream()
-    _gluon_gemm_a8w8_preshuffled_kernel_launch()(
+    _gluon_gemm_a8w8_preshuffled_kernel(
         dev,
         stream,
         grid,

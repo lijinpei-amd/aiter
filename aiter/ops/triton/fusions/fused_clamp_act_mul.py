@@ -94,11 +94,6 @@ def _fused_clamp_silu_mul_gluon_kernel_launch(num_warps):
     )
 
 
-_fused_clamp_silu_mul_kernel_launch = make_launcher(
-    _fused_clamp_silu_mul_kernel, dynamic_options=("num_warps",)
-)
-
-
 def fused_clamp_act_mul(
     inp: torch.Tensor,
     out: torch.Tensor | None = None,
@@ -367,7 +362,7 @@ def fused_clamp_act_mul(
         num_warps = _get_config(M, n_half, BLOCK_SIZE_N, "triton")["num_warps"]
 
         dev, stream = current_device_stream()
-        _fused_clamp_silu_mul_kernel_launch(
+        _fused_clamp_silu_mul_kernel(
             dev,
             stream,
             (M,),

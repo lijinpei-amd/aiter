@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
@@ -275,6 +276,12 @@ _sparse_attn_prefill_kernel_repr = make_kernel_repr(
 )
 
 
+def _sparse_attn_prefill_kernel_grid(num_heads: int, BLOCK_H: int, *, num_queries: int):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (num_queries, triton.cdiv(num_heads, BLOCK_H))
+
+
+@make_launcher(grid_cpp=_sparse_attn_prefill_kernel_grid)
 @triton.autotune(
     configs=autotune_configs("SPARSE_ATTENTION_DSV4", _get_prefill_autotune_configs()),
     key=["num_heads", "head_dim", "HAS_ATTN_SINK"],

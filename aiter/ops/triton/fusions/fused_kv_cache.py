@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import functools
 import os
 
 import torch
@@ -28,26 +27,12 @@ except:  # noqa: E722
     gluon_fused_qk_rope_cat_and_cache_mla_kernel = None
     gluon_fused_qk_rope_reshape_and_cache_kernel = None
 
-from intj import make_launcher
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import e4m3_dtype
-
-_triton_cat_and_cache_mla_launch = make_launcher(
-    triton_fused_qk_rope_cat_and_cache_mla_kernel, options={"num_warps": 1}
-)
-
-
-@functools.cache
-def _gluon_cat_and_cache_mla_launch():
-    # The Gluon kernel is None when its gfx1250 module fails to import.
-    return make_launcher(
-        gluon_fused_qk_rope_cat_and_cache_mla_kernel, options={"num_warps": 1}
-    )
-
 
 _LOGGER = AiterTritonLogger()
 
@@ -288,9 +273,9 @@ def fused_qk_rope_cat_and_cache_mla(
     n_pid = b * qh + (b_slot - b) * kh
     grid = (n_pid, 1, 1)
     if DEVICE_ARCH == "gfx1250":
-        _kernel = _gluon_cat_and_cache_mla_launch()
+        _kernel = gluon_fused_qk_rope_cat_and_cache_mla_kernel
     else:
-        _kernel = _triton_cat_and_cache_mla_launch
+        _kernel = triton_fused_qk_rope_cat_and_cache_mla_kernel
 
     dev, stream = current_device_stream()
     _kernel(
@@ -346,18 +331,6 @@ def fused_qk_rope_cat_and_cache_mla(
     )
 
     return q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out
-
-
-@functools.cache
-def _gluon_fused_qk_rope_reshape_and_cache_kernel_launch():
-    return make_launcher(
-        gluon_fused_qk_rope_reshape_and_cache_kernel, options={"num_warps": 1}
-    )
-
-
-_triton_fused_qk_rope_reshape_and_cache_kernel_launch = make_launcher(
-    triton_fused_qk_rope_reshape_and_cache_kernel, options={"num_warps": 1}
-)
 
 
 def fused_qk_rope_reshape_and_cache(
@@ -603,7 +576,7 @@ def fused_qk_rope_reshape_and_cache(
     grid = (n_pid, 1, 1)
     if use_gluon:
         dev, stream = current_device_stream()
-        _gluon_fused_qk_rope_reshape_and_cache_kernel_launch()(
+        gluon_fused_qk_rope_reshape_and_cache_kernel(
             dev,
             stream,
             grid,
@@ -667,7 +640,7 @@ def fused_qk_rope_reshape_and_cache(
         )
     else:
         dev, stream = current_device_stream()
-        _triton_fused_qk_rope_reshape_and_cache_kernel_launch(
+        triton_fused_qk_rope_reshape_and_cache_kernel(
             dev,
             stream,
             grid,

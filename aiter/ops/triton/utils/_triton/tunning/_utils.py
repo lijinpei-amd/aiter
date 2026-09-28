@@ -10,15 +10,13 @@ from triton.testing import runtime
 from aiter.ops.triton.utils.device_info import current_device_stream
 
 
+@make_launcher(grid_arg=1)
 @triton.jit
 def split_dummy(d_ptr):
     pid = tl.program_id(axis=0)
     x = tl.load(d_ptr + pid)
     x = x + 1
     tl.store(d_ptr + pid, x)
-
-
-_split_dummy_launch = make_launcher(split_dummy, grid_arg=1)
 
 
 def run_profile(fn: Callable, n_run: int = 250):
@@ -33,7 +31,7 @@ def run_profile(fn: Callable, n_run: int = 250):
     cache.zero_()
     di.synchronize()
     dev, stream = current_device_stream()
-    _split_dummy_launch(
+    split_dummy(
         dev,
         stream,
         128,  # grid0

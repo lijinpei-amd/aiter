@@ -27,7 +27,6 @@ import copy
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.attention.mla_decode_rope import (
     _fwd_grouped_kernel_stage1_rope,
@@ -128,18 +127,6 @@ def _decode_grouped_att_m_fwd_rope(
     )
 
 
-_fwd_kernel_stage2_launch = make_launcher(
-    _fwd_kernel_stage2,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
-
-
 def _decode_softmax_reducev_fwd(
     logits,
     q,
@@ -157,7 +144,7 @@ def _decode_softmax_reducev_fwd(
 
     grid = (batch * head_num,)
     dev, stream = current_device_stream()
-    _fwd_kernel_stage2_launch(
+    _fwd_kernel_stage2(
         dev,
         stream,
         grid,

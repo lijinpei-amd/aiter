@@ -3,7 +3,6 @@ from dataclasses import dataclass, field
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.moe.moe_routing.routing import (
     _combined_routing,
@@ -86,13 +85,6 @@ class RoutingData:
 # --------------------------
 
 
-_combined_routing_launch = make_launcher(
-    _combined_routing,
-    grid_arg=1,
-    options={"num_warps": 1},
-)
-
-
 def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M):
     cdiv = triton.cdiv
 
@@ -124,7 +116,7 @@ def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOC
     indx_offs = partial_hist
 
     dev, stream = current_device_stream()
-    _combined_routing_launch(
+    _combined_routing(
         dev,
         stream,
         blocks1a + blocks1b,

@@ -70,9 +70,6 @@ def gemm_a16w16_fake_tensor(
     return torch.empty((M, N), dtype=dtype, device=x.device)
 
 
-_gemm_splitk_reduce_kernel_launch = make_launcher(_gemm_splitk_reduce_kernel)
-
-
 @functools.cache
 def _triton_persistent_kernel_launch(num_stages, waves_per_eu):
     return make_launcher(
@@ -100,15 +97,6 @@ def _gluon_persistent_kernel_launch(kernel_type, num_warps, num_stages, waves_pe
             "waves_per_eu": waves_per_eu,
         },
     )
-
-
-@functools.cache
-def _gluon_kernel_launch(kernel_type):
-    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
-        _KERNEL_MAP,
-    )
-
-    return make_launcher(_KERNEL_MAP[kernel_type], dynamic_options=("num_warps",))
 
 
 @torch_compile_guard(gen_fake=gemm_a16w16_fake_tensor)
@@ -330,7 +318,7 @@ def gemm_a16w16_(
                     triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
                 )
                 dev, stream = current_device_stream()
-                _gemm_splitk_reduce_kernel_launch(
+                _gemm_splitk_reduce_kernel(
                     dev,
                     stream,
                     grid_reduce,
@@ -505,7 +493,7 @@ def gemm_a16w16_(
         )
 
         dev, stream = current_device_stream()
-        _gluon_kernel_launch(kernel_type)(
+        _KERNEL_MAP[kernel_type](
             dev,
             stream,
             grid,
@@ -613,7 +601,7 @@ def gemm_a16w16_(
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
         dev, stream = current_device_stream()
-        _gemm_splitk_reduce_kernel_launch(
+        _gemm_splitk_reduce_kernel(
             dev,
             stream,
             grid_reduce,

@@ -376,6 +376,9 @@ def chunk_delta_attn_fwd_kernel_intra_sub_chunk(
     tl.store(p_Akk, b_Ai.to(Akk.dtype.element_ty), mask=m_Akk_st)
 
 
+@make_launcher(
+    extra_annotation={"DOT_PRECISION": Constexpr(value=SOLVE_TRIL_DOT_PRECISION.value)},
+)
 @triton.heuristics(
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
@@ -697,12 +700,6 @@ def chunk_delta_attn_fwd_kernel_inter_solve_fused(
         tl.store(p_Akk33, b_Ai33.to(Akk.dtype.element_ty), mask=m_A3)
 
 
-_chunk_delta_attn_fwd_kernel_inter_solve_fused_launch = make_launcher(
-    chunk_delta_attn_fwd_kernel_inter_solve_fused,
-    extra_annotation={"DOT_PRECISION": Constexpr(value=SOLVE_TRIL_DOT_PRECISION.value)},
-)
-
-
 @input_guard
 def chunk_delta_attn_fwd_intra(
     q: torch.Tensor,
@@ -777,7 +774,7 @@ def chunk_delta_attn_fwd_intra(
 
     grid = (NT, B * HV)
     dev, stream = current_device_stream()
-    _chunk_delta_attn_fwd_kernel_inter_solve_fused_launch(
+    chunk_delta_attn_fwd_kernel_inter_solve_fused(
         dev,
         stream,
         grid,

@@ -36,6 +36,7 @@ _layernorm_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(grid_arg=1)
 @triton.jit(repr=_layernorm_kernel_repr)
 def _layernorm_kernel(
     # Pointers to matrices
@@ -148,6 +149,7 @@ _fused_add_layernorm_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(grid_arg=1)
 @triton.jit(repr=_fused_add_layernorm_kernel_repr)
 def _fused_add_layernorm_kernel(
     # Pointers to matrices

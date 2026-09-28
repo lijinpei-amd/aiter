@@ -265,18 +265,6 @@ def mxfp4_quant(
     return dynamic_mxfp4_quant(x, x_fp4=x_fp4, blockscale_e8m0=x_scale)
 
 
-_moe_gemm_a4w4_launch = make_launcher(
-    _moe_gemm_a4w4,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
-
-
 @functools.cache
 def _moe_gemm_a4w4_decode_launch(num_warps):
     return make_launcher(_moe_gemm_a4w4_decode, options={"num_warps": num_warps})
@@ -675,7 +663,7 @@ def moe_gemm_a4w4(
     else:
         # launch triton kernel
         dev, stream = current_device_stream()
-        _moe_gemm_a4w4_launch(
+        _moe_gemm_a4w4(
             dev,
             stream,
             (grid,),

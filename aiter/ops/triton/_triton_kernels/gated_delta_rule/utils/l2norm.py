@@ -37,6 +37,7 @@ _L2NORM_FWD_BT = 32
 _L2NORM_FWD_NUM_WARPS = 4
 
 
+@make_launcher(grid_arg=1)
 @triton.jit
 def l2norm_fwd_kernel1(
     X,
@@ -66,9 +67,6 @@ def l2norm_fwd_kernel1(
     tl.store(Y + cols, b_y.to(Y.dtype.element_ty), mask=mask)
     if STORE_RSTD:
         tl.store(Rstd + i_t, b_rstd)
-
-
-_l2norm_fwd_kernel1_launch = make_launcher(l2norm_fwd_kernel1, grid_arg=1)
 
 
 @make_launcher(grid_arg=1)
@@ -104,6 +102,7 @@ def l2norm_bwd_kernel1(
     tl.store(dx + cols, b_dx, mask=mask)
 
 
+@make_launcher(grid_arg=1, options={"num_warps": _L2NORM_FWD_NUM_WARPS})
 @triton.jit
 def l2norm_fwd_kernel(
     X,
@@ -143,13 +142,6 @@ def l2norm_fwd_kernel(
     if STORE_RSTD:
         row1d = xoffset + tl.arange(0, BT)
         tl.store(Rstd + row1d, rstd, mask=row1d < T)
-
-
-_l2norm_fwd_kernel_launch = make_launcher(
-    l2norm_fwd_kernel,
-    grid_arg=1,
-    options={"num_warps": _L2NORM_FWD_NUM_WARPS},
-)
 
 
 def _l2norm_bwd_kernel_grid(T: int, BT: int):
@@ -273,7 +265,7 @@ def l2norm_fwd(
     if D <= 512:
         BT = _L2NORM_FWD_BT
         dev, stream = current_device_stream()
-        _l2norm_fwd_kernel_launch(
+        l2norm_fwd_kernel(
             dev,
             stream,
             triton.cdiv(T, BT),
@@ -289,7 +281,7 @@ def l2norm_fwd(
         )
     else:
         dev, stream = current_device_stream()
-        _l2norm_fwd_kernel1_launch(
+        l2norm_fwd_kernel1(
             dev,
             stream,
             T,

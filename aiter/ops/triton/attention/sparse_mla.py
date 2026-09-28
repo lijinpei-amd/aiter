@@ -5,11 +5,11 @@ import math
 
 import torch
 
-from aiter.ops.triton.attention.pa_decode_sparse import (
-    _as_int32_contiguous_1d,
-    _sparse_mla_gfx950_launch,
-    _sparse_mla_reduce_gfx950_launch,
+from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla import (
+    _sparse_mla,
+    _sparse_mla_reduce,
 )
+from aiter.ops.triton.attention.pa_decode_sparse import _as_int32_contiguous_1d
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import max_addressable_bytes
 from aiter.ops.triton.utils.device_info import current_device_stream, get_num_sms
@@ -601,7 +601,7 @@ def sparse_mla_fwd(
     q_cache = ".cg" if num_splits == 1 else ""
     grid = (num_queries, num_splits, heads_blocks)
     dev, stream = current_device_stream()
-    _sparse_mla_gfx950_launch(
+    _sparse_mla(
         dev,
         stream,
         grid,
@@ -685,7 +685,7 @@ def sparse_mla_fwd(
 
     # One head per reduce workgroup
     rgrid = (num_queries, num_heads)
-    _sparse_mla_reduce_gfx950_launch(
+    _sparse_mla_reduce(
         dev,
         stream,
         rgrid,

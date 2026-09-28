@@ -267,6 +267,7 @@ _fused_qk_rope_cat_and_cache_mla_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(options={"num_warps": 1})
 @triton.jit(repr=_fused_qk_rope_cat_and_cache_mla_kernel_repr)
 def _fused_qk_rope_cat_and_cache_mla_kernel(
     q_nope_ptr,
@@ -644,6 +645,7 @@ _fused_qk_rope_reshape_and_cache_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(options={"num_warps": 1})
 @triton.jit(repr=_fused_qk_rope_reshape_and_cache_kernel_repr)
 def _fused_qk_rope_reshape_and_cache_kernel(
     q_ptr,

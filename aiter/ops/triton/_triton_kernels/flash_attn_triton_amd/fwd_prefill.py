@@ -920,6 +920,12 @@ def compute_block_masking(
         )
 
 
+def _attn_fwd_grid(BLOCK_M: int, *, nheads_q: int, max_seqlens_q: int, batch: int):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (nheads_q, triton.cdiv(max_seqlens_q, BLOCK_M), batch)
+
+
+@make_launcher(grid_cpp=_attn_fwd_grid)
 @triton.autotune(
     configs=fwd_prefill_autotune_configs,
     key=FWD_PREFILL_AUTOTUNE_KEYS,
@@ -1474,14 +1480,6 @@ def attn_fwd(
     tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=o_ptrs_mask)
 
 
-def _attn_fwd_grid(BLOCK_M: int, *, nheads_q: int, max_seqlens_q: int, batch: int):
-    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
-    return (nheads_q, triton.cdiv(max_seqlens_q, BLOCK_M), batch)
-
-
-_attn_fwd_launch = make_launcher(attn_fwd, grid_cpp=_attn_fwd_grid)
-
-
 def attention_forward_prefill_triton_impl(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1885,7 +1883,7 @@ def attention_forward_prefill_triton_impl(
     # launch kernel
 
     dev, stream = current_device_stream()
-    _attn_fwd_launch(
+    attn_fwd(
         dev,
         stream,
         nheads_q,  # grid

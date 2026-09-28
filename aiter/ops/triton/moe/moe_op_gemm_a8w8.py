@@ -5,7 +5,6 @@ import itertools
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w8 import (
     _moe_gemm_a8w8,
@@ -132,18 +131,6 @@ def get_kernel_config(m, n, k, routing_data, swizzle_mx_scale=None):
 # -----------------------------------------------------------------------------
 
 
-_moe_gemm_a8w8_launch = make_launcher(
-    _moe_gemm_a8w8,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
-
-
 def moe_gemm_a8w8(
     x,
     w,
@@ -243,7 +230,7 @@ def moe_gemm_a8w8(
     grid = grid_m * grid_n * config["split_k"]
     # launch kernel
     dev, stream = current_device_stream()
-    _moe_gemm_a8w8_launch(
+    _moe_gemm_a8w8(
         dev,
         stream,
         (grid,),

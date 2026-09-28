@@ -33,6 +33,7 @@ generation, so the tags here carry the generation instead:
 """
 
 import triton.language as tl
+from intj import make_launcher
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.language.core import _aggregate as aggregate
@@ -1668,6 +1669,12 @@ _sparse_mla_repr = make_kernel_repr(
 )
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "waves_per_eu",
+    ),
+)
 @gluon.jit(repr=_sparse_mla_repr)
 def _sparse_mla(
     # Shapes below: C = queries, H = num_heads, S = HEAD_SIZE (the V width),
@@ -2200,6 +2207,7 @@ _sparse_mla_reduce_repr = make_kernel_repr(
 )
 
 
+@make_launcher(options={"num_warps": 1})
 @gluon.jit(repr=_sparse_mla_reduce_repr)
 def _sparse_mla_reduce(
     part_m_ptr,

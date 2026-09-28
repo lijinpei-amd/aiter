@@ -534,20 +534,15 @@ def test_triton_route_matches_reference(case):
         assert rel_err(ht, ht_ref) < 2e-2
 
 
-def test_reference_inter_solve_launches_through_intj(monkeypatch):
+def test_reference_inter_solve_launches_through_intj():
     from aiter.ops.triton._triton_kernels.chunk_delta_attn import intra_attn
 
+    # The kernel is decorated with its intj launcher, so the reference path
+    # has no Triton JIT function left to launch through.
+    target = intra_attn.chunk_delta_attn_fwd_kernel_inter_solve_fused
+    assert type(target.__self__).__name__ == "Launcher"
     args = make_inputs(1, 128, 4)
     want, _ = run_reference(*args)
-    target = intra_attn.chunk_delta_attn_fwd_kernel_inter_solve_fused
-    original = type(target).__getitem__
-
-    def refuse_old_dispatch(self, grid):
-        if self is target:
-            raise AssertionError("inter solve used Triton's indexed launcher")
-        return original(self, grid)
-
-    monkeypatch.setattr(type(target), "__getitem__", refuse_old_dispatch)
     got, _ = run_reference(*args)
     assert torch.equal(got, want)
 

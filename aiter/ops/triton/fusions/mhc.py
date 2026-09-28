@@ -4,7 +4,6 @@
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.fusions import (
     _mhc_asymmetric_sinkhorn_kernel,
@@ -56,42 +55,6 @@ def _validate_dot_config(config: dict, *, name: str) -> None:
             raise ValueError(f"{name} BLOCK_C must be a positive power of two")
     if config.get("NUM_KSPLIT", 1) < 1:
         raise ValueError(f"{name} NUM_KSPLIT must be >= 1")
-
-
-_mhc_fused_split_kernel_launch = make_launcher(
-    _mhc_fused_split_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
-
-
-_mhc_reduce_apply_kernel_launch = make_launcher(
-    _mhc_reduce_apply_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
-
-
-_mhc_fused_kernel_launch = make_launcher(
-    _mhc_fused_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
 
 
 def mhc(
@@ -301,7 +264,7 @@ def mhc(
 
         grid_split = (triton.cdiv(M, BLOCK_M), num_ksplit)
         dev, stream = current_device_stream()
-        _mhc_fused_split_kernel_launch(
+        _mhc_fused_split_kernel(
             dev,
             stream,
             grid_split,
@@ -336,7 +299,7 @@ def mhc(
 
         grid_reduce_apply = (triton.cdiv(M, BLOCK_M), triton.cdiv(C, BLOCK_C))
         dev, stream = current_device_stream()
-        _mhc_reduce_apply_kernel_launch(
+        _mhc_reduce_apply_kernel(
             dev,
             stream,
             grid_reduce_apply,
@@ -386,7 +349,7 @@ def mhc(
     else:
         grid = (triton.cdiv(M, BLOCK_M), total_n_blocks)
         dev, stream = current_device_stream()
-        _mhc_fused_kernel_launch(
+        _mhc_fused_kernel(
             dev,
             stream,
             grid,
@@ -434,18 +397,6 @@ def mhc(
     h_post = out[:, :n].unsqueeze(-1)  # (M, n, 1)
     h_res = out[:, n:].view(M, n, n)  # (M, n, n)
     return h_post, h_res, layer_input
-
-
-_mhc_post_kernel_launch = make_launcher(
-    _mhc_post_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
 
 
 def mhc_post(
@@ -553,7 +504,7 @@ def mhc_post(
 
     grid = (triton.cdiv(M, BLOCK_M),)
     dev, stream = current_device_stream()
-    _mhc_post_kernel_launch(
+    _mhc_post_kernel(
         dev,
         stream,
         grid,
@@ -588,30 +539,6 @@ def mhc_post(
     )
 
     return out
-
-
-_mhc_post_pre_split_kernel_launch = make_launcher(
-    _mhc_post_pre_split_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
-
-
-_mhc_post_pre_reduce_apply_kernel_launch = make_launcher(
-    _mhc_post_pre_reduce_apply_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
 
 
 def mhc_post_pre(
@@ -864,7 +791,7 @@ def mhc_post_pre(
     # --- Launch 1: fused post + partial pre GEMM/sqrsum, one CTA per (M-tile, C-tile).
     grid_split = (triton.cdiv(M, BLOCK_M), NUM_KSPLIT)
     dev, stream = current_device_stream()
-    _mhc_post_pre_split_kernel_launch(
+    _mhc_post_pre_split_kernel(
         dev,
         stream,
         grid_split,
@@ -959,7 +886,7 @@ def mhc_post_pre(
         triton.cdiv(M, BLOCK_M) * NUM_C_BLOCKS + triton.cdiv(M, BLOCK_M_POST_RES) * 2,
     )
     dev, stream = current_device_stream()
-    _mhc_post_pre_reduce_apply_kernel_launch(
+    _mhc_post_pre_reduce_apply_kernel(
         dev,
         stream,
         grid_reduce_apply,
@@ -1123,11 +1050,6 @@ def _validate_dsv4_parameters(
     return M, n, C
 
 
-_mhc_asymmetric_sinkhorn_kernel_launch = make_launcher(
-    _mhc_asymmetric_sinkhorn_kernel, dynamic_options=("num_warps",)
-)
-
-
 def _mhc_pre_dsv4_forward(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -1172,7 +1094,7 @@ def _mhc_pre_dsv4_forward(
         "fusions", "MHC_DSV4", "_mhc_asymmetric_sinkhorn_kernel", _SINKHORN_FALLBACK
     )
     dev, stream = current_device_stream()
-    _mhc_asymmetric_sinkhorn_kernel_launch(
+    _mhc_asymmetric_sinkhorn_kernel(
         dev,
         stream,
         (M,),
@@ -1316,18 +1238,6 @@ def mhc_post_dsv4(
     return _MHCPostDSV4.apply(layer_input, residual, post_mix, comb_mix, config)
 
 
-_mhc_head_kernel_launch = make_launcher(
-    _mhc_head_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
-
-
 def _mhc_head_dsv4_forward(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -1357,7 +1267,7 @@ def _mhc_head_dsv4_forward(
     )
     out = torch.empty(M, C, dtype=residual.dtype, device=residual.device)
     dev, stream = current_device_stream()
-    _mhc_head_kernel_launch(
+    _mhc_head_kernel(
         dev,
         stream,
         (triton.cdiv(M, BLOCK_M),),

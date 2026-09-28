@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Exercise Sage quant wrappers without their Triton bracket launches."""
+"""Exercise Sage quant wrappers through their intj launchers."""
 
 import pytest
 import torch
@@ -24,16 +24,12 @@ _SAGE_KERNELS = (
 )
 
 
-@pytest.fixture(autouse=True)
-def _reject_sage_bracket_launch(monkeypatch):
-    original = JITFunction.__getitem__
-
-    def reject(self, grid):
-        if any(self is kernel for kernel in _SAGE_KERNELS):
-            raise AssertionError("Sage Triton bracket launch was used")
-        return original(self, grid)
-
-    monkeypatch.setattr(JITFunction, "__getitem__", reject)
+def test_sage_kernels_are_intj_launchers():
+    # Each kernel is decorated with its intj launcher, so no Triton JIT
+    # function is left to launch through.
+    for kernel in _SAGE_KERNELS:
+        assert not isinstance(kernel, JITFunction)
+        assert type(kernel.__self__).__name__ == "Launcher"
 
 
 def _input():
@@ -48,7 +44,9 @@ def test_sage_v_f4f4_pack_uses_intj():
     torch.testing.assert_close(descale, v.abs().amax(dim=1).float() / 6.0)
 
 
-@pytest.mark.skipif(arch_info.get_arch() != "gfx950", reason="native FP4 pack requires gfx950")
+@pytest.mark.skipif(
+    arch_info.get_arch() != "gfx950", reason="native FP4 pack requires gfx950"
+)
 def test_sage_v_mxfp4_pack_uses_intj():
     raw, scales = sage.pack_v_mxfp4_colmajor_raw(_input().contiguous())
     assert raw.shape == (sage.fp4_v_raw_buffer_size(1, 128, 1),)
@@ -92,8 +90,16 @@ def test_sage_rotate_downcast_uses_intj():
 def test_sage_int8_quant_uses_intj():
     q = _input()
     result = sage.sage_quant(
-        q, q, q, get_fp8_e4m3_dtype(), 240.0, BLKQ=32, BLKK=64,
-        smooth_k=False, q_smoothing=False, layout="bshd",
+        q,
+        q,
+        q,
+        get_fp8_e4m3_dtype(),
+        240.0,
+        BLKQ=32,
+        BLKK=64,
+        smooth_k=False,
+        q_smoothing=False,
+        layout="bshd",
     )
     assert result[0].dtype == result[2].dtype == torch.int8
     torch.testing.assert_close(result[5], q.abs().amax(dim=1).float() / 240.0)
@@ -102,8 +108,15 @@ def test_sage_int8_quant_uses_intj():
 def test_sage_mxfp4_quant_uses_intj():
     q = _input()
     result = sage.sage_quant_mxfp4(
-        q, q, q, get_fp8_e4m3_dtype(), 240.0, 32, 64,
-        q_smoothing=False, layout="bshd",
+        q,
+        q,
+        q,
+        get_fp8_e4m3_dtype(),
+        240.0,
+        32,
+        64,
+        q_smoothing=False,
+        layout="bshd",
     )
     assert result[4].dtype == get_fp8_e4m3_dtype()
     torch.testing.assert_close(result[5], q.abs().amax(dim=1).float() / 240.0)
@@ -112,8 +125,15 @@ def test_sage_mxfp4_quant_uses_intj():
 def test_sage_mxfp6_quant_uses_intj():
     q = _input()
     result = sage.sage_quant_mxfp6(
-        q, q, q, get_fp8_e4m3_dtype(), 240.0, 32, 64,
-        q_smoothing=False, layout="bshd",
+        q,
+        q,
+        q,
+        get_fp8_e4m3_dtype(),
+        240.0,
+        32,
+        64,
+        q_smoothing=False,
+        layout="bshd",
     )
     assert result[0].shape == result[2].shape == (1, 128, 1, 96)
     torch.testing.assert_close(result[5], q.abs().amax(dim=1).float() / 240.0)

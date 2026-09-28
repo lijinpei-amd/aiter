@@ -35,6 +35,7 @@ _bwd_preprocess_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_bwd_preprocess_repr)
 def _bwd_preprocess(
     o_ptr,

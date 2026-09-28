@@ -58,6 +58,7 @@ _fwd_kernel_stage1_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("num_warps",), options={"num_stages": 2})
 @triton.jit(repr=_fwd_kernel_stage1_repr)
 def _fwd_kernel_stage1(
     Q,
@@ -217,11 +218,6 @@ def _fwd_kernel_stage1(
         )
 
 
-_fwd_kernel_stage1_launch = make_launcher(
-    _fwd_kernel_stage1, dynamic_options=("num_warps",), options={"num_stages": 2}
-)
-
-
 def _decode_att_m_fwd(
     q,
     k_buffer,
@@ -268,7 +264,7 @@ def _decode_att_m_fwd(
     BLOCK_DV = triton.next_power_of_2(Lv)
 
     dev, stream = current_device_stream()
-    _fwd_kernel_stage1_launch(
+    _fwd_kernel_stage1(
         dev,
         stream,
         grid,
@@ -323,6 +319,15 @@ _fwd_grouped_kernel_stage1_repr = make_kernel_repr(
 )
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 @triton.jit(repr=_fwd_grouped_kernel_stage1_repr)
 def _fwd_grouped_kernel_stage1(
     Q,
@@ -493,18 +498,6 @@ def _fwd_grouped_kernel_stage1(
         )
 
 
-_fwd_grouped_kernel_stage1_launch = make_launcher(
-    _fwd_grouped_kernel_stage1,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
-
-
 def _decode_grouped_att_m_fwd(
     q,
     k_buffer,
@@ -564,7 +557,7 @@ def _decode_grouped_att_m_fwd(
             num_warps = 2
 
     dev, stream = current_device_stream()
-    _fwd_grouped_kernel_stage1_launch(
+    _fwd_grouped_kernel_stage1(
         dev,
         stream,
         grid,
@@ -617,6 +610,12 @@ _fwd_kernel_stage2_repr = make_kernel_repr(
 )
 
 
+_STAGE2_OPTIONS = {"num_warps": 4, "num_stages": 2}
+if is_hip_:
+    _STAGE2_OPTIONS.update(waves_per_eu=4, matrix_instr_nonkdim=16, kpack=2)
+
+
+@make_launcher(options=_STAGE2_OPTIONS)
 @triton.jit(repr=_fwd_kernel_stage2_repr)
 def _fwd_kernel_stage2(
     Mid_O,
@@ -680,12 +679,6 @@ def _fwd_kernel_stage2(
     )
 
 
-_STAGE2_OPTIONS = {"num_warps": 4, "num_stages": 2}
-if is_hip_:
-    _STAGE2_OPTIONS.update(waves_per_eu=4, matrix_instr_nonkdim=16, kpack=2)
-_fwd_kernel_stage2_launch = make_launcher(_fwd_kernel_stage2, options=_STAGE2_OPTIONS)
-
-
 def _decode_softmax_reducev_fwd(
     logits,
     q,
@@ -703,7 +696,7 @@ def _decode_softmax_reducev_fwd(
 
     grid = (batch, head_num)
     dev, stream = current_device_stream()
-    _fwd_kernel_stage2_launch(
+    _fwd_kernel_stage2(
         dev,
         stream,
         grid,

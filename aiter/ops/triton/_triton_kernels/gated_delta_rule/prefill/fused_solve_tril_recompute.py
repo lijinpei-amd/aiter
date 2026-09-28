@@ -124,6 +124,10 @@ def _bp_st2d(
     )
 
 
+@make_launcher(
+    grid_arg=2,
+    extra_annotation={"DOT_PRECISION": Constexpr(value=FLA_TRIL_PRECISION)},
+)
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
     configs=autotune_configs(
@@ -459,13 +463,6 @@ def fused_solve_tril_recompute_w_u_kernel(
         )
 
 
-_fused_solve_tril_recompute_w_u_kernel_launch = make_launcher(
-    fused_solve_tril_recompute_w_u_kernel,
-    grid_arg=2,
-    extra_annotation={"DOT_PRECISION": Constexpr(value=FLA_TRIL_PRECISION)},
-)
-
-
 # =============================================================================
 # Split path: head-major recompute_w_u kernel (consumes pre-inverted Ai).
 #
@@ -770,7 +767,7 @@ def fused_solve_tril_recompute_w_u(
     w_out = k.new_empty(B, H, T, K)
 
     dev, stream = current_device_stream()
-    _fused_solve_tril_recompute_w_u_kernel_launch(
+    fused_solve_tril_recompute_w_u_kernel(
         dev,
         stream,
         NT,

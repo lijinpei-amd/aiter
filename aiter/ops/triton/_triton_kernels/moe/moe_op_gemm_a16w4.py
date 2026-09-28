@@ -4,6 +4,7 @@
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
@@ -101,6 +102,15 @@ def unswizzle_mx_scale_cdna4(
     return x
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 @triton.jit(launch_metadata=matmul_launch_metadata)
 def _moe_gemm_a16w4(
     Y,

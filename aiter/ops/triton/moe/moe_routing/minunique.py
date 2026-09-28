@@ -1,6 +1,5 @@
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.moe.moe_routing.minunique import _keepk_sort0
 from aiter.ops.triton._triton_kernels.moe.moe_routing.routing import _combined_routing
@@ -65,13 +64,6 @@ def keepk_sort0(
     return Vout, Iout
 
 
-_combined_routing_launch = make_launcher(
-    _combined_routing,
-    grid_arg=1,
-    options={"num_warps": 1},
-)
-
-
 def _minunique_common(
     num_tokens,
     n_expts_tot,
@@ -120,7 +112,7 @@ def _minunique_common(
     )
     blocks1b = triton.cdiv(num_tokens, HIST_BLOCK_M)
     intj_dev, intj_stream = current_device_stream()
-    _combined_routing_launch(
+    _combined_routing(
         intj_dev,
         intj_stream,
         blocks1a + blocks1b,

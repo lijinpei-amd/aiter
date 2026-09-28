@@ -42,17 +42,6 @@ DEVICE_ARCH = arch_info.get_arch()
 _LOGGER = AiterTritonLogger()
 
 
-def _sparse_attn_prefill_kernel_grid(num_heads: int, BLOCK_H: int, *, num_queries: int):
-    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
-    return (num_queries, triton.cdiv(num_heads, BLOCK_H))
-
-
-_sparse_attn_prefill_kernel_launch = make_launcher(
-    _sparse_attn_prefill_kernel,
-    grid_cpp=_sparse_attn_prefill_kernel_grid,
-)
-
-
 @functools.cache
 def _pa_prefill_sparse_launch(num_warps):
     return make_launcher(
@@ -241,7 +230,7 @@ def pa_prefill_sparse(
             triton.cdiv(num_heads, META["BLOCK_H"]),
         )
         dev, stream = current_device_stream()
-        _sparse_attn_prefill_kernel_launch(
+        _sparse_attn_prefill_kernel(
             dev,
             stream,
             num_queries,  # grid

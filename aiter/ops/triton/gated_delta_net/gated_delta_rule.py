@@ -20,7 +20,6 @@ from collections.abc import Sequence
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule import (
     _fused_recurrent_gated_delta_rule_fwd_kernel,
@@ -36,12 +35,6 @@ from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
-
-
-_fused_recurrent_gated_delta_rule_fwd_kernel_launch = make_launcher(
-    _fused_recurrent_gated_delta_rule_fwd_kernel,
-    options={"num_stages": 3, "num_warps": 1},
-)
 
 
 def fused_recurrent_gated_delta_rule(
@@ -187,7 +180,7 @@ def fused_recurrent_gated_delta_rule(
     # Launch kernel
     grid = (NV, N * HV)
     dev, stream = current_device_stream()
-    _fused_recurrent_gated_delta_rule_fwd_kernel_launch(
+    _fused_recurrent_gated_delta_rule_fwd_kernel(
         dev,
         stream,
         grid,

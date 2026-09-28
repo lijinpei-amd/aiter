@@ -1013,6 +1013,9 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
 #     ],
 #     cache_results=True,
 # )
+# Reads the import-time constants MFMA, VMEM_LOAD and COMPUTE
+# (sched_group_barrier masks).
+@make_launcher(assume_constant_globals=True)
 @gluon.jit
 def paged_attention_decode_sliding_window_head_1(
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
@@ -2155,6 +2158,7 @@ def paged_attention_decode_sliding_window_head_1(
 #     ],
 #     cache_results=True,
 # )
+@make_launcher
 @gluon.jit
 def paged_attention_decode_sliding_window(
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
@@ -4272,14 +4276,10 @@ _paged_attention_decode_v2_reduce_kernel_launch = make_launcher(
     paged_attention_decode_v2_reduce_kernel,
 )
 
-# The head_1 and large-block kernels read the import-time constants MFMA,
-# VMEM_LOAD and COMPUTE (sched_group_barrier masks).
-_paged_attention_decode_sliding_window_head_1_launch = make_launcher(
-    paged_attention_decode_sliding_window_head_1, assume_constant_globals=True
-)
-_paged_attention_decode_sliding_window_launch = make_launcher(
-    paged_attention_decode_sliding_window
-)
+# The large-block kernel (like sliding_window_head_1) reads the import-time
+# constants MFMA, VMEM_LOAD and COMPUTE (sched_group_barrier masks). The
+# dot and reduce kernels keep named launchers: pa_decode_gluon_aot.py compiles
+# the same JIT functions ahead of time through Triton.
 _paged_attention_decode_v2_gluon_large_block_dot_kernel_launch = make_launcher(
     paged_attention_decode_v2_gluon_large_block_dot_kernel,
     assume_constant_globals=True,
@@ -4366,9 +4366,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     if PS and not (SLIDING_WINDOW > 0 and KV_BLOCK_SIZE == 1024):
         ONE_SHOT = num_splits <= 1
         if num_kv_heads == 1:
-            paged_attention_launch = (
-                _paged_attention_decode_sliding_window_head_1_launch
-            )
+            paged_attention_launch = paged_attention_decode_sliding_window_head_1
             if ONE_QUERY_GROUP_SIZE_POW2 >= 16:
                 grid = (num_sequences, query_seq_len * num_kv_heads, num_splits)
                 QUERY_SEQ_LEN_POW2 = 1
@@ -4380,7 +4378,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
                 grid = (num_sequences, mtp_splits, num_splits)
                 QUERY_SEQ_LEN_POW2 = triton.cdiv(QUERY_SEQ_LEN_POW2, mtp_splits)
         else:
-            paged_attention_launch = _paged_attention_decode_sliding_window_launch
+            paged_attention_launch = paged_attention_decode_sliding_window
         dev, stream = current_device_stream()
         paged_attention_launch(
             dev,

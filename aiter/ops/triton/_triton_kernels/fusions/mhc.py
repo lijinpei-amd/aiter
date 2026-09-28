@@ -5,6 +5,7 @@
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -55,6 +56,7 @@ _mhc_asymmetric_sinkhorn_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("num_warps",))
 @triton.jit(repr=_mhc_asymmetric_sinkhorn_kernel_repr)
 def _mhc_asymmetric_sinkhorn_kernel(
     logits_ptr,
@@ -104,6 +106,15 @@ _mhc_head_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 @triton.jit(repr=_mhc_head_kernel_repr)
 def _mhc_head_kernel(
     x_ptr,
@@ -198,6 +209,15 @@ _mhc_fused_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 @triton.jit(repr=_mhc_fused_kernel_repr)
 def _mhc_fused_kernel(
     x_ptr,
@@ -415,6 +435,15 @@ _mhc_fused_split_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 @triton.jit(repr=_mhc_fused_split_kernel_repr)
 def _mhc_fused_split_kernel(
     x_ptr,
@@ -594,6 +623,15 @@ _mhc_reduce_apply_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 @triton.jit(repr=_mhc_reduce_apply_kernel_repr)
 def _mhc_reduce_apply_kernel(
     acc_ptr,  # Unified split-K partials: (NUM_KSPLIT, M, n + n + n_squared), layout [pre | post | res]
@@ -851,6 +889,15 @@ _mhc_post_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 @triton.jit(repr=_mhc_post_kernel_repr)
 def _mhc_post_kernel(
     out_ptr,  # (M, n, C)  bf16 / fp16
@@ -978,6 +1025,15 @@ _mhc_post_pre_split_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 @triton.jit(repr=_mhc_post_pre_split_kernel_repr)
 def _mhc_post_pre_split_kernel(
     # mhc_post inputs
@@ -1275,6 +1331,15 @@ _mhc_post_pre_reduce_apply_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 @triton.jit(repr=_mhc_post_pre_reduce_apply_kernel_repr)
 def _mhc_post_pre_reduce_apply_kernel(
     acc_ptr,  # Unified split-K partials: (NUM_KSPLIT, M, n + n + n_squared), layout [pre | post | res]

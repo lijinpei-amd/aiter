@@ -23,18 +23,12 @@ It supporst page size = 1.
 # Adapted from
 # https://github.com/ModelTC/lightllm/blob/f2a54f0912293f683bf1d1695fd12c4098a5bf82/lightllm/models/llama/triton_kernel/context_flashattention_nopad.py#L1
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.attention.prefill_attention import _fwd_kernel
 from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
-
-
-_fwd_kernel_launch = make_launcher(
-    _fwd_kernel, dynamic_options=("num_warps",), options={"num_stages": 1}
-)
 
 
 def context_attention_fwd(
@@ -74,7 +68,7 @@ def context_attention_fwd(
     num_warps = 4 if Lk <= 64 else 8
 
     dev, stream = current_device_stream()
-    _fwd_kernel_launch(
+    _fwd_kernel(
         dev,
         stream,
         grid,

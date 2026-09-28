@@ -26,6 +26,12 @@ _sparse_mla_fwd_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+    ),
+)
 @triton.jit(repr=_sparse_mla_fwd_kernel_repr)
 def _sparse_mla_fwd_kernel(
     q_ptr,

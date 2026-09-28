@@ -159,7 +159,7 @@ def quantize_fp6_v_clean_triton(
     grid = (triton.cdiv(n_blocks, BLOCK_N),)
 
     dev, stream = current_device_stream()
-    _pack_v_fp6_kernel_launch(
+    _pack_v_fp6_kernel(
         dev,
         stream,
         grid,
@@ -201,7 +201,7 @@ def quantize_fp6_v_data_scale_triton(
     grid = (triton.cdiv(n_blocks, BLOCK_N),)
 
     dev, stream = current_device_stream()
-    _pack_v_fp6_kernel_launch(
+    _pack_v_fp6_kernel(
         dev,
         stream,
         grid,
@@ -302,6 +302,7 @@ if _HAVE_TRITON:
         ],
     )
 
+    @make_launcher
     @triton.jit(repr=_pack_v_fp6_repr)
     def _pack_v_fp6_kernel(
         v_ptr,  # fp8 V [b, sk, h_kv, d] (any strides)
@@ -387,8 +388,6 @@ if _HAVE_TRITON:
             scale_off = base + 12288 + physical_d * 4 + kvblk
             tl.store(out_ptr + scale_off, sb, mask=m)
 
-    _pack_v_fp6_kernel_launch = make_launcher(_pack_v_fp6_kernel)
-
 
 def _qk_field_perm() -> np.ndarray:
     """Per-output-field source index within a 32-block for the lastdim pack.
@@ -410,6 +409,7 @@ if _HAVE_TRITON:
         ],
     )
 
+    @make_launcher(options={"num_warps": 1})
     @triton.jit(repr=_pack_qk_fp6_repr)
     def _pack_qk_fp6_kernel(
         x_ptr,  # float [N, D] row-major (D % 32 == 0)
@@ -458,10 +458,6 @@ if _HAVE_TRITON:
         sb = ((E + 127) & 0xFF).to(tl.uint8)
         tl.store(scale_ptr + scale_off, sb, mask=m)
 
-    _pack_qk_fp6_kernel_launch = make_launcher(
-        _pack_qk_fp6_kernel, options={"num_warps": 1}
-    )
-
     _gather_k_lds_repr = make_kernel_repr(
         "_gather_k_lds_kernel",
         [
@@ -470,6 +466,7 @@ if _HAVE_TRITON:
         ],
     )
 
+    @make_launcher(options={"num_warps": 4})
     @triton.jit(repr=_gather_k_lds_repr)
     def _gather_k_lds_kernel(
         packed_ptr,  # uint8 packed K [b, sk, h, 96] flattened (contiguous)
@@ -504,11 +501,6 @@ if _HAVE_TRITON:
         )
         tl.store(buf_ptr + dst_addr, byte)
 
-    _gather_k_lds_kernel_launch = make_launcher(
-        _gather_k_lds_kernel,
-        options={"num_warps": 4},
-    )
-
     _fill_k_scale_tail_repr = make_kernel_repr(
         "_fill_k_scale_tail_kernel",
         [
@@ -518,6 +510,7 @@ if _HAVE_TRITON:
         ],
     )
 
+    @make_launcher(grid_arg=1, options={"num_warps": 4})
     @triton.jit(repr=_fill_k_scale_tail_repr)
     def _fill_k_scale_tail_kernel(
         scale_ptr,  # uint8 scale [b, sk, h, 4] flattened
@@ -551,12 +544,6 @@ if _HAVE_TRITON:
         val = tl.load(scale_ptr + src, mask=valid, other=0).to(tl.uint8)
         tl.store(buf_ptr + dst, val)
 
-    _fill_k_scale_tail_kernel_launch = make_launcher(
-        _fill_k_scale_tail_kernel,
-        grid_arg=1,
-        options={"num_warps": 4},
-    )
-
 
 _QK_FIELD_PERM_CACHE: dict = {}
 
@@ -588,7 +575,7 @@ def quantize_fp6_lastdim_triton(x: "torch.Tensor"):
     grid = (triton.cdiv(n_blocks, 16),)
 
     dev, stream = current_device_stream()
-    _pack_qk_fp6_kernel_launch(
+    _pack_qk_fp6_kernel(
         dev,
         stream,
         grid,
@@ -706,7 +693,7 @@ def reorder_fp6_k_lds_order_triton(
     grid = (b * h * (data_hs // BLOCK),)
 
     dev, stream = current_device_stream()
-    _gather_k_lds_kernel_launch(
+    _gather_k_lds_kernel(
         dev,
         stream,
         grid,
@@ -724,7 +711,7 @@ def reorder_fp6_k_lds_order_triton(
     # Fill the per-tile 1024B scale tail: Region A (unshifted) + Region B (pre-shifted +1 byte, so
     # the kernel MFMA op_sel picks dblk1/dblk3 with no runtime shift). The B pre-shift reads 1 byte
     # past the last token's scale on the final tile -> the +256 buf slack keeps it mapped.
-    _fill_k_scale_tail_kernel_launch(
+    _fill_k_scale_tail_kernel(
         dev,
         stream,
         b * h * nt,

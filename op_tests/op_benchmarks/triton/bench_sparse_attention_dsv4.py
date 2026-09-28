@@ -18,7 +18,6 @@ import argparse
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
     _sparse_attn_prefill_kernel as csa_prefill_tl,
@@ -38,16 +37,6 @@ except ImportError:
 
 
 sparse_attn_prefill_kernel = csa_prefill_tl
-
-
-def _sparse_attn_prefill_grid(num_heads: int, BLOCK_H: int, *, num_queries: int):
-    # Compiled into the launcher by intj (grid_cpp); BLOCK_H is the tuned value.
-    return (num_queries, triton.cdiv(num_heads, BLOCK_H))
-
-
-_sparse_attn_prefill_kernel_launch = make_launcher(
-    sparse_attn_prefill_kernel, grid_cpp=_sparse_attn_prefill_grid
-)
 
 
 NOPE_DIM = 448
@@ -129,7 +118,7 @@ def _launch_prefill(
         return
     else:  # default triton backend
         dev, stream = current_device_stream()
-        _sparse_attn_prefill_kernel_launch(
+        sparse_attn_prefill_kernel(
             dev,
             stream,
             num_queries,

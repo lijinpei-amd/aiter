@@ -183,6 +183,7 @@ _topk_repr = make_kernel_repr(
 )
 
 
+@make_launcher(options={"num_warps": 8})
 @triton.jit(repr=_topk_repr)
 def _topk(
     X,

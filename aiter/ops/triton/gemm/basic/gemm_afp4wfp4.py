@@ -6,7 +6,7 @@ import functools
 
 import torch
 import triton
-from intj import Constexpr, make_launcher
+from intj import make_launcher
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
@@ -117,15 +117,6 @@ def gemm_afp4wfp4_fake_tensor(
         return y_pp
 
     return torch.empty((M, N), dtype=dtype, device=x.device)
-
-
-_gemm_splitk_reduce_kernel_launch = make_launcher(
-    _gemm_splitk_reduce_kernel,
-    extra_annotation={
-        "KERNEL_NAME": Constexpr(value="_gemm_afp4wfp4_reduce_kernel"),
-        "activation": Constexpr(value=""),
-    },
-)
 
 
 @functools.cache
@@ -387,7 +378,7 @@ def gemm_afp4wfp4_(
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
         dev, stream = current_device_stream()
-        _gemm_splitk_reduce_kernel_launch(
+        _gemm_splitk_reduce_kernel(
             dev,
             stream,
             grid_reduce,
@@ -406,7 +397,9 @@ def gemm_afp4wfp4_(
             ACTUAL_KSPLIT,
             triton.next_power_of_2(config["NUM_KSPLIT"]),
             False,  # ADD_BIAS
+            "",  # activation
             False,  # use_activation
+            "_gemm_afp4wfp4_reduce_kernel",  # KERNEL_NAME
         )
 
     return y
@@ -601,7 +594,7 @@ def gemm_afp4wfp4_preshuffled_scales(
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
         dev, stream = current_device_stream()
-        _gemm_splitk_reduce_kernel_launch(
+        _gemm_splitk_reduce_kernel(
             dev,
             stream,
             grid_reduce,
@@ -620,7 +613,9 @@ def gemm_afp4wfp4_preshuffled_scales(
             ACTUAL_KSPLIT,
             triton.next_power_of_2(config["NUM_KSPLIT"]),
             False,  # ADD_BIAS
+            "",  # activation
             False,  # use_activation
+            "_gemm_afp4wfp4_reduce_kernel",  # KERNEL_NAME
         )
 
     return y
@@ -896,7 +891,7 @@ def gemm_afp4wfp4_preshuffle(
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
         dev, stream = current_device_stream()
-        _gemm_splitk_reduce_kernel_launch(
+        _gemm_splitk_reduce_kernel(
             dev,
             stream,
             grid_reduce,
@@ -915,7 +910,9 @@ def gemm_afp4wfp4_preshuffle(
             ACTUAL_KSPLIT,
             triton.next_power_of_2(config["NUM_KSPLIT"]),
             False,  # ADD_BIAS
+            "",  # activation
             False,  # use_activation
+            "_gemm_afp4wfp4_reduce_kernel",  # KERNEL_NAME
         )
 
     return y

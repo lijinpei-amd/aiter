@@ -347,6 +347,15 @@ _fwd_kernel_stage2_repr = make_kernel_repr(
 )
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 @triton.jit(repr=_fwd_kernel_stage2_repr)
 def _fwd_kernel_stage2(
     Mid_O,

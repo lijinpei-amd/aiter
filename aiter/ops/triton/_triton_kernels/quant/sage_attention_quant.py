@@ -220,6 +220,7 @@ _sage_quant_v_repr = make_kernel_repr(
 )
 
 
+@make_launcher(options={"num_stages": 3, "num_warps": 8})
 @triton.jit(repr=_sage_quant_v_repr)
 def sage_quant_v_kernel(
     V_Input,
@@ -401,6 +402,7 @@ def _e2m1_pack_native(value_lo, value_hi):
     ).to(tl.uint8)
 
 
+@make_launcher(grid_arg=1)
 @triton.jit
 def sage_quant_v_fp4_colmajor_kernel(
     v_ptr,  # V [b, h_kv, S, D] (any strides -- a permuted view is fine, no copy needed)
@@ -479,6 +481,7 @@ def sage_quant_v_fp4_colmajor_kernel(
     )
 
 
+@make_launcher(grid_arg=1, options={"num_stages": 1, "num_warps": 1})
 @triton.jit
 def sage_quant_v_mxfp4_colmajor_kernel(
     v_ptr,  # V [b, h_kv, S, D]
@@ -567,6 +570,7 @@ _rotate_quantize_q_repr = make_kernel_repr(
 )
 
 
+@make_launcher(options={"num_stages": 5, "num_warps": 4})
 @triton.jit(repr=_rotate_quantize_q_repr)
 def _rotate_quantize_q_kernel(
     Q,
@@ -703,6 +707,7 @@ _rotate_quantize_k_repr = make_kernel_repr(
 )
 
 
+@make_launcher(options={"num_stages": 5, "num_warps": 4})
 @triton.jit(repr=_rotate_quantize_k_repr)
 def _rotate_quantize_k_kernel(
     Q,
@@ -1015,6 +1020,7 @@ _rot_q_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_rot_q_repr)
 def _rot_q_kernel(
     Q,
@@ -1124,6 +1130,7 @@ _rot_k_only_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_rot_k_only_repr)
 def _rot_k_only_kernel(
     K,
@@ -1200,6 +1207,7 @@ _compute_delta_s_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_compute_delta_s_repr)
 def _compute_delta_s_kernel(
     Q_mean,
@@ -1284,6 +1292,7 @@ _q_smooth_int8_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_q_smooth_int8_repr)
 def _q_smooth_int8_kernel(
     Q,
@@ -1370,6 +1379,7 @@ _sage_quant_repr = make_kernel_repr(
 )
 
 
+@make_launcher(options={"num_stages": 3, "num_warps": 8})
 @triton.jit(repr=_sage_quant_repr)
 def sage_quant_kernel(
     Q_Input,

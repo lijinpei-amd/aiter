@@ -9,6 +9,7 @@
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -25,6 +26,7 @@ _fwd_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(options={"num_stages": 1, "num_warps": 1, "waves_per_eu": 1})
 @triton.jit(repr=_fwd_kernel_repr)
 def _fwd_kernel(
     Q,
@@ -314,6 +316,7 @@ _fwd_kernel_alibi_repr = make_kernel_repr(
 )
 
 
+@make_launcher(options={"num_stages": 1, "num_warps": 1, "waves_per_eu": 1})
 @triton.jit(repr=_fwd_kernel_alibi_repr)
 def _fwd_kernel_alibi(
     Q,

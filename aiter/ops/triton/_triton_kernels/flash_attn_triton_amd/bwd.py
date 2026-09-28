@@ -2781,11 +2781,19 @@ def _bwd_kernel_split_dq_noncausal(
         tl.store(DQ + adj_dq + offs_dq, dq, mask=mask_q)
 
 
+def _bwd_preprocess_grid(
+    max_seqlen_q: int, PRE_BLOCK: int, *, batch: int, nheads_q: int
+):
+    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
+    return (triton.cdiv(max_seqlen_q, PRE_BLOCK), batch, nheads_q)
+
+
 # This function computes delta given output Out and gradient DO
 # Here is the I/O shape:
 # Out: (batch, nhead_q, max_seqlens_q, headDim)
 # DO: (batch, nhead_q, max_seqlens_q, headDim)
 # Delta: (batch, nheads_q, max_seqlens_q)
+@make_launcher(grid_cpp=_bwd_preprocess_grid)
 @triton.autotune(
     configs=preprocess_autotune_configs,
     key=PREPROCESS_AUTOTUNE_KEYS,
@@ -2864,16 +2872,6 @@ def _bwd_preprocess(
         + offs_m * stride_delta_m
     )
     tl.store(Delta + off_delta, delta, mask=mask_m)
-
-
-def _bwd_preprocess_grid(
-    max_seqlen_q: int, PRE_BLOCK: int, *, batch: int, nheads_q: int
-):
-    # Compiled into the launcher by intj (grid_cpp); it may read tuned values.
-    return (triton.cdiv(max_seqlen_q, PRE_BLOCK), batch, nheads_q)
-
-
-_bwd_preprocess_launch = make_launcher(_bwd_preprocess, grid_cpp=_bwd_preprocess_grid)
 
 
 # The main inner-loop logic for computing dK and dV.
@@ -4788,7 +4786,7 @@ def attention_backward_triton_impl(
         stride_delta_b, stride_delta_h, stride_delta_m = delta.stride()
 
     intj_dev, intj_stream = current_device_stream()
-    _bwd_preprocess_launch(
+    _bwd_preprocess(
         intj_dev,
         intj_stream,
         batch,  # grid

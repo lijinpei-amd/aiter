@@ -33,6 +33,7 @@ _BK_DEFAULT = 64
 _BV_DEFAULT = 64
 
 
+@make_launcher(grid_arg=2)
 @triton.heuristics(
     {
         "STORE_QG": lambda args: args["qg"] is not None,
@@ -168,9 +169,6 @@ def recompute_w_u_fwd_kernel(
         tl.store(p_w, b_w.to(p_w.dtype.element_ty), mask=m_tk)
 
 
-_recompute_w_u_fwd_kernel_launch = make_launcher(recompute_w_u_fwd_kernel, grid_arg=2)
-
-
 @input_guard
 def recompute_w_u_fwd(
     k: torch.Tensor,
@@ -221,7 +219,7 @@ def recompute_w_u_fwd(
     kg = torch.empty(B, T, HV, K, device=k.device, dtype=k.dtype)
 
     dev, stream = current_device_stream()
-    _recompute_w_u_fwd_kernel_launch(
+    recompute_w_u_fwd_kernel(
         dev,
         stream,
         NT,

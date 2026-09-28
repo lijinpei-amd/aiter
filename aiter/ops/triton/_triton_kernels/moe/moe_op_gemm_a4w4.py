@@ -4,6 +4,7 @@
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
@@ -141,6 +142,15 @@ _moe_gemm_a4w4_repr = make_kernel_repr(
 )
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 @triton.jit(launch_metadata=matmul_launch_metadata, repr=_moe_gemm_a4w4_repr)
 def _moe_gemm_a4w4(
     Y,

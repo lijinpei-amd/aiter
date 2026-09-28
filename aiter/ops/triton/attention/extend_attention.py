@@ -19,7 +19,6 @@ It supports page size = 1 and prefill with KV cache (i.e. extend).
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.attention.extend_attention import (
     _fwd_kernel,
@@ -30,18 +29,6 @@ from aiter.ops.triton.utils.device_info import current_device_stream, get_num_xc
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
-
-
-_fwd_kernel_launch = make_launcher(
-    _fwd_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
 
 
 def extend_attention_fwd(
@@ -132,7 +119,7 @@ def extend_attention_fwd(
     grid = (head_num * num_blocks * batch_size,)
 
     dev, stream = current_device_stream()
-    _fwd_kernel_launch(
+    _fwd_kernel(
         dev,
         stream,
         grid,

@@ -3,7 +3,6 @@
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.normalization.norm import (
     _fused_add_layernorm_kernel,
@@ -19,9 +18,6 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import get_dtype_max
 
 _LOGGER = AiterTritonLogger()
-
-
-_layernorm_kernel_launch = make_launcher(_layernorm_kernel, grid_arg=1)
 
 
 def _layernorm_forward(
@@ -41,7 +37,7 @@ def _layernorm_forward(
     BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
 
     dev, stream = current_device_stream()
-    _layernorm_kernel_launch(
+    _layernorm_kernel(
         dev,
         stream,
         M,
@@ -58,12 +54,6 @@ def _layernorm_forward(
         eps,
         BLOCK_SIZE,
     )
-
-
-_fused_add_layernorm_kernel_launch = make_launcher(
-    _fused_add_layernorm_kernel,
-    grid_arg=1,
-)
 
 
 def _layernorm_forward_with_add(
@@ -85,7 +75,7 @@ def _layernorm_forward_with_add(
     BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
 
     dev, stream = current_device_stream()
-    _fused_add_layernorm_kernel_launch(
+    _fused_add_layernorm_kernel(
         dev,
         stream,
         M,

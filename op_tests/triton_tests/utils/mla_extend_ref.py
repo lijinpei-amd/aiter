@@ -46,6 +46,15 @@ def tanh(x):
     return 2 * tl.sigmoid(2 * x) - 1
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+)
 @triton.jit
 def _fwd_kernel(
     Q_Extend,
@@ -296,18 +305,6 @@ def _fwd_kernel(
         )
 
 
-_fwd_kernel_launch = make_launcher(
-    _fwd_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
-
-
 def extend_attention_fwd(
     q_extend,
     k_extend,
@@ -397,7 +394,7 @@ def extend_attention_fwd(
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
 
     dev, stream = current_device_stream()
-    _fwd_kernel_launch(
+    _fwd_kernel(
         dev,
         stream,
         grid,

@@ -357,18 +357,6 @@ def _triton_mla_decode_fwd_kernel_launch(num_warps, num_stages, waves_per_eu):
     )
 
 
-_triton_mla_decode_fwd_reduce_kernel_launch = make_launcher(
-    triton_mla_decode_fwd_reduce_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
-
-
 def mla_decode_fwd(
     q,  # [num_tokens_per_seq * num_seqs, num_query_heads, qk_lora_rank + qk_rope_head_dim]
     kv_buffer,  # [num_blocks, block_size, num_kv_heads, qk_lora_rank + qk_rope_head_dim]
@@ -688,7 +676,7 @@ def mla_decode_fwd(
     #     _reduce_kernel = triton_mla_decode_fwd_reduce_kernel
 
     dev, stream = current_device_stream()
-    _triton_mla_decode_fwd_reduce_kernel_launch(
+    triton_mla_decode_fwd_reduce_kernel(
         dev,
         stream,
         (total_num_tokens, num_query_heads),

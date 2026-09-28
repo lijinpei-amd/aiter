@@ -99,27 +99,7 @@ def _gluon_pa_decode_sparse_reduce_launch(num_warps):
     )
 
 
-_triton_pa_decode_sparse_reduce_launch = make_launcher(
-    triton_pa_decode_sparse_reduce,
-    dynamic_options=(
-        "num_warps",
-        "waves_per_eu",
-    ),
-)
-
 # The gfx950 sparse-MLA kernels, shared with sparse_mla.py.
-_sparse_mla_gfx950_launch = make_launcher(
-    _sparse_mla_gfx950,
-    dynamic_options=(
-        "num_warps",
-        "waves_per_eu",
-    ),
-)
-
-_sparse_mla_reduce_gfx950_launch = make_launcher(
-    _sparse_mla_reduce_gfx950,
-    options={"num_warps": 1},
-)
 
 
 def pa_decode_sparse(
@@ -546,7 +526,7 @@ def pa_decode_sparse(
         )
     else:
         dev, stream = current_device_stream()
-        _triton_pa_decode_sparse_reduce_launch(
+        triton_pa_decode_sparse_reduce(
             dev,
             stream,
             grid_reduce,
@@ -798,7 +778,7 @@ def _pa_decode_sparse_gfx950_gluon(
     # workgroup id, so the axis order decides what shares an XCD's L2.
     grid = (num_queries, num_splits, heads_blocks)
     dev, stream = current_device_stream()
-    _sparse_mla_gfx950_launch(
+    _sparse_mla_gfx950(
         dev,
         stream,
         grid,
@@ -887,7 +867,7 @@ def _pa_decode_sparse_gfx950_gluon(
 
     # One head per reduce workgroup
     rgrid = (num_queries, num_heads)
-    _sparse_mla_reduce_gfx950_launch(
+    _sparse_mla_reduce_gfx950(
         dev,
         stream,
         rgrid,

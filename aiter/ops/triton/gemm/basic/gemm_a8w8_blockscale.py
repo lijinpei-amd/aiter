@@ -6,7 +6,7 @@ import os
 
 import torch
 import triton
-from intj import Constexpr, make_launcher
+from intj import make_launcher
 from packaging.version import Version
 
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
@@ -35,14 +35,12 @@ _GLUON_PRESHUFFLE_ARCHS = ("gfx1250",)
 _GLUON_DEFAULT_ARCHS = ("gfx1250",)
 _GLUON_KERNEL_TYPES = ("bandwidth_bound", "compute_bound")
 
-
-_gemm_splitk_reduce_kernel_launch = make_launcher(
-    _gemm_splitk_reduce_kernel,
-    extra_annotation={
-        "KERNEL_NAME": Constexpr(value="_gemm_a8w8_blockscale_reduce_kernel"),
-        "activation": Constexpr(value=""),
-    },
-)
+try:  # gfx950 Gluon kernel; unavailable on Triton builds without Gluon.
+    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a8w8_blockscale import (
+        _gemm_a8w8_blockscale_kernel as _gluon_gfx950_gemm_a8w8_blockscale_kernel,
+    )
+except ImportError:
+    _gluon_gfx950_gemm_a8w8_blockscale_kernel = None
 
 
 @functools.cache
@@ -56,26 +54,6 @@ def _triton_gemm_a8w8_blockscale_kernel_launch(num_stages):
             "kpack",
         ),
         options={"num_stages": num_stages},
-    )
-
-
-@functools.cache
-def _gluon_gfx950_gemm_a8w8_blockscale_launch():
-    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a8w8_blockscale import (
-        _gemm_a8w8_blockscale_kernel,
-    )
-
-    # The kernel reads the import-time constant _SUPPORTED_TILES.
-    return make_launcher(
-        _gemm_a8w8_blockscale_kernel,
-        dynamic_options=(
-            "num_warps",
-            "num_stages",
-            "waves_per_eu",
-            "matrix_instr_nonkdim",
-            "kpack",
-        ),
-        assume_constant_globals=True,
     )
 
 
@@ -221,7 +199,7 @@ def gemm_a8w8_blockscale(
     if backend == "gluon" and arch == "gfx950":
         # gfx950 has one blockscale kernel, which serves both kernel types.
         dev, stream = current_device_stream()
-        _gluon_gfx950_gemm_a8w8_blockscale_launch()(
+        _gluon_gfx950_gemm_a8w8_blockscale_kernel(
             dev,
             stream,
             grid,
@@ -357,7 +335,7 @@ def gemm_a8w8_blockscale(
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
         dev, stream = current_device_stream()
-        _gemm_splitk_reduce_kernel_launch(
+        _gemm_splitk_reduce_kernel(
             dev,
             stream,
             grid_reduce,
@@ -376,22 +354,12 @@ def gemm_a8w8_blockscale(
             ACTUAL_KSPLIT,
             triton.next_power_of_2(config["NUM_KSPLIT"]),
             False,  # ADD_BIAS
+            "",  # activation
             False,  # use_activation
+            "_gemm_a8w8_blockscale_reduce_kernel",  # KERNEL_NAME
         )
 
     return y
-
-
-_triton_gemm_a8w8_blockscale_preshuffle_kernel_launch = make_launcher(
-    triton_gemm_a8w8_blockscale_preshuffle_kernel,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
 
 
 def gemm_a8w8_blockscale_preshuffle(
@@ -588,7 +556,7 @@ def gemm_a8w8_blockscale_preshuffle(
         )
     else:
         dev, stream = current_device_stream()
-        _triton_gemm_a8w8_blockscale_preshuffle_kernel_launch(
+        triton_gemm_a8w8_blockscale_preshuffle_kernel(
             dev,
             stream,
             grid,
@@ -644,7 +612,7 @@ def gemm_a8w8_blockscale_preshuffle(
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
         dev, stream = current_device_stream()
-        _gemm_splitk_reduce_kernel_launch(
+        _gemm_splitk_reduce_kernel(
             dev,
             stream,
             grid_reduce,
@@ -663,7 +631,9 @@ def gemm_a8w8_blockscale_preshuffle(
             ACTUAL_KSPLIT,
             triton.next_power_of_2(config["NUM_KSPLIT"]),
             False,  # ADD_BIAS
+            "",  # activation
             False,  # use_activation
+            "_gemm_a8w8_blockscale_reduce_kernel",  # KERNEL_NAME
         )
 
     return y

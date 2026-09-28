@@ -361,18 +361,6 @@ def _moe_gemm_a8w4_decode_launch(num_warps):
     )
 
 
-_moe_gemm_a8w4_launch = make_launcher(
-    _moe_gemm_a8w4_triton,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
-
-
 def moe_gemm_a8w4(
     x,
     w,
@@ -809,7 +797,7 @@ def moe_gemm_a8w4(
         )
     else:
         dev, stream = current_device_stream()
-        _moe_gemm_a8w4_launch(
+        _moe_gemm_a8w4_triton(
             dev,
             stream,
             (grid,),

@@ -4,6 +4,7 @@
 """Gluon FP8 block-scale GEMM kernels for gfx950."""
 
 import triton
+from intj import make_launcher
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.runtime.jit import constexpr_function
@@ -706,6 +707,17 @@ def _compute_MN_tile(
     )
 
 
+# Reads the import-time constant _SUPPORTED_TILES.
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    ),
+    assume_constant_globals=True,
+)
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,

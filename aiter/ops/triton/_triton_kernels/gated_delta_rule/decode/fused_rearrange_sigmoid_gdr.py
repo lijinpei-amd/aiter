@@ -10,8 +10,10 @@
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 
+@make_launcher(options={"num_stages": 3, "num_warps": 4})
 @triton.heuristics(
     {
         "USE_INITIAL_STATE": lambda args: args["h0"] is not None,

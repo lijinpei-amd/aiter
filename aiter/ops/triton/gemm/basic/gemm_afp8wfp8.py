@@ -7,7 +7,7 @@ import math
 
 import torch
 import triton
-from intj import Constexpr, make_launcher
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
@@ -70,12 +70,6 @@ def _resolve_x_scale_strides(
     if is_x_scale_transposed:
         return x_scales.stride(1), x_scales.numel() // x_scales.stride(0)
     return x_scales.stride(0), x_scales.stride(1)
-
-
-_gemm_splitk_reduce_kernel_launch = make_launcher(
-    _gemm_splitk_reduce_kernel,
-    extra_annotation={"KERNEL_NAME": Constexpr(value="_gemm_afp8wfp8_reduce_kernel")},
-)
 
 
 @functools.cache
@@ -228,7 +222,7 @@ def gemm_afp8wfp8(
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
         dev, stream = current_device_stream()
-        _gemm_splitk_reduce_kernel_launch(
+        _gemm_splitk_reduce_kernel(
             dev,
             stream,
             grid_reduce,
@@ -249,17 +243,10 @@ def gemm_afp8wfp8(
             False,  # ADD_BIAS
             None,  # activation
             False,  # use_activation
+            "_gemm_afp8wfp8_reduce_kernel",  # KERNEL_NAME
         )
 
     return y
-
-
-_gemm_splitk_reduce_kernel_launch2 = make_launcher(
-    _gemm_splitk_reduce_kernel,
-    extra_annotation={
-        "KERNEL_NAME": Constexpr(value="_gemm_afp8wfp8_preshuffle_reduce_kernel")
-    },
-)
 
 
 @functools.cache
@@ -547,7 +534,7 @@ def gemm_afp8wfp8_preshuffle(
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
         dev, stream = current_device_stream()
-        _gemm_splitk_reduce_kernel_launch2(
+        _gemm_splitk_reduce_kernel(
             dev,
             stream,
             grid_reduce,
@@ -568,6 +555,7 @@ def gemm_afp8wfp8_preshuffle(
             False,  # ADD_BIAS
             None,  # activation
             False,  # use_activation
+            "_gemm_afp8wfp8_preshuffle_reduce_kernel",  # KERNEL_NAME
         )
 
     return y

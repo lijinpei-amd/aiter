@@ -2,6 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import triton.experimental.gluon.language as gl
+from intj import make_launcher
 from triton.experimental import gluon
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
@@ -59,6 +60,7 @@ def wmma_layout(num_warps):
     )
 
 
+@make_launcher(dynamic_options=("num_warps",))
 @gluon.jit(repr=_gemm_a16w16_bandwidth_bound_repr)
 def _gemm_a16w16_bandwidth_bound_kernel(
     a_ptr,
@@ -377,6 +379,7 @@ def _gemm_a16w16_bandwidth_bound_kernel(
     )
 
 
+@make_launcher(dynamic_options=("num_warps",))
 @gluon.jit(repr=_gemm_a16w16_compute_bound_repr)
 def _gemm_a16w16_compute_bound_kernel(
     a_ptr,

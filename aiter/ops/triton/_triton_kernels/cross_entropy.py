@@ -18,8 +18,13 @@ Three kernels are provided:
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
+# Launch options shared by all three kernels.
+_WAVES_PER_EU = 2
+_NUM_STAGES = 2
 
 # repr keys are the integer/bool constexprs that select the compiled variant;
 # label_smoothing (a float) is intentionally excluded — a fractional value would
@@ -33,6 +38,10 @@ _ce_fused_loss_grad_kernel_repr = make_kernel_repr(
 _ce_grad_scale_kernel_repr = make_kernel_repr("_ce_grad_scale_kernel", ["BLOCK_SIZE"])
 
 
+@make_launcher(
+    dynamic_options=("num_warps",),
+    options={"waves_per_eu": _WAVES_PER_EU, "num_stages": _NUM_STAGES},
+)
 @triton.jit(repr=_ce_local_softmax_stats_kernel_repr)
 def _ce_local_softmax_stats_kernel(
     X_ptr,
@@ -85,6 +94,10 @@ def _ce_local_softmax_stats_kernel(
     tl.store(m_d_Xy_ptr + base + 2 * m_d_Xy_stride, X_y)
 
 
+@make_launcher(
+    dynamic_options=("num_warps",),
+    options={"waves_per_eu": _WAVES_PER_EU, "num_stages": _NUM_STAGES},
+)
 @triton.jit(repr=_ce_fused_loss_grad_kernel_repr)
 def _ce_fused_loss_grad_kernel(
     X_ptr,
@@ -196,6 +209,10 @@ def _ce_fused_loss_grad_kernel(
     tl.store(loss_ptr, loss)
 
 
+@make_launcher(
+    dynamic_options=("num_warps",),
+    options={"waves_per_eu": _WAVES_PER_EU, "num_stages": _NUM_STAGES},
+)
 @triton.jit(repr=_ce_grad_scale_kernel_repr)
 def _ce_grad_scale_kernel(
     X_ptr,

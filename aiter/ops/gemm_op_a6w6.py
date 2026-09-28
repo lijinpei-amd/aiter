@@ -267,6 +267,7 @@ if _HAS_TRITON:
         mag_code = tl.floor(a * quant_scale + 0.5) + code_bias
         return mag_code.to(tl.int32) + (scaled < 0.0).to(tl.int32) * 32
 
+    @make_launcher
     @triton.jit
     def _quant_pack_kernel(
         x_ptr,
@@ -346,8 +347,7 @@ if _HAS_TRITON:
         scaddr = (t * NK_PAD + step) * 1024 + su * 512 + kg * 128 + r16 * 8 + sub
         tl.store(s_ptr + scaddr, e8, mask=rm)
 
-    _quant_pack_kernel_launch = make_launcher(_quant_pack_kernel)
-
+    @make_launcher(options={"num_warps": 4})
     @triton.jit
     def _quant_pack_4block_kernel(
         x_ptr,
@@ -431,11 +431,6 @@ if _HAS_TRITON:
         sub = (rem % 128) // 16
         scaddr = (t * NK_PAD + step) * 1024 + su * 512 + kg * 128 + r16 * 8 + sub
         tl.store(s_ptr + scaddr, e8, mask=rm)
-
-    _quant_pack_4block_kernel_launch = make_launcher(
-        _quant_pack_4block_kernel,
-        options={"num_warps": 4},
-    )
 
 
 def quant_mxfp6(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -914,7 +909,7 @@ def _launch_quant_mxfp6_gemm_triton(
         NSTEP = NB // _BATCHED_PACK_K_BLOCKS
         grid = ((rows + BM - 1) // BM * NSTEP,)
         dev, stream = current_device_stream()
-        _quant_pack_4block_kernel_launch(
+        _quant_pack_4block_kernel(
             dev,
             stream,
             grid,
@@ -932,7 +927,7 @@ def _launch_quant_mxfp6_gemm_triton(
         BM = 128
         grid = ((rows + BM - 1) // BM * NB,)
         dev, stream = current_device_stream()
-        _quant_pack_kernel_launch(
+        _quant_pack_kernel(
             dev,
             stream,
             grid,

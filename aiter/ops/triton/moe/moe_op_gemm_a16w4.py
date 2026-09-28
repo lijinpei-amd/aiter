@@ -221,18 +221,6 @@ def _moe_gemm_a16w4_gluon_launch(num_warps):
     )
 
 
-_moe_gemm_a16w4_triton_launch = make_launcher(
-    _moe_gemm_a16w4_triton,
-    dynamic_options=(
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "kpack",
-    ),
-)
-
-
 def moe_gemm_a16w4(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -435,7 +423,7 @@ def moe_gemm_a16w4(
         )
     else:
         dev, stream = current_device_stream()
-        _moe_gemm_a16w4_triton_launch(
+        _moe_gemm_a16w4_triton(
             dev,
             stream,
             (grid,),

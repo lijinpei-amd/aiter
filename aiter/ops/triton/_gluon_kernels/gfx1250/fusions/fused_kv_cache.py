@@ -25,6 +25,7 @@ helpers.
 """
 
 import triton.language as tl
+from intj import make_launcher
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
@@ -355,6 +356,7 @@ def _rope_pe(
     return x_pe * cos + x_pe_rotated * sin
 
 
+@make_launcher(options={"num_warps": 1})
 @gluon.jit
 def _fused_qk_rope_cat_and_cache_mla_kernel(
     q_nope_ptr,
@@ -922,6 +924,7 @@ def _rope_pe_2d(
     return x_pe * cos + x_pe_rotated * sin
 
 
+@make_launcher(options={"num_warps": 1})
 @gluon.jit
 def _fused_qk_rope_reshape_and_cache_kernel(
     q_ptr,

@@ -9,7 +9,6 @@
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.attention.pa_prefill import (
     _fwd_kernel,
@@ -21,17 +20,6 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 _LOGGER = AiterTritonLogger()
 
 BASE_BLOCK = 64
-NUM_WARPS = 1
-
-
-_fwd_kernel_launch = make_launcher(
-    _fwd_kernel,
-    options={"num_stages": 1, "num_warps": NUM_WARPS, "waves_per_eu": 1},
-)
-_fwd_kernel_alibi_launch = make_launcher(
-    _fwd_kernel_alibi,
-    options={"num_stages": 1, "num_warps": NUM_WARPS, "waves_per_eu": 1},
-)
 
 
 @torch.inference_mode()
@@ -121,7 +109,7 @@ def context_attention_fwd(
 
     if alibi_slopes is not None:
         dev, stream = current_device_stream()
-        _fwd_kernel_alibi_launch(
+        _fwd_kernel_alibi(
             dev,
             stream,
             grid,
@@ -174,7 +162,7 @@ def context_attention_fwd(
         return
 
     dev, stream = current_device_stream()
-    _fwd_kernel_launch(
+    _fwd_kernel(
         dev,
         stream,
         grid,

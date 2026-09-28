@@ -199,6 +199,7 @@ _combined_routing_repr = make_kernel_repr(
 )
 
 
+@make_launcher(grid_arg=1, options={"num_warps": 1})
 @triton.jit(repr=_combined_routing_repr)
 def _combined_routing(
     GatherIndx,
