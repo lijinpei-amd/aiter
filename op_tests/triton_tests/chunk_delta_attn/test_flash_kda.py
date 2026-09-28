@@ -28,6 +28,7 @@ from aiter.ops.triton._triton_kernels.chunk_delta_attn.flash_kda import (
     flash_kda_supported,
 )
 from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
+from op_tests.triton_tests.chunk_delta_attn import kda_launchers
 from op_tests.triton_tests.utils.kda_ref import chunk_kda_ref
 
 device = "cuda"
@@ -102,16 +103,11 @@ def _k2_tuner_search_space():
     """
     if len(_flash_kda._K2_CONFIGS) < 2:
         pytest.skip("no published K2 candidates on this device to key between")
-    kern = _flash_kda._flash_kda_segment_kernel
-    saved = kern.configs
-    kern.configs = list(_flash_kda._K2_CONFIGS)
-    # Each native handle copies the tuner, configs included, when it is made.
-    _flash_kda._cached_intj_launcher.cache_clear()
-    try:
-        yield kern
-    finally:
-        kern.configs = saved
-        _flash_kda._cached_intj_launcher.cache_clear()
+    # The kernel's launcher is built over its tuner and tunes on a copy of it,
+    # so the kernel gets a fresh launcher over a tuner holding the candidates.
+    configs = {"_flash_kda_segment_kernel": _flash_kda._K2_CONFIGS}
+    with kda_launchers.relaunched(kda_launchers.with_configs(configs)) as kernels:
+        yield kernels["_flash_kda_segment_kernel"]
 
 
 def run_reference(q, k, v, g, beta, A_log, dt_bias, scale, **kw):
@@ -578,44 +574,26 @@ def test_cases_reach_the_gluon_k2():
     """
     if not _flash_kda._gluon_k2_usable(FLASH_KDA_CHUNK, K_DIM, K_DIM):
         pytest.skip("this arch or tile shape never routes K2 to Gluon")
-    from aiter.ops.triton._gluon_kernels.gfx950.chunk_delta_attn import (
-        flash_kda_k2 as _g2,
-    )
-
     reached = set()
-    original = _flash_kda._intj_launcher
 
-    def counted(kernel, *a, **k):
-        native = original(kernel, *a, **k)
-        if kernel is not _g2.k2_ab_fused_gluon:
-            return native
-
-        def launch(*args):
+    def record(name, _):
+        if name == "k2_ab_fused_gluon":
             reached.add(current)
-            return native(*args)
 
-        return launch
-
-    _flash_kda._intj_launcher = counted
-    try:
+    with kda_launchers.relaunched(kda_launchers.spying(record)):
         for current, make in _CASES.items():
             args, kw = make()
             with _route(k1=True, k2=True):
                 run_flash(*args, **kw)
-    finally:
-        _flash_kda._intj_launcher = original
 
     want = {name for name in _CASES if name.startswith("segmented")}
     assert want <= reached, f"never reached the Gluon K2: {sorted(want - reached)}"
 
 
-def test_wide_gluon_k2_launch_matches_triton(monkeypatch):
+def test_wide_gluon_k2_launch_matches_triton():
     """The published four-warp K2 schedule, which derives its layouts in-JIT."""
     if not _flash_kda._gluon_k2_usable(FLASH_KDA_CHUNK, K_DIM, K_DIM):
         pytest.skip("Gluon K2 requires gfx950")
-    from aiter.ops.triton._gluon_kernels.gfx950.chunk_delta_attn import (
-        flash_kda_k2 as _g2,
-    )
 
     args = make_inputs(1, 512, 64)
     assert _flash_kda._k2_gluon_schedule(K_DIM, 16, 64) == (64, 4)
@@ -623,31 +601,24 @@ def test_wide_gluon_k2_launch_matches_triton(monkeypatch):
         want, want_state = run_flash(*args, chunks_per_seg=1, output_final_state=True)
 
     seen = []
-    original = _flash_kda._intj_launcher
 
-    def counted(kernel, device, options=(), *a, **k):
-        if kernel is _g2.k2_ab_fused_gluon:
-            seen.append(dict(options))
-        return original(kernel, device, options, *a, **k)
+    def record(name, launch_args):
+        if name == "k2_ab_fused_gluon":
+            seen.append(launch_args[4])  # device, stream, 2-D grid, num_warps
 
-    monkeypatch.setattr(_flash_kda, "_intj_launcher", counted)
-    with _route(k1=True, k2=True):
+    spy = kda_launchers.spying(record)
+    with kda_launchers.relaunched(spy), _route(k1=True, k2=True):
         got, got_state = run_flash(*args, chunks_per_seg=1, output_final_state=True)
-    assert seen == [{"num_warps": 4}]
+    assert seen == [4]
     assert rel_err(got, want) < 2e-3
     assert rel_err(got_state, want_state) < 1e-4
 
 
 def test_gluon_kda_jits_have_no_captured_layout_globals():
     """intj refuses a JIT that reads globals, and cannot bake layout objects."""
-    from aiter.ops.triton._gluon_kernels.gfx950.chunk_delta_attn.flash_kda_k1 import (
-        k1_prepare_gluon,
-    )
-    from aiter.ops.triton._gluon_kernels.gfx950.chunk_delta_attn.flash_kda_k2 import (
-        k2_ab_fused_gluon,
-    )
-
-    for kernel in (k1_prepare_gluon, k2_ab_fused_gluon):
+    with kda_launchers.relaunched(lambda kernel, **_: kernel) as kernels:
+        jits = kernels["k1_prepare_gluon"], kernels["k2_ab_fused_gluon"]
+    for kernel in jits:
         _ = kernel.cache_key  # Triton populates used_global_vals lazily.
         assert not kernel.used_global_vals
 

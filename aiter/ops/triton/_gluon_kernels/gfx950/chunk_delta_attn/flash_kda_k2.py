@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+from intj import make_launcher
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
@@ -70,6 +71,7 @@ _k2_ab_fused_repr = make_kernel_repr(
 )
 
 
+@make_launcher(grid_arg=2, dynamic_options=("num_warps",))
 @gluon.jit(repr=_k2_ab_fused_repr)
 def k2_ab_fused_gluon(
     ws_kd,

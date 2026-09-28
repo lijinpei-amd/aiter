@@ -3,13 +3,13 @@
 
 """Tests for FlashKDA's direct intj launches.
 
-Every FlashKDA kernel launches through a cached, device-bound ``make_launcher``
-handle; the autotuned K1/K2 pass their decorated kernel, so intj tunes on a
-miss. intj's own ``test_spec_key_is_never_coarser_than_triton`` covers its
-specialization key. These tests check what FlashKDA adds on top: that the
-results are the bytes an ordinary Triton launch produces, that no launch goes
-through Triton's ``JITFunction.run``, and the device, stream, knob and lifetime
-rules of the handle cache.
+Every FlashKDA kernel is decorated with its intj launcher; the autotuned K1/K2
+carry their tuner, so intj tunes on a miss. intj's own
+``test_spec_key_is_never_coarser_than_triton`` covers its specialization key.
+These tests check what FlashKDA adds on top: that the results are the bytes an
+ordinary Triton launch produces, that no launch goes through Triton's
+``JITFunction.run``, and the device, stream and lifetime rules of the
+launchers.
 """
 
 import contextlib
@@ -19,12 +19,12 @@ import weakref
 import pytest
 import torch
 import triton
-import triton.language as tl
-from triton.runtime.autotuner import Autotuner, Heuristics
+from intj.launcher import module_of
 from triton.runtime.jit import JITFunction
 
 from aiter.ops.triton._triton_kernels.chunk_delta_attn import flash_kda as fk
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.flash_kda import flash_kda_fwd
+from op_tests.triton_tests.chunk_delta_attn import kda_launchers
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="flash_kda needs a GPU"
@@ -34,11 +34,6 @@ device = "cuda"
 dtype = torch.bfloat16
 K_DIM = 128
 LOWER_BOUND = -5.0
-
-
-@triton.jit
-def _write_one(out):
-    tl.store(out, 1)
 
 
 def make_inputs(B, T, H, seed=0, bias=False, state=False, varlen=False):
@@ -84,47 +79,9 @@ def run(args, **kw):
 
 @contextlib.contextmanager
 def ordinary_launches():
-    """Route FlashKDA's native handles through ``kernel[grid](...)``, for tests.
-
-    Undoes what ``_intj_launcher`` changes about the call: the decorator-assigned
-    and baked values come back as keywords, and a ``grid_cpp`` grid becomes the
-    Triton grid callback.
-    """
-    saved = fk._intj_launcher
-
-    def ordinary(kernel, device, options=(), baked=(), grid_cpp=None):
-        del device
-        jit, assigned = kernel, set()
-        while not isinstance(jit, JITFunction):
-            if type(jit) is Autotuner:
-                assigned.update(n for c in jit.configs for n in c.all_kwargs())
-            elif type(jit) is Heuristics:
-                assigned.update(jit.values)
-            jit = jit.fn
-        names = [
-            p.name for p in jit.params if p.name not in assigned | set(dict(baked))
-        ]
-
-        def launch(stream, *rest):
-            del stream  # Triton reads the current stream itself.
-            if grid_cpp is None:
-                grid, values = rest[:2], rest[2:]
-            else:
-                extra, values = rest[0], rest[1:]
-
-                def grid(meta):
-                    return grid_cpp(meta["W"], meta["BW"], segs_h=extra)
-
-            assert len(values) == len(names)
-            kernel[grid](**dict(zip(names, values)), **dict(baked), **dict(options))
-
-        return launch
-
-    fk._intj_launcher = ordinary
-    try:
+    """Route FlashKDA's launchers through ``kernel[grid](...)``, for tests."""
+    with kda_launchers.relaunched(kda_launchers.triton_launcher):
         yield
-    finally:
-        fk._intj_launcher = saved
 
 
 @pytest.fixture
@@ -171,50 +128,46 @@ def test_alignment_is_part_of_the_key():
 
 def test_no_launch_goes_through_triton(monkeypatch, triton_route):
     """All three Triton kernels reach intj, tuned or not, first call included."""
-    expected = {
-        fk._flash_kda_prepare_kernel,
-        fk._flash_kda_segment_kernel,
-        fk._flash_kda_seg_scan_kernel,
-    }
     seen = set()
-    original = fk._intj_launcher
-
-    def counted(kernel, *a, **kw):
-        seen.add(kernel)
-        return original(kernel, *a, **kw)
 
     def fail(*args, **kwargs):
         raise AssertionError("FlashKDA launched through JITFunction.run")
 
-    monkeypatch.setattr(fk, "_intj_launcher", counted)
-    monkeypatch.setattr(JITFunction, "run", fail)
-    fk._cached_intj_launcher.cache_clear()  # First calls too, not just hits.
-    run(make_inputs(1, 512, 4, seed=3), chunks_per_seg=4)
-    assert seen == expected
+    # Never-called launchers: first calls too, not just hits.
+    with kda_launchers.relaunched(kda_launchers.spying(lambda n, _: seen.add(n))):
+        monkeypatch.setattr(JITFunction, "run", fail)
+        run(make_inputs(1, 512, 4, seed=3), chunks_per_seg=4)
+    assert seen == {
+        "_flash_kda_prepare_kernel",
+        "_flash_kda_segment_kernel",
+        "_flash_kda_seg_scan_kernel",
+    }
 
 
 def test_multi_config_tuning_stays_native(monkeypatch, triton_route):
     """With several candidates, intj tunes K1 and K2 itself; still no Triton launch."""
-    k1 = fk._flash_kda_prepare_kernel.fn
-    k2 = fk._flash_kda_segment_kernel
     args = make_inputs(1, 1024, 4)
     want_o, want_s = run(args, chunks_per_seg=4)
 
-    monkeypatch.setattr(
-        k1, "configs", [triton.Config({}, num_warps=w, num_stages=1) for w in (2, 4)]
+    configs = kda_launchers.with_configs(
+        {
+            "_flash_kda_prepare_kernel": [
+                triton.Config({}, num_warps=w, num_stages=1) for w in (2, 4)
+            ],
+            "_flash_kda_segment_kernel": [
+                triton.Config({"BW": bw}, num_warps=2, num_stages=2) for bw in (16, 32)
+            ],
+        }
     )
-    monkeypatch.setattr(
-        k2,
-        "configs",
-        [triton.Config({"BW": bw}, num_warps=2, num_stages=2) for bw in (16, 32)],
-    )
-    monkeypatch.setattr(JITFunction, "run", lambda *a, **k: pytest.fail("Triton run"))
-    fk._cached_intj_launcher.cache_clear()
-    try:
+    with kda_launchers.relaunched(configs) as kernels:
+        monkeypatch.setattr(
+            JITFunction, "run", lambda *a, **k: pytest.fail("Triton run")
+        )
         got_o, got_s = run(args, chunks_per_seg=4)
+        k1 = kernels["_flash_kda_prepare_kernel"].fn
+        k2 = kernels["_flash_kda_segment_kernel"]
+        assert len(k1.configs) == len(k2.configs) == 2
         assert k1.best_config in k1.configs and k2.best_config in k2.configs
-    finally:
-        fk._cached_intj_launcher.cache_clear()  # Drop handles holding these configs.
     # Other configs reorder no reduction the result depends on beyond rounding.
     assert (got_o.float() - want_o.float()).abs().max() < 1e-2
     assert (got_s.float() - want_s.float()).abs().max() < 1e-3
@@ -292,35 +245,7 @@ def test_cached_native_handle_does_not_retain_tensor():
     assert ref() is None
 
 
-def test_native_handle_changes_with_debug_knob(monkeypatch):
-    from triton import knobs
-
-    dev = torch.cuda.current_device()
-    first = fk._intj_launcher(_write_one, dev)
-    monkeypatch.setattr(knobs.runtime, "debug", not knobs.runtime.debug)
-    assert fk._intj_launcher(_write_one, dev) is not first
-
-
-def test_native_handle_changes_with_jit_debug(monkeypatch):
-    dev = torch.cuda.current_device()
-    first = fk._intj_launcher(_write_one, dev)
-    monkeypatch.setattr(_write_one, "debug", not bool(_write_one.debug))
-    assert fk._intj_launcher(_write_one, dev) is not first
-
-
-def test_cached_native_handle_refuses_interpreter_mode(monkeypatch):
-    from intj.launcher import UnsupportedKernel
-    from triton import knobs
-
-    dev = torch.cuda.current_device()
-    fk._intj_launcher(_write_one, dev)
-    monkeypatch.setattr(knobs.runtime, "interpret", True)
-    with pytest.raises(UnsupportedKernel, match="TRITON_INTERPRET"):
-        fk._intj_launcher(_write_one, dev)
-
-
-def test_every_handle_constructs():
-    """Including both Gluon kernels, which only run on gfx950: no refusal here."""
+def _launchers():
     from aiter.ops.triton._gluon_kernels.gfx950.chunk_delta_attn.flash_kda_k1 import (
         k1_prepare_gluon,
     )
@@ -328,24 +253,23 @@ def test_every_handle_constructs():
         k2_ab_fused_gluon,
     )
 
-    dev = torch.cuda.current_device()
-    for cm in ("", ".wt"):
-        fk._intj_launcher(
-            k1_prepare_gluon,
-            dev,
-            (("num_warps", 2),),
-            (("CM_WS", cm), ("CM_LOAD", ".cg")),
-        )
-        fk._intj_launcher(
-            fk._flash_kda_prepare_kernel, dev, baked=(("CM_QKG", ".cg"), ("CM_WS", cm))
-        )
-    for nw in (2, 4):
-        fk._intj_launcher(k2_ab_fused_gluon, dev, (("num_warps", nw),))
-        fk._intj_launcher(fk._flash_kda_seg_scan_kernel, dev, (("num_warps", nw),))
-    for cm in ("", ".cs"):
-        fk._intj_launcher(
-            fk._flash_kda_segment_kernel,
-            dev,
-            baked=(("CM_OUT", cm),),
-            grid_cpp=fk._k2_grid,
-        )
+    return (
+        k1_prepare_gluon,
+        k2_ab_fused_gluon,
+        fk._flash_kda_prepare_kernel,
+        fk._flash_kda_segment_kernel,
+        fk._flash_kda_seg_scan_kernel,
+    )
+
+
+def test_kernels_are_intj_launchers():
+    """No Triton JIT function is left to launch through."""
+    for kernel in _launchers():
+        assert not isinstance(kernel, JITFunction)
+        assert type(kernel.__self__).__name__ == "Launcher"
+
+
+def test_every_launcher_builds():
+    """Including both Gluon kernels, which only run on gfx950: no refusal here."""
+    for kernel in _launchers():
+        module_of(kernel)
