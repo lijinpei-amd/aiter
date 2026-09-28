@@ -4272,6 +4272,22 @@ _paged_attention_decode_v2_reduce_kernel_launch = make_launcher(
     paged_attention_decode_v2_reduce_kernel,
 )
 
+# The head_1 and large-block kernels read the import-time constants MFMA,
+# VMEM_LOAD and COMPUTE (sched_group_barrier masks).
+_paged_attention_decode_sliding_window_head_1_launch = make_launcher(
+    paged_attention_decode_sliding_window_head_1, assume_constant_globals=True
+)
+_paged_attention_decode_sliding_window_launch = make_launcher(
+    paged_attention_decode_sliding_window
+)
+_paged_attention_decode_v2_gluon_large_block_dot_kernel_launch = make_launcher(
+    paged_attention_decode_v2_gluon_large_block_dot_kernel,
+    assume_constant_globals=True,
+)
+_paged_attention_decode_v2_gluon_dot_kernel_launch = make_launcher(
+    paged_attention_decode_v2_gluon_dot_kernel
+)
+
 
 def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     grid,
@@ -4350,7 +4366,9 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     if PS and not (SLIDING_WINDOW > 0 and KV_BLOCK_SIZE == 1024):
         ONE_SHOT = num_splits <= 1
         if num_kv_heads == 1:
-            paged_attention_kernel = paged_attention_decode_sliding_window_head_1
+            paged_attention_launch = (
+                _paged_attention_decode_sliding_window_head_1_launch
+            )
             if ONE_QUERY_GROUP_SIZE_POW2 >= 16:
                 grid = (num_sequences, query_seq_len * num_kv_heads, num_splits)
                 QUERY_SEQ_LEN_POW2 = 1
@@ -4362,8 +4380,12 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
                 grid = (num_sequences, mtp_splits, num_splits)
                 QUERY_SEQ_LEN_POW2 = triton.cdiv(QUERY_SEQ_LEN_POW2, mtp_splits)
         else:
-            paged_attention_kernel = paged_attention_decode_sliding_window
-        paged_attention_kernel[grid](
+            paged_attention_launch = _paged_attention_decode_sliding_window_launch
+        dev, stream = current_device_stream()
+        paged_attention_launch(
+            dev,
+            stream,
+            grid,
             exp_sums_ptr,
             max_logits_ptr,
             output_ptr,
@@ -4403,36 +4425,42 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
             stride_query_scale_kv_head,
             kv_scale_stride_0,
             kv_scale_stride_1,
-            query_seq_len=query_seq_len,
-            query_group_size=query_group_size,
-            head_size=HEAD_SIZE,
-            COMPUTE_TYPE=COMPUTE_TYPE,
-            QUERY_SEQ_LEN_POW2=QUERY_SEQ_LEN_POW2,
-            ONE_QUERY_GROUP_SIZE_POW2=ONE_QUERY_GROUP_SIZE_POW2,
-            HEAD_SIZE_POW2=HEAD_SIZE_POW2,
-            KV_BLOCK_SIZE=KV_BLOCK_SIZE,
-            CONTEXT_PARTITION_SIZE=CONTEXT_PARTITION_SIZE,
-            QUERY_QUANT_MODE=QUERY_QUANT_MODE,
-            KV_QUANT_MODE=KV_QUANT_MODE,
-            VALUE_TRANSPOSED=VALUE_TRANSPOSED,
-            IS_CAUSAL=IS_CAUSAL,
-            FP8_MAX_VALUE=FP8_MAX_VALUE,
-            SLIDING_WINDOW=SLIDING_WINDOW,
-            CDNA_VERSION=CDNA_VERSION,
-            ONE_SHOT=ONE_SHOT,
+            query_seq_len,
+            query_group_size,
+            HEAD_SIZE,
+            COMPUTE_TYPE,
+            QUERY_SEQ_LEN_POW2,
+            ONE_QUERY_GROUP_SIZE_POW2,
+            HEAD_SIZE_POW2,
+            KV_BLOCK_SIZE,
+            CONTEXT_PARTITION_SIZE,
+            QUERY_QUANT_MODE,
+            KV_QUANT_MODE,
+            VALUE_TRANSPOSED,
+            IS_CAUSAL,
+            FP8_MAX_VALUE,
+            SLIDING_WINDOW,
+            CDNA_VERSION,
+            ONE_SHOT,
         )
         return
 
     if KV_BLOCK_SIZE > CONTEXT_PARTITION_SIZE:
         # Use big block kernel for large block sizes
-        paged_attention_kernel = paged_attention_decode_v2_gluon_large_block_dot_kernel
+        paged_attention_launch = (
+            _paged_attention_decode_v2_gluon_large_block_dot_kernel_launch
+        )
 
     else:
         # Use standard kernel for normal block sizes
-        paged_attention_kernel = paged_attention_decode_v2_gluon_dot_kernel
+        paged_attention_launch = _paged_attention_decode_v2_gluon_dot_kernel_launch
 
     # Launch the dot kernel
-    paged_attention_kernel[grid](
+    dev, stream = current_device_stream()
+    paged_attention_launch(
+        dev,
+        stream,
+        grid,
         exp_sums_ptr,
         max_logits_ptr,
         output_ptr,
@@ -4469,24 +4497,24 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         stride_query_scale_kv_head,
         kv_scale_stride_0,
         kv_scale_stride_1,
-        head_size=HEAD_SIZE,
-        num_seqs=grid[0],
-        num_kv_heads=grid[1],
-        max_context_partition_num=grid[2],
-        COMPUTE_TYPE=COMPUTE_TYPE,
-        QUERY_SEQ_LEN=query_seq_len,
-        ONE_QUERY_GROUP_SIZE=query_group_size,
-        HEAD_SIZE_POW2=HEAD_SIZE_POW2,
-        KV_BLOCK_SIZE=KV_BLOCK_SIZE,
-        CONTEXT_PARTITION_SIZE=CONTEXT_PARTITION_SIZE,
-        KV_COMPUTE_BLOCK_SIZE=KV_COMPUTE_BLOCK_SIZE,
-        QUERY_QUANT_MODE=QUERY_QUANT_MODE,
-        KV_QUANT_MODE=KV_QUANT_MODE,
-        FP8_MAX_VALUE=FP8_MAX_VALUE,
-        VALUE_TRANSPOSED=VALUE_TRANSPOSED,
-        IS_CAUSAL=IS_CAUSAL,
-        CDNA_VERSION=CDNA_VERSION,
-        SLIDING_WINDOW=SLIDING_WINDOW,
+        HEAD_SIZE,
+        grid[0],
+        grid[1],
+        grid[2],
+        COMPUTE_TYPE,
+        query_seq_len,
+        query_group_size,
+        HEAD_SIZE_POW2,
+        KV_BLOCK_SIZE,
+        CONTEXT_PARTITION_SIZE,
+        KV_COMPUTE_BLOCK_SIZE,
+        QUERY_QUANT_MODE,
+        KV_QUANT_MODE,
+        FP8_MAX_VALUE,
+        VALUE_TRANSPOSED,
+        IS_CAUSAL,
+        CDNA_VERSION,
+        SLIDING_WINDOW,
     )
 
 

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 import argparse
+import functools
 import hashlib
 import os
 import random
@@ -11,6 +12,7 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 from jinja2 import Template
 
 import aiter
@@ -21,6 +23,7 @@ from aiter.ops.triton.gluon.pa_decode_gluon import (
     paged_attention_decode_v2_gluon_large_block_dot_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.test_common import perftest
 from csrc.cpp_itfs.gluon_aot_tools.compile_gluon import (
     CompileGluonArgs,
@@ -472,6 +475,18 @@ def run_compiled_attention_kernel(
     )
 
 
+@functools.cache
+def _direct_launch(kernel):
+    # The large-block kernel reads the import-time constants COMPUTE and
+    # VMEM_LOAD (sched_group_barrier masks) from pa_decode_gluon.
+    return make_launcher(
+        kernel,
+        dynamic_options=("waves_per_eu",),
+        options={"num_stages": 1},
+        assume_constant_globals=True,
+    )
+
+
 @perftest()
 def run_direct_attention_kernel(
     exp_sums: torch.Tensor,
@@ -588,7 +603,12 @@ def run_direct_attention_kernel(
             waves_per_eu = 4
 
     # Launch the kernel directly (following _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper)
-    kernel[grid](
+    dev, stream = current_device_stream()
+    _direct_launch(kernel)(
+        dev,
+        stream,
+        grid,
+        waves_per_eu,
         exp_sums,
         max_logits,
         temporary_output,
@@ -626,25 +646,24 @@ def run_direct_attention_kernel(
         stride_query_scale_kv_head,
         key_scale_stride_0,
         key_scale_stride_1,
-        head_size=head_size,
-        num_seqs=num_seqs,
-        num_kv_heads=num_kv_heads,
-        max_context_partition_num=max_context_partition_num,
-        COMPUTE_TYPE=compute_type_tl,
-        QUERY_SEQ_LEN=query_seq_len,
-        ONE_QUERY_GROUP_SIZE=query_group_size,
-        HEAD_SIZE_POW2=triton.next_power_of_2(head_size),
-        KV_BLOCK_SIZE=kv_block_size,
-        CONTEXT_PARTITION_SIZE=context_partition_size,
-        KV_COMPUTE_BLOCK_SIZE=kv_compute_block_size,
-        QUERY_QUANT_MODE=query_quant_mode,
-        KV_QUANT_MODE=kv_quant_mode,
-        FP8_MAX_VALUE=fp8_max_value,
-        VALUE_TRANSPOSED=value_transposed,
-        IS_CAUSAL=is_causal,
-        CDNA_VERSION=cdna_version,
-        waves_per_eu=waves_per_eu,
-        num_stages=1,
+        head_size,
+        num_seqs,
+        num_kv_heads,
+        max_context_partition_num,
+        compute_type_tl,
+        query_seq_len,
+        query_group_size,
+        triton.next_power_of_2(head_size),
+        kv_block_size,
+        context_partition_size,
+        kv_compute_block_size,
+        query_quant_mode,
+        kv_quant_mode,
+        fp8_max_value,
+        value_transposed,
+        is_causal,
+        cdna_version,
+        0,  # SLIDING_WINDOW
     )
 
 
