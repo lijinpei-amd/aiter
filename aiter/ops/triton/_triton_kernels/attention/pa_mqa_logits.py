@@ -444,6 +444,8 @@ _deepgemm_fp8_paged_mqa_logits_repr = make_kernel_repr(
 )
 
 
+# The caller returns the compiled kernel's Triton cache key.
+@make_launcher(dynamic_options=("waves_per_eu",), return_compiled=True)
 @triton.jit(repr=_deepgemm_fp8_paged_mqa_logits_repr)
 def _deepgemm_fp8_paged_mqa_logits(
     batch_size,

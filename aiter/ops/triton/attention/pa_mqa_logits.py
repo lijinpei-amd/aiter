@@ -26,6 +26,8 @@ from functools import cache
 
 import torch
 import triton
+import triton.language as tl
+from intj import NEVER, Aligned, Argument, Assume, PointerRange, make_launcher
 from packaging.version import Version
 from triton.backends.compiler import GPUTarget
 
@@ -291,21 +293,9 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
     )
 
 
-@cache
-def _compile_deepgemm_fp8_paged_mqa_logits(
-    ChunkQ,
-    ChunkK,
-    Preshuffle,
-    KVBlockSize,
-    HiddenDim,
-    is_padded_mode: bool,
-    WavePerEU: int = 2,
-    VarCtxOpt: bool = False,
-):
-    gfx_version = get_gfx()
-    assert gfx_version in _GLUON_PA_MQA_LOGITS_ARCHS
-    is_gfx1250 = gfx_version == "gfx1250"
-    if is_gfx1250:
+def _check_gluon_block_size(Preshuffle, KVBlockSize, ChunkK):
+    assert get_gfx() in _GLUON_PA_MQA_LOGITS_ARCHS
+    if get_gfx() == "gfx1250":
         if Preshuffle:
             assert KVBlockSize > 1 and ChunkK % KVBlockSize == 0, (
                 f"gfx1250 preshuffle (TDM block-load) requires KVBlockSize>1 "
@@ -318,6 +308,135 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
                 f"KVBlockSize={KVBlockSize}. Use Preshuffle=True for "
                 f"KVBlockSize>1 (TDM block-load)."
             )
+
+
+@cache
+def _aot_metadata_path(
+    ChunkQ,
+    ChunkK,
+    Preshuffle,
+    KVBlockSize,
+    HiddenDim,
+    is_padded_mode,
+    WavePerEU,
+    VarCtxOpt,
+):
+    """The directory holding the prebuilt hsaco/json that AOTMetadataContext
+    substitutes for this kernel's compile."""
+    padded_str = "T" if is_padded_mode and not Preshuffle else "F"
+    preshuffle_suffix = "_preshuffle" if Preshuffle else ""
+    varctx_suffix = "_varctx" if VarCtxOpt else ""
+    kernel_str = f"paged_mqa_logits{preshuffle_suffix}{varctx_suffix}_{ChunkQ}x{ChunkK}x{HiddenDim}_B{KVBlockSize}P{padded_str}W{WavePerEU}"
+    return f"{AITER_TRITON_CONFIGS_PATH}/paged_mqa_logits/aot/{kernel_str}"
+
+
+def _gluon_kernel(Preshuffle, VarCtxOpt):
+    if not Preshuffle:
+        return _gluon_deepgemm_fp8_paged_mqa_logits
+    if VarCtxOpt:
+        return _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx
+    return _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle
+
+
+@cache
+def _gluon_paged_mqa_logits_launch(Preshuffle, VarCtxOpt, is_padded_mode):
+    """The Gluon kernel for this mode, with the types and specialization facts
+    the Triton < 3.5 AOT path spells out in `_compile_deepgemm_fp8_paged_mqa_logits`
+    (asserted, not measured: the caller promises them). A parameter it gives
+    no fact keeps none, except that intj still measures the facts an `Assume`
+    leaves out (the KV pointers' and the index pointers' remaining ones)."""
+    gfx_version = get_gfx()
+    is_gfx1250 = gfx_version == "gfx1250"
+    # gfx942 uses the AMD fnuz e4m3 variant (*fp8e4b8); gfx950 and gfx1250 use
+    # the OCP/IEEE e4m3 variant (*fp8e4nv), matching utils.types.get_fp8_dtypes.
+    fp8_ptr = tl.pointer_type(
+        tl.float8e4b8 if gfx_version == "gfx942" else tl.float8e4nv
+    )
+    i32 = Argument(type=tl.int32, specialize=NEVER)
+    i32_aligned = Argument(type=tl.int32, specialize=Assume(Aligned(16)))
+    # The plain kernel forms per-token KV addresses from the page table, so
+    # a cache past 2 GiB overflows a 32-bit stride product.
+    kv_stride = Argument(
+        type=tl.int32 if Preshuffle else tl.int64,
+        specialize=Assume(Aligned(16)) if is_padded_mode else NEVER,
+    )
+    kv_facts = Assume(Aligned(16)) if is_padded_mode else NEVER
+    annotation = {
+        "batch_size": i32,
+        "next_n": i32,
+        "heads_num": i32_aligned,
+        "Q_buffer": Argument(
+            type=fp8_ptr, specialize=Assume(Aligned(16), PointerRange(32))
+        ),
+        "stride_q_batch": i32_aligned,
+        "stride_q_next_n": i32_aligned,
+        "stride_q_heads": i32_aligned,
+        "KV_buffer": Argument(type=fp8_ptr, specialize=kv_facts),
+        "stride_k_seq": kv_stride,
+        "scale_buffer": Argument(type=tl.pointer_type(tl.float32), specialize=kv_facts),
+        "stride_scale_seq": kv_stride,
+        "context_len_ptr": Argument(
+            type=tl.pointer_type(tl.int32), specialize=Assume(PointerRange(32))
+        ),
+        "kv_indices": Argument(
+            type=tl.pointer_type(tl.int32), specialize=Assume(PointerRange(32))
+        ),
+        "weights": Argument(
+            type=tl.pointer_type(tl.float32),
+            specialize=Assume(Aligned(16), PointerRange(32)),
+        ),
+        "stride_w_batch": i32_aligned,
+        # OutLogits_buffer: NO tt.pointer_range 32 -- the output row base
+        # offset (row * stride_out_batch) can exceed a 32-bit byte offset
+        # for wide dense logits (e.g. max_model_len=1<<20). stride_out_batch
+        # is i64 and the gluon kernel advances the base pointer in 64 bit
+        # (buffer_store voffset stays int32) to avoid the 2**31 overflow.
+        "OutLogits_buffer": Argument(
+            type=tl.pointer_type(tl.float32), specialize=NEVER
+        ),
+        "stride_out_batch": Argument(type=tl.int64, specialize=NEVER),
+        "max_model_len": i32,
+        "max_block_len": i32,
+        "num_block": i32,
+    }
+    if VarCtxOpt:
+        annotation["safe_chunks_per_cta_ptr"] = Argument(
+            type=tl.pointer_type(tl.int32), specialize=NEVER
+        )
+    else:
+        annotation["SplitKV"] = i32
+
+    kernel_fn = _gluon_kernel(Preshuffle, VarCtxOpt)
+    # The kernels read the import-time constant _Use_2d_instr_shape_mfma_layout.
+    # Callers read the returned kernel's hash (the AOT benchmark zips its cache
+    # directory).
+    return make_launcher(
+        kernel_fn,
+        dynamic_options=("waves_per_eu",),
+        extra_annotation=annotation,
+        options={
+            "num_warps": 1 if is_gfx1250 and Preshuffle else 4,
+            "num_stages": 2,
+        },
+        return_compiled=True,
+        assume_constant_globals=True,
+    )
+
+
+@cache
+def _compile_deepgemm_fp8_paged_mqa_logits(
+    ChunkQ,
+    ChunkK,
+    Preshuffle,
+    KVBlockSize,
+    HiddenDim,
+    is_padded_mode: bool,
+    WavePerEU: int = 2,
+    VarCtxOpt: bool = False,
+):
+    gfx_version = get_gfx()
+    _check_gluon_block_size(Preshuffle, KVBlockSize, ChunkK)
+    is_gfx1250 = gfx_version == "gfx1250"
     cdna_version = get_cdna_version()
     warp_size = 32 if is_gfx1250 else 64
     target = GPUTarget("hip", gfx_version, warp_size)
@@ -443,14 +562,18 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
             options=options,
         )
     else:
-        padded_str = "T" if is_padded_mode and not Preshuffle else "F"
-        preshuffle_suffix = "_preshuffle" if Preshuffle else ""
-        varctx_suffix = "_varctx" if VarCtxOpt else ""
-        kernel_str = f"paged_mqa_logits{preshuffle_suffix}{varctx_suffix}_{ChunkQ}x{ChunkK}x{HiddenDim}_B{KVBlockSize}P{padded_str}W{WavePerEU}"
-        metadata_pth = f"{AITER_TRITON_CONFIGS_PATH}/paged_mqa_logits/aot/{kernel_str}"
         with AOTMetadataContext(
             kernel_fn.fn.__name__,
-            metadata_pth,
+            _aot_metadata_path(
+                ChunkQ,
+                ChunkK,
+                Preshuffle,
+                KVBlockSize,
+                HiddenDim,
+                is_padded_mode,
+                WavePerEU,
+                VarCtxOpt,
+            ),
         ):
             kernel = triton.compile(
                 src,
@@ -579,19 +702,12 @@ def deepgemm_fp8_paged_mqa_logits(
 
     if enable_gluon_pa_mqa_logits:
         is_padded_mode = kv_cache_fp8.stride(0) % 16 == 0
-        kernel = _compile_deepgemm_fp8_paged_mqa_logits(
-            ChunkQ=heads,
-            ChunkK=ChunkK,
-            Preshuffle=Preshuffle,
-            KVBlockSize=KVBlockSize,
-            HiddenDim=hidden_dim,
-            is_padded_mode=is_padded_mode,
-            WavePerEU=WavePerEU,
-            VarCtxOpt=VarCtxOpt,
-        )
         if triton_version >= Version("3.5.0"):
-            cdna_version = get_cdna_version()
-            kernel[grid](
+            _check_gluon_block_size(Preshuffle, KVBlockSize, ChunkK)
+            launch = _gluon_paged_mqa_logits_launch(
+                Preshuffle, VarCtxOpt, is_padded_mode
+            )
+            args = (
                 batch_size,
                 next_n,
                 heads,
@@ -613,15 +729,46 @@ def deepgemm_fp8_paged_mqa_logits(
                 max_block_len,
                 num_block,
                 SplitKV if not VarCtxOpt else VarCtxSchedule,
-                # constexpr
-                heads,
+                heads,  # ChunkQ
                 ChunkK,
+                hidden_dim,  # HiddenDim
                 KVBlockSize,
-                hidden_dim,
-                cdna_version,
-                get_gfx(),
+                get_cdna_version(),
+                get_gfx(),  # ARCH
             )
+            waves_per_eu = 1 if get_gfx() == "gfx1250" and not Preshuffle else WavePerEU
+            dev, stream = current_device_stream()
+            if enable_jit_gluon_pa_mqa_logits_kernel:
+                kernel = launch(dev, stream, grid, waves_per_eu, *args)
+            else:
+                # A launch that misses intj's cache compiles on this thread, so
+                # the context swaps in the prebuilt hsaco/json, as it did for
+                # triton.compile. The prebuilt kernel must have this signature.
+                with AOTMetadataContext(
+                    _gluon_kernel(Preshuffle, VarCtxOpt).fn.__name__,
+                    _aot_metadata_path(
+                        heads,
+                        ChunkK,
+                        Preshuffle,
+                        KVBlockSize,
+                        hidden_dim,
+                        is_padded_mode,
+                        WavePerEU,
+                        VarCtxOpt,
+                    ),
+                ):
+                    kernel = launch(dev, stream, grid, waves_per_eu, *args)
         else:  #  load AOT compiled gluon kernel
+            kernel = _compile_deepgemm_fp8_paged_mqa_logits(
+                ChunkQ=heads,
+                ChunkK=ChunkK,
+                Preshuffle=Preshuffle,
+                KVBlockSize=KVBlockSize,
+                HiddenDim=hidden_dim,
+                is_padded_mode=is_padded_mode,
+                WavePerEU=WavePerEU,
+                VarCtxOpt=VarCtxOpt,
+            )
             assert triton_version < Version(
                 "3.4.0"
             ), "https://github.com/triton-lang/triton/pull/7258 involves a ABI-breaking change on triton3.4, "
@@ -661,7 +808,12 @@ def deepgemm_fp8_paged_mqa_logits(
         assert not Preshuffle, "Preshuffle mode is only supported on gluon kernel."
         kv_cache_values = kv_cache_fp8.view(num_block, KVBlockSize, hidden_dim)
         kv_cache_scales = kv_cache_scale.view(num_block, KVBlockSize)
-        kernel = _deepgemm_fp8_paged_mqa_logits[grid](
+        dev, stream = current_device_stream()
+        kernel = _deepgemm_fp8_paged_mqa_logits(
+            dev,
+            stream,
+            grid,
+            WavePerEU,
             batch_size,
             next_n,
             heads,
@@ -683,11 +835,10 @@ def deepgemm_fp8_paged_mqa_logits(
             out_logits.stride(0),
             max_model_len,
             max_block_len,
-            waves_per_eu=WavePerEU,
-            ChunkQ=heads,
-            ChunkK=ChunkK,
-            SplitKV=SplitKV,
-            HiddenDim=hidden_dim,
-            KVBlockSize=KVBlockSize,
+            heads,  # ChunkQ
+            ChunkK,
+            hidden_dim,  # HiddenDim
+            KVBlockSize,
+            SplitKV,
         )
     return triton.runtime.cache.get_cache_manager(kernel.hash).key

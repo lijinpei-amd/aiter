@@ -430,7 +430,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
     max_model_len,
     max_block_len,
     num_block,
-    SplitKV: gl.constexpr,
+    SplitKV,  # runtime i32, as every launch compiles it
     ChunkQ: gl.constexpr,
     ChunkK: gl.constexpr,
     HiddenDim: gl.constexpr,
