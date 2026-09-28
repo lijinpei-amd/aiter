@@ -526,8 +526,8 @@ def _unified_attention_2d_triton(params: _UAParams):
         config["BLOCK_Q"],
         params.num_seqs,
         config["BLOCK_M"],
-        config.get("FP8_MIN", -240.0),
-        config.get("FP8_MAX", 240.0),
+        config.get("FP8_MIN", torch.finfo(e4m3_dtype).min),
+        config.get("FP8_MAX", torch.finfo(e4m3_dtype).max),
         params.all_decode,
         params.shuffled_kv_cache,
         config.get("SPLIT_UNMASKED_LOOP", False),
@@ -680,8 +680,8 @@ def _reduce_segments_triton(
         params.cu_seqlens_q,
         None,  # BLOCK_Q
         NUM_SEGMENTS,
-        config.get("FP8_MIN", -240.0),
-        config.get("FP8_MAX", 240.0),
+        config.get("FP8_MIN", torch.finfo(e4m3_dtype).min),
+        config.get("FP8_MAX", torch.finfo(e4m3_dtype).max),
     )
 
 
@@ -952,8 +952,8 @@ def _unified_attention_3d_gfx1250(
         QUERY_DTYPE,
         KV_CACHE_DTYPE,
         params.block_scales_size,
-        config.get("FP8_MIN", -240.0),
-        config.get("FP8_MAX", 240.0),
+        config.get("FP8_MIN", torch.finfo(e4m3_dtype).min),
+        config.get("FP8_MAX", torch.finfo(e4m3_dtype).max),
     )
 
 

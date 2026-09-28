@@ -265,8 +265,8 @@ def mla_prefill_fwd(
             QUERY_DTYPE,
             KV_CACHE_DTYPE,
             K_WIDTH,
-            attn_config.get("FP8_MIN", -240.0),
-            attn_config.get("FP8_MAX", 240.0),
+            attn_config.get("FP8_MIN", torch.finfo(e4m3_dtype).min),
+            attn_config.get("FP8_MAX", torch.finfo(e4m3_dtype).max),
         )
     else:
         dev, stream = current_device_stream()
@@ -309,8 +309,8 @@ def mla_prefill_fwd(
             attn_config["num_warps"],
             attn_config["num_stages"],
             NUM_HEAD_BLOCKS,
-            attn_config.get("FP8_MIN", -240.0),
-            attn_config.get("FP8_MAX", 240.0),
+            attn_config.get("FP8_MIN", torch.finfo(e4m3_dtype).min),
+            attn_config.get("FP8_MAX", torch.finfo(e4m3_dtype).max),
         )
     return out
 
@@ -565,8 +565,8 @@ def mla_decode_fwd(
                 KV_CACHE_DTYPE,
                 BLOCK_SCALES_SIZE,
                 NUM_HEAD_BLOCKS,
-                attn_config.get("FP8_MIN", -240.0),
-                attn_config.get("FP8_MAX", 240.0),
+                attn_config.get("FP8_MIN", torch.finfo(e4m3_dtype).min),
+                attn_config.get("FP8_MAX", torch.finfo(e4m3_dtype).max),
             )
         else:
             dev, stream = current_device_stream()
@@ -716,7 +716,7 @@ def mla_decode_fwd(
         BLOCK_Q,
         reduce_config["NUM_SEGMENTS_PER_SEQ"],
         ALL_DECODE,
-        reduce_config.get("FP8_MIN", -240.0),
-        reduce_config.get("FP8_MAX", 240.0),
+        reduce_config.get("FP8_MIN", torch.finfo(e4m3_dtype).min),
+        reduce_config.get("FP8_MAX", torch.finfo(e4m3_dtype).max),
     )
     return out
