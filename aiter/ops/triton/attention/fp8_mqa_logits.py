@@ -100,15 +100,9 @@ def _gfx942_tile_fits_lds(
 @functools.cache
 def _gluon_fp8_mqa_logits_kernel_launch():
     # Built on first use: the Gluon kernel is None when its import fails.
+    # gfx1250 only: the gfx950 kernel launches through Triton (see fp8_mqa_logits)
     return make_launcher(
-        _gluon_fp8_mqa_logits_kernel,
-        dynamic_options=(
-            "num_warps",
-            "num_stages",
-            "waves_per_eu",
-            "matrix_instr_nonkdim",
-            "kpack",
-        ),
+        _gluon_fp8_mqa_logits_kernel, dynamic_options=("num_warps", "waves_per_eu")
     )
 
 
@@ -321,50 +315,76 @@ def fp8_mqa_logits(
             other = {"LOOP_VARIANT": loop_variant}
             grid = ((seq_len + block_m - 1) // block_m,)
 
-        dev, stream = current_device_stream()
-        _gluon_fp8_mqa_logits_kernel_launch()(
-            dev,
-            stream,
-            grid,
-            num_warps,
-            other.get("num_stages", 2),
-            waves_per_eu,
-            other.get("matrix_instr_nonkdim", 0),
-            other.get("kpack", 1),
-            Q,
-            KV,
-            kv_scales,
-            weights,
-            cu_starts,
-            cu_ends,
-            logits,
-            seq_len,
-            seq_len_kv,
-            other["num_kv_splits"],
-            num_heads,
-            head_size,
-            stride_q_s,
-            stride_q_h,
-            stride_q_d,
-            stride_kv_s,
-            stride_kv_d,
-            stride_w_s,
-            stride_w_h,
-            stride_logits_s,
-            stride_logits_k,
-            block_kv,
-            num_warps,
-            num_buffers,
-            num_chains,
-            use_buffer_load,
-            use_buffer_store,
-            other["USE_PADDED_SHARED_LAYOUT"],
-            other.get("BLOCK_M", 1),
-            other.get("MFMA_NONK_DIM", 32),
-            other.get("M_CHUNK", 0),
-            other.get("UNROLL", 1),
-            other.get("RELAXED_STORE", 0),
-            other.get("HAS_KV_SPLIT", 0),
-        )
+        if arch == "gfx950":
+            # Triton launch: intj refuses the kernel's used_global_vals reference
+            # to _MAX_PROPAGATE_NAN_ALL (see docs/intj_launch_exceptions.md).
+            _gluon_fp8_mqa_logits_kernel[grid](
+                Q_ptr=Q,
+                KV_ptr=KV,
+                kv_scales_ptr=kv_scales,
+                weights_ptr=weights,
+                cu_start_ptr=cu_starts,
+                cu_end_ptr=cu_ends,
+                logits_ptr=logits,
+                seq_len=seq_len,
+                seq_len_kv=seq_len_kv,
+                NUM_HEADS=num_heads,
+                HEAD_SIZE=head_size,
+                stride_q_s=stride_q_s,
+                stride_q_h=stride_q_h,
+                stride_q_d=stride_q_d,
+                stride_kv_s=stride_kv_s,
+                stride_kv_d=stride_kv_d,
+                stride_w_s=stride_w_s,
+                stride_w_h=stride_w_h,
+                stride_logits_s=stride_logits_s,
+                stride_logits_k=stride_logits_k,
+                BLOCK_KV=block_kv,
+                NUM_WARPS=num_warps,
+                NUM_BUFFERS=num_buffers,
+                NUM_CHAINS=num_chains,
+                USE_BUFFER_LOAD=use_buffer_load,
+                USE_BUFFER_STORE=use_buffer_store,
+                num_warps=num_warps,
+                waves_per_eu=waves_per_eu,
+                **other,
+            )
+        else:
+            # gfx1250: a different kernel signature (LOOP_VARIANT, no split-K)
+            dev, stream = current_device_stream()
+            _gluon_fp8_mqa_logits_kernel_launch()(
+                dev,
+                stream,
+                grid,
+                num_warps,
+                waves_per_eu,
+                Q,
+                KV,
+                kv_scales,
+                weights,
+                cu_starts,
+                cu_ends,
+                logits,
+                seq_len,
+                seq_len_kv,
+                num_heads,
+                head_size,
+                stride_q_s,
+                stride_q_h,
+                stride_q_d,
+                stride_kv_s,
+                stride_kv_d,
+                stride_w_s,
+                stride_w_h,
+                stride_logits_s,
+                stride_logits_k,
+                block_kv,
+                num_warps,
+                num_buffers,
+                num_chains,
+                other["LOOP_VARIANT"],
+                use_buffer_load,
+                use_buffer_store,
+            )
 
     return logits
