@@ -3,6 +3,7 @@ from pathlib import Path
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -92,6 +93,7 @@ _pod_persistent_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("waves_per_eu", "num_warps"), return_compiled=True)
 @triton.jit(repr=_pod_persistent_repr)
 def pod_persistent(
     # Prefill/Decode Communication

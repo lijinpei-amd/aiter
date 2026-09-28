@@ -6,6 +6,7 @@ import torch
 from aiter.ops.triton._triton_kernels.quant.quant import (
     pod_persistent,
 )
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -196,9 +197,14 @@ def pod_attention(
     # TODO: need to tune
     max_output_tile_cnt = 16
 
-    pod_kernel = pod_persistent[grid](
+    dev, stream = current_device_stream()
+    pod_kernel = pod_persistent(
+        dev,
+        stream,
+        grid,
+        waves_per_eu,
+        num_warps,
         cu_ctr,
-        # Decode positional arguments
         q,
         k,
         v,
@@ -209,22 +215,21 @@ def pod_attention(
         o,
         batch_num_block_n,
         locks,
-        q.stride(0),  # N_CTX_Q
-        q.stride(1),  # H
-        q.stride(2),  # HEAD_DIM
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        o.stride(0),
-        o.stride(1),
-        o.stride(2),
-        Op.stride(0),  # total_programs
-        Op.stride(1),  # N_CTX_Q
-        Op.stride(2),  # HEAD_DIM
-        # Prefill positional arguments
+        q.stride(0),  # stride_qm
+        q.stride(1),  # stride_qh
+        q.stride(2),  # stride_qk
+        k.stride(0),  # stride_kn
+        k.stride(1),  # stride_kh
+        k.stride(2),  # stride_kk
+        v.stride(0),  # stride_vn
+        v.stride(1),  # stride_vh
+        v.stride(2),  # stride_vk
+        o.stride(0),  # stride_om
+        o.stride(1),  # stride_oh
+        o.stride(2),  # stride_on
+        Op.stride(0),  # stride_oph
+        Op.stride(1),  # stride_opm
+        Op.stride(2),  # stride_opn
         q_pf,
         k_pf,
         v_pf,
@@ -234,52 +239,44 @@ def pod_attention(
         o_pf,
         batch_num_block_n_pf,
         locks_pf,
-        q_pf.stride(0),
-        q_pf.stride(1),
-        q_pf.stride(2),
-        k_pf.stride(0),
-        k_pf.stride(1),
-        k_pf.stride(2),
-        v_pf.stride(0),
-        v_pf.stride(1),
-        v_pf.stride(2),
-        o_pf.stride(0),
-        o_pf.stride(1),
-        o_pf.stride(2),
-        Op_pf.stride(0),
-        Op_pf.stride(1),
-        Op_pf.stride(2),
-        # Decode keyword argument
-        HEAD_DIM=HEAD_DIM_K,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        batch_size=batch_size,
-        num_m_blocks=num_m_blocks,
-        num_n_blocks=num_n_blocks,
-        # leanAttention params
-        high_load_wgs=high_load_wgs,
-        max_tiles_per_wg=max_tiles_per_wg,
-        tiles_per_head=tiles_per_head,
-        num_splits=num_splits,
-        waves_per_eu=waves_per_eu,
-        num_warps=num_warps,
-        # Prefill keyword argument
-        # HEAD_DIM=HEAD_DIM_K,
-        BLOCK_M_pf=BLOCK_M_pf,
-        BLOCK_N_pf=BLOCK_N_pf,
-        MASKED_BLOCKS=MASKED_BLOCKS,
-        batch_size_pf=batch_size_pf,
-        # causal_pf=causal_pf,
-        num_m_blocks_pf=num_m_blocks_pf,
-        num_n_blocks_pf=num_n_blocks_pf,
-        # leanAttention params
-        high_load_wgs_pf=high_load_wgs_pf,
-        max_tiles_per_wg_pf=max_tiles_per_wg_pf,
-        tiles_per_head_pf=tiles_per_head_pf,
-        num_splits_pf=num_splits_pf,
-        prefill_ratio=prefill_ratio,
-        decode_ratio=decode_ratio,
-        max_output_tile_cnt=max_output_tile_cnt,
+        q_pf.stride(0),  # stride_qm_pf
+        q_pf.stride(1),  # stride_qh_pf
+        q_pf.stride(2),  # stride_qk_pf
+        k_pf.stride(0),  # stride_kn_pf
+        k_pf.stride(1),  # stride_kh_pf
+        k_pf.stride(2),  # stride_kk_pf
+        v_pf.stride(0),  # stride_vn_pf
+        v_pf.stride(1),  # stride_vh_pf
+        v_pf.stride(2),  # stride_vk_pf
+        o_pf.stride(0),  # stride_om_pf
+        o_pf.stride(1),  # stride_oh_pf
+        o_pf.stride(2),  # stride_on_pf
+        Op_pf.stride(0),  # stride_oph_pf
+        Op_pf.stride(1),  # stride_opm_pf
+        Op_pf.stride(2),  # stride_opn_pf
+        HEAD_DIM_K,
+        BLOCK_M,
+        BLOCK_N,
+        batch_size,
+        num_m_blocks,
+        num_n_blocks,
+        high_load_wgs,
+        max_tiles_per_wg,
+        tiles_per_head,
+        num_splits,
+        BLOCK_M_pf,
+        BLOCK_N_pf,
+        MASKED_BLOCKS,
+        batch_size_pf,
+        num_m_blocks_pf,
+        num_n_blocks_pf,
+        high_load_wgs_pf,
+        max_tiles_per_wg_pf,
+        tiles_per_head_pf,
+        num_splits_pf,
+        prefill_ratio,
+        decode_ratio,
+        max_output_tile_cnt,
     )
     # torch.cuda.synchronize()
     print(

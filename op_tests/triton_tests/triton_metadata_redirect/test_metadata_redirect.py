@@ -6,6 +6,7 @@ import pytest
 import torch
 import triton
 import triton.language as tl
+from intj import make_launcher
 from triton.backends.compiler import GPUTarget
 from triton.tools.compile import CompileArgs, compile_kernel
 
@@ -5819,13 +5820,21 @@ def test_jit():
         with open(json_file, "w") as f:
             f.write(aot_kernel0_json)
 
+        # return_compiled: the launch returns the CompiledKernel it ran.
+        @make_launcher(return_compiled=True)
         @with_custom_metadata_path(temp_dir)
         @triton.jit
         def empty_kernel(x_ptr, SIZE: tl.constexpr):
             return
 
         x = torch.zeros((1, 1, 2), dtype=torch.float32, device="cuda")
-        kernel = empty_kernel[(1, 1, 1)](x, SIZE=64)
+        kernel = empty_kernel(
+            x.device.index,
+            torch.cuda.current_stream().cuda_stream,
+            (1, 1, 1),
+            x,
+            64,  # SIZE
+        )
 
         # check
         assert kernel.metadata.hash in aot_kernel0_json, "hash not found in json"
