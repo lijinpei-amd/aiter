@@ -10,6 +10,20 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-25-kda-direct-intj-launch-design.md`
 
+> **Amendment (2026-09-29): no handle cache; the kernels are their launchers.**
+> The `_intj_launcher` / `_cached_intj_launcher` factory is removed. Each of the
+> five kernels carries `@make_launcher(...)` on its definition and is called
+> `kernel(device, stream, *grid, *dynamic_options, *args)`: no `bind_device`,
+> `grid_arg=2` (K2 keeps `grid_cpp=_k2_grid`), `num_warps` as an option for
+> Gluon K1 and a dynamic option for Gluon K2 and the scan, and the cache
+> modifiers passed as str constexprs instead of baked. The handle key (JIT
+> source key, debug, instrumentation and fpsan knobs) and the interpreter check
+> go: intj reads those at a launcher's first call. Device/stream validation is
+> unchanged. Tests get fresh launchers from
+> `op_tests/triton_tests/chunk_delta_attn/kda_launchers.py::relaunched`, which
+> re-runs the kernel modules under a stand-in `make_launcher`, instead of
+> `_cached_intj_launcher.cache_clear()`.
+
 > **Amendment (2026-09-27): multi-config K1/K2 also launch through intj.** intj
 > `develop` now accepts `@triton.autotune`/`@triton.heuristics` chains in
 > `make_launcher` (intj `docs/Usage.md`, "Autotune and heuristics"), so the

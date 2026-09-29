@@ -1,5 +1,11 @@
 # KDA Direct intj Launch Design
 
+> **Amendment (2026-09-29).** The cached, device-bound handle factory below is
+> gone: each kernel is decorated with its own `make_launcher` launcher and
+> called with the device index per call; the cache modifiers are str
+> constexprs, and intj fixes the Triton knobs at a launcher's first call. See
+> the plan's 2026-09-29 amendment.
+>
 > **Amendment (2026-09-27).** intj `develop` launches `@triton.autotune` and
 > `@triton.heuristics` kernels natively (Triton tunes on a miss, intj launches
 > on a hit), so the "keep decorated Triton launches for multi-config K1/K2"

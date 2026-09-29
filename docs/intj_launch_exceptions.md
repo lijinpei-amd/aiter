@@ -51,7 +51,7 @@ at declaration), so a kernel can carry its launcher as a decorator in a
 module Aiter imports without a GPU. That is the default form:
 
 ```python
-@make_launcher(grid_arg=1, options={"num_warps": 4})   # 352 kernels
+@make_launcher(grid_arg=1, options={"num_warps": 4})   # 357 kernels
 @triton.jit
 def _foo_kernel(...): ...
 
@@ -68,7 +68,7 @@ kernel: the split-K reduce takes `KERNEL_NAME` and `activation` as str
 constexprs; sage_quant_v, `_combined_routing`, `_moe_gemm_a8w8` and
 `_sparse_attn_prefill_kernel` each serve two call sites.
 
-Two other forms remain, 13 named launchers and 51 `functools.cache`
+Two other forms remain, 13 named launchers and 50 `functools.cache`
 factories, only where one kernel needs something a decorator cannot give:
 
 ```python
@@ -86,7 +86,6 @@ _baz_launch(num_warps)(dev, stream, grid, *public_args)
 | --- | --- |
 | 46 factories: mla (5), pa_decode_sparse (3), unified_attention 3d (Triton and gfx1250), rope's thd-cached kernels (4), the gfx950/gfx1250 and Triton afp4wfp4 (5), afp8wfp8 (2), a16wfp4 (2), a16w8_blockscale (2), a8w8_blockscale Triton and gfx1250, a16w16 persistent (Triton and gfx1250), batched bf16 (Triton and gfx1250), the fused GEMMs (5), MoE decode Gluon (4), mha gfx950 Gluon, pa_prefill_sparse Gluon, fused_clamp_act_mul Gluon, fused_add_rmsnorm_pad Gluon, `_dynamic_mxfp4_quant_kernel`, `bench_cache_copy`'s `simple_tdm_kernel` | A compile option (`num_warps`, `num_stages`, `waves_per_eu`, `matrix_instr_nonkdim`, `num_ctas`) is also a kernel parameter. intj refuses it as a dynamic option (`dynamic option 'num_warps' is a kernel parameter`), so `options=` fixes it per launcher, keyed by the factory. |
 | `pa_mqa_logits` `_gluon_paged_mqa_logits_launch` | One launcher per (Preshuffle, VarCtx, KV-padded) mode, each with a different baked `extra_annotation` (the hand-written types and `Assume` facts); `return_compiled=True`. |
-| FlashKDA `_cached_intj_launcher` (5 kernels) | Its handles key on the `JITFunction`'s `debug` attribute and source key, which a decorator fixes at the first call (knobs could be `dynamic_options`; `jit.debug` cannot), and `test_intj_launch.py` needs the JIT functions for its Triton-parity adapter and for retuning with new configs. |
 | `mla_decode_ref` stage-1 grouped and stage-2 factories | `kpack` depends on `get_arch()`; the factory defers that GPU query to the first launch, so `op_tests.triton_tests.utils` (which star-imports this module) imports without a GPU. A dynamic `kpack` would be an unknown option on CUDA. |
 | `pa_attention_kernel_test` `_direct_launch` | Launches pa_decode_gluon's dot kernels with other options (`num_stages=1`, per-call `waves_per_eu`) than pa_decode_gluon's own launchers; the kernel is picked at runtime. |
 | `aiter/mla.py` `_fwd_kernel_stage2_asm_launch`, `test_mla_stage2_merge.py` | `asm_mla_decode_fwd.py` and `aot/triton/decode_mla.py` compile the JIT function ahead of time by name; the test sweeps options on it. |
@@ -393,20 +392,35 @@ factories, with the reason for each, are listed under
 
 ## FlashKDA
 
-`_FastLaunch` (`chunk_delta_attn/fast_launch.py`) is gone. `flash_kda_fwd`
-validates that every input is on the current GPU, then launches each kernel
-through `_intj_launcher`, a `functools.cache` of bound handles keyed by kernel,
-device, compile options, baked cache modifiers, grid, the JIT source key and
-the Triton debug/instrumentation/fpsan knobs; it reads the current stream
-before every launch, so CUDA-graph capture works. The autotuned K1 and K2 pass
-their decorated kernels, so intj tunes on a miss (the tuner configs, the
-opt-in `CHUNK_DELTA_ATTN_TRITON_AUTOTUNE=1` space included) and launches
-natively on a hit: K1's `IS_VARLEN`/`HAS_BIAS` and the scan's `HAS_H0` stay
-`is not None` heuristics, lowered to C by intj; K2's grid reads the tuned `BW`
-through `grid_cpp`. The Gluon JITs build their layouts inside the kernel
-(K2's from `gl.num_warps()`), which intj requires; their gfx950 ISA is
-unchanged. See
+`_FastLaunch` (`chunk_delta_attn/fast_launch.py`) is gone, and so is the
+`_intj_launcher` handle cache that replaced it. `flash_kda_fwd` validates that
+every input is on the current GPU, then calls the five kernels, each decorated
+with its intj launcher, as `kernel(device, stream, *grid, *args)`; it reads the
+current stream before every launch, so CUDA-graph capture works. Gluon K1
+fixes `num_warps=2` as an option; Gluon K2 and the segment scan take
+`num_warps` per call (`dynamic_options`); the cache modifiers are str
+constexprs, keyed by value. The autotuned K1 and K2 carry their tuners, so
+intj tunes on a miss (the tuner configs, the opt-in
+`CHUNK_DELTA_ATTN_TRITON_AUTOTUNE=1` space included) and launches natively on a
+hit: K1's `IS_VARLEN`/`HAS_BIAS` and the scan's `HAS_H0` stay `is not None`
+heuristics, lowered to C by intj; K2's grid reads the tuned `BW` through
+`grid_cpp`. Triton's debug/instrumentation/fpsan knobs and `TRITON_INTERPRET`
+are read at each launcher's first call and fixed after it. Tests that need a
+never-called launcher, other tuner configs, a spy or a Triton reference
+re-run the kernel modules under a stand-in `make_launcher`
+(`op_tests/triton_tests/chunk_delta_attn/kda_launchers.py`). The Gluon JITs
+build their layouts inside the kernel (K2's from `gl.num_warps()`), which intj
+requires; their gfx950 ISA is unchanged. See
 [the KDA direct-launch plan](superpowers/plans/2026-09-25-kda-direct-intj-launch.md).
+K1's and K2's autotune keys include `CM_WS` / `CM_OUT`, so segmented and
+unsegmented launches still tune apart as they did under per-modifier handles.
+Verified with intj `develop` `0f2226f`, Triton 3.8.0, on gfx942 and gfx950
+(MI350X): the three KDA test files pass in all four modes (default,
+`AITER_FDA_USE_GLUON=0`, `CHUNK_DELTA_ATTN_TRITON_AUTOTUNE=1`, both); o and
+final state are bitwise equal to the handle-cache revision on all 10
+`_CASES` x {forced Triton, Gluon K1+K2}, default and autotuned; warmed
+`flash_kda_fwd` host time is 5-12% lower on every route and GPU time is
+unchanged.
 Needs intj `develop` at or after `ad8c832`: earlier, a tuned handle retained
 the argument tensors of its last tuning miss, which
 `test_cached_native_handle_does_not_retain_tensor` catches.
