@@ -2,10 +2,11 @@
 
 Triton and Gluon `JITFunction` launches in this branch go through intj's
 `make_launcher` (see [Launchers](#launchers)). This branch needs the sibling
-intj checkout, `develop` at or after `0ec6835` (lazy build, `dynamic_options`,
+intj checkout, `develop` at or after `7e4acc9` (lazy build, `dynamic_options`,
 object constexprs looked up in C, `assume_constant_globals`, `torch.Tensor`
 and `torch.Tensor | None` annotations, Triton's conversion of annotated
-scalars), installed or on `PYTHONPATH`; Aiter does not yet publish an intj
+scalars, a `tl.constexpr` parameter that sets the compile option it is named
+after), installed or on `PYTHONPATH`; Aiter does not yet publish an intj
 dependency. Declaring a launcher does no GPU work, but needs a host C
 compiler once per interpreter (intj builds its generic lazy stub).
 
@@ -51,7 +52,7 @@ at declaration), so a kernel can carry its launcher as a decorator in a
 module Aiter imports without a GPU. That is the default form:
 
 ```python
-@make_launcher(grid_arg=1, options={"num_warps": 4})   # 357 kernels
+@make_launcher(grid_arg=1, options={"num_warps": 4})   # 408 kernels
 @triton.jit
 def _foo_kernel(...): ...
 
@@ -68,23 +69,22 @@ kernel: the split-K reduce takes `KERNEL_NAME` and `activation` as str
 constexprs; sage_quant_v, `_combined_routing`, `_moe_gemm_a8w8` and
 `_sparse_attn_prefill_kernel` each serve two call sites.
 
-Two other forms remain, 13 named launchers and 50 `functools.cache`
+Two other forms remain, 13 named launchers and 4 `functools.cache`
 factories, only where one kernel needs something a decorator cannot give:
 
 ```python
 _bar_launch = make_launcher(_bar_kernel, ...)          # the JIT function is needed elsewhere
 
-@functools.cache                                        # an option is also a kernel parameter
-def _baz_launch(num_warps):
-    return make_launcher(_baz_kernel, options={"num_warps": num_warps})
+@functools.cache                                        # an option needs the GPU (kpack)
+def _baz_launch():
+    return make_launcher(_baz_kernel, options=_baz_options())
 
 _bar_launch(dev, stream, grid, *public_args)
-_baz_launch(num_warps)(dev, stream, grid, *public_args)
+_baz_launch()(dev, stream, grid, *public_args)
 ```
 
 | Launcher | Why not a decorator |
 | --- | --- |
-| 46 factories: mla (5), pa_decode_sparse (3), unified_attention 3d (Triton and gfx1250), rope's thd-cached kernels (4), the gfx950/gfx1250 and Triton afp4wfp4 (5), afp8wfp8 (2), a16wfp4 (2), a16w8_blockscale (2), a8w8_blockscale Triton and gfx1250, a16w16 persistent (Triton and gfx1250), batched bf16 (Triton and gfx1250), the fused GEMMs (5), MoE decode Gluon (4), mha gfx950 Gluon, pa_prefill_sparse Gluon, fused_clamp_act_mul Gluon, fused_add_rmsnorm_pad Gluon, `_dynamic_mxfp4_quant_kernel`, `bench_cache_copy`'s `simple_tdm_kernel` | A compile option (`num_warps`, `num_stages`, `waves_per_eu`, `matrix_instr_nonkdim`, `num_ctas`) is also a kernel parameter. intj refuses it as a dynamic option (`dynamic option 'num_warps' is a kernel parameter`), so `options=` fixes it per launcher, keyed by the factory. |
 | `pa_mqa_logits` `_gluon_paged_mqa_logits_launch` | One launcher per (Preshuffle, VarCtx, KV-padded) mode, each with a different baked `extra_annotation` (the hand-written types and `Assume` facts); `return_compiled=True`. |
 | `mla_decode_ref` stage-1 grouped and stage-2 factories | `kpack` depends on `get_arch()`; the factory defers that GPU query to the first launch, so `op_tests.triton_tests.utils` (which star-imports this module) imports without a GPU. A dynamic `kpack` would be an unknown option on CUDA. |
 | `pa_attention_kernel_test` `_direct_launch` | Launches pa_decode_gluon's dot kernels with other options (`num_stages=1`, per-call `waves_per_eu`) than pa_decode_gluon's own launchers; the kernel is picked at runtime. |
@@ -111,10 +111,12 @@ Defaults are passed explicitly, values that `@triton.autotune` /
   entry that omits a key still compiles with Triton's default.
 - **A kernel parameter that is also a compile option** (`num_warps:
   tl.constexpr`: many Gluon kernels, several GEMMs, mla, rope's thd-cached
-  kernels) cannot be a dynamic option (intj refuses it), so its launcher is a
-  factory keyed on the option values, and the value is passed both to the
-  factory and as the parameter, as Triton does. Before this change
-  `compat.launch` compiled these sites with the default option instead.
+  kernels) is passed once, as the parameter: intj sets the option from it on
+  every call, as Triton does for the keyword. Neither `options=` nor
+  `dynamic_options` names it (intj refuses the first; the second is a no-op).
+  Such kernels used to have a `functools.cache` factory keyed on the option
+  values (intj before `7e4acc9` refused the name as a dynamic option), and
+  before that `compat.launch` compiled them with the default option.
 - **`str` / `tl.dtype` / JIT-function constexprs** (pa_decode's
   `compute_type`, mla_gluon's `REGIME`, the split-K reduce `activation`,
   moe topk's `SCORE_MODE`, the split-K reduce's `KERNEL_NAME`, ...) are
@@ -179,9 +181,9 @@ trace `_cuda_getCurrentRawStream`).
 
 ## gfx1250 Gluon kernels
 
-The eight gfx1250 sites that stayed on `intj.compat.launch` now use
-factories (`num_warps` is a parameter of most of these kernels), with the
-compile options the old call passed and nothing else:
+The eight gfx1250 sites that stayed on `intj.compat.launch` are now
+decorated kernels (`num_warps`, a parameter of most of them, sets the
+option), compiled with the options the old call passed and nothing else:
 
 | Site | Kernels | Was passed | Now built in the kernel from |
 | --- | --- | --- | --- |
@@ -389,6 +391,61 @@ factories, with the reason for each, are listed under
   | `fast_transpose_2d` (bound handle → decorator) | 18.7 us | 18.5 us |
   | `layer_norm` (named → decorator) | 18.8 us | 18.4 us |
   | `gemm_a8w8`, split-K (baked `KERNEL_NAME` → str constexpr) | 30.8 us | 29.8 us |
+
+## Option parameters
+
+intj `develop` `7e4acc9` and later feed a `tl.constexpr` parameter named like a
+compile option into that option on every call, and refuse a static `options=`
+entry that names one. The 46 `functools.cache` factories that fixed such an
+option per launcher are gone: their 51 kernels are decorated and called
+directly, the value passed once, as the parameter (see
+[Launchers](#launchers)). Nothing else changed at the call sites; options that
+are not parameters stay `dynamic_options`. The gfx942 int8 smoothquant Gluon
+kernel, whose decorator fixed `options={"num_warps": 4}` over its own
+`num_warps` parameter, no longer imported under those intj revisions; it now
+takes the value from the parameter. None of the 51 kernels is autotuned, so no
+tuner is shared that used to be separate.
+
+Verified with intj `develop` `ff4d3f1` against the parent (`8294a80a0`, run
+with intj `0f2226f`, the last revision it imports under), Triton 3.8.0,
+`AITER_TRITON_ONLY=1`:
+
+- **Tests.** The 54 test files that reach a converted wrapper, at most 300
+  tests per file (full runs of the moe a8w8-blockscale and int8-smoothquant
+  files), plus drivers for kernels no test reaches (the non-GQA thd-cached
+  rope kernels, the unified-attention 3d kernel on gfx942, the gfx942 int8
+  Gluon kernel, the gfx950 Gluon afp4wfp4 kernel, `gemm_afp4wfp4_preshuffled_scales`,
+  `bench_cache_copy`'s kernel), on both revisions.
+  gfx942, the same counts in every file: 4951 passed, 5964 skipped, 1 error (the HIP-rope import).
+  gfx950 (MI350X): 7898 passed, 18 failed, 2527 skipped, 1 error; the parent
+  7897 passed, 19 failed. The failures have the same ids (`test_mha_with_sink.py`
+  cases and the HIP build in `test_fused_mxfp4_quant.py`) except one
+  `test_mha_with_sink.py` dropout case that failed only in the parent's
+  sampled run; alone it fails 4 of 4 times on both revisions.
+- **Outputs.** Every tensor a public wrapper call returned, and every tensor
+  argument after the call, hashed per test and call index (inputs seeded per
+  test): 3,059 calls of 48 wrappers on gfx942 and 5,222 of 61 on gfx950 are
+  bitwise equal to the parent. The other 8 (gfx950) differ only in
+  uninitialized memory: the `torch.empty` padding rows of
+  `fused_clamp_act_mul`'s preshuffled scale (an unconverted Triton kernel), and
+  a `y` buffer `fused_gemm_afp4wfp4_a16w16` does not write under
+  `skip_reduce`.
+- **Code.** The AMDGCN of every compile of the 29 converted kernels that run
+  on these GPUs (plus the int8 kernel), on each GPU they ran on, is identical
+  to the parent's, with the same compile options, once debug info is stripped (a decorator line shifts the source
+  line numbers, so the Triton cache keys differ).
+- **Host and GPU time.** Warmed wrapper calls (17 cases on gfx942, 26 on
+  gfx950; 3-9 alternating rounds, one process each, pinned GPU and core 16)
+  and the bare launch (the parent's factory call included; 5-20 rounds): no
+  consistent change. Host time is equal or lower (the factory lookup is
+  gone), e.g. launch 4.06 → 3.94 us (`pa_decode_sparse`, gfx942); GPU time is
+  equal. Per-process launch times are bimodal on both revisions, so a few
+  3-6 round medians differed by up to 0.3 us in either direction; rerun
+  with 20 processes each, they match.
+
+Not run: the 22 gfx1250-only Gluon kernels (declared, and their extensions
+built on gfx942); each call site passes, as the parameter, the value the
+factory used to fix as the option.
 
 ## FlashKDA
 
