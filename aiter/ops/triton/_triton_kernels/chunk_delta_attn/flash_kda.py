@@ -139,7 +139,9 @@ _K1_FALLBACK_CONFIG = triton.Config({}, num_warps=2, num_stages=1)
             "flash_kda_prepare_kernel", _K1_FALLBACK_CONFIG
         ),
     ),
-    key=["H", "K", "C"],
+    # CM_WS is ".wt" unsegmented and "" segmented: a different store, and a
+    # different sequence length, so the two tune apart.
+    key=["H", "K", "C", "CM_WS"],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T"])
@@ -400,8 +402,11 @@ def _k2_grid(W: int, BW: int, *, segs_h: int):
     # very different per-iteration cost and must not share a tuned config, and
     # NUM_SEGS_CLASS is there for the same reason -- without it the segmented
     # and unsegmented schedules collide and whichever runs first sets the
-    # config for both, a result the on-disk cache then keeps.
-    key=["H", "K", "W", "C", "HAS_V", "COMPUTE_OUTPUT", "NUM_SEGS_CLASS"],
+    # config for both, a result the on-disk cache then keeps. The class alone
+    # does not separate them (one segment per sequence at a batch of 4 lands
+    # in the class of four segments of one sequence), so CM_OUT, which differs
+    # between the two, is in the key too.
+    key=["H", "K", "W", "C", "HAS_V", "COMPUTE_OUTPUT", "NUM_SEGS_CLASS", "CM_OUT"],
     **autotune_cache_kwargs,
 )
 @triton.jit
