@@ -4,12 +4,14 @@
 """Gluon MXFP4 GEMM kernel for gfx950."""
 
 import triton
+from intj import make_launcher
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
 
+@make_launcher(dynamic_options=("kpack",))
 @triton.heuristics(
     {
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)

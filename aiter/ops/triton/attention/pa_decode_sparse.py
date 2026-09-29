@@ -7,12 +7,10 @@ indices.
 TODO: add details once API has settled
 """
 
-import functools
 import math
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla import (
     _sparse_mla as _sparse_mla_gfx950,
@@ -64,39 +62,6 @@ def _check_out(out, q, dtype):
     assert out.dtype == dtype, f"out dtype {out.dtype} != {dtype}"
     assert out.device == q.device
     return out
-
-
-@functools.cache
-def _gluon_pa_decode_sparse_launch(num_warps):
-    return make_launcher(
-        gluon_pa_decode_sparse,
-        dynamic_options=(
-            "num_stages",
-            "waves_per_eu",
-        ),
-        options={"num_warps": num_warps},
-    )
-
-
-@functools.cache
-def _triton_pa_decode_sparse_launch(num_warps):
-    return make_launcher(
-        triton_pa_decode_sparse,
-        dynamic_options=(
-            "num_stages",
-            "waves_per_eu",
-        ),
-        options={"num_warps": num_warps},
-    )
-
-
-@functools.cache
-def _gluon_pa_decode_sparse_reduce_launch(num_warps):
-    return make_launcher(
-        gluon_pa_decode_sparse_reduce,
-        dynamic_options=("waves_per_eu",),
-        options={"num_warps": num_warps},
-    )
 
 
 # The gfx950 sparse-MLA kernels, shared with sparse_mla.py.
@@ -371,7 +336,7 @@ def pa_decode_sparse(
     grid_attn = (T, n_head_blocks, kv_splits)
     if use_gluon:
         dev, stream = current_device_stream()
-        _gluon_pa_decode_sparse_launch(attn_num_warps)(
+        gluon_pa_decode_sparse(
             dev,
             stream,
             grid_attn,
@@ -423,7 +388,7 @@ def pa_decode_sparse(
         )
     else:
         dev, stream = current_device_stream()
-        _triton_pa_decode_sparse_launch(attn_num_warps)(
+        triton_pa_decode_sparse(
             dev,
             stream,
             grid_attn,
@@ -491,7 +456,7 @@ def pa_decode_sparse(
 
     if use_gluon:
         dev, stream = current_device_stream()
-        _gluon_pa_decode_sparse_reduce_launch(reduce_num_warps)(
+        gluon_pa_decode_sparse_reduce(
             dev,
             stream,
             grid_reduce,

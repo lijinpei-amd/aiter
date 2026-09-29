@@ -13,6 +13,7 @@ plus the second KV region.
 """
 
 import triton.language as tl
+from intj import make_launcher
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
@@ -44,6 +45,7 @@ def _region_prologue(
     return cur_valid, safe_slot_cur
 
 
+@make_launcher(dynamic_options=("waves_per_eu",))
 @gluon.jit(repr=_pa_prefill_sparse_repr)
 def _pa_prefill_sparse(
     q_ptr,  # [T, H, D]

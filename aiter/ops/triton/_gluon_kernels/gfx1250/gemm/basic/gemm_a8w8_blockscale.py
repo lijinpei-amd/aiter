@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import triton
+from intj import make_launcher
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
@@ -46,6 +47,7 @@ _gemm_a8w8_blockscale_compute_bound_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("waves_per_eu", "matrix_instr_nonkdim", "kpack"))
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
@@ -433,6 +435,7 @@ def _gemm_a8w8_blockscale_bandwidth_bound_kernel(
     gl.amd.gfx1250.tdm.async_wait(0)
 
 
+@make_launcher(dynamic_options=("waves_per_eu", "matrix_instr_nonkdim", "kpack"))
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
@@ -830,6 +833,7 @@ def depreshuffle_b(
     )
 
 
+@make_launcher(dynamic_options=("waves_per_eu", "matrix_instr_nonkdim", "kpack"))
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
@@ -1335,6 +1339,7 @@ _gemm_a8w8_blockscale_preshuffle_compute_bound_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("waves_per_eu", "matrix_instr_nonkdim", "kpack"))
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,

@@ -2,11 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
-import functools
-
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
@@ -34,6 +31,13 @@ _LOGGER = AiterTritonLogger()
 _USE_GEMM_SPLITK_BF16 = False
 
 _GLUON_SUPPORTED_ARCHS = ("gfx950",)
+
+try:  # gfx950 Gluon kernel; unavailable on Triton builds without Gluon.
+    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_afp4wfp4 import (
+        _gemm_afp4wfp4_kernel as _gluon_gemm_afp4wfp4_gfx950_kernel,
+    )
+except ImportError:
+    _gluon_gemm_afp4wfp4_gfx950_kernel = None
 _GLUON_PRESHUFFLE_ARCHS = ("gfx1250",)
 _GLUON_DEFAULT_ARCHS = ("gfx1250",)
 
@@ -117,42 +121,6 @@ def gemm_afp4wfp4_fake_tensor(
         return y_pp
 
     return torch.empty((M, N), dtype=dtype, device=x.device)
-
-
-@functools.cache
-def _gluon_gemm_afp4wfp4_gfx950_kernel_launch(
-    num_warps, num_stages, waves_per_eu, matrix_instr_nonkdim
-):
-    from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_afp4wfp4 import (
-        _gemm_afp4wfp4_kernel as _gluon_gemm_afp4wfp4_gfx950_kernel,
-    )
-
-    return make_launcher(
-        _gluon_gemm_afp4wfp4_gfx950_kernel,
-        dynamic_options=("kpack",),
-        options={
-            "num_warps": num_warps,
-            "num_stages": num_stages,
-            "waves_per_eu": waves_per_eu,
-            "matrix_instr_nonkdim": matrix_instr_nonkdim,
-        },
-    )
-
-
-@functools.cache
-def _triton_gemm_afp4wfp4_kernel_launch(
-    num_warps, num_stages, waves_per_eu, matrix_instr_nonkdim
-):
-    return make_launcher(
-        _triton_gemm_afp4wfp4_kernel,
-        dynamic_options=("kpack",),
-        options={
-            "num_warps": num_warps,
-            "num_stages": num_stages,
-            "waves_per_eu": waves_per_eu,
-            "matrix_instr_nonkdim": matrix_instr_nonkdim,
-        },
-    )
 
 
 @torch_compile_guard(gen_fake=gemm_afp4wfp4_fake_tensor)
@@ -278,12 +246,7 @@ def gemm_afp4wfp4_(
 
     if backend == "gluon":
         dev, stream = current_device_stream()
-        _gluon_gemm_afp4wfp4_gfx950_kernel_launch(
-            config.get("num_warps", 4),
-            config.get("num_stages", 2),
-            config.get("waves_per_eu", 0),
-            config.get("matrix_instr_nonkdim", 0),
-        )(
+        _gluon_gemm_afp4wfp4_gfx950_kernel(
             dev,
             stream,
             grid,
@@ -321,12 +284,7 @@ def gemm_afp4wfp4_(
         )
     else:
         dev, stream = current_device_stream()
-        _triton_gemm_afp4wfp4_kernel_launch(
-            config.get("num_warps", 4),
-            config.get("num_stages", 2),
-            config.get("waves_per_eu", 0),
-            config.get("matrix_instr_nonkdim", 0),
-        )(
+        _triton_gemm_afp4wfp4_kernel(
             dev,
             stream,
             grid,
@@ -442,22 +400,6 @@ def gemm_afp4wfp4(
     )
 
 
-@functools.cache
-def _triton_gemm_afp4wfp4_kernel_preshuffle_scales_launch(
-    num_warps, num_stages, waves_per_eu, matrix_instr_nonkdim
-):
-    return make_launcher(
-        _triton_gemm_afp4wfp4_kernel_preshuffle_scales,
-        dynamic_options=("kpack",),
-        options={
-            "num_warps": num_warps,
-            "num_stages": num_stages,
-            "waves_per_eu": waves_per_eu,
-            "matrix_instr_nonkdim": matrix_instr_nonkdim,
-        },
-    )
-
-
 def gemm_afp4wfp4_preshuffled_scales(
     x,
     w,
@@ -539,12 +481,7 @@ def gemm_afp4wfp4_preshuffled_scales(
     )
 
     dev, stream = current_device_stream()
-    _triton_gemm_afp4wfp4_kernel_preshuffle_scales_launch(
-        config.get("num_warps", 4),
-        config.get("num_stages", 2),
-        config.get("waves_per_eu", 0),
-        config.get("matrix_instr_nonkdim", 0),
-    )(
+    _triton_gemm_afp4wfp4_kernel_preshuffle_scales(
         dev,
         stream,
         grid,
@@ -619,40 +556,6 @@ def gemm_afp4wfp4_preshuffled_scales(
         )
 
     return y
-
-
-@functools.cache
-def _triton_gemm_afp4wfp4_preshuffle_kernel_launch(
-    num_warps, num_stages, waves_per_eu, matrix_instr_nonkdim
-):
-    return make_launcher(
-        _triton_gemm_afp4wfp4_preshuffle_kernel,
-        dynamic_options=("kpack",),
-        options={
-            "num_warps": num_warps,
-            "num_stages": num_stages,
-            "waves_per_eu": waves_per_eu,
-            "matrix_instr_nonkdim": matrix_instr_nonkdim,
-        },
-    )
-
-
-@functools.cache
-def _gluon_gemm_mxfp4_preshuffle_gfx1250_launch(num_warps):
-    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
-        gemm_mxfp4_preshuffle_gfx1250,
-    )
-
-    return make_launcher(
-        gemm_mxfp4_preshuffle_gfx1250,
-        dynamic_options=(
-            "num_stages",
-            "waves_per_eu",
-            "matrix_instr_nonkdim",
-            "kpack",
-        ),
-        options={"num_warps": num_warps},
-    )
 
 
 def gemm_afp4wfp4_preshuffle(
@@ -754,8 +657,12 @@ def gemm_afp4wfp4_preshuffle(
         k_tiles = triton.cdiv(K_bytes, BLOCK_K_BYTES)
         config["NUM_BUFFERS"] = min(config["NUM_BUFFERS"], k_tiles)
 
+        from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
+            gemm_mxfp4_preshuffle_gfx1250,
+        )
+
         dev, stream = current_device_stream()
-        _gluon_gemm_mxfp4_preshuffle_gfx1250_launch(config["num_warps"])(
+        gemm_mxfp4_preshuffle_gfx1250(
             dev,
             stream,
             grid,
@@ -834,12 +741,7 @@ def gemm_afp4wfp4_preshuffle(
 
     config.pop("NUM_BUFFERS", None)
     dev, stream = current_device_stream()
-    _triton_gemm_afp4wfp4_preshuffle_kernel_launch(
-        config.get("num_warps", 4),
-        config.get("num_stages", 2),
-        config.get("waves_per_eu", 0),
-        config.get("matrix_instr_nonkdim", 0),
-    )(
+    _triton_gemm_afp4wfp4_preshuffle_kernel(
         dev,
         stream,
         grid,

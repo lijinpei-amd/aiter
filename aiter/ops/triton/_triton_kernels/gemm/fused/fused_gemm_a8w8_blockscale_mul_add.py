@@ -27,6 +27,7 @@ _fused_gemm_a8w8_blockscale_mul_add_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("kpack",))
 @triton.heuristics(
     {
         "EVEN_K": lambda args: (args["K"] % args["BLOCK_SIZE_K"] == 0)

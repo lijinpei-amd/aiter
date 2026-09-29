@@ -7,6 +7,7 @@ Gluon persistent Triton GEMM.
 """
 
 import triton.experimental.gluon.language as gl
+from intj import make_launcher
 from triton.experimental import gluon
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
@@ -50,6 +51,7 @@ _gemm_a16w16_persistent_compute_bound_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @gluon.jit(repr=_gemm_a16w16_persistent_repr)
 def gemm_a16w16_persistent_kernel_(
     a_ptr,
@@ -351,6 +353,7 @@ def gemm_a16w16_persistent_kernel_(
         gl.barrier()
 
 
+@make_launcher
 @gluon.jit(repr=_gemm_a16w16_persistent_compute_bound_repr)
 def gemm_a16w16_persistent_compute_bound_kernel_(
     a_ptr,

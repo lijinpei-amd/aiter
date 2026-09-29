@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import functools
 import os
 
 import torch
 import triton
-from intj import make_launcher
 from packaging.version import Version
 
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
@@ -41,35 +39,6 @@ try:  # gfx950 Gluon kernel; unavailable on Triton builds without Gluon.
     )
 except ImportError:
     _gluon_gfx950_gemm_a8w8_blockscale_kernel = None
-
-
-@functools.cache
-def _triton_gemm_a8w8_blockscale_kernel_launch(num_stages):
-    return make_launcher(
-        triton_gemm_a8w8_blockscale_kernel,
-        dynamic_options=(
-            "num_warps",
-            "waves_per_eu",
-            "matrix_instr_nonkdim",
-            "kpack",
-        ),
-        options={"num_stages": num_stages},
-    )
-
-
-@functools.cache
-def _gluon_gfx1250_gemm_a8w8_blockscale_launch(preshuffle, kernel_type, num_warps):
-    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a8w8_blockscale import (
-        _KERNEL_MAP,
-        _PRESHUFFLE_KERNEL_MAP,
-    )
-
-    kernel_map = _PRESHUFFLE_KERNEL_MAP if preshuffle else _KERNEL_MAP
-    return make_launcher(
-        kernel_map[kernel_type],
-        dynamic_options=("waves_per_eu", "matrix_instr_nonkdim", "kpack"),
-        options={"num_warps": num_warps},
-    )
 
 
 def gemm_a8w8_blockscale(
@@ -240,10 +209,12 @@ def gemm_a8w8_blockscale(
             config["cache_modifier"],
         )
     elif backend == "gluon":
+        from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a8w8_blockscale import (
+            _KERNEL_MAP,
+        )
+
         dev, stream = current_device_stream()
-        _gluon_gfx1250_gemm_a8w8_blockscale_launch(
-            False, kernel_type, config["num_warps"]
-        )(
+        _KERNEL_MAP[kernel_type](
             dev,
             stream,
             grid,
@@ -283,7 +254,7 @@ def gemm_a8w8_blockscale(
         )
     else:
         dev, stream = current_device_stream()
-        _triton_gemm_a8w8_blockscale_kernel_launch(config.get("num_stages", 2))(
+        triton_gemm_a8w8_blockscale_kernel(
             dev,
             stream,
             grid,
@@ -508,10 +479,12 @@ def gemm_a8w8_blockscale_preshuffle(
         config["NUM_BUFFERS"] = config.pop("num_stages", 1)
 
     if backend == "gluon":
+        from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a8w8_blockscale import (
+            _PRESHUFFLE_KERNEL_MAP,
+        )
+
         dev, stream = current_device_stream()
-        _gluon_gfx1250_gemm_a8w8_blockscale_launch(
-            True, kernel_type, config["num_warps"]
-        )(
+        _PRESHUFFLE_KERNEL_MAP[kernel_type](
             dev,
             stream,
             grid,

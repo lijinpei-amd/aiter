@@ -2,6 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import triton.experimental.gluon.language as gl
+from intj import make_launcher
 from triton.experimental import gluon
 
 from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
@@ -32,6 +33,7 @@ _batched_gemm_bf16_compute_bound_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @gluon.jit(repr=_batched_gemm_bf16_bandwidth_bound_repr)
 def _batched_gemm_bf16_bandwidth_bound_kernel(
     a_ptr,
@@ -370,6 +372,7 @@ def _batched_gemm_bf16_bandwidth_bound_kernel(
     )
 
 
+@make_launcher
 @gluon.jit(repr=_batched_gemm_bf16_compute_bound_repr)
 def _batched_gemm_bf16_compute_bound_kernel(
     a_ptr,

@@ -451,6 +451,7 @@ _dynamic_mxfp4_quant_repr = make_kernel_repr(
 )
 
 
+@make_launcher(options={"waves_per_eu": 0})
 @triton.heuristics(
     {
         "EVEN_M_N": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0

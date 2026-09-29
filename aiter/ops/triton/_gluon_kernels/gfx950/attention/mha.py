@@ -23,6 +23,7 @@
 ##############################################################################
 
 
+from intj import make_launcher
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
@@ -476,6 +477,15 @@ _attn_fwd_repr = make_kernel_repr(
 )
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+        "num_ctas",
+    )
+)
 @gluon.jit(repr=_attn_fwd_repr)
 def _attn_fwd(
     q_ptr,

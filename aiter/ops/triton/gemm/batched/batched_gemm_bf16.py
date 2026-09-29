@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import functools
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _batched_gemm_splitk_reduce_kernel,
@@ -29,34 +27,6 @@ def _is_gluon_available():
         return any(supported in get_arch() for supported in _GLUON_SUPPORTED_ARCHS)
     except Exception:  # noqa: BLE001
         return False
-
-
-@functools.cache
-def _batched_gemm_bf16_kernel_launch(num_warps, num_stages, waves_per_eu):
-    return make_launcher(
-        _batched_gemm_bf16_kernel,
-        dynamic_options=(
-            "matrix_instr_nonkdim",
-            "kpack",
-        ),
-        options={
-            "num_warps": num_warps,
-            "num_stages": num_stages,
-            "waves_per_eu": waves_per_eu,
-        },
-    )
-
-
-@functools.cache
-def _gluon_batched_gemm_bf16_kernel_launch(kernel_type, num_warps, waves_per_eu):
-    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.batched.batched_gemm_bf16 import (
-        _KERNEL_MAP,
-    )
-
-    return make_launcher(
-        _KERNEL_MAP[kernel_type],
-        options={"num_warps": num_warps, "waves_per_eu": waves_per_eu},
-    )
 
 
 def batched_gemm_bf16(
@@ -217,7 +187,7 @@ def batched_gemm_bf16(
         splitk_block_size = SPLITK_BLOCK_SIZE
 
         dev, stream = current_device_stream()
-        _gluon_batched_gemm_bf16_kernel_launch(kernel_type, num_warps, waves_per_eu)(
+        _KERNEL_MAP[kernel_type](
             dev,
             stream,
             grid,
@@ -280,11 +250,7 @@ def batched_gemm_bf16(
         )
 
         dev, stream = current_device_stream()
-        _batched_gemm_bf16_kernel_launch(
-            config.get("num_warps", 4),
-            config.get("num_stages", 2),
-            config.get("waves_per_eu", 0),
-        )(
+        _batched_gemm_bf16_kernel(
             dev,
             stream,
             grid,

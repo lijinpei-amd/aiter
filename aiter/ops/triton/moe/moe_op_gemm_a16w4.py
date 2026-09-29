@@ -1,13 +1,11 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_details/_matmul.py
 
-import functools
 import itertools
 from functools import lru_cache
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a16w4 import (
     _moe_gemm_a16w4 as _moe_gemm_a16w4_gluon,
@@ -207,20 +205,6 @@ def swizzle_scales_gfx1250(data):
 # -----------------------------------------------------------------------------
 
 
-@functools.cache
-def _moe_gemm_a16w4_gluon_launch(num_warps):
-    return make_launcher(
-        _moe_gemm_a16w4_gluon,
-        dynamic_options=(
-            "num_stages",
-            "waves_per_eu",
-            "matrix_instr_nonkdim",
-            "kpack",
-        ),
-        options={"num_warps": num_warps},
-    )
-
-
 def moe_gemm_a16w4(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -366,7 +350,7 @@ def moe_gemm_a16w4(
     # launch kernel
     if backend == "gluon":
         dev, stream = current_device_stream()
-        _moe_gemm_a16w4_gluon_launch(config["num_warps"])(
+        _moe_gemm_a16w4_gluon(
             dev,
             stream,
             (grid,),

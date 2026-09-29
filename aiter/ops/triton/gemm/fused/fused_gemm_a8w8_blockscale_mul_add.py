@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import functools
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_a8w8_blockscale_mul_add import (
     _fused_gemm_a8w8_blockscale_mul_add_kernel,
@@ -61,22 +59,6 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
         )
 
     return SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT
-
-
-@functools.cache
-def _fused_gemm_a8w8_blockscale_mul_add_kernel_launch(
-    num_warps, num_stages, waves_per_eu, matrix_instr_nonkdim
-):
-    return make_launcher(
-        _fused_gemm_a8w8_blockscale_mul_add_kernel,
-        dynamic_options=("kpack",),
-        options={
-            "num_warps": num_warps,
-            "num_stages": num_stages,
-            "waves_per_eu": waves_per_eu,
-            "matrix_instr_nonkdim": matrix_instr_nonkdim,
-        },
-    )
 
 
 def fused_gemm_a8w8_blockscale_mul_add(
@@ -194,12 +176,7 @@ def fused_gemm_a8w8_blockscale_mul_add(
         ),
     )
     dev, stream = current_device_stream()
-    _fused_gemm_a8w8_blockscale_mul_add_kernel_launch(
-        config.get("num_warps", 4),
-        config.get("num_stages", 2),
-        config.get("waves_per_eu", 0),
-        config.get("matrix_instr_nonkdim", 0),
-    )(
+    _fused_gemm_a8w8_blockscale_mul_add_kernel(
         dev,
         stream,
         grid,

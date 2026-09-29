@@ -1,4 +1,5 @@
 import triton.experimental.gluon.language as gl
+from intj import make_launcher
 from triton.experimental import gluon
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
@@ -146,6 +147,14 @@ _gemm_mxfp4_preshuffle_gfx1250_repr = make_kernel_repr(
 )
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    )
+)
 @gluon.jit(repr=_gemm_mxfp4_preshuffle_gfx1250_repr)
 def gemm_mxfp4_preshuffle_gfx1250(
     a_fp4_ptr,

@@ -2,11 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
-import functools
-
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.quant.quant import (
     _dynamic_mxfp4_quant_blockscale_kernel,
@@ -194,13 +191,6 @@ def dynamic_per_token_quant_fp8_i8(
     return qx, scale_out
 
 
-@functools.cache
-def _dynamic_mxfp4_quant_kernel_launch(num_warps):
-    return make_launcher(
-        _dynamic_mxfp4_quant_kernel, options={"waves_per_eu": 0, "num_warps": num_warps}
-    )
-
-
 def dynamic_mxfp4_quant(
     x: torch.Tensor,
     scaling_mode: str = "even",
@@ -339,7 +329,7 @@ def dynamic_mxfp4_quant(
     )
 
     dev, stream = current_device_stream()
-    _dynamic_mxfp4_quant_kernel_launch(NUM_WARPS)(
+    _dynamic_mxfp4_quant_kernel(
         dev,
         stream,
         grid,

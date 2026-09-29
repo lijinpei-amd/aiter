@@ -49,6 +49,7 @@ _pa_decode_sparse_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("num_stages", "waves_per_eu"))
 @triton.jit(repr=_pa_decode_sparse_repr)
 def _pa_decode_sparse(
     q_ptr,  # [N, H, D]

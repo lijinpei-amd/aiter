@@ -1,6 +1,7 @@
 import torch
 import triton.experimental.gluon.language as gl
 import triton.language as tl
+from intj import make_launcher
 from triton._C.libtriton.gluon_ir import make_cga_layout
 from triton.experimental import gluon
 from triton.experimental.gluon.language.amd.gfx1250 import async_copy
@@ -127,6 +128,7 @@ def unshuffle_weight_gfx1250(w_buffer_slice, BLOCK_N, NATIVE_BLOCK_K_W):
     return w
 
 
+@make_launcher(dynamic_options=("waves_per_eu",))
 @gluon.jit(
     launch_metadata=matmul_launch_metadata,
     do_not_specialize=["num_tokens"],
@@ -889,6 +891,7 @@ def _moe_gemm_a8w4_decode_persistent(
         gl.amd.gfx1250.tdm.async_wait(0)
 
 
+@make_launcher(dynamic_options=("waves_per_eu",))
 @gluon.jit(
     launch_metadata=matmul_launch_metadata,
     do_not_specialize=["num_tokens"],

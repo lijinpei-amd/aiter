@@ -14,6 +14,7 @@ Both KV_SPLITS branches are supported.
 """
 
 import triton.language as tl
+from intj import make_launcher
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
@@ -32,6 +33,7 @@ _pa_decode_sparse_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("num_stages", "waves_per_eu"))
 @gluon.jit(repr=_pa_decode_sparse_repr)
 def _pa_decode_sparse(
     q_ptr,
@@ -554,6 +556,7 @@ _pa_decode_sparse_reduce_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("waves_per_eu",))
 @gluon.jit(repr=_pa_decode_sparse_reduce_repr)
 def _pa_decode_sparse_reduce(
     m_partial_ptr,  # [N, KV_SPLITS, H_padded] fp32

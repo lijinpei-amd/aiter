@@ -1,11 +1,9 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
-import functools
 import math
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.attention.mla import (
     _mla_decode_fwd_kernel as triton_mla_decode_fwd_kernel,
@@ -128,32 +126,6 @@ def select_3d_config(
     return attn_config, reduce_config
 
 
-@functools.cache
-def _gluon_mla_prefill_fwd_kernel_non_pipelined_launch(num_warps, num_stages):
-    return make_launcher(
-        gluon_mla_prefill_fwd_kernel_non_pipelined,
-        dynamic_options=(
-            "waves_per_eu",
-            "matrix_instr_nonkdim",
-            "kpack",
-        ),
-        options={"num_warps": num_warps, "num_stages": num_stages},
-    )
-
-
-@functools.cache
-def _triton_mla_prefill_fwd_kernel_launch(num_warps, num_stages):
-    return make_launcher(
-        triton_mla_prefill_fwd_kernel,
-        dynamic_options=(
-            "waves_per_eu",
-            "matrix_instr_nonkdim",
-            "kpack",
-        ),
-        options={"num_warps": num_warps, "num_stages": num_stages},
-    )
-
-
 def mla_prefill_fwd(
     q,  # [num_tokens_per_seq * num_seqs, num_query_heads, qk_lora_rank + qk_rope_head_dim]
     kv_buffer,  # [num_blocks, block_size, num_kv_heads, qk_lora_rank + qk_rope_head_dim]
@@ -222,9 +194,7 @@ def mla_prefill_fwd(
 
     if IS_DEVICE_ARCH_GFX12:
         dev, stream = current_device_stream()
-        _gluon_mla_prefill_fwd_kernel_non_pipelined_launch(
-            attn_config.get("num_warps", 4), attn_config.get("num_stages", 2)
-        )(
+        gluon_mla_prefill_fwd_kernel_non_pipelined(
             dev,
             stream,
             (num_kv_heads, total_num_q_blocks),
@@ -270,9 +240,7 @@ def mla_prefill_fwd(
         )
     else:
         dev, stream = current_device_stream()
-        _triton_mla_prefill_fwd_kernel_launch(
-            attn_config.get("num_warps", 4), attn_config.get("num_stages", 2)
-        )(
+        triton_mla_prefill_fwd_kernel(
             dev,
             stream,
             (num_kv_heads, total_num_q_blocks),
@@ -313,48 +281,6 @@ def mla_prefill_fwd(
             attn_config.get("FP8_MAX", torch.finfo(e4m3_dtype).max),
         )
     return out
-
-
-@functools.cache
-def _gluon_mla_decode_fwd_kernel_launch(num_warps, num_stages):
-    return make_launcher(
-        gluon_mla_decode_fwd_kernel,
-        dynamic_options=(
-            "waves_per_eu",
-            "matrix_instr_nonkdim",
-            "kpack",
-        ),
-        options={"num_warps": num_warps, "num_stages": num_stages},
-    )
-
-
-@functools.cache
-def _gluon_mla_decode_fwd_kernel_non_pipelined_launch(num_warps, num_stages):
-    return make_launcher(
-        gluon_mla_decode_fwd_kernel_non_pipelined,
-        dynamic_options=(
-            "waves_per_eu",
-            "matrix_instr_nonkdim",
-            "kpack",
-        ),
-        options={"num_warps": num_warps, "num_stages": num_stages},
-    )
-
-
-@functools.cache
-def _triton_mla_decode_fwd_kernel_launch(num_warps, num_stages, waves_per_eu):
-    return make_launcher(
-        triton_mla_decode_fwd_kernel,
-        dynamic_options=(
-            "matrix_instr_nonkdim",
-            "kpack",
-        ),
-        options={
-            "num_warps": num_warps,
-            "num_stages": num_stages,
-            "waves_per_eu": waves_per_eu,
-        },
-    )
 
 
 def mla_decode_fwd(
@@ -500,9 +426,7 @@ def mla_decode_fwd(
     if IS_DEVICE_ARCH_GFX12:
         if shuffled_kv_cache:
             dev, stream = current_device_stream()
-            _gluon_mla_decode_fwd_kernel_launch(
-                attn_config.get("num_warps", 4), attn_config.get("num_stages", 2)
-            )(
+            gluon_mla_decode_fwd_kernel(
                 dev,
                 stream,
                 (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS),
@@ -558,9 +482,7 @@ def mla_decode_fwd(
             )
         else:
             dev, stream = current_device_stream()
-            _gluon_mla_decode_fwd_kernel_non_pipelined_launch(
-                attn_config.get("num_warps", 4), attn_config.get("num_stages", 2)
-            )(
+            gluon_mla_decode_fwd_kernel_non_pipelined(
                 dev,
                 stream,
                 (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS),
@@ -614,11 +536,7 @@ def mla_decode_fwd(
             )
     else:
         dev, stream = current_device_stream()
-        _triton_mla_decode_fwd_kernel_launch(
-            attn_config.get("num_warps", 4),
-            attn_config.get("num_stages", 2),
-            attn_config.get("waves_per_eu", 0),
-        )(
+        triton_mla_decode_fwd_kernel(
             dev,
             stream,
             (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS),

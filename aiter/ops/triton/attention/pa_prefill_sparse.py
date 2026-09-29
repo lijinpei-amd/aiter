@@ -18,11 +18,8 @@ take a 1-D ``(kv_indices, kv_indptr)`` pair over one pool.
     else    -> triton ``_sparse_attn_prefill_kernel`` (single source)
 """
 
-import functools
-
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_prefill_sparse import (
     _pa_prefill_sparse as gluon_pa_prefill_sparse,
@@ -40,15 +37,6 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 DEVICE_ARCH = arch_info.get_arch()
 
 _LOGGER = AiterTritonLogger()
-
-
-@functools.cache
-def _pa_prefill_sparse_launch(num_warps):
-    return make_launcher(
-        gluon_pa_prefill_sparse,
-        dynamic_options=("waves_per_eu",),
-        options={"num_warps": num_warps},
-    )
 
 
 def pa_prefill_sparse(
@@ -149,7 +137,7 @@ def pa_prefill_sparse(
         grid = (T, triton.cdiv(H, block_h))
 
         dev, stream = current_device_stream()
-        _pa_prefill_sparse_launch(num_warps)(
+        gluon_pa_prefill_sparse(
             dev,
             stream,
             grid,

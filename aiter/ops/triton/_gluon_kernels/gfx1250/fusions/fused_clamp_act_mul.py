@@ -6,6 +6,7 @@ Gluon (gfx1250) port of triton _fused_clamp_silu_mul_kernel for GFX1250
 
 """
 
+from intj import make_launcher
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
@@ -30,6 +31,7 @@ _fused_clamp_silu_mul_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("waves_per_eu",))
 @gluon.jit(repr=_fused_clamp_silu_mul_repr)
 def _fused_clamp_silu_mul_kernel(
     inp_ptr,

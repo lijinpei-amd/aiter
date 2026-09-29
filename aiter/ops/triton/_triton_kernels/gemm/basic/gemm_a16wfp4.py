@@ -3,6 +3,7 @@
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
@@ -26,6 +27,7 @@ _gemm_a16wfp4_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("kpack",))
 @triton.heuristics(
     {
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
@@ -202,6 +204,7 @@ _gemm_a16wfp4_preshuffle_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("kpack",))
 @triton.heuristics(
     {
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)

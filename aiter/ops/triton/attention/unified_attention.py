@@ -1,11 +1,9 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
-import functools
 from typing import NamedTuple
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     kernel_unified_attention_2d,
@@ -535,22 +533,6 @@ def _unified_attention_2d_triton(params: _UAParams):
     )
 
 
-@functools.cache
-def _kernel_unified_attention_3d_launch(num_warps, num_stages, waves_per_eu):
-    return make_launcher(
-        kernel_unified_attention_3d,
-        dynamic_options=(
-            "matrix_instr_nonkdim",
-            "kpack",
-        ),
-        options={
-            "num_warps": num_warps,
-            "num_stages": num_stages,
-            "waves_per_eu": waves_per_eu,
-        },
-    )
-
-
 def _unified_attention_3d_triton(
     params: _UAParams,
     segm_output,
@@ -572,11 +554,7 @@ def _unified_attention_3d_triton(
         total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
 
     dev, stream = current_device_stream()
-    _kernel_unified_attention_3d_launch(
-        config.get("num_warps", 4),
-        config.get("num_stages", 2),
-        config.get("waves_per_eu", 0),
-    )(
+    kernel_unified_attention_3d(
         dev,
         stream,
         (total_num_q_blocks, params.num_kv_heads, NUM_SEGMENTS),
@@ -822,22 +800,6 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
     )
 
 
-@functools.cache
-def _unified_attention_gluon_kernel_3d_launch(num_warps, num_stages, waves_per_eu):
-    return make_launcher(
-        _unified_attention_kernel_3d_gfx1250,
-        dynamic_options=(
-            "matrix_instr_nonkdim",
-            "kpack",
-        ),
-        options={
-            "num_warps": num_warps,
-            "num_stages": num_stages,
-            "waves_per_eu": waves_per_eu,
-        },
-    )
-
-
 def _unified_attention_3d_gfx1250(
     params: _UAParams,
     segm_output,
@@ -862,11 +824,7 @@ def _unified_attention_3d_gfx1250(
         total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
 
     dev, stream = current_device_stream()
-    _unified_attention_gluon_kernel_3d_launch(
-        config.get("num_warps", 4),
-        config.get("num_stages", 2),
-        config.get("waves_per_eu", 0),
-    )(
+    _unified_attention_kernel_3d_gfx1250(
         dev,
         stream,
         (total_num_q_blocks, params.num_kv_heads, NUM_SEGMENTS),

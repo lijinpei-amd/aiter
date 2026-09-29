@@ -26,6 +26,14 @@ _gemm_a8w8_blockscale_repr = make_kernel_repr(
 )
 
 
+@make_launcher(
+    dynamic_options=(
+        "num_warps",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "kpack",
+    )
+)
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,

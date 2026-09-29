@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import functools
 from enum import IntEnum
 
 import torch
 import triton
 import triton.language as tl
-from intj import make_launcher
 from torch import autograd
 
 from aiter.ops.triton._triton_kernels.rope.rope import (
@@ -883,30 +881,6 @@ def rope_cached_positions_offsets_bwd(
     return out
 
 
-@functools.cache
-def _rope_kernel_thd_cached_2c_fwd_launch(num_stages):
-    return make_launcher(
-        _rope_kernel_thd_cached_2c_fwd,
-        dynamic_options=(
-            "num_warps",
-            "waves_per_eu",
-        ),
-        options={"num_stages": num_stages},
-    )
-
-
-@functools.cache
-def _rope_kernel_cached_thd_2c_gqa_fwd_launch(num_stages):
-    return make_launcher(
-        _rope_kernel_cached_thd_2c_gqa_fwd,
-        dynamic_options=(
-            "num_warps",
-            "waves_per_eu",
-        ),
-        options={"num_stages": num_stages},
-    )
-
-
 def _rope_cached_thd_2c_fwd(
     x: torch.Tensor,
     y: torch.Tensor,
@@ -977,7 +951,7 @@ def _rope_cached_thd_2c_fwd(
         num_stages = 2 if SPLIT_H_SIZE > 1 else 1
 
         dev, stream = current_device_stream()
-        _rope_kernel_thd_cached_2c_fwd_launch(num_stages)(
+        _rope_kernel_thd_cached_2c_fwd(
             dev,
             stream,
             grid,
@@ -1023,7 +997,7 @@ def _rope_cached_thd_2c_fwd(
             num_stages = 2 if QH_per_G > 1 else 1
 
             dev, stream = current_device_stream()
-            _rope_kernel_cached_thd_2c_gqa_fwd_launch(num_stages)(
+            _rope_kernel_cached_thd_2c_gqa_fwd(
                 dev,
                 stream,
                 grid,
@@ -1233,30 +1207,6 @@ def rope_cached_thd_positions_offsets_2c_fwd_inplace(
     return out_x, out_y
 
 
-@functools.cache
-def _rope_kernel_thd_cached_2c_bwd_launch(num_stages):
-    return make_launcher(
-        _rope_kernel_thd_cached_2c_bwd,
-        dynamic_options=(
-            "num_warps",
-            "waves_per_eu",
-        ),
-        options={"num_stages": num_stages},
-    )
-
-
-@functools.cache
-def _rope_kernel_cached_thd_2c_gqa_bwd_launch(num_stages):
-    return make_launcher(
-        _rope_kernel_cached_thd_2c_gqa_bwd,
-        dynamic_options=(
-            "num_warps",
-            "waves_per_eu",
-        ),
-        options={"num_stages": num_stages},
-    )
-
-
 def _rope_cached_thd_positions_offsets_2c_bwd(
     x: torch.Tensor,
     y: torch.Tensor,
@@ -1327,7 +1277,7 @@ def _rope_cached_thd_positions_offsets_2c_bwd(
         num_stages = 2 if SPLIT_H_SIZE > 1 else 1
 
         dev, stream = current_device_stream()
-        _rope_kernel_thd_cached_2c_bwd_launch(num_stages)(
+        _rope_kernel_thd_cached_2c_bwd(
             dev,
             stream,
             grid,
@@ -1373,7 +1323,7 @@ def _rope_cached_thd_positions_offsets_2c_bwd(
             num_stages = 2 if QH_per_G > 1 else 1
 
             dev, stream = current_device_stream()
-            _rope_kernel_cached_thd_2c_gqa_bwd_launch(num_stages)(
+            _rope_kernel_cached_thd_2c_gqa_bwd(
                 dev,
                 stream,
                 grid,

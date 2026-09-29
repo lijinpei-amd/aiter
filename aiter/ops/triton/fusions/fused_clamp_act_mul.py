@@ -3,12 +3,10 @@
 
 from __future__ import annotations
 
-import functools
 from typing import Literal
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_clamp_act_mul import (
     _fused_clamp_silu_mul_kernel as _fused_clamp_silu_mul_gluon_kernel,
@@ -83,15 +81,6 @@ def _get_config(M: int, N: int, block_size_n: int, backend: str) -> dict:
     if config["BLOCK_SIZE_N"] is None:
         config["BLOCK_SIZE_N"] = block_size_n
     return config
-
-
-@functools.cache
-def _fused_clamp_silu_mul_gluon_kernel_launch(num_warps):
-    return make_launcher(
-        _fused_clamp_silu_mul_gluon_kernel,
-        dynamic_options=("waves_per_eu",),
-        options={"num_warps": num_warps},
-    )
 
 
 def fused_clamp_act_mul(
@@ -317,7 +306,7 @@ def fused_clamp_act_mul(
 
         # (M chunks * rows to process, N tiles)
         dev, stream = current_device_stream()
-        _fused_clamp_silu_mul_gluon_kernel_launch(num_warps)(
+        _fused_clamp_silu_mul_gluon_kernel(
             dev,
             stream,
             (

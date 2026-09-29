@@ -1,12 +1,10 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_ogs.py
 
-import functools
 import itertools
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a8w4 import (
     _moe_gemm_a8w4_decode as _moe_gemm_a8w4_decode_gluon,
@@ -343,24 +341,6 @@ def get_kernel_config_gluon(m, n, k, routing_data, out_mx_quant=False):
 # -----------------------------------------------------------------------------
 
 
-@functools.cache
-def _moe_gemm_a8w4_decode_persistent_launch(num_warps):
-    return make_launcher(
-        _moe_gemm_a8w4_decode_persistent_gluon,
-        dynamic_options=("waves_per_eu",),
-        options={"num_warps": num_warps},
-    )
-
-
-@functools.cache
-def _moe_gemm_a8w4_decode_launch(num_warps):
-    return make_launcher(
-        _moe_gemm_a8w4_decode_gluon,
-        dynamic_options=("waves_per_eu",),
-        options={"num_warps": num_warps},
-    )
-
-
 def moe_gemm_a8w4(
     x,
     w,
@@ -592,7 +572,7 @@ def moe_gemm_a8w4(
     # launch kernel
     if use_gluon and config["persistent_iters"] > 1:
         dev, stream = current_device_stream()
-        _moe_gemm_a8w4_decode_persistent_launch(config["num_warps"])(
+        _moe_gemm_a8w4_decode_persistent_gluon(
             dev,
             stream,
             (grid,),
@@ -654,7 +634,7 @@ def moe_gemm_a8w4(
         )
     elif use_gluon and block_m == 16:
         dev, stream = current_device_stream()
-        _moe_gemm_a8w4_decode_launch(config["num_warps"])(
+        _moe_gemm_a8w4_decode_gluon(
             dev,
             stream,
             (grid,),

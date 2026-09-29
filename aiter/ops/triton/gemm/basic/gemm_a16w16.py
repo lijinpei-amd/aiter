@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import functools
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
@@ -68,35 +66,6 @@ def gemm_a16w16_fake_tensor(
     if y is not None:
         return y
     return torch.empty((M, N), dtype=dtype, device=x.device)
-
-
-@functools.cache
-def _triton_persistent_kernel_launch(num_stages, waves_per_eu):
-    return make_launcher(
-        _triton_persistent_kernel,
-        dynamic_options=(
-            "num_warps",
-            "matrix_instr_nonkdim",
-            "kpack",
-        ),
-        options={"num_stages": num_stages, "waves_per_eu": waves_per_eu},
-    )
-
-
-@functools.cache
-def _gluon_persistent_kernel_launch(kernel_type, num_warps, num_stages, waves_per_eu):
-    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16_persistent import (
-        _KERNEL_MAP,
-    )
-
-    return make_launcher(
-        _KERNEL_MAP[kernel_type],
-        options={
-            "num_warps": num_warps,
-            "num_stages": num_stages,
-            "waves_per_eu": waves_per_eu,
-        },
-    )
 
 
 @torch_compile_guard(gen_fake=gemm_a16w16_fake_tensor)
@@ -265,9 +234,7 @@ def gemm_a16w16_(
             out_ptr = y if NUM_KSPLIT == 1 else y_pp
 
             dev, stream = current_device_stream()
-            _gluon_persistent_kernel_launch(
-                kernel_type, num_warps, num_stages, waves_per_eu
-            )(
+            _GLUON_PERSISTENT_KERNEL_MAP[kernel_type](
                 dev,
                 stream,
                 NUM_WGS,
@@ -360,9 +327,7 @@ def gemm_a16w16_(
             N, config["BLOCK_SIZE_N"]
         )
         dev, stream = current_device_stream()
-        _triton_persistent_kernel_launch(
-            config.get("num_stages", 2), config.get("waves_per_eu", 0)
-        )(
+        _triton_persistent_kernel(
             dev,
             stream,
             (min(NUM_WGS, num_tiles),),
@@ -396,7 +361,7 @@ def gemm_a16w16_(
             bias is not None,
             False,  # SKIP_REDUCE
             NUM_WGS,
-            config.get("num_stages", 0),
+            config.get("num_stages", 2),
             config.get("waves_per_eu", 0),
         )
 

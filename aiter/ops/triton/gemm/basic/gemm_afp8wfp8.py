@@ -2,12 +2,10 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
-import functools
 import math
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
@@ -70,22 +68,6 @@ def _resolve_x_scale_strides(
     if is_x_scale_transposed:
         return x_scales.stride(1), x_scales.numel() // x_scales.stride(0)
     return x_scales.stride(0), x_scales.stride(1)
-
-
-@functools.cache
-def _gemm_afp8wfp8_kernel_launch(
-    num_warps, num_stages, waves_per_eu, matrix_instr_nonkdim
-):
-    return make_launcher(
-        _gemm_afp8wfp8_kernel,
-        dynamic_options=("kpack",),
-        options={
-            "num_warps": num_warps,
-            "num_stages": num_stages,
-            "waves_per_eu": waves_per_eu,
-            "matrix_instr_nonkdim": matrix_instr_nonkdim,
-        },
-    )
 
 
 def gemm_afp8wfp8(
@@ -166,12 +148,7 @@ def gemm_afp8wfp8(
     )
 
     dev, stream = current_device_stream()
-    _gemm_afp8wfp8_kernel_launch(
-        config.get("num_warps", 4),
-        config.get("num_stages", 2),
-        config.get("waves_per_eu", 0),
-        config.get("matrix_instr_nonkdim", 0),
-    )(
+    _gemm_afp8wfp8_kernel(
         dev,
         stream,
         grid,
@@ -247,22 +224,6 @@ def gemm_afp8wfp8(
         )
 
     return y
-
-
-@functools.cache
-def _gemm_afp8wfp8_preshuffle_kernel_launch(
-    num_warps, num_stages, waves_per_eu, matrix_instr_nonkdim
-):
-    return make_launcher(
-        _gemm_afp8wfp8_preshuffle_kernel,
-        dynamic_options=("kpack",),
-        options={
-            "num_warps": num_warps,
-            "num_stages": num_stages,
-            "waves_per_eu": waves_per_eu,
-            "matrix_instr_nonkdim": matrix_instr_nonkdim,
-        },
-    )
 
 
 def gemm_afp8wfp8_preshuffle(
@@ -478,12 +439,7 @@ def gemm_afp8wfp8_preshuffle(
         )
     else:
         dev, stream = current_device_stream()
-        _gemm_afp8wfp8_preshuffle_kernel_launch(
-            config.get("num_warps", 4),
-            config.get("num_stages", 2),
-            config.get("waves_per_eu", 0),
-            config.get("matrix_instr_nonkdim", 0),
-        )(
+        _gemm_afp8wfp8_preshuffle_kernel(
             dev,
             stream,
             grid,

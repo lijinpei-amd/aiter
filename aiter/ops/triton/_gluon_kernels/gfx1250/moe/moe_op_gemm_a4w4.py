@@ -1,5 +1,6 @@
 import torch
 import triton.experimental.gluon.language as gl
+from intj import make_launcher
 from triton._C.libtriton.gluon_ir import make_cga_layout
 from triton.experimental import gluon
 
@@ -1398,6 +1399,7 @@ def _moe_gemm_a4w4_prefill(
         gl.amd.gfx1250.tdm.async_wait(0)
 
 
+@make_launcher
 @gluon.jit(
     launch_metadata=matmul_launch_metadata,
     do_not_specialize=["num_tokens"],

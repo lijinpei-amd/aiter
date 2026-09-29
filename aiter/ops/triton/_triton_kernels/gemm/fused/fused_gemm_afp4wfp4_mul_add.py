@@ -27,6 +27,7 @@ _fused_gemm_afp4wfp4_mul_add_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("kpack",))
 @triton.heuristics(
     {
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
@@ -248,6 +249,7 @@ _fused_gemm_afp4wfp4_preshuffle_mul_add_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("kpack",))
 @triton.heuristics(
     {
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)

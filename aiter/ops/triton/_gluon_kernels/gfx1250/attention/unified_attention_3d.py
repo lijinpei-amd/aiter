@@ -6,6 +6,7 @@ import math
 import torch
 import triton.experimental.gluon.language as gl
 import triton.language as tl
+from intj import make_launcher
 from triton.experimental import gluon
 from triton.language.core import _aggregate as aggregate
 
@@ -1923,6 +1924,7 @@ unified_attention_gluon_kernel_3d_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("matrix_instr_nonkdim", "kpack"))
 @gluon.jit(repr=unified_attention_gluon_kernel_3d_repr)
 def _unified_attention_gluon_kernel_3d(
     segm_output_ptr,  # [num_tokens, num_query_heads, num_segments, head_size or head_size // 2 if nvfp4]

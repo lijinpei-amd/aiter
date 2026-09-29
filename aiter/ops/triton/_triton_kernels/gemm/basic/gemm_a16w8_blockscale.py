@@ -3,6 +3,7 @@
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.quant.fused_fp8_quant import _fp8_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
@@ -30,6 +31,7 @@ _gemm_a16w8_blockscale_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("kpack",))
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
@@ -229,6 +231,7 @@ _gemm_a16w8_blockscale_preshuffle_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("kpack",))
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,

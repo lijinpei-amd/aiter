@@ -569,6 +569,7 @@ kernel_unified_attention_3d_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("matrix_instr_nonkdim", "kpack"))
 @triton.jit(repr=kernel_unified_attention_3d_repr)
 def kernel_unified_attention_3d(
     segm_output_ptr,

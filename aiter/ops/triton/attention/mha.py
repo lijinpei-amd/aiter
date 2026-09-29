@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import functools
 import math
 import os
 import warnings
@@ -10,7 +9,6 @@ from typing import Literal
 import torch
 import triton
 import triton.language as tl
-from intj import make_launcher
 from packaging.version import Version
 
 from aiter.ops.triton._gluon_kernels.gfx950.attention.mha import (
@@ -236,21 +234,6 @@ def _pack_attn_returns(out, softmax_lse, s_dmask, return_lse, return_attn_probs)
     return result[0] if len(result) == 1 else tuple(result)
 
 
-@functools.cache
-def _gluon_attn_fwd_launch(num_warps):
-    return make_launcher(
-        _gluon_attn_fwd,
-        dynamic_options=(
-            "num_stages",
-            "waves_per_eu",
-            "matrix_instr_nonkdim",
-            "kpack",
-            "num_ctas",
-        ),
-        options={"num_warps": num_warps},
-    )
-
-
 def _gluon_flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -459,7 +442,7 @@ def _gluon_flash_attn_forward(
     grid = (batch * num_q_heads * triton.cdiv(seqlen_q, BLOCK_M), 1)
 
     dev, stream = current_device_stream()
-    _gluon_attn_fwd_launch(config.get("num_warps", 4))(
+    _gluon_attn_fwd(
         dev,
         stream,
         grid,

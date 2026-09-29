@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import functools
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
@@ -41,22 +39,6 @@ def gemm_a16wfp4_fake_tensor(
         N, _ = w.shape
         return torch.zeros((M, N), dtype=dtype, device=x.device)
     return y
-
-
-@functools.cache
-def _gemm_a16wfp4_kernel_launch(
-    num_warps, num_stages, waves_per_eu, matrix_instr_nonkdim
-):
-    return make_launcher(
-        _gemm_a16wfp4_kernel,
-        dynamic_options=("kpack",),
-        options={
-            "num_warps": num_warps,
-            "num_stages": num_stages,
-            "waves_per_eu": waves_per_eu,
-            "matrix_instr_nonkdim": matrix_instr_nonkdim,
-        },
-    )
 
 
 @torch_compile_guard(gen_fake=gemm_a16wfp4_fake_tensor)
@@ -145,12 +127,7 @@ def gemm_a16wfp4_(
         ),
     )
     dev, stream = current_device_stream()
-    _gemm_a16wfp4_kernel_launch(
-        config.get("num_warps", 4),
-        config.get("num_stages", 2),
-        config.get("waves_per_eu", 0),
-        config.get("matrix_instr_nonkdim", 0),
-    )(
+    _gemm_a16wfp4_kernel(
         dev,
         stream,
         grid,
@@ -268,22 +245,6 @@ def gemm_a16wfp4_preshuffle_fake_tensor(
     return torch.empty((M, N), dtype=dtype, device=x.device)
 
 
-@functools.cache
-def _gemm_a16wfp4_preshuffle_kernel_launch(
-    num_warps, num_stages, waves_per_eu, matrix_instr_nonkdim
-):
-    return make_launcher(
-        _gemm_a16wfp4_preshuffle_kernel,
-        dynamic_options=("kpack",),
-        options={
-            "num_warps": num_warps,
-            "num_stages": num_stages,
-            "waves_per_eu": waves_per_eu,
-            "matrix_instr_nonkdim": matrix_instr_nonkdim,
-        },
-    )
-
-
 @torch_compile_guard(gen_fake=gemm_a16wfp4_preshuffle_fake_tensor)
 def gemm_a16wfp4_preshuffle_(
     x: torch.Tensor,
@@ -370,12 +331,7 @@ def gemm_a16wfp4_preshuffle_(
         ),
     )
     dev, stream = current_device_stream()
-    _gemm_a16wfp4_preshuffle_kernel_launch(
-        config.get("num_warps", 4),
-        config.get("num_stages", 2),
-        config.get("waves_per_eu", 0),
-        config.get("matrix_instr_nonkdim", 0),
-    )(
+    _gemm_a16wfp4_preshuffle_kernel(
         dev,
         stream,
         grid,

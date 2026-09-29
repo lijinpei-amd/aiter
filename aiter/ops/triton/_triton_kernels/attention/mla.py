@@ -71,6 +71,7 @@ _mla_prefill_fwd_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("waves_per_eu", "matrix_instr_nonkdim", "kpack"))
 @triton.jit(repr=_mla_prefill_fwd_kernel_repr)
 def _mla_prefill_fwd_kernel(
     output_ptr,  # [num_tokens, num_query_heads, head_size]
@@ -333,6 +334,7 @@ _mla_decode_fwd_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("matrix_instr_nonkdim", "kpack"))
 @triton.jit(repr=_mla_decode_fwd_kernel_repr)
 def _mla_decode_fwd_kernel(
     segm_output_ptr,  # [total_num_tokens, num_query_heads, KV_LORA_RANK + qk_rope_head_dim]

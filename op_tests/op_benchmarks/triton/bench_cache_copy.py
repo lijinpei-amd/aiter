@@ -1,5 +1,4 @@
 import argparse
-import functools
 import math
 
 import torch
@@ -86,6 +85,7 @@ def _wmma_warp_bases(num_warps):
     return [[1 << i, 0] for i in range(num_warps.bit_length() - 1)]
 
 
+@make_launcher
 @gluon.jit
 def simple_tdm_kernel(
     key_cache_ptr,
@@ -300,14 +300,6 @@ def simple_tdm_kernel(
     )
 
 
-@functools.cache
-def _simple_tdm_kernel_launch(num_warps, waves_per_eu):
-    return make_launcher(
-        simple_tdm_kernel,
-        options={"num_warps": num_warps, "waves_per_eu": waves_per_eu},
-    )
-
-
 def benchmark(args):
     num_blocks = args.num_blocks
     block_size = args.block_size
@@ -406,11 +398,10 @@ def benchmark(args):
             num_kv_heads, head_size, block_size, dtype=torch.bfloat16, device="cuda"
         )
 
-        launch = _simple_tdm_kernel_launch(num_warps, waves_per_eu)
         dev, stream = current_device_stream()
 
         def fn():
-            launch(
+            simple_tdm_kernel(
                 dev,
                 stream,
                 num_kv_heads,

@@ -1,12 +1,10 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_ogs.py
 
-import functools
 import itertools
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a4w4 import (
     _moe_gemm_a4w4_decode,
@@ -265,11 +263,6 @@ def mxfp4_quant(
     return dynamic_mxfp4_quant(x, x_fp4=x_fp4, blockscale_e8m0=x_scale)
 
 
-@functools.cache
-def _moe_gemm_a4w4_decode_launch(num_warps):
-    return make_launcher(_moe_gemm_a4w4_decode, options={"num_warps": num_warps})
-
-
 def moe_gemm_a4w4(
     x,
     w,
@@ -486,7 +479,7 @@ def moe_gemm_a4w4(
     if use_gluon and block_m == 16:
         # launch gluon kernel
         dev, stream = current_device_stream()
-        _moe_gemm_a4w4_decode_launch(config["num_warps"])(
+        _moe_gemm_a4w4_decode(
             dev,
             stream,
             grid,

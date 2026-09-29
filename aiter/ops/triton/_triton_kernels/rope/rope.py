@@ -886,6 +886,7 @@ _rope_kernel_thd_cached_2c_fwd_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("num_warps", "waves_per_eu"))
 @triton.jit(repr=_rope_kernel_thd_cached_2c_fwd_repr)
 def _rope_kernel_thd_cached_2c_fwd(
     x_ptr,
@@ -1082,6 +1083,7 @@ _rope_kernel_thd_cached_2c_bwd_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("num_warps", "waves_per_eu"))
 @triton.jit(repr=_rope_kernel_thd_cached_2c_bwd_repr)
 def _rope_kernel_thd_cached_2c_bwd(
     x_ptr,
@@ -1279,6 +1281,7 @@ _rope_kernel_cached_thd_2c_gqa_fwd_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("num_warps", "waves_per_eu"))
 @triton.jit(repr=_rope_kernel_cached_thd_2c_gqa_fwd_repr)
 def _rope_kernel_cached_thd_2c_gqa_fwd(
     x_ptr,
@@ -1672,6 +1675,7 @@ _rope_kernel_cached_thd_2c_gqa_bwd_repr = make_kernel_repr(
 )
 
 
+@make_launcher(dynamic_options=("num_warps", "waves_per_eu"))
 @triton.jit(repr=_rope_kernel_cached_thd_2c_gqa_bwd_repr)
 def _rope_kernel_cached_thd_2c_gqa_bwd(
     x_ptr,

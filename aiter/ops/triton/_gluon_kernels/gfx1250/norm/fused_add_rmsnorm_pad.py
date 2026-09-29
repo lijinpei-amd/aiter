@@ -3,6 +3,7 @@
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
@@ -25,6 +26,7 @@ _gluon_fused_add_rmsnorm_pad_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @gluon.jit(repr=_gluon_fused_add_rmsnorm_pad_kernel_repr)
 def _gluon_fused_add_rmsnorm_pad_kernel(
     x_ptr,

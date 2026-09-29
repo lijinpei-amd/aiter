@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import functools
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
@@ -20,22 +18,6 @@ from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
-
-
-@functools.cache
-def _gemm_a16w8_blockscale_kernel_launch(
-    num_warps, num_stages, waves_per_eu, matrix_instr_nonkdim
-):
-    return make_launcher(
-        _gemm_a16w8_blockscale_kernel,
-        dynamic_options=("kpack",),
-        options={
-            "num_warps": num_warps,
-            "num_stages": num_stages,
-            "waves_per_eu": waves_per_eu,
-            "matrix_instr_nonkdim": matrix_instr_nonkdim,
-        },
-    )
 
 
 def gemm_a16w8_blockscale(
@@ -115,12 +97,7 @@ def gemm_a16w8_blockscale(
         ),
     )
     dev, stream = current_device_stream()
-    _gemm_a16w8_blockscale_kernel_launch(
-        config.get("num_warps", 4),
-        config.get("num_stages", 2),
-        config.get("waves_per_eu", 0),
-        config.get("matrix_instr_nonkdim", 0),
-    )(
+    _gemm_a16w8_blockscale_kernel(
         dev,
         stream,
         grid,
@@ -196,22 +173,6 @@ def gemm_a16w8_blockscale(
         )
 
     return y
-
-
-@functools.cache
-def _gemm_a16w8_blockscale_preshuffle_kernel_launch(
-    num_warps, num_stages, waves_per_eu, matrix_instr_nonkdim
-):
-    return make_launcher(
-        _gemm_a16w8_blockscale_preshuffle_kernel,
-        dynamic_options=("kpack",),
-        options={
-            "num_warps": num_warps,
-            "num_stages": num_stages,
-            "waves_per_eu": waves_per_eu,
-            "matrix_instr_nonkdim": matrix_instr_nonkdim,
-        },
-    )
 
 
 def gemm_a16w8_blockscale_preshuffle(
@@ -297,12 +258,7 @@ def gemm_a16w8_blockscale_preshuffle(
         ),
     )
     dev, stream = current_device_stream()
-    _gemm_a16w8_blockscale_preshuffle_kernel_launch(
-        config.get("num_warps", 4),
-        config.get("num_stages", 2),
-        config.get("waves_per_eu", 0),
-        config.get("matrix_instr_nonkdim", 0),
-    )(
+    _gemm_a16w8_blockscale_preshuffle_kernel(
         dev,
         stream,
         grid,

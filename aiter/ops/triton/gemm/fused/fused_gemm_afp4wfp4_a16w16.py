@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import functools
 import os
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_a16w16 import (
     _fused_gemm_afp4wfp4_a16w16_kernel,
@@ -22,38 +20,6 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
 
 _LOGGER = AiterTritonLogger()
-
-
-@functools.cache
-def _fused_gemm_afp4wfp4_preshuffle_a16w16_kernel_launch(
-    num_warps, num_stages, waves_per_eu, matrix_instr_nonkdim
-):
-    return make_launcher(
-        _fused_gemm_afp4wfp4_preshuffle_a16w16_kernel,
-        dynamic_options=("kpack",),
-        options={
-            "num_warps": num_warps,
-            "num_stages": num_stages,
-            "waves_per_eu": waves_per_eu,
-            "matrix_instr_nonkdim": matrix_instr_nonkdim,
-        },
-    )
-
-
-@functools.cache
-def _fused_gemm_afp4wfp4_a16w16_kernel_launch(
-    num_warps, num_stages, waves_per_eu, matrix_instr_nonkdim
-):
-    return make_launcher(
-        _fused_gemm_afp4wfp4_a16w16_kernel,
-        dynamic_options=("kpack",),
-        options={
-            "num_warps": num_warps,
-            "num_stages": num_stages,
-            "waves_per_eu": waves_per_eu,
-            "matrix_instr_nonkdim": matrix_instr_nonkdim,
-        },
-    )
 
 
 def fused_gemm_afp4wfp4_a16w16(
@@ -196,21 +162,17 @@ def fused_gemm_afp4wfp4_a16w16(
             )
         ),
     )
-    selected_kernel = (
-        _fused_gemm_afp4wfp4_preshuffle_a16w16_kernel
+    # The AOT metadata is keyed by kernel name.
+    selected_kernel_name = (
+        "_fused_gemm_afp4wfp4_preshuffle_a16w16_kernel"
         if is_fp4_preshuffled
-        else _fused_gemm_afp4wfp4_a16w16_kernel
+        else "_fused_gemm_afp4wfp4_a16w16_kernel"
     )
 
     def selected_kernel_wrapper():
         if is_fp4_preshuffled:
             dev, stream = current_device_stream()
-            _fused_gemm_afp4wfp4_preshuffle_a16w16_kernel_launch(
-                config.get("num_warps", 4),
-                config.get("num_stages", 2),
-                config.get("waves_per_eu", 0),
-                config.get("matrix_instr_nonkdim", 0),
-            )(
+            _fused_gemm_afp4wfp4_preshuffle_a16w16_kernel(
                 dev,
                 stream,
                 grid,
@@ -264,12 +226,7 @@ def fused_gemm_afp4wfp4_a16w16(
             )
         else:
             dev, stream = current_device_stream()
-            _fused_gemm_afp4wfp4_a16w16_kernel_launch(
-                config.get("num_warps", 4),
-                config.get("num_stages", 2),
-                config.get("waves_per_eu", 0),
-                config.get("matrix_instr_nonkdim", 0),
-            )(
+            _fused_gemm_afp4wfp4_a16w16_kernel(
                 dev,
                 stream,
                 grid,
@@ -325,10 +282,10 @@ def fused_gemm_afp4wfp4_a16w16(
     M_POW2 = triton.next_power_of_2(M)
     if M < 32 and M_POW2 > 16:
         M_POW2 = 16
-    metadata_pth = f"{AITER_TRITON_CONFIGS_PATH}/gemm/aot/{selected_kernel.fn.__name__}_M={M_POW2}-N4={N_fp4}-N16={N_bf16}-K={K*2}"
+    metadata_pth = f"{AITER_TRITON_CONFIGS_PATH}/gemm/aot/{selected_kernel_name}_M={M_POW2}-N4={N_fp4}-N16={N_bf16}-K={K*2}"
     if use_aot and os.path.exists(metadata_pth):
         with AOTMetadataContext(
-            selected_kernel.fn.__name__,
+            selected_kernel_name,
             f"{metadata_pth}",
         ):
             selected_kernel_wrapper()
