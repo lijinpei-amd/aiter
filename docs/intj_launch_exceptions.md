@@ -98,9 +98,11 @@ str constexprs; sage_quant_v, `_combined_routing`, `_moe_gemm_a8w8` and
 
 One other form remains, 11 launchers: more launchers over a decorated
 kernel's JIT function, where one kernel needs several launchers (a decorator
-declares one) and taking what they differ in per call would cost its
-production launches. `HsacoKernel` makes its launchers at run time (last
-row); no `functools.cache` factory is left:
+declares one). For attn_res, `test_mla_stage2_merge.py` and
+`pa_attention_kernel_test`, taking what they differ in per call measured
+slower production launches; for pa_mqa_logits it would change the binaries
+of a KV mode (reasoned, not measured). `HsacoKernel` makes its launchers at
+run time (last row); no `functools.cache` factory is left:
 
 ```python
 _k_other = make_launcher(_k.__self__.options.jit_func, ...)   # other options or baked values
@@ -116,7 +118,7 @@ under it (pa_mqa_logits).
 | `attn_res` `attnres_fwd_sequence_kernels` (5) | table over the decorated `attnres_fwd_kernel`'s JIT function (or tuner) | One launcher per `L2` bucket of the sequence layout, each baking that bucket's unused residual slots as `None` and what the packed layout adds; the decorator is `attn_res_gate`'s and the packed layout's. One sequence launcher passing all 16 slots measured 0.27 us more per launch at L=2 and 0.10 us at L=8 on gfx942 (see [attn_res's sequence layout](#attn_ress-sequence-layout)). |
 | `test_mla_stage2_merge.py` `_fwd_kernel_stage2_asm_launch` | over a decorated kernel's JIT function | The script sweeps `num_warps`, `num_stages` and `waves_per_eu`, which `aiter.mla`'s decorator bakes. Taking them per call there makes each production call 31 positional arguments, past the 30 CPython passes directly: +0.33-0.47 us per launch on gfx942. With the grid as one tuple it stays at 30 and costs +22-46 ns, which production would pay for this script's sweep (see [The named launchers as decorators](#the-named-launchers-as-decorators)). |
 | `pa_attention_kernel_test` `_direct_dot_launch`, `_direct_large_block_dot_launch` | over a decorated kernel's JIT function | Launch pa_decode_gluon's dot kernels' JIT functions with other options (`num_stages=1`, per-call `waves_per_eu`) than their decorators. Taking both per call on the production dot-kernel decorator added 0.05-0.11 us to each of its launches on gfx942 (the large-block kernel was not timed). |
-| `pa_mqa_logits` KV-padded launchers (3) | table (`_GLUON_PAGED_MQA_LOGITS_LAUNCHERS`, beside the three decorated Gluon kernels) over the JIT functions recorded under their decorators | Each Gluon kernel has a launcher for a KV cache whose row stride is a multiple of 16 and one for any stride, with different hand-written `Assume` facts (`delayed=`: they need `get_gfx()`); the decorator is the unpadded mode's. One launcher measuring the KV facts per call would compile the unpadded mode with facts it does not assume now (the KV pointers' alignment), so other binaries than the AOT mode's prebuilt ones match. |
+| `pa_mqa_logits` other-KV-mode launchers (3): plain KV-padded, preshuffle and preshuffle-varctx unpadded | table (`_GLUON_PAGED_MQA_LOGITS_LAUNCHERS`, beside the three decorated Gluon kernels) over the JIT functions recorded under their decorators | Each Gluon kernel has a launcher for a KV cache whose row stride is a multiple of 16 and one for any stride, with different hand-written `Assume` facts (`delayed=`: they need `get_gfx()`). The decorator is the mode 132-byte KV tokens take in each kernel's default page (the benchmark's): unpadded for the plain kernel's page of one token, padded for every preshuffle page (8 or a multiple of 16 tokens). The table launchers run for a padded plain cache (a page of a multiple of 4 such tokens, or tokens padded to 16 bytes, the benchmark's `-p`) and for a preshuffle page of 8 odd-sized tokens. One launcher measuring the KV facts per call (`AUTO`) would compile the unpadded mode with two facts on `KV_buffer` and `scale_buffer` that it now omits (`NEVER`), and that hold for a 16-byte-aligned cache under 2 GiB: 16-byte alignment and the <2 GiB pointer range. That changes today's unpadded binaries, which the AOT mode's prebuilt artifacts hold. Reasoned, not measured: no such launcher was built or timed. |
 | `csrc/cpp_itfs/utils.py` `_IntjKernel.launchers` | made on first call | `jit(kernel)` wraps whatever JIT function its caller passes; one `return_compiled=True` launcher per set of option keywords, taken as `dynamic_options` (see [HsacoKernel](#hsacokernel)). |
 
 Every call is positional. `current_device_stream()`
@@ -1322,12 +1324,14 @@ The last launchers declared beside their kernel are decorators now; what is
 left over a kernel's JIT function is listed under [Launchers](#launchers).
 Measured on gfx942 (MI300X, triton 3.8.0, torch 2.14+rocm7.2, intj
 `2783079`) against `00df7c810` (before the named-launcher commits were
-cherry-picked).
+cherry-picked); "new" is `73e982ef0`, which after review moved the
+preshuffle kernels' decorators to the KV-padded mode (first `4bd3633f3`,
+then `8d3fbaf06` with this record, decorated the unpadded mode of all three).
 
 | Launcher (before) | Now |
 | --- | --- |
 | `attn_res` `attnres_fwd_kernel = make_launcher(_attnres_fwd, ...)`, after an optional `triton.autotune` rebind | `@make_launcher(...)` over `@_attn_res_tuning` (the `ATTN_RES_TRITON_AUTOTUNE` tuner, or nothing) over `@triton.jit`; the five `attnres_fwd_sequence_kernels` are made over its `__self__.options.jit_func` |
-| `pa_mqa_logits` `_GLUON_PAGED_MQA_LOGITS_LAUNCHERS`, six launchers from one `make_launcher` comprehension over `_gluon_kernel(mode)` | the unpadded-KV launcher of each Gluon kernel is its `@make_launcher(..., delayed=partial(_gluon_launch_keywords, ...))` decorator, in `aiter/ops/triton/gluon/pa_mqa_logits.py` with the keywords function; `@_jit_function_of(Preshuffle, VarCtxOpt)` under it records the JIT function, over which the three KV-padded launchers are made; the six-entry table, `require_metadata_redirect` and `AOTMetadataContext` take the recorded JIT functions (names unchanged) |
+| `pa_mqa_logits` `_GLUON_PAGED_MQA_LOGITS_LAUNCHERS`, six launchers from one `make_launcher` comprehension over `_gluon_kernel(mode)` | each Gluon kernel's decorator, `@make_launcher(..., delayed=partial(_gluon_launch_keywords, ...))`, is the launcher of the KV mode 132-byte tokens take in its default page: unpadded for the plain kernel (a page of one token), KV-padded for the two preshuffle kernels (every page they take is padded with such tokens). It sits in `aiter/ops/triton/gluon/pa_mqa_logits.py` with the keywords function; `@_jit_function_of(Preshuffle, VarCtxOpt)` under it records the JIT function, over which the table makes each kernel's other-mode launcher; the six-entry table, `require_metadata_redirect` and `AOTMetadataContext` take the recorded JIT functions (names unchanged) |
 | `aiter/mla.py` `_fwd_kernel_stage2_asm_launch`, `rmsnorm.py` `_rms_norm_kernel_launch` | gone (see [The named launchers as decorators](#the-named-launchers-as-decorators)) |
 
 Every call site keeps its arguments, their count and order. 426 decorator
@@ -1355,6 +1359,17 @@ JIT function of the Gluon module set back to its starting line in
 after the new imports), the 7 configurations below compile to
 `00df7c810`'s Triton cache keys.
 
+Moving the preshuffle decorators to the padded mode moves no kernel's lines
+and changes no mode's keywords. Against `8d3fbaf06` (unpadded
+decorators), the offset test's 49 compiles and the driver's 7 have the same
+Triton hashes, and equal json, TTGIR, AMDGCN and stripped HSACO. The
+driver's, compiled from one path, are byte-identical; the offset test's
+differ only in the tree's path in the DWARF (pytest resolves the symlinked
+path, so the two trees' paths differ there). Outputs, the launcher each call
+took and the returned cache keys equal `8d3fbaf06`'s in JIT and AOT mode.
+The other kernels' rows were compiled at `8d3fbaf06`; `73e982ef0` changes
+none of their files.
+
 **pa_mqa_logits' AOT path.** A driver runs `deepgemm_fp8_paged_mqa_logits`
 on 7 configurations that reach all six launchers (batch 1, 64 heads,
 128-dim, 256-token context, ChunkK 256, WavePerEU 2): plain page 1 with a
@@ -1367,15 +1382,21 @@ bitwise equal between the trees, in both modes. AOT artifacts made from
 as `bench_deepgemm_attention.py -aot` does, load on the new tree: for every
 configuration the first call (a miss) and the second (a hit) return a
 kernel whose json and hsaco are the artifact's (its json `hash` is
-`00df7c810`'s), and the outputs equal JIT mode's. Same on `00df7c810`.
+`00df7c810`'s), and the outputs equal JIT mode's. Same on `00df7c810`
+and `8d3fbaf06`.
 
 **Check sweep** (`intj-aiter-check-sweep.py --build`, both trees): 415
 modules, 383 import on one GPU; 424 launchers (7 `delayed=`), every one
 checks and builds; the same 14 declared launchers not reached. Without a
-GPU 148 of 415 import on both, no new failure.
+GPU, 148 of 415 import on each tree and the same 267 fail (`00df7c810`'s
+count from a GPU-free sweep of its own; the new tree's sweep re-imports on
+the base only the modules that fail on the new one).
 
 **Tests** (gfx942; `aiter_triton_only_dtypes`, `aiter_pertoken_shim`,
-`aiter_quant_shim` plugins; failures by test id):
+`aiter_quant_shim` plugins; failures by test id). The pa_mqa_logits, metadata
+redirect and `test_intj_attention_launches.py` rows ran on `73e982ef0`; the
+others on `8d3fbaf06`, whose code they share (the later commits change only
+the Gluon pa_mqa_logits module and that test file):
 
 | | `00df7c810` | new |
 | --- | --- | --- |
@@ -1386,52 +1407,82 @@ GPU 148 of 415 import on both, no new failure.
 | `triton_tests/triton_metadata_redirect/test_metadata_redirect.py`, JIT / AOT mode | 4 / 4 passed | the same |
 | `triton_tests/normalization/test_rmsnorm.py` | 450 passed, 2 failed | the same |
 | `triton_tests/normalization/test_intj_launches.py` | 1 passed | 1 passed |
-| `triton_tests/attention/test_intj_attention_launches.py` | 1 passed | 4 passed (adds the stage-2 tests) |
+| `triton_tests/attention/test_intj_attention_launches.py`, JIT / AOT mode | 1 passed / not run | 11 passed (adds the stage-2 and pa_mqa_logits tests) / 5 passed, 6 skipped |
 | `test_mla_decode_gate.py`, `test_mla_v4_nm.py` | 21 skipped (gfx950 only) | the same |
 | `test_mla_stage2_merge.py` (a script), 50 configurations | err 0 | err 0 |
+
+`test_pa_mqa_logits_launchers_carry_their_modes_keywords` checks, after
+`check()`, that each of the six table entries launches the JIT function
+recorded for its (Preshuffle, VarCtxOpt) with `_gluon_launch_keywords`'s
+annotation and options for its mode, and that the six modes' keywords differ.
+`test_pa_mqa_logits_launches_each_mode_through_its_launcher` runs each mode
+through `deepgemm_fp8_paged_mqa_logits` (2 sequences of 2 tokens, 64 heads;
+132-, 144- and 133-byte tokens), checks which launcher ran and compares with
+torch. Before them the offset tests reached three modes (plain unpadded and
+padded, preshuffle padded) and no pytest test the VarCtx kernel. Five mutations
+fail the first test: a decorator's `delayed=` with another `VarCtxOpt`, the
+plain decorator padded, a JIT function recorded under another mode, a table
+key with the other KV mode, the table's launchers with their decorator's KV
+mode. The last three pass every launch test: with the wrong facts the logits
+are still right on gfx942. The launch test's output width is a multiple of
+16: the VarCtx kernel stores logits up to a sequence's length rounded up to
+16, so with a `max_model_len` below that it writes past the row, into the
+next row's first logits (300 tokens and `max_model_len` 300: 4 stores past
+the row; 290 and 290: 14; 300 and 304: none; upstream `874d253dd3` stores
+the same 4 at 300 tokens; not fixed here).
 
 The autotune failure is `test_attn_res_gate_out_quant_matches_unfused_quant[64]`;
 the rmsnorm ones are `test_fused_add_rmsnorm_gemma_norm[bf16|fp16]`, whose
 HIP reference `aiter.rmsnorm2d_fwd_with_add` `AITER_TRITON_ONLY` leaves
 unbound.
 
-**Host time** per launch (us), every launcher whose declaration changed,
-new vs `00df7c810`: the launcher called alone with the arguments its
-production wrapper passed (captured from a real call; a site that passes
-them positionally is replayed positionally, a starred one starred), in
-batches of 8 calls with a synchronize after each batch outside the timer,
-median of 3000 batches; each batch followed by one of an unchanged
-reference launcher (pa_mqa_logits' VarCtx schedule kernel). One process per
-tree and round with all 11 cases, the trees' order alternating, 60 rounds,
-pinned to a core of the GPU's NUMA node with memory bound to it. Process
-times are bimodal on both trees: in 29 of 60 `00df7c810` processes and 32
-of 60 new ones every launch is slower, the reference's too (4.3-5.1 us
-against 3.3-3.6 us). The table is over the others (reference under 4 us;
-31 and 28 processes): the median of the process medians, the difference,
-and its bootstrap 95% interval.
+**Host time** per launch (us), new vs `00df7c810`, every production
+launcher whose declaration changed: the decorated ones, all five sequence
+launchers and the six pa_mqa_logits ones (`test_mla_stage2_merge.py`'s
+script launcher, now made over the decorator's `jit_func`, was not timed).
+Each case calls the launcher alone with the arguments its production wrapper
+passed (captured from a real call; a site that passes them positionally is
+replayed positionally, a starred one starred), in batches of 8 calls with a
+synchronize after each batch outside the timer, median of 3000 batches; each
+batch is followed by one of an unchanged reference launcher (pa_mqa_logits'
+VarCtx schedule kernel). One process per tree and round with all 14 cases,
+the trees' order alternating, two runs of 60 rounds, pinned to a core of the
+GPU's NUMA node with memory bound to it. Process times are bimodal on both
+trees: in 37 of 120 `00df7c810` processes and 38 of 120 new ones every
+launch is slower, the reference's too (4.0-5.2 us against 3.3-3.5 us). The
+table is over the others (reference under 4 us; 83 and 82 processes): the
+median of the process medians, the difference, and its bootstrap 95%
+interval.
 
 | Launcher (case) | `00df7c810` | new | new - `00df7c810` [95% CI] | the same, each batch minus the reference's |
 | --- | ---: | ---: | ---: | ---: |
-| `_fwd_kernel_stage2_asm` (28 positional) | 3.556 | 3.554 | -0.002 [-0.048, +0.040] | +0.014 [-0.045, +0.038] |
-| `_rms_norm_kernel` (15 positional) | 3.222 | 3.211 | -0.012 [-0.053, +0.035] | +0.018 [-0.027, +0.069] |
-| `attnres_fwd_kernel`, `attn_res_gate` (starred) | 3.708 | 3.698 | -0.010 [-0.053, +0.044] | -0.008 [-0.035, +0.021] |
-| `attnres_fwd_sequence_kernels[2]`, L=2 | 3.483 | 3.451 | -0.032 [-0.064, +0.030] | -0.004 [-0.053, +0.025] |
-| `attnres_fwd_sequence_kernels[16]`, L=16 | 4.288 | 4.285 | -0.004 [-0.028, +0.049] | +0.003 [-0.031, +0.035] |
-| pa_mqa_logits plain, unpadded (decorator) | 3.469 | 3.473 | +0.004 [-0.041, +0.051] | +0.004 [-0.027, +0.033] |
-| pa_mqa_logits plain, padded | 3.503 | 3.493 | -0.010 [-0.046, +0.024] | -0.003 [-0.023, +0.023] |
-| pa_mqa_logits preshuffle, padded | 3.495 | 3.483 | -0.012 [-0.046, +0.016] | -0.009 [-0.033, +0.014] |
-| pa_mqa_logits preshuffle-varctx, padded | 3.583 | 3.572 | -0.010 [-0.035, +0.028] | +0.006 [-0.033, +0.039] |
-| pa_mqa_logits preshuffle, unpadded (decorator) | 3.468 | 3.459 | -0.010 [-0.054, +0.058] | +0.002 [-0.037, +0.032] |
-| pa_mqa_logits preshuffle-varctx, unpadded (decorator) | 3.606 | 3.568 | -0.038 [-0.107, +0.040] | -0.038 [-0.087, -0.006] |
+| `_fwd_kernel_stage2_asm` (28 positional) | 3.551 | 3.551 | -0.001 [-0.021, +0.016] | -0.005 [-0.021, +0.009] |
+| `_rms_norm_kernel` (15 positional) | 3.222 | 3.218 | -0.004 [-0.020, +0.021] | +0.001 [-0.027, +0.016] |
+| `attnres_fwd_kernel`, `attn_res_gate` (starred) | 3.674 | 3.670 | -0.004 [-0.020, +0.027] | -0.000 [-0.017, +0.014] |
+| `attnres_fwd_sequence_kernels[1]`, L=1 | 3.344 | 3.342 | -0.002 [-0.022, +0.026] | +0.006 [-0.015, +0.021] |
+| `attnres_fwd_sequence_kernels[2]`, L=2 | 3.442 | 3.463 | +0.021 [-0.014, +0.042] | +0.000 [-0.017, +0.020] |
+| `attnres_fwd_sequence_kernels[4]`, L=4 | 3.479 | 3.483 | +0.004 [-0.005, +0.020] | +0.010 [-0.023, +0.029] |
+| `attnres_fwd_sequence_kernels[8]`, L=8 | 3.833 | 3.822 | -0.011 [-0.023, +0.013] | +0.001 [-0.017, +0.018] |
+| `attnres_fwd_sequence_kernels[16]`, L=16 | 4.240 | 4.236 | -0.004 [-0.022, +0.019] | +0.006 [-0.004, +0.017] |
+| pa_mqa_logits plain, unpadded (decorator) | 3.454 | 3.458 | +0.004 [-0.019, +0.015] | +0.001 [-0.019, +0.017] |
+| pa_mqa_logits plain, padded | 3.482 | 3.493 | +0.010 [-0.015, +0.025] | -0.003 [-0.025, +0.015] |
+| pa_mqa_logits preshuffle, padded (decorator) | 3.499 | 3.491 | -0.008 [-0.029, +0.017] | -0.000 [-0.026, +0.023] |
+| pa_mqa_logits preshuffle-varctx, padded (decorator) | 3.547 | 3.536 | -0.011 [-0.028, +0.011] | -0.013 [-0.032, +0.013] |
+| pa_mqa_logits preshuffle, unpadded | 3.445 | 3.447 | +0.003 [-0.022, +0.021] | -0.003 [-0.018, +0.017] |
+| pa_mqa_logits preshuffle-varctx, unpadded | 3.534 | 3.538 | +0.005 [-0.014, +0.023] | -0.023 [-0.038, +0.022] |
 
-No launcher measured slower: the largest point estimate is +0.004 us
-(+0.018 us against the reference). Every interval of the raw times includes
-zero; of the reference-corrected ones only pa_mqa_logits' preshuffle-varctx
-unpadded launcher's excludes it, on the faster side. The two point
-estimates past 0.03 us (attn_res L=2, that launcher) are the new tree being
-faster.
+No difference is resolved: every interval includes zero, raw and against the
+reference. The point estimates are -0.011 to +0.021 us raw and -0.023
+to +0.010 us against the reference, and the intervals are 0.02-0.06 us wide, so
+a change of a few hundredths of a microsecond is not excluded (up to +0.042
+us on L=2's raw interval). A single run is noisier: in the first, new-tree
+processes ran the unchanged reference 0.017 us slower, and two raw
+intervals excluded zero on the slower side (`attn_res_gate` +0.034, plain
+padded +0.026; -0.014 and -0.012 in the second run).
 
 Not verified: gfx950 (runtime and compile), CUDA; the Iris
 `fused_pipeline_kernel` (no `iris`; see the previous section's stub
 compile); real AOT artifacts other than these, and concurrent misses in AOT
-mode.
+mode. The reason pa_mqa_logits keeps a table (one launcher measuring the KV
+facts would change the unpadded binaries; see [Launchers](#launchers)) is
+reasoned: no such launcher was built, compared or timed.
