@@ -252,8 +252,10 @@ def test_wide_packed_scale_load_layout_matches_producer(scale_k, operand):
     ],
 )
 def test_invalid_packed_k128_configs_are_rejected(changes, k, diagnostic):
+    # A FROZEN_STEP build is validated by the frozen snapshot's own copy.
+    check = frozen._validate_frozen if changes.get("FROZEN_STEP") else validate
     with pytest.raises(AssertionError, match=diagnostic):
-        validate(_config(**changes), 4096, k)
+        check(_config(**changes), 4096, k)
 
 
 class _HostView:

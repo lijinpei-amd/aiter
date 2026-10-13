@@ -7,6 +7,7 @@ import math
 
 import pytest
 
+from aiter.ops.triton._gluon_kernels.gfx950.moe._frozen import _validate_frozen
 from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import compute_kernel_layout
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
     _live_span,
@@ -143,7 +144,7 @@ def test_frozen_shuffled_scales_reject_k_wider_than_256():
     with pytest.raises(
         AssertionError, match="BLOCK_K == SCALE_MINI_BLOCK_K == 256"
     ):
-        validate(tc, 4096, 7168)
+        _validate_frozen(tc, 4096, 7168)
 
 
 @pytest.mark.parametrize(

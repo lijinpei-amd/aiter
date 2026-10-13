@@ -23,18 +23,14 @@ from ._lang import (
     WarpPipeline,
 )
 from ._lang import unwrap as _v
-from ._layout import (
-    LDS_CAP_BYTES,
-    LDS_EPILOGUE_RESERVE_BYTES,
-    LDS_USABLE_BYTES,
-    compute_kernel_layout,
-)
+from ._layout import compute_kernel_layout
 from ._schedule import (
     _fill_slots_valid,
     _pipeline_peeled,
     pipeline_depth,
     pipeline_unroll,
 )
+from ._types import LDS_CAP_BYTES, LDS_EPILOGUE_RESERVE_BYTES, LDS_USABLE_BYTES
 
 __all__ = [
     "validate",
@@ -104,9 +100,9 @@ def validate(tc, N, K, layout=None):
         )
 
     # -- register prefetch depth --
-    # The live and frozen drivers both carry the complete BLOCK_K stage in
-    # registers from the preceding step. There is no partial or disabled handoff
-    # after removing the payload K split.
+    # The live driver carries the complete BLOCK_K stage in registers from the
+    # preceding step. There is no partial or disabled handoff after removing the
+    # payload K split.
     pk = _v(tc.VGPR_PREFETCH_K)
     assert pk == BK, (
         f"VGPR_PREFETCH_K must equal BLOCK_K (got {pk} vs {BK}): "
@@ -161,24 +157,6 @@ def validate_layout(tc, layout, N, K):
     assert _v(tc.ALLOW_B_VIA_LDS) or tc.operand_preshuffled(1), (
         "ALLOW_B_VIA_LDS=False requires B_PRESHUFFLED"
     )
-    has_custom_storage = bool(
-        not _v(tc.ALLOW_B_VIA_LDS)
-        or not _v(tc.ALLOW_B_SCALE_VIA_LDS)
-        or not _v(tc.ALLOW_A_SCALE_VIA_LDS)
-        or _v(tc.A_NUM_BUFFER)
-        or _v(tc.B_NUM_BUFFER)
-        or _v(tc.A_SCALE_NUM_BUFFER)
-        or _v(tc.B_SCALE_NUM_BUFFER)
-    )
-    assert not (_v(tc.FROZEN_STEP) and has_custom_storage), (
-        "FROZEN_STEP does not support register storage or per-component buffer counts"
-    )
-    if _v(tc.FROZEN_STEP):
-        for idx in (0, 1):
-            assert layout.payload_via_lds(idx), (
-                f"FROZEN_STEP requires operand {idx}'s payload in LDS; "
-                "use the live pipeline for a direct-register payload"
-            )
     validate_buffer_counts(tc)
 
     # -- host preconditions (no N tail, no K tail; only the even case exists) --
@@ -213,12 +191,6 @@ def validate_layout(tc, layout, N, K):
             "SCALE_MINI_BLOCK_K must be a power of two and a multiple of BLOCK_K"
         )
         assert K % sk == 0, "K must contain complete SCALE_MINI_BLOCK_K tiles"
-        if _v(tc.FROZEN_STEP):
-            assert BK == 256 and sk == BK and layout.scale_ratio_non_k_slot(idx) == 1, (
-                "FROZEN_STEP shuffled scales require BLOCK_K == "
-                "SCALE_MINI_BLOCK_K == 256 and one scale tile per payload slot; "
-                "use the live pipeline for independent scale mini blocks"
-            )
 
     # -- the slot is the unit of LDS allocation, of the global->LDS copy, of the
     #    MFMA and of the accumulator, so it must align to the CTA block;
