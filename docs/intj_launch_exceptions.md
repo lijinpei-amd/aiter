@@ -25,10 +25,12 @@ launches in the table below, each needing a runtime capability or launch
 behavior intj cannot preserve. No `intj.compat.launch` call is left; the
 last eight, gfx1250 Gluon paths that passed a tuple or a Gluon layout object
 as a constexpr, now build those values in the kernel (see
-[gfx1250 Gluon kernels](#gfx1250-gluon-kernels)). pod_attention and the metadata-redirect
-test's `empty_kernel`, which read the returned `CompiledKernel`, now use a
-`return_compiled=True` launcher. So does `csrc/cpp_itfs/utils.py`'s
-`HsacoKernel` (see [HsacoKernel](#hsacokernel)).
+[gfx1250 Gluon kernels](#gfx1250-gluon-kernels)). pod_attention and both
+metadata-redirect tests' `empty_kernel`, which read the returned
+`CompiledKernel`, now use `return_compiled=True` launchers (see
+[The metadata-redirect separate-compile test](#the-metadata-redirect-separate-compile-test)).
+So does `csrc/cpp_itfs/utils.py`'s `HsacoKernel` (see
+[HsacoKernel](#hsacokernel)).
 
 Line numbers refer to this branch. The three Iris kernels are blocked only
 by their Iris helpers (intj takes their `tl.tensor` annotations) and remain
@@ -45,7 +47,6 @@ pending Iris-enabled multi-GPU validation.
 | `aiter/ops/triton/moe/moe_op_gemm_a8w4.py:717` | `_moe_gemm_a8w4_prefill_gluon` | Selected config can use `num_ctas > 1`; intj refuses it. |
 | `aiter/ops/triton/utils/device_info.py:57` | `kernel.__self__.options.jit_func` | Only while `torch.compile` traces: Dynamo cannot trace an intj launcher, and `fav3_sage_wrapper_func` must compile with `fullgraph=True` (see [torch.compile of fav3_sage](#torchcompile-of-fav3_sage)). |
 | `op_tests/triton_tests/torch_compile/test_compile_constexpr_mutation.py:37` | `_rmsnorm_constexpr_kernel` | Test checks Triton launch behavior under `torch.compile`. |
-| `op_tests/triton_tests/triton_metadata_redirect/test_metadata_redirect.py:5877` | `kernel` | Explicit precompiled `triton.compile` result, not a `JITFunction`. |
 | `op_tests/triton_tests/utils/causal_conv1d_update_refs.py:656` | `_causal_conv1d_update_kernel_sglang` | `**pdl_kwargs` can include `launch_pdl=True`, which intj cannot launch. |
 | `op_tests/triton_tests/utils/causal_conv1d_update_refs.py:1199` | `_causal_conv1d_update_kernel_vllm` | `launch_pdl=_is_arch_support_pdl()` can request PDL. |
 
@@ -173,7 +174,10 @@ Defaults are passed explicitly, values that `@triton.autotune` /
   launch that misses compiles and then loads the prebuilt hsaco/json, as
   `triton.compile` did (see [pa_mqa_logits' AOT mode](#pa_mqa_logits-aot-mode)).
   pod_attention prints the returned kernel's `n_regs`/`n_spills`, and the
-  metadata-redirect test checks its `metadata.hash`, the same way.
+  metadata-redirect tests check its `metadata.hash`, the same way. Such a
+  launcher compiles without running on a zero-volume grid:
+  `test_separate_compile_and_run` compiles that way inside the context and
+  runs outside it.
 - **`torch.Tensor` / `tl.tensor` annotations** mean "exactly a tensor" to
   intj (Triton ignores them). A parameter that can be `None` (MHA forward's
   descale, alibi, dropout-mask and sink pointers) is annotated
@@ -1033,3 +1037,77 @@ offset test's.
 Not verified: Triton 3.7 (intj's floor; only 3.8.0 here), a real Triton
 < 3.4, gfx1250, concurrent misses on several threads in AOT mode, and
 plain-kernel artifacts for a padded KV cache (`-p`, `PT` in the name).
+
+## The metadata-redirect separate-compile test
+
+`test_separate_compile_and_run` compiled `empty_kernel` with
+`triton.compile(ASTSource(signature={"x_ptr": "*fp32"}, constexprs={"SIZE": 64}),
+target=GPUTarget("hip", "gfx942", 64))` inside `AOTMetadataContext`, then
+launched the returned `CompiledKernel` with `kernel[(1, 1, 1)](x)`. It now
+declares a `return_compiled=True` launcher whose `extra_annotation` states
+that source: `x_ptr` an `*fp32` `Argument` with `specialize=NEVER`, `SIZE` a
+baked `Constexpr(value=64)`.
+
+- **Compile.** The first call, with a zero-volume grid, runs inside the
+  context. It misses intj's cache, so `triton.compiler.compile` runs on this
+  thread and the context's patched `CompiledKernel.__init__` swaps in the
+  prebuilt hsaco/json. The call returns that kernel without running it.
+- **Run.** A `(1, 1, 1)` call outside the context finds the kernel, launches
+  it and must return the same object.
+- **Checks.** The json's hash (as before), the hsaco path from this test's
+  directory, and the prebuilt bytes as the loaded binary. Each bypass fails
+  the test: compiling outside the context, launching once before it, or
+  redirecting to another directory holding the same files (caught by the
+  path check only). In a full-file run the first two fail with
+  `FileNotFoundError` instead: `test_jit`'s `with_custom_metadata_path`
+  leaves `empty_kernel` registered on the thread, pointing at `test_jit`'s
+  deleted directory (on the parent too).
+
+What the launcher cannot reproduce: compiling needs the launch's arguments
+(device, stream, `x`) and loads the binary right away rather than at the
+first run, and the target is the current device's rather than an explicit
+`GPUTarget` (the file runs only on gfx942, where they are equal). The miss
+compiles with the same options, target, argument types, constexpr and (no)
+attributes as `triton.compile` did (checked by intercepting it), but its
+`ASTSource` signature also lists `SIZE` as `constexpr`, as Triton's JIT
+does, so Triton caches the result under a different key. The redirect
+replaces that result either way.
+
+Verified on gfx942 (MI300X, `HIP_VISIBLE_DEVICES=5`, intj `2783079`, Triton
+3.8.0): the file passes in full, 3 of 3, on this revision and on its parent.
+
+Host time per launch of the empty kernel, grid `(1, 1, 1)`: batches of 8
+calls with a synchronize after each batch outside the timer, median of 3000
+batches per process, seven alternating parent/intj rounds in separate
+processes pinned to the GPU's NUMA node; median of the round medians
+(range).
+
+| Launch | us/call |
+| --- | ---: |
+| `kernel[(1, 1, 1)](x)` (parent) | 7.33 (7.24-7.42) |
+| `runner = kernel[(1, 1, 1)]` hoisted, `runner(x)` | 6.89 (6.80-7.12) |
+| `launch(dev, stream, (1, 1, 1), x)` | 3.11 (3.02-3.16) |
+| `launch(*current_device_stream(), (1, 1, 1), x)` | 3.73 (3.59-3.83) |
+
+GPU time is unchanged: 2.51-2.53 us per launch on both sides, the same
+prebuilt binary (`torch.cuda.Event` around 200 launches queued behind
+`torch.cuda._sleep`, three runs each; rocprofv3 aborts against torch's
+bundled rocprofiler).
+
+The first call costs more. Compile through the redirect plus the first run,
+in a fresh process with the CUDA context, Triton's driver and Triton's
+`triton_key()` hash already done (0.50 s per process; parent 502 ms and
+intj 568 ms on warm caches with it, 572 ms and 2499 ms cold), median ms
+(range) of seven alternating rounds warm, five for the other two rows:
+
+| Disk caches | parent | intj |
+| --- | ---: | ---: |
+| Warm Triton and intj caches | 1.9 (1.9-2.2) | 63.3 (62.9-64.6) |
+| Warm, `torch.utils.cpp_extension` already imported | 2.2 (2.0-2.3) | 8.2 (8.0-9.1) |
+| Cold (empty `TRITON_HOME`) | 62.0 (61.3-63.7) | 1982 (1966-2027) |
+
+intj's warm overhead is mostly its first import of `torch.utils.cpp_extension`
+(once per process, when the first launcher is checked); cold, it builds the
+launcher's extension (1.74 s in the host C compiler and 0.26 s rendering, in
+one profiled run). The parent's first run also loads the binary (0.7-1.1
+ms); intj loads it while compiling, so its first run takes under 0.12 ms.
