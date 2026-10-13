@@ -20,7 +20,7 @@ values) wait for `__self__.build()` or the first call (see
 needs a host C compiler once per interpreter (intj builds its generic lazy
 stub).
 
-What still launches through Triton, and why: the 14 tracked Triton bracket
+What still launches through Triton, and why: the 15 tracked Triton bracket
 launches in the table below, each needing a runtime capability or launch
 behavior intj cannot preserve. No `intj.compat.launch` call is left; the
 last eight, gfx1250 Gluon paths that passed a tuple or a Gluon layout object
@@ -44,6 +44,7 @@ pending Iris-enabled multi-GPU validation.
 | `aiter/ops/triton/gemm/basic/gemm_afp8wfp8.py:386` | `_PRESHUFFLE_KERNEL_MAP[kernel_type]` | gfx1250 preshuffle can use `num_ctas > 1` (CGA multicast); intj refuses it. |
 | `aiter/ops/triton/moe/moe_op_gemm_a4w4.py:595` | `_moe_gemm_a4w4_prefill` | Selected config can use `num_ctas > 1`; intj refuses it. |
 | `aiter/ops/triton/moe/moe_op_gemm_a8w4.py:717` | `_moe_gemm_a8w4_prefill_gluon` | Selected config can use `num_ctas > 1`; intj refuses it. |
+| `aiter/ops/triton/utils/device_info.py:57` | `kernel.__self__.options.jit_func` | Only while `torch.compile` traces: Dynamo cannot trace an intj launcher, and `fav3_sage_wrapper_func` must compile with `fullgraph=True` (see [torch.compile of fav3_sage](#torchcompile-of-fav3_sage)). |
 | `csrc/cpp_itfs/utils.py:515` | `self.triton_kernel` | `HsacoKernel._call` preserves the returned kernel alongside its separate HSACO path. |
 | `op_tests/triton_tests/torch_compile/test_compile_constexpr_mutation.py:37` | `_rmsnorm_constexpr_kernel` | Test checks Triton launch behavior under `torch.compile`. |
 | `op_tests/triton_tests/triton_metadata_redirect/test_metadata_redirect.py:5875` | `kernel` | Explicit precompiled `triton.compile` result, not a `JITFunction`. |
@@ -190,8 +191,13 @@ Defaults are passed explicitly, values that `@triton.autotune` /
 Unlike `compat.launch`, a launcher does not check for Triton launch hooks,
 CPU tensors, `TensorWrapper` arguments or interpreter mode, and it reads
 Triton's debug/instrumentation/fpsan knobs once, at its first call. Like
-`compat.launch`, a launch graph-breaks under `torch.compile` (Dynamo cannot
-trace `_cuda_getCurrentRawStream`).
+`compat.launch`, a launch graph-breaks under `torch.compile`: Dynamo traces
+neither `_cuda_getCurrentRawStream` nor the launcher, a C function. The
+kernels `fav3_sage_wrapper_func` launches, whose `fullgraph=True` support
+`test_fav3_sage_compile.py` checks, go through
+`device_info.launch_on_current_stream`, which launches the launcher's JIT
+function through Triton while `torch.compiler.is_compiling()` (see
+[torch.compile of fav3_sage](#torchcompile-of-fav3_sage)).
 
 ## gfx1250 Gluon kernels
 
@@ -545,6 +551,41 @@ the dtypes plugin and the torch `per_tensor_quant`/`pertoken_quant` shims:
 Not run: `op_tests/cpp/test_pa_decode_gluon_aot.py` (its builds need CK
 headers), `aiter/aot/triton/decode_mla.py` (unchanged: it still compiles the
 JIT function `_fwd_kernel_stage2_asm`).
+
+## torch.compile of fav3_sage
+
+Upstream compiles `fav3_sage_wrapper_func` with `torch.compile(fullgraph=True)`
+(`test_fav3_sage_compile.py`); since the migration its 17 tests failed with
+`Unsupported`, first on `_cuda_getCurrentRawStream`, then, with the stream
+passed in, on the launcher itself. The seven launches the wrapper reaches
+(`sage_fwd`, `sage_quant_kernel`, `_q_smooth_int8_kernel`, `_rot_q_kernel`,
+`_rot_k_only_kernel`, and `_compute_delta_s_kernel` at two sites) go through
+`launch_on_current_stream(kernel, grid, *args)`
+(`aiter/ops/triton/utils/device_info.py`). In eager mode it calls the
+launcher on the current device and stream. While
+`torch.compiler.is_compiling()`, it launches `kernel.__self__.options.jit_func`
+through Triton with the launcher's `options` and its `dynamic_options`
+values by name, which Dynamo traces into the graph. It suits only a
+launcher that takes its grid as one tuple and has no `delayed=`,
+`bind_values` or knob in `dynamic_options`, as these seven do. The Sage paths the
+wrapper does not reach (`smooth_rotate_downcast_qk`, the MXFP4/MXFP6/F4F4 V
+packers, `sage_fwd_mxfp4`) still call their launchers directly and
+graph-break under `torch.compile`.
+
+Verified with intj `2783079`, Triton 3.8.0, `AITER_TRITON_ONLY=1`:
+
+- **gfx942.** `test_fav3_sage_compile.py` 17 passed;
+  `test_fav3_sage.py` and `test_sage_quant_intj.py` 410 passed, 572 skipped,
+  as before. All 16 variants of the wrapper (default, `return_lse`,
+  `q_smooth`, both, Hadamard rotation with and without `q_smooth`, causal,
+  `smooth_k=False`, in both layouts) compile with `fullgraph=True`, and each
+  one's compiled-vs-eager maximum difference equals the base tree's.
+- **gfx950 (MI350X)**, on a copy with the same code: the three files 999
+  passed (the two eager files 982 before); the 16 variants compile, with the
+  base tree's differences.
+- **Host time** (gfx942): about 0.35 us more per launch than a direct call
+  (4.66 vs 5.03 us, toy kernel); the default wrapper path launches twice
+  (`sage_quant_kernel`, `sage_fwd`). Not measured on gfx950.
 
 ## FlashKDA
 

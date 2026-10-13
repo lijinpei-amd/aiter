@@ -20,7 +20,7 @@ from aiter.ops.triton.utils.config_utils import (
     load_config_json,
     resolve_config_dir,
 )
-from aiter.ops.triton.utils.device_info import current_device_stream
+from aiter.ops.triton.utils.device_info import launch_on_current_stream
 
 _CONFIG_NAME = "FAV3_SAGE"
 # Arches with no tuned fav3_sage table of their own read the gfx942 file
@@ -538,10 +538,8 @@ def fav3_sage_func(
 
     # --- 7. Kernel Launch ---
     grid = (triton.cdiv(seqlen_q, config["BLOCK_M"]), nheads_q, batch)
-    dev, stream = current_device_stream()
-    sage_fwd(
-        dev,
-        stream,
+    launch_on_current_stream(
+        sage_fwd,
         grid,
         config.get("num_warps", 4),
         config.get("num_stages", 2),

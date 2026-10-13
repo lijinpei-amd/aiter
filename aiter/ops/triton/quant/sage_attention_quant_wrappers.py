@@ -19,7 +19,10 @@ from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     sage_quant_v_mxfp4_colmajor_kernel,
 )
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
-from aiter.ops.triton.utils.device_info import current_device_stream
+from aiter.ops.triton.utils.device_info import (
+    current_device_stream,
+    launch_on_current_stream,
+)
 
 
 def _bshd_order(layout):
@@ -161,10 +164,8 @@ def _apply_int8_q_smoothing(q, k, BLKQ, layout, sm_scale):
     sm_scale_log2 = sm_scale * 1.4426950408889634
     grid_q = (b * h_q, Q_NUM_BLKS, triton.cdiv(d, 32))
 
-    dev, stream = current_device_stream()
-    _q_smooth_int8_kernel(
-        dev,
-        stream,
+    launch_on_current_stream(
+        _q_smooth_int8_kernel,
         grid_q,
         q,
         q_out,
@@ -190,9 +191,8 @@ def _apply_int8_q_smoothing(q, k, BLKQ, layout, sm_scale):
     )
 
     grid_delta = (b * h_q, Q_NUM_BLKS, K_NUM_BLKS)
-    _compute_delta_s_kernel(
-        dev,
-        stream,
+    launch_on_current_stream(
+        _compute_delta_s_kernel,
         grid_delta,
         q_mean,
         k,
@@ -624,10 +624,8 @@ def sage_quant(
 
     # call sage_quant_kernel
 
-    dev, stream = current_device_stream()
-    sage_quant_kernel(
-        dev,
-        stream,
+    launch_on_current_stream(
+        sage_quant_kernel,
         grid,
         q,
         q_int8,
@@ -748,10 +746,8 @@ def rotation_smooth_qk(
     # rotate q and optionally smooth
     grid_q = (b * h_q, Q_NUM_BLKS, d // BLOCK_R)
 
-    dev, stream = current_device_stream()
-    _rot_q_kernel(
-        dev,
-        stream,
+    launch_on_current_stream(
+        _rot_q_kernel,
         grid_q,
         q,
         Q_rot,
@@ -782,9 +778,8 @@ def rotation_smooth_qk(
 
     # rotate k
     grid_k = (b * h_k, K_NUM_BLKS, d // BLOCK_R)
-    _rot_k_only_kernel(
-        dev,
-        stream,
+    launch_on_current_stream(
+        _rot_k_only_kernel,
         grid_k,
         k,
         K_rot,
@@ -817,10 +812,8 @@ def rotation_smooth_qk(
         # = Q_rot x K_rot + q_mean x K_rot
         # = Q_rot x K_rot + delta_s
         grid_delta = (b * h_q, Q_NUM_BLKS, K_NUM_BLKS)
-        dev, stream = current_device_stream()
-        _compute_delta_s_kernel(
-            dev,
-            stream,
+        launch_on_current_stream(
+            _compute_delta_s_kernel,
             grid_delta,
             q_mean,
             K_rot,
