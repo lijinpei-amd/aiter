@@ -1,5 +1,3 @@
-import functools
-
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -238,6 +236,24 @@ def _decode_att_m_fwd(
     )
 
 
+def _stage1_options():
+    # Called by the launcher's delayed=, on its first call (get_arch() needs
+    # a GPU).
+    if not is_hip_:
+        return {"num_warps": 4, "num_stages": 2}
+    # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
+    # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
+    kpack = 1 if get_arch() == "gfx950" else 2
+    return {
+        "num_warps": 4,
+        "num_stages": 1,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": kpack,
+    }
+
+
+@make_launcher(delayed=lambda: {"options": _stage1_options()})
 @triton.jit
 def _fwd_grouped_kernel_stage1(
     Q,
@@ -397,27 +413,6 @@ def _fwd_grouped_kernel_stage1(
         )
 
 
-def _stage1_options():
-    # Evaluated when the launcher is first used (get_arch() needs a GPU).
-    if not is_hip_:
-        return {"num_warps": 4, "num_stages": 2}
-    # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
-    # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
-    kpack = 1 if get_arch() == "gfx950" else 2
-    return {
-        "num_warps": 4,
-        "num_stages": 1,
-        "waves_per_eu": 1,
-        "matrix_instr_nonkdim": 16,
-        "kpack": kpack,
-    }
-
-
-@functools.cache
-def _fwd_grouped_kernel_stage1_launch():
-    return make_launcher(_fwd_grouped_kernel_stage1, options=_stage1_options())
-
-
 def _decode_grouped_att_m_fwd(
     q,
     k_buffer,
@@ -460,7 +455,7 @@ def _decode_grouped_att_m_fwd(
     )
 
     dev, stream = current_device_stream()
-    _fwd_grouped_kernel_stage1_launch()(
+    _fwd_grouped_kernel_stage1(
         dev,
         stream,
         grid,
@@ -494,6 +489,22 @@ def _decode_grouped_att_m_fwd(
     )
 
 
+def _stage2_options():
+    # Called by the launcher's delayed=, on its first call (get_arch() needs
+    # a GPU).
+    if not is_hip_:
+        return {"num_warps": 4, "num_stages": 2}
+    kpack = 1 if get_arch() == "gfx950" else 2
+    return {
+        "num_warps": 4,
+        "num_stages": 2,
+        "waves_per_eu": 4,
+        "matrix_instr_nonkdim": 16,
+        "kpack": kpack,
+    }
+
+
+@make_launcher(delayed=lambda: {"options": _stage2_options()})
 @triton.jit
 def _fwd_kernel_stage2(
     Mid_O,
@@ -552,25 +563,6 @@ def _fwd_kernel_stage2(
     )
 
 
-def _stage2_options():
-    # Evaluated when the launcher is first used (get_arch() needs a GPU).
-    if not is_hip_:
-        return {"num_warps": 4, "num_stages": 2}
-    kpack = 1 if get_arch() == "gfx950" else 2
-    return {
-        "num_warps": 4,
-        "num_stages": 2,
-        "waves_per_eu": 4,
-        "matrix_instr_nonkdim": 16,
-        "kpack": kpack,
-    }
-
-
-@functools.cache
-def _fwd_kernel_stage2_launch():
-    return make_launcher(_fwd_kernel_stage2, options=_stage2_options())
-
-
 def _decode_softmax_reducev_fwd(
     logits,
     q,
@@ -587,7 +579,7 @@ def _decode_softmax_reducev_fwd(
 
     grid = (batch, head_num)
     dev, stream = current_device_stream()
-    _fwd_kernel_stage2_launch()(
+    _fwd_kernel_stage2(
         dev,
         stream,
         grid,
