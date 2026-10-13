@@ -14,6 +14,8 @@ from aiter import logger
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.utility.triton.triton_metadata_redirect import (
     AOTMetadataContext,
+    MetadataRedirectMissing,
+    require_metadata_redirect,
     with_custom_metadata_path,
 )
 
@@ -5884,6 +5886,46 @@ def test_separate_compile_and_run():
         # ...
 
 
+def test_required_redirect_only_on_miss():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        logger.info("temp_dir: %s", temp_dir)
+
+        # The prebuilt empty_kernel under this kernel's name: the redirect
+        # finds files by kernel name, the json names the symbol to load.
+        name = "required_redirect_kernel"
+        with open(os.path.join(temp_dir, f"{name}.hsaco"), "wb") as f:
+            f.write(bytes(aot_kernel0_hsaco))
+        with open(os.path.join(temp_dir, f"{name}.json"), "w") as f:
+            f.write(aot_kernel0_json)
+
+        @make_launcher(return_compiled=True)
+        @triton.jit
+        def required_redirect_kernel(x_ptr, SIZE: tl.constexpr):
+            return
+
+        # Process-wide, so the kernel has a name no other test uses.
+        require_metadata_redirect(name)
+        x = torch.zeros((1, 1, 2), dtype=torch.float32, device="cuda")
+
+        def launch():
+            return required_redirect_kernel(
+                x.device.index,
+                torch.cuda.current_stream().cuda_stream,
+                (1, 1, 1),
+                x,
+                64,  # SIZE
+            )
+
+        # A miss outside the context compiles, then refuses to load that.
+        with pytest.raises(MetadataRedirectMissing):
+            launch()
+        with AOTMetadataContext(name, temp_dir):
+            kernel = launch()
+        assert kernel.metadata.hash in aot_kernel0_json, "hash not found in json"
+        # A hit loads nothing, so it needs no context.
+        assert launch() is kernel
+
+
 if __name__ == "__main__":
     if SKIP_TEST:
         logger.info(SKIP_REASON)
@@ -5891,3 +5933,4 @@ if __name__ == "__main__":
         test_f32_kernel()
         test_jit()
         test_separate_compile_and_run()
+        test_required_redirect_only_on_miss()

@@ -21,6 +21,17 @@ Example usage1 for aot:
 
     with AOTMetadataContext("kernel_name", "/custom/path"):
         kernel = compile_kernel(...)
+
+Example usage2 for a launcher that compiles only on a cache miss:
+    from aiter.utility.triton.triton_metadata_redirect import (
+        AOTMetadataContext, MetadataRedirectMissing, require_metadata_redirect)
+
+    require_metadata_redirect("kernel_name")
+    try:
+        launch(...)  # a hit loads nothing, so it needs no context
+    except MetadataRedirectMissing:  # a miss, outside the context
+        with AOTMetadataContext("kernel_name", "/custom/path"):
+            launch(...)
 """
 
 import functools
@@ -45,6 +56,28 @@ def _get_thread_registry():
 _patch_lock = threading.Lock()
 # Flag indicating whether patching has been performed
 _patched = False
+# Kernel names that may only be loaded from a redirect (process-wide)
+_required: set[str] = set()
+
+
+class MetadataRedirectMissing(RuntimeError):
+    """A kernel passed to `require_metadata_redirect` was loaded with no
+    redirect registered for it on this thread."""
+
+
+def require_metadata_redirect(*kernel_names: str) -> None:
+    """Makes loading any of `kernel_names` raise MetadataRedirectMissing unless
+    this thread has a redirect for it (AOTMetadataContext or
+    with_custom_metadata_path), for the rest of the process.
+
+    A caller that launches through a cache which compiles only on a miss can
+    then enter AOTMetadataContext only for a miss: a launch that loads nothing
+    needs no redirect, and one that misses outside the context raises before
+    loading the binary it compiled onto the GPU, so the caller can retry it
+    inside one.
+    """
+    with _patch_lock:
+        _required.update(kernel_names)
 
 
 def _ensure_patched():
@@ -64,6 +97,7 @@ def _ensure_patched():
                         break
 
                 # Replace metadata paths using thread-local registry
+                missing = False
                 if kernel_name:
                     registry = _get_thread_registry()
                     if kernel_name in registry:
@@ -74,9 +108,18 @@ def _ensure_patched():
                         metadata_group[kernel_name + ".hsaco"] = os.path.join(
                             dir, f"{kernel_name}.hsaco"
                         )
+                    else:
+                        missing = kernel_name in _required
 
                 # Call the original initialization method
                 _original_compiled_kernel_init(self, src, metadata_group, hash)
+                if missing:
+                    # Raised only now so the unused kernel is deleted cleanly;
+                    # it loads its binary later, in _init_handles.
+                    raise MetadataRedirectMissing(
+                        f"{kernel_name} may only be loaded from prebuilt "
+                        "metadata: compile it inside AOTMetadataContext"
+                    )
 
             # Replace the original __init__ method with our patched version
             triton_compiler.CompiledKernel.__init__ = _replacement_init

@@ -27,7 +27,7 @@
 
 import math
 import os
-from functools import cache, partial
+from functools import partial
 
 import torch
 import triton
@@ -51,7 +51,11 @@ from aiter.ops.triton.gluon.pa_mqa_logits import (
 )
 from aiter.ops.triton.utils.config_utils import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.device_info import current_device_stream, get_num_sms
-from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
+from aiter.utility.triton.triton_metadata_redirect import (
+    AOTMetadataContext,
+    MetadataRedirectMissing,
+    require_metadata_redirect,
+)
 
 enable_aot_gluon_pa_mqa_logits = os.environ.get(
     "AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS", "0"
@@ -290,7 +294,6 @@ def _check_gluon_block_size(Preshuffle, KVBlockSize, ChunkK):
             )
 
 
-@cache
 def _aot_metadata_path(
     ChunkQ,
     ChunkK,
@@ -410,6 +413,16 @@ _GLUON_PAGED_MQA_LOGITS_LAUNCHERS = {
     for Preshuffle, VarCtxOpt in ((False, False), (True, False), (True, True))
     for is_padded_mode in (False, True)
 }
+
+if enable_aot_gluon_pa_mqa_logits:
+    # Every load of these kernels must be of a prebuilt binary: a compile
+    # outside AOTMetadataContext raises, and deepgemm_fp8_paged_mqa_logits
+    # retries it inside one.
+    require_metadata_redirect(
+        _gluon_deepgemm_fp8_paged_mqa_logits.fn.__name__,
+        _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.fn.__name__,
+        _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx.fn.__name__,
+    )
 
 
 def deepgemm_fp8_paged_mqa_logits_schedule(
@@ -567,12 +580,13 @@ def deepgemm_fp8_paged_mqa_logits(
         )
         waves_per_eu = 1 if get_gfx() == "gfx1250" and not Preshuffle else WavePerEU
         dev, stream = current_device_stream()
-        if enable_jit_gluon_pa_mqa_logits_kernel:
+        try:
             kernel = launch(dev, stream, grid, waves_per_eu, *args)
-        else:
-            # A launch that misses intj's cache compiles on this thread, so
-            # the context swaps in the prebuilt hsaco/json, as it did for
-            # triton.compile. The prebuilt kernel must have this signature.
+        except MetadataRedirectMissing:
+            # AOT mode, and the launch missed intj's cache: its compile, on
+            # this thread, refused to load what it compiled. Launch again with
+            # the prebuilt hsaco/json swapped in; the prebuilt kernel must have
+            # this signature. A hit loads nothing, so it needs no context.
             with AOTMetadataContext(
                 _gluon_kernel(Preshuffle, VarCtxOpt).fn.__name__,
                 _aot_metadata_path(
