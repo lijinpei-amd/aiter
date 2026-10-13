@@ -10,6 +10,7 @@ import torch
 import triton
 import triton.language as tl
 from intj import make_launcher
+from intj.launcher import UnsupportedKernel
 
 import aiter
 from aiter import dtypes
@@ -1581,6 +1582,10 @@ def mla_prefill_reduce(
                 output,
                 tile_q,
             )
+        except UnsupportedKernel:
+            # intj refuses on the first call; a refusal is a bug to surface,
+            # not a reason to take the slow path below.
+            raise
         except Exception as e:  # noqa: BLE001
             print(f"Warning: Triton reduce failed ({e}), falling back to PyTorch")
 
