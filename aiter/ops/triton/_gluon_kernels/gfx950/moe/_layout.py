@@ -14,8 +14,6 @@ two cannot drift.
 ``_KernelFuncShape`` stays a method-only aggregate inherited by ``KernelFuncConfig``.
 """
 
-import math
-
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.language.core import _aggregate as aggregate
@@ -887,28 +885,6 @@ def _calc_component_via_lds(tc, component):
 
 
 @gluon.constexpr_function
-def _calc_pipeline_register_period(tc):
-    """LCM of the active direct-register rings; absent scales have no ring.
-
-    ``_schedule.ring_restoration_period`` over direct-register components only.
-    Separate because the two have different consumers: LDS slots may use runtime
-    indices, while register tuples need static ones in the main loop, so only the
-    register rings have to return to slot zero for a body to be unrollable. Resolved
-    here, not in ``_schedule``, because the frozen driver reads it too and must not
-    import the live schedule model.
-    """
-    period = 1
-    for operand in (0, 1):
-        for is_scale in (False, True):
-            if is_scale and not tc.func_cfg.has_scale(operand):
-                continue
-            if not _calc_component_via_lds(tc, (operand, is_scale)):
-                ratio = _calc_scale_ratio_k_step(tc, operand) if is_scale else 1
-                period = math.lcm(period, tc.num_buffers(operand, is_scale) * ratio)
-    return period
-
-
-@gluon.constexpr_function
 def _calc_k_width_for(tc, idx):
     """``DotOperandLayout.k_width`` for one operand, in *stored* elements.
 
@@ -1602,7 +1578,6 @@ class KernelLayout:
     _byte_unit_lds_ok: gl.constexpr
     # -- storage placement --
     _component_via_lds: gl.constexpr
-    _pipeline_register_period: gl.constexpr
     # -- payload layouts --
     _dot_result_fragment_layout: gl.constexpr
     _dot_operand_fragment_layout: gl.constexpr
@@ -1814,11 +1789,6 @@ class KernelLayout:
     @gluon.constexpr_function
     def scale_in_reg(self, idx):
         return not self.scale_via_lds(idx)
-
-    @gluon.constexpr_function
-    def pipeline_register_period(self):
-        """LCM of the direct-register ring periods, in payload K steps."""
-        return _v(self._pipeline_register_period)
 
     # -- payload layouts ----------------------------------------------------------
 
@@ -2207,7 +2177,6 @@ def compute_kernel_layout(tuning_cfg):
         lds_unit_rows=pair(_calc_lds_unit_rows),
         byte_unit_lds_ok=pair(_calc_byte_unit_lds_ok),
         component_via_lds=via_lds,
-        pipeline_register_period=_calc_pipeline_register_period(tc),
         dot_result_fragment_layout=_calc_dot_result_fragment_layout(tc) if ok else None,
         dot_operand_fragment_layout=pair_if(always, _calc_dot_operand_fragment_layout),
         dot_operand_lds_layout=pair_if(payload_via_lds, _calc_dot_operand_lds_layout),

@@ -8,10 +8,11 @@ import os
 import pytest
 import torch
 
-from aiter.ops.triton._gluon_kernels.gfx950.moe import _frozen, _layout, _schedule
+from aiter.ops.triton._gluon_kernels.gfx950.moe import _frozen
 from aiter.ops.triton._gluon_kernels.gfx950.moe._frozen import (
     _buffer_load_order_frozen,
     _buffer_load_tile_frozen,
+    _compute_frozen_layout,
     _pipeline_peeled_frozen,
     _validate_frozen_pipeline,
     pipeline_depth_frozen,
@@ -28,53 +29,70 @@ from op_tests.triton_tests.moe.test_moe_gemm_gluon_registers import (
     _register_config,
 )
 
+#: ``_buffer_load_order_frozen`` for every 1..4 x 1..4 slot grid: payload copies as
+#: ``(is_a, tile)`` in slot order. 2x2 is the tuned interleave, the rest alternate A
+#: and B from A(0). Pinned when the frozen module stopped sharing code with the live
+#: schedule, so the snapshot no longer has a live counterpart to agree with.
+_FROZEN_FILL_ORDER = {
+    (1, 1): [(1, 0), (0, 0)],
+    (1, 2): [(1, 0), (0, 0), (0, 1)],
+    (1, 3): [(1, 0), (0, 0), (0, 1), (0, 2)],
+    (1, 4): [(1, 0), (0, 0), (0, 1), (0, 2), (0, 3)],
+    (2, 1): [(1, 0), (0, 0), (1, 1)],
+    (2, 2): [(0, 0), (1, 0), (1, 1), (0, 1)],
+    (2, 3): [(1, 0), (0, 0), (1, 1), (0, 1), (0, 2)],
+    (2, 4): [(1, 0), (0, 0), (1, 1), (0, 1), (0, 2), (0, 3)],
+    (3, 1): [(1, 0), (0, 0), (1, 1), (1, 2)],
+    (3, 2): [(1, 0), (0, 0), (1, 1), (0, 1), (1, 2)],
+    (3, 3): [(1, 0), (0, 0), (1, 1), (0, 1), (1, 2), (0, 2)],
+    (3, 4): [(1, 0), (0, 0), (1, 1), (0, 1), (1, 2), (0, 2), (0, 3)],
+    (4, 1): [(1, 0), (0, 0), (1, 1), (1, 2), (1, 3)],
+    (4, 2): [(1, 0), (0, 0), (1, 1), (0, 1), (1, 2), (1, 3)],
+    (4, 3): [(1, 0), (0, 0), (1, 1), (0, 1), (1, 2), (0, 2), (1, 3)],
+    (4, 4): [(1, 0), (0, 0), (1, 1), (0, 1), (1, 2), (0, 2), (1, 3), (0, 3)],
+}
 
-@pytest.mark.parametrize("dtype", ["mxfp4", "bf16", "mxfp8"])
-def test_vendored_frozen_helpers_match_the_live_schedule(dtype):
-    """``_frozen.py`` owns private copies of the schedule helpers it used to import.
 
-    That is deliberate: the frozen body is a verbatim snapshot whose acceptance test is
-    identical assembly, so it must not move when the live scheduling model is
-    refactored. The coupling belongs here, as a drift detector, rather than in the
-    source as an import -- if a live refactor is *supposed* to change these values, this
-    is the test that says so out loud.
+@pytest.mark.parametrize(
+    "dtype,depth,unroll", [("mxfp4", 3, 3), ("bf16", 3, 3), ("mxfp8", 5, 6)]
+)
+def test_frozen_schedule_helpers_hold_their_pinned_values(dtype, depth, unroll):
+    """``_frozen.py`` owns private copies of every helper it uses.
+
+    The frozen body is a verbatim snapshot whose acceptance test is identical
+    assembly, and it shares no code with the live modules, which may diverge from it
+    freely. So these values are pinned rather than compared against live
+    counterparts: if one moves, the snapshot moved.
     """
     if get_arch() != "gfx950":
         pytest.skip("Gluon MoE kernels are gfx950 only.")
     quant = {"mxfp4": DtypeQuant.MXFP4, "bf16": DtypeQuant.BF16,
              "mxfp8": DtypeQuant.MXFP8}[dtype]
     tc = host._probe_tuning_config(_register_config(dtype), quant, quant)
-    layout = _layout.compute_kernel_layout(tc)
-    assert pipeline_depth_frozen(tc, layout) == _schedule.pipeline_depth(tc, layout)
+    layout = _compute_frozen_layout(tc)
+    assert pipeline_depth_frozen(tc, layout) == depth
+    assert pipeline_unroll_frozen(tc, layout) == unroll
+    assert _pipeline_peeled_frozen(tc) == 1
+    assert host._cval(layout.pipeline_register_period()) == 1
 
-    # The vendored layout twins must still agree with the live ones. _slot_index is
-    # the only one callable without device tensors; the offset builders need a live
-    # trace, and the bitwise-determinism tests below are what cover those.
+    # N outer, M inner: with two slots per axis the visit order is
+    # (0,0), (1,0), (0,1), (1,1).
     for nm in range(1, 5):
         for nn in range(1, 5):
             for mi in range(nm):
                 for ni in range(nn):
-                    assert _frozen._slot_index_frozen(
-                        mi, ni, nm, nn
-                    ) == _layout._slot_index(mi, ni, nm, nn), (mi, ni, nm, nn)
-    assert pipeline_unroll_frozen(tc, layout) == _schedule.pipeline_unroll(tc, layout)
-    for nm in range(1, 5):
-        for nn in range(1, 5):
-            assert _buffer_load_order_frozen(nm, nn) == _schedule._buffer_load_order(
-                nm, nn
-            ), (nm, nn)
-            # The live side resolved ownership into per-component mappings, so
-            # there is no live positional tile view left to compare against.
-            # Check the frozen twin against its own order instead, which is what
-            # it is a transcription of.
-            order = _buffer_load_order_frozen(nm, nn)
-            for pos, (is_a, tile) in enumerate(order):
-                assert _buffer_load_tile_frozen(pos, nm, nn, True) == (
-                    tile if is_a else None
-                ), (nm, nn, pos)
-                assert _buffer_load_tile_frozen(pos, nm, nn, False) == (
-                    None if is_a else tile
-                ), (nm, nn, pos)
+                    assert _frozen._slot_index_frozen(mi, ni, nm, nn) == (
+                        ni * nm + mi
+                    ), (mi, ni, nm, nn)
+    for (nm, nn), order in _FROZEN_FILL_ORDER.items():
+        assert _buffer_load_order_frozen(nm, nn) == order, (nm, nn)
+        for pos, (is_a, tile) in enumerate(order):
+            assert _buffer_load_tile_frozen(pos, nm, nn, True) == (
+                tile if is_a else None
+            ), (nm, nn, pos)
+            assert _buffer_load_tile_frozen(pos, nm, nn, False) == (
+                None if is_a else tile
+            ), (nm, nn, pos)
 
 
 @pytest.fixture(scope="module", params=["mxfp4", "bf16"])
@@ -123,7 +141,7 @@ def test_frozen_unshuffled_k128_scales_load_directly(monkeypatch):
         A_SCALE_SORTED_SHUFFLED=False,
         B_SCALE_SHUFFLED=False,
     )
-    layout = _layout.compute_kernel_layout(
+    layout = _compute_frozen_layout(
         host._probe_tuning_config(config, DtypeQuant.MXFP8, DtypeQuant.MXFP8)
     )
     assert host._cval(layout.scale_in_reg(0))
@@ -163,7 +181,7 @@ def test_same_compiled_entry_honors_runtime_num_k(gated, depth, dtype, monkeypat
     )
     assert case.route.block_m == config["BLOCK_M"]
     tc = host._probe_tuning_config(config, quant, quant)
-    layout = _layout.compute_kernel_layout(tc)
+    layout = _compute_frozen_layout(tc)
     full_num_k = case.k // config["BLOCK_K"]
     minimum = (
         pipeline_depth_frozen(tc, layout)
@@ -176,7 +194,7 @@ def test_same_compiled_entry_honors_runtime_num_k(gated, depth, dtype, monkeypat
     for short_num_k in short_counts:
         short_k = short_num_k * config["BLOCK_K"]
         assert short_num_k < full_num_k
-        assert _validate_frozen_pipeline(tc, layout, short_k)
+        assert _validate_frozen_pipeline(tc, short_k)
         prefix = moe_gemm_torch(
             x_ref[:, :short_k].float(),
             w_ref[:, :short_k, :].float(),

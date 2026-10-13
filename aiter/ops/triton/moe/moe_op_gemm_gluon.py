@@ -37,6 +37,9 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._entry import (
     _moe_gluon_gemm2,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._frozen import (
+    _compute_frozen_layout,
+    _validate_frozen,
+    _validate_frozen_buffer_counts,
     _validate_frozen_pipeline,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import compute_kernel_layout
@@ -296,8 +299,12 @@ def _probe_lds_bytes(cfg: dict, dq_a, dq_b) -> int:
 def _probe_lds_bytes_uncached(cfg: dict, dq_a, dq_b) -> int:
     """LDS footprint of a candidate config, computed by the *aggregate* rather than by a
     second copy of the arithmetic -- the host and the device must not be able to
-    disagree about whether a config fits."""
-    return compute_kernel_layout(_probe_tuning_config(cfg, dq_a, dq_b)).lds_bytes()
+    disagree about whether a config fits. A FROZEN_STEP config is sized by the frozen
+    snapshot's own layout, which is what its kernel allocates."""
+    tc = _probe_tuning_config(cfg, dq_a, dq_b)
+    if _cval(tc.FROZEN_STEP):
+        return _compute_frozen_layout(tc).lds_bytes()
+    return compute_kernel_layout(tc).lds_bytes()
 
 
 def _probe_tuning_config(cfg: dict, dq_a, dq_b):
@@ -321,12 +328,16 @@ def _probe_tuning_config(cfg: dict, dq_a, dq_b):
 
 
 def _validate_selected_pipeline(tuning_cfg, layout, K):
-    validator = (
-        _validate_frozen_pipeline
-        if _cval(tuning_cfg.FROZEN_STEP)
-        else _validate_live_pipeline
-    )
-    return validator(tuning_cfg, layout, K)
+    """Validate the pipeline the build runs. ``layout`` is the live layout, or None.
+
+    A FROZEN_STEP build is checked by the frozen snapshot against its own layout, so
+    ``layout`` is ignored there; None builds the live one only when it is needed.
+    """
+    if _cval(tuning_cfg.FROZEN_STEP):
+        return _validate_frozen_pipeline(tuning_cfg, K)
+    if layout is None:
+        layout = compute_kernel_layout(tuning_cfg)
+    return _validate_live_pipeline(tuning_cfg, layout, K)
 
 
 @cache
@@ -334,7 +345,7 @@ def _pipeline_error(cfg_items: tuple, dq_a, dq_b, K):
     """Share the exact device ring and minimum-strip contract with host fallback."""
     try:
         tc = _probe_tuning_config(dict(cfg_items), dq_a, dq_b)
-        _validate_selected_pipeline(tc, compute_kernel_layout(tc), K)
+        _validate_selected_pipeline(tc, None, K)
     except AssertionError as error:
         return str(error)
     return None
@@ -1243,7 +1254,10 @@ def _launch_spec(
     # Storage can still change during scale preparation, which changes the exact
     # minimum K. Validate inherited depths and shape arithmetic now; validate the
     # complete effective configuration once preparation has resolved its layouts.
-    validate_buffer_counts(tuning_cfg_host)
+    if _cval(tuning_cfg_host.FROZEN_STEP):
+        _validate_frozen_buffer_counts(tuning_cfg_host)
+    else:
+        validate_buffer_counts(tuning_cfg_host)
     layout_host = compute_kernel_layout(tuning_cfg_host)
     layout_host.num_k_tiles(K)
     grid_n = _cval(layout_host.grid_N(N))
@@ -1260,7 +1274,15 @@ def _launch_spec(
 
 @cache
 def _validate_launch_config(tuning_cfg, N, K):
-    """Validate each cached effective layout once, before any kernel launch."""
+    """Validate each cached effective layout once, before any kernel launch.
+
+    A FROZEN_STEP build runs the frozen snapshot's own copies of the checks, over its
+    own layout, so a live validation change cannot move which frozen builds launch.
+    """
+    if _cval(tuning_cfg.FROZEN_STEP):
+        layout = _compute_frozen_layout(tuning_cfg)
+        _validate_frozen(tuning_cfg, N, K, layout)
+        return _validate_frozen_pipeline(tuning_cfg, K, layout)
     layout = compute_kernel_layout(tuning_cfg)
     validate(tuning_cfg, N, K, layout)
     return _validate_selected_pipeline(tuning_cfg, layout, K)

@@ -165,7 +165,7 @@ def dump_case(name, cfg, dq_a, dq_b, K, out):
     out(f"  geom NM={nm} NN={nn} slots={slots} mk={layout.num_k_slots_per_tile()} "
         f"num_k={num_k} scheme={int(tc.WAIT_COMMIT_SCHEME)}")
     out(f"  sizing depth={depth} unroll={unroll} peeled={peeled} "
-        f"regperiod={layout.pipeline_register_period()} "
+        f"regperiod={S.pipeline_register_period(tc, layout)} "
         f"hasreg={S._has_register_component(tc, layout)}")
     out(f"  order {S._buffer_load_order(nm, nn)}")
 

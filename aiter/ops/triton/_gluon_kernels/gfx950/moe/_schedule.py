@@ -40,6 +40,7 @@ __all__ = [
     "B",
     "ScheduleSpec",
     "async_pattern_period",
+    "pipeline_register_period",
     "ring_restoration_period",
     "schedule_spec",
 ]
@@ -167,13 +168,36 @@ def ring_restoration_period(tc, layout):
 
     Distinct from three neighbours it is easy to conflate with. The requested unroll
     (``K_UNROLL``) is a tuning knob. The effective unroll is this LCM'd with that knob.
-    The register-only period (``KernelLayout.pipeline_register_period``) counts the
-    same quantity over direct-register rings alone, because only those need a static
-    index.
+    The register-only period (:func:`pipeline_register_period`) counts the same
+    quantity over direct-register rings alone, because only those need a static index.
     """
     period = 1
     for component in COMPONENTS:
         if _present(tc, layout, component):
+            period = math.lcm(
+                period,
+                _component_depth(tc, layout, component)
+                * _component_ratio(tc, layout, component),
+            )
+    return period
+
+
+@gluon.constexpr_function
+def pipeline_register_period(tc, layout):
+    """Payload steps after which every present direct-register ring is back at slot zero.
+
+    :func:`ring_restoration_period` restricted to the components ``_in_reg`` places
+    in registers: the LCM of depth times scale K-step ratio over those alone. Absent
+    scales have no ring, and LDS-backed components do not participate.
+
+    Separate because the two have different consumers. LDS slots may use runtime
+    indices, while register tuples need static ones in the main loop, so only the
+    register rings have to return to slot zero for a body to be unrollable. A period
+    of one means no register ring rotates at all.
+    """
+    period = 1
+    for component in COMPONENTS:
+        if _present(tc, layout, component) and _in_reg(tc, layout, component):
             period = math.lcm(
                 period,
                 _component_depth(tc, layout, component)

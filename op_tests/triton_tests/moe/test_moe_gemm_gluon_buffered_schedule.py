@@ -108,16 +108,6 @@ class _Config(_ScheduleConfig):
     def component_in_reg(self, component):
         return not self.component_via_lds(component)
 
-    def pipeline_register_period(self):
-        return math.lcm(
-            *(
-                self.depths[component]
-                * (self.scale_ratio_k_step(component[0]) if component[1] else 1)
-                for component in self.active_components()
-                if not self.component_via_lds(component)
-            )
-        )
-
     def pipeline_peeled(self):
         if not hasattr(self, "_peeled"):
             self._peeled = _pipeline_peeled(self, self)
@@ -1194,7 +1184,7 @@ def test_absent_scale_ring_indices_ignore_invalid_unused_depths(scale_depths):
     assert validate(tc, 512, 960)
     layout = compute_kernel_layout(tc)
     assert pipeline_depth(tc, layout) == 2
-    assert layout.pipeline_register_period() == 1
+    assert schedule.pipeline_register_period(tc, layout) == 1
     for component in (A_SCALE, B_SCALE):
         for in_loop in (False, True):
             for fill in (False, True):

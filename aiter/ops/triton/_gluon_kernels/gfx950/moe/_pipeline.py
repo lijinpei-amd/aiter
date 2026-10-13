@@ -42,6 +42,7 @@ from ._schedule import (
     _stage_wait,
     _via_lds,
     pipeline_depth,
+    pipeline_register_period,
     pipeline_unroll,
     ring_restoration_period,
 )
@@ -78,7 +79,7 @@ def _index(
             out = ((_pipeline_peeled(tc, layout) + KI + 1 + advance) // ratio) % depth
         else:
             tile = (step + advance) // ratio
-            if require_constexpr(layout.pipeline_register_period() == 1):
+            if require_constexpr(pipeline_register_period(tc, layout) == 1):
                 # Avoid signed ring arithmetic without disturbing live register queues.
                 gl.assume(tile >= 0)
             out = tile % depth
@@ -931,7 +932,7 @@ def _drain_buffered_pipeline(
     if require_constexpr(
         period <= 3
         and pipeline_unroll(tc, layout) % period == 0
-        and layout.pipeline_register_period() == 1
+        and pipeline_register_period(tc, layout) == 1
         and pc.func_cfg.output_quant is None
     ):
         phase = main % period

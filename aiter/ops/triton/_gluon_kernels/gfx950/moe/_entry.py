@@ -40,10 +40,9 @@ def _moe_gemm_body(
 ):
     """Select the frozen or live body once, before entering either implementation.
 
-    The layout is computed here, once, and handed to whichever body runs: the frozen
-    body imports nothing from ``_layout.py``, so it cannot compute its own.
+    The live layout is computed only for the live body. The frozen body is a
+    self-contained snapshot and builds its own layout from ``tuning_cfg``.
     """
-    layout = compute_kernel_layout(tuning_cfg)
     if require_constexpr(tuning_cfg.FROZEN_STEP):
         _moe_gemm_body_frozen(
             a,
@@ -57,12 +56,12 @@ def _moe_gemm_body(
             grid_n,
             func_cfg,
             tuning_cfg,
-            layout,
             N,
             K,
             NUM_K,
         )
     else:
+        layout = compute_kernel_layout(tuning_cfg)
         _moe_gemm_body_live(
             a,
             b,

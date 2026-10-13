@@ -313,7 +313,7 @@ def test_frozen_dot_helper_forwards_scale_phase(monkeypatch, phase):
             FROZEN_STEP=True,
         )
     )
-    layout = _HostView(compute_kernel_layout(tc.config))
+    layout = _HostView(frozen._compute_frozen_layout(tc.config))
     fc = _HostView(tc.func_cfg)
     phases = []
 
