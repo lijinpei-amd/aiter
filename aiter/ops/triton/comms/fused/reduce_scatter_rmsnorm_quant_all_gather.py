@@ -40,7 +40,9 @@ logger = logging.getLogger("aiter")
 # Note: Shared implementations imported to avoid code duplication:
 # - _reduce_scatter_impl from reduce_scatter.py
 # - _all_gather_impl from all_gather.py
-# - _rms_norm_kernel from _triton_kernels/rmsnorm.py (tl.program_id(0) works in nested calls)
+# - _rms_norm, the JIT function of _rms_norm_kernel (its intj launcher) from
+#   _triton_kernels/rmsnorm.py (tl.program_id(0) works in nested calls)
+_rms_norm = _rms_norm_kernel.__self__.options.jit_func
 
 
 @triton.jit
@@ -152,7 +154,7 @@ def fused_pipeline_kernel(
     )
 
     # Stage 2: RMSNorm (using shared kernel - tl.program_id(0) works in nested calls)
-    _rms_norm_kernel(
+    _rms_norm(
         shard_ptr,
         norm_ptr,
         gamma_ptr,

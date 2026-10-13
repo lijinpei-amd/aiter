@@ -3,7 +3,6 @@
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.normalization.rmsnorm import (
     _fused_add_rmsnorm_kernel,
@@ -69,9 +68,6 @@ def num_programs_fwd(x):
         return num_programs(x)
 
 
-_rms_norm_kernel_launch = make_launcher(_rms_norm_kernel)
-
-
 def _rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, epsilon: float):
 
     n_rows, n_cols = x.shape
@@ -85,7 +81,7 @@ def _rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, epsilon: float):
 
     grid = (NUM_PRGMS,)
     dev, stream = current_device_stream()
-    _rms_norm_kernel_launch(
+    _rms_norm_kernel(
         dev,
         stream,
         grid,

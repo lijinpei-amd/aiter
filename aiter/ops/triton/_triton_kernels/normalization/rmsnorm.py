@@ -53,6 +53,7 @@ _rms_norm_kernel_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.jit(repr=_rms_norm_kernel_repr)
 def _rms_norm_kernel(
     # Pointers to matrices
