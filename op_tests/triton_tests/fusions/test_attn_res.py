@@ -896,9 +896,11 @@ def test_attn_res_sequence_requires_d_multiple_of_16():
         attn_res_fwd(query, residuals, rms_weight, layout="sequence")
 
 
-@pytest.mark.parametrize("L", [17, 33])
-def test_attn_res_sequence_takes_more_than_16_residuals(L):
-    """More residuals than the kernel's 16 slots take the packed layout."""
+@pytest.mark.parametrize("L", [*range(1, 18), 33])
+def test_attn_res_sequence_every_residual_count(L):
+    """Every residual count matches the torch reference, so each of the
+    kernel's 16 slots holds its own residual in every padded L2 bucket. More
+    than 16 residuals take the packed layout."""
     rms_eps, scale = 1e-6, 0.7
     query, residuals, rms_weight, output_rms_weight = generate_attn_res_inputs(
         64, 256, L, torch.float32, with_onorm=True

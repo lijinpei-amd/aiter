@@ -725,8 +725,8 @@ on gfx942 and gfx950 (MI350X):
 - **Tests.** `test_attn_res.py`: 255 passed on both GPUs (the base tree's 251
   plus the sequence launch checked bitwise against a Triton launch of the same
   kernel across L2 buckets, dtypes, output norm, scalars equal to 1.0 and
-  token counts, and 17 and 33 residuals against the torch reference and the
-  packed layout), and the same with
+  token counts, and every residual count from 1 to 17, and 33, against the
+  torch reference), and the same with
   `ATTN_RES_TRITON_AUTOTUNE=1`, except on gfx942
   `test_attn_res_gate_out_quant_matches_unfused_quant[64]`, which fails there
   on the base tree too. `test_mhc.py`, which imports the same kernel package:
