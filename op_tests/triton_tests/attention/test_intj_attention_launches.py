@@ -114,3 +114,147 @@ def test_mla_aot_tools_load_the_stage2_jit_function():
     assert _fwd_kernel_stage2_asm.__name__ == "_fwd_kernel_stage2_asm"
     launcher = aiter.mla._fwd_kernel_stage2_asm
     assert _fwd_kernel_stage2_asm is launcher.__self__.options.jit_func
+
+
+# pa_mqa_logits' launchers by (Preshuffle, VarCtxOpt, KV-padded) mode, each
+# with the page (KVBlockSize) and bytes per token that reach it: 128 fp8
+# values and a 4-byte scale make a 132-byte token, and a page's stride is
+# padded (a multiple of 16) unless it is one such token or 8 of 133 bytes.
+_PA_MQA_LOGITS_MODES = {
+    (False, False, False): (1, 132),
+    (False, False, True): (1, 144),
+    (True, False, False): (8, 133),
+    (True, False, True): (16, 132),
+    (True, True, False): (8, 133),
+    (True, True, True): (16, 132),
+}
+
+
+def _pa_mqa_logits():
+    from aiter.ops.triton.attention import pa_mqa_logits
+
+    if not pa_mqa_logits.enable_gluon_pa_mqa_logits:
+        pytest.skip("pa_mqa_logits' Gluon kernels need gfx942, gfx950 or gfx1250")
+    return pa_mqa_logits
+
+
+def test_pa_mqa_logits_launchers_carry_their_modes_keywords():
+    """Each launcher has its mode's JIT function and keywords.
+
+    A kernel's mode is written by hand three times (the decorator's `delayed=`
+    keywords, the JIT function recorded under it, the table key), and a
+    launcher assuming another KV mode's facts can still compute the right
+    logits, so the keywords are compared, not just the outputs.
+    """
+    from aiter.ops.triton.gluon import pa_mqa_logits as gluon
+
+    launchers = _pa_mqa_logits()._GLUON_PAGED_MQA_LOGITS_LAUNCHERS
+    assert sorted(launchers) == sorted(_PA_MQA_LOGITS_MODES)
+    assert sorted(gluon._GLUON_JIT_FUNCTIONS) == sorted(
+        {mode[:2] for mode in _PA_MQA_LOGITS_MODES}
+    )
+    keywords = {mode: gluon._gluon_launch_keywords(*mode) for mode in launchers}
+    for a, b in itertools.combinations(launchers, 2):
+        assert keywords[a] != keywords[b], (a, b)
+    for mode, launcher in launchers.items():
+        launcher.__self__.check()
+        options = launcher.__self__.options
+        assert options.jit_func is gluon._GLUON_JIT_FUNCTIONS[mode[:2]], mode
+        assert options.extra_annotation == keywords[mode]["extra_annotation"], mode
+        assert options.options == keywords[mode]["options"], mode
+
+
+@pytest.mark.parametrize(
+    "mode",
+    list(_PA_MQA_LOGITS_MODES),
+    ids=lambda mode: "-".join(
+        name for name, on in zip(("preshuffle", "varctx", "padded"), mode) if on
+    )
+    or "plain",
+)
+@torch.inference_mode()
+def test_pa_mqa_logits_launches_each_mode_through_its_launcher(mode, monkeypatch):
+    """deepgemm_fp8_paged_mqa_logits picks the mode's launcher and matches
+    torch; the offset tests reach only three of the six modes."""
+    from aiter import dtypes
+    from aiter.jit.utils.chip_info import get_gfx
+    from aiter.ops.shuffle import shuffle_weight
+
+    m = _pa_mqa_logits()
+    if get_gfx() not in ("gfx942", "gfx950") or m.enable_aot_gluon_pa_mqa_logits:
+        pytest.skip(
+            "needs gfx942 or gfx950 in JIT mode (gfx1250 lacks VarCtx and pages under 16)"
+        )
+    preshuffle, varctx, _ = mode
+    page, token_bytes = _PA_MQA_LOGITS_MODES[mode]
+    hidden, heads, next_n, context_lengths = 128, 64, 2, (300, 77)
+    # A multiple of 16: the VarCtx kernel stores logits up to a sequence's
+    # length rounded up to 16, past the row if max_model_len is below that
+    # (upstream too).
+    batch, max_model_len = len(context_lengths), 320
+    num_blocks = 2 * -(-max(context_lengths) // page)
+    g = torch.Generator(device="cuda").manual_seed(4517)
+
+    def randn(*shape):
+        return torch.randn(*shape, generator=g, device="cuda")
+
+    q = randn(batch, next_n, heads, hidden).to(dtypes.fp8)
+    kv = randn(num_blocks, page, hidden).to(dtypes.fp8)
+    scales = 0.25 + torch.rand(num_blocks, page, generator=g, device="cuda")
+    weights = randn(batch * next_n, heads)
+    packed = torch.zeros(
+        num_blocks, page * token_bytes, dtype=torch.uint8, device="cuda"
+    )
+    values = shuffle_weight(kv, layout=(min(page, 16), 16)) if preshuffle else kv
+    packed[:, : page * hidden] = values.reshape(num_blocks, -1).view(torch.uint8)
+    packed[:, page * hidden : page * (hidden + 4)] = scales.view(torch.uint8)
+    block_tables = torch.zeros(batch, num_blocks // 2, dtype=torch.int32, device="cuda")
+    for b, length in enumerate(context_lengths):
+        pages = -(-length // page)
+        block_tables[b, :pages] = torch.randperm(
+            num_blocks, generator=g, device="cuda"
+        )[:pages]
+    context_lens = torch.tensor(context_lengths, dtype=torch.int32, device="cuda")
+    schedule = (
+        m.deepgemm_fp8_paged_mqa_logits_schedule(
+            batch, next_n, context_lens, max_model_len
+        )
+        if varctx
+        else None
+    )
+
+    launched = []
+    launchers = m._GLUON_PAGED_MQA_LOGITS_LAUNCHERS
+    for key, launch in list(launchers.items()):
+
+        def record(*args, key=key, launch=launch):
+            launched.append(key)
+            return launch(*args)
+
+        monkeypatch.setitem(launchers, key, record)
+    out = torch.full((batch * next_n, max_model_len), float("-inf"), device="cuda")
+    m.deepgemm_fp8_paged_mqa_logits(
+        q,
+        packed.view(num_blocks, page, 1, token_bytes),
+        weights,
+        out,
+        context_lens,
+        block_tables,
+        max_model_len,
+        Preshuffle=preshuffle,
+        KVBlockSize=page,
+        VarCtxSchedule=schedule,
+    )
+    assert launched == [mode]
+
+    reference = torch.full_like(out, float("-inf"))
+    keys_all = kv.float() * scales[..., None]
+    for b, length in enumerate(context_lengths):
+        pages = block_tables[b, : -(-length // page)].long()
+        keys = keys_all[pages].reshape(-1, hidden)[:length]
+        rows = slice(b * next_n, (b + 1) * next_n)
+        logits = ((q[b].float() @ keys.T).relu() * weights[rows, :, None]).sum(1)
+        query_positions = length - next_n + torch.arange(next_n, device="cuda")
+        future = torch.arange(length, device="cuda") > query_positions[:, None]
+        reference[rows, :length] = logits.masked_fill(future, float("-inf"))
+    torch.testing.assert_close(out, reference, rtol=1e-2, atol=1e-2)
