@@ -17,8 +17,12 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._entry import (
     _moe_gluon_gemm1,
     _moe_gluon_gemm2,
 )
+from aiter.ops.triton._gluon_kernels.gfx950.moe._frozen import _validate_frozen
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import constexpr_fields
-from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import compute_kernel_layout
+from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import (
+    _n_reduction_slot,
+    compute_kernel_layout,
+)
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
     A_PAYLOAD,
     A_SCALE,
@@ -796,10 +800,11 @@ def test_small_payload_tiles_use_register_rings(config):
     assert _plain(layout.lds_bytes()) == 0
     assert _plain(_validate(tc, 64, 512))
 
+    # A FROZEN_STEP build is validated by the frozen snapshot's own copy.
     config.update(A_NUM_BUFFER=0, B_NUM_BUFFER=0, FROZEN_STEP=True)
     frozen = KernelTuningConfig(fc, *_tuning_spec(config))
     with pytest.raises(AssertionError, match="requires operand 0's payload in LDS"):
-        validate(frozen, 64, 512)
+        _validate_frozen(frozen, 64, 512)
 
 
 @pytest.mark.parametrize("register_b", [False, True])
@@ -896,7 +901,7 @@ def test_frozen_reference_rejects_new_storage_options(config, field):
     config[field] = 0 if field in host._ALLOW_VIA_LDS_KEYS else 1
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     with pytest.raises(AssertionError, match="FROZEN_STEP does not support"):
-        validate(tc, 4096, 7168)
+        _validate_frozen(tc, 4096, 7168)
 
 
 def test_register_weights_require_preshuffle(config):
@@ -1036,7 +1041,7 @@ def test_epilogue_modes_preserve_output_geometry(config, epilogue):
     func = KernelFuncConfig(*_func_spec(epilogue))
     tc = KernelTuningConfig(func, *_tuning_spec(config))
     assert _plain(func.activation_reduction_n()) == 2
-    assert _plain(func.n_reduction_slot()) == 1
+    assert _plain(_n_reduction_slot(func)) == 1
     assert _plain(compute_kernel_layout(tc).grid_N(4096)) == 16
     assert _plain(_validate(tc, 4096, 7168))
 

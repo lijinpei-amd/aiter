@@ -30,18 +30,13 @@ from ._lang import (
 from ._lang import (
     unwrap as _v,
 )
-from ._layout import (
-    LDS_USABLE_BYTES,
-    _KernelFuncShape,
-)
 
-#: Re-exported for the host wrapper, which sizes candidate tiles against it.
-__all__ = ["LDS_USABLE_BYTES", "KernelFuncConfig", "KernelTuningConfig"]
+__all__ = ["KernelFuncConfig", "KernelTuningConfig"]
 
 
 @aggregate
 @strip_annotate
-class KernelFuncConfig(_KernelFuncShape):
+class KernelFuncConfig:
     """What the kernel *computes*. Every field is constexpr; optional behaviour is a
     ``None`` sentinel because an aggregate has fixed fields -- "does not exist for
     gemm2" is not expressible, ``activation is None`` is.
@@ -113,6 +108,20 @@ class KernelFuncConfig(_KernelFuncShape):
     @gluon.constexpr_function
     def has_activation(self):
         return _v(self.activation) is not None
+
+    @gluon.constexpr_function
+    def activation_reduction_n(self):
+        """Emitted columns per raw column. 2 for a gated activation, 1 otherwise."""
+        return 2 if _v(self.activation) is not None else 1
+
+    @gluon.constexpr_function
+    def gu_split(self):
+        """Is the gated pair laid out as two N halves rather than interleaved?
+
+        Only meaningful with a gated activation -- the flag is inert otherwise, so it
+        is folded in here instead of at every use site.
+        """
+        return bool(_v(self.gate_up_split)) and _v(self.activation) is not None
 
     # -- dtype accessors --
     #

@@ -28,7 +28,6 @@ from functools import cache
 import torch
 
 from aiter.ops.triton._gluon_kernels.gfx950.moe._config import (
-    LDS_USABLE_BYTES,
     KernelFuncConfig,
     KernelTuningConfig,
 )
@@ -44,6 +43,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._frozen import (
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import compute_kernel_layout
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
+    LDS_USABLE_BYTES,
     ActivationSpec,
     ActKind,
     DSReadOperand,
@@ -1254,13 +1254,21 @@ def _launch_spec(
     # Storage can still change during scale preparation, which changes the exact
     # minimum K. Validate inherited depths and shape arithmetic now; validate the
     # complete effective configuration once preparation has resolved its layouts.
+    # A FROZEN_STEP build takes its checks and launch geometry from the frozen
+    # snapshot's own copies, as in _validate_launch_config, so no live KernelLayout
+    # is built for it. The snapshot has no grid_N; its N tile is BLOCK_N, the same
+    # divisor the live grid_N uses.
     if _cval(tuning_cfg_host.FROZEN_STEP):
         _validate_frozen_buffer_counts(tuning_cfg_host)
+        _compute_frozen_layout(tuning_cfg_host).num_k_tiles(K)
+        block_n = _cval(tuning_cfg_host.BLOCK_N)
+        assert N % block_n == 0, f"N ({N}) must be a multiple of BLOCK_N ({block_n})"
+        grid_n = N // block_n
     else:
         validate_buffer_counts(tuning_cfg_host)
-    layout_host = compute_kernel_layout(tuning_cfg_host)
-    layout_host.num_k_tiles(K)
-    grid_n = _cval(layout_host.grid_N(N))
+        layout_host = compute_kernel_layout(tuning_cfg_host)
+        layout_host.num_k_tiles(K)
+        grid_n = _cval(layout_host.grid_N(N))
     # Keep each spec in one constexpr so launch specialization sees four leaves.
     constexpr_args = (
         gl.constexpr(func_spec),

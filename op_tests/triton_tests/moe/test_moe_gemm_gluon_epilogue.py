@@ -18,7 +18,10 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._epilogue import (
     _epi_stage_flush,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import constexpr_fields
-from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import compute_kernel_layout
+from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import (
+    _n_reduction_slot,
+    compute_kernel_layout,
+)
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     ActivationSpec,
     ActKind,
@@ -77,7 +80,7 @@ def _epilogue_config(split, num_warps):
 @gluon.jit
 def _staging_bytes(block_id, pid_n, mi, ni, epoch, func, tuning, layout):
     RFL: gl.constexpr = layout.dot_result_fragment_layout()
-    REDUCTION: gl.constexpr = func.n_reduction_slot()
+    REDUCTION: gl.constexpr = _n_reduction_slot(func)
     OUT_N: gl.constexpr = 128 // REDUCTION
     rows = block_id * 128 + mi * 64 + gl.arange(
         0, 64, layout=gl.SliceLayout(1, RFL)

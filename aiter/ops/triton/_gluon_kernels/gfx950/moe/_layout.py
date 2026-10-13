@@ -11,7 +11,6 @@ built on (``allow_component_via_lds``, ``scale_shuffled``, ...) is
 admits a direct-to-LDS copy, so it is resolved here. The host (grid, LDS probes) and
 the kernel both read that object, so neither re-derives a layout per query and the
 two cannot drift.
-``_KernelFuncShape`` stays a method-only aggregate inherited by ``KernelFuncConfig``.
 """
 
 from triton.experimental import gluon
@@ -22,15 +21,13 @@ from ._lang import MX_GROUP, WARP_SIZE, require_constexpr, strip_annotate
 from ._lang import unwrap as _v
 
 __all__ = [
-    "LDS_CAP_BYTES",
-    "LDS_EPILOGUE_RESERVE_BYTES",
-    "LDS_USABLE_BYTES",
     "KernelLayout",
     "_a_payload_hbm_offsets",
     "_a_scale_hbm_offsets",
     "_b_payload_hbm_offsets",
     "_b_scale_hbm_offsets",
     "_blocked_b_hbm_offsets",
+    "_n_reduction_slot",
     "_n_split_offs",
     "_n_start",
     "_shuffled_scale_register_offsets",
@@ -39,17 +36,6 @@ __all__ = [
     "byte_unit_lds_layout",
     "compute_kernel_layout",
 ]
-
-#: gfx950 LDS capacity, mirrors utils/_triton/arch_info.py::_LDS_CAP_BYTES["gfx950"].
-LDS_CAP_BYTES = 163840
-#: Headroom the operand buffers must leave for LDS the *compiler* allocates on top of
-#: them -- the epilogue's convert_layout from the MFMA layout to the store layout needs
-#: scratch that `lds_bytes()` cannot see. Empirical: a bf16 64x256 / BLOCK_K=128 tile
-#: whose explicit buffers came to exactly 163840 B was rejected at launch at 166368 B.
-#: Kept small on purpose -- the tuned MXFP4 configs sit at ~153 KiB and must not move.
-LDS_EPILOGUE_RESERVE_BYTES = 4096
-#: What the operand buffers may actually use.
-LDS_USABLE_BYTES = LDS_CAP_BYTES - LDS_EPILOGUE_RESERVE_BYTES
 
 _NO_SCALE: gl.constexpr = gl.constexpr(None)
 
@@ -645,34 +631,16 @@ def _slot_index(
     return n_slot_idx * num_m_slots_per_block + m_slot_idx
 
 
-@aggregate
-class _KernelFuncShape:
-    """Operation-shape accessors inherited by ``KernelFuncConfig``."""
+@gluon.constexpr_function
+def _n_reduction_slot(func_cfg):
+    """Emitted columns per raw column within one N slot.
 
-    @gluon.constexpr_function
-    def activation_reduction_n(self):
-        """Emitted columns per raw column. 2 for a gated activation, 1 otherwise."""
-        return 2 if _v(self.activation) is not None else 1
-
-    @gluon.constexpr_function
-    def gu_split(self):
-        """Is the gated pair laid out as two N halves rather than interleaved?
-
-        Only meaningful with a gated activation -- the flag is inert otherwise, so it
-        is folded in here instead of at every use site.
-        """
-        return bool(_v(self.gate_up_split)) and _v(self.activation) is not None
-
-    @gluon.constexpr_function
-    def n_reduction_slot(self):
-        """Emitted columns per raw column within one N slot.
-
-        The block-level ratio is always :meth:`activation_reduction_n`, but under
-        ``gu_split`` the halving happens *across* two slots rather than inside each
-        one -- a slot is a whole operand side, so its width maps 1:1 onto emitted
-        channels and two of them collapse into one output tile.
-        """
-        return 1 if self.gu_split() else self.activation_reduction_n()
+    The block-level ratio is always ``KernelFuncConfig.activation_reduction_n``, but
+    under ``gu_split`` the halving happens *across* two slots rather than inside each
+    one -- a slot is a whole operand side, so its width maps 1:1 onto emitted
+    channels and two of them collapse into one output tile.
+    """
+    return 1 if func_cfg.gu_split() else func_cfg.activation_reduction_n()
 
 
 # -- per-quantity derivations ---------------------------------------------------------
@@ -1382,7 +1350,7 @@ def _calc_dot_operand_scale_buffer_load_lds_layout(tc, idx):
 @gluon.constexpr_function
 def _calc_output_n_slot(tc):
     """Emitted columns produced by one logical N-slot epilogue tile."""
-    return _v(tc.MINI_BLOCK_N) // tc.func_cfg.n_reduction_slot()
+    return _v(tc.MINI_BLOCK_N) // _n_reduction_slot(tc.func_cfg)
 
 
 @gluon.constexpr_function
@@ -1481,9 +1449,7 @@ def _calc_lds_bytes(tc):
         num_slots_block = _calc_num_lds_slots_per_block_non_k(tc, idx)
         if _calc_component_via_lds(tc, (idx, False)):
             total += num_slots_block * shape[0] * shape[1] * width * tc.num_buffers(idx)
-        if fc.has_scale(idx) and (
-            _v(tc.FROZEN_STEP) or _calc_component_via_lds(tc, (idx, True))
-        ):
+        if fc.has_scale(idx) and _calc_component_via_lds(tc, (idx, True)):
             s = _calc_scale_lds_shape_block(tc, idx)
             total += s[0] * s[1] * s[2]
     return total
@@ -2144,11 +2110,7 @@ def compute_kernel_layout(tuning_cfg):
     def scale_tiles(fn):
         return tuple(fn(tc, idx) if scale_tiles_ok(idx) else None for idx in ops)
 
-    lds_ok = all(
-        scale_tiles_ok(idx)
-        or not (has_scale(idx) and (_v(tc.FROZEN_STEP) or via_lds[idx][1]))
-        for idx in ops
-    )
+    lds_ok = all(scale_tiles_ok(idx) or not scale_via_lds(idx) for idx in ops)
     epilogue_via_lds = _calc_epilogue_inputs_via_lds(tc)
     return KernelLayout(
         BLOCK_N=_v(tc.BLOCK_N),

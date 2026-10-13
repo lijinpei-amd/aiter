@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Dtype / quant-scheme enums and the host->device NamedTuples of the gfx950 Gluon MoE
-grouped GEMMs.
+"""Dtype / quant-scheme enums, the LDS budget and the host->device NamedTuples of the
+gfx950 Gluon MoE grouped GEMMs.
 """
 
 from enum import IntEnum, IntFlag
@@ -33,6 +33,9 @@ __all__ = [
     "B_PAYLOAD",
     "B_SCALE",
     "COMPONENTS",
+    "LDS_CAP_BYTES",
+    "LDS_EPILOGUE_RESERVE_BYTES",
+    "LDS_USABLE_BYTES",
     "OPERANDS",
     "PAYLOAD",
     "SCALE",
@@ -78,6 +81,17 @@ OPERANDS = (A, B)
 # Canonical component order. The live schedule also uses this as its copy issue
 # order, so changing it requires updating PER_OP wait-count expectations.
 COMPONENTS = (A_PAYLOAD, A_SCALE, B_PAYLOAD, B_SCALE)
+
+#: gfx950 LDS capacity, mirrors utils/_triton/arch_info.py::_LDS_CAP_BYTES["gfx950"].
+LDS_CAP_BYTES = 163840
+#: Headroom the operand buffers must leave for LDS the *compiler* allocates on top of
+#: them -- the epilogue's convert_layout from the MFMA layout to the store layout needs
+#: scratch that `lds_bytes()` cannot see. Empirical: a bf16 64x256 / BLOCK_K=128 tile
+#: whose explicit buffers came to exactly 163840 B was rejected at launch at 166368 B.
+#: Kept small on purpose -- the tuned MXFP4 configs sit at ~153 KiB and must not move.
+LDS_EPILOGUE_RESERVE_BYTES = 4096
+#: What the operand buffers may actually use.
+LDS_USABLE_BYTES = LDS_CAP_BYTES - LDS_EPILOGUE_RESERVE_BYTES
 
 
 class ActKind(IntEnum):
