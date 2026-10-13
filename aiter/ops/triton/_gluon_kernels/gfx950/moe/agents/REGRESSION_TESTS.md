@@ -166,7 +166,7 @@ Otherwise record a fresh baseline.
 |---|---|---|
 | Gate | `reference/gate/{sched,build_id,asm}_baseline.txt`, used automatically by `gate.sh` when `$OUT` has none | verdict PASS. T1 856 passed, T2a 18 passed, determinism shas `59d442f663991659` / `0cfa77fb04450594` 5/5 |
 | Suite | `reference/suite_1d3431e50/*.txt`, the FAILED lines and summary per file | 1811 passed / 58 failed / 22 skipped. Compare with `compare_suite.py tests/reference/suite_1d3431e50 $OUT/suite_<label>` |
-| Cold bench | `reference/cold_1d3431e50_phys5/`, `summary.json` and `report.md` | physical GPU 5 (BDF `0000:96:00.0`), `--tolerant`, 160/160 processes, 0 failures. Compare with `compare_cold.py tests/reference/cold_1d3431e50_phys5 <label>`, on physical GPU 5 only |
+| Cold bench | `reference/cold_1d3431e50_phys5/`, `summary.json` and `report.md`. `summary.json` is the run as recorded, with the pre-`dcef897ca` knob names (`B_IN_REG`, ...); `summary_allow_via_lds.json` is the same run with them renamed to `ALLOW_*_VIA_LDS` and inverted | physical GPU 5 (BDF `0000:96:00.0`), `--tolerant`, 160/160 processes, 0 failures. Compare with `compare_cold.py tests/reference/cold_1d3431e50_phys5 <label>`, on physical GPU 5 only |
 
 Run conditions for the cold bench: physical GPUs 0–3 were running other users' jobs
 throughout. The same code measured on the same GPU on 2026-10-13 (`cold_klayout_v3_g5`)

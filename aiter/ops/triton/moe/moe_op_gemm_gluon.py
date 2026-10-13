@@ -85,6 +85,13 @@ _ALLOW_VIA_LDS_KEYS = (
     "ALLOW_B_SCALE_VIA_LDS",
     "ALLOW_A_SCALE_VIA_LDS",
 )
+#: Knobs renamed with inverted polarity. Rejected rather than aliased: an old key that
+#: was silently dropped would fall back to LDS placement with no error.
+_INVERTED_KNOB_RENAMES = {
+    "B_IN_REG": "ALLOW_B_VIA_LDS",
+    "B_SCALE_IN_REG": "ALLOW_B_SCALE_VIA_LDS",
+    "A_SCALE_IN_REG": "ALLOW_A_SCALE_VIA_LDS",
+}
 _SCALE_MINI_BLOCK_KEYS = (
     "SCALE_MINI_BLOCK_M",
     "SCALE_MINI_BLOCK_N",
@@ -2125,6 +2132,12 @@ def _tuning_args(c: dict) -> tuple:
         "result_mod": "result_cache_modifier",
         "result_scale_mod": "result_scale_cache_modifier",
     }
+    for legacy, canonical in _INVERTED_KNOB_RENAMES.items():
+        if legacy in c:
+            raise ValueError(
+                f"{legacy} was renamed to {canonical} with inverted polarity; "
+                f"use {canonical}={not c[legacy]}"
+            )
     for legacy, canonical in aliases.items():
         if legacy in c:
             if canonical in c and c[canonical] != c[legacy]:
