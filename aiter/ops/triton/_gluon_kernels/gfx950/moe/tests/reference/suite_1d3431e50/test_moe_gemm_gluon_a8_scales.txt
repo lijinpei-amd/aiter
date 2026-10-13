@@ -1,0 +1,5 @@
+FAILED op_tests/triton_tests/moe/test_moe_gemm_gluon_a8_scales.py::test_independent_scale_mini_blocks[register-k1024-PER_OP]
+FAILED op_tests/triton_tests/moe/test_moe_gemm_gluon_a8_scales.py::test_independent_scale_mini_blocks[register-k1024-PER_SLOT]
+FAILED op_tests/triton_tests/moe/test_moe_gemm_gluon_a8_scales.py::test_independent_scale_mini_blocks[register-k1024-PER_STAGE_WHOLE]
+FAILED op_tests/triton_tests/moe/test_moe_gemm_gluon_a8_scales.py::test_independent_scale_mini_blocks[register-k1024-PER_STAGE_WARP_PIPELINE]
+4 failed, 40 passed in 11.20s

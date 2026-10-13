@@ -1,0 +1,1547 @@
+{
+  "gluon_a4w4": {
+    "source": "base_cases.json",
+    "source_case": "gluon_a4w4",
+    "by_token": {
+      "16": {
+        "tuning": {
+          "ACT_FAST_RCP": true,
+          "A_NUM_BUFFER": 0,
+          "A_SCALE_IN_REG": false,
+          "A_SCALE_NUM_BUFFER": 0,
+          "A_SCALE_SORTED_SHUFFLED": true,
+          "BLOCK_K": 256,
+          "BLOCK_M": 64,
+          "BLOCK_N": 256,
+          "B_IN_REG": false,
+          "B_NUM_BUFFER": 0,
+          "B_PRESHUFFLED": false,
+          "B_SCALE_IN_REG": false,
+          "B_SCALE_NUM_BUFFER": 0,
+          "B_SCALE_SHUFFLED": true,
+          "DS_READ_A_PAYLOAD_IN_MFMA": false,
+          "DS_READ_A_SCALE_IN_MFMA": false,
+          "DS_READ_B_PAYLOAD_IN_MFMA": false,
+          "DS_READ_B_SCALE_IN_MFMA": false,
+          "FROZEN_STEP": false,
+          "GROUP_M": 4,
+          "K_UNROLL": 3,
+          "MINI_BLOCK_M": 32,
+          "MINI_BLOCK_N": 128,
+          "NUM_LDS_BUFFER": 3,
+          "NUM_XCDS": 8,
+          "SCALE_FILL_MID": false,
+          "SCALE_MINI_BLOCK_K": 0,
+          "SCALE_MINI_BLOCK_M": 0,
+          "SCALE_MINI_BLOCK_N": 0,
+          "SCHED_MODE": 0,
+          "SOFF_UNROLL": false,
+          "TILE_SCHED": 2,
+          "UNROLL_EPILOGUE": true,
+          "VGPR_PREFETCH_K": 256,
+          "WAIT_COMMIT_SCHEME": 3,
+          "WARP_PIPELINE": 0,
+          "WAVES_PER_EU": 1,
+          "expert_cache_modifier": ".cg",
+          "expert_scale_cache_modifier": ".cg",
+          "k_width": null,
+          "mfma_instr_shape": [
+            16,
+            16,
+            128
+          ],
+          "result_cache_modifier": "",
+          "result_scale_cache_modifier": "",
+          "tiles_per_warp": [
+            2,
+            2
+          ],
+          "token_cache_modifier": "",
+          "token_scale_cache_modifier": "",
+          "transposed": true,
+          "warps_per_cta": [
+            1,
+            4
+          ]
+        },
+        "env": {}
+      },
+      "64": {
+        "tuning": {
+          "ACT_FAST_RCP": true,
+          "A_NUM_BUFFER": 0,
+          "A_SCALE_IN_REG": false,
+          "A_SCALE_NUM_BUFFER": 0,
+          "A_SCALE_SORTED_SHUFFLED": true,
+          "BLOCK_K": 256,
+          "BLOCK_M": 64,
+          "BLOCK_N": 256,
+          "B_IN_REG": false,
+          "B_NUM_BUFFER": 0,
+          "B_PRESHUFFLED": false,
+          "B_SCALE_IN_REG": false,
+          "B_SCALE_NUM_BUFFER": 0,
+          "B_SCALE_SHUFFLED": true,
+          "DS_READ_A_PAYLOAD_IN_MFMA": false,
+          "DS_READ_A_SCALE_IN_MFMA": false,
+          "DS_READ_B_PAYLOAD_IN_MFMA": false,
+          "DS_READ_B_SCALE_IN_MFMA": false,
+          "FROZEN_STEP": false,
+          "GROUP_M": 4,
+          "K_UNROLL": 3,
+          "MINI_BLOCK_M": 32,
+          "MINI_BLOCK_N": 128,
+          "NUM_LDS_BUFFER": 3,
+          "NUM_XCDS": 8,
+          "SCALE_FILL_MID": false,
+          "SCALE_MINI_BLOCK_K": 0,
+          "SCALE_MINI_BLOCK_M": 0,
+          "SCALE_MINI_BLOCK_N": 0,
+          "SCHED_MODE": 0,
+          "SOFF_UNROLL": false,
+          "TILE_SCHED": 2,
+          "UNROLL_EPILOGUE": true,
+          "VGPR_PREFETCH_K": 256,
+          "WAIT_COMMIT_SCHEME": 3,
+          "WARP_PIPELINE": 0,
+          "WAVES_PER_EU": 1,
+          "expert_cache_modifier": ".cg",
+          "expert_scale_cache_modifier": ".cg",
+          "k_width": null,
+          "mfma_instr_shape": [
+            16,
+            16,
+            128
+          ],
+          "result_cache_modifier": "",
+          "result_scale_cache_modifier": "",
+          "tiles_per_warp": [
+            2,
+            2
+          ],
+          "token_cache_modifier": "",
+          "token_scale_cache_modifier": "",
+          "transposed": true,
+          "warps_per_cta": [
+            1,
+            4
+          ]
+        },
+        "env": {}
+      },
+      "256": {
+        "tuning": {
+          "ACT_FAST_RCP": true,
+          "A_NUM_BUFFER": 0,
+          "A_SCALE_IN_REG": false,
+          "A_SCALE_NUM_BUFFER": 0,
+          "A_SCALE_SORTED_SHUFFLED": true,
+          "BLOCK_K": 256,
+          "BLOCK_M": 64,
+          "BLOCK_N": 256,
+          "B_IN_REG": false,
+          "B_NUM_BUFFER": 0,
+          "B_PRESHUFFLED": false,
+          "B_SCALE_IN_REG": false,
+          "B_SCALE_NUM_BUFFER": 0,
+          "B_SCALE_SHUFFLED": true,
+          "DS_READ_A_PAYLOAD_IN_MFMA": false,
+          "DS_READ_A_SCALE_IN_MFMA": false,
+          "DS_READ_B_PAYLOAD_IN_MFMA": false,
+          "DS_READ_B_SCALE_IN_MFMA": false,
+          "FROZEN_STEP": false,
+          "GROUP_M": 4,
+          "K_UNROLL": 3,
+          "MINI_BLOCK_M": 32,
+          "MINI_BLOCK_N": 128,
+          "NUM_LDS_BUFFER": 3,
+          "NUM_XCDS": 8,
+          "SCALE_FILL_MID": false,
+          "SCALE_MINI_BLOCK_K": 0,
+          "SCALE_MINI_BLOCK_M": 0,
+          "SCALE_MINI_BLOCK_N": 0,
+          "SCHED_MODE": 0,
+          "SOFF_UNROLL": false,
+          "TILE_SCHED": 2,
+          "UNROLL_EPILOGUE": true,
+          "VGPR_PREFETCH_K": 256,
+          "WAIT_COMMIT_SCHEME": 3,
+          "WARP_PIPELINE": 0,
+          "WAVES_PER_EU": 1,
+          "expert_cache_modifier": ".cg",
+          "expert_scale_cache_modifier": ".cg",
+          "k_width": null,
+          "mfma_instr_shape": [
+            16,
+            16,
+            128
+          ],
+          "result_cache_modifier": "",
+          "result_scale_cache_modifier": "",
+          "tiles_per_warp": [
+            2,
+            2
+          ],
+          "token_cache_modifier": "",
+          "token_scale_cache_modifier": "",
+          "transposed": true,
+          "warps_per_cta": [
+            1,
+            4
+          ]
+        },
+        "env": {}
+      },
+      "1024": {
+        "tuning": {
+          "ACT_FAST_RCP": true,
+          "A_NUM_BUFFER": 0,
+          "A_SCALE_IN_REG": false,
+          "A_SCALE_NUM_BUFFER": 0,
+          "A_SCALE_SORTED_SHUFFLED": true,
+          "BLOCK_K": 256,
+          "BLOCK_M": 128,
+          "BLOCK_N": 256,
+          "B_IN_REG": false,
+          "B_NUM_BUFFER": 0,
+          "B_PRESHUFFLED": false,
+          "B_SCALE_IN_REG": false,
+          "B_SCALE_NUM_BUFFER": 0,
+          "B_SCALE_SHUFFLED": true,
+          "DS_READ_A_PAYLOAD_IN_MFMA": false,
+          "DS_READ_A_SCALE_IN_MFMA": false,
+          "DS_READ_B_PAYLOAD_IN_MFMA": false,
+          "DS_READ_B_SCALE_IN_MFMA": false,
+          "FROZEN_STEP": false,
+          "GROUP_M": 4,
+          "K_UNROLL": 3,
+          "MINI_BLOCK_M": 64,
+          "MINI_BLOCK_N": 128,
+          "NUM_LDS_BUFFER": 3,
+          "NUM_XCDS": 8,
+          "SCALE_FILL_MID": false,
+          "SCALE_MINI_BLOCK_K": 0,
+          "SCALE_MINI_BLOCK_M": 0,
+          "SCALE_MINI_BLOCK_N": 0,
+          "SCHED_MODE": 0,
+          "SOFF_UNROLL": false,
+          "TILE_SCHED": 2,
+          "UNROLL_EPILOGUE": true,
+          "VGPR_PREFETCH_K": 256,
+          "WAIT_COMMIT_SCHEME": 3,
+          "WARP_PIPELINE": 0,
+          "WAVES_PER_EU": 1,
+          "expert_cache_modifier": ".cg",
+          "expert_scale_cache_modifier": ".cg",
+          "k_width": null,
+          "mfma_instr_shape": [
+            16,
+            16,
+            128
+          ],
+          "result_cache_modifier": "",
+          "result_scale_cache_modifier": "",
+          "tiles_per_warp": [
+            2,
+            2
+          ],
+          "token_cache_modifier": "",
+          "token_scale_cache_modifier": "",
+          "transposed": true,
+          "warps_per_cta": [
+            1,
+            4
+          ]
+        },
+        "env": {}
+      },
+      "4096": {
+        "tuning": {
+          "ACT_FAST_RCP": true,
+          "A_NUM_BUFFER": 0,
+          "A_SCALE_IN_REG": false,
+          "A_SCALE_NUM_BUFFER": 0,
+          "A_SCALE_SORTED_SHUFFLED": true,
+          "BLOCK_K": 256,
+          "BLOCK_M": 128,
+          "BLOCK_N": 256,
+          "B_IN_REG": false,
+          "B_NUM_BUFFER": 0,
+          "B_PRESHUFFLED": false,
+          "B_SCALE_IN_REG": false,
+          "B_SCALE_NUM_BUFFER": 0,
+          "B_SCALE_SHUFFLED": true,
+          "DS_READ_A_PAYLOAD_IN_MFMA": false,
+          "DS_READ_A_SCALE_IN_MFMA": false,
+          "DS_READ_B_PAYLOAD_IN_MFMA": false,
+          "DS_READ_B_SCALE_IN_MFMA": false,
+          "FROZEN_STEP": false,
+          "GROUP_M": 4,
+          "K_UNROLL": 3,
+          "MINI_BLOCK_M": 64,
+          "MINI_BLOCK_N": 128,
+          "NUM_LDS_BUFFER": 3,
+          "NUM_XCDS": 8,
+          "SCALE_FILL_MID": false,
+          "SCALE_MINI_BLOCK_K": 0,
+          "SCALE_MINI_BLOCK_M": 0,
+          "SCALE_MINI_BLOCK_N": 0,
+          "SCHED_MODE": 0,
+          "SOFF_UNROLL": false,
+          "TILE_SCHED": 2,
+          "UNROLL_EPILOGUE": true,
+          "VGPR_PREFETCH_K": 256,
+          "WAIT_COMMIT_SCHEME": 3,
+          "WARP_PIPELINE": 0,
+          "WAVES_PER_EU": 1,
+          "expert_cache_modifier": ".cg",
+          "expert_scale_cache_modifier": ".cg",
+          "k_width": null,
+          "mfma_instr_shape": [
+            16,
+            16,
+            128
+          ],
+          "result_cache_modifier": "",
+          "result_scale_cache_modifier": "",
+          "tiles_per_warp": [
+            2,
+            2
+          ],
+          "token_cache_modifier": "",
+          "token_scale_cache_modifier": "",
+          "transposed": true,
+          "warps_per_cta": [
+            1,
+            4
+          ]
+        },
+        "env": {}
+      }
+    },
+    "description": "a4w4 Gluon: T16=ladder T64=ladder T256=ladder T1024=ladder T4096=ladder"
+  },
+  "flydsl_a4w4": {
+    "source": "base_cases.json",
+    "source_case": "flydsl_a4w4",
+    "description": "a4w4 FlyDSL: per-shape retuned 2026-09-21",
+    "by_token": {
+      "16": {
+        "tuning": {
+          "tile_m": 32,
+          "tile_n": 256,
+          "tile_k": 256,
+          "use_nt": true,
+          "gate_mode": "separated",
+          "xcd_swizzle": 4
+        },
+        "env": {}
+      },
+      "64": {
+        "tuning": {
+          "tile_m": 32,
+          "tile_n": 256,
+          "tile_k": 256,
+          "use_nt": true,
+          "gate_mode": "separated",
+          "xcd_swizzle": 4
+        },
+        "env": {}
+      },
+      "256": {
+        "tuning": {
+          "tile_m": 32,
+          "tile_n": 256,
+          "tile_k": 256,
+          "use_nt": true,
+          "gate_mode": "separated",
+          "xcd_swizzle": 0
+        },
+        "env": {}
+      },
+      "1024": {
+        "tuning": {
+          "tile_m": 64,
+          "tile_n": 256,
+          "tile_k": 256,
+          "use_nt": false,
+          "gate_mode": "separated",
+          "xcd_swizzle": 0
+        },
+        "env": {}
+      },
+      "4096": {
+        "tuning": {
+          "tile_m": 64,
+          "tile_n": 256,
+          "tile_k": 256,
+          "use_nt": false,
+          "gate_mode": "separated",
+          "xcd_swizzle": 4
+        },
+        "env": {}
+      }
+    }
+  },
+  "gluon_a8w4": {
+    "source": "base_cases.json",
+    "source_case": "gluon_a8w4",
+    "by_token": {
+      "16": {
+        "tuning": {
+          "ACT_FAST_RCP": true,
+          "A_NUM_BUFFER": 0,
+          "A_SCALE_IN_REG": false,
+          "A_SCALE_NUM_BUFFER": 0,
+          "A_SCALE_SORTED_SHUFFLED": false,
+          "BLOCK_K": 512,
+          "BLOCK_M": 32,
+          "BLOCK_N": 128,
+          "B_IN_REG": false,
+          "B_NUM_BUFFER": 0,
+          "B_PRESHUFFLED": false,
+          "B_SCALE_IN_REG": false,
+          "B_SCALE_NUM_BUFFER": 0,
+          "B_SCALE_SHUFFLED": false,
+          "DS_READ_A_PAYLOAD_IN_MFMA": false,
+          "DS_READ_A_SCALE_IN_MFMA": false,
+          "DS_READ_B_PAYLOAD_IN_MFMA": false,
+          "DS_READ_B_SCALE_IN_MFMA": false,
+          "FROZEN_STEP": false,
+          "GROUP_M": 4,
+          "K_UNROLL": 3,
+          "MINI_BLOCK_M": 16,
+          "MINI_BLOCK_N": 64,
+          "NUM_LDS_BUFFER": 3,
+          "NUM_XCDS": 8,
+          "SCALE_FILL_MID": false,
+          "SCALE_MINI_BLOCK_K": 0,
+          "SCALE_MINI_BLOCK_M": 0,
+          "SCALE_MINI_BLOCK_N": 0,
+          "SCHED_MODE": 0,
+          "SOFF_UNROLL": false,
+          "TILE_SCHED": 2,
+          "UNROLL_EPILOGUE": true,
+          "VGPR_PREFETCH_K": 512,
+          "WAIT_COMMIT_SCHEME": 1,
+          "WARP_PIPELINE": 0,
+          "WAVES_PER_EU": 0,
+          "expert_cache_modifier": ".cg",
+          "expert_scale_cache_modifier": ".cg",
+          "k_width": null,
+          "mfma_instr_shape": [
+            16,
+            16,
+            128
+          ],
+          "result_cache_modifier": "",
+          "result_scale_cache_modifier": "",
+          "tiles_per_warp": [
+            1,
+            1
+          ],
+          "token_cache_modifier": "",
+          "token_scale_cache_modifier": "",
+          "transposed": true,
+          "warps_per_cta": [
+            1,
+            4
+          ]
+        },
+        "env": {}
+      },
+      "64": {
+        "tuning": {
+          "ACT_FAST_RCP": true,
+          "A_NUM_BUFFER": 0,
+          "A_SCALE_IN_REG": false,
+          "A_SCALE_NUM_BUFFER": 0,
+          "A_SCALE_SORTED_SHUFFLED": false,
+          "BLOCK_K": 512,
+          "BLOCK_M": 32,
+          "BLOCK_N": 128,
+          "B_IN_REG": false,
+          "B_NUM_BUFFER": 0,
+          "B_PRESHUFFLED": false,
+          "B_SCALE_IN_REG": false,
+          "B_SCALE_NUM_BUFFER": 0,
+          "B_SCALE_SHUFFLED": false,
+          "DS_READ_A_PAYLOAD_IN_MFMA": false,
+          "DS_READ_A_SCALE_IN_MFMA": false,
+          "DS_READ_B_PAYLOAD_IN_MFMA": false,
+          "DS_READ_B_SCALE_IN_MFMA": false,
+          "FROZEN_STEP": false,
+          "GROUP_M": 4,
+          "K_UNROLL": 3,
+          "MINI_BLOCK_M": 16,
+          "MINI_BLOCK_N": 64,
+          "NUM_LDS_BUFFER": 3,
+          "NUM_XCDS": 8,
+          "SCALE_FILL_MID": false,
+          "SCALE_MINI_BLOCK_K": 0,
+          "SCALE_MINI_BLOCK_M": 0,
+          "SCALE_MINI_BLOCK_N": 0,
+          "SCHED_MODE": 0,
+          "SOFF_UNROLL": false,
+          "TILE_SCHED": 2,
+          "UNROLL_EPILOGUE": true,
+          "VGPR_PREFETCH_K": 512,
+          "WAIT_COMMIT_SCHEME": 1,
+          "WARP_PIPELINE": 0,
+          "WAVES_PER_EU": 0,
+          "expert_cache_modifier": ".cg",
+          "expert_scale_cache_modifier": ".cg",
+          "k_width": null,
+          "mfma_instr_shape": [
+            16,
+            16,
+            128
+          ],
+          "result_cache_modifier": "",
+          "result_scale_cache_modifier": "",
+          "tiles_per_warp": [
+            1,
+            1
+          ],
+          "token_cache_modifier": "",
+          "token_scale_cache_modifier": "",
+          "transposed": true,
+          "warps_per_cta": [
+            1,
+            4
+          ]
+        },
+        "env": {}
+      },
+      "256": {
+        "tuning": {
+          "ACT_FAST_RCP": true,
+          "A_NUM_BUFFER": 0,
+          "A_SCALE_IN_REG": false,
+          "A_SCALE_NUM_BUFFER": 0,
+          "A_SCALE_SORTED_SHUFFLED": true,
+          "BLOCK_K": 256,
+          "BLOCK_M": 64,
+          "BLOCK_N": 256,
+          "B_IN_REG": false,
+          "B_NUM_BUFFER": 0,
+          "B_PRESHUFFLED": false,
+          "B_SCALE_IN_REG": false,
+          "B_SCALE_NUM_BUFFER": 0,
+          "B_SCALE_SHUFFLED": true,
+          "DS_READ_A_PAYLOAD_IN_MFMA": false,
+          "DS_READ_A_SCALE_IN_MFMA": false,
+          "DS_READ_B_PAYLOAD_IN_MFMA": false,
+          "DS_READ_B_SCALE_IN_MFMA": false,
+          "FROZEN_STEP": false,
+          "GROUP_M": 4,
+          "K_UNROLL": 3,
+          "MINI_BLOCK_M": 32,
+          "MINI_BLOCK_N": 128,
+          "NUM_LDS_BUFFER": 3,
+          "NUM_XCDS": 8,
+          "SCALE_FILL_MID": false,
+          "SCALE_MINI_BLOCK_K": 0,
+          "SCALE_MINI_BLOCK_M": 0,
+          "SCALE_MINI_BLOCK_N": 0,
+          "SCHED_MODE": 0,
+          "SOFF_UNROLL": false,
+          "TILE_SCHED": 2,
+          "UNROLL_EPILOGUE": true,
+          "VGPR_PREFETCH_K": 256,
+          "WAIT_COMMIT_SCHEME": 3,
+          "WARP_PIPELINE": 0,
+          "WAVES_PER_EU": 1,
+          "expert_cache_modifier": ".cg",
+          "expert_scale_cache_modifier": ".cg",
+          "k_width": null,
+          "mfma_instr_shape": [
+            16,
+            16,
+            128
+          ],
+          "result_cache_modifier": "",
+          "result_scale_cache_modifier": "",
+          "tiles_per_warp": [
+            2,
+            2
+          ],
+          "token_cache_modifier": "",
+          "token_scale_cache_modifier": "",
+          "transposed": true,
+          "warps_per_cta": [
+            1,
+            4
+          ]
+        },
+        "env": {}
+      },
+      "1024": {
+        "tuning": {
+          "ACT_FAST_RCP": true,
+          "A_NUM_BUFFER": 0,
+          "A_SCALE_IN_REG": false,
+          "A_SCALE_NUM_BUFFER": 0,
+          "A_SCALE_SORTED_SHUFFLED": true,
+          "BLOCK_K": 256,
+          "BLOCK_M": 128,
+          "BLOCK_N": 256,
+          "B_IN_REG": true,
+          "B_NUM_BUFFER": 0,
+          "B_PRESHUFFLED": true,
+          "B_SCALE_IN_REG": false,
+          "B_SCALE_NUM_BUFFER": 0,
+          "B_SCALE_SHUFFLED": true,
+          "DS_READ_A_PAYLOAD_IN_MFMA": false,
+          "DS_READ_A_SCALE_IN_MFMA": false,
+          "DS_READ_B_PAYLOAD_IN_MFMA": false,
+          "DS_READ_B_SCALE_IN_MFMA": false,
+          "FROZEN_STEP": false,
+          "GROUP_M": 4,
+          "K_UNROLL": 3,
+          "MINI_BLOCK_M": 64,
+          "MINI_BLOCK_N": 128,
+          "NUM_LDS_BUFFER": 3,
+          "NUM_XCDS": 8,
+          "SCALE_FILL_MID": false,
+          "SCALE_MINI_BLOCK_K": 0,
+          "SCALE_MINI_BLOCK_M": 0,
+          "SCALE_MINI_BLOCK_N": 0,
+          "SCHED_MODE": 0,
+          "SOFF_UNROLL": false,
+          "TILE_SCHED": 2,
+          "UNROLL_EPILOGUE": true,
+          "VGPR_PREFETCH_K": 256,
+          "WAIT_COMMIT_SCHEME": 3,
+          "WARP_PIPELINE": 0,
+          "WAVES_PER_EU": 1,
+          "expert_cache_modifier": ".cg",
+          "expert_scale_cache_modifier": ".cg",
+          "k_width": null,
+          "mfma_instr_shape": [
+            16,
+            16,
+            128
+          ],
+          "result_cache_modifier": "",
+          "result_scale_cache_modifier": "",
+          "tiles_per_warp": [
+            4,
+            2
+          ],
+          "token_cache_modifier": "",
+          "token_scale_cache_modifier": "",
+          "transposed": true,
+          "warps_per_cta": [
+            1,
+            4
+          ]
+        },
+        "env": {}
+      },
+      "4096": {
+        "tuning": {
+          "ACT_FAST_RCP": true,
+          "A_NUM_BUFFER": 0,
+          "A_SCALE_IN_REG": false,
+          "A_SCALE_NUM_BUFFER": 0,
+          "A_SCALE_SORTED_SHUFFLED": true,
+          "BLOCK_K": 256,
+          "BLOCK_M": 128,
+          "BLOCK_N": 256,
+          "B_IN_REG": true,
+          "B_NUM_BUFFER": 0,
+          "B_PRESHUFFLED": true,
+          "B_SCALE_IN_REG": false,
+          "B_SCALE_NUM_BUFFER": 0,
+          "B_SCALE_SHUFFLED": true,
+          "DS_READ_A_PAYLOAD_IN_MFMA": false,
+          "DS_READ_A_SCALE_IN_MFMA": false,
+          "DS_READ_B_PAYLOAD_IN_MFMA": false,
+          "DS_READ_B_SCALE_IN_MFMA": false,
+          "FROZEN_STEP": false,
+          "GROUP_M": 4,
+          "K_UNROLL": 3,
+          "MINI_BLOCK_M": 64,
+          "MINI_BLOCK_N": 128,
+          "NUM_LDS_BUFFER": 3,
+          "NUM_XCDS": 8,
+          "SCALE_FILL_MID": false,
+          "SCALE_MINI_BLOCK_K": 0,
+          "SCALE_MINI_BLOCK_M": 0,
+          "SCALE_MINI_BLOCK_N": 0,
+          "SCHED_MODE": 0,
+          "SOFF_UNROLL": false,
+          "TILE_SCHED": 2,
+          "UNROLL_EPILOGUE": true,
+          "VGPR_PREFETCH_K": 256,
+          "WAIT_COMMIT_SCHEME": 3,
+          "WARP_PIPELINE": 0,
+          "WAVES_PER_EU": 1,
+          "expert_cache_modifier": ".cg",
+          "expert_scale_cache_modifier": ".cg",
+          "k_width": null,
+          "mfma_instr_shape": [
+            16,
+            16,
+            128
+          ],
+          "result_cache_modifier": "",
+          "result_scale_cache_modifier": "",
+          "tiles_per_warp": [
+            4,
+            2
+          ],
+          "token_cache_modifier": "",
+          "token_scale_cache_modifier": "",
+          "transposed": true,
+          "warps_per_cta": [
+            1,
+            4
+          ]
+        },
+        "env": {}
+      }
+    },
+    "description": "a8w4 Gluon: T16=ladder T64=ladder T256=ladder T1024=ladder T4096=ladder"
+  },
+  "flydsl_a8w4": {
+    "source": "base_cases.json",
+    "source_case": "flydsl_a8w4",
+    "description": "a8w4 FlyDSL: per-shape retuned 2026-09-21; T=256 uses the synchronous-A-copy runner-up because the async winner fails cold replay ~40% of runs",
+    "by_token": {
+      "16": {
+        "tuning": {
+          "tile_m": 32,
+          "tile_n": 64,
+          "tile_k": 256,
+          "waves_per_eu": 4,
+          "b_nt": 2,
+          "gate_mode": "interleave",
+          "use_async_copy": true,
+          "xcd_swizzle": 4,
+          "k_wave": 2
+        },
+        "env": {}
+      },
+      "64": {
+        "tuning": {
+          "tile_m": 32,
+          "tile_n": 64,
+          "tile_k": 256,
+          "waves_per_eu": 4,
+          "b_nt": 2,
+          "gate_mode": "interleave",
+          "use_async_copy": true,
+          "xcd_swizzle": 0,
+          "k_wave": 2
+        },
+        "env": {}
+      },
+      "256": {
+        "tuning": {
+          "tile_m": 64,
+          "tile_n": 128,
+          "tile_k": 256,
+          "waves_per_eu": 4,
+          "b_nt": 2,
+          "gate_mode": "interleave",
+          "use_async_copy": false,
+          "xcd_swizzle": 0,
+          "k_wave": 1
+        },
+        "env": {}
+      },
+      "1024": {
+        "tuning": {
+          "tile_m": 128,
+          "tile_n": 256,
+          "tile_k": 256,
+          "waves_per_eu": 1,
+          "b_nt": 2,
+          "gate_mode": "interleave",
+          "use_async_copy": true,
+          "xcd_swizzle": 0,
+          "k_wave": 1
+        },
+        "env": {}
+      },
+      "4096": {
+        "tuning": {
+          "tile_m": 128,
+          "tile_n": 256,
+          "tile_k": 256,
+          "waves_per_eu": 4,
+          "b_nt": 2,
+          "gate_mode": "interleave",
+          "use_async_copy": true,
+          "xcd_swizzle": 0,
+          "k_wave": 1
+        },
+        "env": {}
+      }
+    }
+  },
+  "gluon_a8w8": {
+    "source": "base_cases.json",
+    "source_case": "gluon_a8w8",
+    "by_token": {
+      "16": {
+        "tuning": {
+          "ACT_FAST_RCP": true,
+          "A_NUM_BUFFER": 0,
+          "A_SCALE_IN_REG": false,
+          "A_SCALE_NUM_BUFFER": 0,
+          "A_SCALE_SORTED_SHUFFLED": false,
+          "BLOCK_K": 256,
+          "BLOCK_M": 32,
+          "BLOCK_N": 128,
+          "B_IN_REG": false,
+          "B_NUM_BUFFER": 0,
+          "B_PRESHUFFLED": false,
+          "B_SCALE_IN_REG": false,
+          "B_SCALE_NUM_BUFFER": 0,
+          "B_SCALE_SHUFFLED": false,
+          "DS_READ_A_PAYLOAD_IN_MFMA": false,
+          "DS_READ_A_SCALE_IN_MFMA": false,
+          "DS_READ_B_PAYLOAD_IN_MFMA": false,
+          "DS_READ_B_SCALE_IN_MFMA": false,
+          "FROZEN_STEP": false,
+          "GROUP_M": 4,
+          "K_UNROLL": 3,
+          "MINI_BLOCK_M": 16,
+          "MINI_BLOCK_N": 64,
+          "NUM_LDS_BUFFER": 3,
+          "NUM_XCDS": 8,
+          "SCALE_FILL_MID": false,
+          "SCALE_MINI_BLOCK_K": 0,
+          "SCALE_MINI_BLOCK_M": 0,
+          "SCALE_MINI_BLOCK_N": 0,
+          "SCHED_MODE": 0,
+          "SOFF_UNROLL": false,
+          "TILE_SCHED": 2,
+          "UNROLL_EPILOGUE": true,
+          "VGPR_PREFETCH_K": 256,
+          "WAIT_COMMIT_SCHEME": 1,
+          "WARP_PIPELINE": 0,
+          "WAVES_PER_EU": 0,
+          "expert_cache_modifier": ".cg",
+          "expert_scale_cache_modifier": "",
+          "k_width": null,
+          "mfma_instr_shape": [
+            16,
+            16,
+            128
+          ],
+          "result_cache_modifier": "",
+          "result_scale_cache_modifier": "",
+          "tiles_per_warp": [
+            1,
+            1
+          ],
+          "token_cache_modifier": "",
+          "token_scale_cache_modifier": "",
+          "transposed": true,
+          "warps_per_cta": [
+            1,
+            4
+          ]
+        },
+        "env": {}
+      },
+      "64": {
+        "tuning": {
+          "ACT_FAST_RCP": true,
+          "A_NUM_BUFFER": 0,
+          "A_SCALE_IN_REG": false,
+          "A_SCALE_NUM_BUFFER": 0,
+          "A_SCALE_SORTED_SHUFFLED": false,
+          "BLOCK_K": 256,
+          "BLOCK_M": 32,
+          "BLOCK_N": 128,
+          "B_IN_REG": false,
+          "B_NUM_BUFFER": 0,
+          "B_PRESHUFFLED": false,
+          "B_SCALE_IN_REG": false,
+          "B_SCALE_NUM_BUFFER": 0,
+          "B_SCALE_SHUFFLED": false,
+          "DS_READ_A_PAYLOAD_IN_MFMA": false,
+          "DS_READ_A_SCALE_IN_MFMA": false,
+          "DS_READ_B_PAYLOAD_IN_MFMA": false,
+          "DS_READ_B_SCALE_IN_MFMA": false,
+          "FROZEN_STEP": false,
+          "GROUP_M": 4,
+          "K_UNROLL": 3,
+          "MINI_BLOCK_M": 16,
+          "MINI_BLOCK_N": 64,
+          "NUM_LDS_BUFFER": 3,
+          "NUM_XCDS": 8,
+          "SCALE_FILL_MID": false,
+          "SCALE_MINI_BLOCK_K": 0,
+          "SCALE_MINI_BLOCK_M": 0,
+          "SCALE_MINI_BLOCK_N": 0,
+          "SCHED_MODE": 0,
+          "SOFF_UNROLL": false,
+          "TILE_SCHED": 2,
+          "UNROLL_EPILOGUE": true,
+          "VGPR_PREFETCH_K": 256,
+          "WAIT_COMMIT_SCHEME": 1,
+          "WARP_PIPELINE": 0,
+          "WAVES_PER_EU": 0,
+          "expert_cache_modifier": ".cg",
+          "expert_scale_cache_modifier": "",
+          "k_width": null,
+          "mfma_instr_shape": [
+            16,
+            16,
+            128
+          ],
+          "result_cache_modifier": "",
+          "result_scale_cache_modifier": "",
+          "tiles_per_warp": [
+            1,
+            1
+          ],
+          "token_cache_modifier": "",
+          "token_scale_cache_modifier": "",
+          "transposed": true,
+          "warps_per_cta": [
+            1,
+            4
+          ]
+        },
+        "env": {}
+      },
+      "256": {
+        "tuning": {
+          "ACT_FAST_RCP": true,
+          "A_NUM_BUFFER": 0,
+          "A_SCALE_IN_REG": false,
+          "A_SCALE_NUM_BUFFER": 0,
+          "A_SCALE_SORTED_SHUFFLED": true,
+          "BLOCK_K": 256,
+          "BLOCK_M": 64,
+          "BLOCK_N": 128,
+          "B_IN_REG": false,
+          "B_NUM_BUFFER": 0,
+          "B_PRESHUFFLED": false,
+          "B_SCALE_IN_REG": false,
+          "B_SCALE_NUM_BUFFER": 0,
+          "B_SCALE_SHUFFLED": true,
+          "DS_READ_A_PAYLOAD_IN_MFMA": false,
+          "DS_READ_A_SCALE_IN_MFMA": false,
+          "DS_READ_B_PAYLOAD_IN_MFMA": false,
+          "DS_READ_B_SCALE_IN_MFMA": false,
+          "FROZEN_STEP": false,
+          "GROUP_M": 4,
+          "K_UNROLL": 3,
+          "MINI_BLOCK_M": 32,
+          "MINI_BLOCK_N": 64,
+          "NUM_LDS_BUFFER": 3,
+          "NUM_XCDS": 8,
+          "SCALE_FILL_MID": false,
+          "SCALE_MINI_BLOCK_K": 0,
+          "SCALE_MINI_BLOCK_M": 0,
+          "SCALE_MINI_BLOCK_N": 0,
+          "SCHED_MODE": 0,
+          "SOFF_UNROLL": false,
+          "TILE_SCHED": 2,
+          "UNROLL_EPILOGUE": true,
+          "VGPR_PREFETCH_K": 256,
+          "WAIT_COMMIT_SCHEME": 3,
+          "WARP_PIPELINE": 0,
+          "WAVES_PER_EU": 1,
+          "expert_cache_modifier": ".cg",
+          "expert_scale_cache_modifier": "",
+          "k_width": null,
+          "mfma_instr_shape": [
+            16,
+            16,
+            128
+          ],
+          "result_cache_modifier": "",
+          "result_scale_cache_modifier": "",
+          "tiles_per_warp": [
+            1,
+            2
+          ],
+          "token_cache_modifier": "",
+          "token_scale_cache_modifier": "",
+          "transposed": true,
+          "warps_per_cta": [
+            2,
+            2
+          ]
+        },
+        "env": {}
+      },
+      "1024": {
+        "tuning": {
+          "ACT_FAST_RCP": true,
+          "A_NUM_BUFFER": 0,
+          "A_SCALE_IN_REG": false,
+          "A_SCALE_NUM_BUFFER": 0,
+          "A_SCALE_SORTED_SHUFFLED": true,
+          "BLOCK_K": 128,
+          "BLOCK_M": 128,
+          "BLOCK_N": 256,
+          "B_IN_REG": false,
+          "B_NUM_BUFFER": 0,
+          "B_PRESHUFFLED": false,
+          "B_SCALE_IN_REG": false,
+          "B_SCALE_NUM_BUFFER": 0,
+          "B_SCALE_SHUFFLED": true,
+          "DS_READ_A_PAYLOAD_IN_MFMA": false,
+          "DS_READ_A_SCALE_IN_MFMA": false,
+          "DS_READ_B_PAYLOAD_IN_MFMA": false,
+          "DS_READ_B_SCALE_IN_MFMA": false,
+          "FROZEN_STEP": false,
+          "GROUP_M": 4,
+          "K_UNROLL": 6,
+          "MINI_BLOCK_M": 64,
+          "MINI_BLOCK_N": 128,
+          "NUM_LDS_BUFFER": 3,
+          "NUM_XCDS": 8,
+          "SCALE_FILL_MID": false,
+          "SCALE_MINI_BLOCK_K": 0,
+          "SCALE_MINI_BLOCK_M": 0,
+          "SCALE_MINI_BLOCK_N": 0,
+          "SCHED_MODE": 0,
+          "SOFF_UNROLL": false,
+          "TILE_SCHED": 2,
+          "UNROLL_EPILOGUE": true,
+          "VGPR_PREFETCH_K": 128,
+          "WAIT_COMMIT_SCHEME": 1,
+          "WARP_PIPELINE": 0,
+          "WAVES_PER_EU": 0,
+          "expert_cache_modifier": ".cg",
+          "expert_scale_cache_modifier": "",
+          "k_width": null,
+          "mfma_instr_shape": [
+            16,
+            16,
+            128
+          ],
+          "result_cache_modifier": "",
+          "result_scale_cache_modifier": "",
+          "tiles_per_warp": [
+            2,
+            2
+          ],
+          "token_cache_modifier": "",
+          "token_scale_cache_modifier": "",
+          "transposed": true,
+          "warps_per_cta": [
+            1,
+            4
+          ]
+        },
+        "env": {}
+      },
+      "4096": {
+        "tuning": {
+          "ACT_FAST_RCP": true,
+          "A_NUM_BUFFER": 0,
+          "A_SCALE_IN_REG": false,
+          "A_SCALE_NUM_BUFFER": 0,
+          "A_SCALE_SORTED_SHUFFLED": true,
+          "BLOCK_K": 128,
+          "BLOCK_M": 128,
+          "BLOCK_N": 256,
+          "B_IN_REG": false,
+          "B_NUM_BUFFER": 0,
+          "B_PRESHUFFLED": false,
+          "B_SCALE_IN_REG": false,
+          "B_SCALE_NUM_BUFFER": 0,
+          "B_SCALE_SHUFFLED": true,
+          "DS_READ_A_PAYLOAD_IN_MFMA": false,
+          "DS_READ_A_SCALE_IN_MFMA": false,
+          "DS_READ_B_PAYLOAD_IN_MFMA": false,
+          "DS_READ_B_SCALE_IN_MFMA": false,
+          "FROZEN_STEP": false,
+          "GROUP_M": 4,
+          "K_UNROLL": 6,
+          "MINI_BLOCK_M": 64,
+          "MINI_BLOCK_N": 128,
+          "NUM_LDS_BUFFER": 3,
+          "NUM_XCDS": 8,
+          "SCALE_FILL_MID": false,
+          "SCALE_MINI_BLOCK_K": 0,
+          "SCALE_MINI_BLOCK_M": 0,
+          "SCALE_MINI_BLOCK_N": 0,
+          "SCHED_MODE": 0,
+          "SOFF_UNROLL": false,
+          "TILE_SCHED": 2,
+          "UNROLL_EPILOGUE": true,
+          "VGPR_PREFETCH_K": 128,
+          "WAIT_COMMIT_SCHEME": 1,
+          "WARP_PIPELINE": 0,
+          "WAVES_PER_EU": 0,
+          "expert_cache_modifier": ".cg",
+          "expert_scale_cache_modifier": "",
+          "k_width": null,
+          "mfma_instr_shape": [
+            16,
+            16,
+            128
+          ],
+          "result_cache_modifier": "",
+          "result_scale_cache_modifier": "",
+          "tiles_per_warp": [
+            2,
+            2
+          ],
+          "token_cache_modifier": "",
+          "token_scale_cache_modifier": "",
+          "transposed": true,
+          "warps_per_cta": [
+            1,
+            4
+          ]
+        },
+        "env": {}
+      }
+    },
+    "description": "a8w8 Gluon: T16=ladder T64=ladder T256=ladder T1024=ladder T4096=ladder"
+  },
+  "flydsl_a8w8": {
+    "source": "base_cases.json",
+    "source_case": "flydsl_a8w8",
+    "description": "a8w8 FlyDSL: per-shape retuned 2026-09-21",
+    "by_token": {
+      "16": {
+        "tuning": {
+          "tile_m": 32,
+          "tile_n": 64,
+          "tile_k": 256,
+          "waves_per_eu": 4,
+          "b_nt": 2,
+          "gate_mode": "interleave",
+          "use_async_copy": true,
+          "xcd_swizzle": 4,
+          "k_wave": 2
+        },
+        "env": {}
+      },
+      "64": {
+        "tuning": {
+          "tile_m": 32,
+          "tile_n": 64,
+          "tile_k": 256,
+          "waves_per_eu": 4,
+          "b_nt": 2,
+          "gate_mode": "interleave",
+          "use_async_copy": true,
+          "xcd_swizzle": 0,
+          "k_wave": 2
+        },
+        "env": {}
+      },
+      "256": {
+        "tuning": {
+          "tile_m": 64,
+          "tile_n": 128,
+          "tile_k": 256,
+          "waves_per_eu": 4,
+          "b_nt": 2,
+          "gate_mode": "interleave",
+          "use_async_copy": false,
+          "xcd_swizzle": 0,
+          "k_wave": 1
+        },
+        "env": {}
+      },
+      "1024": {
+        "tuning": {
+          "tile_m": 128,
+          "tile_n": 128,
+          "tile_k": 256,
+          "waves_per_eu": 2,
+          "b_nt": 2,
+          "gate_mode": "separated",
+          "use_async_copy": true,
+          "xcd_swizzle": 0,
+          "k_wave": 1
+        },
+        "env": {}
+      },
+      "4096": {
+        "tuning": {
+          "tile_m": 128,
+          "tile_n": 128,
+          "tile_k": 256,
+          "waves_per_eu": 2,
+          "b_nt": 2,
+          "gate_mode": "separated",
+          "use_async_copy": true,
+          "xcd_swizzle": 0,
+          "k_wave": 1
+        },
+        "env": {}
+      }
+    }
+  },
+  "gluon_a16w16": {
+    "source": "base_cases.json",
+    "source_case": "gluon_a16w16",
+    "by_token": {
+      "16": {
+        "tuning": {
+          "BLOCK_M": 32,
+          "BLOCK_N": 128,
+          "BLOCK_K": 128,
+          "K_UNROLL": 3,
+          "MINI_BLOCK_K": 128,
+          "MINI_BLOCK_M": 16,
+          "MINI_BLOCK_N": 64,
+          "NUM_LDS_BUFFER": 3,
+          "mfma_instr_shape": [
+            16,
+            16,
+            32
+          ],
+          "warps_per_cta": [
+            1,
+            4
+          ],
+          "tiles_per_warp": [
+            1,
+            1
+          ],
+          "k_width": null,
+          "transposed": true,
+          "WAVES_PER_EU": 1,
+          "TILE_SCHED": 2,
+          "GROUP_M": 4,
+          "NUM_XCDS": 8,
+          "token_mod": "",
+          "token_scale_mod": "",
+          "expert_mod": "",
+          "expert_scale_mod": "",
+          "result_mod": "",
+          "result_scale_mod": "",
+          "WARP_PIPELINE": 0,
+          "VGPR_PREFETCH_K": 128,
+          "A_SCALE_SORTED_SHUFFLED": false,
+          "B_SCALE_SHUFFLED": false,
+          "B_PRESHUFFLED": false,
+          "ACT_FAST_RCP": true,
+          "WAIT_COMMIT_SCHEME": 3,
+          "DS_READ_IN_MFMA": 0,
+          "SCHED_MODE": 0,
+          "FROZEN_STEP": false,
+          "SOFF_UNROLL": false,
+          "SCALE_FILL_MID": false
+        },
+        "env": {}
+      },
+      "64": {
+        "tuning": {
+          "BLOCK_M": 32,
+          "BLOCK_N": 128,
+          "BLOCK_K": 128,
+          "K_UNROLL": 3,
+          "MINI_BLOCK_K": 128,
+          "MINI_BLOCK_M": 16,
+          "MINI_BLOCK_N": 64,
+          "NUM_LDS_BUFFER": 3,
+          "mfma_instr_shape": [
+            16,
+            16,
+            32
+          ],
+          "warps_per_cta": [
+            1,
+            4
+          ],
+          "tiles_per_warp": [
+            1,
+            1
+          ],
+          "k_width": null,
+          "transposed": true,
+          "WAVES_PER_EU": 1,
+          "TILE_SCHED": 2,
+          "GROUP_M": 4,
+          "NUM_XCDS": 8,
+          "token_mod": "",
+          "token_scale_mod": "",
+          "expert_mod": "",
+          "expert_scale_mod": "",
+          "result_mod": "",
+          "result_scale_mod": "",
+          "WARP_PIPELINE": 0,
+          "VGPR_PREFETCH_K": 128,
+          "A_SCALE_SORTED_SHUFFLED": false,
+          "B_SCALE_SHUFFLED": false,
+          "B_PRESHUFFLED": false,
+          "ACT_FAST_RCP": true,
+          "WAIT_COMMIT_SCHEME": 3,
+          "DS_READ_IN_MFMA": 0,
+          "SCHED_MODE": 0,
+          "FROZEN_STEP": false,
+          "SOFF_UNROLL": false,
+          "SCALE_FILL_MID": false
+        },
+        "env": {}
+      },
+      "256": {
+        "tuning": {
+          "ACT_FAST_RCP": true,
+          "A_NUM_BUFFER": 0,
+          "A_SCALE_IN_REG": false,
+          "A_SCALE_NUM_BUFFER": 0,
+          "A_SCALE_SORTED_SHUFFLED": false,
+          "BLOCK_K": 64,
+          "BLOCK_M": 64,
+          "BLOCK_N": 256,
+          "B_IN_REG": false,
+          "B_NUM_BUFFER": 0,
+          "B_PRESHUFFLED": false,
+          "B_SCALE_IN_REG": false,
+          "B_SCALE_NUM_BUFFER": 0,
+          "B_SCALE_SHUFFLED": false,
+          "DS_READ_A_PAYLOAD_IN_MFMA": false,
+          "DS_READ_A_SCALE_IN_MFMA": false,
+          "DS_READ_B_PAYLOAD_IN_MFMA": false,
+          "DS_READ_B_SCALE_IN_MFMA": false,
+          "FROZEN_STEP": false,
+          "GROUP_M": 4,
+          "K_UNROLL": 3,
+          "MINI_BLOCK_M": 32,
+          "MINI_BLOCK_N": 128,
+          "NUM_LDS_BUFFER": 3,
+          "NUM_XCDS": 8,
+          "SCALE_FILL_MID": false,
+          "SCALE_MINI_BLOCK_K": 0,
+          "SCALE_MINI_BLOCK_M": 0,
+          "SCALE_MINI_BLOCK_N": 0,
+          "SCHED_MODE": 0,
+          "SOFF_UNROLL": false,
+          "TILE_SCHED": 2,
+          "UNROLL_EPILOGUE": true,
+          "VGPR_PREFETCH_K": 64,
+          "WAIT_COMMIT_SCHEME": 3,
+          "WARP_PIPELINE": 0,
+          "WAVES_PER_EU": 1,
+          "expert_cache_modifier": ".cg",
+          "expert_scale_cache_modifier": "",
+          "k_width": null,
+          "mfma_instr_shape": [
+            32,
+            32,
+            16
+          ],
+          "result_cache_modifier": "",
+          "result_scale_cache_modifier": "",
+          "tiles_per_warp": [
+            1,
+            1
+          ],
+          "token_cache_modifier": "",
+          "token_scale_cache_modifier": "",
+          "transposed": true,
+          "warps_per_cta": [
+            1,
+            4
+          ]
+        },
+        "env": {}
+      },
+      "1024": {
+        "tuning": {
+          "ACT_FAST_RCP": true,
+          "A_NUM_BUFFER": 0,
+          "A_SCALE_IN_REG": false,
+          "A_SCALE_NUM_BUFFER": 0,
+          "A_SCALE_SORTED_SHUFFLED": false,
+          "BLOCK_K": 64,
+          "BLOCK_M": 128,
+          "BLOCK_N": 256,
+          "B_IN_REG": false,
+          "B_NUM_BUFFER": 0,
+          "B_PRESHUFFLED": false,
+          "B_SCALE_IN_REG": false,
+          "B_SCALE_NUM_BUFFER": 0,
+          "B_SCALE_SHUFFLED": false,
+          "DS_READ_A_PAYLOAD_IN_MFMA": false,
+          "DS_READ_A_SCALE_IN_MFMA": false,
+          "DS_READ_B_PAYLOAD_IN_MFMA": false,
+          "DS_READ_B_SCALE_IN_MFMA": false,
+          "FROZEN_STEP": false,
+          "GROUP_M": 4,
+          "K_UNROLL": 3,
+          "MINI_BLOCK_M": 64,
+          "MINI_BLOCK_N": 128,
+          "NUM_LDS_BUFFER": 3,
+          "NUM_XCDS": 8,
+          "SCALE_FILL_MID": false,
+          "SCALE_MINI_BLOCK_K": 0,
+          "SCALE_MINI_BLOCK_M": 0,
+          "SCALE_MINI_BLOCK_N": 0,
+          "SCHED_MODE": 0,
+          "SOFF_UNROLL": false,
+          "TILE_SCHED": 2,
+          "UNROLL_EPILOGUE": true,
+          "VGPR_PREFETCH_K": 64,
+          "WAIT_COMMIT_SCHEME": 3,
+          "WARP_PIPELINE": 0,
+          "WAVES_PER_EU": 1,
+          "expert_cache_modifier": ".cg",
+          "expert_scale_cache_modifier": "",
+          "k_width": null,
+          "mfma_instr_shape": [
+            32,
+            32,
+            16
+          ],
+          "result_cache_modifier": "",
+          "result_scale_cache_modifier": "",
+          "tiles_per_warp": [
+            1,
+            1
+          ],
+          "token_cache_modifier": "",
+          "token_scale_cache_modifier": "",
+          "transposed": true,
+          "warps_per_cta": [
+            2,
+            4
+          ]
+        },
+        "env": {}
+      },
+      "4096": {
+        "tuning": {
+          "ACT_FAST_RCP": true,
+          "A_NUM_BUFFER": 0,
+          "A_SCALE_IN_REG": false,
+          "A_SCALE_NUM_BUFFER": 0,
+          "A_SCALE_SORTED_SHUFFLED": false,
+          "BLOCK_K": 64,
+          "BLOCK_M": 128,
+          "BLOCK_N": 256,
+          "B_IN_REG": false,
+          "B_NUM_BUFFER": 0,
+          "B_PRESHUFFLED": false,
+          "B_SCALE_IN_REG": false,
+          "B_SCALE_NUM_BUFFER": 0,
+          "B_SCALE_SHUFFLED": false,
+          "DS_READ_A_PAYLOAD_IN_MFMA": false,
+          "DS_READ_A_SCALE_IN_MFMA": false,
+          "DS_READ_B_PAYLOAD_IN_MFMA": false,
+          "DS_READ_B_SCALE_IN_MFMA": false,
+          "FROZEN_STEP": false,
+          "GROUP_M": 4,
+          "K_UNROLL": 3,
+          "MINI_BLOCK_M": 64,
+          "MINI_BLOCK_N": 128,
+          "NUM_LDS_BUFFER": 3,
+          "NUM_XCDS": 8,
+          "SCALE_FILL_MID": false,
+          "SCALE_MINI_BLOCK_K": 0,
+          "SCALE_MINI_BLOCK_M": 0,
+          "SCALE_MINI_BLOCK_N": 0,
+          "SCHED_MODE": 0,
+          "SOFF_UNROLL": false,
+          "TILE_SCHED": 2,
+          "UNROLL_EPILOGUE": true,
+          "VGPR_PREFETCH_K": 64,
+          "WAIT_COMMIT_SCHEME": 3,
+          "WARP_PIPELINE": 0,
+          "WAVES_PER_EU": 1,
+          "expert_cache_modifier": ".cg",
+          "expert_scale_cache_modifier": "",
+          "k_width": null,
+          "mfma_instr_shape": [
+            32,
+            32,
+            16
+          ],
+          "result_cache_modifier": "",
+          "result_scale_cache_modifier": "",
+          "tiles_per_warp": [
+            1,
+            1
+          ],
+          "token_cache_modifier": "",
+          "token_scale_cache_modifier": "",
+          "transposed": true,
+          "warps_per_cta": [
+            2,
+            4
+          ]
+        },
+        "env": {}
+      }
+    },
+    "description": "a16w16 Gluon: T16=pinned T64=pinned T256=ladder T1024=ladder T4096=ladder"
+  },
+  "flydsl_a16w16": {
+    "source": "base_cases.json",
+    "source_case": "flydsl_a16w16",
+    "description": "a16w16 FlyDSL: per-shape retuned 2026-09-21",
+    "by_token": {
+      "16": {
+        "tuning": {
+          "tile_m": 16,
+          "tile_n": 128,
+          "tile_k": 128,
+          "waves_per_eu": 2,
+          "b_nt": 2,
+          "xcd_swizzle": 0,
+          "k_wave": 2
+        },
+        "env": {}
+      },
+      "64": {
+        "tuning": {
+          "tile_m": 16,
+          "tile_n": 128,
+          "tile_k": 256,
+          "waves_per_eu": 1,
+          "b_nt": 2,
+          "xcd_swizzle": 1,
+          "k_wave": 1
+        },
+        "env": {}
+      },
+      "256": {
+        "tuning": {
+          "tile_m": 64,
+          "tile_n": 128,
+          "tile_k": 128,
+          "waves_per_eu": 1,
+          "b_nt": 2,
+          "xcd_swizzle": 1,
+          "k_wave": 1
+        },
+        "env": {}
+      },
+      "1024": {
+        "tuning": {
+          "tile_m": 64,
+          "tile_n": 128,
+          "tile_k": 128,
+          "waves_per_eu": 1,
+          "b_nt": 2,
+          "xcd_swizzle": 0,
+          "k_wave": 1
+        },
+        "env": {}
+      },
+      "4096": {
+        "tuning": {
+          "tile_m": 128,
+          "tile_n": 128,
+          "tile_k": 128,
+          "waves_per_eu": 1,
+          "b_nt": 2,
+          "xcd_swizzle": 0,
+          "k_wave": 1
+        },
+        "env": {}
+      }
+    }
+  }
+}
