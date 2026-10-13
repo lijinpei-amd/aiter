@@ -40,7 +40,7 @@ pending Iris-enabled multi-GPU validation.
 | --- | --- | --- |
 | `aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/common.py:409` | `torch.library.wrap_triton(_rotary_kernel)` | `torch.library.wrap_triton` is required for `torch.compile` behavior. |
 | `aiter/ops/triton/comms/all_gather.py:226` | `_all_gather_kernel` | Blocked by Iris helpers only: its nested JIT helper calls Iris `put`; intj compatibility lacks Iris-enabled validation. |
-| `aiter/ops/triton/comms/fused/reduce_scatter_rmsnorm_quant_all_gather.py:368` | `fused_pipeline_kernel` | Nested JIT helpers call Iris `load` and `put`; intj compatibility lacks Iris-enabled validation. |
+| `aiter/ops/triton/comms/fused/reduce_scatter_rmsnorm_quant_all_gather.py:370` | `fused_pipeline_kernel` | Nested JIT helpers call Iris `load` and `put`; intj compatibility lacks Iris-enabled validation. |
 | `aiter/ops/triton/comms/reduce_scatter.py:236` | `_reduce_scatter_kernel` | Blocked by Iris helpers only: its nested JIT helper calls Iris `load`; intj compatibility lacks Iris-enabled validation. |
 | `aiter/ops/triton/gemm/basic/gemm_afp8wfp8.py:386` | `_PRESHUFFLE_KERNEL_MAP[kernel_type]` | gfx1250 preshuffle can use `num_ctas > 1` (CGA multicast); intj refuses it. |
 | `aiter/ops/triton/moe/moe_op_gemm_a4w4.py:595` | `_moe_gemm_a4w4_prefill` | Selected config can use `num_ctas > 1`; intj refuses it. |
@@ -63,7 +63,7 @@ earlier (see above). So a kernel can carry its launcher as a decorator in a
 module Aiter imports without a GPU. That is the default form:
 
 ```python
-@make_launcher(grid_arg=1, options={"num_warps": 4})   # 420 kernels
+@make_launcher(grid_arg=1, options={"num_warps": 4})   # 422 kernels
 @triton.jit
 def _foo_kernel(...): ...
 
@@ -73,8 +73,10 @@ _foo_kernel.__self__.options.jit_func                   # the JIT function (tune
 
 The kernel's name is then the launcher. Code that needs the `JITFunction`
 reads `kernel.__self__.options.jit_func`: the pa_decode_gluon AOT compile
-tools and warmup, and the tests that read `arg_names`, `Heuristics`
-predicates or source, or launch a Triton reference. Arguments the decorator
+tools and warmup, the mla AOT tools (through `aiter/aot/triton/mla_jit.py`),
+the Iris kernel that calls rmsnorm's kernel as a device function (as
+`_rms_norm`), and the tests that read `arg_names`, `Heuristics` predicates
+or source, or launch a Triton reference. Arguments the decorator
 needs (a `grid_cpp` def, an option constant such as `mla_decode_ref`'s,
 whose `kpack` depends on the arch) sit above the kernel. Keywords computed
 only when the launcher is first used come from `delayed=`, a function the
@@ -89,23 +91,21 @@ decorated kernel: the split-K reduce takes `KERNEL_NAME` and `activation` as
 str constexprs; sage_quant_v, `_combined_routing`, `_moe_gemm_a8w8` and
 `_sparse_attn_prefill_kernel` each serve two call sites.
 
-Three other forms remain, 17 launchers, only where a decorator cannot give
+Three other forms remain, 15 launchers, only where a decorator cannot give
 what one kernel needs, and `HsacoKernel` makes its launchers at run time (last
 row); no `functools.cache` factory is left:
 
 ```python
-_k = make_launcher(_k, ...)                    # beside the kernel, over a wrapper applied after it
-_bar_launch = make_launcher(_bar_kernel, ...)  # the JIT function keeps its own name
+_k = make_launcher(_k, ...)              # beside the kernel, over a wrapper applied after it
+_k_other = make_launcher(_k.__self__.options.jit_func, ...)  # a decorated kernel's JIT function, other options
 _TABLE = {mode: make_launcher(_kernel(mode), delayed=partial(_keywords, mode)) for mode in _MODES}
 ```
 
 | Launcher | Form | Why not a decorator |
 | --- | --- | --- |
 | `attn_res` `attnres_fwd_kernel`, `attnres_fwd_sequence_kernels` (5) | beside the kernel, table | Under `ATTN_RES_TRITON_AUTOTUNE` the kernel module wraps the kernel in `@triton.autotune` after defining it, and the launchers must wrap the tuner. All six launch one kernel, each baking what its layout (and `L2` bucket, for the sequence layout's table) never varies (see [attn_res's sequence layout](#attn_ress-sequence-layout)). |
-| `aiter/mla.py` `_fwd_kernel_stage2_asm_launch` | named | `aiter/aot/triton/decode_mla.py` and `csrc/cpp_itfs/mla/asm_mla_decode_fwd.py` compile `_fwd_kernel_stage2_asm` ahead of time with Triton's own `triton.tools.compile`, which loads `aiter/mla.py` and takes that attribute as a `JITFunction`; its generated loader looks the kernel up in the HSACO by the same name, so the JIT function cannot move to another one. |
-| `test_mla_stage2_merge.py` `_fwd_kernel_stage2_asm_launch` | named | Sweeps `num_warps`, `num_stages` and `waves_per_eu` per call over `aiter.mla`'s JIT function (above). |
-| `rmsnorm` `_rms_norm_kernel_launch` | named | The kernel is also a device function: the Iris `reduce_scatter_rmsnorm_quant_all_gather` kernel calls it, and a launcher cannot be called from kernel code. |
-| `pa_attention_kernel_test` `_direct_dot_launch`, `_direct_large_block_dot_launch` | named | Launch pa_decode_gluon's dot kernels' JIT functions with other options (`num_stages=1`, per-call `waves_per_eu`) than their decorators. |
+| `test_mla_stage2_merge.py` `_fwd_kernel_stage2_asm_launch` | over a decorated kernel's JIT function | The script sweeps `num_warps`, `num_stages` and `waves_per_eu`, which `aiter.mla`'s decorator bakes. Taking them per call there makes each production call 31 positional arguments, past the 30 CPython passes directly: +0.33-0.47 us per launch on gfx942. With the grid as one tuple it stays at 30 and costs +22-46 ns, which production would pay for this script's sweep (see [The named launchers as decorators](#the-named-launchers-as-decorators)). |
+| `pa_attention_kernel_test` `_direct_dot_launch`, `_direct_large_block_dot_launch` | over a decorated kernel's JIT function | Launch pa_decode_gluon's dot kernels' JIT functions with other options (`num_stages=1`, per-call `waves_per_eu`) than their decorators. Taking both per call on the production dot-kernel decorator added 0.05-0.11 us to each of its launches on gfx942 (the large-block kernel was not timed). |
 | `pa_mqa_logits` `_GLUON_PAGED_MQA_LOGITS_LAUNCHERS` (6) | table | One launcher per (Preshuffle, VarCtx, KV-padded) mode over three Gluon kernels, each with its own hand-written types and `Assume` facts, from `delayed=` (they need `get_gfx()`); `return_compiled=True`. Each JIT function backs two launchers (KV-padded and unpadded facts), which one decorator cannot declare. |
 | `csrc/cpp_itfs/utils.py` `_IntjKernel.launchers` | made on first call | `jit(kernel)` wraps whatever JIT function its caller passes; one `return_compiled=True` launcher per set of option keywords, taken as `dynamic_options` (see [HsacoKernel](#hsacokernel)). |
 
@@ -496,7 +496,10 @@ keywords. What changed:
   kernels, attn_res and the five fused MXFP4 kernels launch under their
   kernel's name; their JIT-function consumers read it from the launcher (see
   [Launchers](#launchers)). Of the 13 named launchers, the three whose JIT
-  function must keep its own name remain. The AOT tools
+  function had to keep its own name remained; `aiter.mla`'s stage-2 merge
+  and rmsnorm's kernel are decorated since (see
+  [The named launchers as decorators](#the-named-launchers-as-decorators)).
+  The AOT tools
   (`csrc/cpp_itfs/gluon_aot_tools/compile*.py`) take the JIT function from a
   launcher they load by name; the HSACO symbol is the JIT function's name,
   which is the attribute's.
@@ -560,8 +563,9 @@ the dtypes plugin and the torch `per_tensor_quant`/`pertoken_quant` shims:
   `triton.compile` raises the same `CompilationError` on both trees.
 
 Not run: `op_tests/cpp/test_pa_decode_gluon_aot.py` (its builds need CK
-headers), `aiter/aot/triton/decode_mla.py` (unchanged: it still compiles the
-JIT function `_fwd_kernel_stage2_asm`).
+headers), `aiter/aot/triton/decode_mla.py` (then unchanged; it now compiles
+the JIT function through `aiter/aot/triton/mla_jit.py`, run in
+[The named launchers as decorators](#the-named-launchers-as-decorators)).
 
 ## torch.compile of fav3_sage
 
@@ -1160,3 +1164,134 @@ intj's warm overhead is mostly its first import of `torch.utils.cpp_extension`
 launcher's extension (1.74 s in the host C compiler and 0.26 s rendering, in
 one profiled run). The parent's first run also loads the binary (0.7-1.1
 ms); intj loads it while compiling, so its first run takes under 0.12 ms.
+
+## The named launchers as decorators
+
+Two of the four named launchers became decorators; the other two launch a
+decorated kernel's JIT function with other options, and stay for a measured
+cost. Base `ba40fc7e2` (none of these files changed up to `00df7c810`);
+gfx942 (triton 3.8.0, torch 2.14+rocm7.2, intj `2783079`), gfx950 compiled
+offline.
+
+| Launcher (before) | Now | Why |
+| --- | --- | --- |
+| `aiter/mla.py` `_fwd_kernel_stage2_asm_launch` | `@make_launcher(grid_arg=2, options=...)` on `_fwd_kernel_stage2_asm` | The AOT tools (`aiter/aot/triton/decode_mla.py`, `csrc/cpp_itfs/mla/asm_mla_decode_fwd.py`) point `triton.tools.compile` at `aiter/aot/triton/mla_jit.py`, which binds `_fwd_kernel_stage2_asm` to the launcher's `__self__.options.jit_func`. `compile_kernel` takes `kernel_name` from that file and its loader looks the HSACO symbol up by the same name, so the name stays `_fwd_kernel_stage2_asm`. |
+| `rmsnorm` `_rms_norm_kernel_launch` | `@make_launcher` on `_rms_norm_kernel` | The Iris kernel `fused_pipeline_kernel` calls `_rms_norm = _rms_norm_kernel.__self__.options.jit_func` as its device function. The kernel stays one JIT function, so both kernels compile the same code. |
+| `test_mla_stage2_merge.py` `_fwd_kernel_stage2_asm_launch` | still `make_launcher(_fwd_kernel_stage2_asm.__self__.options.jit_func, dynamic_options=(num_warps, num_stages, waves_per_eu))` | See [Launchers](#launchers) and the measurements below. |
+| `pa_attention_kernel_test` `_direct_dot_launch`, `_direct_large_block_dot_launch` | unchanged (over pa_decode_gluon's `jit_func`), reason now in the comment | Making `num_stages` and `waves_per_eu` dynamic on pa_decode_gluon's dot-kernel decorator added 0.05-0.11 us to each production launch (below). |
+
+`grep -rE '^\s*@(intj\.)?make_launcher\b' --include=*.py aiter op_tests csrc`
+counts 422 decorator lines (420 at `00df7c810`). The other
+`make_launcher(` calls (`grep -rn 'make_launcher(' --include=*.py aiter
+op_tests csrc` minus the decorator lines; `kda_launchers.py` only re-runs
+decorated kernel modules under a stand-in) went from 8 to 6, declaring 15
+launchers (17 before) plus `HsacoKernel`'s, made at run time. Already a
+decorator but inside a function: `test_metadata_redirect.py` `test_jit`'s
+`empty_kernel`, under `with_custom_metadata_path(temp_dir)` of the test's
+own temp dir.
+
+**Codegen and AOT identity.** A decorator line above a kernel moves its
+`def`, and Triton records source lines in the TTGIR locations and the
+HSACO's DWARF. So "identical" was checked two ways: old vs new with line
+numbers set aside, and new against a control tree (`ba40fc7e2` plus an
+identity decorator `@(lambda f: f)` and comment lines at the same lines as
+the new decorator), which must be byte-identical. All runs compile from one
+fixed path (the file path is in the debug info), each with a fresh
+`TRITON_CACHE_DIR`.
+
+- **mla AOT** (both tools, gfx942 native and gfx950 offline; the C++ build
+  of `asm_mla_decode_fwd` stubbed, everything before it real). With the
+  tools' own signatures (15 and 17 entries for a 24-parameter kernel),
+  `ba40fc7e2` and new fail identically: `CompilationError ... 'NoneType'
+  object has no attribute '_unflatten_ir'`; these signatures predate the
+  current kernel, not fixed here. With a valid 24-entry signature (the
+  tools' last three constexprs kept), new vs control is byte-identical:
+  generated `.c`/`.h`, HSACO, amdgcn, ttgir, metadata json including
+  `hash`. New vs `ba40fc7e2`: `.h` identical; `.c` differs only in the
+  embedded HSACO; HSACO identical after `llvm-objcopy --strip-debug`;
+  disassembly identical; amdgcn differs only in `.loc` and one
+  `DW_AT_call_line` (+5 lines); ttgir only in `mla.py` line numbers; json
+  only in `hash` (Triton's `cache_key` includes the first decorator's
+  line). Symbol `_fwd_kernel_stage2_asm`, func names
+  `decode_mla_stage2_asm_f0fd6ad4_...`/`_7932f740_...`, and the loader's
+  `hipModuleGetFunction(..., "_fwd_kernel_stage2_asm")` are unchanged.
+- **rmsnorm** (`_rmsnorm_forward` on 6 shapes, which compile 6
+  configurations, blocked and not, `BLOCK_SIZE` 1024-32768; the same
+  annotated sources compiled for gfx950): new vs control byte-identical on
+  both targets (ttgir, amdgcn, HSACO, json). New vs `ba40fc7e2`: identical
+  except line numbers (+1); the json, `hash` included, is identical:
+  Triton's cache key takes the first decorator's line, 56 in both trees
+  (`@triton.jit(...)` before, `@make_launcher` now).
+- **Iris `fused_pipeline_kernel`**: `iris` is not installed, so it was
+  compiled with a stub `iris` package (`load`/`put` as plain loads/stores)
+  for 3 configurations on gfx942 and gfx950. Its ttgir, amdgcn and stripped
+  HSACO equal `ba40fc7e2`'s except for line numbers. Its `cache_key`
+  differs (`da620d7bb68f` before, `d1720a2b3ae7` now): its source now calls
+  `_rms_norm`.
+
+**Measurements** (gfx942, host time per launch, rotated order, medians):
+
+- `aiter.mla` stage-2, production shape: old launcher 5016 ns, new
+  decorated launcher 4995 ns. Same JIT function with `num_warps`,
+  `num_stages`, `waves_per_eu` dynamic and `grid_arg=2`: +334 to +403 ns
+  (20-call batches), +380 to +470 ns (single calls); rerun +389, +391, +411
+  ns. `num_stages` and `waves_per_eu` dynamic, or `num_warps` alone: within
+  5 ns of baked. The compiled kernel (HSACO) is the same either way.
+- The cause is the argument count, not the options: three options make the
+  call 31 positional arguments (device, stream, 2 grid values, 3 options,
+  24 kernel arguments), and CPython compiles a call with more than 30 to
+  `CALL_FUNCTION_EX` (`dis` shows it). A 27-argument test kernel costs 4123
+  ns with no dynamic option (30 positional) and 4514-4566 ns with 1 to 3
+  (31-33); a 23-argument one 4031-4069 ns with 0 to 3 (26-29). `math.hypot`
+  shows the same switch from 30 to 31 arguments. With the grid as one tuple
+  (30 positional) the three options cost +22, +31, +46 ns over the current
+  launcher (3 runs; a review measured +30 to +43 ns).
+- pa_decode_gluon dot kernel, arguments captured from
+  `pa_attention_kernel_test`: `dynamic_options=("num_stages",
+  "waves_per_eu")` over the default-option launcher: +105, +50, +81 ns;
+  rerun +90, +73, +62, +109, +57 ns (one more run, in which every launcher
+  was 2 us slower, gave +377 ns). Its 54 parameters put every call past 30
+  positional arguments already, so this is intj's own cost. Only this
+  kernel was timed; the large-block kernel has the same 54 parameters.
+
+**Tests** (gfx942, `ba40fc7e2` vs new):
+
+| | `ba40fc7e2` | new |
+| --- | --- | --- |
+| check sweep: launchers / check ok / build ok | 419 / 419 / 419 | 419 / 419 / 419 |
+| GPU-free imports (414 modules) | 148, same failure set | 148, same failure set |
+| `triton_tests/normalization/test_rmsnorm.py` | 450 passed, 2 failed | 450 passed, 2 failed |
+| `triton_tests/normalization/test_intj_launches.py` | 1 passed | 1 passed |
+| `test_mla_decode_gate.py`, `test_mla_v4_nm.py` | 21 skipped (gfx950 only) | 21 skipped |
+| `test_mla_stage2_merge.py` (32 configs) | err 0 everywhere | err 0 everywhere (rerun, 36 configs: the same) |
+| `triton_tests/attention/test_intj_attention_launches.py` | not present | 4 passed |
+| production stage-2 call, 3 shapes | output MD5s | the same MD5s |
+| `pa_attention_kernel_test` direct | passed, MD5s | passed, same MD5s |
+
+The 2 rmsnorm failures are the HIP reference `aiter.rmsnorm2d_fwd_with_add`,
+absent under `AITER_TRITON_ONLY`. `test_mla.py` fails on both trees before
+reaching `mla_decode_fwd` (`aiter.flash_attn_varlen_func`, HIP).
+`test_mla_stage2_merge.py` is a script (under pytest it fails on both trees:
+`test_stage2_merge() missing 5 required positional arguments`); its markdown
+summary needs `tabulate` (not installed), so it was printed with
+`to_string`.
+
+`test_mla_stage2_merge_launcher_matches_torch` calls the decorated launcher
+as `mla_decode_fwd_v4_nm` does, on three sequences that merge N, N - 1 and 1
+splits, against torch; `test_mla_aot_tools_load_the_stage2_jit_function`
+checks that `mla_jit.py` yields the JIT function under the kernel's name.
+Before them no pytest test that runs on gfx942 under `AITER_TRITON_ONLY`
+reached this launcher. Each of these mutations fails them: the decorator
+dropped, `grid_arg=1`, `mla_jit.py` binding the launcher, the kernel
+ignoring `valid_split_count`, its `stride_mid_oh`/`stride_mid_os`
+parameters swapped. They cannot catch a wrong option or argument order
+inside `mla_decode_fwd` / `mla_decode_fwd_v4_nm`; that needs
+`test_mla_v4_nm.py` (gfx950) or `test_mla.py` (HIP ops).
+
+Not verified: the mla AOT C++ build (`compile_template_op` needs CK
+headers) and running the generated loader; gfx1250 (the stage-1 asm target)
+not compiled; `mla_decode_fwd` end to end (its stage 1 is HIP asm; the
+stage-2 launch was run directly with production arguments instead); the
+Iris kernel against the real `iris`, and multi-GPU; gfx950 at runtime
+(compiled offline only); the dynamic-options cost on pa_decode_gluon's
+large-block kernel.
