@@ -7,8 +7,10 @@ Aiter does not yet publish an intj dependency. `20e578f` adds `Exactly(...)`,
 a specialization of exactly the listed facts, which pa_mqa_logits' launchers
 state (see [pa_mqa_logits' facts as `Exactly`](#pa_mqa_logits-facts-as-exactly)).
 Since its `9906f12`, intj's attrs list the empty `(i,): []` entries Triton's
-own launch lists, so every intj compile's Triton hash changed once and each
-kernel recompiles once (an empty entry adds no fact: the binary is the same).
+own launch lists, one per constexpr and per runtime integer or pointer it
+specializes but compiles no fact for, so an intj compile with any such
+parameter (nearly all) gets a new Triton hash and recompiles once (an empty
+entry adds no fact: the binary is the same; checked for pa_mqa_logits only).
 Earlier revisions brought the lazy build, `dynamic_options`, object
 constexprs looked up in C, `assume_constant_globals`, `torch.Tensor` and
 `torch.Tensor | None` annotations, Triton's conversion of annotated scalars
