@@ -400,7 +400,11 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
             (7,): kv_cache_attr,  # KV_buffer
             (8,): kv_cache_attr,  # stride_k_seq
             (9,): kv_cache_attr,  # scale_buffer
-            (10,): kv_cache_attr,  # stride_scale_seq
+            # stride_scale_seq: NO tt.divisibility -- it counts fp32 elements,
+            # a quarter of the KV row stride, so a 16-byte-aligned KV row only
+            # makes it a multiple of 4 (36 for the bench's 144-byte tokens with
+            # -p, 264 for a page of 8 132-byte tokens). The hint never changed
+            # the generated code: each lane loads its own token's scale.
             (11,): [["tt.pointer_range", 32]],  # context_len_ptr
             (12,): [["tt.pointer_range", 32]],  # kv_indices
             (13,): [

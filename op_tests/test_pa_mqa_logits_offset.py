@@ -35,6 +35,7 @@ import torch
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.triton.attention import pa_mqa_logits
 from aiter.ops.triton.attention.pa_mqa_logits import (
     deepgemm_fp8_paged_mqa_logits,
     enable_jit_gluon_pa_mqa_logits_kernel,
@@ -505,6 +506,166 @@ def test_paged_mqa_logits_large_kv_offsets(
         keys = keys.reshape(-1, hidden_dim)[:context_length]
         scores = (q[b, 0].float() @ keys.T).relu()
         reference[b, :context_length] = (scores * weights[b, :, None]).sum(dim=0)
+    torch.testing.assert_close(out, reference, rtol=1e-2, atol=1e-2)
+
+
+class _RecordingKernel:
+    """A compiled kernel that records the arguments of each launch."""
+
+    def __init__(self, kernel, launches):
+        self.kernel, self.launches, self.hash = kernel, launches, kernel.hash
+
+    def __getitem__(self, grid):
+        def launch(*args):
+            self.launches.append((self.kernel, args))
+            return self.kernel[grid](*args)
+
+        return launch
+
+
+@pytest.mark.skipif(
+    get_gfx() not in ("gfx942", "gfx950", "gfx1250")
+    or not enable_jit_gluon_pa_mqa_logits_kernel,
+    reason="Requires the CDNA Gluon JIT paged MQA kernel",
+)
+@pytest.mark.parametrize(
+    "layout,block_size,token_bytes",
+    [
+        # The bench's `-p` layout: 128 FP8 values, one FP32 scale and 12 bytes
+        # of padding per token. KV rows are 144 bytes, scale rows 36 floats.
+        pytest.param("plain", 1, 144, id="plain-B1-144B"),
+        # Unpadded 132-byte tokens on 8-token pages: 1056-byte KV rows, 264
+        # floats of scale.
+        pytest.param("plain", 8, 132, id="plain-B8-132B"),
+        pytest.param("preshuffle", 8, 132, id="preshuffle-B8-132B"),
+        # 64-token pages: both strides are multiples of 16.
+        pytest.param("preshuffle", 64, 132, id="preshuffle-B64-132B"),
+    ],
+)
+@torch.inference_mode()
+def test_paged_mqa_logits_padded_kv_facts(
+    monkeypatch: pytest.MonkeyPatch,
+    layout: str,
+    block_size: int,
+    token_bytes: int,
+) -> None:
+    """Check what the KV-padded kernel assumes about its arguments.
+
+    The Gluon kernels are compiled by hand, with ``tt.divisibility`` and
+    ``tt.pointer_range`` promised per argument. A KV row stride that is a
+    multiple of 16 bytes selects the KV-padded compile, but the FP32 scale
+    stride is a quarter of it, so it need not be a multiple of 16. The
+    promise was false for these layouts without changing the generated code,
+    so the logits alone cannot catch it: check every fact the compiled kernel
+    was given against the arguments it was launched with.
+    """
+    preshuffle = layout != "plain"
+    if get_gfx() == "gfx1250" and (block_size < 16 if preshuffle else block_size > 1):
+        pytest.skip("gfx1250 runs plain pages of 1 and preshuffle pages >= 16")
+    device = "cuda"
+    generator = torch.Generator(device=device).manual_seed(5627)
+    heads, hidden_dim, next_n = 64, 128, 2
+    context_lengths = (997, 63)
+    batch, max_context = len(context_lengths), max(context_lengths)
+    max_pages = (max_context + block_size - 1) // block_size
+    num_blocks = 2 * max_pages + 3
+
+    q = torch.randn(
+        batch,
+        next_n,
+        heads,
+        hidden_dim,
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    ).to(dtypes.fp8)
+    kv = torch.randn(
+        num_blocks,
+        block_size,
+        hidden_dim,
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    ).to(dtypes.fp8)
+    scales = 0.25 + torch.rand(
+        num_blocks, block_size, generator=generator, device=device
+    )
+    weights = torch.randn(batch * next_n, heads, generator=generator, device=device)
+
+    # Each physical block stores all FP8 values, all FP32 scales, then padding.
+    packed = torch.zeros(
+        num_blocks, block_size * token_bytes, dtype=torch.uint8, device=device
+    )
+    value_bytes = block_size * hidden_dim
+    values = shuffle_weight(kv, layout=(min(block_size, 16), 16)) if preshuffle else kv
+    packed[:, :value_bytes] = values.reshape(num_blocks, -1).view(torch.uint8)
+    packed[:, value_bytes : value_bytes + 4 * block_size] = scales.view(torch.uint8)
+    cache = packed.view(num_blocks, block_size, 1, token_bytes)
+
+    block_tables = torch.zeros(batch, max_pages, dtype=torch.int32, device=device)
+    for b, context_length in enumerate(context_lengths):
+        pages = (context_length + block_size - 1) // block_size
+        block_tables[b, :pages] = torch.randperm(
+            num_blocks, generator=generator, device=device
+        )[:pages]
+    context_lens = torch.tensor(context_lengths, dtype=torch.int32, device=device)
+
+    launches = []
+    compile_kernel = pa_mqa_logits._compile_deepgemm_fp8_paged_mqa_logits
+    monkeypatch.setattr(
+        pa_mqa_logits,
+        "_compile_deepgemm_fp8_paged_mqa_logits",
+        lambda *args, **kwargs: _RecordingKernel(
+            compile_kernel(*args, **kwargs), launches
+        ),
+    )
+    out = torch.full((batch * next_n, max_context), float("-inf"), device=device)
+    deepgemm_fp8_paged_mqa_logits(
+        q,
+        cache,
+        weights,
+        out,
+        context_lens,
+        block_tables,
+        max_context,
+        Preshuffle=preshuffle,
+        KVBlockSize=block_size,
+        TotalCuCount=1,
+    )
+
+    assert len(launches) == 1
+    kernel, args = launches[0]
+    names = list(kernel.src.signature)
+    for (index,), facts in kernel.src.attrs.items():
+        arg = args[index]
+        for fact, value in facts:
+            if fact == "tt.divisibility":
+                address = arg.data_ptr() if isinstance(arg, torch.Tensor) else arg
+                assert address % value == 0, (
+                    f"{names[index]} = {address} is compiled as divisible by "
+                    f"{value}"
+                )
+            elif fact == "tt.pointer_range":
+                assert arg.untyped_storage().nbytes() < 2 ** (value - 1), (
+                    f"{names[index]} spans {arg.untyped_storage().nbytes()} "
+                    f"bytes, compiled as within a {value}-bit range"
+                )
+
+    reference = torch.full_like(out, float("-inf"))
+    dequantized_kv = kv.float() * scales[..., None]
+    for b, context_length in enumerate(context_lengths):
+        pages = (context_length + block_size - 1) // block_size
+        page_ids = block_tables[b, :pages].long()
+        keys = dequantized_kv[page_ids].reshape(-1, hidden_dim)[:context_length]
+        scores = (q[b].float() @ keys.T).relu()
+        row_weights = weights[b * next_n : (b + 1) * next_n]
+        logits = (scores * row_weights[..., None]).sum(dim=1)
+        positions = torch.arange(context_length, device=device)
+        query_positions = context_length - next_n + torch.arange(next_n, device=device)
+        logits.masked_fill_(
+            positions[None, :] > query_positions[:, None], float("-inf")
+        )
+        reference[b * next_n : (b + 1) * next_n, :context_length] = logits
     torch.testing.assert_close(out, reference, rtol=1e-2, atol=1e-2)
 
 
