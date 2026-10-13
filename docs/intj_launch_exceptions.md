@@ -20,7 +20,7 @@ values) wait for `__self__.build()` or the first call (see
 needs a host C compiler once per interpreter (intj builds its generic lazy
 stub).
 
-What still launches through Triton, and why: the 15 tracked Triton bracket
+What still launches through Triton, and why: the 14 tracked Triton bracket
 launches in the table below, each needing a runtime capability or launch
 behavior intj cannot preserve. No `intj.compat.launch` call is left; the
 last eight, gfx1250 Gluon paths that passed a tuple or a Gluon layout object
@@ -40,7 +40,6 @@ pending Iris-enabled multi-GPU validation.
 | `aiter/ops/triton/comms/all_gather.py:226` | `_all_gather_kernel` | Blocked by Iris helpers only: its nested JIT helper calls Iris `put`; intj compatibility lacks Iris-enabled validation. |
 | `aiter/ops/triton/comms/fused/reduce_scatter_rmsnorm_quant_all_gather.py:368` | `fused_pipeline_kernel` | Nested JIT helpers call Iris `load` and `put`; intj compatibility lacks Iris-enabled validation. |
 | `aiter/ops/triton/comms/reduce_scatter.py:236` | `_reduce_scatter_kernel` | Blocked by Iris helpers only: its nested JIT helper calls Iris `load`; intj compatibility lacks Iris-enabled validation. |
-| `aiter/ops/triton/fusions/attn_res.py:337` | `_attnres_fwd_jit`, `attnres_fwd_kernel`'s JIT function | `_run_sequence` passes `res`, a tuple of residual tensors; intj raises `TypeError: unsupported argument 'res' of type tuple` (tuple arguments are unsupported, with or without `ATTN_RES_TRITON_AUTOTUNE`). |
 | `aiter/ops/triton/gemm/basic/gemm_afp8wfp8.py:386` | `_PRESHUFFLE_KERNEL_MAP[kernel_type]` | gfx1250 preshuffle can use `num_ctas > 1` (CGA multicast); intj refuses it. |
 | `aiter/ops/triton/moe/moe_op_gemm_a4w4.py:595` | `_moe_gemm_a4w4_prefill` | Selected config can use `num_ctas > 1`; intj refuses it. |
 | `aiter/ops/triton/moe/moe_op_gemm_a8w4.py:717` | `_moe_gemm_a8w4_prefill_gluon` | Selected config can use `num_ctas > 1`; intj refuses it. |
@@ -74,8 +73,7 @@ _foo_kernel.__self__.options.jit_func                   # the JIT function (tune
 
 The kernel's name is then the launcher. Code that needs the `JITFunction`
 reads `kernel.__self__.options.jit_func`: the pa_decode_gluon AOT compile
-tools and warmup, attn_res's sequence layout (a tuple argument, launched
-through Triton), and the tests that read `arg_names`, `Heuristics`
+tools and warmup, and the tests that read `arg_names`, `Heuristics`
 predicates or source, or launch a Triton reference. Arguments the decorator
 needs (a `grid_cpp` def, an option constant such as `mla_decode_ref`'s,
 whose `kpack` depends on the arch) sit above the kernel. Keywords computed
@@ -91,7 +89,7 @@ decorated kernel: the split-K reduce takes `KERNEL_NAME` and `activation` as
 str constexprs; sage_quant_v, `_combined_routing`, `_moe_gemm_a8w8` and
 `_sparse_attn_prefill_kernel` each serve two call sites.
 
-Three other forms remain, 12 launchers, only where a decorator cannot give
+Three other forms remain, 13 launchers, only where a decorator cannot give
 what one kernel needs; no `functools.cache` factory is left:
 
 ```python
@@ -102,7 +100,7 @@ _TABLE = {mode: make_launcher(_kernel(mode), delayed=partial(_keywords, mode)) f
 
 | Launcher | Form | Why not a decorator |
 | --- | --- | --- |
-| `attn_res` `attnres_fwd_kernel` | beside the kernel | Under `ATTN_RES_TRITON_AUTOTUNE` the kernel module wraps the kernel in `@triton.autotune` after defining it, and the launcher must wrap the tuner. |
+| `attn_res` `attnres_fwd_kernel`, `attnres_fwd_sequence_kernel` | beside the kernel | Under `ATTN_RES_TRITON_AUTOTUNE` the kernel module wraps the kernel in `@triton.autotune` after defining it, and the launchers must wrap the tuner. Both launch one kernel, each baking what its layout never varies (see [attn_res's sequence layout](#attn_ress-sequence-layout)). |
 | `aiter/mla.py` `_fwd_kernel_stage2_asm_launch` | named | `aiter/aot/triton/decode_mla.py` and `csrc/cpp_itfs/mla/asm_mla_decode_fwd.py` compile `_fwd_kernel_stage2_asm` ahead of time with Triton's own `triton.tools.compile`, which loads `aiter/mla.py` and takes that attribute as a `JITFunction`; its generated loader looks the kernel up in the HSACO by the same name, so the JIT function cannot move to another one. |
 | `test_mla_stage2_merge.py` `_fwd_kernel_stage2_asm_launch` | named | Sweeps `num_warps`, `num_stages` and `waves_per_eu` per call over `aiter.mla`'s JIT function (above). |
 | `rmsnorm` `_rms_norm_kernel_launch` | named | The kernel is also a device function: the Iris `reduce_scatter_rmsnorm_quant_all_gather` kernel calls it, and a launcher cannot be called from kernel code. |
@@ -138,7 +136,8 @@ Defaults are passed explicitly, values that `@triton.autotune` /
   passed positionally and keyed by value. A value is baked with
   `extra_annotation={name: Constexpr(value=...)}` only where one decorated
   kernel has a single caller (the batched split-K reduce, the chunk-delta
-  solves' `DOT_PRECISION`).
+  solves' `DOT_PRECISION`), or where a launcher serves one layout of a
+  shared kernel (attn_res's two launchers).
 - **Gluon layouts and tuples** are never arguments: intj bakes scalars, not
   layout objects or tuples. A kernel builds them from its constexpr ints and
   strings, inline or through a `gluon.constexpr_function` it calls (the
@@ -146,7 +145,9 @@ Defaults are passed explicitly, values that `@triton.autotune` /
   sets returned as a `SimpleNamespace`). Such a function imports what it
   needs locally: a global it reads (a class, a module constant) joins the
   kernel's `used_global_vals`, which intj refuses unless the launcher
-  promises `assume_constant_globals=True`.
+  promises `assume_constant_globals=True`. A tuple of tensors becomes one
+  pointer parameter per element, which the kernel packs back into a tuple
+  (attn_res's sequence layout: `res0`..`res15`).
 - **Kernels that read globals** get `assume_constant_globals=True` when every
   global is assigned once at import and never rebound (no `global`,
   `setattr`, `monkeypatch` or `reload` touches it): the one-kernel MHA
@@ -177,7 +178,7 @@ Defaults are passed explicitly, values that `@triton.autotune` /
 - **Tuned kernels.** The values a tuning layer assigns (`BL`, `num_warps`
   and `num_stages` under `ATTN_RES_TRITON_AUTOTUNE`, the chunk-delta
   autotune spaces) come from the tuner; they are neither passed nor
-  dynamic options. `attn_res`'s launcher takes `num_warps` and `num_stages`
+  dynamic options. `attn_res`'s launchers take `num_warps` and `num_stages`
   per call unless `ATTN_RES_TRITON_AUTOTUNE` is set.
 - **A kernel picked at runtime** (`impl = gluon if ... else triton`) is one
   launcher per kernel and an `if` at the launch (gemm_a8w8_blockscale,
@@ -693,3 +694,67 @@ same-process A/B changing only the default pipeline's solve dispatch measured
 2.1197 ms with Triton and 2.0917 ms with intj (−1.32%) over five alternating
 rounds. Its output and `Akk` were bitwise equal. The FlashKDA pipeline
 differences are within the observed run-to-run variation.
+
+## attn_res's sequence layout
+
+`_run_sequence` passed its residuals to `attnres_fwd_kernel` as one tuple
+(`res`), which intj does not decode, so it launched the JIT function through
+Triton. The kernel now takes 16 pointer parameters, `res0`..`res15`, and packs
+them back into the tuple its gather loop indexes: the residuals, padded to
+`L2` with the first one as before, then `None`. The sequence layout therefore
+takes at most 16 residuals (`ATTN_RES_SEQ_SLOTS`) and raises `ValueError`
+above that; the tuple took any number. Two launchers launch the one kernel,
+each baking what its layout never varies: `attnres_fwd_kernel`
+(`attn_res_gate`, `layout="packed"`) bakes the 16 slots as `None`, so the
+decode path passes no slot argument (passing them measured 0.4 us more per
+launch on gfx942); `attnres_fwd_sequence_kernel` bakes the packed-only
+pointers and flags. A device table of base pointers was not used: it needs a
+host-to-device copy per call, or a cache keyed by pointer values, where 16
+kernel arguments need neither. The sequence entry also takes the
+Python fast paths `attn_res_gate` uses (no reshape of a 2-D contiguous
+residual, memoized `next_power_of_2`, no INFO-log arguments below that level).
+
+Verified with intj `develop` `2783079`, Triton 3.8.0, `AITER_TRITON_ONLY=1`,
+on gfx942 and gfx950 (MI350X):
+
+- **Tests.** `test_attn_res.py`: 255 passed on both GPUs (the base tree's 251
+  plus the sequence launch checked bitwise against a Triton launch of the same
+  kernel across L2 buckets, dtypes, output norm, scalars equal to 1.0 and
+  token counts, and the 16-residual limit), and the same with
+  `ATTN_RES_TRITON_AUTOTUNE=1`, except on gfx942
+  `test_attn_res_gate_out_quant_matches_unfused_quant[64]`, which fails there
+  on the base tree too. `test_mhc.py`, which imports the same kernel package:
+  406 passed, 12 skipped on both GPUs, as on the base tree. Under
+  `torch.compile` the sequence entry works without `fullgraph` and fails
+  with it, before and after (gfx942).
+- **Outputs.** 519 sequence-layout cases (L 1-16, fp32/bf16/fp16, with and
+  without the output norm, eps and scale values, leading dimensions, and the
+  shape sweep below) are bitwise equal to the base tree's and to upstream
+  `874d253dd3`'s, on both GPUs.
+- **Code.** The AMDGCN and kernel descriptor (kernarg size, registers) of all
+  168 sequence compiles and 186 gate/packed compiles the comparison reaches
+  are identical to the base tree's, on both GPUs.
+- **Host time**, us per call: N=1, D=1024, bf16, output norm (`attn_res_gate`:
+  N=1, B=8, D=7168, quant and `close_block`); median of 2000 batches of 8
+  calls per process, median (and range) of 5 alternating processes, pinned to
+  the GPU's NUMA node. "Launch" is the kernel call alone, arguments prebuilt.
+  Upstream's numbers are the base tree's within 1.5% for the sequence layout.
+
+  | | gfx942 before | gfx942 after | gfx950 before | gfx950 after |
+  | --- | ---: | ---: | ---: | ---: |
+  | sequence entry, L=2 | 66.0 | 11.9 (11.9-12.3) | 33.6 | 7.4 (7.4-7.6) |
+  | sequence entry, L=16 | 110.4 | 18.5 (18.4-18.7) | 61.4 | 10.9 (10.8-11.0) |
+  | sequence launch, L=2 | 37.2 | 4.6 (4.6-4.7) | 22.7 | 3.3 (3.3-3.4) |
+  | sequence launch, L=16 | 62.2 | 5.5 (5.3-5.5) | 39.4 | 3.4 (3.3-3.6) |
+  | packed entry, L=4 | 26.8 | 25.4 (24.8-25.5) | 18.0 | 16.9 (16.7-17.0) |
+  | `attn_res_gate` | 17.3 | 17.0 (16.9-17.2) | 10.7 | 10.7 (10.6-10.9) |
+
+- **GPU time** (`torch.cuda.Event` over 50 back-to-back launches queued
+  behind a sleep, 3 alternating processes; rocprofv3 aborts under this torch):
+  L in {2, 4, 8, 16}, N in {1, 64, 4096}, D in {1024, 4096, 7168}, bf16. The
+  after/before ratio of the 36 shapes is 0.995-1.007 on gfx950 and
+  0.995-1.028 on gfx942, median 1.000 on both; the gfx942 outlier (N=1,
+  D=1024, L=2, 3.99 vs 4.10 us) re-measured equal over 200-launch batches
+  (3.96-3.99 vs 3.96-3.97 us), as did the same launch through Triton.
+
+Not run: CUDA, and L above 16 (refused now).
