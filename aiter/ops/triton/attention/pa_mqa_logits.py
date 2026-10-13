@@ -22,7 +22,7 @@
 
 import math
 import os
-from functools import cache
+from functools import cache, partial
 
 import torch
 import triton
@@ -338,11 +338,11 @@ def _gluon_kernel(Preshuffle, VarCtxOpt):
     return _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle
 
 
-@cache
-def _gluon_paged_mqa_logits_launch(Preshuffle, VarCtxOpt, is_padded_mode):
-    """The Gluon kernel for this mode, with the types and specialization facts
-    the Triton < 3.5 AOT path spells out in `_compile_deepgemm_fp8_paged_mqa_logits`
-    (asserted, not measured: the caller promises them). A parameter it gives
+def _gluon_launch_keywords(Preshuffle, VarCtxOpt, is_padded_mode):
+    """The make_launcher keywords that need the GPU (get_gfx) for this mode's
+    launcher: the types and specialization facts the Triton < 3.5 AOT path
+    spells out in `_compile_deepgemm_fp8_paged_mqa_logits` (asserted, not
+    measured: the caller promises them), and the options. A parameter it gives
     no fact keeps none, except that intj still measures the facts an `Assume`
     leaves out (the KV pointers' and the index pointers' remaining ones)."""
     gfx_version = get_gfx()
@@ -406,21 +406,30 @@ def _gluon_paged_mqa_logits_launch(Preshuffle, VarCtxOpt, is_padded_mode):
     else:
         annotation["SplitKV"] = i32
 
-    kernel_fn = _gluon_kernel(Preshuffle, VarCtxOpt)
-    # The kernels read the import-time constant _Use_2d_instr_shape_mfma_layout.
-    # Callers read the returned kernel's hash (the AOT benchmark zips its cache
-    # directory).
-    return make_launcher(
-        kernel_fn,
-        dynamic_options=("waves_per_eu",),
-        extra_annotation=annotation,
-        options={
+    return {
+        "extra_annotation": annotation,
+        "options": {
             "num_warps": 1 if is_gfx1250 and Preshuffle else 4,
             "num_stages": 2,
         },
+    }
+
+
+# One launcher per (Preshuffle, VarCtxOpt, KV-padded) mode, each stating that
+# mode's types and facts (delayed: they depend on the GPU). The kernels read
+# the import-time constant _Use_2d_instr_shape_mfma_layout. Callers read the
+# returned kernel's hash (the AOT benchmark zips its cache directory).
+_GLUON_PAGED_MQA_LOGITS_LAUNCHERS = {
+    (Preshuffle, VarCtxOpt, is_padded_mode): make_launcher(
+        _gluon_kernel(Preshuffle, VarCtxOpt),
+        dynamic_options=("waves_per_eu",),
         return_compiled=True,
         assume_constant_globals=True,
+        delayed=partial(_gluon_launch_keywords, Preshuffle, VarCtxOpt, is_padded_mode),
     )
+    for Preshuffle, VarCtxOpt in ((False, False), (True, False), (True, True))
+    for is_padded_mode in (False, True)
+}
 
 
 @cache
@@ -704,9 +713,10 @@ def deepgemm_fp8_paged_mqa_logits(
         is_padded_mode = kv_cache_fp8.stride(0) % 16 == 0
         if triton_version >= Version("3.5.0"):
             _check_gluon_block_size(Preshuffle, KVBlockSize, ChunkK)
-            launch = _gluon_paged_mqa_logits_launch(
+            assert Preshuffle or not VarCtxOpt, "VarCtxSchedule needs Preshuffle=True"
+            launch = _GLUON_PAGED_MQA_LOGITS_LAUNCHERS[
                 Preshuffle, VarCtxOpt, is_padded_mode
-            )
+            ]
             args = (
                 batch_size,
                 next_n,
