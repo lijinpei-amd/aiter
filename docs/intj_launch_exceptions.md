@@ -27,7 +27,8 @@ last eight, gfx1250 Gluon paths that passed a tuple or a Gluon layout object
 as a constexpr, now build those values in the kernel (see
 [gfx1250 Gluon kernels](#gfx1250-gluon-kernels)). pod_attention and the metadata-redirect
 test's `empty_kernel`, which read the returned `CompiledKernel`, now use a
-`return_compiled=True` launcher.
+`return_compiled=True` launcher. So does `csrc/cpp_itfs/utils.py`'s
+`HsacoKernel` (see [HsacoKernel](#hsacokernel)).
 
 Line numbers refer to this branch. The three Iris kernels are blocked only
 by their Iris helpers (intj takes their `tl.tensor` annotations) and remain
@@ -43,7 +44,6 @@ pending Iris-enabled multi-GPU validation.
 | `aiter/ops/triton/moe/moe_op_gemm_a4w4.py:595` | `_moe_gemm_a4w4_prefill` | Selected config can use `num_ctas > 1`; intj refuses it. |
 | `aiter/ops/triton/moe/moe_op_gemm_a8w4.py:717` | `_moe_gemm_a8w4_prefill_gluon` | Selected config can use `num_ctas > 1`; intj refuses it. |
 | `aiter/ops/triton/utils/device_info.py:57` | `kernel.__self__.options.jit_func` | Only while `torch.compile` traces: Dynamo cannot trace an intj launcher, and `fav3_sage_wrapper_func` must compile with `fullgraph=True` (see [torch.compile of fav3_sage](#torchcompile-of-fav3_sage)). |
-| `csrc/cpp_itfs/utils.py:515` | `self.triton_kernel` | `HsacoKernel._call` preserves the returned kernel alongside its separate HSACO path. |
 | `op_tests/triton_tests/torch_compile/test_compile_constexpr_mutation.py:37` | `_rmsnorm_constexpr_kernel` | Test checks Triton launch behavior under `torch.compile`. |
 | `op_tests/triton_tests/triton_metadata_redirect/test_metadata_redirect.py:5877` | `kernel` | Explicit precompiled `triton.compile` result, not a `JITFunction`. |
 | `op_tests/triton_tests/utils/causal_conv1d_update_refs.py:656` | `_causal_conv1d_update_kernel_sglang` | `**pdl_kwargs` can include `launch_pdl=True`, which intj cannot launch. |
@@ -590,6 +590,122 @@ Verified with intj `2783079`, Triton 3.8.0, `AITER_TRITON_ONLY=1`:
 - **Host time** (gfx942): about 0.35 us more per launch than a direct call
   (4.66 vs 5.03 us, toy kernel); the default wrapper path launches twice
   (`sage_quant_kernel`, `sage_fwd`). Not measured on gfx950.
+
+## HsacoKernel
+
+`csrc.cpp_itfs.utils.jit(kernel, stream=None)` returns an `HsacoKernel`,
+called with Triton's spelling, `kernel[grid](*args, **kwargs)`. Nothing in
+the tree calls it (`aiter`, `aiter/aot`, `csrc`, `op_tests` grepped; only
+`aiter/aot/test/test_hsaco.py` uses the HSACO helpers beneath it), so it is
+kept as a public helper with the same call signature.
+
+**Default mode: intj.** The first call makes the launchers (construction
+does no GPU work). Each call shape, the number of positional arguments and
+the keyword names in order, is bound once with the kernel's signature into a
+plan; a launch then only picks its arguments out of one tuple:
+
+- keywords that name no parameter are compile options, as in Triton: one
+  launcher per set of them, which it takes as `dynamic_options` (sorted, so
+  keyword order does not matter);
+- the parameters follow in declaration order, defaults applied;
+- `return_compiled=True`, so the call still returns the `CompiledKernel`
+  (no measurable cost);
+- `grid` is an int, a 1-3 tuple or list, or a callable. The callable gets
+  every parameter by name, as Triton's does, and is evaluated in Python
+  before the launch: a `grid_py` launcher (with the grid passed through a
+  thread-local, as `intj.compat` does) measured within 0.1 us of it, in
+  either direction (gfx950 3.55 vs 3.63 us, gfx942 6.84 vs 6.72 us), and
+  Python evaluation keeps one launcher for every grid form;
+- the launch goes on `stream` when one was given (a raw handle, or a
+  `torch.cuda.Stream` and its device), else on the current device's current
+  stream. The Triton path ignored `stream`; the HSACO path used it.
+
+Launchers and plans belong to the JIT function, not to the wrapper, so
+`jit(k)[grid](...)` built per call keeps hitting their kernel caches.
+Refusals are loud: an unknown keyword raises `UnsupportedKernel` (Triton
+raised `KeyError`), `device=`/`stream=` keywords and what intj cannot
+launch (tuple arguments, kernels reading globals, `num_ctas > 1`, ...) raise
+instead of launching through Triton.
+
+**`AITER_USE_HSACO=1` stays as it was.** That mode is for deployment
+without compiling at run time: it compiles an HSACO from Triton once, keeps
+it under `BUILD_DIR` keyed by constexpr values and argument types, and later
+processes load and launch that file through hip-python without Triton
+compiling anything. intj cannot serve it: a launcher compiles through
+`triton.compiler.compile` on a miss and builds its own C extension with the
+host compiler on first use, and takes no prebuilt HSACO. Its run-time cost
+lies elsewhere too: before launching, the HSACO path calls
+`inspect.signature` and binds every call, stats the HSACO and reads the
+metadata JSON every call, and logs two INFO records per launch once `aiter`
+is imported. Without the logging and the launch itself that is 26-61 us
+per call (the lower bound below), against 2.9-6.4 us for the whole intj
+launch, and would be fixed in that code, not by replacing the launcher.
+
+hip-python is installed on neither machine, so the HSACO path was run with
+a stand-in `hip.hip` module (ctypes over `libamdhip64`, the argument buffer
+packed at natural alignment and passed as `extra`). With it, the path
+returns the intj path's bytes for the cases it can launch, and shows three
+defects of the mode on both GPUs (not fixed here): the grid must be a 3-tuple
+(an int, a 1- or 2-tuple or a callable raises); every launch uses 256
+threads whatever `num_warps` compiled (`num_warps=8`, `BLOCK=1024`: 512 of
+1024 outputs written); compile options are not in the HSACO key, so a later
+`num_warps=4` call launches the 8-warp HSACO (same 512 of 1024). A fourth
+is read in the code, not run on two GPUs: `HsacoLauncher` always loads the
+module on device 0 (`hipSetDevice(0)`).
+
+**Host time**, per call, warmed, 8-call batches with a synchronize after
+each outside the timer, median of 3000 batches per process (the cases take
+turns in chunks of 250), 9 processes per column alternating, pinned to one
+core on the GPU's NUMA node (gfx942: MI300X GPU 5, core 100; gfx950:
+MI350X GPU 5, core 300). Median [min-max] over the processes, us. "Triton"
+is upstream's `HsacoKernel` (`874d253dd3`); "HSACO" is upstream with
+`AITER_USE_HSACO=1`, with the stand-in above and `aiter` imported (INFO
+logging); its lower bound stubs the hip launch out and sets
+`AITER_LOG_LEVEL=WARNING`. The raw rows time the launch under the wrapper:
+the JIT function's own `k[grid](...)`, and the intj launcher `HsacoKernel`
+holds, called with the current device and stream.
+
+| gfx950 | Triton | HSACO | HSACO lower bound | intj |
+| --- | ---: | ---: | ---: | ---: |
+| plain, `jit(k)[(1, 1, 1)](x, y, out, n, 256)` | 10.76 [10.71-10.90] | 55.1 [53.9-55.8] | 25.8 [25.4-26.7] | 2.90 [2.89-2.91] |
+| two constexpr keywords, one default, `num_warps`, `waves_per_eu` | 10.39 [10.36-10.49] | 60.8 [59.7-61.8] | 31.0 [30.9-32.1] | 3.31 [3.30-3.33] |
+| callable grid | 11.55 [11.50-11.73] | raises | raises | 4.16 [4.06-4.20] |
+| raw launch, plain | 10.58 [10.48-10.68] | | | 2.47 [2.46-2.48] |
+| raw launch, options | 10.15 [10.09-10.18] | | | 2.49 [2.49-2.50] |
+
+| gfx942 | Triton | HSACO | HSACO lower bound | intj |
+| --- | ---: | ---: | ---: | ---: |
+| plain | 17.17 [16.91-17.74] | 101.6 [101.0-103.0] | 51.9 [51.1-52.5] | 4.44 [4.41-5.61] |
+| keywords and options | 17.00 [16.75-17.22] | 109.9 [108.9-111.2] | 60.7 [59.4-61.5] | 5.17 [5.05-6.17] |
+| callable grid | 18.61 [18.41-19.38] | raises | raises | 6.41 [6.33-7.62] |
+| raw launch, plain | 16.82 [16.59-17.71] | | | 3.77 [3.72-5.24] |
+| raw launch, options | 16.49 [16.04-16.80] | | | 3.74 [3.71-5.25] |
+
+Against the Triton path, intj saves 7.1-7.9 us per call on gfx950 (64-73%)
+and 11.8-12.7 us on gfx942 (66-74%). The wrapper adds 0.43 us (plain),
+0.82 us (keywords and options) and 1.69 us (callable grid) to the raw
+launch on gfx950. Two of the nine gfx942 intj processes ran 1.1-1.5 us
+slower in every row, raw launch included (the bimodal per-process launch
+time noted above); the gfx942 machine was shared with other jobs. The
+kernels are the ones Triton compiles (the tests check the AMDGCN is
+identical), so GPU time was not measured.
+
+**Tests.** `op_tests/cpp/test_hsaco_kernel.py`: positional, keyword and
+defaulted arguments, option keywords (compiled options and AMDGCN equal to
+Triton's), every grid form, the grid function's arguments against
+Triton's, a zero grid, the stream (current, `with torch.cuda.stream`, a
+`torch.cuda.Stream`, a raw handle, a bad one), launchers shared across
+wrappers, and the refusals, with no launch reaching `JITFunction.run`; plus
+outputs equal to a Triton launch and, where `hip` imports, to the HSACO
+path. gfx942 and gfx950 (MI350X): 19 passed, 1 skipped (no hip-python);
+with the stand-in on `PYTHONPATH`, 20 passed on both.
+On gfx942, each of four injected mistakes (ignoring `stream`, unsorted
+option names, the grid's `meta` built from the wrong arguments, a wrong
+default) fails at least one test.
+
+Not verified: `HsacoKernel` under `torch.compile` (intj graph-breaks where
+Dynamo used to trace the Triton launch; no caller compiles it), with real
+hip-python, and on two GPUs.
 
 ## FlashKDA
 
