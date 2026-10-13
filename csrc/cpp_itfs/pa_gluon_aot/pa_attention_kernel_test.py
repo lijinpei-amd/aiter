@@ -475,9 +475,11 @@ def run_compiled_attention_kernel(
 
 
 # The direct launch compiles pa_decode_gluon's dot kernels with other options
-# than its own launchers: num_stages=1 and a per-call waves_per_eu. The
-# large-block kernel reads the import-time constants COMPUTE and VMEM_LOAD
-# (sched_group_barrier masks) from pa_decode_gluon.
+# than its own launchers: num_stages=1 and a per-call waves_per_eu. (Taking
+# both per call on pa_decode_gluon's launchers instead costs each of its
+# launches 0.05-0.1 us on gfx942.) The large-block kernel reads the
+# import-time constants COMPUTE and VMEM_LOAD (sched_group_barrier masks) from
+# pa_decode_gluon.
 _direct_dot_launch, _direct_large_block_dot_launch = (
     make_launcher(
         kernel.__self__.options.jit_func,
