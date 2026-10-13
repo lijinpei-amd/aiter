@@ -165,8 +165,11 @@ def run_torch(logits, attn_lse, num_valid, out_dtype):
     return out.to(out_dtype)
 
 
-# aiter.mla's launcher bakes the production options (per-call options cost
-# its launches ~0.45 us); this one sweeps them over the same JIT function.
+# This script sweeps the options aiter.mla's decorator bakes, so it launches
+# the same JIT function through its own launcher. Taking them per call there
+# would make each production call 31 positional arguments, past the 30 CPython
+# passes directly (+0.33-0.47 us per launch on gfx942); with the grid as one
+# tuple it stays at 30, and production would pay +22-46 ns for this sweep.
 _fwd_kernel_stage2_asm_launch = make_launcher(
     _fwd_kernel_stage2_asm.__self__.options.jit_func,
     dynamic_options=(
