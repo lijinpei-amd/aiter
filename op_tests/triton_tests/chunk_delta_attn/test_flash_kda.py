@@ -535,7 +535,8 @@ def test_reference_inter_solve_launches_through_intj():
     from aiter.ops.triton._triton_kernels.chunk_delta_attn import intra_attn
 
     # The kernel is decorated with its intj launcher, so the reference path
-    # has no Triton JIT function left to launch through.
+    # launches through intj: the module name is the launcher, not a
+    # JITFunction (that is `__self__.options.jit_func`).
     target = intra_attn.chunk_delta_attn_fwd_kernel_inter_solve_fused
     assert isinstance(target.__self__, Launcher)
     args = make_inputs(1, 128, 4)

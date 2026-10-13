@@ -10,11 +10,12 @@ def even_m_n(args, block_m, n, block_n, num_iter=None):
     return args["M"] % args[block_m] == 0 and args[n] % block_n_size == 0
 
 
-# intj's `make_launcher` lowers a heuristic that reads a caller argument (one
-# not keyed elsewhere) to C, and only accepts a lambda or a single-return
-# `def` with exactly one parameter, no free variables, reading it as
-# `a["literal"]` -- a `functools.partial` of `even_m_n` above is refused
-# (`UnsupportedKernel: heuristic 'EVEN_M_N' must be a lambda or def`). These
+# intj lowers a heuristic that reads a caller argument (one not keyed
+# elsewhere) to C, and only accepts a lambda or a single-return `def` with
+# exactly one parameter, no free variables, reading it as `a["literal"]` -- a
+# `functools.partial` of `even_m_n` above is refused by the launcher's
+# `check()` or first call (`UnsupportedKernel: heuristic 'EVEN_M_N' must be a
+# lambda or def`). These
 # cover every distinct (block_m, n, block_n, num_iter) combination the Triton
 # kernels in `_triton_kernels/quant/fused_mxfp4_quant.py` and the gfx1250 Gluon
 # kernels in `_gluon_kernels/gfx1250/quant/fused_mxfp4_quant.py` pass to

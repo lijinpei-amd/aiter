@@ -263,7 +263,8 @@ def _launchers():
 
 
 def test_kernels_are_intj_launchers():
-    """No Triton JIT function is left to launch through."""
+    """Each module name is the launcher, not a JITFunction (that is
+    `__self__.options.jit_func`)."""
     for kernel in _launchers():
         assert not isinstance(kernel, JITFunction)
         assert isinstance(kernel.__self__, Launcher)

@@ -142,10 +142,10 @@ def test_alignment_truth_table(module_name, kernel_name, kind, dimensions, expec
     assert set(kernel.values) == set(names)
     for name, value in zip(names, expected[kind]):
         predicate = kernel.values[name]
-        # intj's make_launcher only accepts a lambda or single-return def
-        # with no free variables, so both the Triton and the Gluon kernels use
-        # module-level defs (`even_m_n1`/`even_m_n1_rows`/`even_m_n2`/
-        # `even_m_n3`/`even_m_n1_iter`) instead of a
+        # intj's check() / first call only accepts a lambda or single-return
+        # def with no free variables, so both the Triton and the Gluon
+        # kernels use module-level defs (`even_m_n1`/`even_m_n1_rows`/
+        # `even_m_n2`/`even_m_n3`/`even_m_n1_iter`) instead of a
         # `functools.partial(even_m_n, ...)`.
         assert predicate.__code__.co_freevars == ()
         assert predicate(args) is value, name

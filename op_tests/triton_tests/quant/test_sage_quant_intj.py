@@ -26,8 +26,8 @@ _SAGE_KERNELS = (
 
 
 def test_sage_kernels_are_intj_launchers():
-    # Each kernel is decorated with its intj launcher, so no Triton JIT
-    # function is left to launch through.
+    # Each kernel is decorated with its intj launcher: the module name is the
+    # launcher, not a JITFunction (that is `__self__.options.jit_func`).
     for kernel in _SAGE_KERNELS:
         assert not isinstance(kernel, JITFunction)
         assert isinstance(kernel.__self__, Launcher)
