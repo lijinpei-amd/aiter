@@ -97,7 +97,7 @@ def _stage_epilogue_inputs(
     # 256 and the surplus is masked off and never read. Bias is BLOCK_N, which is already
     # a whole number of elements per thread.
     EPI_T: gl.constexpr = layout.epilogue_threads()
-    EPI_LDS: gl.constexpr = tuning_cfg.epilogue_inputs_via_lds()
+    EPI_LDS: gl.constexpr = layout.epilogue_inputs_via_lds()
     if require_constexpr(EPI_LDS and func_cfg.has_gammas):
         gamma_lds_ptr = gl.allocate_shared_memory(
             gl.float32,

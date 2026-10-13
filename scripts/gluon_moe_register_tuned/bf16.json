@@ -1,6 +1,6 @@
 [
   {
-    "name": "b_in_reg",
+    "name": "b_via_reg",
     "config": {
       "BLOCK_M": 128,
       "BLOCK_N": 256,
@@ -49,9 +49,9 @@
       "FROZEN_STEP": false,
       "SOFF_UNROLL": false,
       "SCALE_FILL_MID": false,
-      "B_IN_REG": true,
-      "B_SCALE_IN_REG": false,
-      "A_SCALE_IN_REG": false,
+      "ALLOW_B_VIA_LDS": false,
+      "ALLOW_B_SCALE_VIA_LDS": true,
+      "ALLOW_A_SCALE_VIA_LDS": true,
       "A_NUM_BUFFER": 3,
       "B_NUM_BUFFER": 3,
       "A_SCALE_NUM_BUFFER": 3,
@@ -59,7 +59,7 @@
     }
   },
   {
-    "name": "b_in_lds",
+    "name": "b_via_lds",
     "config": {
       "BLOCK_M": 128,
       "BLOCK_N": 128,
@@ -108,9 +108,9 @@
       "FROZEN_STEP": false,
       "SOFF_UNROLL": false,
       "SCALE_FILL_MID": false,
-      "B_IN_REG": false,
-      "B_SCALE_IN_REG": false,
-      "A_SCALE_IN_REG": false,
+      "ALLOW_B_VIA_LDS": true,
+      "ALLOW_B_SCALE_VIA_LDS": true,
+      "ALLOW_A_SCALE_VIA_LDS": true,
       "A_NUM_BUFFER": 4,
       "B_NUM_BUFFER": 4,
       "A_SCALE_NUM_BUFFER": 4,

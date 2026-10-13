@@ -123,9 +123,11 @@ def test_frozen_unshuffled_k128_scales_load_directly(monkeypatch):
         A_SCALE_SORTED_SHUFFLED=False,
         B_SCALE_SHUFFLED=False,
     )
-    tc = host._probe_tuning_config(config, DtypeQuant.MXFP8, DtypeQuant.MXFP8)
-    assert not host._cval(tc.scale_via_lds(0))
-    assert not host._cval(tc.scale_via_lds(1))
+    layout = _layout.compute_kernel_layout(
+        host._probe_tuning_config(config, DtypeQuant.MXFP8, DtypeQuant.MXFP8)
+    )
+    assert host._cval(layout.scale_in_reg(0))
+    assert host._cval(layout.scale_in_reg(1))
     _launch_register_case(case, config)
     torch.testing.assert_close(case.output[0], case.expected, rtol=3e-4, atol=3e-4)
 

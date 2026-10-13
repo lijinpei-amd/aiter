@@ -135,7 +135,7 @@ class LDSManager:
         a_ty: gl.constexpr = func_cfg.operand_elem_ty(0)
         b_ty: gl.constexpr = func_cfg.operand_elem_ty(1)
 
-        if require_constexpr(tuning_cfg.component_via_lds(_A_PAYLOAD)):
+        if require_constexpr(layout.component_via_lds(_A_PAYLOAD)):
             a_payload_lds_ptr = gl.allocate_shared_memory(
                 a_ty,
                 layout.payload_lds_shape_block(0),
@@ -143,7 +143,7 @@ class LDSManager:
             )
         else:
             a_payload_lds_ptr: gl.constexpr = None
-        if require_constexpr(tuning_cfg.component_via_lds(_B_PAYLOAD)):
+        if require_constexpr(layout.component_via_lds(_B_PAYLOAD)):
             b_payload_lds_ptr = gl.allocate_shared_memory(
                 b_ty,
                 layout.payload_lds_shape_block(1),
@@ -152,7 +152,7 @@ class LDSManager:
         else:
             b_payload_lds_ptr: gl.constexpr = None
         if require_constexpr(
-            func_cfg.has_scale(0) and tuning_cfg.component_via_lds(_A_SCALE)
+            func_cfg.has_scale(0) and layout.component_via_lds(_A_SCALE)
         ):
             a_scale_lds_ptr = gl.allocate_shared_memory(
                 gl.uint8,
@@ -162,7 +162,7 @@ class LDSManager:
         else:
             a_scale_lds_ptr: gl.constexpr = None
         if require_constexpr(
-            func_cfg.has_scale(1) and tuning_cfg.component_via_lds(_B_SCALE)
+            func_cfg.has_scale(1) and layout.component_via_lds(_B_SCALE)
         ):
             b_scale_lds_ptr = gl.allocate_shared_memory(
                 gl.uint8,
@@ -252,7 +252,7 @@ class LDSManager:
         if require_constexpr(VIA_LDS):
             if require_constexpr(
                 self.func_cfg.has_scale(operand)
-                and cfg.component_via_lds((operand, True))
+                and layout.component_via_lds((operand, True))
                 and tile % ratio == 0
             ):
                 if require_constexpr(operand == 0):
@@ -271,7 +271,7 @@ class LDSManager:
                 )
         else:
             gl.static_assert(self.func_cfg.has_scale(operand))
-            gl.static_assert(not cfg.component_via_lds((operand, True)))
+            gl.static_assert(layout.component_in_reg((operand, True)))
             if require_constexpr(cfg.scale_shuffled(operand)):
                 if require_constexpr(layout.scale_packed_ok(operand)):
                     scale = gl.amd.cdna4.buffer_load(
@@ -386,7 +386,7 @@ class LDSManager:
             )
         if require_constexpr(READ_SCALE and self.func_cfg.has_scale(operand)):
             gl.static_assert(
-                self.tuning_cfg.component_via_lds((operand, True)),
+                layout.component_via_lds((operand, True)),
                 "ds_read_frag only reads LDS-staged scales",
             )
             ratio: gl.constexpr = layout.scale_ratio_non_k_slot(operand)

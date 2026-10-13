@@ -114,10 +114,11 @@ def cases():
     out.append(_case("mxfp4-bk128-sk512-R4", DQ.MXFP4, DQ.MXFP4, BLOCK_K=128,
                      VGPR_PREFETCH_K=128, SCALE_MINI_BLOCK_K=512, K_UNROLL=1))
     # 4. direct-register placement, per component and at the D=2 same-step boundary
-    out.append(_case("breg", DQ.MXFP4, DQ.MXFP4, B_IN_REG=True, B_PRESHUFFLED=True))
-    out.append(_case("ascale-reg", DQ.MXFP4, DQ.MXFP4, A_SCALE_IN_REG=True))
-    out.append(_case("bscale-reg", DQ.MXFP4, DQ.MXFP4, B_SCALE_IN_REG=True))
-    out.append(_case("bscale-reg-d2", DQ.MXFP4, DQ.MXFP4, B_SCALE_IN_REG=True,
+    out.append(_case("breg", DQ.MXFP4, DQ.MXFP4, ALLOW_B_VIA_LDS=False,
+                     B_PRESHUFFLED=True))
+    out.append(_case("ascale-reg", DQ.MXFP4, DQ.MXFP4, ALLOW_A_SCALE_VIA_LDS=False))
+    out.append(_case("bscale-reg", DQ.MXFP4, DQ.MXFP4, ALLOW_B_SCALE_VIA_LDS=False))
+    out.append(_case("bscale-reg-d2", DQ.MXFP4, DQ.MXFP4, ALLOW_B_SCALE_VIA_LDS=False,
                      NUM_LDS_BUFFER=0, A_NUM_BUFFER=3, B_NUM_BUFFER=3,
                      A_SCALE_NUM_BUFFER=3, B_SCALE_NUM_BUFFER=2))
     # 5. unequal ring depths

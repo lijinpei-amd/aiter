@@ -17,7 +17,6 @@ from triton.experimental.gluon import language as gl
 from triton.language.core import _aggregate as aggregate
 
 from ._lang import (
-    WARP_SIZE,
     DotKind,
     DtypeQuant,
     EpilogueMode,
@@ -35,12 +34,6 @@ from ._lang import (
 )
 from ._layout import (
     LDS_USABLE_BYTES,
-    _calc_copy_contiguity,
-    _calc_epilogue_bias_per_thread,
-    _calc_epilogue_threads,
-    _calc_num_warps,
-    _calc_payload_lds_shape_slot,
-    _calc_scale_lds_shape_slot,
     _KernelFuncShape,
     compute_kernel_layout,
 )
@@ -226,7 +219,9 @@ class KernelFuncConfig(_KernelFuncShape):
 class KernelTuningConfig:
     """How the kernel *runs*. Holds the func config so :func:`compute_kernel_layout`
     can see the operand dtypes (an aggregate may hold another aggregate as a typed
-    field). Every derived shape and layout lives in the resulting ``KernelLayout``.
+    field). Every derived shape and layout lives in the resulting ``KernelLayout``,
+    and so does the resolved LDS/register placement: this config only says whether
+    tuning *allows* a component through LDS.
     """
 
     func_cfg: KernelFuncConfig
@@ -267,9 +262,9 @@ class KernelTuningConfig:
     FROZEN_STEP: gl.constexpr
     SOFF_UNROLL: gl.constexpr
     SCALE_FILL_MID: gl.constexpr
-    B_IN_REG: gl.constexpr
-    B_SCALE_IN_REG: gl.constexpr
-    A_SCALE_IN_REG: gl.constexpr
+    ALLOW_B_VIA_LDS: gl.constexpr
+    ALLOW_B_SCALE_VIA_LDS: gl.constexpr
+    ALLOW_A_SCALE_VIA_LDS: gl.constexpr
     A_NUM_BUFFER: gl.constexpr
     B_NUM_BUFFER: gl.constexpr
     A_SCALE_NUM_BUFFER: gl.constexpr
@@ -320,9 +315,9 @@ class KernelTuningConfig:
         FROZEN_STEP=False,
         SOFF_UNROLL=False,
         SCALE_FILL_MID=False,
-        B_IN_REG=False,
-        B_SCALE_IN_REG=False,
-        A_SCALE_IN_REG=False,
+        ALLOW_B_VIA_LDS=True,
+        ALLOW_B_SCALE_VIA_LDS=True,
+        ALLOW_A_SCALE_VIA_LDS=True,
         A_NUM_BUFFER=0,
         B_NUM_BUFFER=0,
         A_SCALE_NUM_BUFFER=0,
@@ -375,9 +370,9 @@ class KernelTuningConfig:
         self.FROZEN_STEP = gl.constexpr(bool(_v(FROZEN_STEP)))
         self.SOFF_UNROLL = gl.constexpr(bool(_v(SOFF_UNROLL)))
         self.SCALE_FILL_MID = gl.constexpr(bool(_v(SCALE_FILL_MID)))
-        self.B_IN_REG = gl.constexpr(bool(_v(B_IN_REG)))
-        self.B_SCALE_IN_REG = gl.constexpr(bool(_v(B_SCALE_IN_REG)))
-        self.A_SCALE_IN_REG = gl.constexpr(bool(_v(A_SCALE_IN_REG)))
+        self.ALLOW_B_VIA_LDS = gl.constexpr(bool(_v(ALLOW_B_VIA_LDS)))
+        self.ALLOW_B_SCALE_VIA_LDS = gl.constexpr(bool(_v(ALLOW_B_SCALE_VIA_LDS)))
+        self.ALLOW_A_SCALE_VIA_LDS = gl.constexpr(bool(_v(ALLOW_A_SCALE_VIA_LDS)))
         self.A_NUM_BUFFER = gl.constexpr(int(_v(A_NUM_BUFFER)))
         self.B_NUM_BUFFER = gl.constexpr(int(_v(B_NUM_BUFFER)))
         self.A_SCALE_NUM_BUFFER = gl.constexpr(int(_v(A_SCALE_NUM_BUFFER)))
@@ -398,81 +393,49 @@ class KernelTuningConfig:
             depth = self.A_NUM_BUFFER if operand == 0 else self.B_NUM_BUFFER
         return _v(depth) or _v(self.NUM_LDS_BUFFER)
 
+    # -- storage placement policy and format decisions -----------------------------
+    # Yes/no policy read from the knobs above, and nothing else: no shapes. Which
+    # components *actually* go through LDS also depends on whether the tile admits a
+    # direct-to-LDS copy, so the final placement is resolved in _layout.py
+    # (``KernelLayout.component_via_lds`` / ``component_in_reg``) from these.
+
     @gluon.constexpr_function
-    def scale_in_reg(self, operand):
-        """Whether tuning explicitly selects direct-register scales for an operand."""
+    def allow_payload_via_lds(self, idx):
+        """Whether tuning permits staging this operand's payload through LDS.
+
+        ``ALLOW_B_VIA_LDS`` for B; A has no knob and is always permitted. A permitted
+        payload can still land in registers when its tile is too small for the copy;
+        see ``KernelLayout.payload_via_lds``.
+        """
+        return _v(idx) == 0 or bool(_v(self.ALLOW_B_VIA_LDS))
+
+    @gluon.constexpr_function
+    def allow_scale_via_lds(self, idx):
+        """Whether tuning permits staging this operand's scales through LDS.
+
+        ``ALLOW_A_SCALE_VIA_LDS`` / ``ALLOW_B_SCALE_VIA_LDS``. A permitted scale can
+        still land in registers when its tile cannot take a coalesced copy; see
+        ``KernelLayout.scale_via_lds``.
+        """
         return bool(
-            _v(self.A_SCALE_IN_REG if _v(operand) == 0 else self.B_SCALE_IN_REG)
-        )
-
-    # -- storage placement and format decisions -------------------------------------
-    # Yes/no policy derived from the knobs above. The shapes they are decided on come
-    # from the pure ``_calc_*`` derivations in _layout.py; compute_kernel_layout in
-    # turn reads these to decide which layout objects exist for a build.
-
-    @gluon.constexpr_function
-    def scale_via_lds(self, idx):
-        """Whether an E8M0 scale tile can be written to LDS with a coalesced copy.
-
-        CDNA4 direct-to-LDS supports only 128-bit or 32-bit per lane and a warp must
-        write one contiguous run, so two tiles are excluded:
-
-        * smaller than ``64 lanes * 4 B`` -- cannot be lowered at all (the A-scale tile
-          at ``BLOCK_M == 16`` with a short ``BLOCK_K``);
-        * a row shorter than 8 scales (``BLOCK_K < 256``) -- one lane then owns a whole
-          row and the reg->shared map is more contiguous than the 32-bit access can
-          cover, which ``canLoadDirectToLDS`` rejects.
-
-        Both fall back to a register ``buffer_load`` straight into the scale fragment
-        layout. That is correct but costs an in-loop register-path global access, which
-        makes every ``wait_group`` conservative -- so the tuner should prefer a BLOCK_K
-        that keeps this True.
-        """
-        if self.scale_in_reg(idx):
-            return False
-        shape = _calc_scale_lds_shape_slot(self, idx)
-        if self.scale_shuffled(idx):
-            # Fragment-ordered in HBM, so the copy is linear and the LDS tile keeps the
-            # same permutation; the read is then a 32-bit ds_read. Staying on LDS also
-            # keeps the warp-broadcast B tile a single fetch rather than one per warp.
-            return True
-        return (
-            shape[0] * shape[1] >= WARP_SIZE * 4 and shape[1] % 4 == 0 and shape[1] >= 8
+            _v(
+                self.ALLOW_A_SCALE_VIA_LDS
+                if _v(idx) == 0
+                else self.ALLOW_B_SCALE_VIA_LDS
+            )
         )
 
     @gluon.constexpr_function
-    def payload_via_lds(self, idx):
-        """Whether the payload uses a 128-bit-per-lane direct copy through LDS.
-
-        Payload tiles that cannot give every wavefront one complete access stay in
-        the register ring. There is deliberately no register-to-LDS fallback.
-        """
-        if _v(idx) == 1 and _v(self.B_IN_REG):
-            return False
-        shape = _calc_payload_lds_shape_slot(self, idx)
-        vec = _calc_copy_contiguity(self, idx)
-        return shape[0] * shape[1] >= WARP_SIZE * vec * _calc_num_warps(self)
-
-    @gluon.constexpr_function
-    def component_via_lds(self, component):
-        """Resolved LDS placement for ``(operand, is_scale)``.
-
-        The component-level result includes both explicit register requests and
-        automatic layout fallbacks. Keep the payload/scale predicates above as the
-        narrow placement-policy implementations and use this method wherever pipeline
-        behavior depends on the resolved placement.
-        """
+    def allow_component_via_lds(self, component):
+        """The ``allow_*_via_lds`` policy for an ``(operand, is_scale)`` component."""
         component = _v(component)
         operand, is_scale = _v(component[0]), bool(_v(component[1]))
         assert operand in (0, 1), "component operand must be 0 (A) or 1 (B)"
         return (
-            self.scale_via_lds(operand) if is_scale else self.payload_via_lds(operand)
+            self.allow_scale_via_lds(operand)
+            if is_scale
+            else self.allow_payload_via_lds(operand)
         )
-
-    @gluon.constexpr_function
-    def component_in_reg(self, component):
-        """Resolved register placement; callers separately gate absent scales."""
-        return not self.component_via_lds(component)
 
     @gluon.constexpr_function
     def operand_preshuffled(self, idx):
@@ -509,17 +472,6 @@ class KernelTuningConfig:
         return _v(self.B_SCALE_SHUFFLED)
 
     @gluon.constexpr_function
-    def epilogue_inputs_via_lds(self):
-        """Whether bias/gamma vectors admit the supported direct-to-LDS copies."""
-        threads = _calc_epilogue_threads(self)
-        bpt = _calc_epilogue_bias_per_thread(self)
-        return (
-            threads >= _v(self.BLOCK_M)
-            and _v(self.BLOCK_N) % threads == 0
-            and bpt in (1, 4)
-        )
-
-    @gluon.constexpr_function
     def quant_staging_rotates(self):
         """Whether the fused-quant staging alternates two per-tile LDS banks."""
         return (
@@ -541,7 +493,7 @@ class KernelTuningConfig:
             operand, is_scale = component
             if is_scale and not self.func_cfg.has_scale(operand):
                 continue
-            if self.component_in_reg(component):
+            if layout.component_in_reg(component):
                 ratio = layout.scale_ratio_k_step(operand) if is_scale else 1
                 period = math.lcm(
                     period, self.num_buffers(operand, is_scale) * ratio

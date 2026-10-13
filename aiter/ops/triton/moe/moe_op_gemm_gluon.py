@@ -80,7 +80,11 @@ _COMPONENT_BUFFER_KEYS = (
     "A_SCALE_NUM_BUFFER",
     "B_SCALE_NUM_BUFFER",
 )
-_REGISTER_STORAGE_KEYS = ("B_IN_REG", "B_SCALE_IN_REG", "A_SCALE_IN_REG")
+_ALLOW_VIA_LDS_KEYS = (
+    "ALLOW_B_VIA_LDS",
+    "ALLOW_B_SCALE_VIA_LDS",
+    "ALLOW_A_SCALE_VIA_LDS",
+)
 _SCALE_MINI_BLOCK_KEYS = (
     "SCALE_MINI_BLOCK_M",
     "SCALE_MINI_BLOCK_N",
@@ -663,12 +667,14 @@ def get_gluon_config_uncached(
             "A_SCALE_SORTED_SHUFFLED": False,
             "B_SCALE_SHUFFLED": False,
             "B_PRESHUFFLED": False,
-            "B_IN_REG": bool(_env_int("AITER_TRITON_MOE_GLUON_B_IN_REG", 0)),
-            "B_SCALE_IN_REG": bool(
-                _env_int("AITER_TRITON_MOE_GLUON_B_SCALE_IN_REG", 0)
+            "ALLOW_B_VIA_LDS": bool(
+                _env_int("AITER_TRITON_MOE_GLUON_ALLOW_B_VIA_LDS", 1)
             ),
-            "A_SCALE_IN_REG": bool(
-                _env_int("AITER_TRITON_MOE_GLUON_A_SCALE_IN_REG", 0)
+            "ALLOW_B_SCALE_VIA_LDS": bool(
+                _env_int("AITER_TRITON_MOE_GLUON_ALLOW_B_SCALE_VIA_LDS", 1)
+            ),
+            "ALLOW_A_SCALE_VIA_LDS": bool(
+                _env_int("AITER_TRITON_MOE_GLUON_ALLOW_A_SCALE_VIA_LDS", 1)
             ),
             # SwiGLU's reciprocal via v_rcp_f32 rather than the IEEE divide, which
             # lowers to v_div_scale_f32 plus a Newton refinement. ~1 ulp of relative
@@ -890,7 +896,7 @@ def _default_launch_config(
         # 276.5), so this tile is chosen for the prefill end and costs nothing at
         # the other. bench_out/gluon_larget_20260921.
         #
-        # B_IN_REG needs preshuffled weights, so the launch path repacks W once and
+        # Register B needs preshuffled weights, so the launch path repacks W once and
         # caches it on the tensor. That is a second copy of the weights resident for
         # the lifetime of the model -- the reason this is not the default everywhere.
         # The divisibility terms above are exactly _preshuffled_b's preconditions, so
@@ -916,7 +922,7 @@ def _default_launch_config(
             A_SCALE_SORTED_SHUFFLED=True,
             B_SCALE_SHUFFLED=True,
             B_PRESHUFFLED=True,
-            B_IN_REG=True,
+            ALLOW_B_VIA_LDS=False,
         )
     if (
         apply_swiglu
@@ -1803,8 +1809,8 @@ def moe_gemm_gluon(
     # only coalesced on a preshuffled weight, so a config that asks for registers is
     # asking for the repack too -- it is not a separate opt-in. The repack is cached
     # on the weight tensor, so it costs one pass per model rather than one per launch.
-    if _env_int("AITER_TRITON_MOE_GLUON_B_PRESHUFFLED", 0) or _cfg.get(
-        "B_IN_REG", False
+    if _env_int("AITER_TRITON_MOE_GLUON_B_PRESHUFFLED", 0) or not _cfg.get(
+        "ALLOW_B_VIA_LDS", True
     ):
         shuf_b = _preshuffled_b(w, _cfg, N, K, dq_b)
         if shuf_b is not None:
@@ -1813,8 +1819,8 @@ def moe_gemm_gluon(
             grid_n, constexpr_args, num_warps, waves_per_eu, _cfg, _tc = _spec(
                 _cfg_key(_cfg)
             )
-    if _cfg.get("B_IN_REG", False) and not _cfg.get("B_PRESHUFFLED", False):
-        raise ValueError("B_IN_REG requires B_PRESHUFFLED weights")
+    if not _cfg.get("ALLOW_B_VIA_LDS", True) and not _cfg.get("B_PRESHUFFLED", False):
+        raise ValueError("ALLOW_B_VIA_LDS=False requires B_PRESHUFFLED weights")
     _validate_launch_config(_tc, N, K)
 
     b = QuantExpertTensor.make(

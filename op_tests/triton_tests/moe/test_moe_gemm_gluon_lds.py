@@ -51,10 +51,10 @@ def test_register_load_does_not_stage_through_lds(operand, scale, block_k):
         _register_config("mxfp4"),
         BLOCK_K=block_k,
         VGPR_PREFETCH_K=block_k,
-        B_IN_REG=True,
+        ALLOW_B_VIA_LDS=False,
         B_PRESHUFFLED=True,
-        A_SCALE_IN_REG=True,
-        B_SCALE_IN_REG=True,
+        ALLOW_A_SCALE_VIA_LDS=False,
+        ALLOW_B_SCALE_VIA_LDS=False,
         A_SCALE_SORTED_SHUFFLED=False,
         B_SCALE_SHUFFLED=False,
     )

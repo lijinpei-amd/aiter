@@ -477,7 +477,7 @@ class _CopyRecorder:
 def _run_scalar_pipeline(monkeypatch, tc, layout, stages, fused):
     """Execute the production driver, reads, fills, ring updates and final MFMA."""
     fc = _HostView(tc.func_cfg)
-    b_step = 128 * 16 if tc.B_IN_REG else 128
+    b_step = 128 * 16 if not tc.ALLOW_B_VIA_LDS else 128
     sink = _CopyRecorder(tc, layout, b_step)
     pc = SimpleNamespace(
         tuning_cfg=tc,
@@ -564,10 +564,10 @@ def test_pipeline_phases_and_packed_scale_addresses(
             B_NUM_BUFFER=counts[1],
             A_SCALE_NUM_BUFFER=counts[2],
             B_SCALE_NUM_BUFFER=counts[3],
-            B_IN_REG=registers,
+            ALLOW_B_VIA_LDS=not registers,
             B_PRESHUFFLED=registers,
-            A_SCALE_IN_REG=registers,
-            B_SCALE_IN_REG=registers,
+            ALLOW_A_SCALE_VIA_LDS=not registers,
+            ALLOW_B_SCALE_VIA_LDS=not registers,
         )
     )
     layout = _HostView(compute_kernel_layout(tc.config))

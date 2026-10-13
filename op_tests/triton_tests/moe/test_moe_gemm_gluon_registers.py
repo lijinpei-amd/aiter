@@ -157,9 +157,9 @@ def test_independent_register_operands(register_case, mask):
     """Every register choice works alone and together, including absent BF16 scales."""
     config = _register_config(register_case.dtype)
     config.update(
-        B_IN_REG=bool(mask & 1),
-        A_SCALE_IN_REG=bool(mask & 2),
-        B_SCALE_IN_REG=bool(mask & 4),
+        ALLOW_B_VIA_LDS=not (mask & 1),
+        ALLOW_A_SCALE_VIA_LDS=not (mask & 2),
+        ALLOW_B_SCALE_VIA_LDS=not (mask & 4),
     )
     _assert_register_case(register_case, config)
 
@@ -195,9 +195,9 @@ def test_independent_buffer_depths(register_case, depths, mask):
         )
     )
     config.update(
-        B_IN_REG=bool(mask & 1),
-        A_SCALE_IN_REG=bool(mask & 2),
-        B_SCALE_IN_REG=bool(mask & 4),
+        ALLOW_B_VIA_LDS=not (mask & 1),
+        ALLOW_A_SCALE_VIA_LDS=not (mask & 2),
+        ALLOW_B_SCALE_VIA_LDS=not (mask & 4),
     )
     _assert_register_case(register_case, config)
 
@@ -212,8 +212,8 @@ def test_register_scales_without_payload_shuffle(register_case, mask, monkeypatc
     config.update(
         A_SCALE_SORTED_SHUFFLED=False,
         B_SCALE_SHUFFLED=False,
-        A_SCALE_IN_REG=bool(mask & 2),
-        B_SCALE_IN_REG=bool(mask & 4),
+        ALLOW_A_SCALE_VIA_LDS=not (mask & 2),
+        ALLOW_B_SCALE_VIA_LDS=not (mask & 4),
     )
     _assert_register_case(register_case, config)
 
@@ -223,9 +223,9 @@ def test_register_buffers_with_compiler_pipeline(register_case, read_mask):
     config = _register_config(register_case.dtype)
     config.update(
         WARP_PIPELINE=1,
-        B_IN_REG=True,
-        A_SCALE_IN_REG=True,
-        B_SCALE_IN_REG=True,
+        ALLOW_B_VIA_LDS=False,
+        ALLOW_A_SCALE_VIA_LDS=False,
+        ALLOW_B_SCALE_VIA_LDS=False,
         A_NUM_BUFFER=2,
         B_NUM_BUFFER=3,
         A_SCALE_NUM_BUFFER=4,
@@ -241,7 +241,7 @@ def test_compiler_pipeline_with_register_ring_unroll(register_case, depth):
     config = _register_config(register_case.dtype)
     config.update(
         WARP_PIPELINE=1,
-        B_IN_REG=True,
+        ALLOW_B_VIA_LDS=False,
         warps_per_cta=(1, 4),
         A_NUM_BUFFER=depth,
         B_NUM_BUFFER=depth,
@@ -257,9 +257,9 @@ def test_mixed_buffers_wait_commit(register_case, scheme, mask):
     config = _register_config(register_case.dtype)
     config.update(
         WAIT_COMMIT_SCHEME=scheme,
-        B_IN_REG=bool(mask & 1),
-        A_SCALE_IN_REG=bool(mask & 2),
-        B_SCALE_IN_REG=bool(mask & 4),
+        ALLOW_B_VIA_LDS=not (mask & 1),
+        ALLOW_A_SCALE_VIA_LDS=not (mask & 2),
+        ALLOW_B_SCALE_VIA_LDS=not (mask & 4),
         A_NUM_BUFFER=2,
         B_NUM_BUFFER=3,
         A_SCALE_NUM_BUFFER=4,
@@ -271,7 +271,7 @@ def test_mixed_buffers_wait_commit(register_case, scheme, mask):
 def test_register_b_uses_buffer_load_and_less_lds(register_case):
     config = _register_config(register_case.dtype)
     lds_kernel = _launch_register_case(register_case, config)
-    config["B_IN_REG"] = True
+    config["ALLOW_B_VIA_LDS"] = False
     reg_kernel = _launch_register_case(register_case, config)
     assert reg_kernel.metadata.shared < lds_kernel.metadata.shared
     loads = [
@@ -298,9 +298,11 @@ def test_small_a_payload_uses_register_ring(monkeypatch):
         tiles_per_warp=(1, 2),
         K_UNROLL=3,
     )
-    tc = host._probe_tuning_config(config, DtypeQuant.BF16, DtypeQuant.BF16)
-    assert host._cval(tc.component_in_reg(A_PAYLOAD))
-    assert host._cval(tc.component_via_lds(B_PAYLOAD))
+    layout = compute_kernel_layout(
+        host._probe_tuning_config(config, DtypeQuant.BF16, DtypeQuant.BF16)
+    )
+    assert host._cval(layout.component_in_reg(A_PAYLOAD))
+    assert host._cval(layout.component_via_lds(B_PAYLOAD))
 
     kernel = _launch_register_case(case, config)
     torch.testing.assert_close(case.output[0], case.expected, rtol=3e-4, atol=3e-5)
@@ -329,12 +331,14 @@ def test_small_b_payload_uses_register_ring_without_preshuffle(monkeypatch):
         warps_per_cta=(4, 1),
         tiles_per_warp=(1, 1),
         K_UNROLL=3,
-        B_IN_REG=False,
+        ALLOW_B_VIA_LDS=True,
         B_PRESHUFFLED=False,
     )
-    tc = host._probe_tuning_config(config, DtypeQuant.BF16, DtypeQuant.BF16)
-    assert host._cval(tc.component_via_lds(A_PAYLOAD))
-    assert host._cval(tc.component_in_reg(B_PAYLOAD))
+    layout = compute_kernel_layout(
+        host._probe_tuning_config(config, DtypeQuant.BF16, DtypeQuant.BF16)
+    )
+    assert host._cval(layout.component_via_lds(A_PAYLOAD))
+    assert host._cval(layout.component_in_reg(B_PAYLOAD))
 
     kernel = _launch_register_case(case, config)
     torch.testing.assert_close(case.output[0], case.expected, rtol=3e-4, atol=3e-5)
@@ -363,12 +367,14 @@ def test_small_a_and_b_payloads_share_register_pipeline(monkeypatch):
         warps_per_cta=(2, 2),
         tiles_per_warp=(1, 1),
         K_UNROLL=3,
-        B_IN_REG=False,
+        ALLOW_B_VIA_LDS=True,
         B_PRESHUFFLED=False,
     )
-    tc = host._probe_tuning_config(config, DtypeQuant.BF16, DtypeQuant.BF16)
-    assert host._cval(tc.component_in_reg(A_PAYLOAD))
-    assert host._cval(tc.component_in_reg(B_PAYLOAD))
+    layout = compute_kernel_layout(
+        host._probe_tuning_config(config, DtypeQuant.BF16, DtypeQuant.BF16)
+    )
+    assert host._cval(layout.component_in_reg(A_PAYLOAD))
+    assert host._cval(layout.component_in_reg(B_PAYLOAD))
 
     kernel = _launch_register_case(case, config)
     torch.testing.assert_close(case.output[0], case.expected, rtol=3e-4, atol=3e-5)
@@ -390,7 +396,7 @@ def test_unquantized_gate_up_split_allows_small_warp_extent(register_case):
         BLOCK_N=128,
         MINI_BLOCK_N=64,
         tiles_per_warp=(2, 1),
-        B_IN_REG=True,
+        ALLOW_B_VIA_LDS=False,
         A_SCALE_SORTED_SHUFFLED=False,
         B_SCALE_SHUFFLED=False,
     )
@@ -405,9 +411,9 @@ def test_k128_register_scale_phase(register_case):
     config.update(
         BLOCK_K=128,
         VGPR_PREFETCH_K=128,
-        B_IN_REG=True,
-        A_SCALE_IN_REG=True,
-        B_SCALE_IN_REG=True,
+        ALLOW_B_VIA_LDS=False,
+        ALLOW_A_SCALE_VIA_LDS=False,
+        ALLOW_B_SCALE_VIA_LDS=False,
         A_NUM_BUFFER=3,
         B_NUM_BUFFER=2,
         A_SCALE_NUM_BUFFER=4,
@@ -440,7 +446,7 @@ def test_scale_and_payload_k_load_units_are_independent(
         VGPR_PREFETCH_K=block_k,
         NUM_LDS_BUFFER=2,
         K_UNROLL=2,
-        B_IN_REG=True,
+        ALLOW_B_VIA_LDS=False,
         A_SCALE_SORTED_SHUFFLED=shuffled[0],
         B_SCALE_SHUFFLED=shuffled[1],
     )
@@ -458,9 +464,9 @@ def test_register_operands_cover_whole_block_k(register_case, mask):
         BLOCK_K=256,
         VGPR_PREFETCH_K=256,
         warps_per_cta=(2, 2),
-        B_IN_REG=bool(mask & 1),
-        A_SCALE_IN_REG=bool(mask & 2),
-        B_SCALE_IN_REG=bool(mask & 4),
+        ALLOW_B_VIA_LDS=not (mask & 1),
+        ALLOW_A_SCALE_VIA_LDS=not (mask & 2),
+        ALLOW_B_SCALE_VIA_LDS=not (mask & 4),
         A_NUM_BUFFER=2,
         B_NUM_BUFFER=2,
         A_SCALE_NUM_BUFFER=2,
@@ -479,9 +485,9 @@ def test_register_pipeline_without_fused_tail(register_case, swiglu):
     case.output = torch.empty_like(expected).unsqueeze(0)
     config = _register_config(case.dtype)
     config.update(
-        B_IN_REG=True,
-        A_SCALE_IN_REG=True,
-        B_SCALE_IN_REG=True,
+        ALLOW_B_VIA_LDS=False,
+        ALLOW_A_SCALE_VIA_LDS=False,
+        ALLOW_B_SCALE_VIA_LDS=False,
         A_NUM_BUFFER=2,
         B_NUM_BUFFER=3,
         A_SCALE_NUM_BUFFER=4,
@@ -513,9 +519,9 @@ def test_register_pipeline_mxfp4_output(register_case, split):
     _launch_register_case(case, config, split=split, y_scales=scales)
     baseline, baseline_scales = case.output.clone(), scales.clone()
     config.update(
-        B_IN_REG=True,
-        A_SCALE_IN_REG=True,
-        B_SCALE_IN_REG=True,
+        ALLOW_B_VIA_LDS=False,
+        ALLOW_A_SCALE_VIA_LDS=False,
+        ALLOW_B_SCALE_VIA_LDS=False,
         A_NUM_BUFFER=2,
         B_NUM_BUFFER=3,
         A_SCALE_NUM_BUFFER=4,
@@ -557,9 +563,9 @@ def test_single_buffer_is_rejected_before_launch(dtype, field, monkeypatch):
     config.update(
         A_SCALE_SORTED_SHUFFLED=False,
         B_SCALE_SHUFFLED=False,
-        B_IN_REG=True,
-        A_SCALE_IN_REG=True,
-        B_SCALE_IN_REG=True,
+        ALLOW_B_VIA_LDS=False,
+        ALLOW_A_SCALE_VIA_LDS=False,
+        ALLOW_B_SCALE_VIA_LDS=False,
     )
     config[field] = 1
     case = _build_register_case(dtype, m=257, k=4096, experts=4, topk=2)
@@ -624,7 +630,11 @@ def test_minimum_k_and_every_reachable_unroll_remainder(dtype, schedule, monkeyp
             B_SCALE_NUM_BUFFER=2,
         )
     if "registers" in schedule:
-        config.update(B_IN_REG=True, A_SCALE_IN_REG=True, B_SCALE_IN_REG=True)
+        config.update(
+            ALLOW_B_VIA_LDS=False,
+            ALLOW_A_SCALE_VIA_LDS=False,
+            ALLOW_B_SCALE_VIA_LDS=False,
+        )
     if schedule == "mixed_lds":
         config["WAIT_COMMIT_SCHEME"] = 1
     if packed:
@@ -684,9 +694,9 @@ def test_unequal_buffers_overlap_epilogue_inputs(register_case, split, epilogue)
     case = register_case
     config = _register_config(case.dtype)
     config.update(
-        B_IN_REG=True,
-        A_SCALE_IN_REG=True,
-        B_SCALE_IN_REG=True,
+        ALLOW_B_VIA_LDS=False,
+        ALLOW_A_SCALE_VIA_LDS=False,
+        ALLOW_B_SCALE_VIA_LDS=False,
         A_NUM_BUFFER=2,
         B_NUM_BUFFER=3,
         A_SCALE_NUM_BUFFER=4,

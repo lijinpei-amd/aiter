@@ -22,7 +22,7 @@ SiLU with alpha 1, no limit, bias, or gammas, and fast reciprocal activation.
 The launch has 4,608 CTAs of 256 threads, or four waves per CTA.
 
 **B preshuffling is the only configuration difference in this pair.** Both
-cases have `B_IN_REG=False` and stage B through `buffer_load` to LDS
+cases have `ALLOW_B_VIA_LDS=True` and stage B through `buffer_load` to LDS
 (`buffer_load ... lds`). Both scale-register flags are false. Thus this pair
 measures the existing B layout option, not the new B-register path.
 
