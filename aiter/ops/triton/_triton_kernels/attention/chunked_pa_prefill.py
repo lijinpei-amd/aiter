@@ -14,7 +14,6 @@ import triton
 import triton.language as tl
 from intj import make_launcher
 
-from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
@@ -37,15 +36,18 @@ _kernel_paged_attention_2d_repr = make_kernel_repr(
 )
 
 
-# gfx942 and gfx1250 keep Triton's defaults
-# For gfx950: tuned launch for the decode kernel.
-tuned_decode = arch_info.get_arch() == "gfx950"
-decode_launch = (
-    {"num_warps": 1, "num_stages": 1, "waves_per_eu": 2} if tuned_decode else {}
-)
+def _decode_launch_keywords():
+    # gfx942 and gfx1250 keep Triton's defaults; gfx950 gets a tuned launch for
+    # the decode kernel. Run on the launcher's first call (delayed=), and
+    # imported here, because arch_info queries the GPU when imported.
+    from aiter.ops.triton.utils._triton import arch_info
+
+    if arch_info.get_arch() == "gfx950":
+        return {"options": {"num_warps": 1, "num_stages": 1, "waves_per_eu": 2}}
+    return {}
 
 
-@make_launcher(grid_arg=2, options=decode_launch)
+@make_launcher(grid_arg=2, delayed=_decode_launch_keywords)
 @triton.jit(repr=_kernel_paged_attention_2d_repr)
 def _kernel_paged_attention_2d(
     output_ptr,  # [num_tokens, num_query_heads, head_size]
