@@ -21,9 +21,10 @@ passed as ``None`` with their save flags off here.
 Both residual layouts are served by the single ``attnres_fwd_kernel`` via an
 ``IS_PACKED`` switch:
 
-* ``layout="sequence"``: a ``Sequence`` of up to 16 independent ``[.., D]``
-  tensors, the native form of the fla ``fused_attnres`` API, passed as one base
-  pointer argument each (padded to ``L2``) and gathered by slot.
+* ``layout="sequence"``: a ``Sequence`` of L independent ``[.., D]`` tensors,
+  the native form of the fla ``fused_attnres`` API, passed as one base pointer
+  argument each (padded to ``L2``) and gathered by slot. The kernel has 16
+  slots; more than 16 tensors are stacked and take the packed layout.
 * ``layout="packed"``: one contiguous ``[.., L, D]`` tensor read with row strides.
 
 :func:`attn_res_gate` exposes the same packed kernel under the inference contract
@@ -315,9 +316,10 @@ def _run_sequence(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm)
     ), f"attn_res sequence layout requires D to be a multiple of 16, got D={D}"
     L = len(residuals)
     if L > ATTN_RES_SEQ_SLOTS:
-        raise ValueError(
-            f"attn_res sequence layout takes at most {ATTN_RES_SEQ_SLOTS} "
-            f"residuals, got {L}; use layout='packed'"
+        # The kernel has ATTN_RES_SEQ_SLOTS residual slots. More residuals take
+        # the packed layout, at the cost of stacking them into one tensor.
+        return _run_packed(
+            q_flat, tuple(residuals), w_flat, ow_flat, rms_eps, scale, has_onorm
         )
     flat_residuals = tuple(_fast_reshape2d(r, D) for r in residuals)
     L2 = max(1, _next_pow2(L))

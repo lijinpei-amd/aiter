@@ -701,9 +701,14 @@ differences are within the observed run-to-run variation.
 (`res`), which intj does not decode, so it launched the JIT function through
 Triton. The kernel now takes 16 pointer parameters, `res0`..`res15`, and packs
 them back into the tuple its gather loop indexes: the residuals, padded to
-`L2` with the first one as before, then `None`. The sequence layout therefore
-takes at most 16 residuals (`ATTN_RES_SEQ_SLOTS`) and raises `ValueError`
-above that; the tuple took any number. Two launchers launch the one kernel,
+`L2` with the first one as before, then `None`. More than 16 residuals
+(`ATTN_RES_SEQ_SLOTS`), which the tuple also took, are stacked into one
+tensor and take the packed layout: one device copy of the residuals, and
+outputs within tolerance of the tuple launch's but not bitwise equal to them
+(29 of 68 cases equal on gfx942, L 17-64). The copy and the packed kernel
+take 0.05-0.47x the GPU time of the tuple launch, whose 32-row tile spills
+(gfx942, L 17 and 32, the N and D of the GPU times below, bf16). Two
+launchers launch the one kernel,
 each baking what its layout never varies: `attnres_fwd_kernel`
 (`attn_res_gate`, `layout="packed"`) bakes the 16 slots as `None`, so the
 decode path passes no slot argument (passing them measured 0.4 us more per
@@ -720,7 +725,8 @@ on gfx942 and gfx950 (MI350X):
 - **Tests.** `test_attn_res.py`: 255 passed on both GPUs (the base tree's 251
   plus the sequence launch checked bitwise against a Triton launch of the same
   kernel across L2 buckets, dtypes, output norm, scalars equal to 1.0 and
-  token counts, and the 16-residual limit), and the same with
+  token counts, and 17 and 33 residuals against the torch reference and the
+  packed layout), and the same with
   `ATTN_RES_TRITON_AUTOTUNE=1`, except on gfx942
   `test_attn_res_gate_out_quant_matches_unfused_quant[64]`, which fails there
   on the base tree too. `test_mhc.py`, which imports the same kernel package:
@@ -757,4 +763,4 @@ on gfx942 and gfx950 (MI350X):
   D=1024, L=2, 3.99 vs 4.10 us) re-measured equal over 200-launch batches
   (3.96-3.99 vs 3.96-3.97 us), as did the same launch through Triton.
 
-Not run: CUDA, and L above 16 (refused now).
+Not run: CUDA.

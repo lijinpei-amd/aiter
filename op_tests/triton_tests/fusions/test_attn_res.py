@@ -896,16 +896,19 @@ def test_attn_res_sequence_requires_d_multiple_of_16():
         attn_res_fwd(query, residuals, rms_weight, layout="sequence")
 
 
-def test_attn_res_sequence_takes_at_most_16_residuals():
-    """The kernel has 16 residual slots; more raise rather than truncate."""
-    query, residuals, rms_weight, _ = generate_attn_res_inputs(
-        4, 64, 17, torch.float32, with_onorm=False
+@pytest.mark.parametrize("L", [17, 33])
+def test_attn_res_sequence_takes_more_than_16_residuals(L):
+    """More residuals than the kernel's 16 slots take the packed layout."""
+    rms_eps, scale = 1e-6, 0.7
+    query, residuals, rms_weight, output_rms_weight = generate_attn_res_inputs(
+        64, 256, L, torch.float32, with_onorm=True
     )
-    with pytest.raises(ValueError, match="at most 16 residuals"):
-        attn_res_fwd(query, residuals, rms_weight, layout="sequence")
-    o = attn_res_fwd(query, residuals[:16], rms_weight, layout="sequence")
-    o_ref, *_ = run_torch(query, residuals[:16], rms_weight, None, 1e-6, 1.0)
+    args = (query, residuals, rms_weight, output_rms_weight, rms_eps, scale)
+    o = attn_res_fwd(*args, layout="sequence")
+    o_ref, *_ = run_torch(*args)
     torch.testing.assert_close(o, o_ref, atol=1e-4, rtol=1e-4)
+    if L > 16:
+        assert torch.equal(o, attn_res_fwd(*args, layout="packed"))
 
 
 @pytest.mark.parametrize("N", [1, 37, 64])
