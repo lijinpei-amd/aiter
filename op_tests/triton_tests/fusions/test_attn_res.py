@@ -10,6 +10,7 @@ import aiter.ops.triton.fusions.attn_res as attn_res_module
 from aiter.ops.triton._triton_kernels.fusions.attn_res import (
     ATTN_RES_TRITON_AUTOTUNE,
     attnres_fwd_kernel,
+    attnres_fwd_sequence_kernel,
 )
 from aiter.ops.triton.fusions.attn_res import attn_res_fwd, attn_res_gate
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
@@ -654,19 +655,26 @@ def _gate_all_variants(prefix, block_residual, score_weight, orw, fp8_dtype):
         ), kwargs
 
 
-def _triton_launch(dev, stream, grid, *args):
-    """attnres_fwd_kernel's JIT function through Triton's own launch, taking the
-    arguments of the intj launcher attn_res_gate calls (attnres_fwd_kernel)."""
-    jit = attnres_fwd_kernel.__self__.options.jit_func
-    names = jit.arg_names
-    options = {}
+def _triton_launch(launcher):
+    """A stand-in for the intj ``launcher`` that takes its arguments and launches
+    its JIT function through Triton's own launch, adding back the arguments the
+    launcher bakes."""
+    opts = launcher.__self__.options
+    jit = opts.jit_func
+    baked = {name: a.value for name, a in opts.extra_annotation.items()}
+    names = [n for n in jit.arg_names if n not in baked]
     if ATTN_RES_TRITON_AUTOTUNE:
-        names = [n for n in names if n != "BL"]  # the tuner assigns BL
-    else:
-        num_warps, num_stages, *args = args
-        options = {"num_warps": num_warps, "num_stages": num_stages}
-    assert len(names) == len(args)
-    jit[grid](**dict(zip(names, args)), **options)
+        names.remove("BL")  # the tuner assigns BL
+
+    def launch(dev, stream, grid, *args):
+        options = {}
+        if not ATTN_RES_TRITON_AUTOTUNE:
+            num_warps, num_stages, *args = args
+            options = {"num_warps": num_warps, "num_stages": num_stages}
+        assert len(names) == len(args)
+        jit[grid](**dict(zip(names, args)), **baked, **options)
+
+    return launch
 
 
 def _gate_outputs(out):
@@ -679,7 +687,9 @@ def _assert_gate_matches_triton(monkeypatch, *args, **kwargs):
     """attn_res_gate returns bitwise what a Triton launch of the same kernel
     returns, on its first call and on a repeated one (a launcher cache hit)."""
     with monkeypatch.context() as m:
-        m.setattr(attn_res_module, "attnres_fwd_kernel", _triton_launch)
+        m.setattr(
+            attn_res_module, "attnres_fwd_kernel", _triton_launch(attnres_fwd_kernel)
+        )
         expected = _gate_outputs(attn_res_gate(*args, **kwargs))
     for _ in range(2):
         got = _gate_outputs(attn_res_gate(*args, **kwargs))
@@ -884,3 +894,51 @@ def test_attn_res_sequence_requires_d_multiple_of_16():
     )
     with pytest.raises(AssertionError, match="multiple of 16"):
         attn_res_fwd(query, residuals, rms_weight, layout="sequence")
+
+
+def test_attn_res_sequence_takes_at_most_16_residuals():
+    """The kernel has 16 residual slots; more raise rather than truncate."""
+    query, residuals, rms_weight, _ = generate_attn_res_inputs(
+        4, 64, 17, torch.float32, with_onorm=False
+    )
+    with pytest.raises(ValueError, match="at most 16 residuals"):
+        attn_res_fwd(query, residuals, rms_weight, layout="sequence")
+    o = attn_res_fwd(query, residuals[:16], rms_weight, layout="sequence")
+    o_ref, *_ = run_torch(query, residuals[:16], rms_weight, None, 1e-6, 1.0)
+    torch.testing.assert_close(o, o_ref, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("N", [1, 37, 64])
+def test_attn_res_sequence_matches_triton_launch(monkeypatch, N):
+    """Across the settings the sequence launch specializes on (L2 bucket, dtype,
+    output norm, a scalar equal to 1.0, the token count), the launch returns
+    bitwise what Triton's launch of the same kernel returns, on a first call
+    and on a launcher cache hit. Launched in one sequence, so a launch that
+    reused a binary compiled for an earlier setting would differ."""
+    D = 256
+    for L, dtype, with_onorm, rms_eps, scale in (
+        (1, torch.bfloat16, False, 1e-6, 0.7),
+        (2, torch.bfloat16, False, 1e-6, 0.7),
+        (3, torch.bfloat16, True, 1e-6, 0.7),
+        (4, torch.float32, True, 1e-6, 0.7),
+        (5, torch.bfloat16, True, 1e-6, 0.7),
+        (9, torch.float16, False, 1e-6, 0.7),
+        (16, torch.bfloat16, True, 1e-6, 0.7),
+        (3, torch.bfloat16, True, 1.0, 0.7),
+        (3, torch.bfloat16, True, 1e-6, 1.0),
+    ):
+        query, residuals, rms_weight, output_rms_weight = generate_attn_res_inputs(
+            N, D, L, dtype, with_onorm
+        )
+        args = (query, residuals, rms_weight, output_rms_weight, rms_eps, scale)
+        with monkeypatch.context() as m:
+            m.setattr(
+                attn_res_module,
+                "attnres_fwd_sequence_kernel",
+                _triton_launch(attnres_fwd_sequence_kernel),
+            )
+            expected = attn_res_fwd(*args, layout="sequence")
+        for _ in range(2):
+            got = attn_res_fwd(*args, layout="sequence")
+            assert got.dtype == expected.dtype and got.shape == expected.shape
+            assert torch.equal(got.view(torch.uint8), expected.view(torch.uint8))

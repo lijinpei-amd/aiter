@@ -21,9 +21,9 @@ passed as ``None`` with their save flags off here.
 Both residual layouts are served by the single ``attnres_fwd_kernel`` via an
 ``IS_PACKED`` switch:
 
-* ``layout="sequence"``: a ``Sequence`` of L independent ``[.., D]`` tensors, the
-  native form of the fla ``fused_attnres`` API, gathered through a length-``L2``
-  pointer table.
+* ``layout="sequence"``: a ``Sequence`` of up to 16 independent ``[.., D]``
+  tensors, the native form of the fla ``fused_attnres`` API, passed as one base
+  pointer argument each (padded to ``L2``) and gathered by slot.
 * ``layout="packed"``: one contiguous ``[.., L, D]`` tensor read with row strides.
 
 :func:`attn_res_gate` exposes the same packed kernel under the inference contract
@@ -44,8 +44,10 @@ import torch
 import triton
 
 from aiter.ops.triton._triton_kernels.fusions.attn_res import (
+    ATTN_RES_SEQ_SLOTS,
     ATTN_RES_TRITON_AUTOTUNE,
     attnres_fwd_kernel,
+    attnres_fwd_sequence_kernel,
 )
 from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -56,11 +58,8 @@ _LOGGER = AiterTritonLogger()
 # Decode is host-bound: at N=1..128 attn_res_gate spent ~50us of Python per
 # call against ~10-25us of device work, ~26us of it in JITFunction.run's
 # argument binding, specialization and cache lookup (MI350X/gfx950, N=1 B=8
-# H=7168, quant + close_block). attn_res_gate and the packed layout launch
-# through attnres_fwd_kernel, an intj launcher, which does that part in C; the
-# sequence layout's tuple argument keeps it on Triton, through the JIT function
-# the launcher launches.
-_attnres_fwd_jit = attnres_fwd_kernel.__self__.options.jit_func
+# H=7168, quant + close_block). Every layout launches through an intj launcher
+# (attnres_fwd_kernel, attnres_fwd_sequence_kernel), which does that part in C.
 
 
 _POW2_CACHE: dict[int, int] = {}
@@ -241,32 +240,22 @@ def _pick_attn_res_packed_config(tokens: int, l2: int) -> tuple[int, int, int]:
     return num_warps, num_stages, min(bl, l2)
 
 
-def _launch_tune_kwargs(num_warps: int, num_stages: int, bl: int | None = None) -> dict:
-    # When ATTN_RES_TRITON_AUTOTUNE is on, attnres_fwd_kernel is itself wrapped by
-    # @triton.autotune (see _triton_kernels/fusions/attn_res.py): BL/num_warps/
-    # num_stages become meta-parameters the decorator supplies from its own config
-    # search, so the launch must NOT also pass them explicitly (that would just be
-    # a redundant/duplicate value, not an override). Otherwise, launch with the
-    # wrapper's static per-token-count picks, as today.
-    if ATTN_RES_TRITON_AUTOTUNE:
-        return {}
-    kwargs = {"num_warps": num_warps, "num_stages": num_stages}
-    if bl is not None:
-        kwargs["BL"] = bl
-    return kwargs
-
-
-def _build_ptr_table(tensors: Sequence[torch.Tensor]) -> tuple[torch.Tensor, ...]:
-    # Pad the per-source tuple to a power-of-2 length so Triton compiles one
-    # kernel per L2 bucket instead of one per L. Padded slots reuse tensors[0]
-    # and are masked out in the kernel.
-    L2 = max(1, triton.next_power_of_2(len(tensors)))
-    assert 1 <= len(tensors) <= L2
+def _res_slots(
+    tensors: Sequence[torch.Tensor], L2: int
+) -> tuple[torch.Tensor | None, ...]:
+    # The kernel's res0..res15. Pad the residuals to a power-of-2 length so one
+    # kernel serves an L2 bucket instead of one per L. Padded slots reuse
+    # tensors[0] and are masked out in the kernel; the slots from L2 up are
+    # None, which keeps them out of the kernarg segment.
     for t in tensors:
         assert (
             t.data_ptr() % 16 == 0
         ), "attn_res residual sources must be 16-byte aligned"
-    return tuple(tensors) + (tensors[0],) * (L2 - len(tensors))
+    return (
+        tuple(tensors)
+        + (tensors[0],) * (L2 - len(tensors))
+        + (None,) * (ATTN_RES_SEQ_SLOTS - L2)
+    )
 
 
 def attn_res_fwd(
@@ -323,59 +312,52 @@ def _run_sequence(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm)
     assert (
         D % 16 == 0
     ), f"attn_res sequence layout requires D to be a multiple of 16, got D={D}"
+    L = len(residuals)
+    if L > ATTN_RES_SEQ_SLOTS:
+        raise ValueError(
+            f"attn_res sequence layout takes at most {ATTN_RES_SEQ_SLOTS} residuals, got "
+            f"{L}; use layout='packed'"
+        )
     flat_residuals = tuple(r.reshape(-1, D).contiguous() for r in residuals)
-    res = _build_ptr_table(flat_residuals)
-    L = len(flat_residuals)
+    L2 = max(1, triton.next_power_of_2(L))
+    res = _res_slots(flat_residuals, L2)
     N = flat_residuals[0].numel() // D
     dtype = flat_residuals[0].dtype
     device = flat_residuals[0].device
 
     o = torch.empty((N, D), device=device, dtype=dtype)
-    L2 = max(1, triton.next_power_of_2(L))
     num_warps, num_stages = _pick_attn_res_seq_config(N)
 
-    _attnres_fwd_jit[(N,)](
-        q=q_flat,
-        res=res,
-        w=w_flat,
-        ow=ow_flat,
-        o=o,
-        o_pre=None,
-        rstd=None,
-        logit=None,
-        lse=None,
-        res_packed=None,
-        prefix=None,
-        add_hidden=None,
-        add_hidden2=None,
-        prefix_out=None,
-        block_out=None,
-        o_scale=None,
-        N=N,
-        L=L,
-        stride_res_n=0,
-        stride_res_l=0,
-        stride_bo_n=0,
-        stride_bo_l=0,
-        L2=L2,
-        D=D,
-        eps=rms_eps,
-        out_eps=rms_eps,
-        scale=scale,
-        BD=triton.next_power_of_2(D),
-        HAS_ONORM=has_onorm,
-        SAVE_OPRE=False,
-        SAVE_STATS=False,
-        IS_PACKED=False,
-        HAS_PREFIX=False,
-        DO_ADD=False,
-        DO_ADD2=False,
-        WRITE_PREF=False,
-        WRITE_BLOCK_CAT=False,
-        HAS_W=True,
-        QUANT_FP8=False,
-        FP8_MAX=1.0,
-        **_launch_tune_kwargs(num_warps, num_stages, L2),
+    # With ATTN_RES_TRITON_AUTOTUNE the tuner assigns BL, num_warps and
+    # num_stages; otherwise BL is L2, one tile (see _ATTN_RES_SEQ_CONFIGS).
+    tune, bl_arg = (
+        ((), ()) if ATTN_RES_TRITON_AUTOTUNE else ((num_warps, num_stages), (L2,))
+    )
+    dev, stream = current_device_stream()
+    attnres_fwd_sequence_kernel(
+        dev,
+        stream,
+        (N,),
+        *tune,
+        q_flat,
+        *res,  # res0..res15
+        w_flat,
+        ow_flat,
+        o,
+        N,
+        L,
+        0,  # stride_res_n
+        0,  # stride_res_l
+        0,  # stride_bo_n
+        0,  # stride_bo_l
+        L2,
+        D,
+        rms_eps,  # eps
+        rms_eps,  # out_eps
+        scale,
+        *bl_arg,
+        triton.next_power_of_2(D),  # BD
+        has_onorm,  # HAS_ONORM
     )
     return o.view(output_shape)
 
@@ -401,7 +383,7 @@ def _run_packed(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm):
     L2 = max(1, triton.next_power_of_2(L))
     num_warps, num_stages, bl = _pick_attn_res_packed_config(N, L2)
 
-    # With ATTN_RES_TRITON_AUTOTUNE the tuner owns these (see _launch_tune_kwargs).
+    # With ATTN_RES_TRITON_AUTOTUNE the tuner assigns BL, num_warps and num_stages.
     tune, bl_arg = (
         ((), ()) if ATTN_RES_TRITON_AUTOTUNE else ((num_warps, num_stages), (bl,))
     )
@@ -412,8 +394,6 @@ def _run_packed(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm):
         (N,),
         *tune,
         q_flat,
-        None,  # res: unused when IS_PACKED (sequence branch is dead); None keeps
-        # the L2 dead pointer slots out of the kernarg segment
         w_flat,
         ow_flat,
         o,
@@ -595,7 +575,7 @@ def attn_res_gate(
     res_stride_n, res_stride_l, _ = br.stride()
     bo_stride_n, bo_stride_l, _ = bo.stride()
     fp8_max = _dtype_max(out_quant_dtype) if quant else 1.0
-    # With ATTN_RES_TRITON_AUTOTUNE the tuner owns these (see _launch_tune_kwargs).
+    # With ATTN_RES_TRITON_AUTOTUNE the tuner assigns BL, num_warps and num_stages.
     tune, bl_arg = (
         ((), ()) if ATTN_RES_TRITON_AUTOTUNE else ((num_warps, num_stages), (bl,))
     )
@@ -606,8 +586,6 @@ def attn_res_gate(
         (N,),
         *tune,
         sw,  # q
-        None,  # res: unused when IS_PACKED (sequence branch is dead); None keeps
-        # the L2 dead pointer slots out of the kernarg segment
         sw,  # w
         ow,
         y,  # o

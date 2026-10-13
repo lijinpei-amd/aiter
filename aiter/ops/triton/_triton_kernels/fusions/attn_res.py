@@ -4,7 +4,7 @@
 
 import triton
 import triton.language as tl
-from intj import make_launcher
+from intj import Argument, Constexpr, make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.tuned_config_utils import (
@@ -46,7 +46,22 @@ _attnres_fwd_kernel_repr = make_kernel_repr(
 @triton.jit(repr=_attnres_fwd_kernel_repr, do_not_specialize=["L"])
 def attnres_fwd_kernel(
     q,
-    res,
+    res0,
+    res1,
+    res2,
+    res3,
+    res4,
+    res5,
+    res6,
+    res7,
+    res8,
+    res9,
+    res10,
+    res11,
+    res12,
+    res13,
+    res14,
+    res15,
     w,
     ow,
     o,
@@ -98,8 +113,11 @@ def attnres_fwd_kernel(
 
     Two residual layouts share the same math via ``IS_PACKED``:
 
-    * ``IS_PACKED=False`` (sequence): ``res`` is a length-``L2`` tuple of the
-      per-source ``[N, D]`` base pointers. fla gathers row ``l`` with a
+    * ``IS_PACKED=False`` (sequence): ``res0`` .. ``res15`` hold the
+      per-source ``[N, D]`` base pointers: the L residuals, then the first one
+      again up to ``L2``, then ``None``. fla passes them as one tuple, which the
+      intj launcher cannot decode, so each is its own parameter and the kernel
+      rebuilds the tuple. fla gathers row ``l`` with a
       tensor-of-pointers ``tl.where`` chain, but that fails to compile on the AMD
       backend (CanonicalizePointers), so we scan the padded slots with a scalar
       base pointer per slot and keep the matching row via a mask -- same result.
@@ -292,6 +310,11 @@ def attnres_fwd_kernel(
                     b_v = tl.where((o_l == n_res)[:, None], ps[None, :], b_v)
             else:
                 # AMD-safe gather: scan the padded slots, mask in the matching row.
+                tl.static_assert(L2 <= 16, "attn_res sequence layout: L2 > 16")
+                res = (
+                    res0, res1, res2, res3, res4, res5, res6, res7,
+                    res8, res9, res10, res11, res12, res13, res14, res15,
+                )  # fmt: skip
                 b_v = tl.zeros([BL, BD], dtype=tl.float32)
                 for i in tl.static_range(0, L2):
                     b_v += tl.load(
@@ -392,11 +415,65 @@ if ATTN_RES_TRITON_AUTOTUNE:
         cache_results=True,
     )(attnres_fwd_kernel)
 
-# attn_res_gate and the packed layout launch through this launcher; the
-# sequence layout's tuple argument launches its JIT function
-# (`attnres_fwd_kernel.__self__.options.jit_func`) through Triton. Under
-# ATTN_RES_TRITON_AUTOTUNE the tuner assigns BL, num_warps and num_stages.
+# The number of sequence-layout residual slots, res0..res15.
+ATTN_RES_SEQ_SLOTS = 16
+
+# Two launchers launch this kernel (or, under ATTN_RES_TRITON_AUTOTUNE, the
+# tuner over it, which then assigns BL, num_warps and num_stages). Each bakes
+# the arguments its layout never varies, so a call neither passes nor decodes
+# them: on the decode path every argument costs host time.
+_attnres_fwd = attnres_fwd_kernel
+_ATTN_RES_DYNAMIC_OPTIONS = (
+    () if ATTN_RES_TRITON_AUTOTUNE else ("num_warps", "num_stages")
+)
+
+# attn_res_gate and layout="packed": the sequence layout's slots are unused.
 attnres_fwd_kernel = make_launcher(
-    attnres_fwd_kernel,
-    dynamic_options=() if ATTN_RES_TRITON_AUTOTUNE else ("num_warps", "num_stages"),
+    _attnres_fwd,
+    dynamic_options=_ATTN_RES_DYNAMIC_OPTIONS,
+    extra_annotation={
+        f"res{i}": Argument(value=None) for i in range(ATTN_RES_SEQ_SLOTS)
+    },
+)
+
+# layout="sequence": none of what the packed layout adds (prefix, add folds,
+# block_out, FP8 quant, SEPARATE) and no backward checkpoint.
+attnres_fwd_sequence_kernel = make_launcher(
+    _attnres_fwd,
+    dynamic_options=_ATTN_RES_DYNAMIC_OPTIONS,
+    extra_annotation={
+        **dict.fromkeys(
+            (
+                "o_pre",
+                "rstd",
+                "logit",
+                "lse",
+                "res_packed",
+                "prefix",
+                "add_hidden",
+                "add_hidden2",
+                "prefix_out",
+                "block_out",
+                "o_scale",
+            ),
+            Argument(value=None),
+        ),
+        **dict.fromkeys(
+            (
+                "SAVE_OPRE",
+                "SAVE_STATS",
+                "IS_PACKED",
+                "HAS_PREFIX",
+                "DO_ADD",
+                "DO_ADD2",
+                "WRITE_PREF",
+                "WRITE_BLOCK_CAT",
+                "QUANT_FP8",
+                "SEPARATE",
+            ),
+            Constexpr(value=False),
+        ),
+        "HAS_W": Constexpr(value=True),
+        "FP8_MAX": Constexpr(value=1.0),
+    },
 )
