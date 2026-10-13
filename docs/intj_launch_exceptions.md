@@ -20,7 +20,7 @@ values) wait for `__self__.build()` or the first call (see
 needs a host C compiler once per interpreter (intj builds its generic lazy
 stub).
 
-What still launches through Triton, and why: the 14 tracked Triton bracket
+What still launches through Triton, and why: the 11 tracked Triton bracket
 launches in the table below, each needing a runtime capability or launch
 behavior intj cannot preserve. No `intj.compat.launch` call is left; the
 last eight, gfx1250 Gluon paths that passed a tuple or a Gluon layout object
@@ -63,7 +63,7 @@ earlier (see above). So a kernel can carry its launcher as a decorator in a
 module Aiter imports without a GPU. That is the default form:
 
 ```python
-@make_launcher(grid_arg=1, options={"num_warps": 4})   # 418 kernels
+@make_launcher(grid_arg=1, options={"num_warps": 4})   # 420 kernels
 @triton.jit
 def _foo_kernel(...): ...
 
@@ -90,7 +90,8 @@ str constexprs; sage_quant_v, `_combined_routing`, `_moe_gemm_a8w8` and
 `_sparse_attn_prefill_kernel` each serve two call sites.
 
 Three other forms remain, 17 launchers, only where a decorator cannot give
-what one kernel needs; no `functools.cache` factory is left:
+what one kernel needs, and `HsacoKernel` makes its launchers at run time (last
+row); no `functools.cache` factory is left:
 
 ```python
 _k = make_launcher(_k, ...)                    # beside the kernel, over a wrapper applied after it
@@ -106,6 +107,7 @@ _TABLE = {mode: make_launcher(_kernel(mode), delayed=partial(_keywords, mode)) f
 | `rmsnorm` `_rms_norm_kernel_launch` | named | The kernel is also a device function: the Iris `reduce_scatter_rmsnorm_quant_all_gather` kernel calls it, and a launcher cannot be called from kernel code. |
 | `pa_attention_kernel_test` `_direct_dot_launch`, `_direct_large_block_dot_launch` | named | Launch pa_decode_gluon's dot kernels' JIT functions with other options (`num_stages=1`, per-call `waves_per_eu`) than their decorators. |
 | `pa_mqa_logits` `_GLUON_PAGED_MQA_LOGITS_LAUNCHERS` (6) | table | One launcher per (Preshuffle, VarCtx, KV-padded) mode over three Gluon kernels, each with its own hand-written types and `Assume` facts, from `delayed=` (they need `get_gfx()`); `return_compiled=True`. Each JIT function backs two launchers (KV-padded and unpadded facts), which one decorator cannot declare. |
+| `csrc/cpp_itfs/utils.py` `_IntjKernel.launchers` | made on first call | `jit(kernel)` wraps whatever JIT function its caller passes; one `return_compiled=True` launcher per set of option keywords, taken as `dynamic_options` (see [HsacoKernel](#hsacokernel)). |
 
 Every call is positional. `current_device_stream()`
 (`aiter/ops/triton/utils/device_info.py`) returns the current device and
@@ -174,7 +176,8 @@ Defaults are passed explicitly, values that `@triton.autotune` /
   launch that misses compiles and then loads the prebuilt hsaco/json, as
   `triton.compile` did (see [pa_mqa_logits' AOT mode](#pa_mqa_logits-aot-mode)).
   pod_attention prints the returned kernel's `n_regs`/`n_spills`, and the
-  metadata-redirect tests check its `metadata.hash`, the same way. Such a
+  metadata-redirect tests check its `metadata.hash`, the same way.
+  `HsacoKernel` returns it, as Triton's launch did. Such a
   launcher compiles without running on a zero-volume grid:
   `test_separate_compile_and_run` compiles that way inside the context and
   runs outside it.
@@ -595,6 +598,341 @@ Verified with intj `2783079`, Triton 3.8.0, `AITER_TRITON_ONLY=1`:
   (4.66 vs 5.03 us, toy kernel); the default wrapper path launches twice
   (`sage_quant_kernel`, `sage_fwd`). Not measured on gfx950.
 
+## FlashKDA
+
+`_FastLaunch` (`chunk_delta_attn/fast_launch.py`) is gone, and so is the
+`_intj_launcher` handle cache that replaced it. `flash_kda_fwd` validates that
+every input is on the current GPU, then calls the five kernels, each decorated
+with its intj launcher, as `kernel(device, stream, *grid, *args)`; it reads the
+current stream before every launch, so CUDA-graph capture works. Gluon K1
+fixes `num_warps=2` as an option; Gluon K2 and the segment scan take
+`num_warps` per call (`dynamic_options`); the cache modifiers are str
+constexprs, keyed by value. The autotuned K1 and K2 carry their tuners, so
+intj tunes on a miss (the tuner configs, the opt-in
+`CHUNK_DELTA_ATTN_TRITON_AUTOTUNE=1` space included) and launches natively on a
+hit: K1's `IS_VARLEN`/`HAS_BIAS` and the scan's `HAS_H0` stay `is not None`
+heuristics, lowered to C by intj; K2's grid reads the tuned `BW` through
+`grid_cpp`. Triton's debug/instrumentation/fpsan knobs and `TRITON_INTERPRET`
+are read at each launcher's first call and fixed after it. Tests that need a
+never-called launcher, other tuner configs, a spy or a Triton reference
+re-run the kernel modules under a stand-in `make_launcher`
+(`op_tests/triton_tests/chunk_delta_attn/kda_launchers.py`). The Gluon JITs
+build their layouts inside the kernel (K2's from `gl.num_warps()`), which intj
+requires; their gfx950 ISA is unchanged. See
+[the KDA direct-launch plan](superpowers/plans/2026-09-25-kda-direct-intj-launch.md).
+K1's and K2's autotune keys include `CM_WS` / `CM_OUT`, so segmented and
+unsegmented launches still tune apart as they did under per-modifier handles.
+Verified with intj `develop` `0f2226f`, Triton 3.8.0, on gfx942 and gfx950
+(MI350X): the three KDA test files pass in all four modes (default,
+`AITER_FDA_USE_GLUON=0`, `CHUNK_DELTA_ATTN_TRITON_AUTOTUNE=1`, both); o and
+final state are bitwise equal to the handle-cache revision on all 10
+`_CASES` x {forced Triton, Gluon K1+K2}, default and autotuned; warmed
+`flash_kda_fwd` host time is 5-12% lower on every route and GPU time is
+unchanged.
+Needs intj `develop` at or after `ad8c832`: earlier, a tuned handle retained
+the argument tensors of its last tuning miss, which
+`test_cached_native_handle_does_not_retain_tensor` catches.
+
+On gfx942 with Triton 3.8.0 and intj `b4e9f1f`, evenly spaced samples (at most
+120 tests per file) of 41 affected test files passed; mxfp4/fp4 and other
+gfx950-only cases skip there and are untested. Selected files also passed with
+Triton 3.7.1. The gated delta rule prefill and decode entry points, which have
+no runnable test here, returned bitwise-equal outputs to upstream Triton
+launches. `test_flash_attn_kvcache_sliding_window` in `test_mha_v3.py` is
+excluded: it reads uninitialized workspace, and fails with NaNs on the
+unconverted upstream revision too once that memory holds NaNs.
+
+For a local Triton 3.7.1 gfx942 check (this ran against the earlier
+callable-grid intj checkout; the path now points at intj `develop`):
+
+```sh
+AITER_TRITON_ONLY=1 PYTHONPATH="$PWD:/mnt/nvme2/jinpli/workspace/home/jinpli/development/intj" \
+  /tmp/intj-compat-py312/bin/python -m pytest -q \
+  'op_tests/triton_tests/test_softmax.py::test_softmax[1-128-fp32]' \
+  'op_tests/triton_tests/test_topk.py::test_topk[dtype0-True-2-128256-1]' \
+  'op_tests/triton_tests/test_cross_entropy.py::test_cross_entropy_forward_basic[dtype0-1-128]' \
+  'op_tests/triton_tests/attention/test_pa_decode_sparse.py::test_pa_decode_
+  sparse_vs_reference[False-False-True-136-512-16-1]' \
+  'op_tests/triton_tests/test_gmm.py::test_gmm[False-trhsF-10-2-3-4]'
+```
+
+All five selected tests passed with Triton 3.7.1. Equivalent selected tests
+passed with `/tmp/gb2/bin/python` (Triton 3.8.0), and an autotuned sparse
+prefill smoke case matched its Torch reference on both versions.
+
+After the FlashKDA direct-launch change (intj `develop`), `test_intj_launch.py`,
+`test_flash_kda.py` and `test_chunk_delta_attn_fwd.py` pass on gfx942 with
+Triton 3.7.1 and 3.8.0, and on 3.8.0 also with
+`CHUNK_DELTA_ATTN_TRITON_AUTOTUNE=1` (four K1 and 24 K2 candidates, tuned by
+intj). Forced-Triton FlashKDA outputs are
+bitwise equal to the `_FastLaunch` revision on every `test_flash_kda.py`
+case, default and autotuned. The Gluon kernels were compile-checked for
+gfx950 only; the gfx950 numbers below predate this change, which has not run
+on gfx950.
+
+## gfx950 chunk-delta benchmark
+
+On an MI350X (`gfx950`), compare isolated Aiter snapshots `28ba24c0a6`
+(baseline) and `f48301958` (converted) with intj `8619f455`. The environment
+was Python 3.14.4, Torch 2.15.0.dev20260816+rocm7.14, HIP 7.14.60850, and
+Triton 3.8.0. intj's automatic tensor access resolved to `CPYTHON` because
+its verified fast Torch layout does not cover Torch 2.15. Each result is the
+median of five alternating baseline/converted runs on GPU 0, with 300 ms of
+warmup and 500 ms in `triton.testing.do_bench`. Negative change means faster.
+
+| Path and shape (B×T×H×K×V) | Baseline ms | Converted ms | Change |
+| --- | ---: | ---: | ---: |
+| FlashKDA 1×512×12×128×128, normal gfx950 Gluon route | 0.0432 | 0.0432 | 0.00% |
+| FlashKDA 1×512×12×128×128, forced Triton route | 0.0467 | 0.0468 | +0.21% |
+| FlashKDA 1×16384×12×128×128, normal gfx950 Gluon route | 0.5442 | 0.5441 | −0.02% |
+| FlashKDA 1×16384×12×128×128, forced Triton route | 0.7869 | 0.7820 | −0.62% |
+| Default pipeline 2×4096×16×64×64 | 2.1290 | 2.0919 | −1.74% |
+
+FlashKDA uses `bench_flash_kda.py` with `AITER_FDA_USE_GLUON=1` or `0`;
+the default pipeline uses `bench_chunk_delta_attn.py` with
+`AITER_FDA_ENABLE=0`. Both scripts live in `op_tests/op_benchmarks/triton/`
+and were run with `AITER_TRITON_ONLY=1`, `HIP_VISIBLE_DEVICES=0`,
+`--warmup-ms 300 --rep-ms 500`, and the table's `--shape` values. GPU-event
+times include host-induced gaps between eager launches, but exclude initial
+JIT compilation and autotuning.
+
+For the forced-Triton 512-token case, 100 warmed K1 prepare launches per
+host-timed block took 12.5658 µs/call on the baseline and 11.8462 µs/call
+with intj (−5.73%). This excludes GPU completion, allocations, JIT, and
+autotuning; two processes per revision each contributed nine blocks. A
+same-process A/B changing only the default pipeline's solve dispatch measured
+2.1197 ms with Triton and 2.0917 ms with intj (−1.32%) over five alternating
+rounds. Its output and `Akk` were bitwise equal. The FlashKDA pipeline
+differences are within the observed run-to-run variation.
+
+## Four sites converted after `ba40fc7e2`
+
+Four rows left the table (15 to 11): attn_res's sequence layout, which
+passed a tuple, and three launches that needed a `CompiledKernel`: two of a
+kernel `triton.compile` built, and `HsacoKernel`'s, which returns the one
+Triton's launch returned. Host time is per warmed call, the
+median of per-process medians, against the caching each site used before
+(spreads, setups and GPU-time checks in each site's section):
+
+| Site | Was | Now | Host time, before → after |
+| --- | --- | --- | --- |
+| [attn_res sequence layout](#attn_ress-sequence-layout) | Triton launch of the JIT function, residuals as a tuple `res` | `res0`..`res15` pointer parameters, one launcher per `L2` bucket; more than 16 residuals take the packed layout | entry, L=2: 66.2 → 11.6 us (gfx942), 33.7 → 7.0 us (gfx950); launch, L=16: 62.5 → 5.4, 40.0 → 3.1 us |
+| [pa_mqa_logits AOT mode](#pa_mqa_logits-aot-mode) | a Triton < 3.4 AOT loader: `kernel[grid]` on a `functools.cache`d `triton.compile` (upstream launched that `CompiledKernel` in both modes on >= 3.5 too) | loader deleted (unreachable: intj needs Triton >= 3.7); AOT mode enters its metadata context only on a miss | gfx950, AOT entry, plain: 23.14 upstream, 20.18 at `ba40fc7e2` → 18.42 us; launch alone 6.62-6.75 (`CompiledKernel`) → 2.57-2.60 us |
+| [`HsacoKernel`](#hsacokernel), default mode | `JITFunction[grid]`, returning the `CompiledKernel` | `return_compiled=True` launchers per option set, a call plan per call shape; honours `stream` | plain call: 10.76 → 2.90 us (gfx950), 17.17 → 4.44 us (gfx942) |
+| [metadata-redirect separate-compile test](#the-metadata-redirect-separate-compile-test) | `triton.compile(ASTSource)`, then `CompiledKernel[(1, 1, 1)](x)` | `return_compiled=True` launcher, compiled on a zero-volume grid inside the context | gfx942: 7.33 → 3.73 us with `current_device_stream()` per call, 3.11 us with both prebuilt; first call 1.9 → 63.3 ms (warm caches) |
+
+GPU time is unchanged where measured: attn_res's after/before ratio has
+median 1.000 over 36 shapes on both GPUs, pa_mqa_logits 17.32 vs 17.39 us
+and 10.35 vs 10.30 us (rocprofv3), the redirect test's kernel 2.51-2.53 us on
+both sides. `HsacoKernel` launches the binary Triton compiles (identical
+AMDGCN in its tests); its GPU time was not measured.
+
+What callers see change: attn_res's sequence layout with more than 16
+residuals matches the tuple launch within tolerance, not bitwise;
+`HsacoKernel` launches on the `stream` it was given, raises
+`UnsupportedKernel` for an unknown keyword or a kernel intj refuses, and
+fails under `torch.compile(fullgraph=True)`; `AITER_USE_HSACO=1` is
+unchanged.
+
+On the integrated tree (gfx942, intj `2783079`, Triton 3.8.0,
+`AITER_TRITON_ONLY=1`): `test_attn_res.py` 272 passed;
+`test_pa_mqa_logits_offset.py` 105 passed, 1 skipped (JIT mode);
+`test_hsaco_kernel.py` 22 passed, 1 skipped (hip-python) on two GPUs;
+`test_metadata_redirect.py` 4 passed. Each changed module imports on one
+GPU, and the 25 launchers reachable from them (pa_mqa_logits' 11, attn_res's
+6, the fusions package's 8 mHC ones) check and build; `HsacoKernel`'s, made
+on first use, check on a toy kernel. Without a GPU the changed modules fail
+to import for the reasons they do on `ba40fc7e2` (`arch_info` needs a GPU or
+`jax`; `chip_info`, and with it the dtypes plugin, needs `rocminfo` to list
+a GPU), except
+`aiter.utility.triton.triton_metadata_redirect` and the pa_mqa_logits kernel
+module, which import, and whose five launchers check, on both. Not rerun on
+the integrated tree: gfx950, AOT mode, the host and GPU timings above.
+
+## attn_res's sequence layout
+
+`_run_sequence` passed its residuals to `attnres_fwd_kernel` as one tuple
+(`res`), which intj does not decode, so it launched the JIT function through
+Triton. The kernel now takes 16 pointer parameters, `res0`..`res15`, and packs
+them back into the tuple its gather loop indexes: the residuals, padded to
+`L2` with the first one as before, then `None`. More than 16 residuals
+(`ATTN_RES_SEQ_SLOTS`), which the tuple also took, are stacked into one
+tensor and take the packed layout: one device copy of the residuals, and
+outputs within tolerance of the tuple launch's but not bitwise equal to them
+(29 of 68 cases equal on gfx942, 27 on gfx950, L 17-64). GPU time per call
+at L 17 and 32 (the N and D of the GPU times below, bf16), copy and packed
+kernel against the tuple launch: 0.05-0.47x on gfx942; 0.06-0.66x on gfx950
+except at D=1024 with N of 1 or 64, where it is 1.2-2.0x (N=1: 13.6 vs 16.7
+us at L=17, 13.7 vs 26.0 us at L=32).
+
+Six launchers launch the one kernel, each baking what its layout never
+varies, so a call neither passes nor decodes it. `attnres_fwd_kernel`
+(`attn_res_gate`, `layout="packed"`) bakes the 16 slots as `None` (passing
+them measured 0.4 us more per launch on gfx942).
+`attnres_fwd_sequence_kernels` holds one launcher per `L2` bucket (1, 2, 4,
+8, 16); each bakes the packed-only pointers and flags, `L2`, and the slots
+from `L2` up as `None` (one launcher passing all 16 slots measured 0.27 us
+more per launch at L=2 and 0.10 us at L=8 on gfx942, none at L=16). A device
+table of base pointers was not used: it needs a host-to-device copy per
+call, or a cache keyed by pointer values, where kernel arguments need
+neither. The sequence entry also takes the Python fast paths
+`attn_res_gate` uses (no reshape of a 2-D contiguous residual, memoized
+`next_power_of_2`, no INFO-log arguments below that level).
+
+Verified with intj `develop` `2783079`, Triton 3.8.0, `AITER_TRITON_ONLY=1`,
+on gfx942 and gfx950 (MI350X):
+
+- **Tests.** `test_attn_res.py`: 272 passed on both GPUs (the base tree's 251
+  plus the sequence launch checked bitwise against a Triton launch of the same
+  kernel across L2 buckets, dtypes, output norm, scalars equal to 1.0 and
+  token counts, and every residual count from 1 to 17, and 33, against the
+  torch reference), and the same with `ATTN_RES_TRITON_AUTOTUNE=1`, except on
+  gfx942 `test_attn_res_gate_out_quant_matches_unfused_quant[64]`, which
+  fails there on the base tree too. `test_mhc.py`, which imports the same
+  kernel package: 406 passed, 12 skipped on both GPUs, as on the base tree.
+  Under `torch.compile` the sequence entry works without `fullgraph` and
+  fails with it, before and after (gfx942).
+- **Outputs.** 519 sequence-layout cases (L 1-16, fp32/bf16/fp16, with and
+  without the output norm, eps and scale values, leading dimensions, and the
+  shape sweep below) are bitwise equal to the base tree's and to upstream
+  `874d253dd3`'s, on both GPUs.
+- **Code.** The AMDGCN and kernel descriptor (kernarg size, registers) of all
+  168 sequence compiles and 186 gate/packed compiles the comparison reaches
+  are identical to the base tree's, on both GPUs.
+- **Host time**, us per call: N=1, D=1024, bf16, output norm (`attn_res_gate`:
+  N=1, B=8, D=7168, quant and `close_block`); median of 2000 batches of 8
+  calls per process, median (and range) of 5 alternating processes, pinned to
+  the GPU's NUMA node. "Launch" is the kernel call alone, arguments prebuilt.
+  Upstream's numbers are the base tree's within 1.5% for the sequence layout.
+  In the same rounds, one sequence launcher passing all 16 slots
+  (`9b60a4ddc`) measured 12.1 (gfx942) and 7.25 (gfx950) for the L=2 entry,
+  and within 0.1 us of the numbers below at L=16.
+
+  | | gfx942 before | gfx942 after | gfx950 before | gfx950 after |
+  | --- | ---: | ---: | ---: | ---: |
+  | sequence entry, L=2 | 66.2 | 11.6 (11.5-11.7) | 33.7 | 7.0 (7.0-7.3) |
+  | sequence entry, L=16 | 111.7 | 18.6 (18.5-18.7) | 62.6 | 10.7 (10.6-11.0) |
+  | sequence launch, L=2 | 37.2 | 4.4 (4.4-4.5) | 22.6 | 2.9 (2.9-3.2) |
+  | sequence launch, L=16 | 62.5 | 5.4 (5.3-5.4) | 40.0 | 3.1 (3.1-3.4) |
+  | packed entry, L=4 | 26.5 | 25.4 (25.1-25.6) | 18.0 | 17.0 (16.8-17.3) |
+  | `attn_res_gate` | 17.0 | 17.2 (17.0-17.4) | 10.5 | 10.5 (10.4-10.8) |
+
+- **GPU time** (`torch.cuda.Event` over 50 back-to-back launches queued
+  behind a sleep, 3 alternating processes; rocprofv3 aborts under this torch):
+  L in {2, 4, 8, 16}, N in {1, 64, 4096}, D in {1024, 4096, 7168}, bf16. The
+  after/before ratio of the 36 shapes is 0.989-1.007 on gfx950 and
+  0.982-1.014 on gfx942, median 1.000 on both. Over 200-launch batches the
+  gfx942 extremes re-measured equal (N=64, D=1024, L=2: 4.28 vs 4.28-4.29
+  us, as did the same launch through Triton), or swapped sides between runs
+  (N=64, D=4096, L=16: 23.2-23.3 vs 24.1-24.7 us, then 24.2-24.6 vs
+  23.0-23.1 us).
+
+Not run: CUDA.
+
+## pa_mqa_logits' AOT mode
+
+`deepgemm_fp8_paged_mqa_logits` had three Gluon paths: JIT mode and AOT mode
+(`AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1`) on Triton >= 3.5, both through the
+six launchers above, and an AOT loader for Triton < 3.4, the last Triton
+launch in the file: `kernel[grid](...)` on a `functools.cache`d
+`triton.compile` of a signature-only stand-in kernel (with an extra dummy
+pointer argument), its hsaco/json swapped in by `AOTMetadataContext`.
+Upstream launched the same cached `triton.compile` result as a
+`CompiledKernel` in both modes on Triton >= 3.5.
+
+- **The Triton < 3.4 loader is deleted, not migrated: it cannot run.** intj
+  needs Triton >= 3.7, and `make_launcher` refuses an older one already at
+  decoration (`UnsupportedKernel: Triton >=3.7 is required`), so `import
+  aiter` fails at its first module-level launcher (Triton 3.5.1:
+  `_triton_kernels/quant/fast_transpose.py`); this file's own kernel module
+  declares launchers too. Upstream's loader was broken as well: the < 3.5
+  import branch never imported `get_cdna_version`, so the first call raised
+  `NameError` (reached on Triton 3.8 with its version string set to 3.3.1),
+  and the stand-ins lack the `num_block`, `CDNA_VERSION` and `ARCH`
+  parameters its signature names. Nothing on Triton >= 3.7 reached
+  `_compile_deepgemm_fp8_paged_mqa_logits` or the stand-ins; both are gone,
+  with the per-call `triton_version >= Version("3.5.0")` test (0.65 us on
+  MI350X: it parses a `Version` every call).
+- **The AOT context is entered only on a miss.** Every AOT-mode call used to
+  enter `AOTMetadataContext`, though only a launch that misses intj's cache
+  compiles and loads a binary. In AOT mode the module now passes its three
+  Gluon kernels to `require_metadata_redirect` (`triton_metadata_redirect.py`):
+  building one's `CompiledKernel` with no redirect registered on the thread
+  raises `MetadataRedirectMissing`, after Triton's `__init__` has read the
+  files and before anything is loaded on the GPU. The entry launches outside
+  the context and retries only on that exception, inside it; the retry finds
+  the first attempt's compile in Triton's cache, and intj keeps nothing from
+  the failed attempt. A compile of those kernels anywhere else in an
+  AOT-mode process raises instead of loading the binary it compiled.
+  `test_metadata_redirect.py::test_required_redirect_only_on_miss` covers the
+  mechanism, on gfx942 only (its prebuilt kernel is a gfx942 binary). In AOT
+  mode `test_pa_mqa_logits_offset.py` covers this file's use of it on gfx942
+  and gfx950: the wide-output test checks that the kernels it ran were
+  loaded from `configs/paged_mqa_logits/aot/`, and
+  `test_paged_mqa_logits_aot_never_runs_its_own_compile` that a configuration
+  with no prebuilt files raises. Outputs alone cannot tell: the compiled and
+  the prebuilt binary compute the same logits. With the
+  `require_metadata_redirect` call removed, these three tests fail on gfx942
+  and gfx950, while on gfx942 the tests that predate them still pass. With
+  the raise in `triton_metadata_redirect.py` removed, they fail on gfx942.
+
+Verified with intj `2783079`, Triton 3.8.0, `AITER_TRITON_ONLY=1`, on gfx942
+(MI300X) and gfx950 (MI350X, GPU 4), against upstream `874d253dd3`, in both
+modes. No AOT artifact ships in the tree: per GPU, they were made from
+upstream the way `bench_deepgemm_attention.py -aot` makes them (run JIT mode,
+copy the returned key's Triton cache directory to
+`configs/paged_mqa_logits/aot/<name>`), for the configurations below and the
+offset test's.
+
+- **Tests**, the same on both trees and GPUs: `test_pa_mqa_logits_offset.py`
+  105 passed in JIT mode, 2 passed and 103 skipped in AOT mode (only the
+  wide-output test runs there; this branch adds the AOT test above, which
+  passes in AOT mode and is skipped in JIT mode); `test_fp8_mqa_logits.py`
+  152 passed;
+  `test_metadata_redirect.py` 4 passed on gfx942 (3 upstream), skipped on
+  gfx950. `test_pa_mqa_logits_opus.py` (2) and
+  `test_pa_mqa_logits_mxfp4_opus.py` (4) fail on both trees: their `test_*`
+  functions take arguments pytest does not supply, and they do not reach
+  this kernel.
+- **Outputs**: 16 calls (plain, preshuffle and preshuffle-varctx at batch 1,
+  the offset test's configuration; two seeds; a miss and a hit) are bitwise
+  equal to upstream's in both modes on both GPUs.
+- **Binary**: in AOT mode a configuration's first call enters the context
+  once and the next 200 not at all; the launched kernel's hsaco is the
+  artifact's and its json hash differs from the compile's. A direct launcher
+  call outside the context raises `MetadataRedirectMissing`; a configuration
+  with no artifact raises `FileNotFoundError`, as before. An artifact made by
+  `bench_deepgemm_attention.py -aot` on this tree loads in AOT mode on
+  gfx950 with the JIT run's `logits_diff`.
+- **Host time** (MI350X GPU 4, `taskset` to NUMA node 1; batch 1, one token,
+  64 heads, 128-dim, 256-token context, ChunkK 256, WavePerEU 2): median us
+  per call of six alternating rounds, one process per tree and mode, each
+  the median of 2000 batches of 8 calls with a synchronize after each batch
+  outside the timer; in parentheses the range of the six process medians.
+  "Before" is this branch at `ba40fc7e2`.
+
+  | Mode | `deepgemm_fp8_paged_mqa_logits` | upstream | before | now |
+  | --- | --- | ---: | ---: | ---: |
+  | AOT | plain, page 1 | 23.14 (22.66-23.45) | 20.18 (20.00-20.30) | 18.42 (18.14-18.44) |
+  | AOT | preshuffle, page 16 | 23.37 (23.06-23.78) | 20.33 (20.12-20.43) | 18.62 (18.24-18.74) |
+  | AOT | preshuffle varctx, page 16 | 23.64 (23.48-24.07) | 20.27 (20.21-20.67) | 18.66 (18.19-18.73) |
+  | JIT | plain, page 1 | 23.02 (22.84-23.22) | 19.36 (19.12-19.62) | 18.54 (18.40-18.68) |
+  | JIT | preshuffle, page 16 | 23.33 (22.79-24.24) | 19.48 (19.20-19.83) | 18.68 (18.41-18.80) |
+  | JIT | preshuffle varctx, page 16 | 23.38 (23.18-23.70) | 19.51 (19.23-19.80) | 18.68 (18.40-19.02) |
+
+  The launch alone, replaying the entry's arguments, is 6.62-6.75 us
+  upstream (`CompiledKernel[grid](*args)`) and 2.57-2.60 us through the
+  launcher, before and now, in every row; inside a per-call
+  `AOTMetadataContext` it is 3.03-3.06 us. Not measured on gfx942.
+- **GPU kernel time** (rocprofv3, 500 launches, JIT mode), upstream vs now:
+  17.32 vs 17.39 us (plain, batch 16, 16384-token context) and 10.35 vs
+  10.30 us (preshuffle, page 64). AOT mode loads the same artifact on both
+  trees. No kernel code changed.
+
+Not verified: Triton 3.7 (intj's floor; only 3.8.0 here), a real Triton
+< 3.4, gfx1250, concurrent misses on several threads in AOT mode, and
+plain-kernel artifacts for a padded KV cache (`-p`, `PT` in the name).
+
 ## HsacoKernel
 
 `csrc.cpp_itfs.utils.jit(kernel, stream=None)` returns an `HsacoKernel`,
@@ -747,297 +1085,6 @@ and `itemgetter` for a one-value plan.
 
 Not verified: real hip-python, and two GPUs on gfx950.
 
-## FlashKDA
-
-`_FastLaunch` (`chunk_delta_attn/fast_launch.py`) is gone, and so is the
-`_intj_launcher` handle cache that replaced it. `flash_kda_fwd` validates that
-every input is on the current GPU, then calls the five kernels, each decorated
-with its intj launcher, as `kernel(device, stream, *grid, *args)`; it reads the
-current stream before every launch, so CUDA-graph capture works. Gluon K1
-fixes `num_warps=2` as an option; Gluon K2 and the segment scan take
-`num_warps` per call (`dynamic_options`); the cache modifiers are str
-constexprs, keyed by value. The autotuned K1 and K2 carry their tuners, so
-intj tunes on a miss (the tuner configs, the opt-in
-`CHUNK_DELTA_ATTN_TRITON_AUTOTUNE=1` space included) and launches natively on a
-hit: K1's `IS_VARLEN`/`HAS_BIAS` and the scan's `HAS_H0` stay `is not None`
-heuristics, lowered to C by intj; K2's grid reads the tuned `BW` through
-`grid_cpp`. Triton's debug/instrumentation/fpsan knobs and `TRITON_INTERPRET`
-are read at each launcher's first call and fixed after it. Tests that need a
-never-called launcher, other tuner configs, a spy or a Triton reference
-re-run the kernel modules under a stand-in `make_launcher`
-(`op_tests/triton_tests/chunk_delta_attn/kda_launchers.py`). The Gluon JITs
-build their layouts inside the kernel (K2's from `gl.num_warps()`), which intj
-requires; their gfx950 ISA is unchanged. See
-[the KDA direct-launch plan](superpowers/plans/2026-09-25-kda-direct-intj-launch.md).
-K1's and K2's autotune keys include `CM_WS` / `CM_OUT`, so segmented and
-unsegmented launches still tune apart as they did under per-modifier handles.
-Verified with intj `develop` `0f2226f`, Triton 3.8.0, on gfx942 and gfx950
-(MI350X): the three KDA test files pass in all four modes (default,
-`AITER_FDA_USE_GLUON=0`, `CHUNK_DELTA_ATTN_TRITON_AUTOTUNE=1`, both); o and
-final state are bitwise equal to the handle-cache revision on all 10
-`_CASES` x {forced Triton, Gluon K1+K2}, default and autotuned; warmed
-`flash_kda_fwd` host time is 5-12% lower on every route and GPU time is
-unchanged.
-Needs intj `develop` at or after `ad8c832`: earlier, a tuned handle retained
-the argument tensors of its last tuning miss, which
-`test_cached_native_handle_does_not_retain_tensor` catches.
-
-On gfx942 with Triton 3.8.0 and intj `b4e9f1f`, evenly spaced samples (at most
-120 tests per file) of 41 affected test files passed; mxfp4/fp4 and other
-gfx950-only cases skip there and are untested. Selected files also passed with
-Triton 3.7.1. The gated delta rule prefill and decode entry points, which have
-no runnable test here, returned bitwise-equal outputs to upstream Triton
-launches. `test_flash_attn_kvcache_sliding_window` in `test_mha_v3.py` is
-excluded: it reads uninitialized workspace, and fails with NaNs on the
-unconverted upstream revision too once that memory holds NaNs.
-
-For a local Triton 3.7.1 gfx942 check (this ran against the earlier
-callable-grid intj checkout; the path now points at intj `develop`):
-
-```sh
-AITER_TRITON_ONLY=1 PYTHONPATH="$PWD:/mnt/nvme2/jinpli/workspace/home/jinpli/development/intj" \
-  /tmp/intj-compat-py312/bin/python -m pytest -q \
-  'op_tests/triton_tests/test_softmax.py::test_softmax[1-128-fp32]' \
-  'op_tests/triton_tests/test_topk.py::test_topk[dtype0-True-2-128256-1]' \
-  'op_tests/triton_tests/test_cross_entropy.py::test_cross_entropy_forward_basic[dtype0-1-128]' \
-  'op_tests/triton_tests/attention/test_pa_decode_sparse.py::test_pa_decode_
-  sparse_vs_reference[False-False-True-136-512-16-1]' \
-  'op_tests/triton_tests/test_gmm.py::test_gmm[False-trhsF-10-2-3-4]'
-```
-
-All five selected tests passed with Triton 3.7.1. Equivalent selected tests
-passed with `/tmp/gb2/bin/python` (Triton 3.8.0), and an autotuned sparse
-prefill smoke case matched its Torch reference on both versions.
-
-After the FlashKDA direct-launch change (intj `develop`), `test_intj_launch.py`,
-`test_flash_kda.py` and `test_chunk_delta_attn_fwd.py` pass on gfx942 with
-Triton 3.7.1 and 3.8.0, and on 3.8.0 also with
-`CHUNK_DELTA_ATTN_TRITON_AUTOTUNE=1` (four K1 and 24 K2 candidates, tuned by
-intj). Forced-Triton FlashKDA outputs are
-bitwise equal to the `_FastLaunch` revision on every `test_flash_kda.py`
-case, default and autotuned. The Gluon kernels were compile-checked for
-gfx950 only; the gfx950 numbers below predate this change, which has not run
-on gfx950.
-
-## gfx950 chunk-delta benchmark
-
-On an MI350X (`gfx950`), compare isolated Aiter snapshots `28ba24c0a6`
-(baseline) and `f48301958` (converted) with intj `8619f455`. The environment
-was Python 3.14.4, Torch 2.15.0.dev20260816+rocm7.14, HIP 7.14.60850, and
-Triton 3.8.0. intj's automatic tensor access resolved to `CPYTHON` because
-its verified fast Torch layout does not cover Torch 2.15. Each result is the
-median of five alternating baseline/converted runs on GPU 0, with 300 ms of
-warmup and 500 ms in `triton.testing.do_bench`. Negative change means faster.
-
-| Path and shape (B×T×H×K×V) | Baseline ms | Converted ms | Change |
-| --- | ---: | ---: | ---: |
-| FlashKDA 1×512×12×128×128, normal gfx950 Gluon route | 0.0432 | 0.0432 | 0.00% |
-| FlashKDA 1×512×12×128×128, forced Triton route | 0.0467 | 0.0468 | +0.21% |
-| FlashKDA 1×16384×12×128×128, normal gfx950 Gluon route | 0.5442 | 0.5441 | −0.02% |
-| FlashKDA 1×16384×12×128×128, forced Triton route | 0.7869 | 0.7820 | −0.62% |
-| Default pipeline 2×4096×16×64×64 | 2.1290 | 2.0919 | −1.74% |
-
-FlashKDA uses `bench_flash_kda.py` with `AITER_FDA_USE_GLUON=1` or `0`;
-the default pipeline uses `bench_chunk_delta_attn.py` with
-`AITER_FDA_ENABLE=0`. Both scripts live in `op_tests/op_benchmarks/triton/`
-and were run with `AITER_TRITON_ONLY=1`, `HIP_VISIBLE_DEVICES=0`,
-`--warmup-ms 300 --rep-ms 500`, and the table's `--shape` values. GPU-event
-times include host-induced gaps between eager launches, but exclude initial
-JIT compilation and autotuning.
-
-For the forced-Triton 512-token case, 100 warmed K1 prepare launches per
-host-timed block took 12.5658 µs/call on the baseline and 11.8462 µs/call
-with intj (−5.73%). This excludes GPU completion, allocations, JIT, and
-autotuning; two processes per revision each contributed nine blocks. A
-same-process A/B changing only the default pipeline's solve dispatch measured
-2.1197 ms with Triton and 2.0917 ms with intj (−1.32%) over five alternating
-rounds. Its output and `Akk` were bitwise equal. The FlashKDA pipeline
-differences are within the observed run-to-run variation.
-
-## attn_res's sequence layout
-
-`_run_sequence` passed its residuals to `attnres_fwd_kernel` as one tuple
-(`res`), which intj does not decode, so it launched the JIT function through
-Triton. The kernel now takes 16 pointer parameters, `res0`..`res15`, and packs
-them back into the tuple its gather loop indexes: the residuals, padded to
-`L2` with the first one as before, then `None`. More than 16 residuals
-(`ATTN_RES_SEQ_SLOTS`), which the tuple also took, are stacked into one
-tensor and take the packed layout: one device copy of the residuals, and
-outputs within tolerance of the tuple launch's but not bitwise equal to them
-(29 of 68 cases equal on gfx942, 27 on gfx950, L 17-64). GPU time per call
-at L 17 and 32 (the N and D of the GPU times below, bf16), copy and packed
-kernel against the tuple launch: 0.05-0.47x on gfx942; 0.06-0.66x on gfx950
-except at D=1024 with N of 1 or 64, where it is 1.2-2.0x (N=1: 13.6 vs 16.7
-us at L=17, 13.7 vs 26.0 us at L=32).
-
-Six launchers launch the one kernel, each baking what its layout never
-varies, so a call neither passes nor decodes it. `attnres_fwd_kernel`
-(`attn_res_gate`, `layout="packed"`) bakes the 16 slots as `None` (passing
-them measured 0.4 us more per launch on gfx942).
-`attnres_fwd_sequence_kernels` holds one launcher per `L2` bucket (1, 2, 4,
-8, 16); each bakes the packed-only pointers and flags, `L2`, and the slots
-from `L2` up as `None` (one launcher passing all 16 slots measured 0.27 us
-more per launch at L=2 and 0.10 us at L=8 on gfx942, none at L=16). A device
-table of base pointers was not used: it needs a host-to-device copy per
-call, or a cache keyed by pointer values, where kernel arguments need
-neither. The sequence entry also takes the Python fast paths
-`attn_res_gate` uses (no reshape of a 2-D contiguous residual, memoized
-`next_power_of_2`, no INFO-log arguments below that level).
-
-Verified with intj `develop` `2783079`, Triton 3.8.0, `AITER_TRITON_ONLY=1`,
-on gfx942 and gfx950 (MI350X):
-
-- **Tests.** `test_attn_res.py`: 272 passed on both GPUs (the base tree's 251
-  plus the sequence launch checked bitwise against a Triton launch of the same
-  kernel across L2 buckets, dtypes, output norm, scalars equal to 1.0 and
-  token counts, and every residual count from 1 to 17, and 33, against the
-  torch reference), and the same with `ATTN_RES_TRITON_AUTOTUNE=1`, except on
-  gfx942 `test_attn_res_gate_out_quant_matches_unfused_quant[64]`, which
-  fails there on the base tree too. `test_mhc.py`, which imports the same
-  kernel package: 406 passed, 12 skipped on both GPUs, as on the base tree.
-  Under `torch.compile` the sequence entry works without `fullgraph` and
-  fails with it, before and after (gfx942).
-- **Outputs.** 519 sequence-layout cases (L 1-16, fp32/bf16/fp16, with and
-  without the output norm, eps and scale values, leading dimensions, and the
-  shape sweep below) are bitwise equal to the base tree's and to upstream
-  `874d253dd3`'s, on both GPUs.
-- **Code.** The AMDGCN and kernel descriptor (kernarg size, registers) of all
-  168 sequence compiles and 186 gate/packed compiles the comparison reaches
-  are identical to the base tree's, on both GPUs.
-- **Host time**, us per call: N=1, D=1024, bf16, output norm (`attn_res_gate`:
-  N=1, B=8, D=7168, quant and `close_block`); median of 2000 batches of 8
-  calls per process, median (and range) of 5 alternating processes, pinned to
-  the GPU's NUMA node. "Launch" is the kernel call alone, arguments prebuilt.
-  Upstream's numbers are the base tree's within 1.5% for the sequence layout.
-  In the same rounds, one sequence launcher passing all 16 slots
-  (`33c4e14a7`) measured 12.1 (gfx942) and 7.25 (gfx950) for the L=2 entry,
-  and within 0.1 us of the numbers below at L=16.
-
-  | | gfx942 before | gfx942 after | gfx950 before | gfx950 after |
-  | --- | ---: | ---: | ---: | ---: |
-  | sequence entry, L=2 | 66.2 | 11.6 (11.5-11.7) | 33.7 | 7.0 (7.0-7.3) |
-  | sequence entry, L=16 | 111.7 | 18.6 (18.5-18.7) | 62.6 | 10.7 (10.6-11.0) |
-  | sequence launch, L=2 | 37.2 | 4.4 (4.4-4.5) | 22.6 | 2.9 (2.9-3.2) |
-  | sequence launch, L=16 | 62.5 | 5.4 (5.3-5.4) | 40.0 | 3.1 (3.1-3.4) |
-  | packed entry, L=4 | 26.5 | 25.4 (25.1-25.6) | 18.0 | 17.0 (16.8-17.3) |
-  | `attn_res_gate` | 17.0 | 17.2 (17.0-17.4) | 10.5 | 10.5 (10.4-10.8) |
-
-- **GPU time** (`torch.cuda.Event` over 50 back-to-back launches queued
-  behind a sleep, 3 alternating processes; rocprofv3 aborts under this torch):
-  L in {2, 4, 8, 16}, N in {1, 64, 4096}, D in {1024, 4096, 7168}, bf16. The
-  after/before ratio of the 36 shapes is 0.989-1.007 on gfx950 and
-  0.982-1.014 on gfx942, median 1.000 on both. Over 200-launch batches the
-  gfx942 extremes re-measured equal (N=64, D=1024, L=2: 4.28 vs 4.28-4.29
-  us, as did the same launch through Triton), or swapped sides between runs
-  (N=64, D=4096, L=16: 23.2-23.3 vs 24.1-24.7 us, then 24.2-24.6 vs
-  23.0-23.1 us).
-
-Not run: CUDA.
-
-## pa_mqa_logits' AOT mode
-
-`deepgemm_fp8_paged_mqa_logits` had three Gluon paths: JIT mode and AOT mode
-(`AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1`) on Triton >= 3.5, both through the
-six launchers above, and an AOT loader for Triton < 3.4, the last Triton
-launch in the file: `kernel[grid](...)` on a `functools.cache`d
-`triton.compile` of a signature-only stand-in kernel (with an extra dummy
-pointer argument), its hsaco/json swapped in by `AOTMetadataContext`.
-Upstream launched the same cached `triton.compile` result as a
-`CompiledKernel` in both modes on Triton >= 3.5.
-
-- **The Triton < 3.4 loader is deleted, not migrated: it cannot run.** intj
-  needs Triton >= 3.7, and `make_launcher` refuses an older one already at
-  decoration (`UnsupportedKernel: Triton >=3.7 is required`), so `import
-  aiter` fails at its first module-level launcher (Triton 3.5.1:
-  `_triton_kernels/quant/fast_transpose.py`); this file's own kernel module
-  declares launchers too. Upstream's loader was broken as well: the < 3.5
-  import branch never imported `get_cdna_version`, so the first call raised
-  `NameError` (reached on Triton 3.8 with its version string set to 3.3.1),
-  and the stand-ins lack the `num_block`, `CDNA_VERSION` and `ARCH`
-  parameters its signature names. Nothing on Triton >= 3.7 reached
-  `_compile_deepgemm_fp8_paged_mqa_logits` or the stand-ins; both are gone,
-  with the per-call `triton_version >= Version("3.5.0")` test (0.65 us on
-  MI350X: it parses a `Version` every call).
-- **The AOT context is entered only on a miss.** Every AOT-mode call used to
-  enter `AOTMetadataContext`, though only a launch that misses intj's cache
-  compiles and loads a binary. In AOT mode the module now passes its three
-  Gluon kernels to `require_metadata_redirect` (`triton_metadata_redirect.py`):
-  building one's `CompiledKernel` with no redirect registered on the thread
-  raises `MetadataRedirectMissing`, after Triton's `__init__` has read the
-  files and before anything is loaded on the GPU. The entry launches outside
-  the context and retries only on that exception, inside it; the retry finds
-  the first attempt's compile in Triton's cache, and intj keeps nothing from
-  the failed attempt. A compile of those kernels anywhere else in an
-  AOT-mode process raises instead of loading the binary it compiled.
-  `test_metadata_redirect.py::test_required_redirect_only_on_miss` covers the
-  mechanism, on gfx942 only (its prebuilt kernel is a gfx942 binary). In AOT
-  mode `test_pa_mqa_logits_offset.py` covers this file's use of it on gfx942
-  and gfx950: the wide-output test checks that the kernels it ran were
-  loaded from `configs/paged_mqa_logits/aot/`, and
-  `test_paged_mqa_logits_aot_never_runs_its_own_compile` that a configuration
-  with no prebuilt files raises. Outputs alone cannot tell: the compiled and
-  the prebuilt binary compute the same logits. With the
-  `require_metadata_redirect` call removed, these three tests fail on gfx942
-  and gfx950, while on gfx942 the tests that predate them still pass. With
-  the raise in `triton_metadata_redirect.py` removed, they fail on gfx942.
-
-Verified with intj `2783079`, Triton 3.8.0, `AITER_TRITON_ONLY=1`, on gfx942
-(MI300X) and gfx950 (MI350X, GPU 4), against upstream `874d253dd3`, in both
-modes. No AOT artifact ships in the tree: per GPU, they were made from
-upstream the way `bench_deepgemm_attention.py -aot` makes them (run JIT mode,
-copy the returned key's Triton cache directory to
-`configs/paged_mqa_logits/aot/<name>`), for the configurations below and the
-offset test's.
-
-- **Tests**, the same on both trees and GPUs: `test_pa_mqa_logits_offset.py`
-  105 passed in JIT mode, 2 passed and 103 skipped in AOT mode (only the
-  wide-output test runs there; this branch adds the AOT test above, which
-  passes in AOT mode and is skipped in JIT mode); `test_fp8_mqa_logits.py`
-  152 passed;
-  `test_metadata_redirect.py` 4 passed on gfx942 (3 upstream), skipped on
-  gfx950. `test_pa_mqa_logits_opus.py` (2) and
-  `test_pa_mqa_logits_mxfp4_opus.py` (4) fail on both trees: their `test_*`
-  functions take arguments pytest does not supply, and they do not reach
-  this kernel.
-- **Outputs**: 16 calls (plain, preshuffle and preshuffle-varctx at batch 1,
-  the offset test's configuration; two seeds; a miss and a hit) are bitwise
-  equal to upstream's in both modes on both GPUs.
-- **Binary**: in AOT mode a configuration's first call enters the context
-  once and the next 200 not at all; the launched kernel's hsaco is the
-  artifact's and its json hash differs from the compile's. A direct launcher
-  call outside the context raises `MetadataRedirectMissing`; a configuration
-  with no artifact raises `FileNotFoundError`, as before. An artifact made by
-  `bench_deepgemm_attention.py -aot` on this tree loads in AOT mode on
-  gfx950 with the JIT run's `logits_diff`.
-- **Host time** (MI350X GPU 4, `taskset` to NUMA node 1; batch 1, one token,
-  64 heads, 128-dim, 256-token context, ChunkK 256, WavePerEU 2): median us
-  per call of six alternating rounds, one process per tree and mode, each
-  the median of 2000 batches of 8 calls with a synchronize after each batch
-  outside the timer; in parentheses the range of the six process medians.
-  "Before" is this branch at `ba40fc7e2`.
-
-  | Mode | `deepgemm_fp8_paged_mqa_logits` | upstream | before | now |
-  | --- | --- | ---: | ---: | ---: |
-  | AOT | plain, page 1 | 23.14 (22.66-23.45) | 20.18 (20.00-20.30) | 18.42 (18.14-18.44) |
-  | AOT | preshuffle, page 16 | 23.37 (23.06-23.78) | 20.33 (20.12-20.43) | 18.62 (18.24-18.74) |
-  | AOT | preshuffle varctx, page 16 | 23.64 (23.48-24.07) | 20.27 (20.21-20.67) | 18.66 (18.19-18.73) |
-  | JIT | plain, page 1 | 23.02 (22.84-23.22) | 19.36 (19.12-19.62) | 18.54 (18.40-18.68) |
-  | JIT | preshuffle, page 16 | 23.33 (22.79-24.24) | 19.48 (19.20-19.83) | 18.68 (18.41-18.80) |
-  | JIT | preshuffle varctx, page 16 | 23.38 (23.18-23.70) | 19.51 (19.23-19.80) | 18.68 (18.40-19.02) |
-
-  The launch alone, replaying the entry's arguments, is 6.62-6.75 us
-  upstream (`CompiledKernel[grid](*args)`) and 2.57-2.60 us through the
-  launcher, before and now, in every row; inside a per-call
-  `AOTMetadataContext` it is 3.03-3.06 us. Not measured on gfx942.
-- **GPU kernel time** (rocprofv3, 500 launches, JIT mode), upstream vs now:
-  17.32 vs 17.39 us (plain, batch 16, 16384-token context) and 10.35 vs
-  10.30 us (preshuffle, page 64). AOT mode loads the same artifact on both
-  trees. No kernel code changed.
-
-Not verified: Triton 3.7 (intj's floor; only 3.8.0 here), a real Triton
-< 3.4, gfx1250, concurrent misses on several threads in AOT mode, and
-plain-kernel artifacts for a padded KV cache (`-p`, `PT` in the name).
-
 ## The metadata-redirect separate-compile test
 
 `test_separate_compile_and_run` compiled `empty_kernel` with
@@ -1074,7 +1121,9 @@ does, so Triton caches the result under a different key. The redirect
 replaces that result either way.
 
 Verified on gfx942 (MI300X, `HIP_VISIBLE_DEVICES=5`, intj `2783079`, Triton
-3.8.0): the file passes in full, 3 of 3, on this revision and on its parent.
+3.8.0): the file passes in full, 3 of 3, on this change and on its parent;
+4 of 4 on the integrated tree, which adds pa_mqa_logits'
+`test_required_redirect_only_on_miss`.
 
 Host time per launch of the empty kernel, grid `(1, 1, 1)`: batches of 8
 calls with a synchronize after each batch outside the timer, median of 3000
