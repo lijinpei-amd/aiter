@@ -29,10 +29,6 @@ from aiter.utility import dtypes
 _LOGGER = AiterTritonLogger()
 
 
-_fused_rms_mxfp4_quant_launch = make_launcher(_fused_rms_mxfp4_quant_kernel, grid_arg=1)
-_gluon_fused_rms_mxfp4_quant_launch = make_launcher(_gluon_fused_rms_mxfp4_quant_kernel)
-
-
 def fused_rms_mxfp4_quant(
     x1: torch.Tensor,
     x1_weight: torch.Tensor,
@@ -181,7 +177,7 @@ def fused_rms_mxfp4_quant(
             ROWS_PER_CTA //= 2
         grid = (triton.cdiv(M, ROWS_PER_CTA) * (1 if x2 is None else 2),)
         dev, stream = current_device_stream()
-        _gluon_fused_rms_mxfp4_quant_launch(
+        _gluon_fused_rms_mxfp4_quant_kernel(
             dev,
             stream,
             grid,
@@ -191,7 +187,7 @@ def fused_rms_mxfp4_quant(
         )
     else:
         dev, stream = current_device_stream()
-        _fused_rms_mxfp4_quant_launch(
+        _fused_rms_mxfp4_quant_kernel(
             dev,
             stream,
             M * (1 if x2 is None else 2),
@@ -250,13 +246,6 @@ def fused_flatten_mxfp4_quant(
     )
 
     return out, out_block_scales
-
-
-_fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel_launch = make_launcher(
-    _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel,
-    dynamic_options=("num_warps",),
-    options={"waves_per_eu": 0, "num_stages": 1},
-)
 
 
 def fused_reduce_act_mul_and_mxfp4_quant(
@@ -394,7 +383,7 @@ def fused_reduce_act_mul_and_mxfp4_quant(
 
     grid = (num_pid,)
     dev, stream = current_device_stream()
-    _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel_launch(
+    _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel(
         dev,
         stream,
         grid,
@@ -438,12 +427,6 @@ def fused_reduce_act_mul_and_mxfp4_quant(
     )
 
     return (y, y_scale), y2
-
-
-_reduce_rms_mxfp4_quant_launch = make_launcher(_fused_reduce_rms_mxfp4_quant_kernel)
-_gluon_reduce_rms_mxfp4_quant_launch = make_launcher(
-    _gluon_fused_reduce_rms_mxfp4_quant_kernel
-)
 
 
 def fused_reduce_rms_mxfp4_quant(
@@ -594,9 +577,9 @@ def fused_reduce_rms_mxfp4_quant(
 
     # select kernel based on args and arch
     kernel = (
-        _gluon_reduce_rms_mxfp4_quant_launch
+        _gluon_fused_reduce_rms_mxfp4_quant_kernel
         if (args in ["gluon", "auto"]) and get_arch() == "gfx1250"
-        else _reduce_rms_mxfp4_quant_launch
+        else _fused_reduce_rms_mxfp4_quant_kernel
     )
 
     dev, stream = current_device_stream()

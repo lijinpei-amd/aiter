@@ -154,6 +154,7 @@ _gluon_fused_rms_mxfp4_quant_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.heuristics(
     {
         "EVEN_M_N": even_m_n1_rows,
@@ -450,6 +451,7 @@ def _gluon_fused_rms_mxfp4_quant_kernel(
         gl.amd.gfx1250.tdm.async_wait(0)
 
 
+@make_launcher
 @triton.heuristics(
     {
         "EVEN_M_N": even_m_n1,

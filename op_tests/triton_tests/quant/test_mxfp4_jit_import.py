@@ -87,9 +87,16 @@ CASES = [
 ]
 
 
+def _heuristics(kernel_name):
+    # The kernel is decorated with its intj launcher, which launches the
+    # Heuristics-wrapped JIT function.
+    launcher = getattr(importlib.import_module(PUBLIC_WRAPPER), kernel_name)
+    return launcher.__self__.options.jit_func
+
+
 @pytest.mark.parametrize("module_name,kernel_name,kind", KERNELS)
 def test_jit_import_and_complete_source(module_name, kernel_name, kind):
-    kernel = getattr(importlib.import_module(PUBLIC_WRAPPER), kernel_name)
+    kernel = _heuristics(kernel_name)
     # Heuristics -> JITFunction -> original Python function.
     assert "def " + kernel_name in inspect.getsource(kernel.fn.fn)
 
@@ -120,7 +127,7 @@ def test_decorators_remain_safe_for_legacy_inspect(module_name, kernel_name, kin
 @pytest.mark.parametrize("module_name,kernel_name,kind", KERNELS)
 @pytest.mark.parametrize("dimensions,expected", CASES)
 def test_alignment_truth_table(module_name, kernel_name, kind, dimensions, expected):
-    kernel = getattr(importlib.import_module(PUBLIC_WRAPPER), kernel_name)
+    kernel = _heuristics(kernel_name)
     args = dict(zip(("M", "N1", "N2", "N3", "NUM_ITER"), dimensions))
     args.update(
         BLOCK_SIZE_M=16,

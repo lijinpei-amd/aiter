@@ -43,6 +43,7 @@ _fused_rms_mxfp4_quant_repr = make_kernel_repr(
 )
 
 
+@make_launcher(grid_arg=1)
 @triton.heuristics(
     {
         "EVEN_M_N": _even_m_n1,
@@ -328,6 +329,10 @@ _fused_reduce_act_mul_and_dynamic_mxfp4_quant_repr = make_kernel_repr(
 )
 
 
+@make_launcher(
+    dynamic_options=("num_warps",),
+    options={"waves_per_eu": 0, "num_stages": 1},
+)
 @triton.heuristics(
     {
         "EVEN_M_N": _even_m_n1_iter,
@@ -567,6 +572,7 @@ _fused_reduce_rms_mxfp4_quant_repr = make_kernel_repr(
 )
 
 
+@make_launcher
 @triton.heuristics(
     {
         "EVEN_M_N": _even_m_n1,

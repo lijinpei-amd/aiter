@@ -4,7 +4,6 @@
 
 import pytest
 import torch
-from intj import make_launcher
 from triton.runtime.autotuner import Heuristics
 from triton.runtime.jit import JITFunction
 
@@ -37,8 +36,11 @@ def _input(rows=2, columns=64):
     return torch.ones((rows, columns), dtype=torch.bfloat16, device="cuda")
 
 
-def _bracket_handle(kernel, grid_arg=None, dynamic_options=(), options=None):
-    """A launcher stand-in that launches ``kernel[grid](...)`` instead."""
+def _bracket_handle(launcher):
+    """A stand-in for ``launcher`` that launches its kernel as
+    ``kernel[grid](...)``, with the launcher's grid form and options."""
+    opts = launcher.__self__.options
+    kernel = opts.jit_func
     jit, assigned = kernel, set()
     while not isinstance(jit, JITFunction):
         assigned.update(jit.values)
@@ -46,13 +48,13 @@ def _bracket_handle(kernel, grid_arg=None, dynamic_options=(), options=None):
     names = [p.name for p in jit.params if p.name not in assigned]
 
     def launch(_device, _stream, *args):
-        if grid_arg:
-            grid, args = args[:grid_arg], args[grid_arg:]
+        if opts.grid_arg:
+            grid, args = args[: opts.grid_arg], args[opts.grid_arg :]
         else:
             grid, args = args[0], args[1:]
-        dynamic = dict(zip(dynamic_options, args))
-        args = args[len(dynamic_options) :]
-        kernel[grid](**dict(zip(names, args)), **dynamic, **(options or {}))
+        dynamic = dict(zip(opts.dynamic_options, args))
+        args = args[len(opts.dynamic_options) :]
+        kernel[grid](**dict(zip(names, args)), **dynamic, **(opts.options or {}))
 
     return launch
 
@@ -86,8 +88,8 @@ def test_fused_rms_mxfp4_quant_matches_triton_reference(monkeypatch):
 
     monkeypatch.setattr(
         _wrapper,
-        "_fused_rms_mxfp4_quant_launch",
-        _bracket_handle(_kernels._fused_rms_mxfp4_quant_kernel, grid_arg=1),
+        "_fused_rms_mxfp4_quant_kernel",
+        _bracket_handle(_kernels._fused_rms_mxfp4_quant_kernel),
     )
     (packed_t, scales_t), norm_t, _, _ = _run()
     monkeypatch.undo()
@@ -107,12 +109,8 @@ def test_fused_reduce_act_mul_mxfp4_quant_matches_triton_reference(monkeypatch):
 
     monkeypatch.setattr(
         _wrapper,
-        "_fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel_launch",
-        _bracket_handle(
-            _kernels._fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel,
-            dynamic_options=("num_warps",),
-            options={"waves_per_eu": 0, "num_stages": 1},
-        ),
+        "_fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel",
+        _bracket_handle(_kernels._fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel),
     )
     packed_t, scales_t = _run()[0]
     monkeypatch.undo()
@@ -132,7 +130,7 @@ def test_fused_reduce_rms_mxfp4_quant_matches_triton_reference(monkeypatch):
 
     monkeypatch.setattr(
         _wrapper,
-        "_reduce_rms_mxfp4_quant_launch",
+        "_fused_reduce_rms_mxfp4_quant_kernel",
         _bracket_handle(_kernels._fused_reduce_rms_mxfp4_quant_kernel),
     )
     (packed_t, scales_t), norm_t, _, _, _ = _run()
@@ -179,10 +177,10 @@ def test_fused_quant_fp8_sort_uses_intj():
 )
 def test_partial_heuristics_are_accepted_by_intj(name):
     # These heuristics used to be `functools.partial(even_m_n, ...)`, which
-    # intj's make_launcher refuses (not a lambda or single-return def with no
-    # free variables). They are now module-level defs reading literal keys;
-    # construction must succeed.
-    make_launcher(getattr(_kernels, name))
+    # intj refuses (not a lambda or single-return def with no free
+    # variables). They are now module-level defs reading literal keys; the
+    # kernel's launcher's check(), which analyzes them, must succeed.
+    getattr(_kernels, name).__self__.check()
 
 
 @pytest.mark.parametrize(
@@ -193,10 +191,10 @@ def test_partial_heuristics_are_accepted_by_intj(name):
     ],
 )
 def test_gluon_partial_heuristics_are_accepted_by_intj(name):
-    # The gfx1250 Gluon kernels got the same module-level defs; the lazy
-    # launcher analyzes their heuristics at construction, without a gfx1250 GPU.
+    # The gfx1250 Gluon kernels got the same module-level defs; check()
+    # analyzes their heuristics without a gfx1250 GPU.
     from aiter.ops.triton._gluon_kernels.gfx1250.quant import (
         fused_mxfp4_quant as gluon_kernels,
     )
 
-    make_launcher(getattr(gluon_kernels, name))
+    getattr(gluon_kernels, name).__self__.check()
