@@ -30,6 +30,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
     B,
     _pipeline_peeled,
     pipeline_depth,
+    pipeline_register_period,
     pipeline_unroll,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
@@ -730,7 +731,7 @@ def test_all_component_buffer_counts_determine_lcm_unroll(
     )
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     layout = compute_kernel_layout(tc)
-    assert _plain(layout.pipeline_register_period()) == period
+    assert _plain(pipeline_register_period(tc, layout)) == period
     assert _plain(pipeline_unroll(tc, layout)) == expected
     resolved = [count or config["NUM_LDS_BUFFER"] for count in counts]
     assert [
@@ -791,7 +792,7 @@ def test_small_payload_tiles_use_register_rings(config):
     assert not _plain(layout.component_via_lds(B_PAYLOAD))
     assert config["ALLOW_B_VIA_LDS"]
     assert not config["B_PRESHUFFLED"]
-    assert _plain(layout.pipeline_register_period()) == 6
+    assert _plain(pipeline_register_period(tc, layout)) == 6
     assert _plain(layout.lds_bytes()) == 0
     assert _plain(_validate(tc, 64, 512))
 

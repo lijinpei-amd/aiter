@@ -1,72 +1,243 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Frozen gfx950 Gluon MoE kernel path.
+"""Frozen gfx950 Gluon MoE kernel: a self-contained snapshot of the best measured build.
 
 ``_pipeline_step_frozen`` is a verbatim copy of ``moe_gemm._pipeline_step_impl`` taken
 from the best measured kernel (2026-09-02), with every env-var constexpr replaced by its
-tuned value so no stray flag can perturb the reference schedule. It lives in its own
-module for exactly that reason: no scheduling or execution logic here is meant to be
-refactored alongside the live step. Mechanical shared-interface renames and import
-moves may track the live modules; keeping this body separate still makes behavioral
-edits visible in the diff.
+tuned value so no stray flag can perturb the reference schedule.
+``AITER_TRITON_MOE_GLUON_FROZEN_STEP=1`` (``FROZEN_STEP`` in the tuning config) selects
+this body at the kernel entry. The complete kernel lives here: offsets, LDS allocation
+and access, dot selection, pipeline state, prologue, runtime loop, drain, final MFMA
+and epilogue.
 
-``AITER_TRITON_MOE_GLUON_FROZEN_STEP=1`` selects this body at the kernel entry.
-The complete performance-sensitive path lives here: LDS allocation and access,
-dot selection, pipeline state, prologue, runtime loop, drain, and final MFMA. Shared
-offset construction and epilogue primitives remain outside because they contain no
-frozen/live policy.
+The module is self-contained. From this package it imports only the two leaves,
+``_lang`` and ``_types``, which hold the language helpers and the enums the host shares
+with the kernel. Everything else it needs is a private copy kept here:
 
-The acceptance test for this extraction is byte-identical generated code against the
-pre-extraction frozen builds. That keeps the snapshot's scheduling statements,
-including its separate prologue fence, fixed while the live implementation evolves.
+* the config rephrasings, as functions over the raw ``func_cfg`` / ``tuning_cfg``
+  fields (``_has_scale_frozen``, ``_num_buffers_frozen``, ...);
+* the layout subset the body reads, as ``_FrozenLayout``, built by
+  ``_compute_frozen_layout``;
+* the schedule helpers, the HBM offset math, the epilogue with its MXFP4 quant and
+  SwiGLU, and the build validation (``_validate_frozen``,
+  ``_validate_frozen_buffer_counts``, ``_validate_frozen_pipeline``).
+
+So no change to ``_config``, ``_layout``, ``_validate``, ``_schedule``, ``_epilogue``,
+``_lds``, ``_pipeline``, ``_quant``, ``_schedule_cache`` or ``moe_gemm`` can move the
+frozen kernel, and those modules may diverge from it freely. The body reads only the
+raw fields of the two config aggregates and of the tensor aggregates passed in; it calls
+no method of ``KernelFuncConfig``, ``KernelTuningConfig`` or ``KernelLayout``. Only
+``_entry`` (to select the body) and the host wrapper (to validate a FROZEN_STEP build)
+import this module.
+
+The acceptance test is byte-identical generated code: the frozen assembly of every
+dispatchable cell must not move when this module is edited, nor when anything outside
+it is.
 """
 
 import math
 
+import triton
 import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.language.core import _aggregate as aggregate
 from triton.language.core import base_value
+from triton.language.extra.hip import libdevice as hip_libdevice
 
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.common_utils import strip_annotate
 
-from ._config import KernelFuncConfig, KernelTuningConfig
-from ._epilogue import _epilogue_store, _stage_epilogue_inputs
+from ._lang import MX_GROUP as MX_GROUP_INT
 from ._lang import MX_GROUP_CE as MX_GROUP
+from ._lang import WARP_SIZE, require_constexpr
 from ._lang import optional as _opt
-from ._lang import require_constexpr
 from ._lang import unwrap as _v
-from ._types import COMPONENTS, DotKind, TileSched
-from ._validate import validate, validate_buffer_counts
+from ._types import (
+    COMPONENTS,
+    A,
+    DotKind,
+    DtypeQuant,
+    EpilogueMode,
+    SchedMode,
+    TileSched,
+    WaitCommitScheme,
+    WarpPipeline,
+    dq_has_scale,
+    dq_mx_format,
+    dq_pack_divisor,
+)
+
+
+# --- vendored config rephrasings ------------------------------------------------
+# Private copies of the ``KernelFuncConfig`` / ``KernelTuningConfig`` methods this
+# snapshot reads, as functions over the aggregates' raw fields. The config classes may
+# rename or reshape their methods freely; only a field rename reaches in here, and it
+# fails loudly rather than silently changing the frozen kernel.
+# ------------------------------------------------------------------------------
+@gluon.constexpr_function
+def _dtype_quant_frozen(fc, idx):
+    if _v(idx) == 0:
+        return _v(fc.token_dtype_quant)
+    return _v(fc.expert_dtype_quant)
+
+
+@gluon.constexpr_function
+def _online_quant_frozen(fc, idx):
+    if _v(idx) == 0:
+        return _v(fc.token_online_quant)
+    return _v(fc.expert_online_quant)
+
+
+@gluon.constexpr_function
+def _has_scale_frozen(fc, idx):
+    return dq_has_scale(_dtype_quant_frozen(fc, idx))
+
+
+@gluon.constexpr_function
+def _pack_divisor_frozen(fc, idx):
+    return dq_pack_divisor(_dtype_quant_frozen(fc, idx))
+
+
+@gluon.constexpr_function
+def _mx_format_frozen(fc, idx):
+    return dq_mx_format(_online_quant_frozen(fc, idx))
+
+
+@gluon.constexpr_function
+def _operand_elem_ty_frozen(fc, idx):
+    """Storage element type of one operand's payload, in LDS and in HBM.
+
+    MXFP4 is two E2M1 values per byte, so it is stored and loaded as ``uint8`` and
+    only ``mfma_scaled``'s ``e2m1`` format string tells the hardware otherwise.
+    """
+    dq = _dtype_quant_frozen(fc, idx)
+    if dq == int(DtypeQuant.BF16):
+        return gl.bfloat16
+    if dq in (int(DtypeQuant.FP8_E4M3), int(DtypeQuant.MXFP8)):
+        return gl.float8e4nv
+    return gl.uint8
+
+
+@gluon.constexpr_function
+def _dot_kind_frozen(fc):
+    """Which dot the operand pair maps onto: MFMA, MFMA_SCALED or UPCAST_MFMA."""
+    a_bf16 = _online_quant_frozen(fc, 0) == int(DtypeQuant.BF16)
+    b_bf16 = _online_quant_frozen(fc, 1) == int(DtypeQuant.BF16)
+    if a_bf16 and b_bf16:
+        return int(DotKind.MFMA)
+    if a_bf16 or b_bf16:
+        return int(DotKind.UPCAST_MFMA)
+    return int(DotKind.MFMA_SCALED)
+
+
+@gluon.constexpr_function
+def _act_frozen(fc):
+    return _v(fc.activation)
+
+
+@gluon.constexpr_function
+def _has_activation_frozen(fc):
+    return _v(fc.activation) is not None
+
+
+@gluon.constexpr_function
+def _activation_reduction_n_frozen(fc):
+    """Emitted columns per raw column. 2 for a gated activation, 1 otherwise."""
+    return 2 if _v(fc.activation) is not None else 1
+
+
+@gluon.constexpr_function
+def _gu_split_frozen(fc):
+    """Is the gated pair laid out as two N halves rather than interleaved?
+
+    Only meaningful with a gated activation -- the flag is inert otherwise.
+    """
+    return bool(_v(fc.gate_up_split)) and _v(fc.activation) is not None
+
+
+@gluon.constexpr_function
+def _n_reduction_slot_frozen(fc):
+    """Emitted columns per raw column within one N slot."""
+    return 1 if _gu_split_frozen(fc) else _activation_reduction_n_frozen(fc)
+
+
+@gluon.constexpr_function
+def _num_buffers_frozen(tc, operand, scale=False):
+    """Ring depth for one payload or scale; zero inherits NUM_LDS_BUFFER."""
+    operand = _v(operand)
+    assert operand in (0, 1), "operand must be 0 (A) or 1 (B)"
+    if _v(scale):
+        depth = tc.A_SCALE_NUM_BUFFER if operand == 0 else tc.B_SCALE_NUM_BUFFER
+    else:
+        depth = tc.A_NUM_BUFFER if operand == 0 else tc.B_NUM_BUFFER
+    return _v(depth) or _v(tc.NUM_LDS_BUFFER)
+
+
+@gluon.constexpr_function
+def _allow_payload_via_lds_frozen(tc, idx):
+    """``ALLOW_B_VIA_LDS`` for B; A has no knob and is always permitted."""
+    return _v(idx) == 0 or bool(_v(tc.ALLOW_B_VIA_LDS))
+
+
+@gluon.constexpr_function
+def _allow_scale_via_lds_frozen(tc, idx):
+    """``ALLOW_A_SCALE_VIA_LDS`` / ``ALLOW_B_SCALE_VIA_LDS``."""
+    return bool(
+        _v(tc.ALLOW_A_SCALE_VIA_LDS if _v(idx) == 0 else tc.ALLOW_B_SCALE_VIA_LDS)
+    )
+
+
+@gluon.constexpr_function
+def _allow_component_via_lds_frozen(tc, component):
+    """The ``allow_*_via_lds`` policy for an ``(operand, is_scale)`` component."""
+    component = _v(component)
+    operand, is_scale = _v(component[0]), bool(_v(component[1]))
+    assert operand in (0, 1), "component operand must be 0 (A) or 1 (B)"
+    return (
+        _allow_scale_via_lds_frozen(tc, operand)
+        if is_scale
+        else _allow_payload_via_lds_frozen(tc, operand)
+    )
+
+
+@gluon.constexpr_function
+def _operand_preshuffled_frozen(tc, idx):
+    """Is this operand's payload already blocked 16-column in HBM? Never for A."""
+    return _v(idx) == 1 and _v(tc.B_PRESHUFFLED)
+
+
+@gluon.constexpr_function
+def _scale_shuffled_frozen(tc, idx):
+    """Is this operand's scale tile already in MFMA fragment order in memory?"""
+    if not _has_scale_frozen(tc.func_cfg, idx):
+        return False
+    if _v(idx) == 0:
+        return _v(tc.A_SCALE_SORTED_SHUFFLED)
+    return _v(tc.B_SCALE_SHUFFLED)
+
+
+@gluon.constexpr_function
+def _warp_pipeline_enabled_frozen(tc):
+    """Any ping-pong at all -- what the VGPR_PREFETCH_K precondition keys on."""
+    return _v(tc.WARP_PIPELINE) != int(WarpPipeline.NONE)
 
 
 # --- vendored schedule helpers ------------------------------------------------
-# Private twins of the ``_schedule.py`` helpers this snapshot used to import. The
-# frozen body is a verbatim copy of the best measured kernel whose acceptance test is
-# *identical assembly*, so it must not move when the live scheduling model is
-# refactored. Importing from ``_schedule`` made that impossible to guarantee: any
-# change to the live fill order, the live depth/unroll signatures, or the live
-# ownership representation silently reshaped the frozen schedule too.
-#
-# These read only accessors that are part of the stable config surface --
-# ``num_buffers``, ``func_cfg.has_scale``, ``K_UNROLL`` on the tuning config and
-# ``scale_ratio_k_step`` on the layout the caller passes in -- plus ``COMPONENTS``.
-# ``test_moe_gemm_gluon_frozen.py`` asserts each twin still agrees with its live
-# counterpart, so drift is caught in the tests rather than prevented by a source
-# dependency.
+# Private copies of the schedule-model helpers this snapshot reads. The live model
+# (``_schedule.py``) is refactored freely; these hold the frozen fill order, ring
+# depths and unroll fixed. ``test_moe_gemm_gluon_frozen.py`` pins their values.
 # ------------------------------------------------------------------------------
 @gluon.constexpr_function
 def _present_frozen(tc, component):
     operand, is_scale = component[0], component[1]
-    return not _v(is_scale) or tc.func_cfg.has_scale(operand)
+    return not _v(is_scale) or _has_scale_frozen(tc.func_cfg, operand)
 
 
 @gluon.constexpr_function
 def _component_depth_frozen(tc, component):
-    return tc.num_buffers(component[0], component[1])
+    return _num_buffers_frozen(tc, component[0], component[1])
 
 
 @gluon.constexpr_function
@@ -132,6 +303,63 @@ def _buffer_load_tile_frozen(pos, NM, NN, want_a):
     is_a, tile = _buffer_load_order_frozen(NM, NN)[pos]
     return tile if bool(is_a) == bool(_v(want_a)) else None
 
+
+@gluon.constexpr_function
+def _payload_fill_slots_frozen(NM, NN):
+    """Slot that owns each payload tile, as ``(A tiles, B tiles)``.
+
+    With both axes split, the interleaved order (and its 2x2 special case) assigns one
+    payload copy per slot. With a degenerate axis there are fewer slots than copies,
+    so fall back to axis-major: ``A(t)`` at ``(mi=t, ni=0)`` and ``B(t)`` at
+    ``(mi=0, ni=t)``.
+    """
+    NM, NN = _v(NM), _v(NN)
+    if NM > 1 and NN > 1:
+        order = _buffer_load_order_frozen(NM, NN)
+        return (
+            tuple(order.index((1, tile)) for tile in range(NM)),
+            tuple(order.index((0, tile)) for tile in range(NN)),
+        )
+    return (
+        tuple(_slot_index_frozen(tile, 0, NM, NN) for tile in range(NM)),
+        tuple(_slot_index_frozen(0, tile, NM, NN) for tile in range(NN)),
+    )
+
+
+@gluon.constexpr_function
+def _component_fill_slots_frozen(tc, layout, component):
+    """Slot that owns each non-K tile of one component.
+
+    ``SCALE_FILL_MID`` is guarded to the 2x2 split, so on any other geometry it is
+    inert.
+    """
+    nm, nn = _v(layout.num_m_slots_per_block()), _v(layout.num_n_slots_per_block())
+    a_slots, b_slots = _payload_fill_slots_frozen(nm, nn)
+    if _v(component[1]) and _v(tc.SCALE_FILL_MID) and nm == 2 and nn == 2:
+        return (1, 2)
+    return a_slots if _v(component[0]) == A else b_slots
+
+
+@gluon.constexpr_function
+def _fill_slots_valid_frozen(tc, layout):
+    """Every mapped slot exists, and no component owns two tiles in one slot."""
+    slots = _v(layout.num_m_slots_per_block()) * _v(layout.num_n_slots_per_block())
+    for component in COMPONENTS:
+        mapping = _component_fill_slots_frozen(tc, layout, component)
+        expected = (
+            _v(layout.num_m_slots_per_block())
+            if _v(component[0]) == A
+            else _v(layout.num_n_slots_per_block())
+        )
+        if len(mapping) != expected:
+            return False
+        if any(slot < 0 or slot >= slots for slot in mapping):
+            return False
+        if len(set(mapping)) != len(mapping):
+            return False
+    return True
+
+
 _TS_XCD_GROUP_M: gl.constexpr = gl.constexpr(int(TileSched.XCD_GROUP_M))
 _TS_GROUP_M: gl.constexpr = gl.constexpr(int(TileSched.GROUP_M))
 _DK_MFMA: gl.constexpr = gl.constexpr(int(DotKind.MFMA))
@@ -140,23 +368,1383 @@ _DK_UPCAST_MFMA: gl.constexpr = gl.constexpr(int(DotKind.UPCAST_MFMA))
 _NO_SCALE: gl.constexpr = gl.constexpr(None)
 
 
-# --- vendored layout helpers --------------------------------------------------
-# The HBM offset math this snapshot addresses its operands with, copied from
-# _layout.py for the same reason as the schedule helpers above: the frozen body's
-# acceptance test is identical assembly, so nothing it depends on may move
-# underneath it.
+# --- vendored layout ----------------------------------------------------------
+# The subset of ``_layout.KernelLayout`` this snapshot reads, as a private aggregate
+# (``_FrozenLayout``) and builder (``_compute_frozen_layout``). Each derivation is a
+# copy of its ``_layout._calc_*`` counterpart with the config methods replaced by the
+# raw-field rephrasings above, and the aggregate holds only the fields the frozen body,
+# epilogue and validation read. The live layout may add, drop or reshape anything
+# without reaching in here.
+# ------------------------------------------------------------------------------
+
+#: gfx950 LDS capacity, mirrors utils/_triton/arch_info.py::_LDS_CAP_BYTES["gfx950"].
+_LDS_CAP_BYTES = 163840
+#: Headroom the operand buffers must leave for LDS the compiler allocates on top of
+#: them (the epilogue's convert_layout scratch).
+_LDS_EPILOGUE_RESERVE_BYTES = 4096
+#: What the operand buffers may actually use.
+_LDS_USABLE_BYTES = _LDS_CAP_BYTES - _LDS_EPILOGUE_RESERVE_BYTES
+#: K extent of one LDS unit, in bytes.
+_LDS_UNIT_K_BYTES = 128
+#: The 16 B a lane moves per access -- the granule the preshuffled HBM order blocks by.
+_LDS_LANE_BYTES = 16
+#: Padding of a non-preshuffled unit: 32 B every 1024 B.
+_LDS_PAD_INTERVAL_BYTES = 1024
+_LDS_PAD_BYTES = 32
+
+
+@gluon.constexpr_function
+def _bases_to_distributed_frozen(offset_bases, contiguity, num_warps, warp_size, shape):
+    """Turn a ``PaddedSharedLayout``'s offset bases into the matching register layout.
+
+    Mirrors Triton's ``CoalesceAsyncCopy`` partition -- lg2(C) bases to reg, lg2(WS) to
+    lane, lg2(NW) to warp, leftovers back to reg -- which is what makes
+    ``buffer_load_to_shared`` fold into a single ``buffer_load_dwordx4 ... lds``.
+    """
+    rank = len(shape)
+    lg2_c = contiguity.bit_length() - 1
+    lg2_nw = num_warps.bit_length() - 1
+    lg2_ws = warp_size.bit_length() - 1
+
+    i = 0
+    reg = list(offset_bases[i : i + lg2_c])
+    i += lg2_c
+    lane = list(offset_bases[i : i + lg2_ws])
+    i += lg2_ws
+    warp = list(offset_bases[i : i + lg2_nw])
+    i += lg2_nw
+    warp = warp + [[0] * rank] * (lg2_nw - len(warp))
+    reg = reg + list(offset_bases[i:])
+    return gl.DistributedLinearLayout(
+        reg_bases=[list(b) for b in reg],
+        lane_bases=[list(b) for b in lane],
+        warp_bases=[list(b) for b in warp],
+        block_bases=[],
+        shape=list(shape),
+    )
+
+
+@gluon.constexpr_function
+def _pow2_bases_frozen(dim, rank, values):
+    """``[[v, 0], ...]`` (or ``[[0, v], ...]``) for each stride in ``values``."""
+    return [[v if i == dim else 0 for i in range(rank)] for v in values]
+
+
+@gluon.constexpr_function
+def _ramp_frozen(lo, hi):
+    """Powers of two ``lo, 2*lo, ... hi/2``; empty when ``hi <= lo``."""
+    out = []
+    v = lo
+    while v < hi:
+        out.append(v)
+        v *= 2
+    return out
+
+
+@gluon.constexpr_function
+def _byte_unit_lds_layout_frozen(shape, nk_dim, elem_bits, unit_rows, preshuffled):
+    """LDS layout of a payload operand, tiled by a fixed (rows x 128 B) unit.
+
+    Not preshuffled: 32 rows, the row permutation ``1, 4, 16, 2, 8``, and 32 B of
+    padding every 1024 B. Preshuffled: 16 rows in the byte order
+    ``utils/shuffle.py::shuffle_weight(w, (16, 16))`` already writes, no padding.
+    """
+    shape = [int(x) for x in _v(shape)]
+    nk_dim = _v(nk_dim)
+    elem_bits = _v(elem_bits)
+    unit_rows = _v(unit_rows)
+    rank = len(shape)
+    kd = 1 - nk_dim
+    els = lambda nbytes: nbytes * 8 // elem_bits
+
+    U = els(_LDS_UNIT_K_BYTES)  # elements per 128 B K unit
+    V = els(_LDS_LANE_BYTES)  # elements per 16 B lane access
+    rows, kelems = shape[nk_dim], shape[kd]
+
+    K = lambda vs: _pow2_bases_frozen(kd, rank, vs)
+    NK = lambda vs: _pow2_bases_frozen(nk_dim, rank, vs)
+
+    if preshuffled:
+        # 16 B of K, then the 16 rows, then the rest of the 128 B unit.
+        bases = K(_ramp_frozen(1, V)) + NK(_ramp_frozen(1, unit_rows)) + K(
+            _ramp_frozen(V, U)
+        )
+    else:
+        assert unit_rows == 32, "the 1, 4, 16, 2, 8 permutation is a 32-row order"
+        bases = K(_ramp_frozen(1, U)) + NK([1, 4, 16, 2, 8])
+    bases = bases + K(_ramp_frozen(U, kelems)) + NK(_ramp_frozen(unit_rows, rows))
+
+    if preshuffled:
+        # PaddedSharedLayout insists on at least one interval/padding pair, so name an
+        # interval wider than the tile: no pad can land inside it.
+        pairs = [[1 << (rows * kelems).bit_length(), 16]]
+    else:
+        pairs = [[els(_LDS_PAD_INTERVAL_BYTES), els(_LDS_PAD_BYTES)]]
+    return gl.PaddedSharedLayout(
+        interval_padding_pairs=pairs,
+        offset_bases=bases,
+        cga_layout=[],
+        shape=shape,
+    )
+
+
+@gluon.constexpr_function
+def _calc_num_warps_frozen(tc):
+    w = _v(tc.warps_per_cta)
+    return w[0] * w[1]
+
+
+@gluon.constexpr_function
+def _calc_num_k_slots_per_tile_frozen(tc):
+    """Payload fragments per BLOCK_K stage."""
+    return 1
+
+
+@gluon.constexpr_function
+def _calc_num_prefetch_k_slots_frozen(tc):
+    """Whether the complete BLOCK_K stage is carried across a pipeline step."""
+    return 1 if _v(tc.VGPR_PREFETCH_K) else 0
+
+
+@gluon.constexpr_function
+def _calc_num_m_slots_per_block_frozen(tc):
+    """M slots per CTA block. Operand A and the accumulator split by this."""
+    return _v(tc.BLOCK_M) // _v(tc.MINI_BLOCK_M)
+
+
+@gluon.constexpr_function
+def _calc_num_n_slots_per_block_frozen(tc):
+    """N slots per CTA block. Operand B and the accumulator split by this."""
+    return _v(tc.BLOCK_N) // _v(tc.MINI_BLOCK_N)
+
+
+@gluon.constexpr_function
+def _calc_num_lds_slots_per_block_non_k_frozen(tc, idx):
+    """Number of independently copied/read non-K slots in one operand block."""
+    return (
+        _calc_num_m_slots_per_block_frozen(tc)
+        if _v(idx) == 0
+        else _calc_num_n_slots_per_block_frozen(tc)
+    )
+
+
+@gluon.constexpr_function
+def _calc_payload_block_k_storage_frozen(tc, idx):
+    """Stored payload elements along K in one pipeline stage."""
+    return _v(tc.BLOCK_K) // _pack_divisor_frozen(tc.func_cfg, idx)
+
+
+@gluon.constexpr_function
+def _calc_scale_block_k_storage_frozen(tc):
+    """E8M0 elements along K in one pipeline stage."""
+    return _v(tc.BLOCK_K) // MX_GROUP_INT
+
+
+@gluon.constexpr_function
+def _calc_scale_fragment_shape_slot_frozen(tc, idx):
+    """Register E8M0 shape for one non-K slot and K slot."""
+    nonk = _v(tc.MINI_BLOCK_M) if _v(idx) == 0 else _v(tc.MINI_BLOCK_N)
+    return [nonk, _v(tc.BLOCK_K) // MX_GROUP_INT]
+
+
+@gluon.constexpr_function
+def _calc_payload_lds_shape_slot_frozen(tc, idx):
+    """Shared shape of one payload slot, in stored (packed) elements."""
+    if _v(idx) == 0:
+        return [
+            _v(tc.MINI_BLOCK_M),
+            _calc_payload_block_k_storage_frozen(tc, 0),
+        ]
+    return [
+        _calc_payload_block_k_storage_frozen(tc, 1),
+        _v(tc.MINI_BLOCK_N),
+    ]
+
+
+@gluon.constexpr_function
+def _calc_scale_lds_shape_slot_frozen(tc, idx):
+    """E8M0 shape of one operand slot: [slot non-K extent, BLOCK_K/32]."""
+    non_k = _v(tc.MINI_BLOCK_M) if _v(idx) == 0 else _v(tc.MINI_BLOCK_N)
+    return [non_k, _calc_scale_block_k_storage_frozen(tc)]
+
+
+@gluon.constexpr_function
+def _calc_scale_lds_shape_block_frozen(tc, idx):
+    """Full scale LDS shape for one block in its staged representation."""
+    idx = _v(idx)
+    if _scale_shuffled_frozen(tc, idx):
+        num_scale_fill_tiles_block = _calc_num_scale_tiles_frozen(tc, idx)
+        scale_fill_shape = _calc_scale_flat_shape_frozen(tc, idx)
+    else:
+        num_scale_fill_tiles_block = _calc_num_lds_slots_per_block_non_k_frozen(
+            tc, idx
+        )
+        scale_fill_shape = _calc_scale_lds_shape_slot_frozen(tc, idx)
+    return [
+        _num_buffers_frozen(tc, idx, True) * num_scale_fill_tiles_block
+    ] + scale_fill_shape
+
+
+@gluon.constexpr_function
+def _calc_copy_contiguity_frozen(tc, idx):
+    """Elements per lane for a 128-bit direct-to-LDS payload copy."""
+    return 128 // _operand_elem_ty_frozen(tc.func_cfg, idx).primitive_bitwidth
+
+
+@gluon.constexpr_function
+def _calc_payload_lds_copy_ok_frozen(tc, idx):
+    """Whether the payload tile admits a 128-bit-per-lane direct copy into LDS."""
+    shape = _calc_payload_lds_shape_slot_frozen(tc, idx)
+    vec = _calc_copy_contiguity_frozen(tc, idx)
+    return shape[0] * shape[1] >= WARP_SIZE * vec * _calc_num_warps_frozen(tc)
+
+
+@gluon.constexpr_function
+def _calc_scale_lds_copy_ok_frozen(tc, idx):
+    """Whether an E8M0 scale tile can be written to LDS with a coalesced copy."""
+    if _scale_shuffled_frozen(tc, idx):
+        return True
+    shape = _calc_scale_lds_shape_slot_frozen(tc, idx)
+    return shape[0] * shape[1] >= WARP_SIZE * 4 and shape[1] % 4 == 0 and shape[1] >= 8
+
+
+@gluon.constexpr_function
+def _calc_component_via_lds_frozen(tc, component):
+    """Final placement of ``(operand, is_scale)``: tuning allows LDS and the copy fits.
+
+    Not gated on whether a scale exists; callers gate absent scales with
+    ``has_scale``.
+    """
+    operand, is_scale = _v(component[0]), bool(_v(component[1]))
+    if not _allow_component_via_lds_frozen(tc, (operand, is_scale)):
+        return False
+    if is_scale:
+        return _calc_scale_lds_copy_ok_frozen(tc, operand)
+    return _calc_payload_lds_copy_ok_frozen(tc, operand)
+
+
+@gluon.constexpr_function
+def _calc_pipeline_register_period_frozen(tc):
+    """LCM of the active direct-register ring periods, in payload K steps.
+
+    Absent scales have no ring. The frozen driver reads it to decide whether a ring
+    index may assume a non-negative tile and whether the remainder loop is unrolled.
+    """
+    period = 1
+    for operand in (0, 1):
+        for is_scale in (False, True):
+            if is_scale and not _has_scale_frozen(tc.func_cfg, operand):
+                continue
+            if not _calc_component_via_lds_frozen(tc, (operand, is_scale)):
+                ratio = _calc_scale_ratio_k_step_frozen(tc, operand) if is_scale else 1
+                period = math.lcm(
+                    period, _num_buffers_frozen(tc, operand, is_scale) * ratio
+                )
+    return period
+
+
+@gluon.constexpr_function
+def _calc_k_width_for_frozen(tc, idx):
+    """``DotOperandLayout.k_width`` for one operand, in *stored* elements.
+
+    128 bits per lane per access; the tuning field is an optional override.
+    """
+    override = _v(tc.k_width)
+    if override is not None:
+        return override
+    return 128 // _operand_elem_ty_frozen(tc.func_cfg, idx).primitive_bitwidth
+
+
+@gluon.constexpr_function
+def _calc_dot_result_fragment_layout_frozen(tc):
+    """AMDMFMALayout for dot / scaled-dot results in register; ``transposed`` pinned."""
+    assert _v(tc.transposed), "transposed=True is pinned, see the module docstring"
+    return gl.amd.AMDMFMALayout(
+        version=4,
+        instr_shape=_v(tc.mfma_instr_shape),
+        transposed=True,
+        warps_per_cta=_v(tc.warps_per_cta),
+        tiles_per_warp=_v(tc.tiles_per_warp),
+    )
+
+
+@gluon.constexpr_function
+def _calc_dot_operand_fragment_layout_frozen(tc, idx):
+    return gl.DotOperandLayout(
+        operand_index=_v(idx),
+        parent=_calc_dot_result_fragment_layout_frozen(tc),
+        k_width=_calc_k_width_for_frozen(tc, idx),
+    )
+
+
+@gluon.constexpr_function
+def _calc_lds_unit_rows_frozen(tc, idx):
+    """Non-K extent of one LDS unit: 16 preshuffled, 32 otherwise."""
+    return 16 if _operand_preshuffled_frozen(tc, idx) else 32
+
+
+@gluon.constexpr_function
+def _calc_byte_unit_lds_ok_frozen(tc, idx):
+    """Does :func:`_byte_unit_lds_layout_frozen` apply to this operand?
+
+    Only the 16x16x128 B operand shape, 8-bit storage, and -- when not preshuffled --
+    ``tiles_per_warp >= 2`` on that axis.
+    """
+    idx = _v(idx)
+    if list(_v(tc.mfma_instr_shape)) != [16, 16, 128]:
+        return False
+    elem_bits = _operand_elem_ty_frozen(tc.func_cfg, idx).primitive_bitwidth
+    if elem_bits != 8:
+        return False
+    if not _operand_preshuffled_frozen(tc, idx) and _v(tc.tiles_per_warp)[idx] < 2:
+        return False
+    shape = _calc_payload_lds_shape_slot_frozen(tc, idx)
+    rows, kelems = shape[idx], shape[1 - idx]
+    unit_rows = _calc_lds_unit_rows_frozen(tc, idx)
+    unit_k = _LDS_UNIT_K_BYTES * 8 // elem_bits
+    return rows % unit_rows == 0 and kelems % unit_k == 0
+
+
+@gluon.constexpr_function
+def _calc_dot_operand_lds_layout_frozen(tc, idx):
+    """Padded shared layout for a payload operand."""
+    idx = _v(idx)
+    shape = _calc_payload_lds_shape_slot_frozen(tc, idx)
+    if _calc_byte_unit_lds_ok_frozen(tc, idx):
+        return _byte_unit_lds_layout_frozen(
+            shape,
+            idx,
+            _operand_elem_ty_frozen(tc.func_cfg, idx).primitive_bitwidth,
+            _calc_lds_unit_rows_frozen(tc, idx),
+            _operand_preshuffled_frozen(tc, idx),
+        )
+    layout = gl.amd.cdna4.compute_efficient_padded_shared_layout(
+        _calc_dot_operand_fragment_layout_frozen(tc, idx),
+        shape,
+        _operand_elem_ty_frozen(tc.func_cfg, idx),
+        True,
+    )
+    if layout is not None:
+        return layout
+    # The helper declines whenever the tile holds a single MFMA tile along the
+    # non-K axis. Fall back to a plain identity-mapped padded layout whose interval is
+    # still >= vec * warpSize, so the copy stays a 128-bit direct-to-LDS.
+    vec = _calc_copy_contiguity_frozen(tc, idx)
+    order = [1, 0] if idx == 0 else [0, 1]
+    return gl.PaddedSharedLayout.with_identity_for(
+        [[WARP_SIZE * vec, vec]], shape, order
+    )
+
+
+@gluon.constexpr_function
+def _calc_dot_operand_buffer_load_lds_layout_frozen(tc, idx):
+    """Register layout of the global->LDS copy offsets for a payload operand."""
+    idx = _v(idx)
+    shape = _calc_payload_lds_shape_slot_frozen(tc, idx)
+    return _bases_to_distributed_frozen(
+        _calc_dot_operand_lds_layout_frozen(tc, idx).offset_bases,
+        _calc_copy_contiguity_frozen(tc, idx),
+        _calc_num_warps_frozen(tc),
+        WARP_SIZE,
+        shape,
+    )
+
+
+@gluon.constexpr_function
+def _calc_payload_hbm_offset_layout_frozen(tc, idx):
+    """Layout used to form one payload tile's global-memory offsets."""
+    if _calc_component_via_lds_frozen(tc, (idx, False)):
+        return _calc_dot_operand_buffer_load_lds_layout_frozen(tc, idx)
+    return _calc_dot_operand_fragment_layout_frozen(tc, idx)
+
+
+@gluon.constexpr_function
+def _calc_dot_operand_scale_fragment_layout_frozen(tc, idx):
+    idx = _v(idx)
+    shape = _calc_scale_lds_shape_slot_frozen(tc, idx)
+    return gl.amd.cdna4.get_mfma_scale_layout(
+        _calc_dot_operand_fragment_layout_frozen(tc, idx), shape, MX_GROUP_INT
+    )
+
+
+@gluon.constexpr_function
+def _calc_scale_mini_block_nonk_frozen(tc, idx):
+    """Rows or columns in one scale load; raw scales retain payload geometry."""
+    mini = _calc_scale_nonk_frozen(tc, idx)
+    if not _scale_shuffled_frozen(tc, idx):
+        return mini
+    requested = tc.SCALE_MINI_BLOCK_M if _v(idx) == 0 else tc.SCALE_MINI_BLOCK_N
+    return _v(requested) or mini
+
+
+@gluon.constexpr_function
+def _calc_scale_mini_block_k_frozen(tc, idx):
+    """Scale load K extent in logical payload elements, not E8M0 bytes."""
+    if not _scale_shuffled_frozen(tc, idx):
+        return _v(tc.BLOCK_K)
+    return _v(tc.SCALE_MINI_BLOCK_K) or max(256, _v(tc.BLOCK_K))
+
+
+@gluon.constexpr_function
+def _calc_scale_ratio_k_step_frozen(tc, idx):
+    """Number of payload K steps covered by one scale load."""
+    bk = _v(tc.BLOCK_K)
+    return _calc_scale_mini_block_k_frozen(tc, idx) // bk
+
+
+@gluon.constexpr_function
+def _calc_scale_ratio_non_k_slot_frozen(tc, idx):
+    """Number of payload non-K slots covered by one scale load."""
+    return _calc_scale_mini_block_nonk_frozen(tc, idx) // _calc_scale_nonk_frozen(
+        tc, idx
+    )
+
+
+@gluon.constexpr_function
+def _calc_num_scale_tiles_frozen(tc, idx):
+    return _calc_num_lds_slots_per_block_non_k_frozen(
+        tc, idx
+    ) // _calc_scale_ratio_non_k_slot_frozen(tc, idx)
+
+
+@gluon.constexpr_function
+def _calc_scale_hbm_offset_layout_frozen(tc, idx):
+    """Layout used to form one scale tile's global-memory offsets."""
+    if _calc_component_via_lds_frozen(tc, (idx, True)):
+        return _calc_dot_operand_scale_buffer_load_lds_layout_frozen(tc, idx)
+    if _scale_shuffled_frozen(tc, idx):
+        if _calc_scale_packed_ok_frozen(tc, idx):
+            return _calc_packed_scale_load_layout_frozen(tc, idx)
+        # get_mfma_scale_layout puts the K-group bit before the non-K bit in
+        # reg_bases, so a lane's four bytes land in registers in address order
+        # 0, +2, +1, +3. A widened load fills registers in ascending order; issue
+        # it with those two bases swapped, then convert with only a lane-local
+        # register renumber because the lane and warp bases stay unchanged.
+        frag = _calc_scale_load_layout_frozen(tc, idx)
+        lead = [[16, 0], [0, 4]]
+        rest = [list(b) for b in frag.reg_bases if list(b) not in lead]
+        return gl.DistributedLinearLayout(
+            reg_bases=lead + rest,
+            lane_bases=[list(b) for b in frag.lane_bases],
+            warp_bases=[list(b) for b in frag.warp_bases],
+            block_bases=[],
+            shape=list(frag.shape),
+        )
+    return _calc_dot_operand_scale_fragment_layout_frozen(tc, idx)
+
+
+@gluon.constexpr_function
+def _calc_scale_nonk_frozen(tc, idx):
+    """Non-K extent of one shuffled scale tile: the slot extent."""
+    if _v(idx) == 0:
+        return _v(tc.MINI_BLOCK_M)
+    return _v(tc.MINI_BLOCK_N)
+
+
+@gluon.constexpr_function
+def _calc_scale_flat_shape_frozen(tc, idx):
+    """LDS staging shape of a shuffled scale tile: one 256 B run per 32-row stripe."""
+    return [
+        _calc_scale_mini_block_nonk_frozen(tc, idx) // 32,
+        _calc_scale_mini_block_k_frozen(tc, idx),
+    ]
+
+
+@gluon.constexpr_function
+def _calc_sorted_shuffled_ok_frozen(tc):
+    """Does this config produce the layout the C++ A-scale shuffle was written for?"""
+    return (
+        list(_v(tc.mfma_instr_shape)) == [16, 16, 128]
+        and _v(tc.BLOCK_M) % 32 == 0
+        and _v(tc.MINI_BLOCK_M) % 32 == 0
+    )
+
+
+@gluon.constexpr_function
+def _calc_shuffled_scale_read_layout_frozen(tc, idx, load=False):
+    """The [non-K, K] view of the flat LDS run, in fragment order."""
+    nonk = (
+        _calc_scale_mini_block_nonk_frozen(tc, idx)
+        if _v(load)
+        else _calc_scale_nonk_frozen(tc, idx)
+    )
+    k = (
+        _calc_scale_mini_block_k_frozen(tc, idx)
+        if _v(load)
+        else max(256, _v(tc.BLOCK_K))
+    )
+    bases = [[16, 0], [0, 4], [1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]]
+    for bit in _ramp_frozen(8, k // MX_GROUP_INT):
+        bases += [[0, bit]]
+    stripe = 32
+    while stripe < nonk:
+        bases = bases + [[stripe, 0]]
+        stripe = stripe * 2
+    return gl.SharedLinearLayout(offset_bases=bases)
+
+
+@gluon.constexpr_function
+def _scale_dword_delta_frozen(delta, k=256):
+    """Where a (non-K, K) step lands, as a coordinate of the i32 tile."""
+    b = [int(x) for x in _v(delta)]
+    if b == [0, 0]:
+        return [0, 0]
+    # CDNA4_SCALE writes byte (n//32)*256 + (k%4)*64 + (n%16)*4 + (k//4)*2 +
+    # (n%32)//16; dropping the two within-dword terms and dividing by four
+    # leaves the dword index below.
+    width = _v(k) // 128
+    d = (b[0] // 32) * (_v(k) // 4) + (b[1] // 8) * 64 + (b[1] % 4) * 16 + (b[0] % 16)
+    return [d // width, d % width]
+
+
+@gluon.constexpr_function
+def _calc_scale_packed_sel_frozen(tc, idx, k_phase=0):
+    """Byte selectors in MFMA order, for one K128 half or the full K256 word."""
+    if not _calc_scale_packed_ok_frozen(tc, idx):
+        return None
+    if _v(tc.BLOCK_K) == 128:
+        return [2 * _v(k_phase), 2 * _v(k_phase) + 1]
+    return [0, 2, 1, 3]
+
+
+@gluon.constexpr_function
+def _calc_scale_packed_ok_frozen(tc, idx):
+    """Can this operand's scale fragment be fed as one dword per lane?"""
+    if not _scale_shuffled_frozen(tc, idx) or _v(tc.BLOCK_K) not in (128, 256):
+        return False
+    frag = gl.amd.cdna4.get_mfma_scale_layout(
+        _calc_dot_operand_fragment_layout_frozen(tc, idx),
+        _calc_scale_fragment_shape_slot_frozen(tc, idx),
+        MX_GROUP_INT,
+    )
+    regs = [list(b) for b in frag.reg_bases]
+    if _v(tc.BLOCK_K) == 128:
+        return len(regs) >= 1 and regs[0] == [16, 0]
+    if len(regs) < 2:
+        return False
+    return regs[0] == [0, 4] and regs[1] == [16, 0]
+
+
+@gluon.constexpr_function
+def _calc_packed_scale_shape_frozen(tc, idx):
+    """Physical i32 storage, including both K128 halves even when one is unused."""
+    nonk = _calc_scale_nonk_frozen(tc, idx)
+    return [nonk, max(256, _v(tc.BLOCK_K)) // 128]
+
+
+@gluon.constexpr_function
+def _calc_packed_scale_frag_layout_frozen(tc, idx):
+    """The i32 fragment with its within-dword register bases folded in."""
+    k = max(256, _v(tc.BLOCK_K))
+    frag = gl.amd.cdna4.get_mfma_scale_layout(
+        _calc_dot_operand_fragment_layout_frozen(tc, idx),
+        [_calc_scale_nonk_frozen(tc, idx), k // MX_GROUP_INT],
+        MX_GROUP_INT,
+    )
+    return gl.DistributedLinearLayout(
+        reg_bases=[_scale_dword_delta_frozen(b, k) for b in frag.reg_bases[2:]],
+        lane_bases=[_scale_dword_delta_frozen(b, k) for b in frag.lane_bases],
+        warp_bases=[_scale_dword_delta_frozen(b, k) for b in frag.warp_bases],
+        block_bases=[],
+        shape=_calc_packed_scale_shape_frozen(tc, idx),
+    )
+
+
+@gluon.constexpr_function
+def _calc_packed_scale_read_layout_frozen(tc, idx, load=False):
+    """The i32 view of the flat LDS run: one offset bit per dword-address bit."""
+    k = (
+        _calc_scale_mini_block_k_frozen(tc, idx)
+        if _v(load)
+        else max(256, _v(tc.BLOCK_K))
+    )
+    bases = list(
+        _calc_shuffled_scale_read_layout_frozen(tc, idx, load).offset_bases
+    )[2:]
+    return gl.SharedLinearLayout(
+        offset_bases=[_scale_dword_delta_frozen(b, k) for b in bases]
+    )
+
+
+@gluon.constexpr_function
+def _calc_scale_load_shape_frozen(tc, idx):
+    return [
+        _calc_scale_mini_block_nonk_frozen(tc, idx),
+        _calc_scale_mini_block_k_frozen(tc, idx) // MX_GROUP_INT,
+    ]
+
+
+@gluon.constexpr_function
+def _calc_scale_load_layout_frozen(tc, idx):
+    return gl.amd.cdna4.get_mfma_scale_layout(
+        _calc_dot_operand_fragment_layout_frozen(tc, idx),
+        _calc_scale_load_shape_frozen(tc, idx),
+        MX_GROUP_INT,
+    )
+
+
+@gluon.constexpr_function
+def _calc_packed_scale_load_shape_frozen(tc, idx):
+    return [
+        _calc_scale_mini_block_nonk_frozen(tc, idx),
+        _calc_scale_mini_block_k_frozen(tc, idx) // 128,
+    ]
+
+
+@gluon.constexpr_function
+def _calc_packed_scale_load_layout_frozen(tc, idx):
+    frag = _calc_scale_load_layout_frozen(tc, idx)
+    k = _calc_scale_mini_block_k_frozen(tc, idx)
+    # The two within-dword axes are identified by value, not position.
+    within_dword = ([0, 4], [16, 0])
+    return gl.DistributedLinearLayout(
+        reg_bases=[
+            _scale_dword_delta_frozen(b, k)
+            for b in frag.reg_bases
+            if list(b) not in within_dword
+        ],
+        lane_bases=[_scale_dword_delta_frozen(b, k) for b in frag.lane_bases],
+        warp_bases=[_scale_dword_delta_frozen(b, k) for b in frag.warp_bases],
+        block_bases=[],
+        shape=_calc_packed_scale_load_shape_frozen(tc, idx),
+    )
+
+
+@gluon.constexpr_function
+def _calc_dot_operand_scale_lds_layout_frozen(tc, idx):
+    """Identity (K-contiguous) shared tile for the raw E8M0 scales."""
+    return gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
+
+
+@gluon.constexpr_function
+def _calc_dot_operand_scale_buffer_load_lds_layout_frozen(tc, idx):
+    """32-bit-per-lane blocked layout for the scale direct-to-LDS write."""
+    idx = _v(idx)
+    shape = _calc_scale_lds_shape_slot_frozen(tc, idx)
+    if _scale_shuffled_frozen(tc, idx):
+        # Flat run, 4 contiguous bytes per lane.
+        return gl.BlockedLayout(
+            size_per_thread=[1, 4],
+            threads_per_warp=[1, WARP_SIZE],
+            warps_per_cta=[_calc_num_warps_frozen(tc), 1],
+            order=[1, 0],
+        )
+    sk = shape[1]
+    lanes_k = sk // 4
+    return gl.BlockedLayout(
+        size_per_thread=[1, 4],
+        threads_per_warp=[WARP_SIZE // lanes_k, lanes_k],
+        warps_per_cta=[_calc_num_warps_frozen(tc), 1],
+        order=[1, 0],
+    )
+
+
+@gluon.constexpr_function
+def _calc_output_n_slot_frozen(tc):
+    """Emitted columns produced by one logical N-slot epilogue tile."""
+    return _v(tc.MINI_BLOCK_N) // _n_reduction_slot_frozen(tc.func_cfg)
+
+
+@gluon.constexpr_function
+def _calc_output_block_n_frozen(tc):
+    """Emitted columns produced by one CTA's raw BLOCK_N tile."""
+    return _v(tc.BLOCK_N) // _activation_reduction_n_frozen(tc.func_cfg)
+
+
+@gluon.constexpr_function
+def _calc_epilogue_threads_frozen(tc):
+    return _calc_num_warps_frozen(tc) * WARP_SIZE
+
+
+@gluon.constexpr_function
+def _calc_epilogue_bias_per_thread_frozen(tc):
+    return _v(tc.BLOCK_N) // _calc_epilogue_threads_frozen(tc)
+
+
+@gluon.constexpr_function
+def _calc_epilogue_inputs_via_lds_frozen(tc):
+    """Whether bias/gamma vectors admit the supported direct-to-LDS copies."""
+    threads = _calc_epilogue_threads_frozen(tc)
+    bpt = _calc_epilogue_bias_per_thread_frozen(tc)
+    return threads >= _v(tc.BLOCK_M) and _v(tc.BLOCK_N) % threads == 0 and bpt in (1, 4)
+
+
+@gluon.constexpr_function
+def _calc_epilogue_input_lds_layout_frozen(tc):
+    return gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[0])
+
+
+@gluon.constexpr_function
+def _calc_epilogue_gamma_buffer_load_lds_layout_frozen(tc):
+    return gl.BlockedLayout([1], [WARP_SIZE], [_calc_num_warps_frozen(tc)], [0])
+
+
+@gluon.constexpr_function
+def _calc_epilogue_bias_buffer_load_lds_layout_frozen(tc):
+    return gl.BlockedLayout(
+        [_calc_epilogue_bias_per_thread_frozen(tc)],
+        [WARP_SIZE],
+        [_calc_num_warps_frozen(tc)],
+        [0],
+    )
+
+
+@gluon.constexpr_function
+def _calc_epilogue_gamma_shape_frozen(tc):
+    return [_calc_epilogue_threads_frozen(tc)]
+
+
+@gluon.constexpr_function
+def _calc_epilogue_bias_shape_frozen(tc):
+    return [_v(tc.BLOCK_N)]
+
+
+@gluon.constexpr_function
+def _calc_quant_staging_layout_frozen(tc):
+    return gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
+
+
+@gluon.constexpr_function
+def _calc_quant_staging_rows_frozen(tc):
+    return _v(tc.BLOCK_M) if _gu_split_frozen(tc.func_cfg) else _v(tc.MINI_BLOCK_M)
+
+
+@gluon.constexpr_function
+def _calc_quant_staging_rotates_frozen(tc):
+    """Whether the fused-quant staging alternates two per-tile LDS banks."""
+    fc = tc.func_cfg
+    return _v(fc.output_quant) is not None and not _gu_split_frozen(fc)
+
+
+@gluon.constexpr_function
+def _calc_lds_bytes_frozen(tc):
+    """Explicit LDS of one build. A frozen build stages every present scale in LDS
+    (``_FrozenLDSManager.alloc`` allocates it whatever its placement)."""
+    fc = tc.func_cfg
+    total = 0
+    for idx in (0, 1):
+        shape = _calc_payload_lds_shape_slot_frozen(tc, idx)
+        width = _operand_elem_ty_frozen(fc, idx).primitive_bitwidth // 8
+        # This shape is one slot; a block holds one non-K slot per split.
+        num_slots_block = _calc_num_lds_slots_per_block_non_k_frozen(tc, idx)
+        if _calc_component_via_lds_frozen(tc, (idx, False)):
+            total += (
+                num_slots_block
+                * shape[0]
+                * shape[1]
+                * width
+                * _num_buffers_frozen(tc, idx)
+            )
+        if _has_scale_frozen(fc, idx) and (
+            _v(tc.FROZEN_STEP) or _calc_component_via_lds_frozen(tc, (idx, True))
+        ):
+            s = _calc_scale_lds_shape_block_frozen(tc, idx)
+            total += s[0] * s[1] * s[2]
+    return total
+
+
+@gluon.constexpr_function
+def _calc_acc_vgprs_per_lane_frozen(tc):
+    return _v(tc.BLOCK_M) * _v(tc.BLOCK_N) // (_calc_num_warps_frozen(tc) * WARP_SIZE)
+
+
+@gluon.constexpr_function
+def _calc_geometry_ok_frozen(tc):
+    """Whether the tile lattice is sound enough to build register/shared layouts on.
+
+    A config that fails it still gets its scalar geometry but no layout objects, so
+    the descriptive assertion in ``_validate_frozen_layout`` is what reports it rather
+    than a layout constructor.
+    """
+    BM, BN, BK = _v(tc.BLOCK_M), _v(tc.BLOCK_N), _v(tc.BLOCK_K)
+    MBM, MBN = _v(tc.MINI_BLOCK_M), _v(tc.MINI_BLOCK_N)
+    instr = _v(tc.mfma_instr_shape)
+    warps = _v(tc.warps_per_cta)
+    tiles = _v(tc.tiles_per_warp)
+    if BK % instr[2] or BK % MX_GROUP_INT or BM % MBM or BN % MBN:
+        return False
+    if MBM % (instr[0] * warps[0] * tiles[0]) or MBN % (instr[1] * warps[1] * tiles[1]):
+        return False
+    for idx in (0, 1):
+        if not _scale_shuffled_frozen(tc, idx):
+            continue
+        block = BM if idx == 0 else BN
+        nonk = _calc_scale_mini_block_nonk_frozen(tc, idx)
+        sk = _calc_scale_mini_block_k_frozen(tc, idx)
+        mini = _calc_scale_nonk_frozen(tc, idx)
+        if not block >= nonk >= mini or block % nonk or nonk % mini or nonk % 32:
+            return False
+        if sk < max(256, BK) or sk & (sk - 1) or sk % BK:
+            return False
+    return True
+
+
+@aggregate
+@strip_annotate
+class _FrozenLayout:
+    """The tile shapes, placements and layouts the frozen kernel reads.
+
+    Built once per build by :func:`_compute_frozen_layout`. Per-operand values are
+    ``(A, B)`` pairs read through accessors indexed by operand (0 = A / tokens,
+    1 = B / experts). ``None`` marks a value that does not exist for this build.
+    Accessors with a free argument are evaluated from the stored scalars.
+    """
+
+    # -- block and slot geometry --
+    _BLOCK_K: gl.constexpr
+    _MINI_BLOCK_M: gl.constexpr
+    _mfma_instr_shape: gl.constexpr
+    _gu_split: gl.constexpr
+    _num_warps: gl.constexpr
+    _num_k_slots_per_tile: gl.constexpr
+    _num_prefetch_k_slots: gl.constexpr
+    _num_m_slots_per_block: gl.constexpr
+    _num_n_slots_per_block: gl.constexpr
+    _num_lds_slots_per_block_non_k: gl.constexpr
+    _payload_block_k_storage: gl.constexpr
+    _scale_block_k_storage: gl.constexpr
+    _payload_lds_shape_slot: gl.constexpr
+    _scale_lds_shape_slot: gl.constexpr
+    _byte_unit_lds_ok: gl.constexpr
+    # -- storage placement --
+    _component_via_lds: gl.constexpr
+    _pipeline_register_period: gl.constexpr
+    # -- payload layouts --
+    _dot_result_fragment_layout: gl.constexpr
+    _dot_operand_fragment_layout: gl.constexpr
+    _dot_operand_lds_layout: gl.constexpr
+    _payload_hbm_offset_layout: gl.constexpr
+    # -- scale geometry --
+    _scale_nonk: gl.constexpr
+    _scale_mini_block_nonk: gl.constexpr
+    _scale_mini_block_k: gl.constexpr
+    _scale_ratio_k_step: gl.constexpr
+    _scale_ratio_non_k_slot: gl.constexpr
+    _num_scale_tiles: gl.constexpr
+    _scale_flat_shape: gl.constexpr
+    _sorted_shuffled_ok: gl.constexpr
+    _scale_packed_ok: gl.constexpr
+    _scale_packed_sel: gl.constexpr
+    _packed_scale_shape: gl.constexpr
+    # -- scale layouts --
+    _dot_operand_scale_fragment_layout: gl.constexpr
+    _dot_operand_scale_lds_layout: gl.constexpr
+    _scale_hbm_offset_layout: gl.constexpr
+    _shuffled_scale_read_layout: gl.constexpr
+    _packed_scale_frag_layout: gl.constexpr
+    _packed_scale_read_layout: gl.constexpr
+    # -- epilogue --
+    _output_n_slot: gl.constexpr
+    _output_block_n: gl.constexpr
+    _epilogue_threads: gl.constexpr
+    _epilogue_input_lds_layout: gl.constexpr
+    _epilogue_gamma_buffer_load_lds_layout: gl.constexpr
+    _epilogue_bias_buffer_load_lds_layout: gl.constexpr
+    _epilogue_gamma_shape: gl.constexpr
+    _epilogue_bias_shape: gl.constexpr
+    _epilogue_inputs_via_lds: gl.constexpr
+    _quant_staging_layout: gl.constexpr
+    _quant_staging_rows: gl.constexpr
+    _quant_staging_rotates: gl.constexpr
+    # -- resources --
+    _lds_bytes: gl.constexpr
+    _acc_vgprs_per_lane: gl.constexpr
+
+    @gluon.constexpr_function
+    def __init__(self, **values):
+        for name, value in values.items():
+            setattr(self, "_" + name, gl.constexpr(value))
+
+    # -- block and slot geometry --------------------------------------------------
+
+    @gluon.constexpr_function
+    def num_warps(self):
+        return _v(self._num_warps)
+
+    @gluon.constexpr_function
+    def num_k_tiles(self, K):
+        K = _v(K)
+        BK = _v(self._BLOCK_K)
+        assert K % BK == 0, f"K ({K}) must be a multiple of BLOCK_K ({BK})"
+        return K // BK
+
+    @gluon.constexpr_function
+    def num_k_slots_per_tile(self):
+        """Payload fragments per BLOCK_K stage."""
+        return _v(self._num_k_slots_per_tile)
+
+    @gluon.constexpr_function
+    def num_prefetch_k_slots(self):
+        """Whether the complete BLOCK_K stage is carried across a pipeline step."""
+        return _v(self._num_prefetch_k_slots)
+
+    @gluon.constexpr_function
+    def num_m_slots_per_block(self):
+        """M slots per CTA block. Operand A and the accumulator split by this."""
+        return _v(self._num_m_slots_per_block)
+
+    @gluon.constexpr_function
+    def num_n_slots_per_block(self):
+        """N slots per CTA block. Operand B and the accumulator split by this."""
+        return _v(self._num_n_slots_per_block)
+
+    @gluon.constexpr_function
+    def num_lds_slots_per_block_non_k(self, idx):
+        """Number of independently copied/read non-K slots in one operand block."""
+        return _v(self._num_lds_slots_per_block_non_k)[_v(idx)]
+
+    @gluon.constexpr_function
+    def payload_block_k_storage(self, idx):
+        """Stored payload elements along K in one pipeline stage."""
+        return _v(self._payload_block_k_storage)[_v(idx)]
+
+    @gluon.constexpr_function
+    def scale_block_k_storage(self):
+        """E8M0 elements along K in one pipeline stage."""
+        return _v(self._scale_block_k_storage)
+
+    @gluon.constexpr_function
+    def payload_lds_shape_slot(self, idx):
+        """Shared shape of one payload slot, in stored (packed) elements."""
+        return list(_v(self._payload_lds_shape_slot)[_v(idx)])
+
+    @gluon.constexpr_function
+    def scale_lds_shape_slot(self, idx):
+        """E8M0 shape of one operand slot: [slot non-K extent, BLOCK_K/32]."""
+        return list(_v(self._scale_lds_shape_slot)[_v(idx)])
+
+    @gluon.constexpr_function
+    def byte_unit_lds_ok(self, idx):
+        """Does :func:`_byte_unit_lds_layout_frozen` apply to this operand?"""
+        return _v(self._byte_unit_lds_ok)[_v(idx)]
+
+    # -- storage placement --------------------------------------------------------
+    # Each ``*_in_reg`` is exactly the complement of its ``*_via_lds``. None of these
+    # is gated on whether a scale exists; callers gate absent scales with
+    # ``_has_scale_frozen``.
+
+    @gluon.constexpr_function
+    def component_via_lds(self, component):
+        """Whether ``(operand, is_scale)`` is staged through LDS."""
+        component = _v(component)
+        operand, is_scale = _v(component[0]), bool(_v(component[1]))
+        assert operand in (0, 1), "component operand must be 0 (A) or 1 (B)"
+        return _v(self._component_via_lds)[operand][int(is_scale)]
+
+    @gluon.constexpr_function
+    def payload_via_lds(self, idx):
+        return self.component_via_lds((idx, False))
+
+    @gluon.constexpr_function
+    def payload_in_reg(self, idx):
+        return not self.payload_via_lds(idx)
+
+    @gluon.constexpr_function
+    def scale_via_lds(self, idx):
+        return self.component_via_lds((idx, True))
+
+    @gluon.constexpr_function
+    def scale_in_reg(self, idx):
+        return not self.scale_via_lds(idx)
+
+    @gluon.constexpr_function
+    def pipeline_register_period(self):
+        """LCM of the direct-register ring periods, in payload K steps."""
+        return _v(self._pipeline_register_period)
+
+    # -- payload layouts ----------------------------------------------------------
+
+    @gluon.constexpr_function
+    def dot_result_fragment_layout(self):
+        """AMDMFMALayout for dot / scaled-dot results in register."""
+        return _v(self._dot_result_fragment_layout)
+
+    @gluon.constexpr_function
+    def dot_operand_fragment_layout(self, idx):
+        return _v(self._dot_operand_fragment_layout)[_v(idx)]
+
+    @gluon.constexpr_function
+    def dot_operand_lds_layout(self, idx):
+        """Padded shared layout for a payload operand staged through LDS."""
+        return _v(self._dot_operand_lds_layout)[_v(idx)]
+
+    @gluon.constexpr_function
+    def payload_hbm_offset_layout(self, idx):
+        """Layout used to form one payload tile's global-memory offsets."""
+        return _v(self._payload_hbm_offset_layout)[_v(idx)]
+
+    # -- scale geometry -----------------------------------------------------------
+
+    @gluon.constexpr_function
+    def scale_nonk(self, idx):
+        """Non-K extent of one shuffled scale tile."""
+        return _v(self._scale_nonk)[_v(idx)]
+
+    @gluon.constexpr_function
+    def scale_mini_block_nonk(self, idx):
+        """Rows or columns in one scale load; raw scales retain payload geometry."""
+        return _v(self._scale_mini_block_nonk)[_v(idx)]
+
+    @gluon.constexpr_function
+    def scale_mini_block_k(self, idx):
+        """Scale load K extent in logical payload elements, not E8M0 bytes."""
+        return _v(self._scale_mini_block_k)[_v(idx)]
+
+    @gluon.constexpr_function
+    def scale_ratio_k_step(self, idx):
+        """Number of payload K steps covered by one scale load."""
+        return _v(self._scale_ratio_k_step)[_v(idx)]
+
+    @gluon.constexpr_function
+    def scale_ratio_non_k_slot(self, idx):
+        """Number of payload non-K slots covered by one scale load."""
+        return _v(self._scale_ratio_non_k_slot)[_v(idx)]
+
+    @gluon.constexpr_function
+    def num_scale_tiles(self, idx):
+        return _v(self._num_scale_tiles)[_v(idx)]
+
+    @gluon.constexpr_function
+    def scale_k_phase(self, step):
+        """Which K128 half of the packed K256 scale word this stage consumes."""
+        return (_v(step) * _v(self._BLOCK_K) // 128) % 2
+
+    @gluon.constexpr_function
+    def scale_hbm_steps(self, idx, steps, phase=0):
+        """Scale pointer displacement in units of one payload stage's scale stride."""
+        ratio = self.scale_ratio_k_step(idx)
+        return ((_v(phase) + _v(steps)) // ratio) * ratio
+
+    @gluon.constexpr_function
+    def scale_flat_shape(self, idx):
+        """LDS staging shape of a shuffled scale tile (one 256 B run per stripe)."""
+        return list(_v(self._scale_flat_shape)[_v(idx)])
+
+    @gluon.constexpr_function
+    def sorted_shuffled_ok(self):
+        """Does the tile match the layout the C++ A-scale shuffle writes?"""
+        return _v(self._sorted_shuffled_ok)
+
+    @gluon.constexpr_function
+    def scale_packed_ok(self, idx):
+        """Can this operand's scale fragment be fed as one dword per lane?"""
+        return _v(self._scale_packed_ok)[_v(idx)]
+
+    @gluon.constexpr_function
+    def scale_packed_sel(self, idx, k_phase=0):
+        """Byte selectors in MFMA order, for one K128 half or the full K256 word."""
+        return _v(self._scale_packed_sel)[_v(idx)][_v(k_phase)]
+
+    @gluon.constexpr_function
+    def packed_scale_shape(self, idx):
+        """Physical i32 storage, including both K128 halves even when one is unused."""
+        return list(_v(self._packed_scale_shape)[_v(idx)])
+
+    # -- scale layouts ------------------------------------------------------------
+
+    @gluon.constexpr_function
+    def dot_operand_scale_fragment_layout(self, idx):
+        return _v(self._dot_operand_scale_fragment_layout)[_v(idx)]
+
+    @gluon.constexpr_function
+    def dot_operand_scale_lds_layout(self, idx):
+        """Identity (K-contiguous) shared tile for the raw E8M0 scales."""
+        return _v(self._dot_operand_scale_lds_layout)[_v(idx)]
+
+    @gluon.constexpr_function
+    def scale_hbm_offset_layout(self, idx):
+        """Layout used to form one scale tile's global-memory offsets."""
+        return _v(self._scale_hbm_offset_layout)[_v(idx)]
+
+    @gluon.constexpr_function
+    def shuffled_scale_read_layout(self, idx):
+        """The [non-K, K] view of one slot's flat LDS run, in fragment order."""
+        return _v(self._shuffled_scale_read_layout)[_v(idx)]
+
+    @gluon.constexpr_function
+    def packed_scale_frag_layout(self, idx):
+        """The i32 fragment with its within-dword register bases folded in."""
+        return _v(self._packed_scale_frag_layout)[_v(idx)]
+
+    @gluon.constexpr_function
+    def packed_scale_read_layout(self, idx):
+        """The i32 view of one slot's flat LDS run."""
+        return _v(self._packed_scale_read_layout)[_v(idx)]
+
+    # -- epilogue and emitted-output layouts --------------------------------------
+
+    @gluon.constexpr_function
+    def result_store_layout(self, extent_m, extent_n, elem_bits):
+        """Blocked layout for the masked global store of one result slot.
+
+        ``vec`` is capped by the elements each thread actually owns, so a narrow tile
+        is not over-covered (which would issue every store twice).
+        """
+        num_warps = self.num_warps()
+        ept = max(1, (_v(extent_m) * _v(extent_n)) // (num_warps * WARP_SIZE))
+        vec = max(1, min(128 // _v(elem_bits), _v(extent_n), ept))
+        lanes_n = max(1, min(WARP_SIZE, _v(extent_n) // vec))
+        lanes_m = max(1, WARP_SIZE // lanes_n)
+        warps_m = max(1, min(num_warps, _v(extent_m) // lanes_m))
+        warps_n = max(1, num_warps // warps_m)
+        return gl.BlockedLayout(
+            size_per_thread=[1, vec],
+            threads_per_warp=[lanes_m, lanes_n],
+            warps_per_cta=[warps_m, warps_n],
+            order=[1, 0],
+        )
+
+    @gluon.constexpr_function
+    def output_n_slot(self):
+        """Emitted columns produced by one logical N-slot epilogue tile."""
+        return _v(self._output_n_slot)
+
+    @gluon.constexpr_function
+    def output_block_n(self):
+        """Emitted columns produced by one CTA's raw BLOCK_N tile."""
+        return _v(self._output_block_n)
+
+    @gluon.constexpr_function
+    def quant_payload_shape(self, rows, output_n=None):
+        """Packed E2M1 byte shape for ``rows`` by emitted-output columns."""
+        output_n = self.output_n_slot() if _v(output_n) is None else _v(output_n)
+        return [_v(rows), output_n // 2]
+
+    @gluon.constexpr_function
+    def quant_scale_shape(self, rows, output_n=None):
+        """E8M0 shape for ``rows`` by emitted-output columns."""
+        output_n = self.output_n_slot() if _v(output_n) is None else _v(output_n)
+        return [_v(rows), output_n // MX_GROUP_INT]
+
+    @gluon.constexpr_function
+    def epilogue_threads(self):
+        return _v(self._epilogue_threads)
+
+    @gluon.constexpr_function
+    def epilogue_input_lds_layout(self):
+        return _v(self._epilogue_input_lds_layout)
+
+    @gluon.constexpr_function
+    def epilogue_gamma_buffer_load_lds_layout(self):
+        return _v(self._epilogue_gamma_buffer_load_lds_layout)
+
+    @gluon.constexpr_function
+    def epilogue_bias_buffer_load_lds_layout(self):
+        return _v(self._epilogue_bias_buffer_load_lds_layout)
+
+    @gluon.constexpr_function
+    def epilogue_gamma_shape(self):
+        return list(_v(self._epilogue_gamma_shape))
+
+    @gluon.constexpr_function
+    def epilogue_bias_shape(self):
+        return list(_v(self._epilogue_bias_shape))
+
+    @gluon.constexpr_function
+    def epilogue_inputs_via_lds(self):
+        """Whether bias/gamma vectors are staged through LDS."""
+        return _v(self._epilogue_inputs_via_lds)
+
+    @gluon.constexpr_function
+    def quant_staging_layout(self):
+        return _v(self._quant_staging_layout)
+
+    @gluon.constexpr_function
+    def quant_staging_rows(self):
+        return _v(self._quant_staging_rows)
+
+    @gluon.constexpr_function
+    def quant_staging_rotates(self):
+        """Whether the fused-quant staging alternates two per-tile LDS banks."""
+        return _v(self._quant_staging_rotates)
+
+    @gluon.constexpr_function
+    def quant_amax_lane_elems(self, extent_m=None, output_n=None):
+        """Inner lane-local width for the split MXFP4 amax reduction.
+
+        Gate/up split: one lane owns the transposed MFMA quad, ``instr_m * instr_n /
+        WARP_SIZE`` consecutive emitted columns. Interleaved: a conservative
+        per-lane element count.
+        """
+        extent_m = _v(self._MINI_BLOCK_M) if _v(extent_m) is None else _v(extent_m)
+        output_n = self.output_n_slot() if _v(output_n) is None else _v(output_n)
+        if _v(self._gu_split):
+            instr = _v(self._mfma_instr_shape)
+            return max(1, min(MX_GROUP_INT, (instr[0] * instr[1]) // WARP_SIZE))
+        per_lane = (extent_m * output_n) // (self.num_warps() * WARP_SIZE)
+        return min(MX_GROUP_INT, max(1, per_lane))
+
+    # -- resources ----------------------------------------------------------------
+
+    @gluon.constexpr_function
+    def lds_bytes(self):
+        return _v(self._lds_bytes)
+
+    @gluon.constexpr_function
+    def acc_vgprs_per_lane(self):
+        return _v(self._acc_vgprs_per_lane)
+
+
+@gluon.constexpr_function
+def _compute_frozen_layout(tuning_cfg):
+    """Evaluate every layout the frozen kernel reads, from its tuning configuration.
+
+    The kernel body and the host's frozen validation both call this, so they agree on
+    one layout. A config whose tile lattice is unsound (see
+    :func:`_calc_geometry_ok_frozen`) still gets its scalar geometry, but its layout
+    objects are ``None``; ``_validate_frozen_layout`` rejects it.
+    """
+    tc = tuning_cfg
+    fc = tc.func_cfg
+    ok = _calc_geometry_ok_frozen(tc)
+    ops = (0, 1)
+
+    def pair(fn, *args):
+        return tuple(fn(tc, idx, *args) for idx in ops)
+
+    def pair_if(cond, fn, *args):
+        return tuple(fn(tc, idx, *args) if ok and cond(idx) else None for idx in ops)
+
+    def always(idx):
+        return True
+
+    def has_scale(idx):
+        return _has_scale_frozen(fc, idx)
+
+    bools = (False, True)
+    via_lds = tuple(
+        tuple(
+            _calc_component_via_lds_frozen(tc, (idx, is_scale)) for is_scale in bools
+        )
+        for idx in ops
+    )
+
+    def payload_via_lds(idx):
+        return via_lds[idx][0]
+
+    def scale_tiles_ok(idx):
+        # A shuffled scale mini block narrower than the payload slot covers no whole
+        # slot: it has no tile count, and no LDS footprint where it is staged there.
+        return _calc_scale_ratio_non_k_slot_frozen(tc, idx) > 0
+
+    def scale_tiles(fn):
+        return tuple(fn(tc, idx) if scale_tiles_ok(idx) else None for idx in ops)
+
+    lds_ok = all(
+        scale_tiles_ok(idx)
+        or not (has_scale(idx) and (_v(tc.FROZEN_STEP) or via_lds[idx][1]))
+        for idx in ops
+    )
+    epilogue_via_lds = _calc_epilogue_inputs_via_lds_frozen(tc)
+    return _FrozenLayout(
+        BLOCK_K=_v(tc.BLOCK_K),
+        MINI_BLOCK_M=_v(tc.MINI_BLOCK_M),
+        mfma_instr_shape=list(_v(tc.mfma_instr_shape)),
+        gu_split=_gu_split_frozen(fc),
+        num_warps=_calc_num_warps_frozen(tc),
+        num_k_slots_per_tile=_calc_num_k_slots_per_tile_frozen(tc),
+        num_prefetch_k_slots=_calc_num_prefetch_k_slots_frozen(tc),
+        num_m_slots_per_block=_calc_num_m_slots_per_block_frozen(tc),
+        num_n_slots_per_block=_calc_num_n_slots_per_block_frozen(tc),
+        num_lds_slots_per_block_non_k=pair(
+            _calc_num_lds_slots_per_block_non_k_frozen
+        ),
+        payload_block_k_storage=pair(_calc_payload_block_k_storage_frozen),
+        scale_block_k_storage=_calc_scale_block_k_storage_frozen(tc),
+        payload_lds_shape_slot=pair(_calc_payload_lds_shape_slot_frozen),
+        scale_lds_shape_slot=pair(_calc_scale_lds_shape_slot_frozen),
+        byte_unit_lds_ok=pair(_calc_byte_unit_lds_ok_frozen),
+        component_via_lds=via_lds,
+        pipeline_register_period=_calc_pipeline_register_period_frozen(tc),
+        dot_result_fragment_layout=(
+            _calc_dot_result_fragment_layout_frozen(tc) if ok else None
+        ),
+        dot_operand_fragment_layout=pair_if(
+            always, _calc_dot_operand_fragment_layout_frozen
+        ),
+        dot_operand_lds_layout=pair_if(
+            payload_via_lds, _calc_dot_operand_lds_layout_frozen
+        ),
+        payload_hbm_offset_layout=pair_if(
+            always, _calc_payload_hbm_offset_layout_frozen
+        ),
+        scale_nonk=pair(_calc_scale_nonk_frozen),
+        scale_mini_block_nonk=pair(_calc_scale_mini_block_nonk_frozen),
+        scale_mini_block_k=pair(_calc_scale_mini_block_k_frozen),
+        scale_ratio_k_step=pair(_calc_scale_ratio_k_step_frozen),
+        scale_ratio_non_k_slot=pair(_calc_scale_ratio_non_k_slot_frozen),
+        num_scale_tiles=scale_tiles(_calc_num_scale_tiles_frozen),
+        scale_flat_shape=pair(_calc_scale_flat_shape_frozen),
+        sorted_shuffled_ok=_calc_sorted_shuffled_ok_frozen(tc),
+        scale_packed_ok=(
+            pair(_calc_scale_packed_ok_frozen) if ok else (False, False)
+        ),
+        scale_packed_sel=tuple(
+            tuple(
+                _calc_scale_packed_sel_frozen(tc, idx, k_phase) if ok else None
+                for k_phase in (0, 1)
+            )
+            for idx in ops
+        ),
+        packed_scale_shape=pair(_calc_packed_scale_shape_frozen),
+        dot_operand_scale_fragment_layout=pair_if(
+            has_scale, _calc_dot_operand_scale_fragment_layout_frozen
+        ),
+        dot_operand_scale_lds_layout=pair(_calc_dot_operand_scale_lds_layout_frozen),
+        scale_hbm_offset_layout=pair_if(
+            has_scale, _calc_scale_hbm_offset_layout_frozen
+        ),
+        shuffled_scale_read_layout=tuple(
+            (
+                _calc_shuffled_scale_read_layout_frozen(tc, idx)
+                if ok and has_scale(idx)
+                else None
+            )
+            for idx in ops
+        ),
+        packed_scale_frag_layout=pair_if(
+            has_scale, _calc_packed_scale_frag_layout_frozen
+        ),
+        packed_scale_read_layout=tuple(
+            (
+                _calc_packed_scale_read_layout_frozen(tc, idx)
+                if ok and has_scale(idx)
+                else None
+            )
+            for idx in ops
+        ),
+        output_n_slot=_calc_output_n_slot_frozen(tc),
+        output_block_n=_calc_output_block_n_frozen(tc),
+        epilogue_threads=_calc_epilogue_threads_frozen(tc),
+        epilogue_input_lds_layout=_calc_epilogue_input_lds_layout_frozen(tc),
+        epilogue_gamma_buffer_load_lds_layout=(
+            _calc_epilogue_gamma_buffer_load_lds_layout_frozen(tc)
+            if epilogue_via_lds
+            else None
+        ),
+        epilogue_bias_buffer_load_lds_layout=(
+            _calc_epilogue_bias_buffer_load_lds_layout_frozen(tc)
+            if epilogue_via_lds
+            else None
+        ),
+        epilogue_gamma_shape=_calc_epilogue_gamma_shape_frozen(tc),
+        epilogue_bias_shape=_calc_epilogue_bias_shape_frozen(tc),
+        epilogue_inputs_via_lds=epilogue_via_lds,
+        quant_staging_layout=_calc_quant_staging_layout_frozen(tc),
+        quant_staging_rows=_calc_quant_staging_rows_frozen(tc),
+        quant_staging_rotates=_calc_quant_staging_rotates_frozen(tc),
+        lds_bytes=_calc_lds_bytes_frozen(tc) if lds_ok else None,
+        acc_vgprs_per_lane=_calc_acc_vgprs_per_lane_frozen(tc),
+    )
+
+
+# --- vendored offset helpers --------------------------------------------------
+# The slot index and the HBM offset math this snapshot addresses its operands with,
+# copied from _layout.py. They read only the ``_FrozenLayout`` this module builds.
 #
-# This is not hypothetical. a1c975cbf changed exactly this area -- it reworked the
-# shuffled-scale address expression and added the frozen rejection for wider scale
-# tiles -- and that is why the frozen arm no longer compiles under the benchmarked
-# flag set. Sharing the live helpers is what let a live change reach in here.
-#
-# The layout accessors these call (num_m_slots_per_block, scale_hbm_offset_layout,
-# ...) stay shared. They read the ``KernelLayout`` the entry point computes and passes
-# in, which this module never imports -- the accessors are the stable surface rather
-# than the part that churns. Aggregates here type that field as ``base_value`` for the
-# same reason. test_moe_gemm_gluon_frozen.py asserts these twins still agree with
-# their live counterparts.
+# a1c975cbf showed why this has to be a copy: it reworked the live shuffled-scale
+# address expression and, while the helpers were shared, that live change reached
+# straight into the frozen kernel.
 # ------------------------------------------------------------------------------
 
 @gluon.constexpr_function
@@ -258,7 +1846,7 @@ def _n_start_frozen(pid_n, n_slot_idx: gl.constexpr, N, func_cfg, tuning_cfg):
     Interleaved tiles are contiguous. Split tiles cover the same emitted channels but
     read gate and up from separate halves of N.
     """
-    if require_constexpr(func_cfg.gu_split()):
+    if require_constexpr(_gu_split_frozen(func_cfg)):
         out = pid_n * tuning_cfg.MINI_BLOCK_N + n_slot_idx * (N // 2)
     else:
         out = pid_n * tuning_cfg.BLOCK_N + n_slot_idx * tuning_cfg.MINI_BLOCK_N
@@ -395,7 +1983,7 @@ def _b_payload_hbm_offsets_frozen(b, pid_n, N, K, func_cfg, tuning_cfg, layout):
     NUM_N_SLOTS_PER_BLOCK: gl.constexpr = layout.num_n_slots_per_block()
     PAYLOAD_BLOCK_K_STORAGE: gl.constexpr = layout.payload_block_k_storage(1)
     layout_b_slot: gl.constexpr = layout.payload_hbm_offset_layout(1)
-    K_STORAGE: gl.constexpr = K // func_cfg.b_pack_divisor()
+    K_STORAGE: gl.constexpr = K // _pack_divisor_frozen(func_cfg, 1)
     b_hbm_offsets_block = ()
     for n_slot_idx in gl.static_range(NUM_N_SLOTS_PER_BLOCK):
         if require_constexpr(tuning_cfg.B_PRESHUFFLED):
@@ -437,7 +2025,7 @@ def _a_scale_hbm_offsets_frozen(
     ``[M_SLOT, SCALE_BLOCK_K_STORAGE]`` grid
     over the raw ``(M, K/32)`` tensor. The caller sees a tuple indexed by M slot.
     """
-    if require_constexpr(not func_cfg.a_has_scale()):
+    if require_constexpr(not _has_scale_frozen(func_cfg, 0)):
         return _NO_SCALE
 
     M_BLOCK: gl.constexpr = tuning_cfg.BLOCK_M
@@ -449,7 +2037,7 @@ def _a_scale_hbm_offsets_frozen(
     SCALE_K: gl.constexpr = layout.scale_mini_block_k(0)
     SCALE_RATIO: gl.constexpr = layout.scale_ratio_non_k_slot(0)
 
-    if require_constexpr(tuning_cfg.scale_shuffled(0) and layout.scale_in_reg(0)):
+    if require_constexpr(_scale_shuffled_frozen(tuning_cfg, 0) and layout.scale_in_reg(0)):
         a_scale_hbm_offsets_block = ()
         for m_slot_idx in gl.static_range(NUM_M_SLOTS_PER_BLOCK):
             a_scale_hbm_offsets_block = a_scale_hbm_offsets_block + (
@@ -533,7 +2121,7 @@ def _b_scale_hbm_offsets_frozen(b, pid_n, N, K, func_cfg, tuning_cfg, layout):
     Either a flat CDNA4_SCALE preshuffle run for staging or the raw ``(K/32, N)``
     grid. The caller receives a tuple indexed by N slot.
     """
-    if require_constexpr(not func_cfg.b_has_scale()):
+    if require_constexpr(not _has_scale_frozen(func_cfg, 1)):
         return _NO_SCALE
 
     N_SLOT: gl.constexpr = tuning_cfg.MINI_BLOCK_N
@@ -544,10 +2132,10 @@ def _b_scale_hbm_offsets_frozen(b, pid_n, N, K, func_cfg, tuning_cfg, layout):
     SCALE_K: gl.constexpr = layout.scale_mini_block_k(1)
     SCALE_RATIO: gl.constexpr = layout.scale_ratio_non_k_slot(1)
     SPLIT_EXTENT: gl.constexpr = (
-        N_SLOT if func_cfg.gu_split() and SCALE_RATIO > 1 else 0
+        N_SLOT if _gu_split_frozen(func_cfg) and SCALE_RATIO > 1 else 0
     )
 
-    if require_constexpr(tuning_cfg.scale_shuffled(1) and layout.scale_in_reg(1)):
+    if require_constexpr(_scale_shuffled_frozen(tuning_cfg, 1) and layout.scale_in_reg(1)):
         b_scale_hbm_offsets_block = ()
         for n_slot_idx in gl.static_range(NUM_N_SLOTS_PER_BLOCK):
             b_scale_hbm_offsets_block = b_scale_hbm_offsets_block + (
@@ -648,7 +2236,7 @@ def _dot(
     K_PHASE: gl.constexpr = 0,
 ):
     """The frozen snapshot's matrix-instruction dispatch."""
-    kind: gl.constexpr = func_cfg.dot_kind()
+    kind: gl.constexpr = _dot_kind_frozen(func_cfg)
     a_sel: gl.constexpr = _packed_sel(tuning_cfg, layout, 0, K_PHASE)
     b_sel: gl.constexpr = _packed_sel(tuning_cfg, layout, 1, K_PHASE)
     any_packed: gl.constexpr = _any_packed(tuning_cfg, layout)
@@ -657,21 +2245,21 @@ def _dot(
             a=a,
             a_scale=a_scale,
             a_scale_sel=a_sel,
-            a_format=func_cfg.mx_format(0),
+            a_format=_mx_format_frozen(func_cfg, 0),
             b=b,
             b_scale=b_scale,
             b_scale_sel=b_sel,
-            b_format=func_cfg.mx_format(1),
+            b_format=_mx_format_frozen(func_cfg, 1),
             acc=acc,
         )
     elif require_constexpr(kind == _DK_MFMA_SCALED):
         out = gl.amd.cdna4.mfma_scaled(
             a=a,
             a_scale=a_scale,
-            a_format=func_cfg.mx_format(0),
+            a_format=_mx_format_frozen(func_cfg, 0),
             b=b,
             b_scale=b_scale,
-            b_format=func_cfg.mx_format(1),
+            b_format=_mx_format_frozen(func_cfg, 1),
             acc=acc,
         )
     elif require_constexpr(kind == _DK_UPCAST_MFMA):
@@ -713,11 +2301,11 @@ def _maybe_block_dot(
 ):
     if require_constexpr(DO_MFMA):
         for i in gl.static_range(N_MINI):
-            if require_constexpr(func_cfg.has_scale(0)):
+            if require_constexpr(_has_scale_frozen(func_cfg, 0)):
                 a_s = a_frags[2 * i + 1]
             else:
                 a_s = _NO_SCALE
-            if require_constexpr(func_cfg.has_scale(1)):
+            if require_constexpr(_has_scale_frozen(func_cfg, 1)):
                 b_s = b_frags[2 * i + 1]
             else:
                 b_s = _NO_SCALE
@@ -758,8 +2346,8 @@ def _buffer_load_to_lds(
 class _FrozenLDSManager:
     """The LDS shape and accessors used by the frozen snapshot."""
 
-    func_cfg: KernelFuncConfig
-    tuning_cfg: KernelTuningConfig
+    func_cfg: base_value
+    tuning_cfg: base_value
     layout: base_value
     a_payload_lds_ptr: gl.shared_memory_descriptor | gl.constexpr
     a_scale_lds_ptr: gl.shared_memory_descriptor | gl.constexpr
@@ -787,14 +2375,14 @@ class _FrozenLDSManager:
 
     @gluon.jit
     def alloc(func_cfg, tuning_cfg, layout):
-        NBA: gl.constexpr = tuning_cfg.num_buffers(0)
-        NBB: gl.constexpr = tuning_cfg.num_buffers(1)
-        NBAS: gl.constexpr = tuning_cfg.num_buffers(0, True)
-        NBBS: gl.constexpr = tuning_cfg.num_buffers(1, True)
+        NBA: gl.constexpr = _num_buffers_frozen(tuning_cfg, 0)
+        NBB: gl.constexpr = _num_buffers_frozen(tuning_cfg, 1)
+        NBAS: gl.constexpr = _num_buffers_frozen(tuning_cfg, 0, True)
+        NBBS: gl.constexpr = _num_buffers_frozen(tuning_cfg, 1, True)
         NMA: gl.constexpr = layout.num_lds_slots_per_block_non_k(0)
         NMB: gl.constexpr = layout.num_lds_slots_per_block_non_k(1)
-        a_ty: gl.constexpr = func_cfg.operand_elem_ty(0)
-        b_ty: gl.constexpr = func_cfg.operand_elem_ty(1)
+        a_ty: gl.constexpr = _operand_elem_ty_frozen(func_cfg, 0)
+        b_ty: gl.constexpr = _operand_elem_ty_frozen(func_cfg, 1)
         a_shape: gl.constexpr = layout.payload_lds_shape_slot(0)
         b_shape: gl.constexpr = layout.payload_lds_shape_slot(1)
 
@@ -814,9 +2402,9 @@ class _FrozenLDSManager:
             )
         else:
             b_payload_lds_ptr: gl.constexpr = None
-        if require_constexpr(func_cfg.has_scale(0)):
+        if require_constexpr(_has_scale_frozen(func_cfg, 0)):
             as_shape: gl.constexpr = layout.scale_lds_shape_slot(0)
-            if require_constexpr(tuning_cfg.scale_shuffled(0)):
+            if require_constexpr(_scale_shuffled_frozen(tuning_cfg, 0)):
                 a_scale_lds_ptr = gl.allocate_shared_memory(
                     gl.uint8,
                     [NBAS * layout.num_scale_tiles(0)] + layout.scale_flat_shape(0),
@@ -830,9 +2418,9 @@ class _FrozenLDSManager:
                 )
         else:
             a_scale_lds_ptr: gl.constexpr = None
-        if require_constexpr(func_cfg.has_scale(1)):
+        if require_constexpr(_has_scale_frozen(func_cfg, 1)):
             bs_shape: gl.constexpr = layout.scale_lds_shape_slot(1)
-            if require_constexpr(tuning_cfg.scale_shuffled(1)):
+            if require_constexpr(_scale_shuffled_frozen(tuning_cfg, 1)):
                 b_scale_lds_ptr = gl.allocate_shared_memory(
                     gl.uint8,
                     [NBBS * NMB] + layout.scale_flat_shape(1),
@@ -905,7 +2493,7 @@ class _FrozenLDSManager:
         gl.static_assert(VIA_LDS)
         ratio: gl.constexpr = layout.scale_ratio_non_k_slot(operand)
         if require_constexpr(
-            self.func_cfg.has_scale(operand)
+            _has_scale_frozen(self.func_cfg, operand)
             and layout.scale_via_lds(operand)
             and tile % ratio == 0
         ):
@@ -1018,13 +2606,13 @@ class _FrozenLDSManager:
                     tile,
                     mini_idx,
                     1 - operand,
-                    self.func_cfg.pack_divisor(operand),
+                    _pack_divisor_frozen(self.func_cfg, operand),
                 ),
                 layout.dot_operand_fragment_layout(operand),
             )
-        if require_constexpr(READ_SCALE and self.func_cfg.has_scale(operand)):
+        if require_constexpr(READ_SCALE and _has_scale_frozen(self.func_cfg, operand)):
             gl.static_assert(self.layout.scale_via_lds(operand))
-            if require_constexpr(self.tuning_cfg.scale_shuffled(operand)):
+            if require_constexpr(_scale_shuffled_frozen(self.tuning_cfg, operand)):
                 if require_constexpr(operand == 0):
                     scale_tile_lds_ptr = self._a_scale_tile(SCALE_READ_IDX, tile)
                 else:
@@ -1041,7 +2629,7 @@ class _FrozenLDSManager:
                     ),
                     layout.packed_scale_frag_layout(operand),
                 )
-            elif require_constexpr(self.tuning_cfg.scale_shuffled(operand)):
+            elif require_constexpr(_scale_shuffled_frozen(self.tuning_cfg, operand)):
                 scale_val = _ds_read(
                     scale_tile_lds_ptr.reinterpret(
                         gl.uint8,
@@ -1079,8 +2667,8 @@ class _PipelineConst:
     a_step: gl.constexpr
     b_step: gl.constexpr
     s_step: gl.constexpr
-    func_cfg: KernelFuncConfig
-    tuning_cfg: KernelTuningConfig
+    func_cfg: base_value
+    tuning_cfg: base_value
     layout: base_value
 
     @gluon.constexpr_function
@@ -1175,14 +2763,14 @@ def _advance_hbm_ptrs(pc, hbm_ptrs, STEPS: gl.constexpr = 1, K_PHASE: gl.constex
     b_hbm_ptr = hbm_ptrs.b_hbm_ptr + STEPS * pc.b_step
     a_scale_hbm_ptr = hbm_ptrs.a_scale_hbm_ptr
     b_scale_hbm_ptr = hbm_ptrs.b_scale_hbm_ptr
-    if require_constexpr(pc.func_cfg.a_has_scale() and pc.layout.scale_via_lds(0)):
+    if require_constexpr(_has_scale_frozen(pc.func_cfg, 0) and pc.layout.scale_via_lds(0)):
         a_scale_hbm_ptr = (
             a_scale_hbm_ptr
             + pc.layout.scale_hbm_steps(0, STEPS, K_PHASE)
             * pc.s_step
             * pc.a_scale_stride_k
         )
-    if require_constexpr(pc.func_cfg.b_has_scale() and pc.layout.scale_via_lds(1)):
+    if require_constexpr(_has_scale_frozen(pc.func_cfg, 1) and pc.layout.scale_via_lds(1)):
         b_scale_hbm_ptr = (
             b_scale_hbm_ptr
             + pc.layout.scale_hbm_steps(1, STEPS, K_PHASE)
@@ -1454,7 +3042,7 @@ def _buffer_load_frozen(
         # Payload and its own scale share one commit group; a scale placed elsewhere
         # gets its own below.
         if require_constexpr(
-            A_SC == A_TILE and func_cfg.has_scale(0) and pc.layout.scale_via_lds(0)
+            A_SC == A_TILE and _has_scale_frozen(func_cfg, 0) and pc.layout.scale_via_lds(0)
         ):
             pc.lds_ptrs.buffer_load_scale(
                 0,
@@ -1462,19 +3050,19 @@ def _buffer_load_frozen(
                 BUFFER_LOAD_IDX,
                 A_TILE,
                 a_scale_hbm_ptr,
-                _opt_at(pc.a_scale_hbm_offs, A_TILE, func_cfg.a_has_scale()),
+                _opt_at(pc.a_scale_hbm_offs, A_TILE, _has_scale_frozen(func_cfg, 0)),
                 0,
             )
         pc.lds_ptrs.commit_buffer_load()
     if require_constexpr(A_SC is not None and A_SC != A_TILE):
-        if require_constexpr(func_cfg.has_scale(0) and pc.layout.scale_via_lds(0)):
+        if require_constexpr(_has_scale_frozen(func_cfg, 0) and pc.layout.scale_via_lds(0)):
             pc.lds_ptrs.buffer_load_scale(
                 0,
                 True,
                 BUFFER_LOAD_IDX,
                 A_SC,
                 a_scale_hbm_ptr,
-                _opt_at(pc.a_scale_hbm_offs, A_SC, func_cfg.a_has_scale()),
+                _opt_at(pc.a_scale_hbm_offs, A_SC, _has_scale_frozen(func_cfg, 0)),
                 0,
             )
         pc.lds_ptrs.commit_buffer_load()
@@ -1483,7 +3071,7 @@ def _buffer_load_frozen(
             1, True, BUFFER_LOAD_IDX, B_TILE, b_hbm_ptr, pc.b_hbm_offs[B_TILE], 0
         )
         if require_constexpr(
-            B_SC == B_TILE and func_cfg.has_scale(1) and pc.layout.scale_via_lds(1)
+            B_SC == B_TILE and _has_scale_frozen(func_cfg, 1) and pc.layout.scale_via_lds(1)
         ):
             pc.lds_ptrs.buffer_load_scale(
                 1,
@@ -1491,19 +3079,19 @@ def _buffer_load_frozen(
                 BUFFER_LOAD_IDX,
                 B_TILE,
                 b_scale_hbm_ptr,
-                _opt_at(pc.b_scale_hbm_offs, B_TILE, func_cfg.b_has_scale()),
+                _opt_at(pc.b_scale_hbm_offs, B_TILE, _has_scale_frozen(func_cfg, 1)),
                 0,
             )
         pc.lds_ptrs.commit_buffer_load()
     if require_constexpr(B_SC is not None and B_SC != B_TILE):
-        if require_constexpr(func_cfg.has_scale(1) and pc.layout.scale_via_lds(1)):
+        if require_constexpr(_has_scale_frozen(func_cfg, 1) and pc.layout.scale_via_lds(1)):
             pc.lds_ptrs.buffer_load_scale(
                 1,
                 True,
                 BUFFER_LOAD_IDX,
                 B_SC,
                 b_scale_hbm_ptr,
-                _opt_at(pc.b_scale_hbm_offs, B_SC, func_cfg.b_has_scale()),
+                _opt_at(pc.b_scale_hbm_offs, B_SC, _has_scale_frozen(func_cfg, 1)),
                 0,
             )
         pc.lds_ptrs.commit_buffer_load()
@@ -1511,9 +3099,9 @@ def _buffer_load_frozen(
         # One bump per step: the frozen kernel did not fold steps into soffset.
         a_hbm_ptr = a_hbm_ptr + KU * pc.a_step
         b_hbm_ptr = b_hbm_ptr + KU * pc.b_step
-        if require_constexpr(func_cfg.a_has_scale() and pc.layout.scale_via_lds(0)):
+        if require_constexpr(_has_scale_frozen(func_cfg, 0) and pc.layout.scale_via_lds(0)):
             a_scale_hbm_ptr = a_scale_hbm_ptr + KU * pc.s_step * pc.a_scale_stride_k
-        if require_constexpr(func_cfg.b_has_scale() and pc.layout.scale_via_lds(1)):
+        if require_constexpr(_has_scale_frozen(func_cfg, 1) and pc.layout.scale_via_lds(1)):
             b_scale_hbm_ptr = b_scale_hbm_ptr + KU * pc.s_step * pc.b_scale_stride_k
     return a_hbm_ptr, b_hbm_ptr, a_scale_hbm_ptr, b_scale_hbm_ptr
 
@@ -1538,14 +3126,14 @@ def _load_scale_register_frozen(
     """Load a frozen-step scale directly from HBM into its MFMA fragment."""
     tc: gl.constexpr = pc.tuning_cfg
     layout: gl.constexpr = pc.layout
-    gl.static_assert(pc.func_cfg.has_scale(operand))
+    gl.static_assert(_has_scale_frozen(pc.func_cfg, operand))
     gl.static_assert(layout.scale_in_reg(operand))
     cache: gl.constexpr = (
         tc.token_scale_cache_modifier
         if operand == 0
         else tc.expert_scale_cache_modifier
     )
-    if require_constexpr(tc.scale_shuffled(operand)):
+    if require_constexpr(_scale_shuffled_frozen(tc, operand)):
         # One dword per lane instead of four ubytes: issue at the address-ordered
         # permutation so the widened load fills registers correctly, then renumber
         # into the layout the MFMA wants.
@@ -1582,7 +3170,7 @@ def _ds_read_operand_frozen(
     layout: gl.constexpr = pc.layout
     NUM_MINI: gl.constexpr = layout.num_k_slots_per_tile()
     SK_MINI: gl.constexpr = tc.BLOCK_K // MX_GROUP
-    HAS: gl.constexpr = pc.func_cfg.has_scale(operand)
+    HAS: gl.constexpr = _has_scale_frozen(pc.func_cfg, operand)
     SCALE_VIA_LDS: gl.constexpr = HAS and layout.scale_via_lds(operand)
     if require_constexpr(operand == 0):
         scale_hbm_offs = pc.a_scale_hbm_offs
@@ -1704,8 +3292,8 @@ def _pipeline_step_frozen(
     NUM_MINI: gl.constexpr = layout.num_k_slots_per_tile()
     PF_MINI: gl.constexpr = layout.num_prefetch_k_slots()
     HEAD_MINI: gl.constexpr = NUM_MINI - PF_MINI
-    A_HAS: gl.constexpr = func_cfg.a_has_scale()
-    B_HAS: gl.constexpr = func_cfg.b_has_scale()
+    A_HAS: gl.constexpr = _has_scale_frozen(func_cfg, 0)
+    B_HAS: gl.constexpr = _has_scale_frozen(func_cfg, 1)
     # ``DO_MFMA=False`` is the prologue's first step: it fills and reads, but has no
     # carried fragments to dot yet. That is only equivalent to the hand-rolled prologue
     # when the stage carries whole -- with HEAD_MINI > 0 the head of what this step reads
@@ -1926,21 +3514,6 @@ def _pipeline_peeled_frozen(tc):
     return 1
 
 
-@gluon.constexpr_function
-def _validate_frozen_pipeline(tc, layout, K):
-    """Validate the frozen driver's rings and runtime-loop lower bound."""
-    validate_buffer_counts(tc)
-    num_k = layout.num_k_tiles(K)
-    depth = pipeline_depth_frozen(tc, layout)
-    peeled = _pipeline_peeled_frozen(tc)
-    unroll = pipeline_unroll_frozen(tc, layout)
-    assert num_k >= depth + peeled + unroll, (
-        f"NUM_K ({num_k}) must be at least NB_MAX ({depth}) + PEELED ({peeled}) "
-        f"+ UNROLL ({unroll}) = {depth + peeled + unroll}"
-    )
-    return True
-
-
 @gluon.jit
 def _index_frozen(
     tc,
@@ -1951,10 +3524,10 @@ def _index_frozen(
     KI: gl.constexpr,
     IN_LOOP: gl.constexpr,
 ):
-    if require_constexpr(kind % 2 and not tc.func_cfg.has_scale(kind // 2)):
+    if require_constexpr(kind % 2 and not _has_scale_frozen(tc.func_cfg, kind // 2)):
         out = 0
     else:
-        depth: gl.constexpr = tc.num_buffers(kind // 2, kind % 2 != 0)
+        depth: gl.constexpr = _num_buffers_frozen(tc, kind // 2, kind % 2 != 0)
         advance: gl.constexpr = depth - 1 if FILL else 0
         if require_constexpr(
             IN_LOOP and pipeline_unroll_frozen(tc, layout) % depth == 0
@@ -1976,7 +3549,7 @@ def _init_buffers_frozen(pc):
     a, b, a_scale, b_scale = (), (), (), ()
     if require_constexpr(layout.payload_in_reg(0)):
         for _ in gl.static_range(
-            tc.num_buffers(0)
+            _num_buffers_frozen(tc, 0)
             * layout.num_m_slots_per_block()
             * layout.num_k_slots_per_tile()
         ):
@@ -1984,28 +3557,28 @@ def _init_buffers_frozen(pc):
                 gl.zeros(
                     [
                         tc.MINI_BLOCK_M,
-                        tc.BLOCK_K // pc.func_cfg.pack_divisor(0),
+                        tc.BLOCK_K // _pack_divisor_frozen(pc.func_cfg, 0),
                     ],
-                    pc.func_cfg.operand_elem_ty(0),
+                    _operand_elem_ty_frozen(pc.func_cfg, 0),
                     layout.dot_operand_fragment_layout(0),
                 ),
             )
     if require_constexpr(layout.payload_in_reg(1)):
         for _ in gl.static_range(
-            tc.num_buffers(1)
+            _num_buffers_frozen(tc, 1)
             * layout.num_n_slots_per_block()
             * layout.num_k_slots_per_tile()
         ):
             b += (
                 gl.zeros(
-                    [tc.BLOCK_K // pc.func_cfg.pack_divisor(1), tc.MINI_BLOCK_N],
-                    pc.func_cfg.operand_elem_ty(1),
+                    [tc.BLOCK_K // _pack_divisor_frozen(pc.func_cfg, 1), tc.MINI_BLOCK_N],
+                    _operand_elem_ty_frozen(pc.func_cfg, 1),
                     layout.dot_operand_fragment_layout(1),
                 ),
             )
-    if require_constexpr(pc.func_cfg.a_has_scale() and layout.scale_in_reg(0)):
+    if require_constexpr(_has_scale_frozen(pc.func_cfg, 0) and layout.scale_in_reg(0)):
         for _ in gl.static_range(
-            tc.num_buffers(0, True)
+            _num_buffers_frozen(tc, 0, True)
             * layout.num_m_slots_per_block()
             * layout.num_k_slots_per_tile()
         ):
@@ -2025,9 +3598,9 @@ def _init_buffers_frozen(pc):
                         layout.dot_operand_scale_fragment_layout(0),
                     ),
                 )
-    if require_constexpr(pc.func_cfg.b_has_scale() and layout.scale_in_reg(1)):
+    if require_constexpr(_has_scale_frozen(pc.func_cfg, 1) and layout.scale_in_reg(1)):
         for _ in gl.static_range(
-            tc.num_buffers(1, True)
+            _num_buffers_frozen(tc, 1, True)
             * layout.num_n_slots_per_block()
             * layout.num_k_slots_per_tile()
         ):
@@ -2163,10 +3736,10 @@ def _drain_frozen_pipeline(
     layout: gl.constexpr = pc.layout
     main = NUM_K - pipeline_depth_frozen(tc, layout)
     period: gl.constexpr = math.lcm(
-        tc.num_buffers(0),
-        tc.num_buffers(1),
-        tc.num_buffers(0, True) if pc.func_cfg.a_has_scale() else 1,
-        tc.num_buffers(1, True) if pc.func_cfg.b_has_scale() else 1,
+        _num_buffers_frozen(tc, 0),
+        _num_buffers_frozen(tc, 1),
+        _num_buffers_frozen(tc, 0, True) if _has_scale_frozen(pc.func_cfg, 0) else 1,
+        _num_buffers_frozen(tc, 1, True) if _has_scale_frozen(pc.func_cfg, 1) else 1,
         layout.scale_ratio_k_step(0),
         layout.scale_ratio_k_step(1),
     )
@@ -2247,6 +3820,858 @@ def _last_mfma_frozen(pc, regs):
     return acc
 
 
+# --- vendored SwiGLU ----------------------------------------------------------
+# Copies of the ``_triton_kernels/moe/activations.py`` helpers the frozen epilogue
+# applies, kept as ``triton.jit`` exactly as the shared module defines them.
+# ------------------------------------------------------------------------------
+@triton.jit
+def _clip_frozen(x, limit, clip_lower: tl.constexpr):
+    res = tl.minimum(x, limit)
+    if clip_lower:
+        res = tl.maximum(-limit, res)
+    return res
+
+
+@triton.jit
+def _swiglu_gate_frozen(gelu, alpha, limit, FAST_RCP: tl.constexpr = False):
+    """``silu(gelu)`` alone -- the half that owns every transcendental."""
+    gelu = gelu.to(tl.float32)
+    if limit is not None:
+        gelu = _clip_frozen(gelu, limit, clip_lower=False)
+    denom = 1 + tl.exp2(-1.44269504089 * alpha * gelu)
+    if FAST_RCP:
+        # Hardware v_rcp_f32 instead of the IEEE divide; ~1 ulp, well inside the bf16
+        # the result is stored as. tl.fdiv(ieee_rounding=False) does NOT do this on the
+        # AMD backend, so the libdevice call is the only route.
+        return hip_libdevice.fast_dividef(gelu, denom)
+    return gelu / denom
+
+
+@triton.jit
+def _swiglu_combine_frozen(s, linear, limit, ADD_RESIDUAL: tl.constexpr):
+    """``s * linear``, with the linear side's clamp. The other half of the activation."""
+    linear = linear.to(tl.float32)
+    if limit is not None:
+        linear = _clip_frozen(linear, limit, clip_lower=True)
+    if ADD_RESIDUAL:
+        return tl.fma(s, linear, s)  # s * (linear + 1)
+    return s * linear
+
+
+@triton.jit
+def _swiglu_pair_frozen(
+    gelu, linear, alpha, limit, ADD_RESIDUAL: tl.constexpr, FAST_RCP: tl.constexpr = False
+):
+    """The activation itself, on gate/linear that are already separated."""
+    return _swiglu_combine_frozen(
+        _swiglu_gate_frozen(gelu, alpha, limit, FAST_RCP), linear, limit, ADD_RESIDUAL
+    )
+
+
+@triton.jit
+def _swiglu_frozen(
+    input,
+    alpha,
+    limit,
+    ADD_RESIDUAL: tl.constexpr,
+    FAST_RCP: tl.constexpr = False,
+    GROUP: tl.constexpr = 1,
+):
+    """SwiGLU on an N-interleaved tile: ``s = silu(gelu)``, then ``s * linear``
+    (``s * (linear + 1)`` with ADD_RESIDUAL). ``GROUP == 2`` reads (g,g,l,l) pairs,
+    anything else (g,l,g,l).
+    """
+    if GROUP == 2:
+        # Index arithmetic for the 4-D view (i, h, e) -> 4i + 2h + e:
+        #   split on e  -> a = 4i+2h,      b = 4i+2h+1
+        #   split each on h -> gate = 4i, 4i+1   linear = 4i+2, 4i+3
+        n4: tl.constexpr = input.shape[1] // 4
+        a, b = tl.split(tl.reshape(input, (input.shape[0], n4, 2, 2)))
+        g0, l0 = tl.split(a)
+        g1, l1 = tl.split(b)
+        gelu = tl.reshape(tl.join(g0, g1), (input.shape[0], input.shape[1] // 2))
+        linear = tl.reshape(tl.join(l0, l1), (input.shape[0], input.shape[1] // 2))
+    else:
+        gelu, linear = tl.split(
+            tl.reshape(input, (input.shape[0], input.shape[1] // 2, 2))
+        )
+    return _swiglu_pair_frozen(gelu, linear, alpha, limit, ADD_RESIDUAL, FAST_RCP)
+
+
+# --- vendored MXFP4 quant -----------------------------------------------------
+# Copy of ``_quant.mxfp4_quant_gluon``, the fused-output quantisation.
+# ------------------------------------------------------------------------------
+@gluon.jit
+def _mxfp4_quant_gluon_frozen(
+    x,
+    BLOCK_SIZE_N: gl.constexpr,
+    BLOCK_SIZE_M: gl.constexpr,
+    MXFP4_QUANT_BLOCK_SIZE: gl.constexpr,
+    LANE_ELEMS: gl.constexpr = 0,
+):
+    """fp32 ``[BLOCK_SIZE_M, BLOCK_SIZE_N]`` -> (packed E2M1 ``[M, N/2]``, E8M0 ``[M, N/32]``).
+
+    The E8M0 scale is computed on the exponent field (``E - 2`` of the rounded-up amax);
+    the E2M1 pack is the CDNA4 ``v_cvt_scalef32_pk_fp4_f32`` instruction. See
+    ``_quant.py`` for the derivation and the two load-bearing details of the asm.
+    """
+
+    NUM_QUANT_BLOCKS: gl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
+    x = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE)
+
+    if LANE_ELEMS > 1 and MXFP4_QUANT_BLOCK_SIZE % LANE_ELEMS == 0:
+        # Everything -- amax, scale and pack -- in ONE reshape lineage: the inner
+        # reduction in fp32 (free |v| modifiers), the outer one in integer (no NaN
+        # canonicalisation), and the E8M0 scale handed to the pack instruction.
+        OUTER: gl.constexpr = MXFP4_QUANT_BLOCK_SIZE // LANE_ELEMS
+        x5 = x.reshape(
+            BLOCK_SIZE_M, NUM_QUANT_BLOCKS, OUTER, LANE_ELEMS // 2, 2
+        )
+        a5 = tl.abs(x5)
+        part = tl.max(a5, axis=-1, keep_dims=True)
+        part = tl.max(part, axis=3, keep_dims=True)
+        amax = tl.max(
+            part.to(tl.int32, bitcast=True), axis=2, keep_dims=True
+        )
+        e_biased = ((amax + 0x200000) >> 23) & 0xFF
+        e_biased = tl.maximum(e_biased, 2)
+        bs_e8m0 = (e_biased - 2).to(tl.uint8)
+        # The *forward* scale 2**(E-129) = bitcast(bs_e8m0 << 23), broadcast to the
+        # full tile so that splitting it yields the same SliceLayout as evens/odds.
+        hw_scale = ((e_biased - 2) << 23).to(tl.float32, bitcast=True)
+        hw5 = gl.full(
+            x5.shape, 1.0, tl.float32, layout=x5.type.layout
+        ) * hw_scale
+        evens, odds = tl.split(x5)
+        scale_e, _scale_o = tl.split(hw5)
+        old_vdst = gl.full(evens.shape, 0, tl.int32, layout=evens.type.layout)
+        packed = tl.inline_asm_elementwise(
+            "v_cvt_scalef32_pk_fp4_f32 $0, $2, $3, $4",
+            "=v,0,v,v,v",
+            [old_vdst, evens, odds, scale_e],
+            dtype=tl.int32,
+            is_pure=True,
+            pack=1,
+        )
+        return (
+            (packed & 0xFF).to(tl.uint8).reshape(
+                BLOCK_SIZE_M, BLOCK_SIZE_N // 2
+            ),
+            bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS),
+        )
+    else:
+        amax = tl.max(tl.abs(x), axis=-1, keep_dims=True)
+        amax = amax.to(tl.int32, bitcast=True)
+        e_biased = ((amax + 0x200000) >> 23) & 0xFF
+        e_biased = tl.maximum(e_biased, 2)
+        bs_e8m0 = (e_biased - 2).to(tl.uint8)
+        quant_scale = ((256 - e_biased) << 23).to(tl.float32, bitcast=True)
+        qx = x * quant_scale
+
+        # Hardware pack. `old_vdst` must be a tied input ("=v,0,v,v"): the instruction
+        # writes only the selected byte and preserves the other three.
+        xr = qx.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE // 2, 2)
+        evens, odds = tl.split(xr)
+        old_vdst = gl.full(evens.shape, 0, tl.int32, layout=evens.type.layout)
+        packed = tl.inline_asm_elementwise(
+            "v_cvt_scalef32_pk_fp4_f32 $0, $2, $3, 1.0",
+            "=v,0,v,v",
+            [old_vdst, evens, odds],
+            dtype=tl.int32,
+            is_pure=True,
+            pack=1,
+        )
+        return (
+            (packed & 0xFF).to(tl.uint8).reshape(BLOCK_SIZE_M, BLOCK_SIZE_N // 2),
+            bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS),
+        )
+
+
+# --- vendored epilogue --------------------------------------------------------
+# Copy of the ``_epilogue.py`` path the frozen body runs: bias/gamma staging before
+# the drain, then bias -> activation -> gammas -> output quant -> store per mini tile.
+# ------------------------------------------------------------------------------
+_DQ_MXFP4: gl.constexpr = gl.constexpr(int(DtypeQuant.MXFP4))
+
+
+@gluon.jit
+def _n_split_offs_frozen(pid_n, i, N, func_cfg, tuning_cfg):
+    """Map a whole raw-N CTA index tensor through the gate/up packing."""
+    n_slot: gl.constexpr = tuning_cfg.MINI_BLOCK_N
+    if require_constexpr(_gu_split_frozen(func_cfg)):
+        out = pid_n * n_slot + (i // n_slot) * (N // 2) + i % n_slot
+    else:
+        out = pid_n * tuning_cfg.BLOCK_N + i
+    return out
+
+
+@aggregate
+@strip_annotate
+class _FrozenEpilogueInputs:
+    """Optional epilogue vectors and the async groups pending during the drain."""
+
+    bias_hbm_base: gl.tensor | gl.constexpr
+    gammas_hbm_ptr: gl.tensor | gl.constexpr
+    gamma_lds_ptr: gl.shared_memory_descriptor | gl.constexpr
+    bias_lds_ptr: gl.shared_memory_descriptor | gl.constexpr
+    groups: gl.constexpr
+
+    @gluon.constexpr_function
+    def __init__(
+        self, bias_hbm_base, gammas_hbm_ptr, gamma_lds_ptr, bias_lds_ptr, groups
+    ):
+        self.bias_hbm_base = _opt(bias_hbm_base)
+        self.gammas_hbm_ptr = _opt(gammas_hbm_ptr)
+        self.gamma_lds_ptr = _opt(gamma_lds_ptr)
+        self.bias_lds_ptr = _opt(bias_lds_ptr)
+        self.groups = gl.constexpr(_v(groups))
+
+
+@gluon.jit
+def _stage_epilogue_inputs_frozen(
+    bias_hbm_ptr,
+    stride_bias_e,
+    rt,
+    expt_id,
+    start_m,
+    block_id,
+    pid_n,
+    N,
+    M_e,
+    func_cfg,
+    tuning_cfg,
+    layout,
+):
+    """Prepare bias and gammas, staging them in LDS before the pipeline drain."""
+    BM: gl.constexpr = tuning_cfg.BLOCK_M
+    BN: gl.constexpr = tuning_cfg.BLOCK_N
+    if require_constexpr(func_cfg.has_bias):
+        bias_hbm_base = bias_hbm_ptr + expt_id.to(gl.int64) * stride_bias_e
+    else:
+        bias_hbm_base: gl.constexpr = None
+    if require_constexpr(func_cfg.has_gammas):
+        gammas_hbm_ptr = rt.gammas + start_m
+    else:
+        gammas_hbm_ptr: gl.constexpr = None
+
+    # Stage the epilogue's two vectors in LDS, allocated and filled together here
+    # rather than in the prologue: they then have the drain's run of MFMAs to overlap
+    # with and are done well before the epilogue's wait_group(0).
+    #
+    # Both tiles are flat: `.index()` drops the leading axis but keeps the layout's rank,
+    # so a [rows, mini] tile cannot be viewed as one mini block. `.slice(start, length)`
+    # preserves rank, so a 1-D tile slices cleanly into per-mini-block views.
+    #
+    # The gammas tile is EPI_T elements, not BLOCK_M: buffer_load_to_shared requires
+    # exactly 32 or 128 bits per thread, so the copy has to cover one element per thread
+    # of the CTA; the surplus is masked off and never read. Bias is BLOCK_N, which is
+    # already a whole number of elements per thread.
+    EPI_T: gl.constexpr = layout.epilogue_threads()
+    EPI_LDS: gl.constexpr = layout.epilogue_inputs_via_lds()
+    if require_constexpr(EPI_LDS and func_cfg.has_gammas):
+        gamma_lds_ptr = gl.allocate_shared_memory(
+            gl.float32,
+            layout.epilogue_gamma_shape(),
+            layout=layout.epilogue_input_lds_layout(),
+        )
+    else:
+        gamma_lds_ptr: gl.constexpr = None
+    if require_constexpr(EPI_LDS and func_cfg.has_bias):
+        bias_lds_ptr = gl.allocate_shared_memory(
+            gl.float32,
+            layout.epilogue_bias_shape(),
+            layout=layout.epilogue_input_lds_layout(),
+        )
+    else:
+        bias_lds_ptr: gl.constexpr = None
+
+    # Committed as one group, which the frozen drain covers with its WAIT_SLACK.
+    EPI_GROUPS: gl.constexpr = (
+        1 if EPI_LDS and (func_cfg.has_gammas or func_cfg.has_bias) else 0
+    )
+    if require_constexpr(EPI_LDS):
+        if require_constexpr(func_cfg.has_gammas):
+            g_offs = BM * block_id + gl.arange(
+                0,
+                EPI_T,
+                layout=layout.epilogue_gamma_buffer_load_lds_layout(),
+            )
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                gamma_lds_ptr, gammas_hbm_ptr, g_offs, mask=g_offs < M_e, other=0.0
+            )
+        if require_constexpr(func_cfg.has_bias):
+            epi_b_offs = _n_split_offs_frozen(
+                pid_n,
+                gl.arange(
+                    0,
+                    BN,
+                    layout=layout.epilogue_bias_buffer_load_lds_layout(),
+                ),
+                N,
+                func_cfg,
+                tuning_cfg,
+            )
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                bias_lds_ptr, bias_hbm_base, epi_b_offs
+            )
+        if require_constexpr(func_cfg.has_gammas or func_cfg.has_bias):
+            # EPI_LDS is only a layout-feasibility flag, so it can be set with
+            # neither vector present. Nothing was issued then, and an empty group
+            # would still occupy a FIFO position.
+            gl.amd.cdna4.async_copy.commit_group()
+    return _FrozenEpilogueInputs(
+        bias_hbm_base, gammas_hbm_ptr, gamma_lds_ptr, bias_lds_ptr, EPI_GROUPS
+    )
+
+
+@gluon.jit
+def _epi_bias_tiles_frozen(
+    bias_lds_ptr, bias_hbm_ptr, pid_n, N, func_cfg, tuning_cfg, layout
+):
+    """Block-level bias, one tensor per mini-N block, from LDS when staged there."""
+    MBN: gl.constexpr = tuning_cfg.MINI_BLOCK_N
+    NN: gl.constexpr = layout.num_n_slots_per_block()
+    RFL: gl.constexpr = layout.dot_result_fragment_layout()
+    out = ()
+    if require_constexpr(func_cfg.has_bias):
+        for hn in gl.static_range(NN):
+            if require_constexpr(bias_lds_ptr is not None):
+                out = out + (
+                    bias_lds_ptr.slice(hn * MBN, MBN).load(gl.SliceLayout(0, RFL)),
+                )
+            else:
+                out = out + (
+                    gl.load(
+                        bias_hbm_ptr
+                        + _n_start_frozen(pid_n, hn, N, func_cfg, tuning_cfg)
+                        + gl.arange(0, MBN)
+                    ),
+                )
+    return out
+
+
+@gluon.jit
+def _epi_gamma_tiles_frozen(
+    gamma_lds_ptr, gammas_hbm_ptr, block_id, M_e, func_cfg, tuning_cfg, layout
+):
+    """Block-level gammas, one tensor per mini-M block -- global path only.
+
+    When gammas live in LDS this returns empty: the read has to happen inside
+    _epilogue_one_tile_frozen off the post-swiglu ``out.type.layout``.
+    """
+    BM: gl.constexpr = tuning_cfg.BLOCK_M
+    MBM: gl.constexpr = tuning_cfg.MINI_BLOCK_M
+    NM: gl.constexpr = layout.num_m_slots_per_block()
+    out = ()
+    if require_constexpr(func_cfg.has_gammas and gamma_lds_ptr is None):
+        for hm in gl.static_range(NM):
+            hoffs = BM * block_id + hm * MBM + gl.arange(0, MBM)
+            out = out + (gl.load(gammas_hbm_ptr + hoffs, mask=hoffs < M_e, other=0.0),)
+    return out
+
+
+@gluon.jit
+def _epi_stage_flush_frozen(
+    qp_lds_ptr,
+    qs_lds_ptr,
+    mi: gl.constexpr,
+    ni: gl.constexpr,
+    y_hbm_ptr,
+    y_stride_m,
+    y_stride_n,
+    ys_hbm_ptr,
+    ys_stride_m,
+    ys_stride_n,
+    block_id,
+    pid_n,
+    M_e,
+    func_cfg,
+    tuning_cfg,
+    layout,
+):
+    """Read one staged MXFP4 mini tile back out of LDS and store it."""
+    BM: gl.constexpr = tuning_cfg.BLOCK_M
+    BN: gl.constexpr = tuning_cfg.BLOCK_N
+    MBM: gl.constexpr = tuning_cfg.MINI_BLOCK_M
+    MBN: gl.constexpr = tuning_cfg.MINI_BLOCK_N
+    ARN: gl.constexpr = _activation_reduction_n_frozen(func_cfg)
+    OUT_MBN: gl.constexpr = layout.output_n_slot()
+    P_COLS: gl.constexpr = layout.quant_payload_shape(MBM, OUT_MBN)[1]
+    S_COLS: gl.constexpr = layout.quant_scale_shape(MBM, OUT_MBN)[1]
+    PL: gl.constexpr = layout.result_store_layout(MBM, P_COLS, 8)
+    SL: gl.constexpr = layout.result_store_layout(MBM, S_COLS, 8)
+    raw_n0 = pid_n * BN + ni * MBN
+    n0 = raw_n0 // ARN
+    # The caller's fenced barrier has retired every wave's staging writes.
+    pv = gl.amd.cdna4.async_copy.load_shared_relaxed(qp_lds_ptr, PL)
+    sv = gl.amd.cdna4.async_copy.load_shared_relaxed(qs_lds_ptr, SL)
+    pm = BM * block_id + mi * MBM + gl.arange(0, MBM, layout=gl.SliceLayout(1, PL))
+    pn = gl.arange(0, P_COLS, layout=gl.SliceLayout(0, PL))
+    gl.amd.cdna4.buffer_store(
+        pv,
+        y_hbm_ptr,
+        pm[:, None] * y_stride_m + (n0 // 2 + pn)[None, :] * y_stride_n,
+        mask=(pm < M_e)[:, None],
+    )
+    sm = BM * block_id + mi * MBM + gl.arange(0, MBM, layout=gl.SliceLayout(1, SL))
+    sn = gl.arange(0, S_COLS, layout=gl.SliceLayout(0, SL))
+    gl.amd.cdna4.buffer_store(
+        sv,
+        ys_hbm_ptr,
+        sm[:, None] * ys_stride_m + (n0 // MX_GROUP + sn)[None, :] * ys_stride_n,
+        mask=(sm < M_e)[:, None],
+    )
+
+
+@gluon.jit
+def _epi_block_flush_frozen(
+    qp_lds_ptr,
+    qs_lds_ptr,
+    y_hbm_ptr,
+    y_stride_m,
+    y_stride_n,
+    ys_hbm_ptr,
+    ys_stride_m,
+    ys_stride_n,
+    block_id,
+    pid_n,
+    M_e,
+    func_cfg,
+    tuning_cfg,
+    layout,
+):
+    """Read the WHOLE staged MXFP4 block back out of LDS and store it (gate/up split)."""
+    BM: gl.constexpr = tuning_cfg.BLOCK_M
+    OUT_MBN: gl.constexpr = layout.output_n_slot()
+    P_COLS: gl.constexpr = layout.quant_payload_shape(BM, OUT_MBN)[1]
+    S_COLS: gl.constexpr = layout.quant_scale_shape(BM, OUT_MBN)[1]
+    PL: gl.constexpr = layout.result_store_layout(BM, P_COLS, 8)
+    SL: gl.constexpr = layout.result_store_layout(BM, S_COLS, 8)
+    n0 = pid_n * layout.output_block_n()
+    # The staging writes are spread over every warp and each warp reads rows it did not
+    # write, so this fence is load-bearing. Only one is needed: nothing reuses the
+    # buffer afterwards.
+    gl.barrier()
+    pv = gl.amd.cdna4.async_copy.load_shared_relaxed(qp_lds_ptr, PL)
+    sv = gl.amd.cdna4.async_copy.load_shared_relaxed(qs_lds_ptr, SL)
+    pm = BM * block_id + gl.arange(0, BM, layout=gl.SliceLayout(1, PL))
+    pn = gl.arange(0, P_COLS, layout=gl.SliceLayout(0, PL))
+    gl.amd.cdna4.buffer_store(
+        pv,
+        y_hbm_ptr,
+        pm[:, None] * y_stride_m + (n0 // 2 + pn)[None, :] * y_stride_n,
+        mask=(pm < M_e)[:, None],
+    )
+    sm = BM * block_id + gl.arange(0, BM, layout=gl.SliceLayout(1, SL))
+    sn = gl.arange(0, S_COLS, layout=gl.SliceLayout(0, SL))
+    gl.amd.cdna4.buffer_store(
+        sv,
+        ys_hbm_ptr,
+        sm[:, None] * ys_stride_m + (n0 // MX_GROUP + sn)[None, :] * ys_stride_n,
+        mask=(sm < M_e)[:, None],
+    )
+
+
+@gluon.jit
+def _epilogue_one_tile_frozen(
+    sub,
+    mi: gl.constexpr,
+    ni: gl.constexpr,
+    bias_tiles,
+    gamma_tiles,
+    gamma_lds_ptr,
+    bias_hbm_ptr,
+    gammas_hbm_ptr,
+    y_hbm_ptr,
+    y_stride_m,
+    y_stride_n,
+    ys_hbm_ptr,
+    ys_stride_m,
+    ys_stride_n,
+    block_id,
+    pid_n,
+    M_e,
+    x_static_scale,
+    func_cfg,
+    tuning_cfg,
+    layout,
+    qp_lds_ptr=None,
+    qs_lds_ptr=None,
+    STAGE_ONLY: gl.constexpr = False,
+    lin=None,
+    STAGE_ROW: gl.constexpr = 0,
+    GATE_PRE: gl.constexpr = False,
+):
+    """bias -> activation -> gammas -> output_quant -> store, for ONE mini tile.
+
+    Under ``gate_up_split`` a "tile" is a *pair*: ``sub`` is the gate side (mini-N block
+    ``ni``) and ``lin`` the linear side (block ``ni + 1``), covering the same emitted
+    channels. ``STAGE_ROW`` is the row this tile occupies in a block-height LDS staging
+    buffer.
+    """
+    BM: gl.constexpr = tuning_cfg.BLOCK_M
+    MBM: gl.constexpr = tuning_cfg.MINI_BLOCK_M
+    ARN: gl.constexpr = _activation_reduction_n_frozen(func_cfg)
+    OUT_MBN: gl.constexpr = layout.output_n_slot()
+    P_COLS: gl.constexpr = layout.quant_payload_shape(MBM, OUT_MBN)[1]
+    S_COLS: gl.constexpr = layout.quant_scale_shape(MBM, OUT_MBN)[1]
+    act: gl.constexpr = _act_frozen(func_cfg)
+    out_ty: gl.constexpr = y_hbm_ptr.dtype.element_ty
+    store_layout: gl.constexpr = layout.result_store_layout(
+        MBM, OUT_MBN, out_ty.primitive_bitwidth
+    )
+
+    # GATE_PRE: the peeled last K step already applied the static scale, the bias and
+    # the silu to `sub`, so those are skipped for the gate side only.
+    if require_constexpr(func_cfg.has_x_static_scale):
+        # Per-tensor fp8 activation scale, before bias, matching the Triton kernels.
+        if require_constexpr(not GATE_PRE):
+            sub = sub * x_static_scale
+        if require_constexpr(_gu_split_frozen(func_cfg)):
+            lin = lin * x_static_scale
+
+    if require_constexpr(func_cfg.has_bias and func_cfg.epilogue < 2):
+        # fp32, expert indexed, over the RAW N axis (before the halving). Split: one
+        # tile per side, so each accumulator takes its own.
+        if require_constexpr(not GATE_PRE):
+            sub = sub + bias_tiles[ni][None, :]
+        if require_constexpr(_gu_split_frozen(func_cfg)):
+            lin = lin + bias_tiles[ni + 1][None, :]
+
+    if require_constexpr(_gu_split_frozen(func_cfg) and func_cfg.epilogue != 0):
+        # Ablation: the same [MBM, MBN] x 2 -> [MBM, MBN] reduction, minus exp2/rcp.
+        out = sub * lin
+        gl.static_assert(out.shape[1] == OUT_MBN)
+    elif require_constexpr(GATE_PRE):
+        out = _swiglu_combine_frozen(
+            sub, lin, act.limit, ADD_RESIDUAL=act.add_residual
+        )
+        gl.static_assert(out.shape[1] == OUT_MBN)
+    elif require_constexpr(_gu_split_frozen(func_cfg)):
+        out = _swiglu_pair_frozen(
+            sub,
+            lin,
+            act.alpha,
+            act.limit,
+            ADD_RESIDUAL=act.add_residual,
+            FAST_RCP=tuning_cfg.ACT_FAST_RCP,
+        )
+        gl.static_assert(out.shape[1] == OUT_MBN)
+    elif require_constexpr(_has_activation_frozen(func_cfg) and func_cfg.epilogue != 0):
+        # Ablation: the same reshape/split reduction _swiglu does, minus exp2/rcp/clip.
+        gate, linear = tl.split(
+            tl.reshape(sub, (sub.shape[0], sub.shape[1] // 2, 2))
+        )
+        out = gate * linear
+        gl.static_assert(out.shape[1] == OUT_MBN)
+    elif require_constexpr(_has_activation_frozen(func_cfg)):
+        out = _swiglu_frozen(
+            sub,
+            act.alpha,
+            act.limit,
+            ADD_RESIDUAL=act.add_residual,
+            FAST_RCP=tuning_cfg.ACT_FAST_RCP,
+            GROUP=3,
+        )
+        gl.static_assert(out.shape[1] == OUT_MBN)
+    else:
+        gl.static_assert(ARN == 1)
+        out = sub
+
+    if require_constexpr(func_cfg.has_gammas and func_cfg.epilogue < 2):
+        if require_constexpr(gamma_lds_ptr is not None):
+            # Only a ds_read: the global copy that filled this ran before the
+            # drain. `out.type.layout` is the one way to name the post-swiglu
+            # layout, so the read has to sit here rather than above the walk.
+            g = gamma_lds_ptr.slice(mi * MBM, MBM).load(
+                gl.SliceLayout(1, out.type.layout)
+            )
+        else:
+            g = gamma_tiles[mi]
+        out = out * g[:, None]
+
+    # Emitted-channel base. The CTA tile is BLOCK_N // ARN emitted channels wide in both
+    # packings -- what differs is only how many mini blocks that is.
+    out_n0 = pid_n * layout.output_block_n() + ni * OUT_MBN
+    if require_constexpr(func_cfg.output_quant is None):
+        val = gl.convert_layout(
+            out.to(out_ty), store_layout, assert_trivial=False
+        )
+        sm = gl.arange(0, MBM, layout=gl.SliceLayout(1, store_layout))
+        sn = gl.arange(0, OUT_MBN, layout=gl.SliceLayout(0, store_layout))
+        rows = BM * block_id + mi * MBM + sm
+        gl.amd.cdna4.buffer_store(
+            val,
+            y_hbm_ptr,
+            rows[:, None] * y_stride_m + (out_n0 + sn)[None, :] * y_stride_n,
+            mask=(rows < M_e)[:, None],
+            cache=tuning_cfg.result_cache_modifier,
+        )
+    else:
+        # Fused MXFP4 output quant, straight off the fp32 accumulator. The MX group
+        # runs along the emitted N axis, so the amax is over 32 emitted columns.
+        gl.static_assert(func_cfg.output_quant == _DQ_MXFP4)
+        gl.static_assert(OUT_MBN % MX_GROUP == 0)
+        # LANE_ELEMS splits the amax: how many of the tile's elements one lane owns,
+        # so the inner reduction is in-lane fp32 and only the outer one cross-lane.
+        LANE_ELEMS: gl.constexpr = layout.quant_amax_lane_elems(MBM, OUT_MBN)
+        payload, scale = _mxfp4_quant_gluon_frozen(
+            out, OUT_MBN, MBM, MX_GROUP, LANE_ELEMS
+        )
+        # Fresh M ranges per store: reusing one auto-layout `offs_m` across two
+        # differently-laid-out stores makes GluonResolveAutoEncodings fail with
+        # "conflicting encodings" on the expand_dims.
+        if require_constexpr(qp_lds_ptr is not None):
+            # LDS round-trip: write in the accumulator's layout, read back in the
+            # store layout, so the global store vectorises (4 x buffer_store_dwordx4
+            # instead of 48 x global_store_byte).
+            PL: gl.constexpr = layout.result_store_layout(MBM, P_COLS, 8)
+            SL: gl.constexpr = layout.result_store_layout(MBM, S_COLS, 8)
+            # if/elif/else, not early returns: a `return` from inside a nested
+            # `if require_constexpr(...)` here does NOT stop the trace. Keep exactly
+            # one store path reachable per configuration.
+            if require_constexpr(_gu_split_frozen(func_cfg)):
+                # Block-height staging: every mi writes its own MBM rows of one buffer,
+                # so the caller flushes all NM tiles with a single barrier and store.
+                qp_lds_ptr.slice(STAGE_ROW, MBM).store(payload)
+                qs_lds_ptr.slice(STAGE_ROW, MBM).store(scale)
+            elif require_constexpr(STAGE_ONLY):
+                # rotating epilogue: stage and leave it; the caller flushes this buffer
+                # one iteration later, after its own barrier.
+                qp_lds_ptr.store(payload)
+                qs_lds_ptr.store(scale)
+            else:
+                gl.barrier()
+                qp_lds_ptr.store(payload)
+                qs_lds_ptr.store(scale)
+                # Relaxed reads still require cross-wave staging-write visibility.
+                gl.barrier()
+                payload_v = gl.amd.cdna4.async_copy.load_shared_relaxed(qp_lds_ptr, PL)
+                scale_v = gl.amd.cdna4.async_copy.load_shared_relaxed(qs_lds_ptr, SL)
+
+                pm = BM * block_id + mi * MBM + gl.arange(
+                    0, MBM, layout=gl.SliceLayout(1, PL)
+                )
+                pn = gl.arange(0, P_COLS, layout=gl.SliceLayout(0, PL))
+                gl.amd.cdna4.buffer_store(
+                    payload_v,
+                    y_hbm_ptr,
+                    pm[:, None] * y_stride_m
+                    + (out_n0 // 2 + pn)[None, :] * y_stride_n,
+                    mask=(pm < M_e)[:, None],
+                )
+                sm = BM * block_id + mi * MBM + gl.arange(
+                    0, MBM, layout=gl.SliceLayout(1, SL)
+                )
+                sn = gl.arange(0, S_COLS, layout=gl.SliceLayout(0, SL))
+                gl.amd.cdna4.buffer_store(
+                    scale_v,
+                    ys_hbm_ptr,
+                    sm[:, None] * ys_stride_m
+                    + (out_n0 // MX_GROUP + sn)[None, :] * ys_stride_n,
+                    mask=(sm < M_e)[:, None],
+                )
+        else:
+            pm = BM * block_id + mi * MBM + gl.arange(0, MBM)
+            gl.store(
+                y_hbm_ptr
+                + pm[:, None] * y_stride_m
+                + (out_n0 // 2 + gl.arange(0, P_COLS))[None, :] * y_stride_n,
+                payload,
+                mask=(pm < M_e)[:, None],
+            )
+            sm = BM * block_id + mi * MBM + gl.arange(0, MBM)
+            gl.store(
+                ys_hbm_ptr
+                + sm[:, None] * ys_stride_m
+                + (out_n0 // MX_GROUP + gl.arange(0, S_COLS))[None, :]
+                * ys_stride_n,
+                scale,
+                mask=(sm < M_e)[:, None],
+            )
+
+
+@gluon.jit
+def _epilogue_store_frozen(
+    acc,
+    y_hbm_ptr,
+    y_stride_m,
+    y_stride_n,
+    ys_hbm_ptr,
+    ys_stride_m,
+    ys_stride_n,
+    bias_hbm_ptr,
+    block_id,
+    pid_n,
+    N,
+    M_e,
+    gammas_hbm_ptr,
+    gamma_lds_ptr,
+    bias_lds_ptr,
+    x_static_scale,
+    func_cfg,
+    tuning_cfg,
+    layout,
+    GATE_PRE: gl.constexpr = False,
+):
+    """bias -> activation -> gammas -> output_quant -> store, per mini (M, N) tile.
+
+    ``acc`` arrives already split into one tensor per mini tile, so the epilogue walks
+    the same tiling and consumes them one at a time.
+    """
+    MBM: gl.constexpr = tuning_cfg.MINI_BLOCK_M
+    OUT_MBN: gl.constexpr = layout.output_n_slot()
+
+    NN: gl.constexpr = layout.num_n_slots_per_block()
+    NM: gl.constexpr = layout.num_m_slots_per_block()
+
+    # Block-level operand loads, each invariant in one of the two walk indices -- bias
+    # in mi, gammas in ni. Own loop variables: reusing `mi`/`ni` here would shadow the
+    # walk's.
+    bias_tiles = _epi_bias_tiles_frozen(
+        bias_lds_ptr, bias_hbm_ptr, pid_n, N, func_cfg, tuning_cfg, layout
+    )
+    gamma_tiles = _epi_gamma_tiles_frozen(
+        gamma_lds_ptr, gammas_hbm_ptr, block_id, M_e, func_cfg, tuning_cfg, layout
+    )
+
+    # Staging for the MXFP4 payload store, bouncing it through LDS so the global store
+    # vectorises. ONE mini tile's worth, reused across the walk (overlaid on the dead
+    # pipeline buffers by the liveness-based shared allocator).
+    QSH: gl.constexpr = layout.quant_staging_layout()
+    ROT: gl.constexpr = layout.quant_staging_rotates()
+    # Split stages the whole block, not one mini tile: NM tiles into one buffer, flushed
+    # once at the end of the walk.
+    QROWS: gl.constexpr = layout.quant_staging_rows()
+    if require_constexpr(func_cfg.output_quant is not None):
+        qp_lds_ptr = gl.allocate_shared_memory(
+            gl.uint8, layout.quant_payload_shape(QROWS, OUT_MBN), layout=QSH
+        )
+        qs_lds_ptr = gl.allocate_shared_memory(
+            gl.uint8, layout.quant_scale_shape(QROWS, OUT_MBN), layout=QSH
+        )
+    else:
+        qp_lds_ptr: gl.constexpr = None
+        qs_lds_ptr: gl.constexpr = None
+    if require_constexpr(ROT):
+        # Second bank for rotating epilogue. Same overlay argument as above.
+        qp2_lds_ptr = gl.allocate_shared_memory(
+            gl.uint8, layout.quant_payload_shape(MBM, OUT_MBN), layout=QSH
+        )
+        qs2_lds_ptr = gl.allocate_shared_memory(
+            gl.uint8, layout.quant_scale_shape(MBM, OUT_MBN), layout=QSH
+        )
+    else:
+        qp2_lds_ptr: gl.constexpr = None
+        qs2_lds_ptr: gl.constexpr = None
+
+    if require_constexpr(_gu_split_frozen(func_cfg)):
+        # One pass over mi, pairing the two mini-N blocks: block 0 is the gate side and
+        # block 1 the linear side of the *same* emitted channels. Every tile stages
+        # into its own MBM rows of the block-height buffer, then one flush stores all.
+        for mi in gl.static_range(NM):
+            _epilogue_one_tile_frozen(
+                acc[_slot_index_frozen(mi, 0, NM, NN)],
+                mi,
+                0,
+                bias_tiles,
+                gamma_tiles,
+                gamma_lds_ptr,
+                bias_hbm_ptr,
+                gammas_hbm_ptr,
+                y_hbm_ptr,
+                y_stride_m,
+                y_stride_n,
+                ys_hbm_ptr,
+                ys_stride_m,
+                ys_stride_n,
+                block_id,
+                pid_n,
+                M_e,
+                x_static_scale,
+                func_cfg,
+                tuning_cfg,
+                layout,
+                qp_lds_ptr,
+                qs_lds_ptr,
+                lin=acc[_slot_index_frozen(mi, 1, NM, NN)],
+                STAGE_ROW=mi * MBM,
+                GATE_PRE=GATE_PRE,
+            )
+        if require_constexpr(func_cfg.output_quant is not None):
+            _epi_block_flush_frozen(
+                qp_lds_ptr, qs_lds_ptr,
+                y_hbm_ptr, y_stride_m, y_stride_n,
+                ys_hbm_ptr, ys_stride_m, ys_stride_n,
+                block_id, pid_n, M_e, func_cfg, tuning_cfg, layout,
+            )
+    elif require_constexpr(ROT):
+        # Software-pipelined staging: flush the PREVIOUS tile, then stage this one,
+        # then one barrier; the two banks alternate so the write never targets the
+        # buffer being read. No `mi: gl.constexpr = ...` locals here: Gluon rejects
+        # rebinding a constexpr on the second unrolled iteration.
+        for k in gl.static_range(NM * NN):
+            if require_constexpr(k > 0):
+                _epi_stage_flush_frozen(
+                    qp2_lds_ptr if (k - 1) % 2 else qp_lds_ptr,
+                    qs2_lds_ptr if (k - 1) % 2 else qs_lds_ptr,
+                    (k - 1) // NN, (k - 1) % NN,
+                    y_hbm_ptr, y_stride_m, y_stride_n,
+                    ys_hbm_ptr, ys_stride_m, ys_stride_n,
+                    block_id, pid_n, M_e, func_cfg, tuning_cfg, layout,
+                )
+            _epilogue_one_tile_frozen(
+                acc[_slot_index_frozen(k // NN, k % NN, NM, NN)],
+                k // NN, k % NN,
+                bias_tiles, gamma_tiles, gamma_lds_ptr, bias_hbm_ptr, gammas_hbm_ptr,
+                y_hbm_ptr, y_stride_m, y_stride_n, ys_hbm_ptr, ys_stride_m, ys_stride_n,
+                block_id, pid_n, M_e, x_static_scale, func_cfg, tuning_cfg,
+                layout,
+                qp2_lds_ptr if k % 2 else qp_lds_ptr,
+                qs2_lds_ptr if k % 2 else qs_lds_ptr,
+                STAGE_ONLY=True,
+            )
+            gl.barrier()
+        LK: gl.constexpr = NM * NN - 1
+        _epi_stage_flush_frozen(
+            qp2_lds_ptr if LK % 2 else qp_lds_ptr,
+            qs2_lds_ptr if LK % 2 else qs_lds_ptr,
+            LK // NN, LK % NN, y_hbm_ptr, y_stride_m, y_stride_n,
+            ys_hbm_ptr, ys_stride_m, ys_stride_n,
+            block_id, pid_n, M_e, func_cfg, tuning_cfg, layout,
+        )
+    else:
+        for mi in gl.static_range(NM):
+            for ni in gl.static_range(NN):
+                # acc is stored in slot-traversal order; the store loop indexes through
+                # the same map.
+                _epilogue_one_tile_frozen(
+                    acc[_slot_index_frozen(mi, ni, NM, NN)],
+                    mi,
+                    ni,
+                    bias_tiles,
+                    gamma_tiles,
+                    gamma_lds_ptr,
+                    bias_hbm_ptr,
+                    gammas_hbm_ptr,
+                    y_hbm_ptr,
+                    y_stride_m,
+                    y_stride_n,
+                    ys_hbm_ptr,
+                    ys_stride_m,
+                    ys_stride_n,
+                    block_id,
+                    pid_n,
+                    M_e,
+                    x_static_scale,
+                    func_cfg,
+                    tuning_cfg,
+                    layout,
+                    qp_lds_ptr,
+                    qs_lds_ptr,
+                )
+
+
 @gluon.jit
 def _moe_gemm_body_frozen(
     a,
@@ -2260,23 +4685,23 @@ def _moe_gemm_body_frozen(
     grid_n,
     func_cfg,
     tuning_cfg,
-    layout,
     N: gl.constexpr,
     K: gl.constexpr,
     NUM_K,
 ):
     """The complete frozen kernel body, selected once by the entry point.
 
-    ``layout`` is the entry point's ``compute_kernel_layout(tuning_cfg)``: this
-    module does not import ``_layout``, so it cannot build one itself.
+    Builds its own ``_FrozenLayout`` from ``tuning_cfg``; nothing of the live layout
+    reaches this body.
     """
+    layout = _compute_frozen_layout(tuning_cfg)
     gl.static_assert(tuning_cfg.FROZEN_STEP)
-    gl.static_assert(validate(tuning_cfg, N, K, layout))
-    gl.static_assert(_validate_frozen_pipeline(tuning_cfg, layout, K))
+    gl.static_assert(_validate_frozen(tuning_cfg, N, K, layout))
+    gl.static_assert(_validate_frozen_pipeline(tuning_cfg, K, layout))
 
     BK: gl.constexpr = tuning_cfg.BLOCK_K
-    PK_A: gl.constexpr = BK // func_cfg.a_pack_divisor()
-    PK_B: gl.constexpr = BK // func_cfg.b_pack_divisor()
+    PK_A: gl.constexpr = BK // _pack_divisor_frozen(func_cfg, 0)
+    PK_B: gl.constexpr = BK // _pack_divisor_frozen(func_cfg, 1)
     SK: gl.constexpr = BK // MX_GROUP
 
     pid = gl.program_id(0)
@@ -2304,11 +4729,11 @@ def _moe_gemm_body_frozen(
         a, rt, block_id, M_e, start_m, func_cfg, tuning_cfg, layout
     )
     b_hbm_ptr = b.ptr + expt_id.to(gl.int64) * b.stride_e
-    if require_constexpr(func_cfg.a_has_scale()):
+    if require_constexpr(_has_scale_frozen(func_cfg, 0)):
         a_scale_hbm_ptr = a.scale_ptr
     else:
         a_scale_hbm_ptr: gl.constexpr = None
-    if require_constexpr(func_cfg.b_has_scale()):
+    if require_constexpr(_has_scale_frozen(func_cfg, 1)):
         b_scale_hbm_ptr = b.scale_ptr + expt_id.to(gl.int64) * b.scale_stride_e
     else:
         b_scale_hbm_ptr: gl.constexpr = None
@@ -2316,13 +4741,13 @@ def _moe_gemm_body_frozen(
     b_hbm_offs = _b_payload_hbm_offsets_frozen(
         b, pid_n, N, K, func_cfg, tuning_cfg, layout
     )
-    if require_constexpr(func_cfg.a_has_scale()):
+    if require_constexpr(_has_scale_frozen(func_cfg, 0)):
         a_scale_hbm_offs = _a_scale_hbm_offsets_frozen(
             a, rt, block_id, M_e, start_m, pid_m, K, func_cfg, tuning_cfg, layout
         )
     else:
         a_scale_hbm_offs: gl.constexpr = None
-    if require_constexpr(func_cfg.b_has_scale()):
+    if require_constexpr(_has_scale_frozen(func_cfg, 1)):
         b_scale_hbm_offs = _b_scale_hbm_offsets_frozen(
             b, pid_n, N, K, func_cfg, tuning_cfg, layout
         )
@@ -2340,11 +4765,11 @@ def _moe_gemm_body_frozen(
         a_scale_hbm_ptr,
         b_scale_hbm_ptr,
     )
-    if require_constexpr(func_cfg.a_has_scale()):
+    if require_constexpr(_has_scale_frozen(func_cfg, 0)):
         a_scale_stride_k: gl.constexpr = a.scale_stride_k
     else:
         a_scale_stride_k: gl.constexpr = None
-    if require_constexpr(func_cfg.b_has_scale()):
+    if require_constexpr(_has_scale_frozen(func_cfg, 1)):
         b_scale_stride_k: gl.constexpr = b.scale_stride_k
     else:
         b_scale_stride_k: gl.constexpr = None
@@ -2365,7 +4790,7 @@ def _moe_gemm_body_frozen(
     )
 
     hbm_ptrs, buffers, regs = _run_frozen_pipeline(pc, hbm_ptrs, NUM_K)
-    epi = _stage_epilogue_inputs(
+    epi = _stage_epilogue_inputs_frozen(
         bias_hbm_ptr,
         stride_bias_e,
         rt,
@@ -2395,7 +4820,7 @@ def _moe_gemm_body_frozen(
         ys_hbm_ptr = res.scale_ptr + start_m.to(gl.int64) * res.scale_stride_m
     else:
         ys_hbm_ptr: gl.constexpr = None
-    _epilogue_store(
+    _epilogue_store_frozen(
         acc,
         y_hbm_ptr,
         res.stride_m,
@@ -2417,3 +4842,294 @@ def _moe_gemm_body_frozen(
         layout,
         GATE_PRE=False,
     )
+
+
+# --- vendored validation ------------------------------------------------------
+# Copies of ``_validate.validate`` / ``validate_buffer_counts`` (and the
+# ``validate_layout`` / ``validate_resources`` they call) as they applied to a
+# FROZEN_STEP build, over the frozen layout, plus the frozen pipeline bound. The kernel
+# ``static_assert``s these and the host runs them before launching a FROZEN_STEP build,
+# so both reject exactly the same configurations, and the live validation may change
+# without moving which frozen builds are accepted.
+# ------------------------------------------------------------------------------
+@gluon.constexpr_function
+def _validate_frozen(tc, N, K, layout=None):
+    """Validate one frozen build: the tuning enums, the layout and the resource budgets.
+
+    ``layout`` is ``tc``'s :func:`_compute_frozen_layout` result; a caller that already
+    holds it passes it in, anything else gets one computed here.
+    """
+    if _v(layout) is None:
+        layout = _compute_frozen_layout(tc)
+    fc = tc.func_cfg
+    BK = _v(tc.BLOCK_K)
+
+    assert _v(fc.epilogue) in (
+        int(EpilogueMode.DEFAULT),
+        int(EpilogueMode.NOP_ACTIVATION),
+        int(EpilogueMode.NOP),
+    ), f"epilogue {_v(fc.epilogue)} is not an EpilogueMode"
+    assert _v(tc.SCHED_MODE) in (
+        int(SchedMode.NONE),
+        int(SchedMode.IGLP_0),
+        int(SchedMode.IGLP_1),
+        int(SchedMode.MFMA_16),
+        int(SchedMode.MFMA_8),
+    ), f"SCHED_MODE {_v(tc.SCHED_MODE)} is not a SchedMode"
+    _validate_frozen_layout(tc, layout, N, K)
+
+    if not _v(tc.UNROLL_EPILOGUE):
+        for idx in (0, 1):
+            assert (
+                not _has_scale_frozen(fc, idx) or layout.scale_ratio_k_step(idx) == 1
+            ), (
+                "UNROLL_EPILOGUE=False requires every active scale to advance "
+                "once per payload step"
+            )
+
+    # -- warp pipelining (the inter-wave ping-pong) --
+    assert _v(tc.WARP_PIPELINE) in (
+        int(WarpPipeline.NONE),
+        int(WarpPipeline.COMPILER),
+        int(WarpPipeline.MANUAL),
+    ), (
+        f"WARP_PIPELINE {_v(tc.WARP_PIPELINE)} is not a WarpPipeline: "
+        f"NONE {int(WarpPipeline.NONE)}, COMPILER {int(WarpPipeline.COMPILER)}, "
+        f"MANUAL {int(WarpPipeline.MANUAL)}"
+    )
+    if _warp_pipeline_enabled_frozen(tc):
+        assert layout.num_prefetch_k_slots() == layout.num_k_slots_per_tile(), (
+            f"WARP_PIPELINE needs VGPR_PREFETCH_K == BLOCK_K (got "
+            f"{_v(tc.VGPR_PREFETCH_K)} vs {BK}): with a partial window the slot's "
+            "MFMAs depend on the slot's own ds_read and there is no mem stage to "
+            "hide behind them"
+        )
+
+    # -- register prefetch depth: the driver carries one whole payload K stage --
+    pk = _v(tc.VGPR_PREFETCH_K)
+    assert pk == BK, (
+        f"VGPR_PREFETCH_K must equal BLOCK_K (got {pk} vs {BK}): "
+        "the pipeline carries one whole payload K stage"
+    )
+
+    # -- commit-group granularity --
+    assert _v(tc.WAIT_COMMIT_SCHEME) in (
+        int(WaitCommitScheme.PER_OP),
+        int(WaitCommitScheme.PER_SLOT),
+        int(WaitCommitScheme.PER_STAGE_WARP_PIPELINE),
+        int(WaitCommitScheme.PER_STAGE_WHOLE),
+    ), (
+        f"WAIT_COMMIT_SCHEME {_v(tc.WAIT_COMMIT_SCHEME)} is not a WaitCommitScheme: "
+        f"PER_OP {int(WaitCommitScheme.PER_OP)}, "
+        f"PER_SLOT {int(WaitCommitScheme.PER_SLOT)}, "
+        f"PER_STAGE_WARP_PIPELINE {int(WaitCommitScheme.PER_STAGE_WARP_PIPELINE)}, "
+        f"PER_STAGE_WHOLE {int(WaitCommitScheme.PER_STAGE_WHOLE)}"
+    )
+
+    _validate_frozen_resources(tc, layout)
+    return True
+
+
+@gluon.constexpr_function
+def _validate_frozen_buffer_counts(tc):
+    """Only components present in the operand formats participate."""
+    for operand in (0, 1):
+        for scale in (False, True):
+            if scale and not _has_scale_frozen(tc.func_cfg, operand):
+                continue
+            depth = _num_buffers_frozen(tc, operand, scale)
+            assert depth >= 2, (
+                f"{'A' if operand == 0 else 'B'}{'_SCALE' if scale else ''}_NUM_BUFFER "
+                f"({depth}) must be at least 2"
+            )
+    assert _v(tc.K_UNROLL) >= 1, "K_UNROLL must be at least 1"
+    return True
+
+
+@gluon.constexpr_function
+def _validate_frozen_layout(tc, layout, N, K):
+    """Validate storage placement and every tensor/tile shape contract."""
+    fc = tc.func_cfg
+    BM, BN, BK = _v(tc.BLOCK_M), _v(tc.BLOCK_N), _v(tc.BLOCK_K)
+    N, K = _v(N), _v(K)
+    instr = _v(tc.mfma_instr_shape)
+    warps = _v(tc.warps_per_cta)
+    tiles = _v(tc.tiles_per_warp)
+
+    assert _v(tc.ALLOW_B_VIA_LDS) or _operand_preshuffled_frozen(tc, 1), (
+        "ALLOW_B_VIA_LDS=False requires B_PRESHUFFLED"
+    )
+    has_custom_storage = bool(
+        not _v(tc.ALLOW_B_VIA_LDS)
+        or not _v(tc.ALLOW_B_SCALE_VIA_LDS)
+        or not _v(tc.ALLOW_A_SCALE_VIA_LDS)
+        or _v(tc.A_NUM_BUFFER)
+        or _v(tc.B_NUM_BUFFER)
+        or _v(tc.A_SCALE_NUM_BUFFER)
+        or _v(tc.B_SCALE_NUM_BUFFER)
+    )
+    assert not (_v(tc.FROZEN_STEP) and has_custom_storage), (
+        "FROZEN_STEP does not support register storage or per-component buffer counts"
+    )
+    if _v(tc.FROZEN_STEP):
+        for idx in (0, 1):
+            assert layout.payload_via_lds(idx), (
+                f"FROZEN_STEP requires operand {idx}'s payload in LDS; "
+                "use the live pipeline for a direct-register payload"
+            )
+    _validate_frozen_buffer_counts(tc)
+
+    # -- host preconditions (no N tail, no K tail; only the even case exists) --
+    assert N % BN == 0, f"N {N} % BLOCK_N {BN} != 0; the wrapper must fall back"
+    assert K % BK == 0, f"K {K} % BLOCK_K {BK} != 0; the wrapper must fall back"
+
+    # -- divisibility lattice --
+    assert BK % instr[2] == 0
+    assert BK % MX_GROUP_INT == 0
+
+    # -- shuffled scale geometry --
+    for idx in (0, 1):
+        if not _scale_shuffled_frozen(tc, idx):
+            continue
+        axis = "M" if idx == 0 else "N"
+        block = BM if idx == 0 else BN
+        nonk, sk = layout.scale_mini_block_nonk(idx), layout.scale_mini_block_k(idx)
+        mini = layout.scale_nonk(idx)
+        assert block >= nonk >= mini, (
+            f"BLOCK_{axis} >= SCALE_MINI_BLOCK_{axis} >= MINI_BLOCK_{axis} is required"
+        )
+        assert block % nonk == 0 and nonk % mini == 0, (
+            f"SCALE_MINI_BLOCK_{axis} must divide BLOCK_{axis} and be a multiple of MINI_BLOCK_{axis}"
+        )
+        assert nonk % 32 == 0, (
+            f"SCALE_MINI_BLOCK_{axis} must contain whole 32-row stripes"
+        )
+        assert sk >= max(256, BK), (
+            "SCALE_MINI_BLOCK_K must be at least 256 and at least BLOCK_K"
+        )
+        assert sk & (sk - 1) == 0 and sk % BK == 0, (
+            "SCALE_MINI_BLOCK_K must be a power of two and a multiple of BLOCK_K"
+        )
+        assert K % sk == 0, "K must contain complete SCALE_MINI_BLOCK_K tiles"
+        if _v(tc.FROZEN_STEP):
+            assert BK == 256 and sk == BK and layout.scale_ratio_non_k_slot(idx) == 1, (
+                "FROZEN_STEP shuffled scales require BLOCK_K == "
+                "SCALE_MINI_BLOCK_K == 256 and one scale tile per payload slot; "
+                "use the live pipeline for independent scale mini blocks"
+            )
+
+    # -- the slot is the unit of LDS allocation, of the global->LDS copy, of the
+    #    MFMA and of the accumulator, so it must align to the CTA block --
+    assert BM % _v(tc.MINI_BLOCK_M) == 0
+    assert BN % _v(tc.MINI_BLOCK_N) == 0
+    assert _fill_slots_valid_frozen(tc, layout), (
+        f"fill ownership is not a valid mapping for num_m_slots_per_block "
+        f"{layout.num_m_slots_per_block()} x num_n_slots_per_block "
+        f"{layout.num_n_slots_per_block()} (MINI_BLOCK_M {_v(tc.MINI_BLOCK_M)} vs "
+        f"BLOCK_M {BM}, MINI_BLOCK_N {_v(tc.MINI_BLOCK_N)} vs BLOCK_N {BN})"
+    )
+    assert _v(tc.MINI_BLOCK_M) % (instr[0] * warps[0] * tiles[0]) == 0, (
+        f"MINI_BLOCK_M {_v(tc.MINI_BLOCK_M)} must be a multiple of "
+        f"instr[0]*warps[0]*tiles[0] = {instr[0] * warps[0] * tiles[0]}"
+    )
+    assert _v(tc.MINI_BLOCK_N) % (instr[1] * warps[1] * tiles[1]) == 0, (
+        f"MINI_BLOCK_N {_v(tc.MINI_BLOCK_N)} must be a multiple of "
+        f"instr[1]*warps[1]*tiles[1] = {instr[1] * warps[1] * tiles[1]}"
+    )
+
+    # -- MFMA shape must fit the tile --
+    assert BM % (instr[0] * warps[0] * tiles[0]) == 0
+    assert BN % (instr[1] * warps[1] * tiles[1]) == 0
+
+    # -- the LDS unit the byte-tiled layout is built from --
+    for idx in (0, 1):
+        if layout.byte_unit_lds_ok(idx) and not _operand_preshuffled_frozen(tc, idx):
+            assert tiles[idx] >= 2, (
+                f"operand {idx} is not preshuffled, so its LDS unit is 32 rows and "
+                f"tiles_per_warp[{idx}] must be >= 2 (got {tiles[idx]})"
+            )
+    if _operand_preshuffled_frozen(tc, 1):
+        # The 16-column-blocked global offsets only stay inside the N slot while
+        # every extent is a whole number of 16-column, 16-byte blocks.
+        pk_b = BK // _pack_divisor_frozen(fc, 1)
+        assert BN % 16 == 0 and _v(tc.MINI_BLOCK_N) % 16 == 0, (
+            f"B_PRESHUFFLED needs BLOCK_N ({BN}) and MINI_BLOCK_N "
+            f"({_v(tc.MINI_BLOCK_N)}) to be multiples of the 16-column block"
+        )
+        assert pk_b % 16 == 0, (
+            f"B_PRESHUFFLED needs BLOCK_K/pack ({pk_b}) to be a multiple of the "
+            "16-byte block"
+        )
+
+    # -- gate/up split: an N slot must be exactly one operand side --
+    if _gu_split_frozen(fc):
+        MBN = _v(tc.MINI_BLOCK_N)
+        assert layout.num_n_slots_per_block() == 2 and MBN * 2 == BN, (
+            f"gate_up_split needs exactly two N slots, one per side: got "
+            f"BLOCK_N {BN} / MINI_BLOCK_N {MBN} = {layout.num_n_slots_per_block()}"
+        )
+        assert N % 2 == 0 and (N // 2) % MBN == 0, (
+            f"gate_up_split needs each half of N ({N}) to be a whole number of "
+            f"MINI_BLOCK_N ({MBN}) tiles"
+        )
+        # A warp's emitted N extent has to contain a whole MX group, or the fused
+        # quant's amax crosses the warp boundary.
+        if _v(fc.output_quant) is not None:
+            warp_n = instr[1] * tiles[1]
+            assert warp_n % MX_GROUP_INT == 0, (
+                f"gate_up_split with a fused MX output quant needs a warp's "
+                f"emitted N extent (instr_n {instr[1]} * tiles_per_warp_n "
+                f"{tiles[1]} = {warp_n}) to be a multiple of {MX_GROUP_INT}, else the "
+                "amax reduction still crosses warps"
+            )
+            assert MBN % MX_GROUP_INT == 0
+
+    # -- the fused MX output quant groups 32 *emitted* columns, so the raw tile has
+    #    to carry 32 * activation_reduction_n of them --
+    elif _v(fc.output_quant) is not None:
+        arn = _activation_reduction_n_frozen(fc)
+        assert BN % (MX_GROUP_INT * arn) == 0, (
+            f"BLOCK_N {BN} must be a multiple of {MX_GROUP_INT * arn} in raw "
+            f"(pre-halving) terms so every MX group is tile-local"
+        )
+        assert _v(tc.MINI_BLOCK_N) % (MX_GROUP_INT * arn) == 0
+
+    return True
+
+
+@gluon.constexpr_function
+def _validate_frozen_resources(tc, layout):
+    """Validate layout-dependent LDS and accumulator resource budgets."""
+    lds = layout.lds_bytes()
+    assert lds <= _LDS_USABLE_BYTES, (
+        f"LDS {lds} B > {_LDS_USABLE_BYTES} B usable ({_LDS_CAP_BYTES} cap minus "
+        f"{_LDS_EPILOGUE_RESERVE_BYTES} B of epilogue scratch): reduce "
+        f"NUM_LDS_BUFFER ({_v(tc.NUM_LDS_BUFFER)}) or the block sizes"
+    )
+    acc = layout.acc_vgprs_per_lane()
+    assert acc <= 256, (
+        f"fp32 accumulator alone needs {acc} VGPR/lane; 256 is the architectural "
+        f"cap and WAVES_PER_EU=2 needs <= 256 total"
+    )
+    return True
+
+
+@gluon.constexpr_function
+def _validate_frozen_pipeline(tc, K, layout=None):
+    """Validate the frozen driver's rings and runtime-loop lower bound.
+
+    ``layout`` is ``tc``'s :func:`_compute_frozen_layout` result; the host omits it and
+    gets one computed here.
+    """
+    if _v(layout) is None:
+        layout = _compute_frozen_layout(tc)
+    _validate_frozen_buffer_counts(tc)
+    num_k = layout.num_k_tiles(K)
+    depth = pipeline_depth_frozen(tc, layout)
+    peeled = _pipeline_peeled_frozen(tc)
+    unroll = pipeline_unroll_frozen(tc, layout)
+    assert num_k >= depth + peeled + unroll, (
+        f"NUM_K ({num_k}) must be at least NB_MAX ({depth}) + PEELED ({peeled}) "
+        f"+ UNROLL ({unroll}) = {depth + peeled + unroll}"
+    )
+    return True

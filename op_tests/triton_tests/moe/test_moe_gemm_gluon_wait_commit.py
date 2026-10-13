@@ -279,15 +279,6 @@ def _trace_emitter(tc, monkeypatch, defer_stage_commit=False):
     tc.ALLOW_B_VIA_LDS = True
     tc.num_buffers = lambda operand, scale=False: 3
     tc.pipeline_peeled = lambda: 1
-    tc.pipeline_register_period = lambda: (
-        3
-        if any(
-            (not component[1] or tc.has_scale(component[0]))
-            and tc.component_in_reg(component)
-            for component in COMPONENTS
-        )
-        else 1
-    )
     tc.num_k_slots_per_tile = lambda: 1
     tc.operand_elem_ty = lambda operand: SimpleNamespace(primitive_bitwidth=8)
     tc.scale_hbm_steps = lambda operand, steps, phase: steps
