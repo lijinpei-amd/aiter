@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import compute_kernel_layout
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
     _pipeline_peeled,
     pipeline_depth,
@@ -287,17 +288,22 @@ def test_minimum_uses_resolved_scale_storage_after_preparation(
         dict(cfg, A_SCALE_SORTED_SHUFFLED=False, B_SCALE_SHUFFLED=False),
         DtypeQuant.MXFP8, DtypeQuant.MXFP8,
     )
+    raw_layout = compute_kernel_layout(raw_tc)
     assert (
-        pipeline_depth(raw_tc) + _pipeline_peeled(raw_tc) + pipeline_unroll(raw_tc) == 9
+        pipeline_depth(raw_tc, raw_layout)
+        + _pipeline_peeled(raw_tc, raw_layout)
+        + pipeline_unroll(raw_tc, raw_layout)
+        == 9
     )
     packed_tc = host._probe_tuning_config(
         dict(cfg, A_SCALE_SORTED_SHUFFLED=True, B_SCALE_SHUFFLED=True),
         DtypeQuant.MXFP8, DtypeQuant.MXFP8,
     )
+    packed_layout = compute_kernel_layout(packed_tc)
     assert (
-        pipeline_depth(packed_tc)
-        + _pipeline_peeled(packed_tc)
-        + pipeline_unroll(packed_tc)
+        pipeline_depth(packed_tc, packed_layout)
+        + _pipeline_peeled(packed_tc, packed_layout)
+        + pipeline_unroll(packed_tc, packed_layout)
         == 6
     )
     monkeypatch.setenv("AITER_TRITON_MOE_GLUON_SORTED_SCALES", "1")

@@ -32,7 +32,11 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import WaitCommitScheme
 
 @dataclass
 class _ScheduleConfig:
-    """Small scheduling inputs, independent of MFMA layout/resource constraints."""
+    """Small scheduling inputs, independent of MFMA layout/resource constraints.
+
+    One duck-typed object stands in for the func config, the tuning config and the
+    ``KernelLayout`` alike: it is passed wherever production passes any of the three.
+    """
 
     nm: int
     nn: int
@@ -231,7 +235,7 @@ class _LDSRecorder:
     """Run actual LDS copy guards; replace only the hardware copy operation."""
 
     def __init__(self, tc):
-        self.func_cfg = self.tuning_cfg = tc
+        self.func_cfg = self.tuning_cfg = self.layout = tc
         self.a_payload_lds_ptr = _Descriptor(A_PAYLOAD, tc)
         self.a_scale_lds_ptr = _Descriptor(A_SCALE, tc)
         self.b_payload_lds_ptr = _Descriptor(B_PAYLOAD, tc)
@@ -275,7 +279,7 @@ def _trace_emitter(tc, monkeypatch, defer_stage_commit=False):
     tc.B_IN_REG = False
     tc.num_buffers = lambda operand, scale=False: 3
     tc.pipeline_peeled = lambda: 1
-    tc.pipeline_register_period = lambda: (
+    tc.pipeline_register_period = lambda _layout: (
         3
         if any(
             (not component[1] or tc.has_scale(component[0]))
@@ -292,6 +296,7 @@ def _trace_emitter(tc, monkeypatch, defer_stage_commit=False):
         lds_ptrs=sink,
         func_cfg=tc,
         tuning_cfg=tc,
+        layout=tc,
         a_hbm_offs=(0,) * tc.nm,
         b_hbm_offs=(0,) * tc.nn,
         a_scale_hbm_offs=(0,) * tc.nm,
@@ -383,7 +388,7 @@ def test_emitted_groups_and_waits_retire_required_copies(
     # Tie the *live* model to the traced emitter, not a parallel one. `_groups` is
     # stage- and phase-aware; queried at a steady-state step every component is active,
     # which is the situation this reference describes.
-    assert _groups(tc, None) == expected
+    assert _groups(tc, tc, None) == expected
     for slot, operations in enumerate(copies):
         mi, ni = slot % tc.nm, slot // tc.nm
         # `_ops` keeps direct-register destinations because the schedule still owns
@@ -391,9 +396,9 @@ def test_emitted_groups_and_waits_retire_required_copies(
         # has no commit group while a register payload still occupies its slot.
         nominal = tuple(
             tile
-            if (not component[1] or tile is None or _via_lds(tc, component))
+            if (not component[1] or tile is None or _via_lds(tc, tc, component))
             else None
-            for component, tile in zip(COMPONENTS, _ops(tc, mi, ni))
+            for component, tile in zip(COMPONENTS, _ops(tc, tc, mi, ni))
         )
         assert nominal == tuple(
             dict(operations).get(component) for component in COMPONENTS
@@ -440,6 +445,7 @@ def test_register_only_slots_need_no_cooperative_fence(scheme, monkeypatch):
     tc.ds_read_in_mfma = lambda *args: False
     pc = SimpleNamespace(
         tuning_cfg=tc,
+        layout=tc,
         func_cfg=tc,
         lds_ptrs=SimpleNamespace(
             wait_buffer_load_groups=waits.append, commit_buffer_load=lambda: None
@@ -504,6 +510,7 @@ def test_pipeline_stage_commit_boundaries(
     pc = SimpleNamespace(
         func_cfg=tc,
         tuning_cfg=tc,
+        layout=tc,
         lds_ptrs=SimpleNamespace(
             wait_buffer_load_groups=lambda count: events.append(("wait", count)),
             commit_buffer_load=lambda: events.append(("commit",)),

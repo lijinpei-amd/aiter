@@ -12,6 +12,7 @@ from aiter.ops.triton.utils.common_utils import strip_annotate
 from ._config import KernelFuncConfig, KernelTuningConfig
 from ._lang import optional as _opt
 from ._lang import require_constexpr
+from ._layout import KernelLayout
 from ._types import A_PAYLOAD, A_SCALE, B_PAYLOAD, B_SCALE
 
 __all__ = ["LDSManager"]
@@ -49,18 +50,18 @@ def _buffer_load_to_lds(
 
 
 @gluon.jit
-def _scale_fragments(scale, cfg, operand: gl.constexpr):
+def _scale_fragments(scale, cfg, layout, operand: gl.constexpr):
     """Split one shuffled scale load in registers, retaining whole packed words."""
-    nonk: gl.constexpr = cfg.scale_mini_block_nonk(operand)
-    sk: gl.constexpr = cfg.scale_mini_block_k(operand)
+    nonk: gl.constexpr = layout.scale_mini_block_nonk(operand)
+    sk: gl.constexpr = layout.scale_mini_block_k(operand)
     bk: gl.constexpr = cfg.BLOCK_K
-    packed: gl.constexpr = cfg.scale_packed_ok(operand)
+    packed: gl.constexpr = layout.scale_packed_ok(operand)
     fragments = ()
-    for n in gl.static_range(cfg.scale_ratio_non_k_slot(operand)):
+    for n in gl.static_range(layout.scale_ratio_non_k_slot(operand)):
         for k in gl.static_range(sk // bk):
             if require_constexpr(packed):
                 if require_constexpr(
-                    cfg.scale_ratio_non_k_slot(operand) == 1 and sk == max(256, bk)
+                    layout.scale_ratio_non_k_slot(operand) == 1 and sk == max(256, bk)
                 ):
                     fragment = scale
                 else:
@@ -69,18 +70,18 @@ def _scale_fragments(scale, cfg, operand: gl.constexpr):
                     words = gl.reshape(scale, [nonk // 32, sk // 256, 64])
                     words = gl.amd.slice(
                         words,
-                        [cfg.scale_nonk(operand) // 32, max(256, bk) // 256, 64],
-                        [n * cfg.scale_nonk(operand) // 32, k * bk // 256, 0],
+                        [layout.scale_nonk(operand) // 32, max(256, bk) // 256, 64],
+                        [n * layout.scale_nonk(operand) // 32, k * bk // 256, 0],
                     )
                     fragment = gl.convert_layout(
-                        gl.reshape(words, cfg.packed_scale_shape(operand)),
-                        cfg.packed_scale_frag_layout(operand),
+                        gl.reshape(words, layout.packed_scale_shape(operand)),
+                        layout.packed_scale_frag_layout(operand),
                     )
             else:
                 fragment = gl.amd.slice(
                     scale,
-                    cfg.scale_fragment_shape_slot(operand),
-                    [n * cfg.scale_nonk(operand), k * bk // 32],
+                    layout.scale_fragment_shape_slot(operand),
+                    [n * layout.scale_nonk(operand), k * bk // 32],
                 )
             fragments += (fragment,)
     return fragments
@@ -93,6 +94,7 @@ class LDSManager:
 
     func_cfg: KernelFuncConfig
     tuning_cfg: KernelTuningConfig
+    layout: KernelLayout
     a_payload_lds_ptr: gl.shared_memory_descriptor | gl.constexpr
     a_scale_lds_ptr: gl.shared_memory_descriptor | gl.constexpr
     b_payload_lds_ptr: gl.shared_memory_descriptor | gl.constexpr
@@ -103,6 +105,7 @@ class LDSManager:
         self,
         func_cfg,
         tuning_cfg,
+        layout,
         a_payload_lds_ptr,
         a_scale_lds_ptr,
         b_payload_lds_ptr,
@@ -110,13 +113,14 @@ class LDSManager:
     ):
         self.func_cfg = func_cfg
         self.tuning_cfg = tuning_cfg
+        self.layout = layout
         self.a_payload_lds_ptr = _opt(a_payload_lds_ptr)
         self.a_scale_lds_ptr = _opt(a_scale_lds_ptr)
         self.b_payload_lds_ptr = _opt(b_payload_lds_ptr)
         self.b_scale_lds_ptr = _opt(b_scale_lds_ptr)
 
     @gluon.jit
-    def alloc(func_cfg, tuning_cfg):
+    def alloc(func_cfg, tuning_cfg, layout):
         """Static factory -- invoked as ``LDSManager.alloc(...)``, no ``self``.
 
         The leading axis runs over pipeline buffer *and* mini block
@@ -134,16 +138,16 @@ class LDSManager:
         if require_constexpr(tuning_cfg.component_via_lds(_A_PAYLOAD)):
             a_payload_lds_ptr = gl.allocate_shared_memory(
                 a_ty,
-                tuning_cfg.payload_lds_shape_block(0),
-                layout=tuning_cfg.dot_operand_lds_layout(0),
+                layout.payload_lds_shape_block(0),
+                layout=layout.dot_operand_lds_layout(0),
             )
         else:
             a_payload_lds_ptr: gl.constexpr = None
         if require_constexpr(tuning_cfg.component_via_lds(_B_PAYLOAD)):
             b_payload_lds_ptr = gl.allocate_shared_memory(
                 b_ty,
-                tuning_cfg.payload_lds_shape_block(1),
-                layout=tuning_cfg.dot_operand_lds_layout(1),
+                layout.payload_lds_shape_block(1),
+                layout=layout.dot_operand_lds_layout(1),
             )
         else:
             b_payload_lds_ptr: gl.constexpr = None
@@ -152,8 +156,8 @@ class LDSManager:
         ):
             a_scale_lds_ptr = gl.allocate_shared_memory(
                 gl.uint8,
-                tuning_cfg.scale_lds_shape_block(0),
-                layout=tuning_cfg.dot_operand_scale_lds_layout(0),
+                layout.scale_lds_shape_block(0),
+                layout=layout.dot_operand_scale_lds_layout(0),
             )
         else:
             a_scale_lds_ptr: gl.constexpr = None
@@ -162,8 +166,8 @@ class LDSManager:
         ):
             b_scale_lds_ptr = gl.allocate_shared_memory(
                 gl.uint8,
-                tuning_cfg.scale_lds_shape_block(1),
-                layout=tuning_cfg.dot_operand_scale_lds_layout(1),
+                layout.scale_lds_shape_block(1),
+                layout=layout.dot_operand_scale_lds_layout(1),
             )
         else:
             b_scale_lds_ptr: gl.constexpr = None
@@ -171,6 +175,7 @@ class LDSManager:
         return LDSManager(
             func_cfg,
             tuning_cfg,
+            layout,
             a_payload_lds_ptr,
             a_scale_lds_ptr,
             b_payload_lds_ptr,
@@ -198,6 +203,7 @@ class LDSManager:
         mask is needed: the output store mask drops the padded rows.
         """
         cfg: gl.constexpr = self.tuning_cfg
+        layout: gl.constexpr = self.layout
         cache: gl.constexpr = (
             cfg.token_cache_modifier if operand == 0 else cfg.expert_cache_modifier
         )
@@ -208,7 +214,8 @@ class LDSManager:
                 lds_ptr = self.b_payload_lds_ptr
             _buffer_load_to_lds(
                 lds_ptr.index(
-                    BUFFER_LOAD_IDX * cfg.num_lds_slots_per_block_non_k(operand) + tile
+                    BUFFER_LOAD_IDX * layout.num_lds_slots_per_block_non_k(operand)
+                    + tile
                 ),
                 hbm_ptr,
                 hbm_offs,
@@ -235,12 +242,13 @@ class LDSManager:
     ):
         """Load one scale tile covering one or more complete payload K stages."""
         cfg: gl.constexpr = self.tuning_cfg
+        layout: gl.constexpr = self.layout
         cache: gl.constexpr = (
             cfg.token_scale_cache_modifier
             if operand == 0
             else cfg.expert_scale_cache_modifier
         )
-        ratio: gl.constexpr = cfg.scale_ratio_non_k_slot(operand)
+        ratio: gl.constexpr = layout.scale_ratio_non_k_slot(operand)
         if require_constexpr(VIA_LDS):
             if require_constexpr(
                 self.func_cfg.has_scale(operand)
@@ -253,7 +261,8 @@ class LDSManager:
                     lds_ptr = self.b_scale_lds_ptr
                 _buffer_load_to_lds(
                     lds_ptr.index(
-                        BUFFER_LOAD_IDX * cfg.num_scale_tiles(operand) + tile // ratio
+                        BUFFER_LOAD_IDX * layout.num_scale_tiles(operand)
+                        + tile // ratio
                     ),
                     hbm_ptr,
                     hbm_offs,
@@ -264,7 +273,7 @@ class LDSManager:
             gl.static_assert(self.func_cfg.has_scale(operand))
             gl.static_assert(not cfg.component_via_lds((operand, True)))
             if require_constexpr(cfg.scale_shuffled(operand)):
-                if require_constexpr(cfg.scale_packed_ok(operand)):
+                if require_constexpr(layout.scale_packed_ok(operand)):
                     scale = gl.amd.cdna4.buffer_load(
                         ptr=hbm_ptr.to(gl.pointer_type(gl.int32)),
                         offsets=hbm_offs // 4,
@@ -280,9 +289,9 @@ class LDSManager:
                             contiguity=4,
                             soffset=SOFF,
                         ),
-                        cfg.scale_load_layout(operand),
+                        layout.scale_load_layout(operand),
                     )
-                fragments = _scale_fragments(scale, cfg, operand)
+                fragments = _scale_fragments(scale, cfg, layout, operand)
             else:
                 scale = gl.amd.cdna4.buffer_load(
                     ptr=hbm_ptr, offsets=hbm_offs, cache=cache, soffset=SOFF
@@ -294,39 +303,42 @@ class LDSManager:
     def ds_read_scale(self, operand: gl.constexpr, SCALE_READ_IDX, tile: gl.constexpr):
         """Read each scale mini block once and retain all of its consumer fragments."""
         cfg: gl.constexpr = self.tuning_cfg
+        layout: gl.constexpr = self.layout
         if require_constexpr(operand == 0):
             lds_ptr = self.a_scale_lds_ptr
         else:
             lds_ptr = self.b_scale_lds_ptr
         if require_constexpr(cfg.scale_shuffled(operand)):
             scale_ptr = lds_ptr.index(
-                SCALE_READ_IDX * cfg.num_scale_tiles(operand)
-                + tile // cfg.scale_ratio_non_k_slot(operand)
+                SCALE_READ_IDX * layout.num_scale_tiles(operand)
+                + tile // layout.scale_ratio_non_k_slot(operand)
             )
-            if require_constexpr(cfg.scale_packed_ok(operand)):
+            if require_constexpr(layout.scale_packed_ok(operand)):
                 scale = _ds_read(
                     scale_ptr.reinterpret(
                         gl.int32,
-                        cfg.packed_scale_load_shape(operand),
-                        cfg.packed_scale_read_layout(operand, True),
+                        layout.packed_scale_load_shape(operand),
+                        layout.packed_scale_read_layout(operand, True),
                     ),
-                    cfg.packed_scale_load_layout(operand),
+                    layout.packed_scale_load_layout(operand),
                 )
             else:
                 scale = _ds_read(
                     scale_ptr.reinterpret(
                         gl.uint8,
-                        cfg.scale_load_shape(operand),
-                        cfg.shuffled_scale_read_layout(operand, True),
+                        layout.scale_load_shape(operand),
+                        layout.shuffled_scale_read_layout(operand, True),
                     ),
-                    cfg.scale_load_layout(operand),
+                    layout.scale_load_layout(operand),
                 )
-            fragments = _scale_fragments(scale, cfg, operand)
+            fragments = _scale_fragments(scale, cfg, layout, operand)
         else:
             fragments = (
                 _ds_read(
-                    lds_ptr.index(SCALE_READ_IDX * cfg.num_scale_tiles(operand) + tile),
-                    cfg.dot_operand_scale_fragment_layout(operand),
+                    lds_ptr.index(
+                        SCALE_READ_IDX * layout.num_scale_tiles(operand) + tile
+                    ),
+                    layout.dot_operand_scale_fragment_layout(operand),
                 ),
             )
         return fragments
@@ -356,7 +368,7 @@ class LDSManager:
 
         An absent or disabled component returns None.
         """
-        cfg: gl.constexpr = self.tuning_cfg
+        layout: gl.constexpr = self.layout
         if require_constexpr(operand == 0):
             payload_lds_ptr = self.a_payload_lds_ptr
         else:
@@ -368,21 +380,21 @@ class LDSManager:
         else:
             payload = _ds_read(
                 payload_lds_ptr.index(
-                    DS_READ_IDX * cfg.num_lds_slots_per_block_non_k(operand) + tile
+                    DS_READ_IDX * layout.num_lds_slots_per_block_non_k(operand) + tile
                 ),
-                cfg.dot_operand_fragment_layout(operand),
+                layout.dot_operand_fragment_layout(operand),
             )
         if require_constexpr(READ_SCALE and self.func_cfg.has_scale(operand)):
             gl.static_assert(
-                cfg.component_via_lds((operand, True)),
+                self.tuning_cfg.component_via_lds((operand, True)),
                 "ds_read_frag only reads LDS-staged scales",
             )
-            ratio: gl.constexpr = cfg.scale_ratio_non_k_slot(operand)
+            ratio: gl.constexpr = layout.scale_ratio_non_k_slot(operand)
             fragments = self.ds_read_scale(
                 operand, SCALE_READ_IDX, tile // ratio * ratio
             )
             scale_val = fragments[
-                (tile % ratio) * cfg.scale_read_k_slots(operand) + mini_idx
+                (tile % ratio) * layout.scale_read_k_slots(operand) + mini_idx
             ]
         else:
             scale_val: gl.constexpr = None

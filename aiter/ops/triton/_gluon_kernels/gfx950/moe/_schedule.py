@@ -53,14 +53,16 @@ class ScheduleSpec(NamedTuple):
     * it states what the schedule actually depends on. Anything not here cannot
       change the schedule, which is what lets a caller reason about whether a tuning
       change can move the emitted code;
-    * it is a sound memo key. The tuning aggregate is not: Triton builds it with
-      ``eq_default=False``, so it hashes by identity and a single compile constructs
-      hundreds of distinct objects for one value, and three of its fields are
-      ``gl.constexpr(list)`` and unhashable outright.
+    * it is a sound memo key. Neither the tuning aggregate nor the layout aggregate
+      is: Triton builds them with ``eq_default=False``, so they hash by identity and a
+      single compile constructs hundreds of distinct objects for one value, and
+      several of their fields are ``gl.constexpr(list)`` and unhashable outright.
 
-    Built from accessor *results*, never from raw fields, because the placement
-    accessors fold in automatic fallbacks and because test doubles mutate their
-    inputs after construction.
+    Built from accessor *results*, never from raw fields: geometry and placement
+    (``nm``, ``nn``, ``ratio_k``, ``via_lds``, ``ratio_non_k``) from the
+    ``KernelLayout`` accessors, which fold in automatic fallbacks, and tuning policy
+    from the tuning configuration, whose test doubles mutate their inputs after
+    construction.
     """
 
     nm: int
@@ -81,17 +83,17 @@ class ScheduleSpec(NamedTuple):
 
 
 @gluon.constexpr_function
-def schedule_spec(tc):
-    """Resolve the schedule model's input surface from a tuning configuration."""
-    present = tuple(_present(tc, c) for c in COMPONENTS)
+def schedule_spec(tc, layout):
+    """Resolve the schedule model's input surface from a tuning config and layout."""
+    present = tuple(_present(tc, layout, c) for c in COMPONENTS)
     via_lds = tuple(bool(_v(tc.component_via_lds(c))) for c in COMPONENTS)
     for c, lds in zip(COMPONENTS, via_lds):
         assert bool(_v(tc.component_in_reg(c))) is not lds, (
             f"component_in_reg must be the complement of component_via_lds for {c}"
         )
     return ScheduleSpec(
-        nm=_v(tc.num_m_slots_per_block()),
-        nn=_v(tc.num_n_slots_per_block()),
+        nm=_v(layout.num_m_slots_per_block()),
+        nn=_v(layout.num_n_slots_per_block()),
         commit=(
             bool(_v(tc.commit_per_op())),
             bool(_v(tc.commit_per_slot())),
@@ -101,64 +103,66 @@ def schedule_spec(tc):
         k_unroll=_v(tc.K_UNROLL),
         present=present,
         depth=tuple(_v(tc.num_buffers(c[0], c[1])) for c in COMPONENTS),
-        ratio_k=tuple(_component_ratio(tc, c) for c in COMPONENTS),
+        ratio_k=tuple(_component_ratio(tc, layout, c) for c in COMPONENTS),
         via_lds=via_lds,
         ds_read_in_mfma=tuple(
             bool(_v(tc.ds_read_in_mfma(c[0], c[1]))) for c in COMPONENTS
         ),
-        ratio_non_k=tuple(_v(tc.scale_ratio_non_k_slot(o)) for o in OPERANDS),
+        ratio_non_k=tuple(_v(layout.scale_ratio_non_k_slot(o)) for o in OPERANDS),
     )
 
 
 @gluon.constexpr_function
-def _present(tc, component):
+def _present(tc, layout, component):
     """Whether a component exists for this operand-format pair."""
     operand, is_scale = component[0], component[1]
     return not _v(is_scale) or tc.func_cfg.has_scale(operand)
 
 
 @gluon.constexpr_function
-def _component_depth(tc, component):
+def _component_depth(tc, layout, component):
     operand, is_scale = component[0], component[1]
     return tc.num_buffers(operand, is_scale)
 
 
 @gluon.constexpr_function
-def _component_ratio(tc, component):
+def _component_ratio(tc, layout, component):
     operand, is_scale = component[0], component[1]
-    return tc.scale_ratio_k_step(operand) if _v(is_scale) else 1
+    return layout.scale_ratio_k_step(operand) if _v(is_scale) else 1
 
 
 @gluon.constexpr_function
-def _live_span(tc, component):
+def _live_span(tc, layout, component):
     """Baseline inclusive lifetime ``L(c)`` in payload K steps."""
-    return (_component_depth(tc, component) - 1) * _component_ratio(tc, component) + 1
+    return (_component_depth(tc, layout, component) - 1) * _component_ratio(
+        tc, layout, component
+    ) + 1
 
 
 @gluon.constexpr_function
-def _via_lds(tc, component):
+def _via_lds(tc, layout, component):
     """Resolved placement for one payload or scale component."""
     return tc.component_via_lds(component)
 
 
 @gluon.constexpr_function
-def _in_reg(tc, component):
+def _in_reg(tc, layout, component):
     """Resolved direct-register placement for one present component."""
     return tc.component_in_reg(component)
 
 
 @gluon.constexpr_function
-def pipeline_depth(tc):
+def pipeline_depth(tc, layout):
     """Largest prefetch span, measured in payload steps, of active components."""
     depth = 0
     for component in COMPONENTS:
-        if _present(tc, component):
-            depth = max(depth, _live_span(tc, component))
+        if _present(tc, layout, component):
+            depth = max(depth, _live_span(tc, layout, component))
     return depth
 
 
 @gluon.constexpr_function
-def ring_restoration_period(tc):
+def ring_restoration_period(tc, layout):
     """Payload steps after which every present component ring is back at slot zero.
 
     A component's ring period is its depth times its scale K-step ratio, not its live
@@ -172,16 +176,17 @@ def ring_restoration_period(tc):
     """
     period = 1
     for component in COMPONENTS:
-        if _present(tc, component):
+        if _present(tc, layout, component):
             period = math.lcm(
                 period,
-                _component_depth(tc, component) * _component_ratio(tc, component),
+                _component_depth(tc, layout, component)
+                * _component_ratio(tc, layout, component),
             )
     return period
 
 
 @gluon.constexpr_function
-def async_pattern_period(tc):
+def async_pattern_period(tc, layout):
     """Payload steps after which the issued async-copy pattern repeats.
 
     The LCM of the scale K-step ratios over present LDS-backed components; payload
@@ -192,13 +197,13 @@ def async_pattern_period(tc):
     """
     period = 1
     for component in COMPONENTS:
-        if _present(tc, component) and _via_lds(tc, component):
-            period = math.lcm(period, _component_ratio(tc, component))
+        if _present(tc, layout, component) and _via_lds(tc, layout, component):
+            period = math.lcm(period, _component_ratio(tc, layout, component))
     return period
 
 
 @gluon.constexpr_function
-def pipeline_unroll(tc):
+def pipeline_unroll(tc, layout):
     """Requested unroll, widened to a whole number of every component ring period.
 
     Including LDS rings keeps every complete body at a fixed ring phase as well as
@@ -206,28 +211,28 @@ def pipeline_unroll(tc):
     """
     requested = _v(tc.K_UNROLL)
     assert requested >= 1, "K_UNROLL must be at least 1"
-    return math.lcm(requested, ring_restoration_period(tc))
+    return math.lcm(requested, ring_restoration_period(tc, layout))
 
 
 @gluon.constexpr_function
-def _pipeline_peeled(tc):
+def _pipeline_peeled(tc, layout):
     """Smallest initial main prefix after which every wait is invariant.
 
     The first MFMA is always peeled to retain its visible zero accumulator.
-    By read stage ``pipeline_depth(tc) - 2``, every active component has an
+    By read stage ``pipeline_depth(tc, layout) - 2``, every active component has an
     entirely full producer history. Checking the finite prefix also handles
     configurations where shared groups hide some staggered fills.
     """
     # These schemes commit even empty prologue slots/stages. Their group
     # distances already match the steady state when a component first reads.
     # At depth three or below, the mandatory first peel covers any warmup.
-    if not tc.commit_per_op() or pipeline_depth(tc) <= 3:
+    if not tc.commit_per_op() or pipeline_depth(tc, layout) <= 3:
         return 1
-    slots = range(tc.num_m_slots_per_block() * tc.num_n_slots_per_block())
+    slots = range(layout.num_m_slots_per_block() * layout.num_n_slots_per_block())
     peeled = 1
-    for x in range(max(0, pipeline_depth(tc) - 2)):
-        steady = tuple(_wait(tc, None, slot, phase=x + 1) for slot in slots)
-        if tuple(_wait(tc, x + 1, slot) for slot in slots) != steady:
+    for x in range(max(0, pipeline_depth(tc, layout) - 2)):
+        steady = tuple(_wait(tc, layout, None, slot, phase=x + 1) for slot in slots)
+        if tuple(_wait(tc, layout, x + 1, slot) for slot in slots) != steady:
             peeled = x + 1
     return peeled
 
@@ -280,7 +285,7 @@ def _payload_fill_slots(NM, NN):
 
 
 @gluon.constexpr_function
-def _component_fill_slots(tc, component):
+def _component_fill_slots(tc, layout, component):
     """Slot that owns each non-K tile of one component.
 
     ``SCALE_FILL_MID`` is consumed here and nowhere else: downstream ownership,
@@ -288,7 +293,7 @@ def _component_fill_slots(tc, component):
     guarded to the 2x2 split, so on any other geometry it is inert -- a rectangular
     tile that sets it is not testing anything.
     """
-    nm, nn = _v(tc.num_m_slots_per_block()), _v(tc.num_n_slots_per_block())
+    nm, nn = _v(layout.num_m_slots_per_block()), _v(layout.num_n_slots_per_block())
     a_slots, b_slots = _payload_fill_slots(nm, nn)
     if _v(component[1]) and _v(tc.SCALE_FILL_MID) and nm == 2 and nn == 2:
         return (1, 2)
@@ -296,20 +301,20 @@ def _component_fill_slots(tc, component):
 
 
 @gluon.constexpr_function
-def _fill_slots_valid(tc):
+def _fill_slots_valid(tc, layout):
     """Every mapped slot exists, and no component owns two tiles in one slot.
 
     The second half is what keeps the flat ``_ops()`` transport representable: it
     carries one optional tile per component, so a component may own at most one tile
     per slot. Different components sharing a slot is fine and expected.
     """
-    slots = _v(tc.num_m_slots_per_block()) * _v(tc.num_n_slots_per_block())
+    slots = _v(layout.num_m_slots_per_block()) * _v(layout.num_n_slots_per_block())
     for component in COMPONENTS:
-        mapping = _component_fill_slots(tc, component)
+        mapping = _component_fill_slots(tc, layout, component)
         expected = (
-            _v(tc.num_m_slots_per_block())
+            _v(layout.num_m_slots_per_block())
             if _v(component[0]) == A
-            else _v(tc.num_n_slots_per_block())
+            else _v(layout.num_n_slots_per_block())
         )
         if len(mapping) != expected:
             return False
@@ -321,13 +326,13 @@ def _fill_slots_valid(tc):
 
 
 @gluon.constexpr_function
-def _component_fill_slot(tc, component, tile):
+def _component_fill_slot(tc, layout, component, tile):
     """Flattened slot that owns one component/non-K-tile producer."""
-    return _component_fill_slots(tc, component)[_v(tile)]
+    return _component_fill_slots(tc, layout, component)[_v(tile)]
 
 
 @gluon.constexpr_function
-def _candidate_ops(tc, slot):
+def _candidate_ops(tc, layout, slot):
     """Tiles this slot owns, in ``COMPONENTS`` order; ``None`` where it owns none.
 
     The single inversion of the fill mappings, and the only per-slot ownership view.
@@ -338,13 +343,15 @@ def _candidate_ops(tc, slot):
     out = []
     for component in COMPONENTS:
         tile = None
-        if _present(tc, component):
+        if _present(tc, layout, component):
             ratio = (
-                _v(tc.scale_ratio_non_k_slot(_v(component[0])))
+                _v(layout.scale_ratio_non_k_slot(_v(component[0])))
                 if _v(component[1])
                 else 1
             )
-            for candidate, owner in enumerate(_component_fill_slots(tc, component)):
+            for candidate, owner in enumerate(
+                _component_fill_slots(tc, layout, component)
+            ):
                 if owner == _v(slot) and candidate % ratio == 0:
                     tile = candidate
                     break
@@ -353,49 +360,49 @@ def _candidate_ops(tc, slot):
 
 
 @gluon.constexpr_function
-def _component_nominal_read_slot(tc, component, tile):
+def _component_nominal_read_slot(tc, layout, component, tile):
     """Payload-owned slot at which a component would normally be selected."""
-    return _component_fill_slots(tc, (component[0], PAYLOAD))[_v(tile)]
+    return _component_fill_slots(tc, layout, (component[0], PAYLOAD))[_v(tile)]
 
 
 @gluon.constexpr_function
-def _component_read_slot(tc, component, tile):
+def _component_read_slot(tc, layout, component, tile):
     """Legal selection slot after accounting for a same-step register producer."""
-    nominal = _component_nominal_read_slot(tc, component, tile)
-    if _in_reg(tc, component) and _fill_span(tc, component) == 1:
-        producer = _component_fill_slot(tc, component, tile)
+    nominal = _component_nominal_read_slot(tc, layout, component, tile)
+    if _in_reg(tc, layout, component) and _fill_span(tc, layout, component) == 1:
+        producer = _component_fill_slot(tc, layout, component, tile)
         if producer > nominal:
             return producer
     return nominal
 
 
 @gluon.constexpr_function
-def _component_read_tile(tc, component, mi, ni):
+def _component_read_tile(tc, layout, component, mi, ni):
     """Non-K tile selected in this slot, or ``None`` when this component is idle."""
-    if not _present(tc, component):
+    if not _present(tc, layout, component):
         return None
     operand, is_scale = component[0], component[1]
     count = (
-        tc.num_m_slots_per_block()
+        layout.num_m_slots_per_block()
         if operand == A
-        else tc.num_n_slots_per_block()
+        else layout.num_n_slots_per_block()
     )
     slot = _slot_index(
         mi,
         ni,
-        tc.num_m_slots_per_block(),
-        tc.num_n_slots_per_block(),
+        layout.num_m_slots_per_block(),
+        layout.num_n_slots_per_block(),
     )
     for tile in range(count):
-        if _v(is_scale) and tile % tc.scale_ratio_non_k_slot(operand) != 0:
+        if _v(is_scale) and tile % layout.scale_ratio_non_k_slot(operand) != 0:
             continue
-        if _component_read_slot(tc, component, tile) == slot:
+        if _component_read_slot(tc, layout, component, tile) == slot:
             return tile
     return None
 
 
 @gluon.constexpr_function
-def _ops(tc, mi, ni):
+def _ops(tc, layout, mi, ni):
     """Tiles in ``COMPONENTS`` order, including direct-register destinations.
 
     The flat four-element transport across the constexpr-to-JIT boundary -- nested
@@ -404,61 +411,62 @@ def _ops(tc, mi, ni):
     """
     return _candidate_ops(
         tc,
+        layout,
         _slot_index(
-            mi, ni, tc.num_m_slots_per_block(), tc.num_n_slots_per_block()
+            mi, ni, layout.num_m_slots_per_block(), layout.num_n_slots_per_block()
         ),
     )
 
 
 @gluon.constexpr_function
-def _fill_span(tc, component):
+def _fill_span(tc, layout, component):
     """Actual inclusive producer-to-selection span ``F(c)`` in payload steps."""
-    span = _live_span(tc, component)
-    if _in_reg(tc, component):
+    span = _live_span(tc, layout, component)
+    if _in_reg(tc, layout, component):
         span -= 1
     return span
 
 
 @gluon.constexpr_function
-def _read_in_mfma(tc, component, tile):
+def _read_in_mfma(tc, layout, component, tile):
     """Effective read region, including mandatory same-step fill ordering."""
     operand, is_scale = component[0], component[1]
     configured = tc.ds_read_in_mfma(operand, is_scale)
-    if not _in_reg(tc, component) or _fill_span(tc, component) != 1:
+    if not _in_reg(tc, layout, component) or _fill_span(tc, layout, component) != 1:
         return configured
     return configured or _component_read_slot(
-        tc, component, tile
-    ) == _component_fill_slot(tc, component, tile)
+        tc, layout, component, tile
+    ) == _component_fill_slot(tc, layout, component, tile)
 
 
 @gluon.constexpr_function
-def _fills_during_startup(tc, component, step):
+def _fills_during_startup(tc, layout, component, step):
     """Whether a component has begun filling by this absolute payload step.
 
     Prologue filling starts at ``1 - F(c)``, so a component with a shorter fill span
     starts later: it does not need its value as early. ``step=None`` is steady state,
     where every present component fills.
     """
-    if not _present(tc, component):
+    if not _present(tc, layout, component):
         return False
-    return step is None or step + _fill_span(tc, component) - 1 >= 0
+    return step is None or step + _fill_span(tc, layout, component) - 1 >= 0
 
 
 @gluon.constexpr_function
-def _fills_during_drain(tc, component, iteration):
+def _fills_during_drain(tc, layout, component, iteration):
     """Whether a component still fills at this zero-based drain iteration.
 
     Filling continues while ``j < D - F(c)``. A component whose values live the full
     pipeline depth has nothing left to fetch once the drain starts; a shallower one
     keeps going, which is why the drain is not idle.
     """
-    if not _present(tc, component):
+    if not _present(tc, layout, component):
         return False
-    return iteration < pipeline_depth(tc) - _fill_span(tc, component)
+    return iteration < pipeline_depth(tc, layout) - _fill_span(tc, layout, component)
 
 
 @gluon.constexpr_function
-def _active(tc, component, stage, drain=False):
+def _active(tc, layout, component, stage, drain=False):
     """Whether a component fills here, dispatching on the caller's region.
 
     The two regimes use different origins -- an absolute payload step before the
@@ -467,32 +475,38 @@ def _active(tc, component, stage, drain=False):
     read side.
     """
     if drain:
-        return _fills_during_drain(tc, component, stage)
-    return _fills_during_startup(tc, component, stage)
+        return _fills_during_drain(tc, layout, component, stage)
+    return _fills_during_startup(tc, layout, component, stage)
 
 
 @gluon.constexpr_function
-def _producer_phase(tc, component):
+def _producer_phase(tc, layout, component):
     """Payload-step residue on which this component issues its producer load."""
-    return (1 - _fill_span(tc, component)) % _component_ratio(tc, component)
-
-
-@gluon.constexpr_function
-def _loads_at_phase(tc, component, phase):
-    """Whether a component issues a load at this K-step phase."""
-    return _present(tc, component) and (
-        phase % _component_ratio(tc, component) == _producer_phase(tc, component)
+    return (1 - _fill_span(tc, layout, component)) % _component_ratio(
+        tc, layout, component
     )
 
 
 @gluon.constexpr_function
-def _reads_at_phase(tc, component, phase):
-    """Whether this step selects a new value for the component."""
-    return _present(tc, component) and phase % _component_ratio(tc, component) == 0
+def _loads_at_phase(tc, layout, component, phase):
+    """Whether a component issues a load at this K-step phase."""
+    return _present(tc, layout, component) and (
+        phase % _component_ratio(tc, layout, component)
+        == _producer_phase(tc, layout, component)
+    )
 
 
 @gluon.constexpr_function
-def _issued_tiles(tc, mi, ni, stage, drain=False, phase=0):
+def _reads_at_phase(tc, layout, component, phase):
+    """Whether this step selects a new value for the component."""
+    return (
+        _present(tc, layout, component)
+        and phase % _component_ratio(tc, layout, component) == 0
+    )
+
+
+@gluon.constexpr_function
+def _issued_tiles(tc, layout, mi, ni, stage, drain=False, phase=0):
     """Tiles this slot issues at this step, ``COMPONENTS``-aligned; ``None`` for none.
 
     :func:`_ops` says what the slot *owns*; this applies the step-local filters on top
@@ -508,39 +522,39 @@ def _issued_tiles(tc, mi, ni, stage, drain=False, phase=0):
         tile
         if (
             tile is not None
-            and _active(tc, component, stage, drain)
-            and _loads_at_phase(tc, component, phase)
+            and _active(tc, layout, component, stage, drain)
+            and _loads_at_phase(tc, layout, component, phase)
         )
         else None
-        for component, tile in zip(COMPONENTS, _ops(tc, mi, ni))
+        for component, tile in zip(COMPONENTS, _ops(tc, layout, mi, ni))
     )
 
 
 @gluon.constexpr_function
-def _has_register_component(tc):
+def _has_register_component(tc, layout):
     """Whether any present live component uses a direct-register ring."""
     for component in COMPONENTS:
-        if _present(tc, component) and _in_reg(tc, component):
+        if _present(tc, layout, component) and _in_reg(tc, layout, component):
             return True
     return False
 
 
 @gluon.constexpr_function
-def _groups(tc, stage, drain=False, phase=None):
+def _groups(tc, layout, stage, drain=False, phase=None):
     """Committed groups at a read phase, including empty slot/stage groups."""
     schedule, whole = [], ()
     phase = stage if phase is None and stage is not None else phase or 0
-    for ni in range(tc.num_n_slots_per_block()):
-        for mi in range(tc.num_m_slots_per_block()):
+    for ni in range(layout.num_n_slots_per_block()):
+        for mi in range(layout.num_m_slots_per_block()):
             # The async view of what this slot issues: the same step schedule the
             # emitter fills from, minus the direct-register copies, which have no
             # commit group.
             ops = tuple(
                 (component, tile)
                 for component, tile in zip(
-                    COMPONENTS, _issued_tiles(tc, mi, ni, stage, drain, phase)
+                    COMPONENTS, _issued_tiles(tc, layout, mi, ni, stage, drain, phase)
                 )
-                if tile is not None and _via_lds(tc, component)
+                if tile is not None and _via_lds(tc, layout, component)
             )
             if tc.commit_per_op():
                 groups = tuple((op,) for op in ops)
@@ -550,8 +564,8 @@ def _groups(tc, stage, drain=False, phase=None):
                 whole += ops
                 groups = (
                     (whole,)
-                    if mi == tc.num_m_slots_per_block() - 1
-                    and ni == tc.num_n_slots_per_block() - 1
+                    if mi == layout.num_m_slots_per_block() - 1
+                    and ni == layout.num_n_slots_per_block() - 1
                     else ()
                 )
             schedule.append(groups)
@@ -559,7 +573,7 @@ def _groups(tc, stage, drain=False, phase=None):
 
 
 @gluon.constexpr_function
-def _read_step(tc, stage, drain):
+def _read_step(tc, layout, stage, drain):
     """Absolute payload step this wait point reads at.
 
     Three coordinates arrive here. ``None`` is steady state, where only the phase
@@ -569,11 +583,11 @@ def _read_step(tc, stage, drain):
     """
     if drain:
         return stage + 1
-    return pipeline_depth(tc) if stage is None else stage
+    return pipeline_depth(tc, layout) if stage is None else stage
 
 
 @gluon.constexpr_function
-def _required_producers(tc, read_step, slot, phase):
+def _required_producers(tc, layout, read_step, slot, phase):
     """Producer tokens the LDS reads at this point demand.
 
     ``(producer_step, component, non_k_tile)``. The step is part of the identity
@@ -583,25 +597,33 @@ def _required_producers(tc, read_step, slot, phase):
     Direct-register components are absent by construction: they have no commit group,
     and the compiler tracks their VMEM dependency itself.
     """
-    nm, nn = tc.num_m_slots_per_block(), tc.num_n_slots_per_block()
+    nm, nn = layout.num_m_slots_per_block(), layout.num_n_slots_per_block()
     out = []
     for ni in range(nn):
         for mi in range(nm):
             if slot is not None and _slot_index(mi, ni, nm, nn) != slot:
                 continue
             for component in COMPONENTS:
-                tile = _component_read_tile(tc, component, mi, ni)
+                tile = _component_read_tile(tc, layout, component, mi, ni)
                 if tile is None:
                     continue
-                if _via_lds(tc, component) and _reads_at_phase(tc, component, phase):
+                if _via_lds(tc, layout, component) and _reads_at_phase(
+                    tc, layout, component, phase
+                ):
                     out.append(
-                        (read_step - _fill_span(tc, component) + 1, component, tile)
+                        (
+                            read_step - _fill_span(tc, layout, component) + 1,
+                            component,
+                            tile,
+                        )
                     )
     return tuple(out)
 
 
 @gluon.constexpr_function
-def _committed_before(tc, stage, read_step, slot, drain, epilogue_groups, phase):
+def _committed_before(
+    tc, layout, stage, read_step, slot, drain, epilogue_groups, phase
+):
     """Commit groups issued before this wait point, oldest first.
 
     Empty entries are meaningful: a per-slot or per-stage scheme commits even when a
@@ -615,17 +637,17 @@ def _committed_before(tc, stage, read_step, slot, drain, epilogue_groups, phase)
     depends only on the suffix after the newest required group.
     """
     out = []
-    for step in range(read_step - pipeline_depth(tc) + 1, read_step + 1):
+    for step in range(read_step - pipeline_depth(tc, layout) + 1, read_step + 1):
         step_phase = phase + step - read_step
         if drain:
             schedule = (
-                _groups(tc, step - 1, True, step_phase)
+                _groups(tc, layout, step - 1, True, step_phase)
                 if step > 0
-                else _groups(tc, None, phase=step_phase)
+                else _groups(tc, layout, None, phase=step_phase)
             )
         else:
             schedule = _groups(
-                tc, None if stage is None else step, phase=step_phase
+                tc, layout, None if stage is None else step, phase=step_phase
             )
         for pos, groups in enumerate(schedule):
             # This step's own slots from `slot` onward commit after the wait.
@@ -668,29 +690,34 @@ def _wait_count(committed, required):
 
 
 @gluon.constexpr_function
-def _wait(tc, stage, slot, drain=False, epilogue_groups=0, phase=None):
+def _wait(tc, layout, stage, slot, drain=False, epilogue_groups=0, phase=None):
     """Immediate for the ``wait_group`` before this read, or ``None`` for no wait.
 
     Four independent steps: where we are, what the reads demand, what has committed,
     how far back the newest demand sits.
     """
-    read_step = _read_step(tc, stage, drain)
+    read_step = _read_step(tc, layout, stage, drain)
     phase = read_step if phase is None else phase
-    # Memoized on the resolved input surface rather than the configuration object.
+    # Memoized on the resolved input surface rather than the configuration objects.
     # This is the most expensive constexpr in the kernel -- it walks pipeline_depth
     # steps of commit groups -- and the emitter asks for it once per slot per step,
     # which repeats across the unrolled body.
     key = (
-        schedule_spec(tc), stage, slot, bool(drain), _v(epilogue_groups), phase
+        schedule_spec(tc, layout),
+        stage,
+        slot,
+        bool(drain),
+        _v(epilogue_groups),
+        phase,
     )
     if key in _schedule_cache.WAIT:
         return _schedule_cache.WAIT[key]
-    required = _required_producers(tc, read_step, slot, phase)
+    required = _required_producers(tc, layout, read_step, slot, phase)
     if not required:
         count = None
     else:
         committed = _committed_before(
-            tc, stage, read_step, slot, drain, epilogue_groups, phase
+            tc, layout, stage, read_step, slot, drain, epilogue_groups, phase
         )
         count = _wait_count(committed, required)
     if len(_schedule_cache.WAIT) < _schedule_cache.LIMIT:
@@ -703,7 +730,7 @@ def _wait(tc, stage, slot, drain=False, epilogue_groups=0, phase=None):
 
 
 @gluon.constexpr_function
-def _stage_wait(tc, stage, drain=False, epilogue_groups=0, phase=None):
+def _stage_wait(tc, layout, stage, drain=False, epilogue_groups=0, phase=None):
     """Wait count for the stage head, or ``None`` when this scheme waits per slot.
 
     Returning ``None`` for the inapplicable scheme keeps the emitter to one evaluation
@@ -713,11 +740,11 @@ def _stage_wait(tc, stage, drain=False, epilogue_groups=0, phase=None):
     """
     if not tc.commit_per_stage():
         return None
-    return _wait(tc, stage, None, drain, epilogue_groups, phase)
+    return _wait(tc, layout, stage, None, drain, epilogue_groups, phase)
 
 
 @gluon.constexpr_function
-def _slot_waits(tc, stage, drain=False, epilogue_groups=0, phase=None):
+def _slot_waits(tc, layout, stage, drain=False, epilogue_groups=0, phase=None):
     """Per-slot wait counts for one step, indexed by ``_slot_index``.
 
     A whole vector rather than one query per slot: Gluon refuses a ``gl.constexpr``
@@ -726,24 +753,25 @@ def _slot_waits(tc, stage, drain=False, epilogue_groups=0, phase=None):
     once at step scope and index, which evaluates ``_wait`` exactly once per slot
     instead of twice.
     """
-    slots = tc.num_m_slots_per_block() * tc.num_n_slots_per_block()
+    slots = layout.num_m_slots_per_block() * layout.num_n_slots_per_block()
     if tc.commit_per_stage():
         # Full length, all ``None``: the emitter then has one uniform test per slot
         # rather than a separate "is this scheme per-slot at all" guard.
         return (None,) * slots
     return tuple(
-        _wait(tc, stage, slot, drain, epilogue_groups, phase) for slot in range(slots)
+        _wait(tc, layout, stage, slot, drain, epilogue_groups, phase)
+        for slot in range(slots)
     )
 
 
 @gluon.constexpr_function
-def validate_pipeline(tc, K):
+def validate_pipeline(tc, layout, K):
     """Validate the live component rings and runtime-loop lower bound."""
     tc.validate_buffer_counts()
-    num_k = tc.num_k_tiles(K)
-    depth = pipeline_depth(tc)
-    peeled = _pipeline_peeled(tc)
-    unroll = pipeline_unroll(tc)
+    num_k = layout.num_k_tiles(K)
+    depth = pipeline_depth(tc, layout)
+    peeled = _pipeline_peeled(tc, layout)
+    unroll = pipeline_unroll(tc, layout)
     assert num_k >= depth + peeled + unroll, (
         f"NUM_K ({num_k}) must be at least PIPELINE_DEPTH ({depth}) "
         f"+ PEELED ({peeled}) + UNROLL ({unroll}) = {depth + peeled + unroll}"
@@ -752,29 +780,29 @@ def validate_pipeline(tc, K):
 
 
 @gluon.constexpr_function
-def _scale_soff_steps(tc, component, offset_step):
+def _scale_soff_steps(tc, layout, component, offset_step):
     """Advance from the first scale producer in an unrolled body."""
-    ratio = _component_ratio(tc, component)
-    start = _pipeline_peeled(tc) + 1
-    producer_phase = _producer_phase(tc, component)
+    ratio = _component_ratio(tc, layout, component)
+    start = _pipeline_peeled(tc, layout) + 1
+    producer_phase = _producer_phase(tc, layout, component)
     first_producer = (start - producer_phase + ratio - 1) // ratio
     producer = (start + offset_step - producer_phase) // ratio
     return (producer - first_producer) * ratio
 
 
 @gluon.constexpr_function
-def _register_index(tc, component, phase, ki, in_loop, fill=False):
+def _register_index(tc, layout, component, phase, ki, in_loop, fill=False):
     """Static register-bank index derived from producer-to-selection timing."""
-    if not _present(tc, component):
+    if not _present(tc, layout, component):
         return 0
-    ratio = _component_ratio(tc, component)
+    ratio = _component_ratio(tc, layout, component)
     if in_loop:
-        origin = _pipeline_peeled(tc) + 1
+        origin = _pipeline_peeled(tc, layout) + 1
         current = origin + ki
     else:
         # Finite regions rotate their tuples after each step, so logical bank zero
         # always denotes the value selected at ``phase``.
         origin = phase
         current = phase
-    target = current + (_fill_span(tc, component) - 1 if fill else 0)
-    return (target // ratio - origin // ratio) % _component_depth(tc, component)
+    target = current + (_fill_span(tc, layout, component) - 1 if fill else 0)
+    return (target // ratio - origin // ratio) % _component_depth(tc, layout, component)

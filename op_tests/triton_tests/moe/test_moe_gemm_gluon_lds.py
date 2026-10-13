@@ -10,6 +10,7 @@ import torch
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import compute_kernel_layout
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lds import LDSManager
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import DtypeQuant
 from aiter.ops.triton.moe import moe_op_gemm_gluon as host
@@ -22,15 +23,16 @@ def _register_load_copy(
     src, dst, tc: gl.constexpr, operand: gl.constexpr, SCALE: gl.constexpr
 ):
     # Unused staging allocations must disappear from the compiled kernel.
-    lds = LDSManager.alloc(tc.func_cfg, tc)
+    layout = compute_kernel_layout(tc)
+    lds = LDSManager.alloc(tc.func_cfg, tc, layout)
     if SCALE:
-        shape: gl.constexpr = tc.scale_lds_shape_slot(operand)
-        layout: gl.constexpr = tc.dot_operand_scale_fragment_layout(operand)
+        shape: gl.constexpr = layout.scale_lds_shape_slot(operand)
+        frag_layout: gl.constexpr = layout.dot_operand_scale_fragment_layout(operand)
     else:
-        shape: gl.constexpr = tc.payload_lds_shape_slot(operand)
-        layout: gl.constexpr = tc.dot_operand_fragment_layout(operand)
-    rows = gl.arange(0, shape[0], layout=gl.SliceLayout(1, layout))
-    cols = gl.arange(0, shape[1], layout=gl.SliceLayout(0, layout))
+        shape: gl.constexpr = layout.payload_lds_shape_slot(operand)
+        frag_layout: gl.constexpr = layout.dot_operand_fragment_layout(operand)
+    rows = gl.arange(0, shape[0], layout=gl.SliceLayout(1, frag_layout))
+    cols = gl.arange(0, shape[1], layout=gl.SliceLayout(0, frag_layout))
     offsets = rows[:, None] * shape[1] + cols[None, :]
     if SCALE:
         fragments = lds.buffer_load_scale(operand, False, None, 0, src, offsets, 16)
@@ -57,16 +59,17 @@ def test_register_load_does_not_stage_through_lds(operand, scale, block_k):
         B_SCALE_SHUFFLED=False,
     )
     tc = host._probe_tuning_config(config, DtypeQuant.MXFP4, DtypeQuant.MXFP4)
+    layout = compute_kernel_layout(tc)
     shape = (
-        tc.scale_lds_shape_slot(operand)
+        layout.scale_lds_shape_slot(operand)
         if scale
-        else tc.payload_lds_shape_slot(operand)
+        else layout.payload_lds_shape_slot(operand)
     )
     elements = shape[0] * shape[1]
     src = (torch.arange(elements + 16, device="cuda") % 251).to(torch.uint8)
     dst = torch.empty(elements, dtype=torch.uint8, device="cuda")
     compiled = _register_load_copy[(1,)](
-        src, dst, tc, operand, scale, num_warps=tc.num_warps()
+        src, dst, tc, operand, scale, num_warps=layout.num_warps()
     )
     torch.testing.assert_close(dst, src[16:], rtol=0, atol=0)
     assert compiled.metadata.shared == 0
