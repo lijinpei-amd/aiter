@@ -2,20 +2,25 @@
 
 Triton and Gluon `JITFunction` launches in this branch go through intj's
 `make_launcher` (see [Launchers](#launchers)). This branch needs the sibling
-intj checkout, `develop` at or after `2783079`, installed or on `PYTHONPATH`;
-Aiter does not yet publish an intj dependency. Earlier revisions brought the
-lazy build, `dynamic_options`, object constexprs looked up in C,
-`assume_constant_globals`, `torch.Tensor` and `torch.Tensor | None`
-annotations, Triton's conversion of annotated scalars and a `tl.constexpr`
-parameter that sets the compile option it is named after. `2783079` adds the
-launcher object, `kernel.__self__` (an `intj.launcher.Launcher`):
-`make_launcher` only records its keywords as `__self__.options`, a
-`MakeLauncherOption` whose `jit_func` is the kernel it launches.
-`__self__.check()` runs a `delayed=` launcher's function, which supplies more
-keywords and may query the GPU, then every check that needs neither the GPU
-nor the target. The checks that need the target (an unknown `options=` name,
-an invalid compile option in an autotune config, the C-side checks on bound
-values) wait for `__self__.build()` or the first call (see
+intj checkout, `develop` at or after `20e578f`, installed or on `PYTHONPATH`;
+Aiter does not yet publish an intj dependency. `20e578f` adds `Exactly(...)`,
+a specialization of exactly the listed facts, which pa_mqa_logits' launchers
+state (see [pa_mqa_logits' facts as `Exactly`](#pa_mqa_logits-facts-as-exactly)).
+Since its `9906f12`, intj's attrs list the empty `(i,): []` entries Triton's
+own launch lists, so every intj compile's Triton hash changed once and each
+kernel recompiles once (an empty entry adds no fact: the binary is the same).
+Earlier revisions brought the lazy build, `dynamic_options`, object
+constexprs looked up in C, `assume_constant_globals`, `torch.Tensor` and
+`torch.Tensor | None` annotations, Triton's conversion of annotated scalars
+and a `tl.constexpr` parameter that sets the compile option it is named
+after. `2783079` added the launcher object, `kernel.__self__` (an
+`intj.launcher.Launcher`): `make_launcher` only records its keywords as
+`__self__.options`, a `MakeLauncherOption` whose `jit_func` is the kernel it
+launches. `__self__.check()` runs a `delayed=` launcher's function, which
+supplies more keywords and may query the GPU, then every check that needs
+neither the GPU nor the target. The checks that need the target (an unknown
+`options=` name, an invalid compile option in an autotune config, the C-side
+checks on bound values) wait for `__self__.build()` or the first call (see
 [intj 2783079](#intj-2783079)). Declaring a launcher does no GPU work, but
 needs a host C compiler once per interpreter (intj builds its generic lazy
 stub).
@@ -118,7 +123,7 @@ under it (pa_mqa_logits).
 | `attn_res` `attnres_fwd_sequence_kernels` (5) | table over the decorated `attnres_fwd_kernel`'s JIT function (or tuner) | One launcher per `L2` bucket of the sequence layout, each baking that bucket's unused residual slots as `None` and what the packed layout adds; the decorator is `attn_res_gate`'s and the packed layout's. One sequence launcher passing all 16 slots measured 0.27 us more per launch at L=2 and 0.10 us at L=8 on gfx942 (see [attn_res's sequence layout](#attn_ress-sequence-layout)). |
 | `test_mla_stage2_merge.py` `_fwd_kernel_stage2_asm_launch` | over a decorated kernel's JIT function | The script sweeps `num_warps`, `num_stages` and `waves_per_eu`, which `aiter.mla`'s decorator bakes. Taking them per call there makes each production call 31 positional arguments, past the 30 CPython passes directly: +0.33-0.47 us per launch on gfx942. With the grid as one tuple it stays at 30 and costs +22-46 ns, which production would pay for this script's sweep (see [The named launchers as decorators](#the-named-launchers-as-decorators)). |
 | `pa_attention_kernel_test` `_direct_dot_launch`, `_direct_large_block_dot_launch` | over a decorated kernel's JIT function | Launch pa_decode_gluon's dot kernels' JIT functions with other options (`num_stages=1`, per-call `waves_per_eu`) than their decorators. Taking both per call on the production dot-kernel decorator added 0.05-0.11 us to each of its launches on gfx942 (the large-block kernel was not timed). |
-| `pa_mqa_logits` other-KV-mode launchers (3): plain KV-padded, preshuffle and preshuffle-varctx unpadded | table (`_GLUON_PAGED_MQA_LOGITS_LAUNCHERS`, beside the three decorated Gluon kernels) over the JIT functions recorded under their decorators | Each Gluon kernel has a launcher for a KV cache whose row stride is a multiple of 16 and one for any stride, with different hand-written `Assume` facts (`delayed=`: they need `get_gfx()`). The decorator is the mode 132-byte KV tokens take in each kernel's default page (the benchmark's): unpadded for the plain kernel's page of one token, padded for every preshuffle page (8 or a multiple of 16 tokens). The table launchers run for a padded plain cache (a page of a multiple of 4 such tokens, or tokens padded to 16 bytes, the benchmark's `-p`) and for a preshuffle page of 8 odd-sized tokens. One launcher measuring the KV facts per call (`AUTO`) would compile the unpadded mode with two facts on `KV_buffer` and `scale_buffer` that it now omits (`NEVER`), and that hold for a 16-byte-aligned cache under 2 GiB: 16-byte alignment and the <2 GiB pointer range. That changes today's unpadded binaries, which the AOT mode's prebuilt artifacts hold. Reasoned, not measured: no such launcher was built or timed. |
+| `pa_mqa_logits` other-KV-mode launchers (3): plain KV-padded, preshuffle and preshuffle-varctx unpadded | table (`_GLUON_PAGED_MQA_LOGITS_LAUNCHERS`, beside the three decorated Gluon kernels) over the JIT functions recorded under their decorators | Each Gluon kernel has a launcher for a KV cache whose row stride is a multiple of 16 and one for any stride, with different hand-written `Exactly` facts (`delayed=`: they need `get_gfx()`). The decorator is the mode 132-byte KV tokens take in each kernel's default page (the benchmark's): unpadded for the plain kernel's page of one token, padded for every preshuffle page (8 or a multiple of 16 tokens). The table launchers run for a padded plain cache (a page of a multiple of 4 such tokens, or tokens padded to 16 bytes, the benchmark's `-p`) and for a preshuffle page of 8 odd-sized tokens. One launcher measuring the KV facts per call (`AUTO`) would compile the unpadded mode with two facts on `KV_buffer` and `scale_buffer` that it now omits (`NEVER`), and that hold for a 16-byte-aligned cache under 2 GiB: 16-byte alignment and the <2 GiB pointer range. That changes today's unpadded binaries, which the AOT mode's prebuilt artifacts hold. Reasoned, not measured: no such launcher was built or timed. |
 | `csrc/cpp_itfs/utils.py` `_IntjKernel.launchers` | made on first call | `jit(kernel)` wraps whatever JIT function its caller passes; one `return_compiled=True` launcher per set of option keywords, taken as `dynamic_options` (see [HsacoKernel](#hsacokernel)). |
 
 Every call is positional. `current_device_stream()`
@@ -175,13 +180,18 @@ Defaults are passed explicitly, values that `@triton.autotune` /
 - **A hand-specialized kernel.** pa_mqa_logits used to compile its Gluon
   kernels with `triton.compile(ASTSource(signature, attrs))`; its launchers
   state the same types and asserted facts in `extra_annotation`
-  (`Argument(type=..., specialize=Assume(Aligned(16), PointerRange(32)))`,
+  (`Argument(type=..., specialize=Exactly(Aligned(16), PointerRange(32)))`,
   `NEVER` where the attrs had none), one launcher per
-  (Preshuffle, VarCtx, KV-padded) mode. An `Assume` leaves the facts it
-  omits measured, and intj cannot assume one fact and refuse another, so
-  the launchers compile with facts the attrs lacked when they hold:
-  `tt.divisibility` on `context_len_ptr` and `kv_indices`, and
-  `tt.pointer_range` on the padded KV and scale pointers.
+  (Preshuffle, VarCtx, KV-padded) mode. `Exactly` assumes the facts it lists
+  and turns every other one off, so each parameter compiles its attrs entry
+  and nothing else, and no fact is measured on a launch. The `Assume` it
+  replaces left the omitted facts measured, so the launchers compiled facts
+  the attrs lacked when they held: `tt.divisibility` on `context_len_ptr` and
+  `kv_indices`, and `tt.pointer_range` on the padded KV and scale pointers.
+  The binary is now upstream's; its Triton hash is not, because intj's attrs
+  list the empty entries upstream's hand-written dict omits, and the JIT
+  functions' cache keys differ between the trees (see
+  [pa_mqa_logits' facts as `Exactly`](#pa_mqa_logits-facts-as-exactly)).
 - **A caller that needs the compiled kernel** uses `return_compiled=True`:
   pa_mqa_logits returns the kernel's Triton cache key (the AOT benchmark
   zips that directory). With `AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1` a
@@ -1486,3 +1496,129 @@ compile); real AOT artifacts other than these, and concurrent misses in AOT
 mode. The reason pa_mqa_logits keeps a table (one launcher measuring the KV
 facts would change the unpadded binaries; see [Launchers](#launchers)) is
 reasoned: no such launcher was built, compared or timed.
+
+## pa_mqa_logits' facts as `Exactly`
+
+intj `20e578f` adds `Exactly(*facts)`: the listed facts are assumed, every
+other applicable fact is `NEVER`, and nothing is measured on a launch.
+`_gluon_launch_keywords` now states upstream's attrs that way. Re-derived
+from `874d253dd3`'s `_compile_deepgemm_fp8_paged_mqa_logits`, whose attrs
+are the same in every (Preshuffle, VarCtx) mode and on every arch but for
+the four KV entries:
+
+| Parameters | Upstream attrs | Now | Before |
+| --- | --- | --- | --- |
+| `heads_num`, `stride_q_batch`, `stride_q_next_n`, `stride_q_heads`, `stride_w_batch` | divisibility 16 | `Exactly(Aligned(16))` | `Assume(Aligned(16))` |
+| `Q_buffer`, `weights` | divisibility 16, pointer range 32 | `Exactly(Aligned(16), PointerRange(32))` | `Assume(Aligned(16), PointerRange(32))` (no fact left to measure) |
+| `KV_buffer`, `stride_k_seq`, `scale_buffer`, `stride_scale_seq` | divisibility 16 when KV-padded, else none | `Exactly(Aligned(16))`, else `NEVER` | `Assume(Aligned(16))` (the pointers' range measured), else `NEVER` |
+| `context_len_ptr`, `kv_indices` | pointer range 32 | `Exactly(PointerRange(32))` | `Assume(PointerRange(32))` (divisibility measured) |
+| the other 8 (`OutLogits_buffer`, `stride_out_batch`, `SplitKV` or `safe_chunks_per_cta_ptr`, ...) | none | `NEVER` | `NEVER` |
+
+Types are unchanged: `*fp8e4b8` (gfx942) or `*fp8e4nv` (gfx950, gfx1250)
+for Q and KV, `i64` KV strides for the plain kernel and `i32` for
+preshuffle; gfx1250's warp size and its `num_warps`/`waves_per_eu` are
+options, not facts. Upstream's padded attrs promise 16-divisibility of
+`stride_scale_seq`, counted in fp32 elements, which a 144-byte token (the
+benchmark's `-p`) breaks (36); `Exactly` keeps that promise as upstream
+wrote it.
+
+Verified with Triton 3.8.0, `AITER_TRITON_ONLY=1`, on gfx942 (MI300X,
+torch 2.14+rocm7.2) and gfx950 (MI350X, GPU 5, torch 2.15.0.dev+rocm7.14),
+against upstream `874d253dd3` and against `4caf64244` with intj `2783079`
+("before").
+
+- **Facts.** A driver launched `deepgemm_fp8_paged_mqa_logits` in all six
+  modes (2 sequences of 2 tokens, 64 heads, the launch test's pages and
+  token sizes) with aligned inputs; with `context_lens`, `kv_indices` and
+  `out_logits` 4 bytes into their storage and an unpadded KV cache starting
+  4 bytes in; and, for the padded modes, with the KV cache in a storage past
+  2 GiB (only its first blocks referenced): 15 launches per GPU, each
+  matching torch. In all 15, on both GPUs, every parameter's facts in the
+  kernel the launcher returned (`kernel.src.attrs`) equal upstream's
+  hand-written attrs, and so do the signature, constexprs and compile
+  options: one compile per mode. Before, 12 of the 15 had extra facts (all
+  but the unaligned unpadded ones), and each of the 15 was a compile of its
+  own (15 Triton hashes, against 6 now).
+- **Code.** For the same constexprs, the TTGIR (locations dropped), AMDGCN
+  (`.loc`, `.file`, comments and debug sections dropped) and HSACO
+  (`llvm-objcopy --strip-debug`) of all 15 launches are identical to
+  upstream's hand compile on both GPUs. Before, the 12 differed from it in
+  the `tt.func` line's argument attributes only; the AMDGCN was already
+  identical. gfx1250 offline (Aiter reporting gfx1250 with `CDNA_VERSION`
+  -1, the target forced to `hip:gfx1250` with warp size 32, each launcher
+  called as the entry calls it there, the compile stopped before loading):
+  facts equal in all six modes; the four non-VarCtx kernels compile to identical
+  TTGIR, AMDGCN and stripped HSACO; both VarCtx kernels fail to compile in
+  both trees with the same `AMDMFMALayout` version error (the entry drops
+  VarCtx on gfx1250).
+- **Triton hash.** Still not upstream's. Over this tree's JIT functions,
+  upstream's hand-written `ASTSource` hashes like intj's compile once its
+  attrs dict is intj's, with the empty `(i,): []` entries Triton's own launch
+  lists and upstream omits, and not before; upstream's extra options
+  (`num_ctas`, `cluster_dims`, `arch`, `backend_name`, `warp_size`, `name`)
+  parse to the same options hash. Across the trees the JIT functions' cache
+  keys differ too: the launcher decorators moved the kernels' lines, and
+  the preshuffle kernel's `SplitKV` lost its `gl.constexpr` annotation
+  (upstream's signature compiled it as `i32`).
+- **AOT mode.** `AOTMetadataContext` redirects a kernel by name to its
+  configuration's directory; nothing keys on the Triton hash, so the
+  artifacts need no regeneration. With the seven gfx950 artifacts of
+  [attn_res and pa_mqa_logits as decorators](#attn_res-and-pa_mqa_logits-as-decorators)
+  and gfx942's four (made from upstream), each configuration's first call
+  enters the context once and the next 200 not at all; the launched kernel
+  loads the artifact's hsaco and json (the json carries the artifact's hash,
+  the compile has the new one); the outputs are bitwise those of JIT mode
+  and, on gfx950, of before in both modes; the artifact's stripped HSACO
+  equals what JIT mode now compiles.
+- **Tests**, on both GPUs (gfx950 skips the metadata-redirect tests, whose
+  prebuilt kernel is a gfx942 binary; AOT mode with the artifacts above):
+
+  | | before | now |
+  | --- | --- | --- |
+  | `test_pa_mqa_logits_offset.py`, JIT / AOT mode | 105 passed, 1 skipped / 3 passed, 103 skipped | the same |
+  | `triton_tests/attention/test_intj_attention_launches.py`, JIT / AOT mode | 11 passed / 5 passed, 6 skipped | 17 passed / 5 passed, 12 skipped |
+  | `test_metadata_redirect.py`, JIT / AOT mode | gfx942 4 / 4 passed | the same |
+  | `test_pa_mqa_logits_opus.py`, `test_pa_mqa_logits_mxfp4_opus.py` | 2 and 4 failed (`TypeError`: their `test_*` functions take arguments pytest does not supply) | the same |
+
+  The six new cases, `test_pa_mqa_logits_compiles_upstreams_facts`, compare
+  each mode's compiled facts with upstream's attrs on aligned inputs under
+  2 GiB. They all fail with the launchers back on `Assume`, with
+  `Aligned(16)` added to `kv_indices`, and with `stride_out_batch` left
+  `AUTO` (gfx942); the launch tests pass under all three.
+- **Check sweep** (gfx942, `intj-aiter-check-sweep.py --build`, GPU phase):
+  415 modules, 383 import; all 424 launchers (7 `delayed=`) check and build
+  on intj `20e578f`, as before on `2783079`; the same 32 modules fail to
+  import and the same 14 declared launchers are not reached.
+- **Host time** (gfx950, `taskset` to NUMA node 1, memory bound to it; batch
+  1, one token, 64 heads, 128-dim, 256-token context; one process per tree
+  and mode, the median of 2000 batches of 8 calls with a synchronize after
+  each batch outside the timer): the median of six such process medians
+  per tree, the three trees' order rotated per round. "intj only" is
+  `4caf64244` (`Assume`) on intj `20e578f`.
+
+  | Mode | Configuration | before | intj only | now |
+  | --- | --- | ---: | ---: | ---: |
+  | JIT | plain, unpadded | 18.32 | 18.15 | 18.20 |
+  | JIT | plain, padded | 18.33 | 18.08 | 18.12 |
+  | JIT | preshuffle, page 16 | 18.53 | 18.39 | 18.29 |
+  | JIT | preshuffle varctx, page 16 | 18.51 | 18.19 | 18.23 |
+  | AOT | plain, unpadded | 18.39 | 18.24 | 18.35 |
+  | AOT | plain, padded | 18.32 | 18.28 | 18.16 |
+  | AOT | preshuffle, page 16 | 18.47 | 18.38 | 18.31 |
+  | AOT | preshuffle varctx, page 16 | 18.60 | 18.35 | 18.24 |
+
+  The launch alone, replaying the entry's arguments, is 2.55-2.60 us
+  before, 2.51-2.62 us on intj only and 2.52-2.55 us now across the rows:
+  what measuring the formerly measured facts cost is a few hundredths of a
+  microsecond at most, within these runs' noise. The entry's gain is mostly
+  intj's own: the `Assume` tree on `20e578f` is within 0.12 us of now
+  either way. An earlier run of five rounds (before and now only) had
+  now 0.14-0.45 us faster per entry and -0.04 to +0.01 us per launch.
+- **GPU kernel time** (rocprofv3, 500 launches, JIT mode, two runs each),
+  before vs now: 17.49/17.49 vs 17.21/17.44 us (plain, batch 16,
+  16384-token context) and 10.22/10.18 vs 10.14/10.17 us (preshuffle, page
+  64): the same binary.
+
+Not verified: gfx1250 hardware, Triton 3.7, artifacts made by
+`bench_deepgemm_attention.py -aot` on this tree, and a launch reading KV
+blocks past 2 GiB (the large-storage launches read only the first blocks).
