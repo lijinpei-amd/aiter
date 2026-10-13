@@ -13,6 +13,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
     pipeline_unroll,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import DtypeQuant
+from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import validate
 from aiter.ops.triton.moe import moe_op_gemm_gluon as host
 from op_tests.triton_tests.moe.test_moe_gemm_gluon_scale_layout import _config
 
@@ -62,7 +63,7 @@ def test_scale_mini_blocks_only_change_the_shuffled_operand(shuffled):
         assert layout.scale_mini_block_k(operand) == (512 if shuffled[operand] else 128)
         assert layout.scale_ratio_k_step(operand) == (4 if shuffled[operand] else 1)
         assert layout.scale_ratio_non_k_slot(operand) == (2 if shuffled[operand] else 1)
-    assert tc.validate(4096, 7168)
+    assert validate(tc, 4096, 7168)
 
 
 @pytest.mark.parametrize("block_k", [128, 256, 512])
@@ -81,7 +82,7 @@ def test_invalid_unused_scale_minis_are_ignored():
         SCALE_MINI_BLOCK_N=3,
         SCALE_MINI_BLOCK_K=1,
     )
-    assert tc.validate(4096, 7168)
+    assert validate(tc, 4096, 7168)
     layout = compute_kernel_layout(tc)
     assert layout.scale_mini_block_nonk(0) == layout.scale_mini_block_nonk(1) == 64
     assert layout.scale_mini_block_k(0) == layout.scale_mini_block_k(1) == 128
@@ -100,7 +101,7 @@ def test_invalid_unused_scale_minis_are_ignored():
 )
 def test_invalid_shuffled_scale_minis_are_rejected(field, value):
     with pytest.raises(AssertionError):
-        _config(**{field: value}).validate(4096, 7168)
+        validate(_config(**{field: value}), 4096, 7168)
 
 
 @pytest.mark.parametrize("K", [7168 + 128, 3584 + 128, 1792 + 128])
@@ -117,9 +118,9 @@ def test_shuffled_scale_k_must_divide_total_k(K):
     with pytest.raises(
         AssertionError, match="K must contain complete SCALE_MINI_BLOCK_K tiles"
     ):
-        tc.validate(4096, K)
+        validate(tc, 4096, K)
     # The same configuration is legal as soon as K is a whole number of scale loads.
-    tc.validate(4096, K + 256 - (K % 256))
+    validate(tc, 4096, K + 256 - (K % 256))
 
 
 def test_shuffled_scale_k_cannot_be_narrower_than_payload_k():
@@ -129,7 +130,7 @@ def test_shuffled_scale_k_cannot_be_narrower_than_payload_k():
         VGPR_PREFETCH_K=512,
     )
     with pytest.raises(AssertionError):
-        tc.validate(4096, 7168)
+        validate(tc, 4096, 7168)
 
 
 def test_frozen_shuffled_scales_reject_k_wider_than_256():
@@ -142,7 +143,7 @@ def test_frozen_shuffled_scales_reject_k_wider_than_256():
     with pytest.raises(
         AssertionError, match="BLOCK_K == SCALE_MINI_BLOCK_K == 256"
     ):
-        tc.validate(4096, 7168)
+        validate(tc, 4096, 7168)
 
 
 @pytest.mark.parametrize(

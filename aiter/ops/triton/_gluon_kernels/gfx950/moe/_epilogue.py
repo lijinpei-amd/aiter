@@ -657,7 +657,7 @@ def _epilogue_store(
     # point, so Triton's liveness-based shared allocator overlays this on top of them
     # and the kernel's LDS footprint does not grow at all.
     QSH: gl.constexpr = layout.quant_staging_layout()
-    ROT: gl.constexpr = tuning_cfg.quant_staging_rotates()
+    ROT: gl.constexpr = layout.quant_staging_rotates()
     # Split stages the whole block, not one mini tile: NM tiles into one buffer, flushed
     # once at the end of the walk. Costs NM x the LDS (still a few KB, overlaid on the
     # dead pipeline buffers) and buys NM-1 barrier pairs and one wide store instead of

@@ -16,7 +16,6 @@ from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton._gluon_kernels.gfx950.moe import _frozen as frozen
 from aiter.ops.triton._gluon_kernels.gfx950.moe import _pipeline as buffered
-from aiter.ops.triton._gluon_kernels.gfx950.moe import _schedule as schedule
 from aiter.ops.triton._gluon_kernels.gfx950.moe import moe_gemm as kernel
 from aiter.ops.triton._gluon_kernels.gfx950.moe._config import (
     KernelFuncConfig,
@@ -38,6 +37,10 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     ActKind,
     DtypeQuant,
     EpilogueMode,
+)
+from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import (
+    validate,
+    validate_pipeline,
 )
 
 
@@ -144,7 +147,7 @@ def test_packed_words_and_selectors_match_producer(
         MINI_BLOCK_N=mini_n,
         warps_per_cta=warps,
     )
-    assert tc.validate(4096, 7168)
+    assert validate(tc, 4096, 7168)
     layout = compute_kernel_layout(tc)
     assert layout.scale_packed_ok(operand)
     byte_layout = layout.dot_operand_scale_fragment_layout(operand)
@@ -250,7 +253,7 @@ def test_wide_packed_scale_load_layout_matches_producer(scale_k, operand):
 )
 def test_invalid_packed_k128_configs_are_rejected(changes, k, diagnostic):
     with pytest.raises(AssertionError, match=diagnostic):
-        _config(**changes).validate(4096, k)
+        validate(_config(**changes), 4096, k)
 
 
 class _HostView:
@@ -586,6 +589,6 @@ def test_pipeline_phases_and_packed_scale_addresses(
     }
     lengths.add(minimum + 2 * effective_unroll)
     for stages in sorted(lengths):
-        assert tc.validate(4096, stages * 128)
-        assert schedule.validate_pipeline(tc, layout, stages * 128)
+        assert validate(tc, 4096, stages * 128)
+        assert validate_pipeline(tc, layout, stages * 128)
         _run_scalar_pipeline(monkeypatch, tc, layout, stages, fused)

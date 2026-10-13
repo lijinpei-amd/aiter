@@ -10,8 +10,6 @@ argument, only its class can. Keeping the arithmetic in the aggregate is what st
 host grid math and the device tile math from drifting.
 """
 
-import math
-
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.language.core import _aggregate as aggregate
@@ -35,9 +33,7 @@ from ._lang import (
 from ._layout import (
     LDS_USABLE_BYTES,
     _KernelFuncShape,
-    compute_kernel_layout,
 )
-from ._types import COMPONENTS
 
 #: Re-exported for the host wrapper, which sizes candidate tiles against it.
 __all__ = ["LDS_USABLE_BYTES", "KernelFuncConfig", "KernelTuningConfig"]
@@ -222,6 +218,9 @@ class KernelTuningConfig:
     field). Every derived shape and layout lives in the resulting ``KernelLayout``,
     and so does the resolved LDS/register placement: this config only says whether
     tuning *allows* a component through LDS.
+
+    Methods here only rephrase the config's own fields. Anything derived from shapes
+    belongs in ``KernelLayout``, and the build preconditions live in ``_validate.py``.
     """
 
     func_cfg: KernelFuncConfig
@@ -448,21 +447,6 @@ class KernelTuningConfig:
         return _v(idx) == 1 and _v(self.B_PRESHUFFLED)
 
     @gluon.constexpr_function
-    def sorted_shuffled_ok(self):
-        """Does this config produce the layout the C++ shuffle was written against?"""
-        # The permutation lives in the LDS tile's SharedLinearLayout, which is a
-        # property of the byte order the shuffle writes -- not of how warps are split.
-        # The warp arrangement is free. The shuffle always packs K256;
-        # a K128 payload stage selects one half.
-        return (
-            list(_v(self.mfma_instr_shape)) == [16, 16, 128]
-            and _v(self.BLOCK_M) % 32 == 0
-            # An M slot only has to be a whole number of 32-row stripes: the shuffle
-            # writes one 256 B run per stripe, so a slot is a contiguous slice.
-            and _v(self.MINI_BLOCK_M) % 32 == 0
-        )
-
-    @gluon.constexpr_function
     def scale_shuffled(self, idx):
         """Is this operand's scale tile already in MFMA fragment order in memory?"""
         if not self.func_cfg.has_scale(idx):
@@ -470,50 +454,6 @@ class KernelTuningConfig:
         if _v(idx) == 0:
             return _v(self.A_SCALE_SORTED_SHUFFLED)
         return _v(self.B_SCALE_SHUFFLED)
-
-    @gluon.constexpr_function
-    def quant_staging_rotates(self):
-        """Whether the fused-quant staging alternates two per-tile LDS banks."""
-        return (
-            _v(self.func_cfg.output_quant) is not None and not self.func_cfg.gu_split()
-        )
-
-    @gluon.constexpr_function
-    def pipeline_register_period(self, layout):
-        """LCM of the active register rings; absent scales have no ring.
-
-        ``_schedule.ring_restoration_period`` over direct-register components only.
-        Separate because the two have different consumers: LDS slots may use runtime
-        indices, while register tuples need static ones in the main loop, so only the
-        register rings have to return to slot zero for a body to be unrollable. Kept
-        here rather than beside its sibling to avoid an import cycle.
-        """
-        period = 1
-        for component in COMPONENTS:
-            operand, is_scale = component
-            if is_scale and not self.func_cfg.has_scale(operand):
-                continue
-            if layout.component_in_reg(component):
-                ratio = layout.scale_ratio_k_step(operand) if is_scale else 1
-                period = math.lcm(
-                    period, self.num_buffers(operand, is_scale) * ratio
-                )
-        return period
-
-    @gluon.constexpr_function
-    def validate_buffer_counts(self):
-        """Only components present in the operand formats participate."""
-        for operand in (0, 1):
-            for scale in (False, True):
-                if scale and not self.func_cfg.has_scale(operand):
-                    continue
-                depth = self.num_buffers(operand, scale)
-                assert depth >= 2, (
-                    f"{'A' if operand == 0 else 'B'}{'_SCALE' if scale else ''}_NUM_BUFFER "
-                    f"({depth}) must be at least 2"
-                )
-        assert _v(self.K_UNROLL) >= 1, "K_UNROLL must be at least 1"
-        return True
 
     @gluon.constexpr_function
     def ds_read_in_mfma(self, operand, scale=False):
@@ -581,89 +521,3 @@ class KernelTuningConfig:
     @gluon.constexpr_function
     def commit_per_stage_whole(self):
         return _v(self.WAIT_COMMIT_SCHEME) == int(WaitCommitScheme.PER_STAGE_WHOLE)
-
-    @gluon.constexpr_function
-    def validate(self, N, K, layout=None):
-        """Every precondition the kernel body then assumes. Constexpr asserts, not
-        comments -- a violated one is either a miscompile or a silent over-read.
-
-        ``layout`` is this config's :func:`compute_kernel_layout` result; a caller
-        that already holds it passes it in, anything else gets one computed here.
-        """
-        if _v(layout) is None:
-            layout = compute_kernel_layout(self)
-        fc = self.func_cfg
-        BK = _v(self.BLOCK_K)
-
-        assert _v(fc.epilogue) in (
-            int(EpilogueMode.DEFAULT),
-            int(EpilogueMode.NOP_ACTIVATION),
-            int(EpilogueMode.NOP),
-        ), f"epilogue {_v(fc.epilogue)} is not an EpilogueMode"
-        assert _v(self.SCHED_MODE) in (
-            int(SchedMode.NONE),
-            int(SchedMode.IGLP_0),
-            int(SchedMode.IGLP_1),
-            int(SchedMode.MFMA_16),
-            int(SchedMode.MFMA_8),
-        ), f"SCHED_MODE {_v(self.SCHED_MODE)} is not a SchedMode"
-        layout.validate(self, N, K)
-
-        if not _v(self.UNROLL_EPILOGUE):
-            for idx in (0, 1):
-                assert not fc.has_scale(idx) or layout.scale_ratio_k_step(idx) == 1, (
-                    "UNROLL_EPILOGUE=False requires every active scale to advance "
-                    "once per payload step"
-                )
-
-        # -- warp pipelining (the inter-wave ping-pong) --
-        # A slot's MFMAs are handed to TritonAMDGPUWarpPipeline as the `mfma` stage and
-        # its ds_reads plus global->LDS copies as the `mem` stage. That is only a legal
-        # split when the MFMAs read nothing the same slot loads, i.e. when the whole
-        # BLOCK_K window is carried in registers from the previous stage. The pass also
-        # rejects a wait inside a stage region, which is why the per-slot wait_group is
-        # emitted before the `mfma` region rather than inside the `mem` one.
-        assert _v(self.WARP_PIPELINE) in (
-            int(WarpPipeline.NONE),
-            int(WarpPipeline.COMPILER),
-            int(WarpPipeline.MANUAL),
-        ), (
-            f"WARP_PIPELINE {_v(self.WARP_PIPELINE)} is not a WarpPipeline: "
-            f"NONE {int(WarpPipeline.NONE)}, COMPILER {int(WarpPipeline.COMPILER)}, "
-            f"MANUAL {int(WarpPipeline.MANUAL)}"
-        )
-        if self.warp_pipeline_enabled():
-            assert layout.num_prefetch_k_slots() == layout.num_k_slots_per_tile(), (
-                f"WARP_PIPELINE needs VGPR_PREFETCH_K == BLOCK_K (got "
-                f"{_v(self.VGPR_PREFETCH_K)} vs {BK}): with a partial window the slot's "
-                "MFMAs depend on the slot's own ds_read and there is no mem stage to "
-                "hide behind them"
-            )
-
-        # -- register prefetch depth --
-        # The live and frozen drivers both carry the complete BLOCK_K stage in
-        # registers from the preceding step. There is no partial or disabled handoff
-        # after removing the payload K split.
-        pk = _v(self.VGPR_PREFETCH_K)
-        assert pk == BK, (
-            f"VGPR_PREFETCH_K must equal BLOCK_K (got {pk} vs {BK}): "
-            "the pipeline carries one whole payload K stage"
-        )
-
-        # -- commit-group granularity --
-        # Reject unknown schemes before building the shared copy/group schedule.
-        assert _v(self.WAIT_COMMIT_SCHEME) in (
-            int(WaitCommitScheme.PER_OP),
-            int(WaitCommitScheme.PER_SLOT),
-            int(WaitCommitScheme.PER_STAGE_WARP_PIPELINE),
-            int(WaitCommitScheme.PER_STAGE_WHOLE),
-        ), (
-            f"WAIT_COMMIT_SCHEME {_v(self.WAIT_COMMIT_SCHEME)} is not a WaitCommitScheme: "
-            f"PER_OP {int(WaitCommitScheme.PER_OP)}, "
-            f"PER_SLOT {int(WaitCommitScheme.PER_SLOT)}, "
-            f"PER_STAGE_WARP_PIPELINE {int(WaitCommitScheme.PER_STAGE_WARP_PIPELINE)}, "
-            f"PER_STAGE_WHOLE {int(WaitCommitScheme.PER_STAGE_WHOLE)}"
-        )
-
-        layout.validate_resources(self)
-        return True

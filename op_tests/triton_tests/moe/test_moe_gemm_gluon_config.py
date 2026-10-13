@@ -52,6 +52,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     TuningSpec,
     WaitCommitScheme,
 )
+from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import validate
 from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_gemm import (
     _PipelinePointers,
     _PipelineRegFragments,
@@ -115,7 +116,7 @@ def _plain(value):
 
 def _validate(tc, N, K):
     layout = compute_kernel_layout(tc)
-    tc.validate(N, K, layout)
+    validate(tc, N, K, layout)
     return host._validate_selected_pipeline(tc, layout, K)
 
 
@@ -334,7 +335,7 @@ def test_t256_mxfp8_gemm1_uses_validated_streaming_geometry():
     tuning = host._probe_tuning_config(
         config, DtypeQuant.MXFP8, DtypeQuant.MXFP8
     )
-    assert host._cval(tuning.validate(4096, 7168))
+    assert host._cval(validate(tuning, 4096, 7168))
     layout = compute_kernel_layout(tuning)
     assert host._cval(host._validate_selected_pipeline(tuning, layout, 7168))
     assert host._probe_lds_bytes(
@@ -729,7 +730,7 @@ def test_all_component_buffer_counts_determine_lcm_unroll(
     )
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     layout = compute_kernel_layout(tc)
-    assert _plain(tc.pipeline_register_period(layout)) == period
+    assert _plain(layout.pipeline_register_period()) == period
     assert _plain(pipeline_unroll(tc, layout)) == expected
     resolved = [count or config["NUM_LDS_BUFFER"] for count in counts]
     assert [
@@ -790,14 +791,14 @@ def test_small_payload_tiles_use_register_rings(config):
     assert not _plain(layout.component_via_lds(B_PAYLOAD))
     assert config["ALLOW_B_VIA_LDS"]
     assert not config["B_PRESHUFFLED"]
-    assert _plain(tc.pipeline_register_period(layout)) == 6
+    assert _plain(layout.pipeline_register_period()) == 6
     assert _plain(layout.lds_bytes()) == 0
     assert _plain(_validate(tc, 64, 512))
 
     config.update(A_NUM_BUFFER=0, B_NUM_BUFFER=0, FROZEN_STEP=True)
     frozen = KernelTuningConfig(fc, *_tuning_spec(config))
     with pytest.raises(AssertionError, match="requires operand 0's payload in LDS"):
-        frozen.validate(64, 512)
+        validate(frozen, 64, 512)
 
 
 @pytest.mark.parametrize("register_b", [False, True])
@@ -844,7 +845,7 @@ def test_active_component_buffer_counts_below_two_are_rejected(config, field, de
     config[field] = depth
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     with pytest.raises(AssertionError, match=field + ".*must be at least 2"):
-        tc.validate(4096, 7168)
+        validate(tc, 4096, 7168)
 
 
 @pytest.mark.parametrize("depth", [-1, 0, 1])
@@ -894,7 +895,7 @@ def test_frozen_reference_rejects_new_storage_options(config, field):
     config[field] = 0 if field in host._ALLOW_VIA_LDS_KEYS else 1
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     with pytest.raises(AssertionError, match="FROZEN_STEP does not support"):
-        tc.validate(4096, 7168)
+        validate(tc, 4096, 7168)
 
 
 def test_register_weights_require_preshuffle(config):
@@ -903,7 +904,7 @@ def test_register_weights_require_preshuffle(config):
     with pytest.raises(
         AssertionError, match="ALLOW_B_VIA_LDS=False requires B_PRESHUFFLED"
     ):
-        tc.validate(4096, 7168)
+        validate(tc, 4096, 7168)
 
 
 def test_independent_register_scales_are_supported(config):
@@ -1026,7 +1027,7 @@ def test_gate_up_small_warp_extent_only_requires_mx_group_for_quantized_output(
         assert _plain(_validate(tc, 2048, 7168))
     else:
         with pytest.raises(AssertionError, match="a warp's emitted N extent"):
-            tc.validate(2048, 7168)
+            validate(tc, 2048, 7168)
 
 
 @pytest.mark.parametrize("epilogue", list(EpilogueMode))
@@ -1083,7 +1084,7 @@ def test_invalid_controls_are_rejected(config, field, value, error):
         config[field] = value
     tc = KernelTuningConfig(KernelFuncConfig(*func), *_tuning_spec(config))
     with pytest.raises(AssertionError, match=error):
-        tc.validate(4096, 7168)
+        validate(tc, 4096, 7168)
 
 
 def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):

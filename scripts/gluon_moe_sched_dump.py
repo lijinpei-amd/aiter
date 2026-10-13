@@ -41,6 +41,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (  # noqa: E402
     COMPONENTS,
     WaitCommitScheme,
 )
+from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import validate  # noqa: E402
 from aiter.ops.triton.moe import moe_op_gemm_gluon as host  # noqa: E402
 
 CNAME = {c: n for c, n in zip(COMPONENTS, ("A_PAY", "A_SCL", "B_PAY", "B_SCL"))}
@@ -148,7 +149,7 @@ def dump_case(name, cfg, dq_a, dq_b, K, out):
     try:
         tc = host._probe_tuning_config(cfg, dq_a, dq_b)
         layout = compute_kernel_layout(tc)
-        tc.validate(N_DEFAULT, K, layout)
+        validate(tc, N_DEFAULT, K, layout)
     except Exception as exc:  # a rejected config is itself a stable, diffable fact
         out(f"== {name}: REJECTED {type(exc).__name__}: {str(exc).splitlines()[0][:120]}")
         return
@@ -164,7 +165,7 @@ def dump_case(name, cfg, dq_a, dq_b, K, out):
     out(f"  geom NM={nm} NN={nn} slots={slots} mk={layout.num_k_slots_per_tile()} "
         f"num_k={num_k} scheme={int(tc.WAIT_COMMIT_SCHEME)}")
     out(f"  sizing depth={depth} unroll={unroll} peeled={peeled} "
-        f"regperiod={tc.pipeline_register_period(layout)} "
+        f"regperiod={layout.pipeline_register_period()} "
         f"hasreg={S._has_register_component(tc, layout)}")
     out(f"  order {S._buffer_load_order(nm, nn)}")
 

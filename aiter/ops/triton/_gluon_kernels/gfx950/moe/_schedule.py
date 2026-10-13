@@ -167,8 +167,9 @@ def ring_restoration_period(tc, layout):
 
     Distinct from three neighbours it is easy to conflate with. The requested unroll
     (``K_UNROLL``) is a tuning knob. The effective unroll is this LCM'd with that knob.
-    The register-only period (``pipeline_register_period``) counts the same quantity
-    over direct-register rings alone, because only those need a static index.
+    The register-only period (``KernelLayout.pipeline_register_period``) counts the
+    same quantity over direct-register rings alone, because only those need a static
+    index.
     """
     period = 1
     for component in COMPONENTS:
@@ -758,21 +759,6 @@ def _slot_waits(tc, layout, stage, drain=False, epilogue_groups=0, phase=None):
         _wait(tc, layout, stage, slot, drain, epilogue_groups, phase)
         for slot in range(slots)
     )
-
-
-@gluon.constexpr_function
-def validate_pipeline(tc, layout, K):
-    """Validate the live component rings and runtime-loop lower bound."""
-    tc.validate_buffer_counts()
-    num_k = layout.num_k_tiles(K)
-    depth = pipeline_depth(tc, layout)
-    peeled = _pipeline_peeled(tc, layout)
-    unroll = pipeline_unroll(tc, layout)
-    assert num_k >= depth + peeled + unroll, (
-        f"NUM_K ({num_k}) must be at least PIPELINE_DEPTH ({depth}) "
-        f"+ PEELED ({peeled}) + UNROLL ({unroll}) = {depth + peeled + unroll}"
-    )
-    return True
 
 
 @gluon.constexpr_function

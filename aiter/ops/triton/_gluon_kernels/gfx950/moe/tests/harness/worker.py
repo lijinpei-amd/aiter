@@ -76,6 +76,7 @@ def build_gluon(data, tuning, artifact_dir):
         KernelFuncConfig,
         KernelTuningConfig,
     )
+    from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import validate
     from aiter.ops.triton.moe import moe_op_gemm_gluon as host
 
     assert Path(host.__file__).resolve().is_relative_to(REPO), host.__file__
@@ -137,7 +138,7 @@ def build_gluon(data, tuning, artifact_dir):
     func_spec, tuning_spec = unwrap(named["CFG_FUNC"]), unwrap(named["CFG_TUNING"])
     func_config = KernelFuncConfig(*func_spec)
     tuning_config = KernelTuningConfig(func_config, *tuning_spec)
-    assert tuning_config.validate(bc.N, bc.K)
+    assert validate(tuning_config, bc.N, bc.K)
     activation = func_spec.activation
     assert activation.alpha == 1.0 and activation.limit is None
     assert not activation.add_residual

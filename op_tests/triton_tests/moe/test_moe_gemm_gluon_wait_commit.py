@@ -279,7 +279,7 @@ def _trace_emitter(tc, monkeypatch, defer_stage_commit=False):
     tc.ALLOW_B_VIA_LDS = True
     tc.num_buffers = lambda operand, scale=False: 3
     tc.pipeline_peeled = lambda: 1
-    tc.pipeline_register_period = lambda _layout: (
+    tc.pipeline_register_period = lambda: (
         3
         if any(
             (not component[1] or tc.has_scale(component[0]))

@@ -35,6 +35,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
     pipeline_unroll,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import WaitCommitScheme
+from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import validate
 from op_tests.triton_tests.moe.test_moe_gemm_gluon_wait_commit import _ScheduleConfig
 
 
@@ -107,7 +108,7 @@ class _Config(_ScheduleConfig):
     def component_in_reg(self, component):
         return not self.component_via_lds(component)
 
-    def pipeline_register_period(self, layout):
+    def pipeline_register_period(self):
         return math.lcm(
             *(
                 self.depths[component]
@@ -1190,10 +1191,10 @@ def test_absent_scale_ring_indices_ignore_invalid_unused_depths(scale_depths):
         None,
         tuple((key, host._hashable(value)) for key, value in config.items()),
     )[-1]
-    assert tc.validate(512, 960)
+    assert validate(tc, 512, 960)
     layout = compute_kernel_layout(tc)
     assert pipeline_depth(tc, layout) == 2
-    assert tc.pipeline_register_period(layout) == 1
+    assert layout.pipeline_register_period() == 1
     for component in (A_SCALE, B_SCALE):
         for in_loop in (False, True):
             for fill in (False, True):
