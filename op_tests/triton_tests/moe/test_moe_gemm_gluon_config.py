@@ -146,9 +146,9 @@ def test_a_scale_row_stride_preserves_sub_16_byte_alignment(kernel):
         ("SOFF_UNROLL", True),
         ("SCALE_FILL_MID", True),
         ("UNROLL_EPILOGUE", False),
-        ("B_IN_REG", True),
-        ("B_SCALE_IN_REG", True),
-        ("A_SCALE_IN_REG", True),
+        ("ALLOW_B_VIA_LDS", False),
+        ("ALLOW_B_SCALE_VIA_LDS", False),
+        ("ALLOW_A_SCALE_VIA_LDS", False),
         ("A_NUM_BUFFER", 4),
         ("B_NUM_BUFFER", 2),
         ("A_SCALE_NUM_BUFFER", 1),
@@ -325,9 +325,9 @@ def test_t256_mxfp8_gemm1_uses_validated_streaming_geometry():
         "A_SCALE_SORTED_SHUFFLED": True,
         "B_SCALE_SHUFFLED": True,
         "B_PRESHUFFLED": False,
-        "B_IN_REG": False,
-        "B_SCALE_IN_REG": False,
-        "A_SCALE_IN_REG": False,
+        "ALLOW_B_VIA_LDS": True,
+        "ALLOW_B_SCALE_VIA_LDS": True,
+        "ALLOW_A_SCALE_VIA_LDS": True,
         "expert_cache_modifier": ".cg",
     }
     assert {name: config[name] for name in expected} == expected
@@ -473,7 +473,7 @@ def test_commit_scheme_counts_real_payload_and_scale_groups(
     config["WAIT_COMMIT_SCHEME"] = int(scheme)
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     layout = compute_kernel_layout(tc)
-    assert _plain(tc.scale_via_lds(0)) and _plain(tc.scale_via_lds(1))
+    assert _plain(layout.scale_via_lds(0)) and _plain(layout.scale_via_lds(1))
     assert sum(len(slot) for slot in buffered_groups(tc, layout, None)) == groups
     # commit_per_stage is the predicate the emitter actually branches on; the
     # wait_at_stage_head alias it used to go through had no production caller.
@@ -656,9 +656,9 @@ def test_removed_controls_do_not_change_tuning(config, monkeypatch, field):
 @pytest.mark.parametrize("storage_mask", range(8))
 def test_register_storage_options_are_independent(config, storage_mask):
     config.update(
-        B_IN_REG=bool(storage_mask & 1),
-        B_SCALE_IN_REG=bool(storage_mask & 2),
-        A_SCALE_IN_REG=bool(storage_mask & 4),
+        ALLOW_B_VIA_LDS=not (storage_mask & 1),
+        ALLOW_B_SCALE_VIA_LDS=not (storage_mask & 2),
+        ALLOW_A_SCALE_VIA_LDS=not (storage_mask & 4),
         B_PRESHUFFLED=bool(storage_mask & 1),
         A_NUM_BUFFER=2,
         B_NUM_BUFFER=3,
@@ -668,10 +668,10 @@ def test_register_storage_options_are_independent(config, storage_mask):
     )
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     layout = compute_kernel_layout(tc)
-    assert _plain(tc.payload_via_lds(0))
-    assert _plain(tc.payload_via_lds(1)) is not bool(storage_mask & 1)
-    assert _plain(tc.scale_via_lds(0)) is not bool(storage_mask & 4)
-    assert _plain(tc.scale_via_lds(1)) is not bool(storage_mask & 2)
+    assert _plain(layout.payload_via_lds(0))
+    assert _plain(layout.payload_via_lds(1)) is not bool(storage_mask & 1)
+    assert _plain(layout.scale_via_lds(0)) is not bool(storage_mask & 4)
+    assert _plain(layout.scale_via_lds(1)) is not bool(storage_mask & 2)
     expected_via_lds = {
         A_PAYLOAD: True,
         A_SCALE: not bool(storage_mask & 4),
@@ -680,8 +680,10 @@ def test_register_storage_options_are_independent(config, storage_mask):
     }
     for component in COMPONENTS:
         via_lds = expected_via_lds[component]
-        assert _plain(tc.component_via_lds(component)) is via_lds
-        assert _plain(tc.component_in_reg(component)) is not via_lds
+        # These tiles all admit the copy, so the knob policy alone decides.
+        assert _plain(tc.allow_component_via_lds(component)) is via_lds
+        assert _plain(layout.component_via_lds(component)) is via_lds
+        assert _plain(layout.component_in_reg(component)) is not via_lds
     # Full-block byte counts make a shared scale fill tile and mini-tile splitting
     # irrelevant to the allocation budget. Register storage removes only its own
     # allocation; every remaining component uses its individual ring depth.
@@ -720,10 +722,10 @@ def test_all_component_buffer_counts_determine_lcm_unroll(
     config.update(zip(host._COMPONENT_BUFFER_KEYS, counts, strict=True))
     config.update(
         K_UNROLL=7,
-        B_IN_REG=True,
+        ALLOW_B_VIA_LDS=False,
         B_PRESHUFFLED=True,
-        A_SCALE_IN_REG=True,
-        B_SCALE_IN_REG=True,
+        ALLOW_A_SCALE_VIA_LDS=False,
+        ALLOW_B_SCALE_VIA_LDS=False,
     )
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     layout = compute_kernel_layout(tc)
@@ -746,7 +748,7 @@ def test_lds_depths_constrain_unroll(config):
     config.update(A_NUM_BUFFER=2, B_NUM_BUFFER=4, A_SCALE_NUM_BUFFER=2)
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
     assert _plain(pipeline_unroll(tc, compute_kernel_layout(tc))) == 84
-    config["A_SCALE_IN_REG"] = True
+    config["ALLOW_A_SCALE_VIA_LDS"] = False
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
     assert _plain(pipeline_unroll(tc, compute_kernel_layout(tc))) == 84
 
@@ -778,11 +780,15 @@ def test_small_payload_tiles_use_register_rings(config):
     )
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
     layout = compute_kernel_layout(tc)
-    assert _plain(tc.component_in_reg(A_PAYLOAD))
-    assert _plain(tc.component_in_reg(B_PAYLOAD))
-    assert not _plain(tc.component_via_lds(A_PAYLOAD))
-    assert not _plain(tc.component_via_lds(B_PAYLOAD))
-    assert not config["B_IN_REG"]
+    # Tuning allows both payloads through LDS; the tiles are too small for the copy,
+    # so the layout falls back to registers on its own.
+    assert _plain(tc.allow_component_via_lds(A_PAYLOAD))
+    assert _plain(tc.allow_component_via_lds(B_PAYLOAD))
+    assert _plain(layout.component_in_reg(A_PAYLOAD))
+    assert _plain(layout.component_in_reg(B_PAYLOAD))
+    assert not _plain(layout.component_via_lds(A_PAYLOAD))
+    assert not _plain(layout.component_via_lds(B_PAYLOAD))
+    assert config["ALLOW_B_VIA_LDS"]
     assert not config["B_PRESHUFFLED"]
     assert _plain(tc.pipeline_register_period(layout)) == 6
     assert _plain(layout.lds_bytes()) == 0
@@ -803,10 +809,10 @@ def test_absent_scales_do_not_participate_in_depth_unroll_or_validation(
         B_NUM_BUFFER=4,
         A_SCALE_NUM_BUFFER=-1,
         B_SCALE_NUM_BUFFER=1,
-        B_IN_REG=register_b,
+        ALLOW_B_VIA_LDS=not register_b,
         B_PRESHUFFLED=register_b,
-        A_SCALE_IN_REG=True,
-        B_SCALE_IN_REG=True,
+        ALLOW_A_SCALE_VIA_LDS=False,
+        ALLOW_B_SCALE_VIA_LDS=False,
     )
     fc = KernelFuncConfig(
         *_func_spec()._replace(
@@ -820,8 +826,8 @@ def test_absent_scales_do_not_participate_in_depth_unroll_or_validation(
     layout = compute_kernel_layout(tc)
     # Placement accessors describe physical policy only. The absent scale streams
     # are still gated by the function configuration at every scheduling caller.
-    assert _plain(tc.component_in_reg(A_SCALE))
-    assert _plain(tc.component_in_reg(B_SCALE))
+    assert _plain(layout.component_in_reg(A_SCALE))
+    assert _plain(layout.component_in_reg(B_SCALE))
     for ni in range(layout.num_n_slots_per_block()):
         for mi in range(layout.num_m_slots_per_block()):
             ops = buffered_ops(tc, layout, mi, ni)
@@ -856,7 +862,7 @@ def test_inherited_buffer_counts_are_validated_after_resolution(config, depth):
 @pytest.mark.parametrize("unroll", [-1, 0])
 @pytest.mark.parametrize("registers", [False, True])
 def test_unroll_must_be_positive_even_with_register_rings(config, unroll, registers):
-    config.update(K_UNROLL=unroll, A_SCALE_IN_REG=registers)
+    config.update(K_UNROLL=unroll, ALLOW_A_SCALE_VIA_LDS=not registers)
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     with pytest.raises(AssertionError, match="K_UNROLL must be at least 1"):
         host._validate_selected_pipeline(tc, compute_kernel_layout(tc), 7168)
@@ -881,30 +887,33 @@ def test_shared_depth_exact_minimum_and_all_unroll_remainders(config, depth, unr
 
 
 @pytest.mark.parametrize(
-    "field", host._COMPONENT_BUFFER_KEYS + host._REGISTER_STORAGE_KEYS
+    "field", host._COMPONENT_BUFFER_KEYS + host._ALLOW_VIA_LDS_KEYS
 )
 def test_frozen_reference_rejects_new_storage_options(config, field):
     config.update(FROZEN_STEP=True, B_PRESHUFFLED=True)
-    config[field] = 1
+    config[field] = 0 if field in host._ALLOW_VIA_LDS_KEYS else 1
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     with pytest.raises(AssertionError, match="FROZEN_STEP does not support"):
         tc.validate(4096, 7168)
 
 
 def test_register_weights_require_preshuffle(config):
-    config["B_IN_REG"] = True
+    config["ALLOW_B_VIA_LDS"] = False
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
-    with pytest.raises(AssertionError, match="B_IN_REG requires B_PRESHUFFLED"):
+    with pytest.raises(
+        AssertionError, match="ALLOW_B_VIA_LDS=False requires B_PRESHUFFLED"
+    ):
         tc.validate(4096, 7168)
 
 
 def test_independent_register_scales_are_supported(config):
-    config.update(A_SCALE_IN_REG=True, B_SCALE_IN_REG=True)
+    config.update(ALLOW_A_SCALE_VIA_LDS=False, ALLOW_B_SCALE_VIA_LDS=False)
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
-    assert _plain(tc.component_in_reg(A_SCALE))
-    assert _plain(tc.component_in_reg(B_SCALE))
-    assert _plain(tc.component_via_lds(A_PAYLOAD))
-    assert _plain(tc.component_via_lds(B_PAYLOAD))
+    layout = compute_kernel_layout(tc)
+    assert _plain(layout.component_in_reg(A_SCALE))
+    assert _plain(layout.component_in_reg(B_SCALE))
+    assert _plain(layout.component_via_lds(A_PAYLOAD))
+    assert _plain(layout.component_via_lds(B_PAYLOAD))
     assert _plain(_validate(tc, 4096, 7168))
 
 
@@ -924,10 +933,10 @@ def test_component_buffers_still_require_nonempty_k(config):
 
 
 @pytest.mark.parametrize(
-    "field", host._COMPONENT_BUFFER_KEYS + host._REGISTER_STORAGE_KEYS
+    "field", host._COMPONENT_BUFFER_KEYS + host._ALLOW_VIA_LDS_KEYS
 )
 def test_storage_environment_settings_reach_tuning_spec(monkeypatch, field):
-    value = 1 if field in host._REGISTER_STORAGE_KEYS else 2
+    value = 0 if field in host._ALLOW_VIA_LDS_KEYS else 2
     monkeypatch.setenv("AITER_TRITON_MOE_GLUON_" + field, str(value))
     config = host.get_gluon_config_uncached(
         128, 4096, 7168, DtypeQuant.MXFP4, DtypeQuant.MXFP4
@@ -1007,7 +1016,7 @@ def test_gate_up_small_warp_extent_only_requires_mx_group_for_quantized_output(
         warps_per_cta=(1, 4),
         tiles_per_warp=(2, 1),
         B_PRESHUFFLED=True,
-        B_IN_REG=True,
+        ALLOW_B_VIA_LDS=False,
         A_SCALE_SORTED_SHUFFLED=False,
         B_SCALE_SHUFFLED=False,
     )
@@ -1111,7 +1120,7 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
         ratios[component] = (
             _plain(layout.scale_ratio_k_step(operand)) if is_scale else 1
         )
-        via_lds[component] = _plain(tc.component_via_lds(component))
+        via_lds[component] = _plain(layout.component_via_lds(component))
         live_span = (depths[component] - 1) * ratios[component] + 1
         fill_spans[component] = live_span - int(not via_lds[component])
         producer_phases[component] = (1 - fill_spans[component]) % ratios[component]
@@ -1329,9 +1338,9 @@ def test_independent_buffer_waits_match_copy_history(
     config.update(zip(host._COMPONENT_BUFFER_KEYS, counts, strict=True))
     config.update(
         WAIT_COMMIT_SCHEME=int(scheme),
-        B_IN_REG=bool(storage_mask & 1),
-        B_SCALE_IN_REG=bool(storage_mask & 2),
-        A_SCALE_IN_REG=bool(storage_mask & 4),
+        ALLOW_B_VIA_LDS=not (storage_mask & 1),
+        ALLOW_B_SCALE_VIA_LDS=not (storage_mask & 2),
+        ALLOW_A_SCALE_VIA_LDS=not (storage_mask & 4),
         B_PRESHUFFLED=bool(storage_mask & 1),
     )
     if geometry == "middle_shared_a":
@@ -1359,7 +1368,9 @@ def test_independent_buffer_waits_match_copy_history(
 def test_independent_buffer_schedule_without_scales(config, scheme, register_b, counts):
     config.update(zip(host._COMPONENT_BUFFER_KEYS, counts, strict=True))
     config.update(
-        WAIT_COMMIT_SCHEME=int(scheme), B_IN_REG=register_b, B_PRESHUFFLED=register_b
+        WAIT_COMMIT_SCHEME=int(scheme),
+        ALLOW_B_VIA_LDS=not register_b,
+        B_PRESHUFFLED=register_b,
     )
     fc = KernelFuncConfig(
         *_func_spec()._replace(

@@ -190,13 +190,15 @@ class TuningSpec(NamedTuple):
     SOFF_UNROLL: bool = False
     #: At a 2x2 mini-tile split, fill scales in the two middle slots.
     SCALE_FILL_MID: bool = False
-    #: Force preshuffled B directly into registers at its global-load slot. Either
-    #: payload may also resolve to registers automatically when its LDS copy is illegal.
-    B_IN_REG: bool = False
-    #: Force direct-register scale storage independently for each operand. A scale may
-    #: also resolve to registers automatically when its LDS copy is not legal.
-    B_SCALE_IN_REG: bool = False
-    A_SCALE_IN_REG: bool = False
+    #: Allow B's payload through LDS. False forces preshuffled B directly into
+    #: registers at its global-load slot. Either payload may also resolve to registers
+    #: automatically when its LDS copy is illegal.
+    ALLOW_B_VIA_LDS: bool = True
+    #: Allow each operand's scales through LDS, independently. False forces
+    #: direct-register scale storage. A scale may also resolve to registers
+    #: automatically when its LDS copy is not legal.
+    ALLOW_B_SCALE_VIA_LDS: bool = True
+    ALLOW_A_SCALE_VIA_LDS: bool = True
     #: Per-component ring depths. Zero inherits NUM_LDS_BUFFER; every active
     #: component must resolve to at least two buffers, including register storage.
     A_NUM_BUFFER: int = 0

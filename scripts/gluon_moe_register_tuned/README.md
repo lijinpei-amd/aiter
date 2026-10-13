@@ -2,8 +2,8 @@
 
 These recipes were tuned on MI350X for GEMM1 with 1,024 input tokens, N=2,048,
 K=7,168, 33 experts, top-k=8, preshuffled B, split gate/up SiLU, and FP32 output.
-Each JSON file contains complete `config` dictionaries named `b_in_reg` and
-`b_in_lds`. Both now use the unified component-buffer pipeline. The measurements
+Each JSON file contains complete `config` dictionaries named `b_via_reg` and
+`b_via_lds`. Both now use the unified component-buffer pipeline. The measurements
 below predate that refactor and its runtime loop bounds; replaying a recipe uses
 the current unroll policy and requires new performance measurements.
 
@@ -15,9 +15,9 @@ described above.
 
 | Input dtype | Legacy baseline | Tuned B in registers | Tuned B in LDS | Fastest recipe |
 | --- | ---: | ---: | ---: | --- |
-| a4w4 / MXFP4 | 145.201 us | 139.741 us | 136.521 us | `b_in_lds` |
-| a8w8 / MXFP8 | 256.992 us | 228.941 us | 219.642 us | `b_in_lds` |
-| a16w16 / BF16 | 500.864 us | 421.983 us | 470.983 us | `b_in_reg` |
+| a4w4 / MXFP4 | 145.201 us | 139.741 us | 136.521 us | `b_via_lds` |
+| a8w8 / MXFP8 | 256.992 us | 228.941 us | 219.642 us | `b_via_lds` |
+| a16w16 / BF16 | 500.864 us | 421.983 us | 470.983 us | `b_via_reg` |
 
 Results are medians of five round medians on GPU 7. Each round brackets the
 candidates with legacy baseline measurements; the baseline column is the median

@@ -167,8 +167,8 @@ def test_scale_k_step_ratio_sets_buffer_span_and_unroll(
         K_UNROLL=3,
         A_SCALE_NUM_BUFFER=2,
         B_SCALE_NUM_BUFFER=3,
-        A_SCALE_IN_REG=register_scales,
-        B_SCALE_IN_REG=register_scales,
+        ALLOW_A_SCALE_VIA_LDS=not register_scales,
+        ALLOW_B_SCALE_VIA_LDS=not register_scales,
     )
     layout = compute_kernel_layout(tc)
     ratio = scale_k // block_k

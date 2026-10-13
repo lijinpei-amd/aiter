@@ -67,7 +67,7 @@ class _Config(_ScheduleConfig):
             not bool(register_mask & 1),
         )
         self.scale_async = (not bool(register_mask & 2), not bool(register_mask & 4))
-        self.B_IN_REG = bool(register_mask & 1)
+        self.ALLOW_B_VIA_LDS = not (register_mask & 1)
         self.packed = packed
         self.scale_steps = scale_steps or ((2, 2) if packed else (1, 1))
         self.scale_tiles = scale_tiles

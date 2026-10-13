@@ -448,9 +448,7 @@ def _a_scale_hbm_offsets_frozen(
     SCALE_K: gl.constexpr = layout.scale_mini_block_k(0)
     SCALE_RATIO: gl.constexpr = layout.scale_ratio_non_k_slot(0)
 
-    if require_constexpr(
-        tuning_cfg.scale_shuffled(0) and not tuning_cfg.scale_via_lds(0)
-    ):
+    if require_constexpr(tuning_cfg.scale_shuffled(0) and layout.scale_in_reg(0)):
         a_scale_hbm_offsets_block = ()
         for m_slot_idx in gl.static_range(NUM_M_SLOTS_PER_BLOCK):
             a_scale_hbm_offsets_block = a_scale_hbm_offsets_block + (
@@ -548,9 +546,7 @@ def _b_scale_hbm_offsets_frozen(b, pid_n, N, K, func_cfg, tuning_cfg, layout):
         N_SLOT if func_cfg.gu_split() and SCALE_RATIO > 1 else 0
     )
 
-    if require_constexpr(
-        tuning_cfg.scale_shuffled(1) and not tuning_cfg.scale_via_lds(1)
-    ):
+    if require_constexpr(tuning_cfg.scale_shuffled(1) and layout.scale_in_reg(1)):
         b_scale_hbm_offsets_block = ()
         for n_slot_idx in gl.static_range(NUM_N_SLOTS_PER_BLOCK):
             b_scale_hbm_offsets_block = b_scale_hbm_offsets_block + (
@@ -625,7 +621,7 @@ def _b_scale_hbm_offsets_frozen(b, pid_n, N, K, func_cfg, tuning_cfg, layout):
 @gluon.constexpr_function
 def _packed_sel(tuning_cfg, layout, idx, k_phase=0):
     """The frozen K256 selector for an LDS-staged packed scale operand."""
-    if layout.scale_packed_ok(idx) and tuning_cfg.scale_via_lds(idx):
+    if layout.scale_packed_ok(idx) and layout.scale_via_lds(idx):
         return layout.scale_packed_sel(idx, k_phase)
     return None
 
@@ -801,7 +797,7 @@ class _FrozenLDSManager:
         a_shape: gl.constexpr = layout.payload_lds_shape_slot(0)
         b_shape: gl.constexpr = layout.payload_lds_shape_slot(1)
 
-        if require_constexpr(tuning_cfg.payload_via_lds(0)):
+        if require_constexpr(layout.payload_via_lds(0)):
             a_payload_lds_ptr = gl.allocate_shared_memory(
                 a_ty,
                 [NBA * NMA, a_shape[0], a_shape[1]],
@@ -809,7 +805,7 @@ class _FrozenLDSManager:
             )
         else:
             a_payload_lds_ptr: gl.constexpr = None
-        if require_constexpr(tuning_cfg.payload_via_lds(1)):
+        if require_constexpr(layout.payload_via_lds(1)):
             b_payload_lds_ptr = gl.allocate_shared_memory(
                 b_ty,
                 [NBB * NMB, b_shape[0], b_shape[1]],
@@ -909,7 +905,7 @@ class _FrozenLDSManager:
         ratio: gl.constexpr = layout.scale_ratio_non_k_slot(operand)
         if require_constexpr(
             self.func_cfg.has_scale(operand)
-            and cfg.scale_via_lds(operand)
+            and layout.scale_via_lds(operand)
             and tile % ratio == 0
         ):
             if require_constexpr(operand == 0):
@@ -1026,7 +1022,7 @@ class _FrozenLDSManager:
                 layout.dot_operand_fragment_layout(operand),
             )
         if require_constexpr(READ_SCALE and self.func_cfg.has_scale(operand)):
-            gl.static_assert(self.tuning_cfg.scale_via_lds(operand))
+            gl.static_assert(self.layout.scale_via_lds(operand))
             if require_constexpr(self.tuning_cfg.scale_shuffled(operand)):
                 if require_constexpr(operand == 0):
                     scale_tile_lds_ptr = self._a_scale_tile(SCALE_READ_IDX, tile)
@@ -1178,14 +1174,14 @@ def _advance_hbm_ptrs(pc, hbm_ptrs, STEPS: gl.constexpr = 1, K_PHASE: gl.constex
     b_hbm_ptr = hbm_ptrs.b_hbm_ptr + STEPS * pc.b_step
     a_scale_hbm_ptr = hbm_ptrs.a_scale_hbm_ptr
     b_scale_hbm_ptr = hbm_ptrs.b_scale_hbm_ptr
-    if require_constexpr(pc.func_cfg.a_has_scale() and pc.tuning_cfg.scale_via_lds(0)):
+    if require_constexpr(pc.func_cfg.a_has_scale() and pc.layout.scale_via_lds(0)):
         a_scale_hbm_ptr = (
             a_scale_hbm_ptr
             + pc.layout.scale_hbm_steps(0, STEPS, K_PHASE)
             * pc.s_step
             * pc.a_scale_stride_k
         )
-    if require_constexpr(pc.func_cfg.b_has_scale() and pc.tuning_cfg.scale_via_lds(1)):
+    if require_constexpr(pc.func_cfg.b_has_scale() and pc.layout.scale_via_lds(1)):
         b_scale_hbm_ptr = (
             b_scale_hbm_ptr
             + pc.layout.scale_hbm_steps(1, STEPS, K_PHASE)
@@ -1457,7 +1453,7 @@ def _buffer_load_frozen(
         # Payload and its own scale share one commit group; a scale placed elsewhere
         # gets its own below.
         if require_constexpr(
-            A_SC == A_TILE and func_cfg.has_scale(0) and pc.tuning_cfg.scale_via_lds(0)
+            A_SC == A_TILE and func_cfg.has_scale(0) and pc.layout.scale_via_lds(0)
         ):
             pc.lds_ptrs.buffer_load_scale(
                 0,
@@ -1470,7 +1466,7 @@ def _buffer_load_frozen(
             )
         pc.lds_ptrs.commit_buffer_load()
     if require_constexpr(A_SC is not None and A_SC != A_TILE):
-        if require_constexpr(func_cfg.has_scale(0) and pc.tuning_cfg.scale_via_lds(0)):
+        if require_constexpr(func_cfg.has_scale(0) and pc.layout.scale_via_lds(0)):
             pc.lds_ptrs.buffer_load_scale(
                 0,
                 True,
@@ -1486,7 +1482,7 @@ def _buffer_load_frozen(
             1, True, BUFFER_LOAD_IDX, B_TILE, b_hbm_ptr, pc.b_hbm_offs[B_TILE], 0
         )
         if require_constexpr(
-            B_SC == B_TILE and func_cfg.has_scale(1) and pc.tuning_cfg.scale_via_lds(1)
+            B_SC == B_TILE and func_cfg.has_scale(1) and pc.layout.scale_via_lds(1)
         ):
             pc.lds_ptrs.buffer_load_scale(
                 1,
@@ -1499,7 +1495,7 @@ def _buffer_load_frozen(
             )
         pc.lds_ptrs.commit_buffer_load()
     if require_constexpr(B_SC is not None and B_SC != B_TILE):
-        if require_constexpr(func_cfg.has_scale(1) and pc.tuning_cfg.scale_via_lds(1)):
+        if require_constexpr(func_cfg.has_scale(1) and pc.layout.scale_via_lds(1)):
             pc.lds_ptrs.buffer_load_scale(
                 1,
                 True,
@@ -1514,9 +1510,9 @@ def _buffer_load_frozen(
         # One bump per step: the frozen kernel did not fold steps into soffset.
         a_hbm_ptr = a_hbm_ptr + KU * pc.a_step
         b_hbm_ptr = b_hbm_ptr + KU * pc.b_step
-        if require_constexpr(func_cfg.a_has_scale() and pc.tuning_cfg.scale_via_lds(0)):
+        if require_constexpr(func_cfg.a_has_scale() and pc.layout.scale_via_lds(0)):
             a_scale_hbm_ptr = a_scale_hbm_ptr + KU * pc.s_step * pc.a_scale_stride_k
-        if require_constexpr(func_cfg.b_has_scale() and pc.tuning_cfg.scale_via_lds(1)):
+        if require_constexpr(func_cfg.b_has_scale() and pc.layout.scale_via_lds(1)):
             b_scale_hbm_ptr = b_scale_hbm_ptr + KU * pc.s_step * pc.b_scale_stride_k
     return a_hbm_ptr, b_hbm_ptr, a_scale_hbm_ptr, b_scale_hbm_ptr
 
@@ -1542,7 +1538,7 @@ def _load_scale_register_frozen(
     tc: gl.constexpr = pc.tuning_cfg
     layout: gl.constexpr = pc.layout
     gl.static_assert(pc.func_cfg.has_scale(operand))
-    gl.static_assert(not tc.scale_via_lds(operand))
+    gl.static_assert(layout.scale_in_reg(operand))
     cache: gl.constexpr = (
         tc.token_scale_cache_modifier
         if operand == 0
@@ -1586,7 +1582,7 @@ def _ds_read_operand_frozen(
     NUM_MINI: gl.constexpr = layout.num_k_slots_per_tile()
     SK_MINI: gl.constexpr = tc.BLOCK_K // MX_GROUP
     HAS: gl.constexpr = pc.func_cfg.has_scale(operand)
-    SCALE_VIA_LDS: gl.constexpr = HAS and tc.scale_via_lds(operand)
+    SCALE_VIA_LDS: gl.constexpr = HAS and layout.scale_via_lds(operand)
     if require_constexpr(operand == 0):
         scale_hbm_offs = pc.a_scale_hbm_offs
     else:
@@ -1686,7 +1682,7 @@ def _pipeline_step_frozen(
     # Every branch on these is inlined below, so there is nothing left to read from
     # os.environ and no way for a stray flag to perturb this copy:
     #   DS_IN_MFMA 1  DS_MOVE 0  _FILLS_FIRST 1 (the env flag, not the derived
-    #   FILLS_FIRST constexpr -- that was tc.B_IN_REG and is inlined False below)
+    #   FILLS_FIRST constexpr -- that was not tc.ALLOW_B_VIA_LDS, inlined False below)
     #   FILL_IN_MFMA 0  LOAD_MFMA_READ 0
     #   MANUAL_PP 1   MEM_PRIO 1  MPP_ALL_FENCED 0  MPP_BARRIER_STRIDE 4
     #   MPP_CLOSE_BARRIER 0  MPP_NO_FENCE 0  MPP_NO_STAGE_BARRIER 0  MPP_PIN_MFMA 0
@@ -1907,9 +1903,9 @@ def _pipeline_step_frozen(
             # _SLOT_SCHED_BARRIER = 0: no end-of-slot scheduler fence.
 
     if require_constexpr(DO_DS_READ):
-        if require_constexpr(A_HAS and not tc.scale_via_lds(0)):
+        if require_constexpr(A_HAS and layout.scale_in_reg(0)):
             a_scale_hbm_ptr = a_scale_hbm_ptr + pc.s_step * pc.a_scale_stride_k
-        if require_constexpr(B_HAS and not tc.scale_via_lds(1)):
+        if require_constexpr(B_HAS and layout.scale_in_reg(1)):
             b_scale_hbm_ptr = b_scale_hbm_ptr + pc.s_step * pc.b_scale_stride_k
     else:
         a_tail = _take_reg_pairs(regs.a_payload, regs.a_scale, 0, NM * PF_MINI)
@@ -1977,7 +1973,7 @@ def _init_buffers_frozen(pc):
     tc: gl.constexpr = pc.tuning_cfg
     layout: gl.constexpr = pc.layout
     a, b, a_scale, b_scale = (), (), (), ()
-    if require_constexpr(not tc.payload_via_lds(0)):
+    if require_constexpr(layout.payload_in_reg(0)):
         for _ in gl.static_range(
             tc.num_buffers(0)
             * layout.num_m_slots_per_block()
@@ -1993,7 +1989,7 @@ def _init_buffers_frozen(pc):
                     layout.dot_operand_fragment_layout(0),
                 ),
             )
-    if require_constexpr(not tc.payload_via_lds(1)):
+    if require_constexpr(layout.payload_in_reg(1)):
         for _ in gl.static_range(
             tc.num_buffers(1)
             * layout.num_n_slots_per_block()
@@ -2006,7 +2002,7 @@ def _init_buffers_frozen(pc):
                     layout.dot_operand_fragment_layout(1),
                 ),
             )
-    if require_constexpr(pc.func_cfg.a_has_scale() and not tc.scale_via_lds(0)):
+    if require_constexpr(pc.func_cfg.a_has_scale() and layout.scale_in_reg(0)):
         for _ in gl.static_range(
             tc.num_buffers(0, True)
             * layout.num_m_slots_per_block()
@@ -2028,7 +2024,7 @@ def _init_buffers_frozen(pc):
                         layout.dot_operand_scale_fragment_layout(0),
                     ),
                 )
-    if require_constexpr(pc.func_cfg.b_has_scale() and not tc.scale_via_lds(1)):
+    if require_constexpr(pc.func_cfg.b_has_scale() and layout.scale_in_reg(1)):
         for _ in gl.static_range(
             tc.num_buffers(1, True)
             * layout.num_n_slots_per_block()

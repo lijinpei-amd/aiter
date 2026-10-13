@@ -384,7 +384,7 @@ def _advance_hbm_ptrs(pc, hbm_ptrs, STEPS: gl.constexpr = 1, K_PHASE: gl.constex
     a_scale_hbm_ptr = hbm_ptrs.a_scale_hbm_ptr
     b_scale_hbm_ptr = hbm_ptrs.b_scale_hbm_ptr
     if require_constexpr(
-        pc.func_cfg.a_has_scale() and pc.tuning_cfg.component_via_lds(_A_SCALE)
+        pc.func_cfg.a_has_scale() and pc.layout.component_via_lds(_A_SCALE)
     ):
         a_scale_hbm_ptr = (
             a_scale_hbm_ptr
@@ -393,7 +393,7 @@ def _advance_hbm_ptrs(pc, hbm_ptrs, STEPS: gl.constexpr = 1, K_PHASE: gl.constex
             * pc.a_scale_stride_k
         )
     if require_constexpr(
-        pc.func_cfg.b_has_scale() and pc.tuning_cfg.component_via_lds(_B_SCALE)
+        pc.func_cfg.b_has_scale() and pc.layout.component_via_lds(_B_SCALE)
     ):
         b_scale_hbm_ptr = (
             b_scale_hbm_ptr

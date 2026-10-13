@@ -86,11 +86,7 @@ class ScheduleSpec(NamedTuple):
 def schedule_spec(tc, layout):
     """Resolve the schedule model's input surface from a tuning config and layout."""
     present = tuple(_present(tc, layout, c) for c in COMPONENTS)
-    via_lds = tuple(bool(_v(tc.component_via_lds(c))) for c in COMPONENTS)
-    for c, lds in zip(COMPONENTS, via_lds):
-        assert bool(_v(tc.component_in_reg(c))) is not lds, (
-            f"component_in_reg must be the complement of component_via_lds for {c}"
-        )
+    via_lds = tuple(bool(_v(layout.component_via_lds(c))) for c in COMPONENTS)
     return ScheduleSpec(
         nm=_v(layout.num_m_slots_per_block()),
         nn=_v(layout.num_n_slots_per_block()),
@@ -142,13 +138,13 @@ def _live_span(tc, layout, component):
 @gluon.constexpr_function
 def _via_lds(tc, layout, component):
     """Resolved placement for one payload or scale component."""
-    return tc.component_via_lds(component)
+    return layout.component_via_lds(component)
 
 
 @gluon.constexpr_function
 def _in_reg(tc, layout, component):
     """Resolved direct-register placement for one present component."""
-    return tc.component_in_reg(component)
+    return layout.component_in_reg(component)
 
 
 @gluon.constexpr_function
