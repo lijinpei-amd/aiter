@@ -814,7 +814,16 @@ Upstream launched the same cached `triton.compile` result as a
   the failed attempt. A compile of those kernels anywhere else in an
   AOT-mode process raises instead of loading the binary it compiled.
   `test_metadata_redirect.py::test_required_redirect_only_on_miss` covers the
-  mechanism and fails with the raise removed.
+  mechanism, on gfx942 only (its prebuilt kernel is a gfx942 binary). In AOT
+  mode `test_pa_mqa_logits_offset.py` covers this file's use of it on gfx942
+  and gfx950: the wide-output test checks that the kernels it ran were
+  loaded from `configs/paged_mqa_logits/aot/`, and
+  `test_paged_mqa_logits_aot_never_runs_its_own_compile` that a configuration
+  with no prebuilt files raises. Outputs alone cannot tell: the compiled and
+  the prebuilt binary compute the same logits. With the
+  `require_metadata_redirect` call removed, these three tests fail on gfx942
+  and gfx950, while on gfx942 the tests that predate them still pass. With
+  the raise in `triton_metadata_redirect.py` removed, they fail on gfx942.
 
 Verified with intj `2783079`, Triton 3.8.0, `AITER_TRITON_ONLY=1`, on gfx942
 (MI300X) and gfx950 (MI350X, GPU 4), against upstream `874d253dd3`, in both
@@ -826,7 +835,9 @@ offset test's.
 
 - **Tests**, the same on both trees and GPUs: `test_pa_mqa_logits_offset.py`
   105 passed in JIT mode, 2 passed and 103 skipped in AOT mode (only the
-  wide-output test runs there); `test_fp8_mqa_logits.py` 152 passed;
+  wide-output test runs there; this branch adds the AOT test above, which
+  passes in AOT mode and is skipped in JIT mode); `test_fp8_mqa_logits.py`
+  152 passed;
   `test_metadata_redirect.py` 4 passed on gfx942 (3 upstream), skipped on
   gfx950. `test_pa_mqa_logits_opus.py` (2) and
   `test_pa_mqa_logits_mxfp4_opus.py` (4) fail on both trees: their `test_*`
