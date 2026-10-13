@@ -40,9 +40,6 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._frozen import (
     _validate_frozen_pipeline,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import compute_kernel_layout
-from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
-    validate_pipeline as _validate_live_pipeline,
-)
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     ActivationSpec,
     ActKind,
@@ -61,6 +58,13 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     WaitCommitScheme,
     WarpPipeline,
     dq_pack_divisor,
+)
+from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import (
+    validate,
+    validate_buffer_counts,
+)
+from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import (
+    validate_pipeline as _validate_live_pipeline,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -1239,7 +1243,7 @@ def _launch_spec(
     # Storage can still change during scale preparation, which changes the exact
     # minimum K. Validate inherited depths and shape arithmetic now; validate the
     # complete effective configuration once preparation has resolved its layouts.
-    tuning_cfg_host.validate_buffer_counts()
+    validate_buffer_counts(tuning_cfg_host)
     layout_host = compute_kernel_layout(tuning_cfg_host)
     layout_host.num_k_tiles(K)
     grid_n = _cval(layout_host.grid_N(N))
@@ -1258,7 +1262,7 @@ def _launch_spec(
 def _validate_launch_config(tuning_cfg, N, K):
     """Validate each cached effective layout once, before any kernel launch."""
     layout = compute_kernel_layout(tuning_cfg)
-    tuning_cfg.validate(N, K, layout)
+    validate(tuning_cfg, N, K, layout)
     return _validate_selected_pipeline(tuning_cfg, layout, K)
 
 
@@ -1378,7 +1382,7 @@ def _sorted_shuffle_a_scales(x_scales, routing_data, gather_indx, K, cfg):
     if x_scales is None or gather_indx is None:
         return None
     block_m = int(cfg["BLOCK_M"])
-    # Mirrors KernelTuningConfig.sorted_shuffled_ok(): the permutation is carried by the
+    # Mirrors KernelLayout.sorted_shuffled_ok(): the permutation is carried by the
     # LDS tile's layout. A shuffled scale load covers an integer number of BLOCK_K
     # payload steps; K128 therefore retains each packed K256 group for two steps.
     if (

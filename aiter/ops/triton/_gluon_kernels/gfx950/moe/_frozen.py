@@ -40,6 +40,7 @@ from ._lang import optional as _opt
 from ._lang import require_constexpr
 from ._lang import unwrap as _v
 from ._types import COMPONENTS, DotKind, TileSched
+from ._validate import validate, validate_buffer_counts
 
 
 # --- vendored schedule helpers ------------------------------------------------
@@ -469,7 +470,7 @@ def _a_scale_hbm_offsets_frozen(
         # row stripe; K128 payload stages reuse the same group before advancing the
         # pointer.
         gl.static_assert(
-            tuning_cfg.sorted_shuffled_ok(),
+            layout.sorted_shuffled_ok(),
             "A_SCALE_SORTED_SHUFFLED requires MFMA 16x16x128 "
             "and whole 32-row A stripes",
         )
@@ -1928,7 +1929,7 @@ def _pipeline_peeled_frozen(tc):
 @gluon.constexpr_function
 def _validate_frozen_pipeline(tc, layout, K):
     """Validate the frozen driver's rings and runtime-loop lower bound."""
-    tc.validate_buffer_counts()
+    validate_buffer_counts(tc)
     num_k = layout.num_k_tiles(K)
     depth = pipeline_depth_frozen(tc, layout)
     peeled = _pipeline_peeled_frozen(tc)
@@ -1961,7 +1962,7 @@ def _index_frozen(
             out = (_pipeline_peeled_frozen(tc) + KI + 1 + advance) % depth
         else:
             tile = step + advance
-            if require_constexpr(tc.pipeline_register_period(layout) == 1):
+            if require_constexpr(layout.pipeline_register_period() == 1):
                 gl.assume(tile >= 0)
             out = tile % depth
     return out
@@ -2128,7 +2129,7 @@ def _run_frozen_pipeline(pc, ptrs, NUM_K):
                 KI=u,
                 IN_LOOP=True,
             )
-    if require_constexpr(unroll > 6 and tc.pipeline_register_period(layout) > 1):
+    if require_constexpr(unroll > 6 and layout.pipeline_register_period() > 1):
         for u in tl.range(0, remaining - unroll_end):
             ptrs, buffers, regs = _step_frozen(
                 pc,
@@ -2172,7 +2173,7 @@ def _drain_frozen_pipeline(
     if require_constexpr(
         period <= 3
         and pipeline_unroll_frozen(tc, layout) % period == 0
-        and tc.pipeline_register_period(layout) == 1
+        and layout.pipeline_register_period() == 1
         and pc.func_cfg.output_quant is None
     ):
         phase = main % period
@@ -2270,7 +2271,7 @@ def _moe_gemm_body_frozen(
     module does not import ``_layout``, so it cannot build one itself.
     """
     gl.static_assert(tuning_cfg.FROZEN_STEP)
-    gl.static_assert(tuning_cfg.validate(N, K, layout))
+    gl.static_assert(validate(tuning_cfg, N, K, layout))
     gl.static_assert(_validate_frozen_pipeline(tuning_cfg, layout, K))
 
     BK: gl.constexpr = tuning_cfg.BLOCK_K

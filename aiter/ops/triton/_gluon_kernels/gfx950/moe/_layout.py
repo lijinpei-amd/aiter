@@ -14,6 +14,8 @@ two cannot drift.
 ``_KernelFuncShape`` stays a method-only aggregate inherited by ``KernelFuncConfig``.
 """
 
+import math
+
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.language.core import _aggregate as aggregate
@@ -464,7 +466,7 @@ def _a_scale_hbm_offsets(
         # row stripe; K128 payload stages reuse the same group before advancing the
         # pointer.
         gl.static_assert(
-            tuning_cfg.sorted_shuffled_ok(),
+            layout.sorted_shuffled_ok(),
             "A_SCALE_SORTED_SHUFFLED requires MFMA 16x16x128 "
             "and whole 32-row A stripes",
         )
@@ -885,6 +887,28 @@ def _calc_component_via_lds(tc, component):
 
 
 @gluon.constexpr_function
+def _calc_pipeline_register_period(tc):
+    """LCM of the active direct-register rings; absent scales have no ring.
+
+    ``_schedule.ring_restoration_period`` over direct-register components only.
+    Separate because the two have different consumers: LDS slots may use runtime
+    indices, while register tuples need static ones in the main loop, so only the
+    register rings have to return to slot zero for a body to be unrollable. Resolved
+    here, not in ``_schedule``, because the frozen driver reads it too and must not
+    import the live schedule model.
+    """
+    period = 1
+    for operand in (0, 1):
+        for is_scale in (False, True):
+            if is_scale and not tc.func_cfg.has_scale(operand):
+                continue
+            if not _calc_component_via_lds(tc, (operand, is_scale)):
+                ratio = _calc_scale_ratio_k_step(tc, operand) if is_scale else 1
+                period = math.lcm(period, tc.num_buffers(operand, is_scale) * ratio)
+    return period
+
+
+@gluon.constexpr_function
 def _calc_k_width_for(tc, idx):
     """``DotOperandLayout.k_width`` for one operand, in *stored* elements.
 
@@ -936,7 +960,7 @@ def _calc_lds_unit_rows(tc, idx):
 
     A preshuffled operand is blocked 16 rows at a time in HBM and the copy has to
     stay linear, so the unit is that block. A plain one is read two MFMA tiles at a
-    time (hence the ``tiles_per_warp >= 2`` that :meth:`validate` insists on), so
+    time (hence the ``tiles_per_warp >= 2`` that ``validate_layout`` insists on), so
     the unit is 32 and the row permutation has a 5th base to work with.
     """
     return 16 if tc.operand_preshuffled(idx) else 32
@@ -1158,6 +1182,22 @@ def _calc_scale_flat_shape(tc, idx):
         _calc_scale_mini_block_nonk(tc, idx) // 32,
         _calc_scale_mini_block_k(tc, idx),
     ]
+
+
+@gluon.constexpr_function
+def _calc_sorted_shuffled_ok(tc):
+    """Does this config produce the layout the C++ A-scale shuffle was written for?"""
+    # The permutation lives in the LDS tile's SharedLinearLayout, which is a
+    # property of the byte order the shuffle writes -- not of how warps are split.
+    # The warp arrangement is free. The shuffle always packs K256;
+    # a K128 payload stage selects one half.
+    return (
+        list(_v(tc.mfma_instr_shape)) == [16, 16, 128]
+        and _v(tc.BLOCK_M) % 32 == 0
+        # An M slot only has to be a whole number of 32-row stripes: the shuffle
+        # writes one 256 B run per stripe, so a slot is a contiguous slice.
+        and _v(tc.MINI_BLOCK_M) % 32 == 0
+    )
 
 
 @gluon.constexpr_function
@@ -1438,6 +1478,13 @@ def _calc_quant_staging_rows(tc):
 
 
 @gluon.constexpr_function
+def _calc_quant_staging_rotates(tc):
+    """Whether the fused-quant staging alternates two per-tile LDS banks."""
+    fc = tc.func_cfg
+    return _v(fc.output_quant) is not None and not fc.gu_split()
+
+
+@gluon.constexpr_function
 def _calc_payload_hbm_step(tc, idx):
     """Stored-element base-pointer increment for one payload K stage."""
     idx = _v(idx)
@@ -1483,10 +1530,11 @@ def _calc_acc_vgprs_per_lane(tc):
 def _calc_geometry_ok(tc):
     """Whether the tile lattice is sound enough to build register/shared layouts on.
 
-    The N/K-independent part of :meth:`KernelLayout.validate`, as a predicate. A config
+    The N/K-independent part of ``_validate.validate_layout``, as a predicate. A config
     that fails it still gets its scalar geometry (the host probes LDS footprints of
     candidates it has not validated yet) but no layout objects, so the descriptive
-    assertion in ``validate`` is what reports it rather than a layout constructor.
+    assertion in ``validate_layout`` is what reports it rather than a layout
+    constructor.
     """
     BM, BN, BK = _v(tc.BLOCK_M), _v(tc.BLOCK_N), _v(tc.BLOCK_K)
     MBM, MBN = _v(tc.MINI_BLOCK_M), _v(tc.MINI_BLOCK_N)
@@ -1554,6 +1602,7 @@ class KernelLayout:
     _byte_unit_lds_ok: gl.constexpr
     # -- storage placement --
     _component_via_lds: gl.constexpr
+    _pipeline_register_period: gl.constexpr
     # -- payload layouts --
     _dot_result_fragment_layout: gl.constexpr
     _dot_operand_fragment_layout: gl.constexpr
@@ -1570,6 +1619,7 @@ class KernelLayout:
     _scale_read_k_slots: gl.constexpr
     _scale_cache_fragments: gl.constexpr
     _scale_flat_shape: gl.constexpr
+    _sorted_shuffled_ok: gl.constexpr
     _scale_load_shape: gl.constexpr
     _scale_packed_ok: gl.constexpr
     _scale_packed_sel: gl.constexpr
@@ -1599,6 +1649,7 @@ class KernelLayout:
     _epilogue_inputs_via_lds: gl.constexpr
     _quant_staging_layout: gl.constexpr
     _quant_staging_rows: gl.constexpr
+    _quant_staging_rotates: gl.constexpr
     # -- resources --
     _lds_bytes: gl.constexpr
     _acc_vgprs_per_lane: gl.constexpr
@@ -1764,6 +1815,11 @@ class KernelLayout:
     def scale_in_reg(self, idx):
         return not self.scale_via_lds(idx)
 
+    @gluon.constexpr_function
+    def pipeline_register_period(self):
+        """LCM of the direct-register ring periods, in payload K steps."""
+        return _v(self._pipeline_register_period)
+
     # -- payload layouts ----------------------------------------------------------
 
     @gluon.constexpr_function
@@ -1844,6 +1900,11 @@ class KernelLayout:
     def scale_flat_shape(self, idx):
         """LDS staging shape of a shuffled scale tile (one 256 B run per stripe)."""
         return list(_v(self._scale_flat_shape)[_v(idx)])
+
+    @gluon.constexpr_function
+    def sorted_shuffled_ok(self):
+        """Does the tile match the layout the C++ A-scale shuffle writes?"""
+        return _v(self._sorted_shuffled_ok)
 
     @gluon.constexpr_function
     def scale_load_shape(self, idx):
@@ -2023,6 +2084,11 @@ class KernelLayout:
         return _v(self._quant_staging_rows)
 
     @gluon.constexpr_function
+    def quant_staging_rotates(self):
+        """Whether the fused-quant staging alternates two per-tile LDS banks."""
+        return _v(self._quant_staging_rotates)
+
+    @gluon.constexpr_function
     def quant_amax_lane_elems(self, extent_m=None, output_n=None):
         """Inner lane-local width for the split MXFP4 amax reduction.
 
@@ -2050,7 +2116,7 @@ class KernelLayout:
         per_lane = (extent_m * output_n) // (self.num_warps() * WARP_SIZE)
         return min(MX_GROUP, max(1, per_lane))
 
-    # -- resources and validation -------------------------------------------------
+    # -- resources ----------------------------------------------------------------
 
     @gluon.constexpr_function
     def lds_bytes(self):
@@ -2060,194 +2126,6 @@ class KernelLayout:
     def acc_vgprs_per_lane(self):
         return _v(self._acc_vgprs_per_lane)
 
-    @gluon.constexpr_function
-    def validate(self, tc, N, K):
-        """Validate storage placement and every tensor/tile shape contract."""
-        fc = tc.func_cfg
-        BM, BN, BK = _v(tc.BLOCK_M), _v(tc.BLOCK_N), _v(tc.BLOCK_K)
-        N, K = _v(N), _v(K)
-        instr = _v(tc.mfma_instr_shape)
-        warps = _v(tc.warps_per_cta)
-        tiles = _v(tc.tiles_per_warp)
-
-        assert _v(tc.ALLOW_B_VIA_LDS) or tc.operand_preshuffled(1), (
-            "ALLOW_B_VIA_LDS=False requires B_PRESHUFFLED"
-        )
-        has_custom_storage = bool(
-            not _v(tc.ALLOW_B_VIA_LDS)
-            or not _v(tc.ALLOW_B_SCALE_VIA_LDS)
-            or not _v(tc.ALLOW_A_SCALE_VIA_LDS)
-            or _v(tc.A_NUM_BUFFER)
-            or _v(tc.B_NUM_BUFFER)
-            or _v(tc.A_SCALE_NUM_BUFFER)
-            or _v(tc.B_SCALE_NUM_BUFFER)
-        )
-        assert not (_v(tc.FROZEN_STEP) and has_custom_storage), (
-            "FROZEN_STEP does not support register storage or per-component buffer counts"
-        )
-        if _v(tc.FROZEN_STEP):
-            for idx in (0, 1):
-                assert self.payload_via_lds(idx), (
-                    f"FROZEN_STEP requires operand {idx}'s payload in LDS; "
-                    "use the live pipeline for a direct-register payload"
-                )
-        tc.validate_buffer_counts()
-
-        # -- host preconditions (no N tail, no K tail; only the even case exists) --
-        assert N % BN == 0, f"N {N} % BLOCK_N {BN} != 0; the wrapper must fall back"
-        assert K % BK == 0, f"K {K} % BLOCK_K {BK} != 0; the wrapper must fall back"
-
-        # -- divisibility lattice --
-        assert BK % instr[2] == 0
-        assert BK % MX_GROUP == 0
-
-        # -- shuffled scale geometry --
-        for idx in (0, 1):
-            if not tc.scale_shuffled(idx):
-                continue
-            axis = "M" if idx == 0 else "N"
-            block = BM if idx == 0 else BN
-            nonk, sk = self.scale_mini_block_nonk(idx), self.scale_mini_block_k(idx)
-            mini = self.scale_nonk(idx)
-            assert block >= nonk >= mini, (
-                f"BLOCK_{axis} >= SCALE_MINI_BLOCK_{axis} >= MINI_BLOCK_{axis} is required"
-            )
-            assert block % nonk == 0 and nonk % mini == 0, (
-                f"SCALE_MINI_BLOCK_{axis} must divide BLOCK_{axis} and be a multiple of MINI_BLOCK_{axis}"
-            )
-            assert nonk % 32 == 0, (
-                f"SCALE_MINI_BLOCK_{axis} must contain whole 32-row stripes"
-            )
-            assert sk >= max(256, BK), (
-                "SCALE_MINI_BLOCK_K must be at least 256 and at least BLOCK_K"
-            )
-            assert sk & (sk - 1) == 0 and sk % BK == 0, (
-                "SCALE_MINI_BLOCK_K must be a power of two and a multiple of BLOCK_K"
-            )
-            assert K % sk == 0, "K must contain complete SCALE_MINI_BLOCK_K tiles"
-            if _v(tc.FROZEN_STEP):
-                assert (
-                    BK == 256 and sk == BK and self.scale_ratio_non_k_slot(idx) == 1
-                ), (
-                    "FROZEN_STEP shuffled scales require BLOCK_K == "
-                    "SCALE_MINI_BLOCK_K == 256 and one scale tile per payload slot; "
-                    "use the live pipeline for independent scale mini blocks"
-                )
-
-        # -- the slot is the unit of LDS allocation, of the global->LDS copy, of the
-        #    MFMA and of the accumulator, so it must align to the CTA block;
-        #    non-divisible values are illegal, not merely wasteful --
-        assert BM % _v(tc.MINI_BLOCK_M) == 0
-        assert BN % _v(tc.MINI_BLOCK_N) == 0
-        # Fill ownership is a mapping from each component's non-K tile to a slot, so
-        # what it has to satisfy is that every mapped slot exists and no component
-        # owns two of its own tiles in one slot -- the flat _ops() transport carries
-        # one optional tile per component. Different components sharing a slot is
-        # fine, which is what lets a single-slot stage own both operands.
-        from ._schedule import _fill_slots_valid
-
-        assert _fill_slots_valid(tc, self), (
-            f"fill ownership is not a valid mapping for num_m_slots_per_block "
-            f"{self.num_m_slots_per_block()} x num_n_slots_per_block "
-            f"{self.num_n_slots_per_block()} (MINI_BLOCK_M {_v(tc.MINI_BLOCK_M)} vs "
-            f"BLOCK_M {BM}, MINI_BLOCK_N {_v(tc.MINI_BLOCK_N)} vs BLOCK_N {BN})"
-        )
-        assert _v(tc.MINI_BLOCK_M) % (instr[0] * warps[0] * tiles[0]) == 0, (
-            f"MINI_BLOCK_M {_v(tc.MINI_BLOCK_M)} must be a multiple of "
-            f"instr[0]*warps[0]*tiles[0] = {instr[0] * warps[0] * tiles[0]}"
-        )
-        assert _v(tc.MINI_BLOCK_N) % (instr[1] * warps[1] * tiles[1]) == 0, (
-            f"MINI_BLOCK_N {_v(tc.MINI_BLOCK_N)} must be a multiple of "
-            f"instr[1]*warps[1]*tiles[1] = {instr[1] * warps[1] * tiles[1]}"
-        )
-
-        # -- MFMA shape must fit the tile --
-        assert BM % (instr[0] * warps[0] * tiles[0]) == 0
-        assert BN % (instr[1] * warps[1] * tiles[1]) == 0
-
-        # -- the LDS unit the byte-tiled layout is built from --
-        # A non-preshuffled unit is 32 rows because a warp reads two 16-row MFMA tiles
-        # from it; at tiles_per_warp 1 the second half of every unit belongs to another
-        # warp, so the 1, 4, 16, 2, 8 permutation would spread one warp's rows over two
-        # padding intervals instead of one. byte_unit_lds_ok() gates on exactly this, so
-        # the assert can only fire if that gate is ever loosened without this being
-        # revisited -- which is the point of stating it here.
-        for idx in (0, 1):
-            if self.byte_unit_lds_ok(idx) and not tc.operand_preshuffled(idx):
-                assert tiles[idx] >= 2, (
-                    f"operand {idx} is not preshuffled, so its LDS unit is 32 rows and "
-                    f"tiles_per_warp[{idx}] must be >= 2 (got {tiles[idx]})"
-                )
-        if tc.operand_preshuffled(1):
-            # The 16-column-blocked global offsets only stay inside the N slot while
-            # every extent is a whole number of 16-column, 16-byte blocks.
-            pk_b = BK // fc.b_pack_divisor()
-            assert BN % 16 == 0 and _v(tc.MINI_BLOCK_N) % 16 == 0, (
-                f"B_PRESHUFFLED needs BLOCK_N ({BN}) and MINI_BLOCK_N "
-                f"({_v(tc.MINI_BLOCK_N)}) to be multiples of the 16-column block"
-            )
-            assert pk_b % 16 == 0, (
-                f"B_PRESHUFFLED needs BLOCK_K/pack ({pk_b}) to be a multiple of the "
-                "16-byte block"
-            )
-
-        # -- scale swizzle --
-        # (checked by the caller against the tensor's scale_swizzle field)
-
-        # -- gate/up split: an N slot must be exactly one operand side --
-        if fc.gu_split():
-            MBN = _v(tc.MINI_BLOCK_N)
-            assert self.num_n_slots_per_block() == 2 and MBN * 2 == BN, (
-                f"gate_up_split needs exactly two N slots, one per side: got "
-                f"BLOCK_N {BN} / MINI_BLOCK_N {MBN} = {self.num_n_slots_per_block()}"
-            )
-            assert N % 2 == 0 and (N // 2) % MBN == 0, (
-                f"gate_up_split needs each half of N ({N}) to be a whole number of "
-                f"MINI_BLOCK_N ({MBN}) tiles"
-            )
-            # The whole point of the layout: a warp's emitted N extent has to contain a
-            # whole MX group, or the fused quant's amax crosses the warp boundary. That
-            # extent is instr_n * tiles_per_warp_n -- warps tile *above* it, so the
-            # warp count is irrelevant here.
-            if _v(fc.output_quant) is not None:
-                warp_n = instr[1] * tiles[1]
-                assert warp_n % MX_GROUP == 0, (
-                    f"gate_up_split with a fused MX output quant needs a warp's "
-                    f"emitted N extent (instr_n {instr[1]} * tiles_per_warp_n "
-                    f"{tiles[1]} = {warp_n}) to be a multiple of {MX_GROUP}, else the "
-                    "amax reduction still crosses warps"
-                )
-                assert MBN % MX_GROUP == 0
-
-        # -- the fused MX output quant groups 32 *emitted* columns, so the raw tile has
-        #    to carry 32 * activation_reduction_n of them --
-        elif _v(fc.output_quant) is not None:
-            arn = fc.activation_reduction_n()
-            assert BN % (MX_GROUP * arn) == 0, (
-                f"BLOCK_N {BN} must be a multiple of {MX_GROUP * arn} in raw "
-                f"(pre-halving) terms so every MX group is tile-local"
-            )
-            assert _v(tc.MINI_BLOCK_N) % (MX_GROUP * arn) == 0
-
-        return True
-
-    @gluon.constexpr_function
-    def validate_resources(self, tc):
-        """Validate layout-dependent LDS and accumulator resource budgets."""
-        # -- resource budgets --
-        lds = self.lds_bytes()
-        assert lds <= LDS_USABLE_BYTES, (
-            f"LDS {lds} B > {LDS_USABLE_BYTES} B usable ({LDS_CAP_BYTES} cap minus "
-            f"{LDS_EPILOGUE_RESERVE_BYTES} B of epilogue scratch): reduce "
-            f"NUM_LDS_BUFFER ({_v(tc.NUM_LDS_BUFFER)}) or the block sizes"
-        )
-        acc = self.acc_vgprs_per_lane()
-        assert acc <= 256, (
-            f"fp32 accumulator alone needs {acc} VGPR/lane; 256 is the architectural "
-            f"cap and WAVES_PER_EU=2 needs <= 256 total"
-        )
-        return True
-
 
 @gluon.constexpr_function
 def compute_kernel_layout(tuning_cfg):
@@ -2256,7 +2134,7 @@ def compute_kernel_layout(tuning_cfg):
     Host and device both call this on the same configuration, so the host's LDS and
     grid arithmetic and the kernel's tile arithmetic cannot drift. A config whose tile
     lattice is unsound (see :func:`_calc_geometry_ok`) still gets its scalar geometry,
-    but its layout objects are ``None``; :meth:`KernelLayout.validate` rejects it.
+    but its layout objects are ``None``; ``_validate.validate_layout`` rejects it.
     """
     tc = tuning_cfg
     fc = tc.func_cfg
@@ -2289,8 +2167,8 @@ def compute_kernel_layout(tuning_cfg):
 
     def scale_tiles_ok(idx):
         # A shuffled scale mini block narrower than the payload slot (which
-        # ``validate`` rejects) covers no whole slot: it has no tile count, and no LDS
-        # footprint where it is staged there.
+        # ``validate_layout`` rejects) covers no whole slot: it has no tile count, and
+        # no LDS footprint where it is staged there.
         return _calc_scale_ratio_non_k_slot(tc, idx) > 0
 
     def scale_tiles(fn):
@@ -2329,6 +2207,7 @@ def compute_kernel_layout(tuning_cfg):
         lds_unit_rows=pair(_calc_lds_unit_rows),
         byte_unit_lds_ok=pair(_calc_byte_unit_lds_ok),
         component_via_lds=via_lds,
+        pipeline_register_period=_calc_pipeline_register_period(tc),
         dot_result_fragment_layout=_calc_dot_result_fragment_layout(tc) if ok else None,
         dot_operand_fragment_layout=pair_if(always, _calc_dot_operand_fragment_layout),
         dot_operand_lds_layout=pair_if(payload_via_lds, _calc_dot_operand_lds_layout),
@@ -2345,6 +2224,7 @@ def compute_kernel_layout(tuning_cfg):
         scale_read_k_slots=pair(_calc_scale_read_k_slots),
         scale_cache_fragments=pair(_calc_scale_cache_fragments),
         scale_flat_shape=pair(_calc_scale_flat_shape),
+        sorted_shuffled_ok=_calc_sorted_shuffled_ok(tc),
         scale_load_shape=pair(_calc_scale_load_shape),
         scale_packed_ok=pair(_calc_scale_packed_ok) if ok else (False, False),
         scale_packed_sel=tuple(
@@ -2408,6 +2288,7 @@ def compute_kernel_layout(tuning_cfg):
         epilogue_inputs_via_lds=epilogue_via_lds,
         quant_staging_layout=_calc_quant_staging_layout(tc),
         quant_staging_rows=_calc_quant_staging_rows(tc),
+        quant_staging_rotates=_calc_quant_staging_rotates(tc),
         lds_bytes=_calc_lds_bytes(tc) if lds_ok else None,
         acc_vgprs_per_lane=_calc_acc_vgprs_per_lane(tc),
     )

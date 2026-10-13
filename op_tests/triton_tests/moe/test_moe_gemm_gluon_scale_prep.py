@@ -21,6 +21,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     DtypeQuant,
     ScaleSwizzle,
 )
+from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import validate
 from aiter.ops.triton.moe import moe_op_gemm_gluon as host
 
 
@@ -108,7 +109,7 @@ def test_a4_defaults_are_unchanged(block_m, small_grid):
 def test_stage1_capability_uses_the_selected_default_geometry(k):
     cfg = _spec(K=k)[4]
     tc = _spec(K=k)[5]
-    assert host._cval(tc.validate(512, k))
+    assert host._cval(validate(tc, 512, k))
     assert host._probe_lds_bytes(cfg, DtypeQuant.MXFP8, DtypeQuant.MXFP8) <= host.LDS_USABLE_BYTES
     case = _inputs(k=k)
     ok, why = host.gluon_supported(

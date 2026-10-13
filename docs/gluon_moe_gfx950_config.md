@@ -91,7 +91,7 @@ need only the mandatory first peel have
 `NUM_K >= PIPELINE_DEPTH + UNROLL + 1`. `K % BLOCK_K == 0` and all
 layout-specific divisibility rules still apply, including complete K256 words
 for packed K128 scales. The selected live or frozen pipeline validator applies
-the resolved-depth and K checks beside `KernelTuningConfig.validate`. The
+the resolved-depth and K checks beside `_validate.validate`. The
 launcher checks depths and K divisibility before preparation, then validates the
 complete effective configuration before launch. The final check matters when
 scale preparation succeeds or falls back: moving scales between LDS and
