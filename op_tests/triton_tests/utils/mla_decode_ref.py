@@ -236,25 +236,19 @@ def _decode_att_m_fwd(
     )
 
 
-def _stage1_launch_keywords():
-    # The launcher's delayed=, run on its first call (get_arch() needs a GPU).
-    if not is_hip_:
-        return {"options": {"num_warps": 4, "num_stages": 2}}
+_STAGE1_OPTIONS = {"num_warps": 4, "num_stages": 2}
+if is_hip_:
     # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
     # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
-    kpack = 1 if get_arch() == "gfx950" else 2
-    return {
-        "options": {
-            "num_warps": 4,
-            "num_stages": 1,
-            "waves_per_eu": 1,
-            "matrix_instr_nonkdim": 16,
-            "kpack": kpack,
-        }
-    }
+    _STAGE1_OPTIONS.update(
+        num_stages=1,
+        waves_per_eu=1,
+        matrix_instr_nonkdim=16,
+        kpack=1 if get_arch() == "gfx950" else 2,
+    )
 
 
-@make_launcher(delayed=_stage1_launch_keywords)
+@make_launcher(options=_STAGE1_OPTIONS)
 @triton.jit
 def _fwd_grouped_kernel_stage1(
     Q,
@@ -490,23 +484,16 @@ def _decode_grouped_att_m_fwd(
     )
 
 
-def _stage2_launch_keywords():
-    # The launcher's delayed=, run on its first call (get_arch() needs a GPU).
-    if not is_hip_:
-        return {"options": {"num_warps": 4, "num_stages": 2}}
-    kpack = 1 if get_arch() == "gfx950" else 2
-    return {
-        "options": {
-            "num_warps": 4,
-            "num_stages": 2,
-            "waves_per_eu": 4,
-            "matrix_instr_nonkdim": 16,
-            "kpack": kpack,
-        }
-    }
+_STAGE2_OPTIONS = {"num_warps": 4, "num_stages": 2}
+if is_hip_:
+    _STAGE2_OPTIONS.update(
+        waves_per_eu=4,
+        matrix_instr_nonkdim=16,
+        kpack=1 if get_arch() == "gfx950" else 2,
+    )
 
 
-@make_launcher(delayed=_stage2_launch_keywords)
+@make_launcher(options=_STAGE2_OPTIONS)
 @triton.jit
 def _fwd_kernel_stage2(
     Mid_O,
