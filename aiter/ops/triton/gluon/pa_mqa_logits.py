@@ -7,7 +7,7 @@ from functools import partial
 
 import triton
 import triton.language as tl
-from intj import NEVER, Aligned, Argument, Assume, PointerRange, make_launcher
+from intj import NEVER, Aligned, Argument, Exactly, PointerRange, make_launcher
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
@@ -63,10 +63,10 @@ def _sum_combine(a, b):
 def _gluon_launch_keywords(Preshuffle, VarCtxOpt, is_padded_mode):
     """The make_launcher keywords that need the GPU (get_gfx) for this mode's
     launcher: the types and specialization facts the hand-written
-    `triton.compile` this replaced spelled out (asserted, not measured: the
-    caller promises them), and the options. A parameter it gives
-    no fact keeps none, except that intj still measures the facts an `Assume`
-    leaves out (the KV pointers' and the index pointers' remaining ones)."""
+    `triton.compile` this replaced spelled out in its signature and attrs, and
+    the options. Each parameter compiles with exactly the facts listed
+    (`Exactly`: asserted, not measured; the caller promises them) and no
+    others, as the attrs entry stated; `NEVER` where the attrs had none."""
     gfx_version = get_gfx()
     is_gfx1250 = gfx_version == "gfx1250"
     # gfx942 uses the AMD fnuz e4m3 variant (*fp8e4b8); gfx950 and gfx1250 use
@@ -75,20 +75,17 @@ def _gluon_launch_keywords(Preshuffle, VarCtxOpt, is_padded_mode):
         tl.float8e4b8 if gfx_version == "gfx942" else tl.float8e4nv
     )
     i32 = Argument(type=tl.int32, specialize=NEVER)
-    i32_aligned = Argument(type=tl.int32, specialize=Assume(Aligned(16)))
+    i32_aligned = Argument(type=tl.int32, specialize=Exactly(Aligned(16)))
+    kv_facts = Exactly(Aligned(16)) if is_padded_mode else NEVER
     # The plain kernel forms per-token KV addresses from the page table, so
     # a cache past 2 GiB overflows a 32-bit stride product.
-    kv_stride = Argument(
-        type=tl.int32 if Preshuffle else tl.int64,
-        specialize=Assume(Aligned(16)) if is_padded_mode else NEVER,
-    )
-    kv_facts = Assume(Aligned(16)) if is_padded_mode else NEVER
+    kv_stride = Argument(type=tl.int32 if Preshuffle else tl.int64, specialize=kv_facts)
     annotation = {
         "batch_size": i32,
         "next_n": i32,
         "heads_num": i32_aligned,
         "Q_buffer": Argument(
-            type=fp8_ptr, specialize=Assume(Aligned(16), PointerRange(32))
+            type=fp8_ptr, specialize=Exactly(Aligned(16), PointerRange(32))
         ),
         "stride_q_batch": i32_aligned,
         "stride_q_next_n": i32_aligned,
@@ -98,14 +95,14 @@ def _gluon_launch_keywords(Preshuffle, VarCtxOpt, is_padded_mode):
         "scale_buffer": Argument(type=tl.pointer_type(tl.float32), specialize=kv_facts),
         "stride_scale_seq": kv_stride,
         "context_len_ptr": Argument(
-            type=tl.pointer_type(tl.int32), specialize=Assume(PointerRange(32))
+            type=tl.pointer_type(tl.int32), specialize=Exactly(PointerRange(32))
         ),
         "kv_indices": Argument(
-            type=tl.pointer_type(tl.int32), specialize=Assume(PointerRange(32))
+            type=tl.pointer_type(tl.int32), specialize=Exactly(PointerRange(32))
         ),
         "weights": Argument(
             type=tl.pointer_type(tl.float32),
-            specialize=Assume(Aligned(16), PointerRange(32)),
+            specialize=Exactly(Aligned(16), PointerRange(32)),
         ),
         "stride_w_batch": i32_aligned,
         # OutLogits_buffer: NO tt.pointer_range 32 -- the output row base

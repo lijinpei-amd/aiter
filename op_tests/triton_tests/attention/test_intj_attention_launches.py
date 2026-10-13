@@ -164,18 +164,20 @@ def test_pa_mqa_logits_launchers_carry_their_modes_keywords():
         assert options.options == keywords[mode]["options"], mode
 
 
-@pytest.mark.parametrize(
-    "mode",
-    list(_PA_MQA_LOGITS_MODES),
-    ids=lambda mode: "-".join(
-        name for name, on in zip(("preshuffle", "varctx", "padded"), mode) if on
+def _mode_id(mode):
+    return (
+        "-".join(
+            name for name, on in zip(("preshuffle", "varctx", "padded"), mode) if on
+        )
+        or "plain"
     )
-    or "plain",
-)
-@torch.inference_mode()
-def test_pa_mqa_logits_launches_each_mode_through_its_launcher(mode, monkeypatch):
-    """deepgemm_fp8_paged_mqa_logits picks the mode's launcher and matches
-    torch; the offset tests reach only three of the six modes."""
+
+
+def _launch_pa_mqa_logits_mode(mode, monkeypatch):
+    """Runs deepgemm_fp8_paged_mqa_logits once on `mode`'s inputs (2 sequences
+    of 2 tokens, 64 heads, the mode's page and token size). Returns the
+    launches it made, as (launcher key, returned kernel), and the output with
+    its torch reference."""
     from aiter import dtypes
     from aiter.jit.utils.chip_info import get_gfx
     from aiter.ops.shuffle import shuffle_weight
@@ -215,6 +217,10 @@ def test_pa_mqa_logits_launches_each_mode_through_its_launcher(mode, monkeypatch
             num_blocks, generator=g, device="cuda"
         )[:pages]
     context_lens = torch.tensor(context_lengths, dtype=torch.int32, device="cuda")
+    # Every pointer 16-byte aligned and under 2 GiB, so a fact the launcher
+    # measured instead of stating would show in what it compiled.
+    for t in (q, packed, weights, block_tables, context_lens):
+        assert t.data_ptr() % 16 == 0 and t.untyped_storage().nbytes() < 2**31
     schedule = (
         m.deepgemm_fp8_paged_mqa_logits_schedule(
             batch, next_n, context_lens, max_model_len
@@ -228,8 +234,9 @@ def test_pa_mqa_logits_launches_each_mode_through_its_launcher(mode, monkeypatch
     for key, launch in list(launchers.items()):
 
         def record(*args, key=key, launch=launch):
-            launched.append(key)
-            return launch(*args)
+            kernel = launch(*args)
+            launched.append((key, kernel))
+            return kernel
 
         monkeypatch.setitem(launchers, key, record)
     out = torch.full((batch * next_n, max_model_len), float("-inf"), device="cuda")
@@ -245,7 +252,6 @@ def test_pa_mqa_logits_launches_each_mode_through_its_launcher(mode, monkeypatch
         KVBlockSize=page,
         VarCtxSchedule=schedule,
     )
-    assert launched == [mode]
 
     reference = torch.full_like(out, float("-inf"))
     keys_all = kv.float() * scales[..., None]
@@ -257,4 +263,57 @@ def test_pa_mqa_logits_launches_each_mode_through_its_launcher(mode, monkeypatch
         query_positions = length - next_n + torch.arange(next_n, device="cuda")
         future = torch.arange(length, device="cuda") > query_positions[:, None]
         reference[rows, :length] = logits.masked_fill(future, float("-inf"))
+    return launched, out, reference
+
+
+@pytest.mark.parametrize("mode", list(_PA_MQA_LOGITS_MODES), ids=_mode_id)
+@torch.inference_mode()
+def test_pa_mqa_logits_launches_each_mode_through_its_launcher(mode, monkeypatch):
+    """deepgemm_fp8_paged_mqa_logits picks the mode's launcher and matches
+    torch; the offset tests reach only three of the six modes."""
+    launched, out, reference = _launch_pa_mqa_logits_mode(mode, monkeypatch)
+    assert [key for key, _ in launched] == [mode]
     torch.testing.assert_close(out, reference, rtol=1e-2, atol=1e-2)
+
+
+def _upstream_facts(padded):
+    """The facts per parameter of upstream's hand-written `triton.compile`
+    (874d253dd3 `_compile_deepgemm_fp8_paged_mqa_logits`'s attrs; the same in
+    every mode and arch but for the KV-padded four), nonempty ones only."""
+    d16, r32 = ("tt.divisibility", 16), ("tt.pointer_range", 32)
+    kv = {d16} if padded else set()
+    facts = {
+        "heads_num": {d16},
+        "Q_buffer": {d16, r32},
+        "stride_q_batch": {d16},
+        "stride_q_next_n": {d16},
+        "stride_q_heads": {d16},
+        "KV_buffer": kv,
+        "stride_k_seq": kv,
+        "scale_buffer": kv,
+        "stride_scale_seq": kv,
+        "context_len_ptr": {r32},
+        "kv_indices": {r32},
+        "weights": {d16, r32},
+        "stride_w_batch": {d16},
+    }
+    return {name: f for name, f in facts.items() if f}
+
+
+@pytest.mark.parametrize("mode", list(_PA_MQA_LOGITS_MODES), ids=_mode_id)
+@torch.inference_mode()
+def test_pa_mqa_logits_compiles_upstreams_facts(mode, monkeypatch):
+    """Each launcher compiles exactly the specialization facts upstream's
+    hand-written attrs stated, and none it measured: the binary is
+    upstream's. The inputs are aligned and small, so a launcher that left a
+    fact measured (an `Assume` where the attrs listed some facts, `AUTO`
+    where they listed none) would compile it here."""
+    launched, _, _ = _launch_pa_mqa_logits_mode(mode, monkeypatch)
+    ((_, kernel),) = launched
+    names = kernel.src.fn.arg_names
+    compiled = {
+        names[path[0]]: {tuple(fact) for fact in facts}
+        for path, facts in kernel.src.attrs.items()
+        if facts
+    }
+    assert compiled == _upstream_facts(padded=mode[2])
