@@ -39,6 +39,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._entry import (
 from aiter.ops.triton._gluon_kernels.gfx950.moe._frozen import (
     _validate_frozen_pipeline,
 )
+from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import compute_kernel_layout
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
     validate_pipeline as _validate_live_pipeline,
 )
@@ -281,7 +282,7 @@ def _probe_lds_bytes_uncached(cfg: dict, dq_a, dq_b) -> int:
     """LDS footprint of a candidate config, computed by the *aggregate* rather than by a
     second copy of the arithmetic -- the host and the device must not be able to
     disagree about whether a config fits."""
-    return _probe_tuning_config(cfg, dq_a, dq_b).lds_bytes()
+    return compute_kernel_layout(_probe_tuning_config(cfg, dq_a, dq_b)).lds_bytes()
 
 
 def _probe_tuning_config(cfg: dict, dq_a, dq_b):
@@ -304,13 +305,13 @@ def _probe_tuning_config(cfg: dict, dq_a, dq_b):
     return KernelTuningConfig(func, *_tuning_args(cfg))
 
 
-def _validate_selected_pipeline(tuning_cfg, K):
+def _validate_selected_pipeline(tuning_cfg, layout, K):
     validator = (
         _validate_frozen_pipeline
         if _cval(tuning_cfg.FROZEN_STEP)
         else _validate_live_pipeline
     )
-    return validator(tuning_cfg, K)
+    return validator(tuning_cfg, layout, K)
 
 
 @cache
@@ -318,7 +319,7 @@ def _pipeline_error(cfg_items: tuple, dq_a, dq_b, K):
     """Share the exact device ring and minimum-strip contract with host fallback."""
     try:
         tc = _probe_tuning_config(dict(cfg_items), dq_a, dq_b)
-        _validate_selected_pipeline(tc, K)
+        _validate_selected_pipeline(tc, compute_kernel_layout(tc), K)
     except AssertionError as error:
         return str(error)
     return None
@@ -1226,8 +1227,9 @@ def _launch_spec(
     # minimum K. Validate inherited depths and shape arithmetic now; validate the
     # complete effective configuration once preparation has resolved its layouts.
     tuning_cfg_host.validate_buffer_counts()
-    tuning_cfg_host.num_k_tiles(K)
-    grid_n = _cval(tuning_cfg_host.grid_N(N))
+    layout_host = compute_kernel_layout(tuning_cfg_host)
+    layout_host.num_k_tiles(K)
+    grid_n = _cval(layout_host.grid_N(N))
     # Keep each spec in one constexpr so launch specialization sees four leaves.
     constexpr_args = (
         gl.constexpr(func_spec),
@@ -1242,8 +1244,9 @@ def _launch_spec(
 @cache
 def _validate_launch_config(tuning_cfg, N, K):
     """Validate each cached effective layout once, before any kernel launch."""
-    tuning_cfg.validate(N, K)
-    return _validate_selected_pipeline(tuning_cfg, K)
+    layout = compute_kernel_layout(tuning_cfg)
+    tuning_cfg.validate(N, K, layout)
+    return _validate_selected_pipeline(tuning_cfg, layout, K)
 
 
 #: Attribute the padded-row token map is memoised under, on the ``ExptData`` instance.

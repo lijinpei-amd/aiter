@@ -17,6 +17,7 @@ from triton.experimental.gluon import language as gl
 from triton.language.core import _aggregate as aggregate
 
 from ._lang import (
+    WARP_SIZE,
     DotKind,
     DtypeQuant,
     EpilogueMode,
@@ -32,7 +33,17 @@ from ._lang import (
 from ._lang import (
     unwrap as _v,
 )
-from ._layout import LDS_USABLE_BYTES, _KernelFuncShape, _KernelTuningLayout
+from ._layout import (
+    LDS_USABLE_BYTES,
+    _calc_copy_contiguity,
+    _calc_epilogue_bias_per_thread,
+    _calc_epilogue_threads,
+    _calc_num_warps,
+    _calc_payload_lds_shape_slot,
+    _calc_scale_lds_shape_slot,
+    _KernelFuncShape,
+    compute_kernel_layout,
+)
 from ._types import COMPONENTS
 
 #: Re-exported for the host wrapper, which sizes candidate tiles against it.
@@ -212,9 +223,10 @@ class KernelFuncConfig(_KernelFuncShape):
 
 @aggregate
 @strip_annotate
-class KernelTuningConfig(_KernelTuningLayout):
-    """How the kernel *runs*. Holds the func config so the layout methods can see the
-    operand dtypes (an aggregate may hold another aggregate as a typed field).
+class KernelTuningConfig:
+    """How the kernel *runs*. Holds the func config so :func:`compute_kernel_layout`
+    can see the operand dtypes (an aggregate may hold another aggregate as a typed
+    field). Every derived shape and layout lives in the resulting ``KernelLayout``.
     """
 
     func_cfg: KernelFuncConfig
@@ -393,8 +405,129 @@ class KernelTuningConfig(_KernelTuningLayout):
             _v(self.A_SCALE_IN_REG if _v(operand) == 0 else self.B_SCALE_IN_REG)
         )
 
+    # -- storage placement and format decisions -------------------------------------
+    # Yes/no policy derived from the knobs above. The shapes they are decided on come
+    # from the pure ``_calc_*`` derivations in _layout.py; compute_kernel_layout in
+    # turn reads these to decide which layout objects exist for a build.
+
     @gluon.constexpr_function
-    def pipeline_register_period(self):
+    def scale_via_lds(self, idx):
+        """Whether an E8M0 scale tile can be written to LDS with a coalesced copy.
+
+        CDNA4 direct-to-LDS supports only 128-bit or 32-bit per lane and a warp must
+        write one contiguous run, so two tiles are excluded:
+
+        * smaller than ``64 lanes * 4 B`` -- cannot be lowered at all (the A-scale tile
+          at ``BLOCK_M == 16`` with a short ``BLOCK_K``);
+        * a row shorter than 8 scales (``BLOCK_K < 256``) -- one lane then owns a whole
+          row and the reg->shared map is more contiguous than the 32-bit access can
+          cover, which ``canLoadDirectToLDS`` rejects.
+
+        Both fall back to a register ``buffer_load`` straight into the scale fragment
+        layout. That is correct but costs an in-loop register-path global access, which
+        makes every ``wait_group`` conservative -- so the tuner should prefer a BLOCK_K
+        that keeps this True.
+        """
+        if self.scale_in_reg(idx):
+            return False
+        shape = _calc_scale_lds_shape_slot(self, idx)
+        if self.scale_shuffled(idx):
+            # Fragment-ordered in HBM, so the copy is linear and the LDS tile keeps the
+            # same permutation; the read is then a 32-bit ds_read. Staying on LDS also
+            # keeps the warp-broadcast B tile a single fetch rather than one per warp.
+            return True
+        return (
+            shape[0] * shape[1] >= WARP_SIZE * 4 and shape[1] % 4 == 0 and shape[1] >= 8
+        )
+
+    @gluon.constexpr_function
+    def payload_via_lds(self, idx):
+        """Whether the payload uses a 128-bit-per-lane direct copy through LDS.
+
+        Payload tiles that cannot give every wavefront one complete access stay in
+        the register ring. There is deliberately no register-to-LDS fallback.
+        """
+        if _v(idx) == 1 and _v(self.B_IN_REG):
+            return False
+        shape = _calc_payload_lds_shape_slot(self, idx)
+        vec = _calc_copy_contiguity(self, idx)
+        return shape[0] * shape[1] >= WARP_SIZE * vec * _calc_num_warps(self)
+
+    @gluon.constexpr_function
+    def component_via_lds(self, component):
+        """Resolved LDS placement for ``(operand, is_scale)``.
+
+        The component-level result includes both explicit register requests and
+        automatic layout fallbacks. Keep the payload/scale predicates above as the
+        narrow placement-policy implementations and use this method wherever pipeline
+        behavior depends on the resolved placement.
+        """
+        component = _v(component)
+        operand, is_scale = _v(component[0]), bool(_v(component[1]))
+        assert operand in (0, 1), "component operand must be 0 (A) or 1 (B)"
+        return (
+            self.scale_via_lds(operand) if is_scale else self.payload_via_lds(operand)
+        )
+
+    @gluon.constexpr_function
+    def component_in_reg(self, component):
+        """Resolved register placement; callers separately gate absent scales."""
+        return not self.component_via_lds(component)
+
+    @gluon.constexpr_function
+    def operand_preshuffled(self, idx):
+        """Is this operand's payload already blocked 16-column in HBM?
+
+        Never for A: the token rows are gathered per launch from the routing order, so
+        there is no static permutation to bake in. For B it is the ``B_PRESHUFFLED``
+        knob, which the caller honours by handing over the permuted weight tensor.
+        """
+        return _v(idx) == 1 and _v(self.B_PRESHUFFLED)
+
+    @gluon.constexpr_function
+    def sorted_shuffled_ok(self):
+        """Does this config produce the layout the C++ shuffle was written against?"""
+        # The permutation lives in the LDS tile's SharedLinearLayout, which is a
+        # property of the byte order the shuffle writes -- not of how warps are split.
+        # The warp arrangement is free. The shuffle always packs K256;
+        # a K128 payload stage selects one half.
+        return (
+            list(_v(self.mfma_instr_shape)) == [16, 16, 128]
+            and _v(self.BLOCK_M) % 32 == 0
+            # An M slot only has to be a whole number of 32-row stripes: the shuffle
+            # writes one 256 B run per stripe, so a slot is a contiguous slice.
+            and _v(self.MINI_BLOCK_M) % 32 == 0
+        )
+
+    @gluon.constexpr_function
+    def scale_shuffled(self, idx):
+        """Is this operand's scale tile already in MFMA fragment order in memory?"""
+        if not self.func_cfg.has_scale(idx):
+            return False
+        if _v(idx) == 0:
+            return _v(self.A_SCALE_SORTED_SHUFFLED)
+        return _v(self.B_SCALE_SHUFFLED)
+
+    @gluon.constexpr_function
+    def epilogue_inputs_via_lds(self):
+        """Whether bias/gamma vectors admit the supported direct-to-LDS copies."""
+        threads = _calc_epilogue_threads(self)
+        bpt = _calc_epilogue_bias_per_thread(self)
+        return (
+            threads >= _v(self.BLOCK_M)
+            and _v(self.BLOCK_N) % threads == 0
+            and bpt in (1, 4)
+        )
+
+    @gluon.constexpr_function
+    def quant_staging_rotates(self):
+        """Whether the fused-quant staging alternates two per-tile LDS banks."""
+        return (
+            _v(self.func_cfg.output_quant) is not None and not self.func_cfg.gu_split()
+        )
+
+    @gluon.constexpr_function
+    def pipeline_register_period(self, layout):
         """LCM of the active register rings; absent scales have no ring.
 
         ``_schedule.ring_restoration_period`` over direct-register components only.
@@ -409,7 +542,7 @@ class KernelTuningConfig(_KernelTuningLayout):
             if is_scale and not self.func_cfg.has_scale(operand):
                 continue
             if self.component_in_reg(component):
-                ratio = self.scale_ratio_k_step(operand) if is_scale else 1
+                ratio = layout.scale_ratio_k_step(operand) if is_scale else 1
                 period = math.lcm(
                     period, self.num_buffers(operand, is_scale) * ratio
                 )
@@ -498,9 +631,15 @@ class KernelTuningConfig(_KernelTuningLayout):
         return _v(self.WAIT_COMMIT_SCHEME) == int(WaitCommitScheme.PER_STAGE_WHOLE)
 
     @gluon.constexpr_function
-    def validate(self, N, K):
+    def validate(self, N, K, layout=None):
         """Every precondition the kernel body then assumes. Constexpr asserts, not
-        comments -- a violated one is either a miscompile or a silent over-read."""
+        comments -- a violated one is either a miscompile or a silent over-read.
+
+        ``layout`` is this config's :func:`compute_kernel_layout` result; a caller
+        that already holds it passes it in, anything else gets one computed here.
+        """
+        if _v(layout) is None:
+            layout = compute_kernel_layout(self)
         fc = self.func_cfg
         BK = _v(self.BLOCK_K)
 
@@ -516,11 +655,11 @@ class KernelTuningConfig(_KernelTuningLayout):
             int(SchedMode.MFMA_16),
             int(SchedMode.MFMA_8),
         ), f"SCHED_MODE {_v(self.SCHED_MODE)} is not a SchedMode"
-        self.validate_layout(N, K)
+        layout.validate(self, N, K)
 
         if not _v(self.UNROLL_EPILOGUE):
             for idx in (0, 1):
-                assert not fc.has_scale(idx) or self.scale_ratio_k_step(idx) == 1, (
+                assert not fc.has_scale(idx) or layout.scale_ratio_k_step(idx) == 1, (
                     "UNROLL_EPILOGUE=False requires every active scale to advance "
                     "once per payload step"
                 )
@@ -542,7 +681,7 @@ class KernelTuningConfig(_KernelTuningLayout):
             f"MANUAL {int(WarpPipeline.MANUAL)}"
         )
         if self.warp_pipeline_enabled():
-            assert self.num_prefetch_k_slots() == self.num_k_slots_per_tile(), (
+            assert layout.num_prefetch_k_slots() == layout.num_k_slots_per_tile(), (
                 f"WARP_PIPELINE needs VGPR_PREFETCH_K == BLOCK_K (got "
                 f"{_v(self.VGPR_PREFETCH_K)} vs {BK}): with a partial window the slot's "
                 "MFMAs depend on the slot's own ds_read and there is no mem stage to "
@@ -574,5 +713,5 @@ class KernelTuningConfig(_KernelTuningLayout):
             f"PER_STAGE_WHOLE {int(WaitCommitScheme.PER_STAGE_WHOLE)}"
         )
 
-        self.validate_layout_resources()
+        layout.validate_resources(self)
         return True

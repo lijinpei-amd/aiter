@@ -28,6 +28,7 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.language.core import _aggregate as aggregate
+from triton.language.core import base_value
 
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.common_utils import strip_annotate
@@ -49,11 +50,12 @@ from ._types import COMPONENTS, DotKind, TileSched
 # change to the live fill order, the live depth/unroll signatures, or the live
 # ownership representation silently reshaped the frozen schedule too.
 #
-# These read only tuning accessors that are part of the stable config surface --
-# ``num_buffers``, ``scale_ratio_k_step``, ``func_cfg.has_scale``, ``K_UNROLL`` -- plus
-# ``COMPONENTS``. ``test_moe_gemm_gluon_frozen.py`` asserts each twin still agrees with
-# its live counterpart, so drift is caught in the tests rather than prevented by a
-# source dependency.
+# These read only accessors that are part of the stable config surface --
+# ``num_buffers``, ``func_cfg.has_scale``, ``K_UNROLL`` on the tuning config and
+# ``scale_ratio_k_step`` on the layout the caller passes in -- plus ``COMPONENTS``.
+# ``test_moe_gemm_gluon_frozen.py`` asserts each twin still agrees with its live
+# counterpart, so drift is caught in the tests rather than prevented by a source
+# dependency.
 # ------------------------------------------------------------------------------
 @gluon.constexpr_function
 def _present_frozen(tc, component):
@@ -67,31 +69,31 @@ def _component_depth_frozen(tc, component):
 
 
 @gluon.constexpr_function
-def _component_ratio_frozen(tc, component):
+def _component_ratio_frozen(tc, layout, component):
     operand, is_scale = component[0], component[1]
-    return tc.scale_ratio_k_step(operand) if _v(is_scale) else 1
+    return layout.scale_ratio_k_step(operand) if _v(is_scale) else 1
 
 
 @gluon.constexpr_function
-def _live_span_frozen(tc, component):
+def _live_span_frozen(tc, layout, component):
     """Baseline inclusive lifetime ``L(c)`` in payload K steps."""
     return (
         _component_depth_frozen(tc, component) - 1
-    ) * _component_ratio_frozen(tc, component) + 1
+    ) * _component_ratio_frozen(tc, layout, component) + 1
 
 
 @gluon.constexpr_function
-def pipeline_depth_frozen(tc):
+def pipeline_depth_frozen(tc, layout):
     """Largest prefetch span, measured in payload steps, of active components."""
     depth = 0
     for component in COMPONENTS:
         if _present_frozen(tc, component):
-            depth = max(depth, _live_span_frozen(tc, component))
+            depth = max(depth, _live_span_frozen(tc, layout, component))
     return depth
 
 
 @gluon.constexpr_function
-def pipeline_unroll_frozen(tc):
+def pipeline_unroll_frozen(tc, layout):
     """LCM of the requested unroll and every active component ring period."""
     requested = _v(tc.K_UNROLL)
     assert requested >= 1, "K_UNROLL must be at least 1"
@@ -101,7 +103,7 @@ def pipeline_unroll_frozen(tc):
             period = math.lcm(
                 period,
                 _component_depth_frozen(tc, component)
-                * _component_ratio_frozen(tc, component),
+                * _component_ratio_frozen(tc, layout, component),
             )
     return period
 
@@ -148,11 +150,12 @@ _NO_SCALE: gl.constexpr = gl.constexpr(None)
 # tiles -- and that is why the frozen arm no longer compiles under the benchmarked
 # flag set. Sharing the live helpers is what let a live change reach in here.
 #
-# The tuning-configuration *methods* these call (num_m_slots_per_block,
-# scale_hbm_offset_layout, ...) stay shared. They cannot be vendored, since the host
-# constructs the aggregate, and they are the stable accessor surface rather than the
-# part that churns. test_moe_gemm_gluon_frozen.py asserts these twins still agree
-# with their live counterparts.
+# The layout accessors these call (num_m_slots_per_block, scale_hbm_offset_layout,
+# ...) stay shared. They read the ``KernelLayout`` the entry point computes and passes
+# in, which this module never imports -- the accessors are the stable surface rather
+# than the part that churns. Aggregates here type that field as ``base_value`` for the
+# same reason. test_moe_gemm_gluon_frozen.py asserts these twins still agree with
+# their live counterparts.
 # ------------------------------------------------------------------------------
 
 @gluon.constexpr_function
@@ -350,13 +353,15 @@ def _shuffled_scale_register_offsets_frozen(
 
 
 @gluon.jit
-def _a_payload_hbm_offsets_frozen(a, rt, block_id, M_e, start_m, func_cfg, tuning_cfg):
+def _a_payload_hbm_offsets_frozen(
+    a, rt, block_id, M_e, start_m, func_cfg, tuning_cfg, layout
+):
     """Gathered A payload offsets, one copy-layout grid per M slot."""
     M_BLOCK: gl.constexpr = tuning_cfg.BLOCK_M
     M_SLOT: gl.constexpr = tuning_cfg.MINI_BLOCK_M
-    NUM_M_SLOTS_PER_BLOCK: gl.constexpr = tuning_cfg.num_m_slots_per_block()
-    PAYLOAD_BLOCK_K_STORAGE: gl.constexpr = tuning_cfg.payload_block_k_storage(0)
-    layout_a_slot: gl.constexpr = tuning_cfg.payload_hbm_offset_layout(0)
+    NUM_M_SLOTS_PER_BLOCK: gl.constexpr = layout.num_m_slots_per_block()
+    PAYLOAD_BLOCK_K_STORAGE: gl.constexpr = layout.payload_block_k_storage(0)
+    layout_a_slot: gl.constexpr = layout.payload_hbm_offset_layout(0)
     a_hbm_offsets_block = ()
     for m_slot_idx in gl.static_range(NUM_M_SLOTS_PER_BLOCK):
         rows_a_slot = _gather_rows_frozen(
@@ -383,12 +388,12 @@ def _a_payload_hbm_offsets_frozen(a, rt, block_id, M_e, start_m, func_cfg, tunin
 
 
 @gluon.jit
-def _b_payload_hbm_offsets_frozen(b, pid_n, N, K, func_cfg, tuning_cfg):
+def _b_payload_hbm_offsets_frozen(b, pid_n, N, K, func_cfg, tuning_cfg, layout):
     """B payload offsets for plain or preshuffled weights, one grid per N slot."""
     N_SLOT: gl.constexpr = tuning_cfg.MINI_BLOCK_N
-    NUM_N_SLOTS_PER_BLOCK: gl.constexpr = tuning_cfg.num_n_slots_per_block()
-    PAYLOAD_BLOCK_K_STORAGE: gl.constexpr = tuning_cfg.payload_block_k_storage(1)
-    layout_b_slot: gl.constexpr = tuning_cfg.payload_hbm_offset_layout(1)
+    NUM_N_SLOTS_PER_BLOCK: gl.constexpr = layout.num_n_slots_per_block()
+    PAYLOAD_BLOCK_K_STORAGE: gl.constexpr = layout.payload_block_k_storage(1)
+    layout_b_slot: gl.constexpr = layout.payload_hbm_offset_layout(1)
     K_STORAGE: gl.constexpr = K // func_cfg.b_pack_divisor()
     b_hbm_offsets_block = ()
     for n_slot_idx in gl.static_range(NUM_N_SLOTS_PER_BLOCK):
@@ -421,7 +426,9 @@ def _b_payload_hbm_offsets_frozen(b, pid_n, N, K, func_cfg, tuning_cfg):
 
 
 @gluon.jit
-def _a_scale_hbm_offsets_frozen(a, rt, block_id, M_e, start_m, pid_m, K, func_cfg, tuning_cfg):
+def _a_scale_hbm_offsets_frozen(
+    a, rt, block_id, M_e, start_m, pid_m, K, func_cfg, tuning_cfg, layout
+):
     """Byte offsets of the A-scale grids, one per M slot (``None`` if unscaled).
 
     Two shapes, picked by ``A_SCALE_SORTED_SHUFFLED``: a flat run into the
@@ -434,12 +441,12 @@ def _a_scale_hbm_offsets_frozen(a, rt, block_id, M_e, start_m, pid_m, K, func_cf
 
     M_BLOCK: gl.constexpr = tuning_cfg.BLOCK_M
     M_SLOT: gl.constexpr = tuning_cfg.MINI_BLOCK_M
-    NUM_M_SLOTS_PER_BLOCK: gl.constexpr = tuning_cfg.num_m_slots_per_block()
-    SCALE_BLOCK_K_STORAGE: gl.constexpr = tuning_cfg.scale_block_k_storage()
-    layout_a_scale_slot: gl.constexpr = tuning_cfg.scale_hbm_offset_layout(0)
-    SCALE_M: gl.constexpr = tuning_cfg.scale_mini_block_nonk(0)
-    SCALE_K: gl.constexpr = tuning_cfg.scale_mini_block_k(0)
-    SCALE_RATIO: gl.constexpr = tuning_cfg.scale_ratio_non_k_slot(0)
+    NUM_M_SLOTS_PER_BLOCK: gl.constexpr = layout.num_m_slots_per_block()
+    SCALE_BLOCK_K_STORAGE: gl.constexpr = layout.scale_block_k_storage()
+    layout_a_scale_slot: gl.constexpr = layout.scale_hbm_offset_layout(0)
+    SCALE_M: gl.constexpr = layout.scale_mini_block_nonk(0)
+    SCALE_K: gl.constexpr = layout.scale_mini_block_k(0)
+    SCALE_RATIO: gl.constexpr = layout.scale_ratio_non_k_slot(0)
 
     if require_constexpr(
         tuning_cfg.scale_shuffled(0) and not tuning_cfg.scale_via_lds(0)
@@ -453,7 +460,7 @@ def _a_scale_hbm_offsets_frozen(a, rt, block_id, M_e, start_m, pid_m, K, func_cf
                     SCALE_M,
                     SCALE_K // 32,
                     K,
-                    tuning_cfg.scale_packed_ok(0),
+                    layout.scale_packed_ok(0),
                 ),
             )
     elif require_constexpr(tuning_cfg.A_SCALE_SORTED_SHUFFLED):
@@ -482,7 +489,7 @@ def _a_scale_hbm_offsets_frozen(a, rt, block_id, M_e, start_m, pid_m, K, func_cf
         # m_slot_idx * (M_SLOT // 32) stripes into this pid_m's chunk.
         # Slots sharing a scale mini block get the same base
         # offsets; only the owner actually issues the copy.
-        SCALE_FILL_SHAPE: gl.constexpr = tuning_cfg.scale_flat_shape(0)
+        SCALE_FILL_SHAPE: gl.constexpr = layout.scale_flat_shape(0)
         a_scale_hbm_offsets_block = ()
         for m_slot_idx in gl.static_range(NUM_M_SLOTS_PER_BLOCK):
             a_scale_hbm_offsets_block = a_scale_hbm_offsets_block + (
@@ -521,7 +528,7 @@ def _a_scale_hbm_offsets_frozen(a, rt, block_id, M_e, start_m, pid_m, K, func_cf
 
 
 @gluon.jit
-def _b_scale_hbm_offsets_frozen(b, pid_n, N, K, func_cfg, tuning_cfg):
+def _b_scale_hbm_offsets_frozen(b, pid_n, N, K, func_cfg, tuning_cfg, layout):
     """Byte offsets of the B-scale grids, one per N slot (``None`` if unscaled).
 
     Either a flat CDNA4_SCALE preshuffle run for staging or the raw ``(K/32, N)``
@@ -531,12 +538,12 @@ def _b_scale_hbm_offsets_frozen(b, pid_n, N, K, func_cfg, tuning_cfg):
         return _NO_SCALE
 
     N_SLOT: gl.constexpr = tuning_cfg.MINI_BLOCK_N
-    NUM_N_SLOTS_PER_BLOCK: gl.constexpr = tuning_cfg.num_n_slots_per_block()
-    SCALE_BLOCK_K_STORAGE: gl.constexpr = tuning_cfg.scale_block_k_storage()
-    layout_b_scale_slot: gl.constexpr = tuning_cfg.scale_hbm_offset_layout(1)
-    SCALE_N: gl.constexpr = tuning_cfg.scale_mini_block_nonk(1)
-    SCALE_K: gl.constexpr = tuning_cfg.scale_mini_block_k(1)
-    SCALE_RATIO: gl.constexpr = tuning_cfg.scale_ratio_non_k_slot(1)
+    NUM_N_SLOTS_PER_BLOCK: gl.constexpr = layout.num_n_slots_per_block()
+    SCALE_BLOCK_K_STORAGE: gl.constexpr = layout.scale_block_k_storage()
+    layout_b_scale_slot: gl.constexpr = layout.scale_hbm_offset_layout(1)
+    SCALE_N: gl.constexpr = layout.scale_mini_block_nonk(1)
+    SCALE_K: gl.constexpr = layout.scale_mini_block_k(1)
+    SCALE_RATIO: gl.constexpr = layout.scale_ratio_non_k_slot(1)
     SPLIT_EXTENT: gl.constexpr = (
         N_SLOT if func_cfg.gu_split() and SCALE_RATIO > 1 else 0
     )
@@ -559,7 +566,7 @@ def _b_scale_hbm_offsets_frozen(b, pid_n, N, K, func_cfg, tuning_cfg):
                     SCALE_N,
                     SCALE_K // 32,
                     K,
-                    tuning_cfg.scale_packed_ok(1),
+                    layout.scale_packed_ok(1),
                     SPLIT_EXTENT,
                     N // 2,
                 ),
@@ -572,7 +579,7 @@ def _b_scale_hbm_offsets_frozen(b, pid_n, N, K, func_cfg, tuning_cfg):
         # offline -- the weights are static, so this costs nothing at run time.
         # One tile per N slot; stripes are contiguous, so slot n_slot_idx starts
         # n_slot_idx * (N_SLOT // 32) stripes into this pid_n's run.
-        SCALE_FILL_SHAPE: gl.constexpr = tuning_cfg.scale_flat_shape(1)
+        SCALE_FILL_SHAPE: gl.constexpr = layout.scale_flat_shape(1)
         b_scale_hbm_offsets_block = ()
         for n_slot_idx in gl.static_range(NUM_N_SLOTS_PER_BLOCK):
             b_scale_hbm_offsets_block = b_scale_hbm_offsets_block + (
@@ -615,29 +622,39 @@ def _b_scale_hbm_offsets_frozen(b, pid_n, N, K, func_cfg, tuning_cfg):
     return b_scale_hbm_offsets_block
 
 
-
 @gluon.constexpr_function
-def _packed_sel(tuning_cfg, idx, k_phase=0):
+def _packed_sel(tuning_cfg, layout, idx, k_phase=0):
     """The frozen K256 selector for an LDS-staged packed scale operand."""
-    if tuning_cfg.scale_packed_ok(idx) and tuning_cfg.scale_via_lds(idx):
-        return tuning_cfg.scale_packed_sel(idx, k_phase)
+    if layout.scale_packed_ok(idx) and tuning_cfg.scale_via_lds(idx):
+        return layout.scale_packed_sel(idx, k_phase)
     return None
 
 
 @gluon.constexpr_function
-def _any_packed(tuning_cfg):
+def _any_packed(tuning_cfg, layout):
     return (
-        _packed_sel(tuning_cfg, 0) is not None or _packed_sel(tuning_cfg, 1) is not None
+        _packed_sel(tuning_cfg, layout, 0) is not None
+        or _packed_sel(tuning_cfg, layout, 1) is not None
     )
 
 
 @gluon.jit
-def _dot(a, a_scale, b, b_scale, acc, func_cfg, tuning_cfg, K_PHASE: gl.constexpr = 0):
+def _dot(
+    a,
+    a_scale,
+    b,
+    b_scale,
+    acc,
+    func_cfg,
+    tuning_cfg,
+    layout,
+    K_PHASE: gl.constexpr = 0,
+):
     """The frozen snapshot's matrix-instruction dispatch."""
     kind: gl.constexpr = func_cfg.dot_kind()
-    a_sel: gl.constexpr = _packed_sel(tuning_cfg, 0, K_PHASE)
-    b_sel: gl.constexpr = _packed_sel(tuning_cfg, 1, K_PHASE)
-    any_packed: gl.constexpr = _any_packed(tuning_cfg)
+    a_sel: gl.constexpr = _packed_sel(tuning_cfg, layout, 0, K_PHASE)
+    b_sel: gl.constexpr = _packed_sel(tuning_cfg, layout, 1, K_PHASE)
+    any_packed: gl.constexpr = _any_packed(tuning_cfg, layout)
     if require_constexpr(kind == _DK_MFMA_SCALED and any_packed):
         out = gl.amd.cdna4.mfma_scaled_packed(
             a=a,
@@ -693,6 +710,7 @@ def _maybe_block_dot(
     N_MINI: gl.constexpr,
     func_cfg,
     tuning_cfg,
+    layout,
     DO_MFMA: gl.constexpr,
     K_PHASE: gl.constexpr = 0,
 ):
@@ -714,6 +732,7 @@ def _maybe_block_dot(
                 acc,
                 func_cfg,
                 tuning_cfg,
+                layout,
                 (K_PHASE + i * tuning_cfg.BLOCK_K // 128) % 2,
             )
     return acc
@@ -744,6 +763,7 @@ class _FrozenLDSManager:
 
     func_cfg: KernelFuncConfig
     tuning_cfg: KernelTuningConfig
+    layout: base_value
     a_payload_lds_ptr: gl.shared_memory_descriptor | gl.constexpr
     a_scale_lds_ptr: gl.shared_memory_descriptor | gl.constexpr
     b_payload_lds_ptr: gl.shared_memory_descriptor | gl.constexpr
@@ -754,6 +774,7 @@ class _FrozenLDSManager:
         self,
         func_cfg,
         tuning_cfg,
+        layout,
         a_payload_lds_ptr,
         a_scale_lds_ptr,
         b_payload_lds_ptr,
@@ -761,29 +782,30 @@ class _FrozenLDSManager:
     ):
         self.func_cfg = func_cfg
         self.tuning_cfg = tuning_cfg
+        self.layout = layout
         self.a_payload_lds_ptr = _opt(a_payload_lds_ptr)
         self.a_scale_lds_ptr = _opt(a_scale_lds_ptr)
         self.b_payload_lds_ptr = _opt(b_payload_lds_ptr)
         self.b_scale_lds_ptr = _opt(b_scale_lds_ptr)
 
     @gluon.jit
-    def alloc(func_cfg, tuning_cfg):
+    def alloc(func_cfg, tuning_cfg, layout):
         NBA: gl.constexpr = tuning_cfg.num_buffers(0)
         NBB: gl.constexpr = tuning_cfg.num_buffers(1)
         NBAS: gl.constexpr = tuning_cfg.num_buffers(0, True)
         NBBS: gl.constexpr = tuning_cfg.num_buffers(1, True)
-        NMA: gl.constexpr = tuning_cfg.num_lds_slots_per_block_non_k(0)
-        NMB: gl.constexpr = tuning_cfg.num_lds_slots_per_block_non_k(1)
+        NMA: gl.constexpr = layout.num_lds_slots_per_block_non_k(0)
+        NMB: gl.constexpr = layout.num_lds_slots_per_block_non_k(1)
         a_ty: gl.constexpr = func_cfg.operand_elem_ty(0)
         b_ty: gl.constexpr = func_cfg.operand_elem_ty(1)
-        a_shape: gl.constexpr = tuning_cfg.payload_lds_shape_slot(0)
-        b_shape: gl.constexpr = tuning_cfg.payload_lds_shape_slot(1)
+        a_shape: gl.constexpr = layout.payload_lds_shape_slot(0)
+        b_shape: gl.constexpr = layout.payload_lds_shape_slot(1)
 
         if require_constexpr(tuning_cfg.payload_via_lds(0)):
             a_payload_lds_ptr = gl.allocate_shared_memory(
                 a_ty,
                 [NBA * NMA, a_shape[0], a_shape[1]],
-                layout=tuning_cfg.dot_operand_lds_layout(0),
+                layout=layout.dot_operand_lds_layout(0),
             )
         else:
             a_payload_lds_ptr: gl.constexpr = None
@@ -791,40 +813,39 @@ class _FrozenLDSManager:
             b_payload_lds_ptr = gl.allocate_shared_memory(
                 b_ty,
                 [NBB * NMB, b_shape[0], b_shape[1]],
-                layout=tuning_cfg.dot_operand_lds_layout(1),
+                layout=layout.dot_operand_lds_layout(1),
             )
         else:
             b_payload_lds_ptr: gl.constexpr = None
         if require_constexpr(func_cfg.has_scale(0)):
-            as_shape: gl.constexpr = tuning_cfg.scale_lds_shape_slot(0)
+            as_shape: gl.constexpr = layout.scale_lds_shape_slot(0)
             if require_constexpr(tuning_cfg.scale_shuffled(0)):
                 a_scale_lds_ptr = gl.allocate_shared_memory(
                     gl.uint8,
-                    [NBAS * tuning_cfg.num_scale_tiles(0)]
-                    + tuning_cfg.scale_flat_shape(0),
-                    layout=tuning_cfg.dot_operand_scale_lds_layout(0),
+                    [NBAS * layout.num_scale_tiles(0)] + layout.scale_flat_shape(0),
+                    layout=layout.dot_operand_scale_lds_layout(0),
                 )
             else:
                 a_scale_lds_ptr = gl.allocate_shared_memory(
                     gl.uint8,
                     [NBAS * NMA, as_shape[0], as_shape[1]],
-                    layout=tuning_cfg.dot_operand_scale_lds_layout(0),
+                    layout=layout.dot_operand_scale_lds_layout(0),
                 )
         else:
             a_scale_lds_ptr: gl.constexpr = None
         if require_constexpr(func_cfg.has_scale(1)):
-            bs_shape: gl.constexpr = tuning_cfg.scale_lds_shape_slot(1)
+            bs_shape: gl.constexpr = layout.scale_lds_shape_slot(1)
             if require_constexpr(tuning_cfg.scale_shuffled(1)):
                 b_scale_lds_ptr = gl.allocate_shared_memory(
                     gl.uint8,
-                    [NBBS * NMB] + tuning_cfg.scale_flat_shape(1),
-                    layout=tuning_cfg.dot_operand_scale_lds_layout(1),
+                    [NBBS * NMB] + layout.scale_flat_shape(1),
+                    layout=layout.dot_operand_scale_lds_layout(1),
                 )
             else:
                 b_scale_lds_ptr = gl.allocate_shared_memory(
                     gl.uint8,
                     [NBBS * NMB, bs_shape[0], bs_shape[1]],
-                    layout=tuning_cfg.dot_operand_scale_lds_layout(1),
+                    layout=layout.dot_operand_scale_lds_layout(1),
                 )
         else:
             b_scale_lds_ptr: gl.constexpr = None
@@ -832,6 +853,7 @@ class _FrozenLDSManager:
         return _FrozenLDSManager(
             func_cfg,
             tuning_cfg,
+            layout,
             a_payload_lds_ptr,
             a_scale_lds_ptr,
             b_payload_lds_ptr,
@@ -850,6 +872,7 @@ class _FrozenLDSManager:
         SOFF: gl.constexpr = 0,
     ):
         cfg: gl.constexpr = self.tuning_cfg
+        layout: gl.constexpr = self.layout
         gl.static_assert(VIA_LDS)
         if require_constexpr(operand == 0):
             lds_ptr = self.a_payload_lds_ptr
@@ -860,7 +883,7 @@ class _FrozenLDSManager:
         )
         _buffer_load_to_lds(
             lds_ptr.index(
-                BUFFER_LOAD_IDX * cfg.num_lds_slots_per_block_non_k(operand) + tile
+                BUFFER_LOAD_IDX * layout.num_lds_slots_per_block_non_k(operand) + tile
             ),
             hbm_ptr,
             hbm_offs,
@@ -881,8 +904,9 @@ class _FrozenLDSManager:
         K_PHASE=0,
     ):
         cfg: gl.constexpr = self.tuning_cfg
+        layout: gl.constexpr = self.layout
         gl.static_assert(VIA_LDS)
-        ratio: gl.constexpr = cfg.scale_ratio_non_k_slot(operand)
+        ratio: gl.constexpr = layout.scale_ratio_non_k_slot(operand)
         if require_constexpr(
             self.func_cfg.has_scale(operand)
             and cfg.scale_via_lds(operand)
@@ -900,7 +924,7 @@ class _FrozenLDSManager:
             _buffer_load_to_lds(
                 lds_ptr.index(
                     BUFFER_LOAD_IDX
-                    * (cfg.num_lds_slots_per_block_non_k(operand) // ratio)
+                    * (layout.num_lds_slots_per_block_non_k(operand) // ratio)
                     + tile // ratio
                 ),
                 hbm_ptr,
@@ -929,8 +953,9 @@ class _FrozenLDSManager:
         pack: gl.constexpr,
     ):
         cfg: gl.constexpr = self.tuning_cfg
+        layout: gl.constexpr = self.layout
         tile_lds_ptr = lds_ptr.index(DS_READ_IDX * n_tiles + tile)
-        if require_constexpr(cfg.num_k_slots_per_tile() > 1):
+        if require_constexpr(layout.num_k_slots_per_tile() > 1):
             width: gl.constexpr = cfg.BLOCK_K // pack
             tile_lds_ptr = tile_lds_ptr.slice(mini_idx * width, width, dim=k_dim)
         return tile_lds_ptr
@@ -945,8 +970,9 @@ class _FrozenLDSManager:
         mini_idx: gl.constexpr,
     ):
         cfg: gl.constexpr = self.tuning_cfg
+        layout: gl.constexpr = self.layout
         tile_lds_ptr = lds_ptr.index(DS_READ_IDX * n_tiles + tile)
-        if require_constexpr(cfg.num_k_slots_per_tile() > 1):
+        if require_constexpr(layout.num_k_slots_per_tile() > 1):
             width: gl.constexpr = cfg.BLOCK_K // MX_GROUP
             tile_lds_ptr = tile_lds_ptr.slice(mini_idx * width, width, dim=1)
         return tile_lds_ptr
@@ -954,9 +980,10 @@ class _FrozenLDSManager:
     @gluon.jit
     def _a_scale_tile(self, DS_READ_IDX, mi: gl.constexpr):
         cfg: gl.constexpr = self.tuning_cfg
-        RA: gl.constexpr = cfg.scale_ratio_non_k_slot(0)
+        layout: gl.constexpr = self.layout
+        RA: gl.constexpr = layout.scale_ratio_non_k_slot(0)
         tile_lds_ptr = self.a_scale_lds_ptr.index(
-            DS_READ_IDX * (cfg.num_lds_slots_per_block_non_k(0) // RA) + mi // RA
+            DS_READ_IDX * (layout.num_lds_slots_per_block_non_k(0) // RA) + mi // RA
         )
         if require_constexpr(RA > 1):
             stripes: gl.constexpr = cfg.MINI_BLOCK_M // 32
@@ -974,7 +1001,7 @@ class _FrozenLDSManager:
         READ_SCALE: gl.constexpr = True,
         SCALE_READ_IDX=None,
     ):
-        cfg: gl.constexpr = self.tuning_cfg
+        layout: gl.constexpr = self.layout
         if require_constexpr(operand == 0):
             payload_lds_ptr = self.a_payload_lds_ptr
             scale_lds_ptr = self.a_scale_lds_ptr
@@ -990,52 +1017,52 @@ class _FrozenLDSManager:
                 self._payload_slice(
                     payload_lds_ptr,
                     DS_READ_IDX,
-                    cfg.num_lds_slots_per_block_non_k(operand),
+                    layout.num_lds_slots_per_block_non_k(operand),
                     tile,
                     mini_idx,
                     1 - operand,
                     self.func_cfg.pack_divisor(operand),
                 ),
-                cfg.dot_operand_fragment_layout(operand),
+                layout.dot_operand_fragment_layout(operand),
             )
         if require_constexpr(READ_SCALE and self.func_cfg.has_scale(operand)):
-            gl.static_assert(cfg.scale_via_lds(operand))
-            if require_constexpr(cfg.scale_shuffled(operand)):
+            gl.static_assert(self.tuning_cfg.scale_via_lds(operand))
+            if require_constexpr(self.tuning_cfg.scale_shuffled(operand)):
                 if require_constexpr(operand == 0):
                     scale_tile_lds_ptr = self._a_scale_tile(SCALE_READ_IDX, tile)
                 else:
                     scale_tile_lds_ptr = scale_lds_ptr.index(
-                        SCALE_READ_IDX * cfg.num_lds_slots_per_block_non_k(operand)
+                        SCALE_READ_IDX * layout.num_lds_slots_per_block_non_k(operand)
                         + tile
                     )
-            if require_constexpr(cfg.scale_packed_ok(operand)):
+            if require_constexpr(layout.scale_packed_ok(operand)):
                 scale_val = _ds_read(
                     scale_tile_lds_ptr.reinterpret(
                         gl.int32,
-                        cfg.packed_scale_shape(operand),
-                        cfg.packed_scale_read_layout(operand),
+                        layout.packed_scale_shape(operand),
+                        layout.packed_scale_read_layout(operand),
                     ),
-                    cfg.packed_scale_frag_layout(operand),
+                    layout.packed_scale_frag_layout(operand),
                 )
-            elif require_constexpr(cfg.scale_shuffled(operand)):
+            elif require_constexpr(self.tuning_cfg.scale_shuffled(operand)):
                 scale_val = _ds_read(
                     scale_tile_lds_ptr.reinterpret(
                         gl.uint8,
-                        cfg.scale_lds_shape_slot(operand),
-                        cfg.shuffled_scale_read_layout(operand),
+                        layout.scale_lds_shape_slot(operand),
+                        layout.shuffled_scale_read_layout(operand),
                     ),
-                    cfg.dot_operand_scale_fragment_layout(operand),
+                    layout.dot_operand_scale_fragment_layout(operand),
                 )
             else:
                 scale_val = _ds_read(
                     self._scale_slice(
                         scale_lds_ptr,
                         SCALE_READ_IDX,
-                        cfg.num_lds_slots_per_block_non_k(operand),
+                        layout.num_lds_slots_per_block_non_k(operand),
                         tile,
                         mini_idx,
                     ),
-                    cfg.dot_operand_scale_fragment_layout(operand),
+                    layout.dot_operand_scale_fragment_layout(operand),
                 )
         else:
             scale_val: gl.constexpr = None
@@ -1057,6 +1084,7 @@ class _PipelineConst:
     s_step: gl.constexpr
     func_cfg: KernelFuncConfig
     tuning_cfg: KernelTuningConfig
+    layout: base_value
 
     @gluon.constexpr_function
     def __init__(
@@ -1073,6 +1101,7 @@ class _PipelineConst:
         s_step,
         func_cfg,
         tuning_cfg,
+        layout,
     ):
         self.lds_ptrs = lds_ptrs
         self.a_hbm_offs = a_hbm_offs
@@ -1086,6 +1115,7 @@ class _PipelineConst:
         self.s_step = gl.constexpr(_v(s_step))
         self.func_cfg = func_cfg
         self.tuning_cfg = tuning_cfg
+        self.layout = layout
 
 
 @aggregate
@@ -1151,14 +1181,14 @@ def _advance_hbm_ptrs(pc, hbm_ptrs, STEPS: gl.constexpr = 1, K_PHASE: gl.constex
     if require_constexpr(pc.func_cfg.a_has_scale() and pc.tuning_cfg.scale_via_lds(0)):
         a_scale_hbm_ptr = (
             a_scale_hbm_ptr
-            + pc.tuning_cfg.scale_hbm_steps(0, STEPS, K_PHASE)
+            + pc.layout.scale_hbm_steps(0, STEPS, K_PHASE)
             * pc.s_step
             * pc.a_scale_stride_k
         )
     if require_constexpr(pc.func_cfg.b_has_scale() and pc.tuning_cfg.scale_via_lds(1)):
         b_scale_hbm_ptr = (
             b_scale_hbm_ptr
-            + pc.tuning_cfg.scale_hbm_steps(1, STEPS, K_PHASE)
+            + pc.layout.scale_hbm_steps(1, STEPS, K_PHASE)
             * pc.s_step
             * pc.b_scale_stride_k
         )
@@ -1182,9 +1212,10 @@ def _frozen_prologue_fence():
 def _prologue_frozen(pc, hbm_ptrs):
     """Fill NB-1 buffers, then retain the snapshot's whole-buffer wait and fence."""
     tc: gl.constexpr = pc.tuning_cfg
+    layout: gl.constexpr = pc.layout
     NB: gl.constexpr = tc.NUM_LDS_BUFFER
-    NM: gl.constexpr = tc.num_m_slots_per_block()
-    NN: gl.constexpr = tc.num_n_slots_per_block()
+    NM: gl.constexpr = layout.num_m_slots_per_block()
+    NN: gl.constexpr = layout.num_n_slots_per_block()
     for i in gl.static_range(NB - 1):
         for ni in gl.static_range(NN):
             for mi in gl.static_range(NM):
@@ -1200,7 +1231,7 @@ def _prologue_frozen(pc, hbm_ptrs):
                 )
                 if require_constexpr(mi == NM - 1 and ni == NN - 1):
                     hbm_ptrs = _advance_hbm_ptrs(
-                        pc, hbm_ptrs, K_PHASE=tc.scale_k_phase(i)
+                        pc, hbm_ptrs, K_PHASE=layout.scale_k_phase(i)
                     )
     pc.lds_ptrs.wait_buffer_load_groups((NB - 2) * (NM + NN))
     _frozen_prologue_fence()
@@ -1404,8 +1435,8 @@ def _buffer_load_frozen(
     slot's wait is exactly what breaks that.
     """
     func_cfg: gl.constexpr = pc.func_cfg
-    NM: gl.constexpr = pc.tuning_cfg.num_m_slots_per_block()
-    NN: gl.constexpr = pc.tuning_cfg.num_n_slots_per_block()
+    NM: gl.constexpr = pc.layout.num_m_slots_per_block()
+    NN: gl.constexpr = pc.layout.num_n_slots_per_block()
     # Under the even schedule the slot owns at most one fill, named by its position in
     # _buffer_load_order_frozen; under the legacy one the (ni == 0) / (mi == 0) predicates below pick.
     POS: gl.constexpr = _buffer_load_pos_frozen(mi, ni, NM, NN)
@@ -1509,6 +1540,7 @@ def _load_scale_register_frozen(
 ):
     """Load a frozen-step scale directly from HBM into its MFMA fragment."""
     tc: gl.constexpr = pc.tuning_cfg
+    layout: gl.constexpr = pc.layout
     gl.static_assert(pc.func_cfg.has_scale(operand))
     gl.static_assert(not tc.scale_via_lds(operand))
     cache: gl.constexpr = (
@@ -1527,7 +1559,7 @@ def _load_scale_register_frozen(
                 cache=cache,
                 contiguity=4,
             ),
-            tc.dot_operand_scale_fragment_layout(operand),
+            layout.dot_operand_scale_fragment_layout(operand),
         )
     else:
         scale = gl.amd.cdna4.buffer_load(
@@ -1550,7 +1582,8 @@ def _ds_read_operand_frozen(
 ):
     """Read one frozen-step operand tile and any direct-register scale fragments."""
     tc: gl.constexpr = pc.tuning_cfg
-    NUM_MINI: gl.constexpr = tc.num_k_slots_per_tile()
+    layout: gl.constexpr = pc.layout
+    NUM_MINI: gl.constexpr = layout.num_k_slots_per_tile()
     SK_MINI: gl.constexpr = tc.BLOCK_K // MX_GROUP
     HAS: gl.constexpr = pc.func_cfg.has_scale(operand)
     SCALE_VIA_LDS: gl.constexpr = HAS and tc.scale_via_lds(operand)
@@ -1668,10 +1701,11 @@ def _pipeline_step_frozen(
     # --------------------------------------------------------------------------------
     func_cfg: gl.constexpr = pc.func_cfg
     tc: gl.constexpr = pc.tuning_cfg
-    NM: gl.constexpr = tc.num_m_slots_per_block()
-    NN: gl.constexpr = tc.num_n_slots_per_block()
-    NUM_MINI: gl.constexpr = tc.num_k_slots_per_tile()
-    PF_MINI: gl.constexpr = tc.num_prefetch_k_slots()
+    layout: gl.constexpr = pc.layout
+    NM: gl.constexpr = layout.num_m_slots_per_block()
+    NN: gl.constexpr = layout.num_n_slots_per_block()
+    NUM_MINI: gl.constexpr = layout.num_k_slots_per_tile()
+    PF_MINI: gl.constexpr = layout.num_prefetch_k_slots()
     HEAD_MINI: gl.constexpr = NUM_MINI - PF_MINI
     A_HAS: gl.constexpr = func_cfg.a_has_scale()
     B_HAS: gl.constexpr = func_cfg.b_has_scale()
@@ -1805,6 +1839,7 @@ def _pipeline_step_frozen(
                 PF_MINI,
                 func_cfg,
                 tc,
+                layout,
                 DO_MFMA,
             )
             if require_constexpr(MPP):
@@ -1895,13 +1930,13 @@ def _pipeline_peeled_frozen(tc):
 
 
 @gluon.constexpr_function
-def _validate_frozen_pipeline(tc, K):
+def _validate_frozen_pipeline(tc, layout, K):
     """Validate the frozen driver's rings and runtime-loop lower bound."""
     tc.validate_buffer_counts()
-    num_k = tc.num_k_tiles(K)
-    depth = pipeline_depth_frozen(tc)
+    num_k = layout.num_k_tiles(K)
+    depth = pipeline_depth_frozen(tc, layout)
     peeled = _pipeline_peeled_frozen(tc)
-    unroll = pipeline_unroll_frozen(tc)
+    unroll = pipeline_unroll_frozen(tc, layout)
     assert num_k >= depth + peeled + unroll, (
         f"NUM_K ({num_k}) must be at least NB_MAX ({depth}) + PEELED ({peeled}) "
         f"+ UNROLL ({unroll}) = {depth + peeled + unroll}"
@@ -1912,6 +1947,7 @@ def _validate_frozen_pipeline(tc, K):
 @gluon.jit
 def _index_frozen(
     tc,
+    layout,
     step,
     kind: gl.constexpr,
     FILL: gl.constexpr,
@@ -1923,11 +1959,13 @@ def _index_frozen(
     else:
         depth: gl.constexpr = tc.num_buffers(kind // 2, kind % 2 != 0)
         advance: gl.constexpr = depth - 1 if FILL else 0
-        if require_constexpr(IN_LOOP and pipeline_unroll_frozen(tc) % depth == 0):
+        if require_constexpr(
+            IN_LOOP and pipeline_unroll_frozen(tc, layout) % depth == 0
+        ):
             out = (_pipeline_peeled_frozen(tc) + KI + 1 + advance) % depth
         else:
             tile = step + advance
-            if require_constexpr(tc.pipeline_register_period() == 1):
+            if require_constexpr(tc.pipeline_register_period(layout) == 1):
                 gl.assume(tile >= 0)
             out = tile % depth
     return out
@@ -1937,10 +1975,13 @@ def _index_frozen(
 def _init_buffers_frozen(pc):
     """Mirror the pre-extraction driver's inert register queues exactly."""
     tc: gl.constexpr = pc.tuning_cfg
+    layout: gl.constexpr = pc.layout
     a, b, a_scale, b_scale = (), (), (), ()
     if require_constexpr(not tc.payload_via_lds(0)):
         for _ in gl.static_range(
-            tc.num_buffers(0) * tc.num_m_slots_per_block() * tc.num_k_slots_per_tile()
+            tc.num_buffers(0)
+            * layout.num_m_slots_per_block()
+            * layout.num_k_slots_per_tile()
         ):
             a += (
                 gl.zeros(
@@ -1949,32 +1990,34 @@ def _init_buffers_frozen(pc):
                         tc.BLOCK_K // pc.func_cfg.pack_divisor(0),
                     ],
                     pc.func_cfg.operand_elem_ty(0),
-                    tc.dot_operand_fragment_layout(0),
+                    layout.dot_operand_fragment_layout(0),
                 ),
             )
     if require_constexpr(not tc.payload_via_lds(1)):
         for _ in gl.static_range(
-            tc.num_buffers(1) * tc.num_n_slots_per_block() * tc.num_k_slots_per_tile()
+            tc.num_buffers(1)
+            * layout.num_n_slots_per_block()
+            * layout.num_k_slots_per_tile()
         ):
             b += (
                 gl.zeros(
                     [tc.BLOCK_K // pc.func_cfg.pack_divisor(1), tc.MINI_BLOCK_N],
                     pc.func_cfg.operand_elem_ty(1),
-                    tc.dot_operand_fragment_layout(1),
+                    layout.dot_operand_fragment_layout(1),
                 ),
             )
     if require_constexpr(pc.func_cfg.a_has_scale() and not tc.scale_via_lds(0)):
         for _ in gl.static_range(
             tc.num_buffers(0, True)
-            * tc.num_m_slots_per_block()
-            * tc.num_k_slots_per_tile()
+            * layout.num_m_slots_per_block()
+            * layout.num_k_slots_per_tile()
         ):
-            if require_constexpr(tc.scale_ratio_k_step(0) > 1):
+            if require_constexpr(layout.scale_ratio_k_step(0) > 1):
                 a_scale += (
                     gl.zeros(
-                        tc.packed_scale_shape(0),
+                        layout.packed_scale_shape(0),
                         gl.int32,
-                        tc.packed_scale_frag_layout(0),
+                        layout.packed_scale_frag_layout(0),
                     ),
                 )
             else:
@@ -1982,21 +2025,21 @@ def _init_buffers_frozen(pc):
                     gl.zeros(
                         [tc.MINI_BLOCK_M, tc.BLOCK_K // 32],
                         gl.uint8,
-                        tc.dot_operand_scale_fragment_layout(0),
+                        layout.dot_operand_scale_fragment_layout(0),
                     ),
                 )
     if require_constexpr(pc.func_cfg.b_has_scale() and not tc.scale_via_lds(1)):
         for _ in gl.static_range(
             tc.num_buffers(1, True)
-            * tc.num_n_slots_per_block()
-            * tc.num_k_slots_per_tile()
+            * layout.num_n_slots_per_block()
+            * layout.num_k_slots_per_tile()
         ):
-            if require_constexpr(tc.scale_ratio_k_step(1) > 1):
+            if require_constexpr(layout.scale_ratio_k_step(1) > 1):
                 b_scale += (
                     gl.zeros(
-                        tc.packed_scale_shape(1),
+                        layout.packed_scale_shape(1),
                         gl.int32,
-                        tc.packed_scale_frag_layout(1),
+                        layout.packed_scale_frag_layout(1),
                     ),
                 )
             else:
@@ -2004,7 +2047,7 @@ def _init_buffers_frozen(pc):
                     gl.zeros(
                         [tc.MINI_BLOCK_N, tc.BLOCK_K // 32],
                         gl.uint8,
-                        tc.dot_operand_scale_fragment_layout(1),
+                        layout.dot_operand_scale_fragment_layout(1),
                     ),
                 )
     return a, b, a_scale, b_scale
@@ -2026,13 +2069,14 @@ def _step_frozen(
     STATIC_PHASE: gl.constexpr = False,
 ):
     tc: gl.constexpr = pc.tuning_cfg
+    layout: gl.constexpr = pc.layout
     ptrs, regs = _pipeline_step_frozen(
         pc,
         ptrs,
         regs,
-        _index_frozen(tc, step, 0, True, KI, IN_LOOP or STATIC_PHASE),
-        _index_frozen(tc, step, 0, False, KI, IN_LOOP or STATIC_PHASE),
-        pipeline_depth_frozen(tc) - 2 - (STAGE if DRAIN else 0),
+        _index_frozen(tc, layout, step, 0, True, KI, IN_LOOP or STATIC_PHASE),
+        _index_frozen(tc, layout, step, 0, False, KI, IN_LOOP or STATIC_PHASE),
+        pipeline_depth_frozen(tc, layout) - 2 - (STAGE if DRAIN else 0),
         not DRAIN,
         True,
         IN_LOOP,
@@ -2048,12 +2092,13 @@ def _step_frozen(
 def _run_frozen_pipeline(pc, ptrs, NUM_K):
     """Run the frozen prologue and runtime K loop, leaving the drain exposed."""
     tc: gl.constexpr = pc.tuning_cfg
+    layout: gl.constexpr = pc.layout
     gl.static_assert(
-        tc.num_prefetch_k_slots() == tc.num_k_slots_per_tile(),
+        layout.num_prefetch_k_slots() == layout.num_k_slots_per_tile(),
         "the frozen pipeline requires VGPR_PREFETCH_K == BLOCK_K",
     )
-    depth: gl.constexpr = pipeline_depth_frozen(tc)
-    unroll: gl.constexpr = pipeline_unroll_frozen(tc)
+    depth: gl.constexpr = pipeline_depth_frozen(tc, layout)
+    unroll: gl.constexpr = pipeline_unroll_frozen(tc, layout)
     peeled: gl.constexpr = _pipeline_peeled_frozen(tc)
     main = NUM_K - depth
     gl.assume(main >= peeled + unroll)
@@ -2062,13 +2107,13 @@ def _run_frozen_pipeline(pc, ptrs, NUM_K):
     buffers = _init_buffers_frozen(pc)
     ptrs = _prologue_frozen(pc, ptrs)
     acc = ()
-    for ni in gl.static_range(tc.num_n_slots_per_block()):
-        for mi in gl.static_range(tc.num_m_slots_per_block()):
+    for ni in gl.static_range(layout.num_n_slots_per_block()):
+        for mi in gl.static_range(layout.num_m_slots_per_block()):
             acc += (
                 gl.zeros(
                     [tc.MINI_BLOCK_M, tc.MINI_BLOCK_N],
                     pc.func_cfg.mma_acc_dtype,
-                    tc.dot_result_fragment_layout(),
+                    layout.dot_result_fragment_layout(),
                 ),
             )
     regs = _PipelineRegFragments((), (), (), (), acc)
@@ -2087,7 +2132,7 @@ def _run_frozen_pipeline(pc, ptrs, NUM_K):
                 KI=u,
                 IN_LOOP=True,
             )
-    if require_constexpr(unroll > 6 and tc.pipeline_register_period() > 1):
+    if require_constexpr(unroll > 6 and tc.pipeline_register_period(layout) > 1):
         for u in tl.range(0, remaining - unroll_end):
             ptrs, buffers, regs = _step_frozen(
                 pc,
@@ -2118,25 +2163,26 @@ def _drain_frozen_pipeline(
     pc, ptrs, buffers, regs, NUM_K, EPILOGUE_GROUPS: gl.constexpr
 ):
     tc: gl.constexpr = pc.tuning_cfg
-    main = NUM_K - pipeline_depth_frozen(tc)
+    layout: gl.constexpr = pc.layout
+    main = NUM_K - pipeline_depth_frozen(tc, layout)
     period: gl.constexpr = math.lcm(
         tc.num_buffers(0),
         tc.num_buffers(1),
         tc.num_buffers(0, True) if pc.func_cfg.a_has_scale() else 1,
         tc.num_buffers(1, True) if pc.func_cfg.b_has_scale() else 1,
-        tc.scale_ratio_k_step(0),
-        tc.scale_ratio_k_step(1),
+        layout.scale_ratio_k_step(0),
+        layout.scale_ratio_k_step(1),
     )
     if require_constexpr(
         period <= 3
-        and pipeline_unroll_frozen(tc) % period == 0
-        and tc.pipeline_register_period() == 1
+        and pipeline_unroll_frozen(tc, layout) % period == 0
+        and tc.pipeline_register_period(layout) == 1
         and pc.func_cfg.output_quant is None
     ):
         phase = main % period
         for p in gl.static_range(period):
             if phase == p:
-                for j in gl.static_range(pipeline_depth_frozen(tc) - 1):
+                for j in gl.static_range(pipeline_depth_frozen(tc, layout) - 1):
                     ptrs, buffers, regs = _step_frozen(
                         pc,
                         ptrs,
@@ -2150,7 +2196,7 @@ def _drain_frozen_pipeline(
                         STATIC_PHASE=True,
                     )
     else:
-        for j in gl.static_range(pipeline_depth_frozen(tc) - 1):
+        for j in gl.static_range(pipeline_depth_frozen(tc, layout) - 1):
             ptrs, buffers, regs = _step_frozen(
                 pc,
                 ptrs,
@@ -2167,34 +2213,36 @@ def _drain_frozen_pipeline(
 @gluon.jit
 def _last_mfma_frozen(pc, regs):
     tc: gl.constexpr = pc.tuning_cfg
+    layout: gl.constexpr = pc.layout
     acc = ()
-    for ni in gl.static_range(tc.num_n_slots_per_block()):
-        for mi in gl.static_range(tc.num_m_slots_per_block()):
+    for ni in gl.static_range(layout.num_n_slots_per_block()):
+        for mi in gl.static_range(layout.num_m_slots_per_block()):
             acc += (
                 _maybe_block_dot(
                     _take_reg_pairs(
                         regs.a_payload,
                         regs.a_scale,
-                        mi * tc.num_k_slots_per_tile(),
-                        tc.num_k_slots_per_tile(),
+                        mi * layout.num_k_slots_per_tile(),
+                        layout.num_k_slots_per_tile(),
                     ),
                     _take_reg_pairs(
                         regs.b_payload,
                         regs.b_scale,
-                        ni * tc.num_k_slots_per_tile(),
-                        tc.num_k_slots_per_tile(),
+                        ni * layout.num_k_slots_per_tile(),
+                        layout.num_k_slots_per_tile(),
                     ),
                     regs.acc[
                         _slot_index_frozen(
                             mi,
                             ni,
-                            tc.num_m_slots_per_block(),
-                            tc.num_n_slots_per_block(),
+                            layout.num_m_slots_per_block(),
+                            layout.num_n_slots_per_block(),
                         )
                     ],
-                    tc.num_k_slots_per_tile(),
+                    layout.num_k_slots_per_tile(),
                     pc.func_cfg,
                     tc,
+                    layout,
                     True,
                     0,
                 ),
@@ -2215,14 +2263,19 @@ def _moe_gemm_body_frozen(
     grid_n,
     func_cfg,
     tuning_cfg,
+    layout,
     N: gl.constexpr,
     K: gl.constexpr,
     NUM_K,
 ):
-    """The complete frozen kernel body, selected once by the entry point."""
+    """The complete frozen kernel body, selected once by the entry point.
+
+    ``layout`` is the entry point's ``compute_kernel_layout(tuning_cfg)``: this
+    module does not import ``_layout``, so it cannot build one itself.
+    """
     gl.static_assert(tuning_cfg.FROZEN_STEP)
-    gl.static_assert(tuning_cfg.validate(N, K))
-    gl.static_assert(_validate_frozen_pipeline(tuning_cfg, K))
+    gl.static_assert(tuning_cfg.validate(N, K, layout))
+    gl.static_assert(_validate_frozen_pipeline(tuning_cfg, layout, K))
 
     BK: gl.constexpr = tuning_cfg.BLOCK_K
     PK_A: gl.constexpr = BK // func_cfg.a_pack_divisor()
@@ -2251,7 +2304,7 @@ def _moe_gemm_body_frozen(
     start_m = gl.load(rt.expt_offs_raw + expt_id)
 
     a_hbm_offs = _a_payload_hbm_offsets_frozen(
-        a, rt, block_id, M_e, start_m, func_cfg, tuning_cfg
+        a, rt, block_id, M_e, start_m, func_cfg, tuning_cfg, layout
     )
     b_hbm_ptr = b.ptr + expt_id.to(gl.int64) * b.stride_e
     if require_constexpr(func_cfg.a_has_scale()):
@@ -2263,19 +2316,23 @@ def _moe_gemm_body_frozen(
     else:
         b_scale_hbm_ptr: gl.constexpr = None
 
-    b_hbm_offs = _b_payload_hbm_offsets_frozen(b, pid_n, N, K, func_cfg, tuning_cfg)
+    b_hbm_offs = _b_payload_hbm_offsets_frozen(
+        b, pid_n, N, K, func_cfg, tuning_cfg, layout
+    )
     if require_constexpr(func_cfg.a_has_scale()):
         a_scale_hbm_offs = _a_scale_hbm_offsets_frozen(
-            a, rt, block_id, M_e, start_m, pid_m, K, func_cfg, tuning_cfg
+            a, rt, block_id, M_e, start_m, pid_m, K, func_cfg, tuning_cfg, layout
         )
     else:
         a_scale_hbm_offs: gl.constexpr = None
     if require_constexpr(func_cfg.b_has_scale()):
-        b_scale_hbm_offs = _b_scale_hbm_offsets_frozen(b, pid_n, N, K, func_cfg, tuning_cfg)
+        b_scale_hbm_offs = _b_scale_hbm_offsets_frozen(
+            b, pid_n, N, K, func_cfg, tuning_cfg, layout
+        )
     else:
         b_scale_hbm_offs: gl.constexpr = None
 
-    lds_ptrs = _FrozenLDSManager.alloc(func_cfg, tuning_cfg)
+    lds_ptrs = _FrozenLDSManager.alloc(func_cfg, tuning_cfg, layout)
 
     a_step: gl.constexpr = PK_A
     b_step: gl.constexpr = PK_B // 16 * 256 if tuning_cfg.B_PRESHUFFLED else PK_B
@@ -2307,6 +2364,7 @@ def _moe_gemm_body_frozen(
         s_step,
         func_cfg,
         tuning_cfg,
+        layout,
     )
 
     hbm_ptrs, buffers, regs = _run_frozen_pipeline(pc, hbm_ptrs, NUM_K)
@@ -2322,6 +2380,7 @@ def _moe_gemm_body_frozen(
         M_e,
         func_cfg,
         tuning_cfg,
+        layout,
     )
     regs = _drain_frozen_pipeline(pc, hbm_ptrs, buffers, regs, NUM_K, epi.groups)
     acc = _last_mfma_frozen(pc, regs)
@@ -2358,5 +2417,6 @@ def _moe_gemm_body_frozen(
         x_static_scale,
         func_cfg,
         tuning_cfg,
+        layout,
         GATE_PRE=False,
     )

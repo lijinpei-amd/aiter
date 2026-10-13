@@ -11,11 +11,13 @@ kernel`` on the second launch -- long after the change that caused it. A module 
 is skipped by that scan, so reaching the table through ``_schedule_cache.WAIT`` is
 invisible to it.
 
-Keys are :class:`~._schedule.ScheduleSpec` values, never tuning-configuration objects.
-Triton builds those with ``eq_default=False``, so they hash by identity, hundreds of
-distinct ones exist per compile for a single value, and several fields are unhashable
-lists. The spec is also rebuilt from accessor results on every call, so a test that
-mutates a configuration in place gets a different key rather than a stale answer.
+Keys are :class:`~._schedule.ScheduleSpec` values, never tuning-configuration or
+``KernelLayout`` objects. Triton builds those with ``eq_default=False``, so they hash
+by identity, hundreds of distinct ones exist per compile for a single value, and
+several fields are unhashable lists. The spec is also rebuilt from accessor results
+(layout accessors for geometry and placement, tuning-config accessors for policy) on
+every call, so a test that mutates a configuration in place gets a different key
+rather than a stale answer.
 
 This only ever avoids recomputing a pure function. It cannot change generated code,
 and ``scripts/gluon_moe_asm_hash.py`` is the check that says so.

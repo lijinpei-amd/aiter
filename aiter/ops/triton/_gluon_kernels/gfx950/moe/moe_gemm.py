@@ -78,6 +78,7 @@ from ._lang import optional as _opt
 from ._lang import require_constexpr
 from ._lang import unwrap as _v
 from ._layout import (
+    KernelLayout,
     _a_payload_hbm_offsets,
     _a_scale_hbm_offsets,
     _b_payload_hbm_offsets,
@@ -122,31 +123,41 @@ _DK_UPCAST_MFMA: gl.constexpr = gl.constexpr(int(DotKind.UPCAST_MFMA))
 
 
 @gluon.jit
-def _dot(a, a_scale, b, b_scale, acc, func_cfg, tuning_cfg, K_PHASE: gl.constexpr = 0):
+def _dot(
+    a,
+    a_scale,
+    b,
+    b_scale,
+    acc,
+    func_cfg,
+    tuning_cfg,
+    layout,
+    K_PHASE: gl.constexpr = 0,
+):
     """The one matrix instruction, dispatched on the operand pair."""
     kind: gl.constexpr = func_cfg.dot_kind()
-    a_sel: gl.constexpr = tuning_cfg.mfma_scale_selector(0, K_PHASE)
-    b_sel: gl.constexpr = tuning_cfg.mfma_scale_selector(1, K_PHASE)
-    any_packed: gl.constexpr = tuning_cfg.has_mfma_packed_scale()
+    a_sel: gl.constexpr = layout.mfma_scale_selector(0, K_PHASE)
+    b_sel: gl.constexpr = layout.mfma_scale_selector(1, K_PHASE)
+    any_packed: gl.constexpr = layout.has_mfma_packed_scale()
     if require_constexpr(kind == _DK_MFMA_SCALED and any_packed):
         if require_constexpr(not func_cfg.has_scale(0)):
             a_scale = gl.full(
-                tuning_cfg.scale_fragment_shape_slot(0),
+                layout.scale_fragment_shape_slot(0),
                 127,
                 gl.uint8,
                 gl.amd.cdna4.get_mfma_scale_layout(
-                    tuning_cfg.dot_operand_fragment_layout(0),
-                    tuning_cfg.scale_fragment_shape_slot(0),
+                    layout.dot_operand_fragment_layout(0),
+                    layout.scale_fragment_shape_slot(0),
                 ),
             )
         if require_constexpr(not func_cfg.has_scale(1)):
             b_scale = gl.full(
-                tuning_cfg.scale_fragment_shape_slot(1),
+                layout.scale_fragment_shape_slot(1),
                 127,
                 gl.uint8,
                 gl.amd.cdna4.get_mfma_scale_layout(
-                    tuning_cfg.dot_operand_fragment_layout(1),
-                    tuning_cfg.scale_fragment_shape_slot(1),
+                    layout.dot_operand_fragment_layout(1),
+                    layout.scale_fragment_shape_slot(1),
                 ),
             )
         # At least one scale tile arrived as pre-packed dwords; the other, if any,
@@ -191,6 +202,7 @@ def _maybe_block_dot(
     N_FRAGS: gl.constexpr,
     func_cfg,
     tuning_cfg,
+    layout,
     DO_MFMA: gl.constexpr,
     K_PHASE: gl.constexpr = 0,
 ):
@@ -213,6 +225,7 @@ def _maybe_block_dot(
                 acc,
                 func_cfg,
                 tuning_cfg,
+                layout,
                 (K_PHASE + i * tuning_cfg.BLOCK_K // 128) % 2,
             )
     return acc
@@ -254,6 +267,7 @@ class _PipelineConst:
     s_step: gl.constexpr
     func_cfg: KernelFuncConfig
     tuning_cfg: KernelTuningConfig
+    layout: KernelLayout
     num_k: gl.constexpr
 
     @gluon.constexpr_function
@@ -271,6 +285,7 @@ class _PipelineConst:
         s_step,
         func_cfg,
         tuning_cfg,
+        layout,
         num_k,
     ):
         self.lds_ptrs = lds_ptrs
@@ -287,6 +302,7 @@ class _PipelineConst:
         self.s_step = gl.constexpr(_v(s_step))
         self.func_cfg = func_cfg
         self.tuning_cfg = tuning_cfg
+        self.layout = layout
         self.num_k = gl.constexpr(_v(num_k))
 
 
@@ -372,7 +388,7 @@ def _advance_hbm_ptrs(pc, hbm_ptrs, STEPS: gl.constexpr = 1, K_PHASE: gl.constex
     ):
         a_scale_hbm_ptr = (
             a_scale_hbm_ptr
-            + pc.tuning_cfg.scale_hbm_steps(0, STEPS, K_PHASE)
+            + pc.layout.scale_hbm_steps(0, STEPS, K_PHASE)
             * pc.s_step
             * pc.a_scale_stride_k
         )
@@ -381,7 +397,7 @@ def _advance_hbm_ptrs(pc, hbm_ptrs, STEPS: gl.constexpr = 1, K_PHASE: gl.constex
     ):
         b_scale_hbm_ptr = (
             b_scale_hbm_ptr
-            + pc.tuning_cfg.scale_hbm_steps(1, STEPS, K_PHASE)
+            + pc.layout.scale_hbm_steps(1, STEPS, K_PHASE)
             * pc.s_step
             * pc.b_scale_stride_k
         )
@@ -401,6 +417,7 @@ def _drain_last_fused(
     x_static_scale,
     func_cfg,
     tuning_cfg,
+    layout,
 ):
     """The final drain step, with the gate half's activation folded into it.
 
@@ -418,9 +435,9 @@ def _drain_last_fused(
     computed, which is why it takes ``GATE_PRE`` to skip recomputing it.
     """
     tc: gl.constexpr = pc.tuning_cfg
-    NM: gl.constexpr = tc.num_m_slots_per_block()
-    NN: gl.constexpr = tc.num_n_slots_per_block()
-    PF_FRAGS: gl.constexpr = tc.num_prefetch_k_slots()
+    NM: gl.constexpr = layout.num_m_slots_per_block()
+    NN: gl.constexpr = layout.num_n_slots_per_block()
+    PF_FRAGS: gl.constexpr = layout.num_prefetch_k_slots()
     act: gl.constexpr = func_cfg.act()
     gl.static_assert(func_cfg.gu_split() and NN == 2)
 
@@ -434,6 +451,7 @@ def _drain_last_fused(
                 PF_FRAGS,
                 func_cfg,
                 tc,
+                layout,
                 True,
                 (pc.num_k - 1) * tc.BLOCK_K // 128 % 2,
             )
@@ -465,12 +483,13 @@ def _moe_gemm_body(
     grid_n,
     func_cfg,
     tuning_cfg,
+    layout,
     N: gl.constexpr,
     K: gl.constexpr,
     NUM_K,
 ):
-    gl.static_assert(tuning_cfg.validate(N, K))
-    gl.static_assert(validate_pipeline(tuning_cfg, K))
+    gl.static_assert(tuning_cfg.validate(N, K, layout))
+    gl.static_assert(validate_pipeline(tuning_cfg, layout, K))
 
     pid = gl.program_id(0)
     if require_constexpr(tuning_cfg.TILE_SCHED == _TS_XCD_GROUP_M):
@@ -500,7 +519,7 @@ def _moe_gemm_body(
     # Issued right after the routing scalars it depends on: the gather's table loads are
     # the longest-latency thing in the prologue, so everything below overlaps with them.
     a_hbm_offs = _a_payload_hbm_offsets(
-        a, rt, block_id, M_e, start_m, func_cfg, tuning_cfg
+        a, rt, block_id, M_e, start_m, func_cfg, tuning_cfg, layout
     )
 
     # Buffer ops carry a 32-bit offset (2 GB window) and V4-Pro's stacked gemm1 weight is
@@ -516,25 +535,27 @@ def _moe_gemm_body(
     else:
         b_scale_hbm_ptr: gl.constexpr = None
 
-    b_hbm_offs = _b_payload_hbm_offsets(b, pid_n, N, K, func_cfg, tuning_cfg)
+    b_hbm_offs = _b_payload_hbm_offsets(b, pid_n, N, K, func_cfg, tuning_cfg, layout)
 
     if require_constexpr(func_cfg.a_has_scale()):
         a_scale_hbm_offs = _a_scale_hbm_offsets(
-            a, rt, block_id, M_e, start_m, pid_m, K, func_cfg, tuning_cfg
+            a, rt, block_id, M_e, start_m, pid_m, K, func_cfg, tuning_cfg, layout
         )
     else:
         a_scale_hbm_offs: gl.constexpr = None
     if require_constexpr(func_cfg.b_has_scale()):
-        b_scale_hbm_offs = _b_scale_hbm_offsets(b, pid_n, N, K, func_cfg, tuning_cfg)
+        b_scale_hbm_offs = _b_scale_hbm_offsets(
+            b, pid_n, N, K, func_cfg, tuning_cfg, layout
+        )
     else:
         b_scale_hbm_offs: gl.constexpr = None
 
-    lds_ptrs = LDSManager.alloc(func_cfg, tuning_cfg)
+    lds_ptrs = LDSManager.alloc(func_cfg, tuning_cfg, layout)
 
     # per-fill pointer bumps (K is the contiguous axis of every operand)
-    a_step: gl.constexpr = tuning_cfg.payload_hbm_step(0)
-    b_step: gl.constexpr = tuning_cfg.payload_hbm_step(1)
-    s_step: gl.constexpr = tuning_cfg.scale_block_k_storage()
+    a_step: gl.constexpr = layout.payload_hbm_step(0)
+    b_step: gl.constexpr = layout.payload_hbm_step(1)
+    s_step: gl.constexpr = layout.scale_block_k_storage()
 
     hbm_ptrs = _PipelinePointers(
         a.ptr,
@@ -565,7 +586,8 @@ def _moe_gemm_body(
         s_step,
         func_cfg,
         tuning_cfg,
-        tuning_cfg.num_k_tiles(K),
+        layout,
+        layout.num_k_tiles(K),
     )
 
     hbm_ptrs, buffers, regs = _run_buffered_pipeline(pc, hbm_ptrs, NUM_K)
@@ -582,12 +604,13 @@ def _moe_gemm_body(
         M_e,
         func_cfg,
         tuning_cfg,
+        layout,
     )
 
     # Shallower streams finish their remaining fills during the drain. The final
     # MFMA is separate and consumes only the fragments already in registers.
     # Fuse its activation where supported by the live step.
-    FUSE: gl.constexpr = func_cfg.gu_split() and tuning_cfg.num_n_slots_per_block() == 2
+    FUSE: gl.constexpr = func_cfg.gu_split() and layout.num_n_slots_per_block() == 2
     regs = _drain_buffered_pipeline(pc, hbm_ptrs, buffers, regs, NUM_K, epi.groups)
     if require_constexpr(not FUSE):
         regs = _PipelineRegFragments(
@@ -616,11 +639,18 @@ def _moe_gemm_body(
             pc,
             regs,
             _epi_bias_tiles(
-                epi.bias_lds_ptr, epi.bias_hbm_base, pid_n, N, func_cfg, tuning_cfg
+                epi.bias_lds_ptr,
+                epi.bias_hbm_base,
+                pid_n,
+                N,
+                func_cfg,
+                tuning_cfg,
+                layout,
             ),
             x_static_scale,
             func_cfg,
             tuning_cfg,
+            layout,
         )
     else:
         acc = regs.acc
@@ -649,6 +679,7 @@ def _moe_gemm_body(
         x_static_scale,
         func_cfg,
         tuning_cfg,
+        layout,
         GATE_PRE=FUSE,
     )
 

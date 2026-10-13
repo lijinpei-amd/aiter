@@ -10,6 +10,7 @@ from ._config import KernelFuncConfig, KernelTuningConfig
 from ._frozen import _moe_gemm_body_frozen
 from ._lang import constexpr_fields, require_constexpr
 from ._lang import unwrap_attr as _cv
+from ._layout import compute_kernel_layout
 from ._types import QuantExpertTensor, QuantTokenTensor, ResultTensor, RoutingMeta
 from .moe_gemm import _moe_gemm_body as _moe_gemm_body_live
 
@@ -37,7 +38,12 @@ def _moe_gemm_body(
     K: gl.constexpr,
     NUM_K,
 ):
-    """Select the frozen or live body once, before entering either implementation."""
+    """Select the frozen or live body once, before entering either implementation.
+
+    The layout is computed here, once, and handed to whichever body runs: the frozen
+    body imports nothing from ``_layout.py``, so it cannot compute its own.
+    """
+    layout = compute_kernel_layout(tuning_cfg)
     if require_constexpr(tuning_cfg.FROZEN_STEP):
         _moe_gemm_body_frozen(
             a,
@@ -51,6 +57,7 @@ def _moe_gemm_body(
             grid_n,
             func_cfg,
             tuning_cfg,
+            layout,
             N,
             K,
             NUM_K,
@@ -68,6 +75,7 @@ def _moe_gemm_body(
             grid_n,
             func_cfg,
             tuning_cfg,
+            layout,
             N,
             K,
             NUM_K,

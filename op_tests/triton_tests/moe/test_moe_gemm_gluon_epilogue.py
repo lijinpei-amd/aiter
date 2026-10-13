@@ -18,6 +18,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._epilogue import (
     _epi_stage_flush,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import constexpr_fields
+from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import compute_kernel_layout
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     ActivationSpec,
     ActKind,
@@ -74,8 +75,8 @@ def _epilogue_config(split, num_warps):
 
 
 @gluon.jit
-def _staging_bytes(block_id, pid_n, mi, ni, epoch, func, tuning):
-    RFL: gl.constexpr = tuning.dot_result_fragment_layout()
+def _staging_bytes(block_id, pid_n, mi, ni, epoch, func, tuning, layout):
+    RFL: gl.constexpr = layout.dot_result_fragment_layout()
     REDUCTION: gl.constexpr = func.n_reduction_slot()
     OUT_N: gl.constexpr = 128 // REDUCTION
     rows = block_id * 128 + mi * 64 + gl.arange(
@@ -108,6 +109,7 @@ def _epilogue_probe(
 ):
     func = KernelFuncConfig(*constexpr_fields(FUNC))
     tuning = KernelTuningConfig(func, *constexpr_fields(TUNING))
+    layout = compute_kernel_layout(tuning)
     SH: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
     block_id = gl.program_id(0)
     pid_n = gl.program_id(1)
@@ -115,13 +117,15 @@ def _epilogue_probe(
         payload_smem = gl.allocate_shared_memory(gl.uint8, [128, 64], SH)
         scale_smem = gl.allocate_shared_memory(gl.uint8, [128, 4], SH)
         for mi in gl.static_range(2):
-            payload, scales = _staging_bytes(block_id, pid_n, mi, 0, epoch, func, tuning)
+            payload, scales = _staging_bytes(
+                block_id, pid_n, mi, 0, epoch, func, tuning, layout
+            )
             payload_smem.slice(mi * 64, 64).store(payload)
             scale_smem.slice(mi * 64, 64).store(scales)
         _epi_block_flush(
             payload_smem, scale_smem,
             payload_ptr, N // 4, 1, scale_ptr, N // 64, 1,
-            block_id, pid_n, M, func, tuning,
+            block_id, pid_n, M, func, tuning, layout,
         )
     else:
         payload_0 = gl.allocate_shared_memory(gl.uint8, [64, 32], SH)
@@ -135,10 +139,10 @@ def _epilogue_probe(
                     scale_1 if (tile - 1) % 2 else scale_0,
                     (tile - 1) // 2, (tile - 1) % 2,
                     payload_ptr, N // 4, 1, scale_ptr, N // 64, 1,
-                    block_id, pid_n, M, func, tuning,
+                    block_id, pid_n, M, func, tuning, layout,
                 )
             payload, scales = _staging_bytes(
-                block_id, pid_n, tile // 2, tile % 2, epoch, func, tuning
+                block_id, pid_n, tile // 2, tile % 2, epoch, func, tuning, layout
             )
             (payload_1 if tile % 2 else payload_0).store(payload)
             (scale_1 if tile % 2 else scale_0).store(scales)
@@ -146,7 +150,7 @@ def _epilogue_probe(
         _epi_stage_flush(
             payload_1, scale_1, 1, 1,
             payload_ptr, N // 4, 1, scale_ptr, N // 64, 1,
-            block_id, pid_n, M, func, tuning,
+            block_id, pid_n, M, func, tuning, layout,
         )
 
 

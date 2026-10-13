@@ -44,7 +44,8 @@ def test_vendored_frozen_helpers_match_the_live_schedule(dtype):
     quant = {"mxfp4": DtypeQuant.MXFP4, "bf16": DtypeQuant.BF16,
              "mxfp8": DtypeQuant.MXFP8}[dtype]
     tc = host._probe_tuning_config(_register_config(dtype), quant, quant)
-    assert pipeline_depth_frozen(tc) == _schedule.pipeline_depth(tc)
+    layout = _layout.compute_kernel_layout(tc)
+    assert pipeline_depth_frozen(tc, layout) == _schedule.pipeline_depth(tc, layout)
 
     # The vendored layout twins must still agree with the live ones. _slot_index is
     # the only one callable without device tensors; the offset builders need a live
@@ -56,7 +57,7 @@ def test_vendored_frozen_helpers_match_the_live_schedule(dtype):
                     assert _frozen._slot_index_frozen(
                         mi, ni, nm, nn
                     ) == _layout._slot_index(mi, ni, nm, nn), (mi, ni, nm, nn)
-    assert pipeline_unroll_frozen(tc) == _schedule.pipeline_unroll(tc)
+    assert pipeline_unroll_frozen(tc, layout) == _schedule.pipeline_unroll(tc, layout)
     for nm in range(1, 5):
         for nn in range(1, 5):
             assert _buffer_load_order_frozen(nm, nn) == _schedule._buffer_load_order(
@@ -160,15 +161,20 @@ def test_same_compiled_entry_honors_runtime_num_k(gated, depth, dtype, monkeypat
     )
     assert case.route.block_m == config["BLOCK_M"]
     tc = host._probe_tuning_config(config, quant, quant)
+    layout = _layout.compute_kernel_layout(tc)
     full_num_k = case.k // config["BLOCK_K"]
-    minimum = pipeline_depth_frozen(tc) + _pipeline_peeled_frozen(tc) + pipeline_unroll_frozen(tc)
+    minimum = (
+        pipeline_depth_frozen(tc, layout)
+        + _pipeline_peeled_frozen(tc)
+        + pipeline_unroll_frozen(tc, layout)
+    )
     # Depth three exercises every specialized drain phase in the same binary.
     short_counts = (minimum + 1,) if depth == 2 else range(minimum, minimum + depth)
     references = {full_num_k: case.expected if gated else case.raw}
     for short_num_k in short_counts:
         short_k = short_num_k * config["BLOCK_K"]
         assert short_num_k < full_num_k
-        assert _validate_frozen_pipeline(tc, short_k)
+        assert _validate_frozen_pipeline(tc, layout, short_k)
         prefix = moe_gemm_torch(
             x_ref[:, :short_k].float(),
             w_ref[:, :short_k, :].float(),

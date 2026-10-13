@@ -34,6 +34,9 @@ sys.path.insert(0, str(REPO))
 from aiter.ops.triton._gluon_kernels.gfx950.moe import _pipeline as P  # noqa: E402
 from aiter.ops.triton._gluon_kernels.gfx950.moe import _schedule as S  # noqa: E402
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import DtypeQuant as DQ  # noqa: E402
+from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import (  # noqa: E402
+    compute_kernel_layout,
+)
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (  # noqa: E402
     COMPONENTS,
     WaitCommitScheme,
@@ -132,10 +135,10 @@ def cases():
     return out
 
 
-def _wait(tc, *a, **kw):
+def _wait(tc, layout, *a, **kw):
     """`_wait` is partial: undefined on fill-only prologue stages (see module docstring)."""
     try:
-        return S._wait(tc, *a, **kw)
+        return S._wait(tc, layout, *a, **kw)
     except ValueError:
         return "unreachable"
 
@@ -143,85 +146,95 @@ def _wait(tc, *a, **kw):
 def dump_case(name, cfg, dq_a, dq_b, K, out):
     try:
         tc = host._probe_tuning_config(cfg, dq_a, dq_b)
-        tc.validate(N_DEFAULT, K)
+        layout = compute_kernel_layout(tc)
+        tc.validate(N_DEFAULT, K, layout)
     except Exception as exc:  # a rejected config is itself a stable, diffable fact
         out(f"== {name}: REJECTED {type(exc).__name__}: {str(exc).splitlines()[0][:120]}")
         return
 
-    nm, nn = tc.num_m_slots_per_block(), tc.num_n_slots_per_block()
+    nm, nn = layout.num_m_slots_per_block(), layout.num_n_slots_per_block()
     slots = nm * nn
-    depth = S.pipeline_depth(tc)
-    unroll = S.pipeline_unroll(tc)
-    peeled = S._pipeline_peeled(tc)
-    num_k = tc.num_k_tiles(K)
+    depth = S.pipeline_depth(tc, layout)
+    unroll = S.pipeline_unroll(tc, layout)
+    peeled = S._pipeline_peeled(tc, layout)
+    num_k = layout.num_k_tiles(K)
 
     out(f"== {name}")
-    out(f"  geom NM={nm} NN={nn} slots={slots} mk={tc.num_k_slots_per_tile()} "
+    out(f"  geom NM={nm} NN={nn} slots={slots} mk={layout.num_k_slots_per_tile()} "
         f"num_k={num_k} scheme={int(tc.WAIT_COMMIT_SCHEME)}")
     out(f"  sizing depth={depth} unroll={unroll} peeled={peeled} "
-        f"regperiod={tc.pipeline_register_period()} hasreg={S._has_register_component(tc)}")
+        f"regperiod={tc.pipeline_register_period(layout)} "
+        f"hasreg={S._has_register_component(tc, layout)}")
     out(f"  order {S._buffer_load_order(nm, nn)}")
 
     for c in COMPONENTS:
-        if not S._present(tc, c):
+        if not S._present(tc, layout, c):
             out(f"  {CNAME[c]} absent")
             continue
-        out(f"  {CNAME[c]} D={S._component_depth(tc, c)} R={S._component_ratio(tc, c)} "
-            f"L={S._live_span(tc, c)} F={S._fill_span(tc, c)} "
-            f"via_lds={S._via_lds(tc, c)} pphase={S._producer_phase(tc, c)} "
-            f"nonk_ratio={tc.scale_ratio_non_k_slot(c[0])}")
+        out(f"  {CNAME[c]} D={S._component_depth(tc, layout, c)} "
+            f"R={S._component_ratio(tc, layout, c)} "
+            f"L={S._live_span(tc, layout, c)} F={S._fill_span(tc, layout, c)} "
+            f"via_lds={S._via_lds(tc, layout, c)} "
+            f"pphase={S._producer_phase(tc, layout, c)} "
+            f"nonk_ratio={layout.scale_ratio_non_k_slot(c[0])}")
 
     # ownership and read binding, per slot
     for ni in range(nn):
         for mi in range(nm):
             s = S._slot_index(mi, ni, nm, nn)
-            ops = S._ops(tc, mi, ni)
-            reads = [S._component_read_tile(tc, c, mi, ni) for c in COMPONENTS]
-            mfma = [S._read_in_mfma(tc, c, t) if t is not None else None
+            ops = S._ops(tc, layout, mi, ni)
+            reads = [S._component_read_tile(tc, layout, c, mi, ni)
+                     for c in COMPONENTS]
+            mfma = [S._read_in_mfma(tc, layout, c, t) if t is not None else None
                     for c, t in zip(COMPONENTS, reads)]
             out(f"  slot{s}(mi={mi},ni={ni}) ops={ops} read={reads} in_mfma={mfma}")
     for c in COMPONENTS:
-        if not S._present(tc, c):
+        if not S._present(tc, layout, c):
             continue
         n_tiles = nm if c[0] == 0 else nn
-        fill = tuple(S._component_fill_slot(tc, c, t) for t in range(n_tiles))
-        rd = tuple(S._component_read_slot(tc, c, t) for t in range(n_tiles))
+        fill = tuple(S._component_fill_slot(tc, layout, c, t) for t in range(n_tiles))
+        rd = tuple(S._component_read_slot(tc, layout, c, t) for t in range(n_tiles))
         out(f"  {CNAME[c]} fill_slots={fill} read_slots={rd}")
 
     # activity and committed groups across every reachable region
     for stage in range(1 - depth, depth + 2):
-        act = tuple(int(S._active(tc, c, stage)) for c in COMPONENTS)
-        out(f"  active stage={stage} {act} groups={S._groups(tc, stage)}")
-    out(f"  active steady {tuple(int(S._active(tc, c, None)) for c in COMPONENTS)} "
-        f"groups={S._groups(tc, None)}")
+        act = tuple(int(S._active(tc, layout, c, stage)) for c in COMPONENTS)
+        out(f"  active stage={stage} {act} groups={S._groups(tc, layout, stage)}")
+    steady = tuple(int(S._active(tc, layout, c, None)) for c in COMPONENTS)
+    out(f"  active steady {steady} "
+        f"groups={S._groups(tc, layout, None)}")
     for j in range(depth - 1):
-        act = tuple(int(S._active(tc, c, j, True)) for c in COMPONENTS)
-        out(f"  active drain j={j} {act} groups={S._groups(tc, j, True)}")
+        act = tuple(int(S._active(tc, layout, c, j, True)) for c in COMPONENTS)
+        out(f"  active drain j={j} {act} groups={S._groups(tc, layout, j, True)}")
 
     # the emitted wait immediates, which are the perf artifact
     for stage in range(0, depth + 2):
-        w = [_wait(tc, stage, s) for s in range(slots)]
-        out(f"  wait startup stage={stage} head={_wait(tc, stage, None)} slots={w}")
+        w = [_wait(tc, layout, stage, s) for s in range(slots)]
+        head = _wait(tc, layout, stage, None)
+        out(f"  wait startup stage={stage} head={head} slots={w}")
     for phase in range(peeled + 1, peeled + 1 + unroll):
-        w = [_wait(tc, None, s, phase=phase) for s in range(slots)]
-        out(f"  wait steady phase={phase} head={_wait(tc, None, None, phase=phase)} slots={w}")
+        w = [_wait(tc, layout, None, s, phase=phase) for s in range(slots)]
+        head = _wait(tc, layout, None, None, phase=phase)
+        out(f"  wait steady phase={phase} head={head} slots={w}")
     for epi in (0, 1):
         for j in range(depth - 1):
             ph = num_k - depth + j + 1
-            w = [_wait(tc, j, s, True, epi, ph) for s in range(slots)]
+            w = [_wait(tc, layout, j, s, True, epi, ph) for s in range(slots)]
             out(f"  wait drain j={j} epi={epi} phase={ph} "
-                f"head={_wait(tc, j, None, True, epi, ph)} slots={w}")
+                f"head={_wait(tc, layout, j, None, True, epi, ph)} slots={w}")
 
     # register-ring indices and the soffset stream
     for c in COMPONENTS:
-        if not S._present(tc, c):
+        if not S._present(tc, layout, c):
             continue
         for fill in (False, True):
-            row = [P._register_index(tc, c, ph, 0, False, fill) for ph in range(unroll + 2)]
-            loop = [P._register_index(tc, c, 0, ki, True, fill) for ki in range(unroll)]
+            row = [P._register_index(tc, layout, c, ph, 0, False, fill)
+                   for ph in range(unroll + 2)]
+            loop = [P._register_index(tc, layout, c, 0, ki, True, fill)
+                    for ki in range(unroll)]
             out(f"  regidx {CNAME[c]} fill={int(fill)} finite={row} in_loop={loop}")
         if c[1]:
-            soff = [P._scale_soff_steps(tc, c, o) for o in range(unroll)]
+            soff = [P._scale_soff_steps(tc, layout, c, o) for o in range(unroll)]
             out(f"  soff {CNAME[c]} {soff}")
 
 

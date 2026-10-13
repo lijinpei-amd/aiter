@@ -61,6 +61,7 @@ def _stage_epilogue_inputs(
     M_e,
     func_cfg,
     tuning_cfg,
+    layout,
 ):
     """Prepare bias and gammas, staging them in LDS before the pipeline drain."""
     BM: gl.constexpr = tuning_cfg.BLOCK_M
@@ -95,21 +96,21 @@ def _stage_epilogue_inputs(
     # of the CTA. BLOCK_M=128 over 256 threads would be half of one, so the tile runs to
     # 256 and the surplus is masked off and never read. Bias is BLOCK_N, which is already
     # a whole number of elements per thread.
-    EPI_T: gl.constexpr = tuning_cfg.epilogue_threads()
+    EPI_T: gl.constexpr = layout.epilogue_threads()
     EPI_LDS: gl.constexpr = tuning_cfg.epilogue_inputs_via_lds()
     if require_constexpr(EPI_LDS and func_cfg.has_gammas):
         gamma_lds_ptr = gl.allocate_shared_memory(
             gl.float32,
-            tuning_cfg.epilogue_gamma_shape(),
-            layout=tuning_cfg.epilogue_input_lds_layout(),
+            layout.epilogue_gamma_shape(),
+            layout=layout.epilogue_input_lds_layout(),
         )
     else:
         gamma_lds_ptr: gl.constexpr = None
     if require_constexpr(EPI_LDS and func_cfg.has_bias):
         bias_lds_ptr = gl.allocate_shared_memory(
             gl.float32,
-            tuning_cfg.epilogue_bias_shape(),
-            layout=tuning_cfg.epilogue_input_lds_layout(),
+            layout.epilogue_bias_shape(),
+            layout=layout.epilogue_input_lds_layout(),
         )
     else:
         bias_lds_ptr: gl.constexpr = None
@@ -128,7 +129,7 @@ def _stage_epilogue_inputs(
             g_offs = BM * block_id + gl.arange(
                 0,
                 EPI_T,
-                layout=tuning_cfg.epilogue_gamma_buffer_load_lds_layout(),
+                layout=layout.epilogue_gamma_buffer_load_lds_layout(),
             )
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
                 gamma_lds_ptr, gammas_hbm_ptr, g_offs, mask=g_offs < M_e, other=0.0
@@ -139,7 +140,7 @@ def _stage_epilogue_inputs(
                 gl.arange(
                     0,
                     BN,
-                    layout=tuning_cfg.epilogue_bias_buffer_load_lds_layout(),
+                    layout=layout.epilogue_bias_buffer_load_lds_layout(),
                 ),
                 N,
                 func_cfg,
@@ -160,7 +161,7 @@ def _stage_epilogue_inputs(
 
 
 @gluon.jit
-def _epi_bias_tiles(bias_lds_ptr, bias_hbm_ptr, pid_n, N, func_cfg, tuning_cfg):
+def _epi_bias_tiles(bias_lds_ptr, bias_hbm_ptr, pid_n, N, func_cfg, tuning_cfg, layout):
     """Block-level bias, one tensor per mini-N block.
 
     Invariant in mi, so NN of them cover the block where the per-tile form issued
@@ -169,8 +170,8 @@ def _epi_bias_tiles(bias_lds_ptr, bias_hbm_ptr, pid_n, N, func_cfg, tuning_cfg):
     this really is a prefetch -- unlike gammas, see _epi_gamma_tiles.
     """
     MBN: gl.constexpr = tuning_cfg.MINI_BLOCK_N
-    NN: gl.constexpr = tuning_cfg.num_n_slots_per_block()
-    RFL: gl.constexpr = tuning_cfg.dot_result_fragment_layout()
+    NN: gl.constexpr = layout.num_n_slots_per_block()
+    RFL: gl.constexpr = layout.dot_result_fragment_layout()
     out = ()
     if require_constexpr(func_cfg.has_bias):
         for hn in gl.static_range(NN):
@@ -190,7 +191,9 @@ def _epi_bias_tiles(bias_lds_ptr, bias_hbm_ptr, pid_n, N, func_cfg, tuning_cfg):
 
 
 @gluon.jit
-def _epi_gamma_tiles(gamma_lds_ptr, gammas_hbm_ptr, block_id, M_e, func_cfg, tuning_cfg):
+def _epi_gamma_tiles(
+    gamma_lds_ptr, gammas_hbm_ptr, block_id, M_e, func_cfg, tuning_cfg, layout
+):
     """Block-level gammas, one tensor per mini-M block -- global path only.
 
     When gammas live in LDS this returns empty on purpose: gammas multiplies the
@@ -201,7 +204,7 @@ def _epi_gamma_tiles(gamma_lds_ptr, gammas_hbm_ptr, block_id, M_e, func_cfg, tun
     """
     BM: gl.constexpr = tuning_cfg.BLOCK_M
     MBM: gl.constexpr = tuning_cfg.MINI_BLOCK_M
-    NM: gl.constexpr = tuning_cfg.num_m_slots_per_block()
+    NM: gl.constexpr = layout.num_m_slots_per_block()
     out = ()
     if require_constexpr(func_cfg.has_gammas and gamma_lds_ptr is None):
         for hm in gl.static_range(NM):
@@ -227,6 +230,7 @@ def _epi_stage_flush(
     M_e,
     func_cfg,
     tuning_cfg,
+    layout,
 ):
     """Read one staged MXFP4 mini tile back out of LDS and store it.
 
@@ -238,11 +242,11 @@ def _epi_stage_flush(
     MBM: gl.constexpr = tuning_cfg.MINI_BLOCK_M
     MBN: gl.constexpr = tuning_cfg.MINI_BLOCK_N
     ARN: gl.constexpr = func_cfg.activation_reduction_n()
-    OUT_MBN: gl.constexpr = tuning_cfg.output_n_slot()
-    P_COLS: gl.constexpr = tuning_cfg.quant_payload_shape(MBM, OUT_MBN)[1]
-    S_COLS: gl.constexpr = tuning_cfg.quant_scale_shape(MBM, OUT_MBN)[1]
-    PL: gl.constexpr = tuning_cfg.result_store_layout(MBM, P_COLS, 8)
-    SL: gl.constexpr = tuning_cfg.result_store_layout(MBM, S_COLS, 8)
+    OUT_MBN: gl.constexpr = layout.output_n_slot()
+    P_COLS: gl.constexpr = layout.quant_payload_shape(MBM, OUT_MBN)[1]
+    S_COLS: gl.constexpr = layout.quant_scale_shape(MBM, OUT_MBN)[1]
+    PL: gl.constexpr = layout.result_store_layout(MBM, P_COLS, 8)
+    SL: gl.constexpr = layout.result_store_layout(MBM, S_COLS, 8)
     raw_n0 = pid_n * BN + ni * MBN
     n0 = raw_n0 // ARN
     # The caller's fenced barrier has retired every wave's staging writes.
@@ -281,6 +285,7 @@ def _epi_block_flush(
     M_e,
     func_cfg,
     tuning_cfg,
+    layout,
 ):
     """Read the WHOLE staged MXFP4 block back out of LDS and store it.
 
@@ -291,12 +296,12 @@ def _epi_block_flush(
     single pair of stores rather than one per tile.
     """
     BM: gl.constexpr = tuning_cfg.BLOCK_M
-    OUT_MBN: gl.constexpr = tuning_cfg.output_n_slot()
-    P_COLS: gl.constexpr = tuning_cfg.quant_payload_shape(BM, OUT_MBN)[1]
-    S_COLS: gl.constexpr = tuning_cfg.quant_scale_shape(BM, OUT_MBN)[1]
-    PL: gl.constexpr = tuning_cfg.result_store_layout(BM, P_COLS, 8)
-    SL: gl.constexpr = tuning_cfg.result_store_layout(BM, S_COLS, 8)
-    n0 = pid_n * tuning_cfg.output_block_n()
+    OUT_MBN: gl.constexpr = layout.output_n_slot()
+    P_COLS: gl.constexpr = layout.quant_payload_shape(BM, OUT_MBN)[1]
+    S_COLS: gl.constexpr = layout.quant_scale_shape(BM, OUT_MBN)[1]
+    PL: gl.constexpr = layout.result_store_layout(BM, P_COLS, 8)
+    SL: gl.constexpr = layout.result_store_layout(BM, S_COLS, 8)
+    n0 = pid_n * layout.output_block_n()
     # The staging writes are spread over every warp and each warp reads rows it did not
     # write, so this fence is load-bearing. Only one is needed: nothing reuses the
     # buffer afterwards.
@@ -343,6 +348,7 @@ def _epilogue_one_tile(
     x_static_scale,
     func_cfg,
     tuning_cfg,
+    layout,
     qp_lds_ptr=None,
     qs_lds_ptr=None,
     STAGE_ONLY: gl.constexpr = False,
@@ -367,12 +373,12 @@ def _epilogue_one_tile(
     BM: gl.constexpr = tuning_cfg.BLOCK_M
     MBM: gl.constexpr = tuning_cfg.MINI_BLOCK_M
     ARN: gl.constexpr = func_cfg.activation_reduction_n()
-    OUT_MBN: gl.constexpr = tuning_cfg.output_n_slot()
-    P_COLS: gl.constexpr = tuning_cfg.quant_payload_shape(MBM, OUT_MBN)[1]
-    S_COLS: gl.constexpr = tuning_cfg.quant_scale_shape(MBM, OUT_MBN)[1]
+    OUT_MBN: gl.constexpr = layout.output_n_slot()
+    P_COLS: gl.constexpr = layout.quant_payload_shape(MBM, OUT_MBN)[1]
+    S_COLS: gl.constexpr = layout.quant_scale_shape(MBM, OUT_MBN)[1]
     act: gl.constexpr = func_cfg.act()
     out_ty: gl.constexpr = y_hbm_ptr.dtype.element_ty
-    store_layout: gl.constexpr = tuning_cfg.result_store_layout(
+    store_layout: gl.constexpr = layout.result_store_layout(
         MBM, OUT_MBN, out_ty.primitive_bitwidth
     )
 
@@ -449,7 +455,7 @@ def _epilogue_one_tile(
     # Emitted-channel base. The CTA tile is BLOCK_N // ARN emitted channels wide in both
     # packings -- what differs is only how many mini blocks that is (2 interleaved, 1
     # split, where ni is always the gate block and OUT_MBN is the whole width).
-    out_n0 = pid_n * tuning_cfg.output_block_n() + ni * OUT_MBN
+    out_n0 = pid_n * layout.output_block_n() + ni * OUT_MBN
     if require_constexpr(func_cfg.output_quant is None):
         val = gl.convert_layout(
             out.to(out_ty), store_layout, assert_trivial=False
@@ -490,7 +496,7 @@ def _epilogue_one_tile(
         # so the inner reduction is in-lane fp32 (free |v| modifiers) and only the
         # outer one goes cross-lane. Getting it wrong is not incorrect, just slower --
         # a mismatched split adds permlane steps instead of removing them.
-        LANE_ELEMS: gl.constexpr = tuning_cfg.quant_amax_lane_elems(MBM, OUT_MBN)
+        LANE_ELEMS: gl.constexpr = layout.quant_amax_lane_elems(MBM, OUT_MBN)
         payload, scale = mxfp4_quant_gluon(
             out, OUT_MBN, MBM, MX_GROUP, LANE_ELEMS
         )
@@ -520,8 +526,8 @@ def _epilogue_one_tile(
             # Two barriers per tile because one buffer serves all NM*NN tiles: one so
             # every lane's write is visible before the reads, one so the reads finish
             # before the next tile overwrites the buffer.
-            PL: gl.constexpr = tuning_cfg.result_store_layout(MBM, P_COLS, 8)
-            SL: gl.constexpr = tuning_cfg.result_store_layout(MBM, S_COLS, 8)
+            PL: gl.constexpr = layout.result_store_layout(MBM, P_COLS, 8)
+            SL: gl.constexpr = layout.result_store_layout(MBM, S_COLS, 8)
             # if/elif/else, not early returns: a `return` from inside a nested
             # `if require_constexpr(...)` here does NOT stop the trace, so the code
             # below it still ran and stored the mini tile to the *unsliced* buffer --
@@ -611,6 +617,7 @@ def _epilogue_store(
     x_static_scale,
     func_cfg,
     tuning_cfg,
+    layout,
     GATE_PRE: gl.constexpr = False,
 ):
     """bias -> activation -> gammas -> output_quant -> store, per mini (M, N) tile.
@@ -622,10 +629,10 @@ def _epilogue_store(
     compiler kill each mini accumulator before the next tile's epilogue.
     """
     MBM: gl.constexpr = tuning_cfg.MINI_BLOCK_M
-    OUT_MBN: gl.constexpr = tuning_cfg.output_n_slot()
+    OUT_MBN: gl.constexpr = layout.output_n_slot()
 
-    NN: gl.constexpr = tuning_cfg.num_n_slots_per_block()
-    NM: gl.constexpr = tuning_cfg.num_m_slots_per_block()
+    NN: gl.constexpr = layout.num_n_slots_per_block()
+    NM: gl.constexpr = layout.num_m_slots_per_block()
 
     # Block-level operand loads. Each is invariant in one of the two
     # walk indices -- bias in mi, gammas in ni -- so the per-tile form below issues
@@ -635,10 +642,10 @@ def _epilogue_store(
     # the read then carries the accumulator's own M/N slice layout, so nothing downstream
     # changes. Otherwise the block-level load still comes from global.
     bias_tiles = _epi_bias_tiles(
-        bias_lds_ptr, bias_hbm_ptr, pid_n, N, func_cfg, tuning_cfg
+        bias_lds_ptr, bias_hbm_ptr, pid_n, N, func_cfg, tuning_cfg, layout
     )
     gamma_tiles = _epi_gamma_tiles(
-        gamma_lds_ptr, gammas_hbm_ptr, block_id, M_e, func_cfg, tuning_cfg
+        gamma_lds_ptr, gammas_hbm_ptr, block_id, M_e, func_cfg, tuning_cfg, layout
     )
 
     # Staging for the MXFP4 payload store, bouncing it through LDS so the global store
@@ -649,19 +656,19 @@ def _epilogue_store(
     # Allocated here so it dominates every use; the pipeline's buffers are dead by this
     # point, so Triton's liveness-based shared allocator overlays this on top of them
     # and the kernel's LDS footprint does not grow at all.
-    QSH: gl.constexpr = tuning_cfg.quant_staging_layout()
+    QSH: gl.constexpr = layout.quant_staging_layout()
     ROT: gl.constexpr = tuning_cfg.quant_staging_rotates()
     # Split stages the whole block, not one mini tile: NM tiles into one buffer, flushed
     # once at the end of the walk. Costs NM x the LDS (still a few KB, overlaid on the
     # dead pipeline buffers) and buys NM-1 barrier pairs and one wide store instead of
     # NM narrow ones.
-    QROWS: gl.constexpr = tuning_cfg.quant_staging_rows()
+    QROWS: gl.constexpr = layout.quant_staging_rows()
     if require_constexpr(func_cfg.output_quant is not None):
         qp_lds_ptr = gl.allocate_shared_memory(
-            gl.uint8, tuning_cfg.quant_payload_shape(QROWS, OUT_MBN), layout=QSH
+            gl.uint8, layout.quant_payload_shape(QROWS, OUT_MBN), layout=QSH
         )
         qs_lds_ptr = gl.allocate_shared_memory(
-            gl.uint8, tuning_cfg.quant_scale_shape(QROWS, OUT_MBN), layout=QSH
+            gl.uint8, layout.quant_scale_shape(QROWS, OUT_MBN), layout=QSH
         )
     else:
         qp_lds_ptr: gl.constexpr = None
@@ -670,10 +677,10 @@ def _epilogue_store(
         # Second bank for rotating epilogue. Same overlay argument as above, so the footprint
         # still does not grow.
         qp2_lds_ptr = gl.allocate_shared_memory(
-            gl.uint8, tuning_cfg.quant_payload_shape(MBM, OUT_MBN), layout=QSH
+            gl.uint8, layout.quant_payload_shape(MBM, OUT_MBN), layout=QSH
         )
         qs2_lds_ptr = gl.allocate_shared_memory(
-            gl.uint8, tuning_cfg.quant_scale_shape(MBM, OUT_MBN), layout=QSH
+            gl.uint8, layout.quant_scale_shape(MBM, OUT_MBN), layout=QSH
         )
     else:
         qp2_lds_ptr: gl.constexpr = None
@@ -707,6 +714,7 @@ def _epilogue_store(
                 x_static_scale,
                 func_cfg,
                 tuning_cfg,
+                layout,
                 qp_lds_ptr,
                 qs_lds_ptr,
                 lin=acc[_slot_index(mi, 1, NM, NN)],
@@ -718,7 +726,7 @@ def _epilogue_store(
                 qp_lds_ptr, qs_lds_ptr,
                 y_hbm_ptr, y_stride_m, y_stride_n,
                 ys_hbm_ptr, ys_stride_m, ys_stride_n,
-                block_id, pid_n, M_e, func_cfg, tuning_cfg,
+                block_id, pid_n, M_e, func_cfg, tuning_cfg, layout,
             )
     elif require_constexpr(ROT):
         # Software-pipelined staging: flush the PREVIOUS tile, then stage this one,
@@ -736,7 +744,7 @@ def _epilogue_store(
                     (k - 1) // NN, (k - 1) % NN,
                     y_hbm_ptr, y_stride_m, y_stride_n,
                     ys_hbm_ptr, ys_stride_m, ys_stride_n,
-                    block_id, pid_n, M_e, func_cfg, tuning_cfg,
+                    block_id, pid_n, M_e, func_cfg, tuning_cfg, layout,
                 )
             _epilogue_one_tile(
                 acc[_slot_index(k // NN, k % NN, NM, NN)],
@@ -744,6 +752,7 @@ def _epilogue_store(
                 bias_tiles, gamma_tiles, gamma_lds_ptr, bias_hbm_ptr, gammas_hbm_ptr,
                 y_hbm_ptr, y_stride_m, y_stride_n, ys_hbm_ptr, ys_stride_m, ys_stride_n,
                 block_id, pid_n, M_e, x_static_scale, func_cfg, tuning_cfg,
+                layout,
                 qp2_lds_ptr if k % 2 else qp_lds_ptr,
                 qs2_lds_ptr if k % 2 else qs_lds_ptr,
                 STAGE_ONLY=True,
@@ -755,7 +764,7 @@ def _epilogue_store(
             qs2_lds_ptr if LK % 2 else qs_lds_ptr,
             LK // NN, LK % NN, y_hbm_ptr, y_stride_m, y_stride_n,
             ys_hbm_ptr, ys_stride_m, ys_stride_n,
-            block_id, pid_n, M_e, func_cfg, tuning_cfg,
+            block_id, pid_n, M_e, func_cfg, tuning_cfg, layout,
         )
     else:
         for mi in gl.static_range(NM):
@@ -784,6 +793,7 @@ def _epilogue_store(
                     x_static_scale,
                     func_cfg,
                     tuning_cfg,
+                    layout,
                     qp_lds_ptr,
                     qs_lds_ptr,
                 )

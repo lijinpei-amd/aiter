@@ -7,6 +7,7 @@ import math
 
 import pytest
 
+from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import compute_kernel_layout
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
     _live_span,
     pipeline_unroll,
@@ -53,19 +54,23 @@ def test_scale_mini_blocks_only_change_the_shuffled_operand(shuffled):
         SCALE_MINI_BLOCK_N=128,
         SCALE_MINI_BLOCK_K=512,
     )
+    layout = compute_kernel_layout(tc)
     for operand in range(2):
-        assert tc.scale_mini_block_nonk(operand) == (128 if shuffled[operand] else 64)
-        assert tc.scale_mini_block_k(operand) == (512 if shuffled[operand] else 128)
-        assert tc.scale_ratio_k_step(operand) == (4 if shuffled[operand] else 1)
-        assert tc.scale_ratio_non_k_slot(operand) == (2 if shuffled[operand] else 1)
+        assert layout.scale_mini_block_nonk(operand) == (
+            128 if shuffled[operand] else 64
+        )
+        assert layout.scale_mini_block_k(operand) == (512 if shuffled[operand] else 128)
+        assert layout.scale_ratio_k_step(operand) == (4 if shuffled[operand] else 1)
+        assert layout.scale_ratio_non_k_slot(operand) == (2 if shuffled[operand] else 1)
     assert tc.validate(4096, 7168)
 
 
 @pytest.mark.parametrize("block_k", [128, 256, 512])
 def test_shuffled_scale_k_defaults_to_at_least_k256(block_k):
     tc = _config(BLOCK_K=block_k, VGPR_PREFETCH_K=block_k)
+    layout = compute_kernel_layout(tc)
     expected = max(256, block_k)
-    assert tc.scale_mini_block_k(0) == tc.scale_mini_block_k(1) == expected
+    assert layout.scale_mini_block_k(0) == layout.scale_mini_block_k(1) == expected
 
 
 def test_invalid_unused_scale_minis_are_ignored():
@@ -77,8 +82,9 @@ def test_invalid_unused_scale_minis_are_ignored():
         SCALE_MINI_BLOCK_K=1,
     )
     assert tc.validate(4096, 7168)
-    assert tc.scale_mini_block_nonk(0) == tc.scale_mini_block_nonk(1) == 64
-    assert tc.scale_mini_block_k(0) == tc.scale_mini_block_k(1) == 128
+    layout = compute_kernel_layout(tc)
+    assert layout.scale_mini_block_nonk(0) == layout.scale_mini_block_nonk(1) == 64
+    assert layout.scale_mini_block_k(0) == layout.scale_mini_block_k(1) == 128
 
 
 @pytest.mark.parametrize(
@@ -164,10 +170,11 @@ def test_scale_k_step_ratio_sets_buffer_span_and_unroll(
         A_SCALE_IN_REG=register_scales,
         B_SCALE_IN_REG=register_scales,
     )
+    layout = compute_kernel_layout(tc)
     ratio = scale_k // block_k
     for operand, depth in enumerate((2, 3)):
-        assert _live_span(tc, (operand, True)) == (depth - 1) * ratio + 1
-        assert tc.scale_ratio_k_step(operand) == ratio
-        assert tc.scale_read_k_slots(operand) == ratio
+        assert _live_span(tc, layout, (operand, True)) == (depth - 1) * ratio + 1
+        assert layout.scale_ratio_k_step(operand) == ratio
+        assert layout.scale_read_k_slots(operand) == ratio
     period = math.lcm(3, 2 * ratio, 3 * ratio)
-    assert pipeline_unroll(tc) == period
+    assert pipeline_unroll(tc, layout) == period
