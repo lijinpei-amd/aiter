@@ -42,7 +42,6 @@ from collections.abc import Sequence
 
 import torch
 import triton
-from intj import make_launcher
 
 from aiter.ops.triton._triton_kernels.fusions.attn_res import (
     ATTN_RES_TRITON_AUTOTUNE,
@@ -58,8 +57,10 @@ _LOGGER = AiterTritonLogger()
 # call against ~10-25us of device work, ~26us of it in JITFunction.run's
 # argument binding, specialization and cache lookup (MI350X/gfx950, N=1 B=8
 # H=7168, quant + close_block). attn_res_gate and the packed layout launch
-# through an intj launcher (_attnres_fwd_kernel_launch), which does that part
-# in C; the sequence layout's tuple argument keeps it on Triton.
+# through attnres_fwd_kernel, an intj launcher, which does that part in C; the
+# sequence layout's tuple argument keeps it on Triton, through the JIT function
+# the launcher launches.
+_attnres_fwd_jit = attnres_fwd_kernel.__self__.options.jit_func
 
 
 _POW2_CACHE: dict[int, int] = {}
@@ -333,7 +334,7 @@ def _run_sequence(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm)
     L2 = max(1, triton.next_power_of_2(L))
     num_warps, num_stages = _pick_attn_res_seq_config(N)
 
-    attnres_fwd_kernel[(N,)](
+    _attnres_fwd_jit[(N,)](
         q=q_flat,
         res=res,
         w=w_flat,
@@ -379,15 +380,6 @@ def _run_sequence(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm)
     return o.view(output_shape)
 
 
-if ATTN_RES_TRITON_AUTOTUNE:
-    # The tuner assigns BL, num_warps and num_stages.
-    _attnres_fwd_kernel_launch = make_launcher(attnres_fwd_kernel)
-else:
-    _attnres_fwd_kernel_launch = make_launcher(
-        attnres_fwd_kernel, dynamic_options=("num_warps", "num_stages")
-    )
-
-
 def _run_packed(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm):
     if isinstance(residuals, (list, tuple)):
         L = len(residuals)
@@ -414,7 +406,7 @@ def _run_packed(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm):
         ((), ()) if ATTN_RES_TRITON_AUTOTUNE else ((num_warps, num_stages), (bl,))
     )
     dev, stream = current_device_stream()
-    _attnres_fwd_kernel_launch(
+    attnres_fwd_kernel(
         dev,
         stream,
         (N,),
@@ -608,7 +600,7 @@ def attn_res_gate(
         ((), ()) if ATTN_RES_TRITON_AUTOTUNE else ((num_warps, num_stages), (bl,))
     )
     dev, stream = current_device_stream()
-    _attnres_fwd_kernel_launch(
+    attnres_fwd_kernel(
         dev,
         stream,
         (N,),

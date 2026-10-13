@@ -4,6 +4,7 @@
 
 import triton
 import triton.language as tl
+from intj import make_launcher
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.tuned_config_utils import (
@@ -390,3 +391,12 @@ if ATTN_RES_TRITON_AUTOTUNE:
         ],
         cache_results=True,
     )(attnres_fwd_kernel)
+
+# attn_res_gate and the packed layout launch through this launcher; the
+# sequence layout's tuple argument launches its JIT function
+# (`attnres_fwd_kernel.__self__.options.jit_func`) through Triton. Under
+# ATTN_RES_TRITON_AUTOTUNE the tuner assigns BL, num_warps and num_stages.
+attnres_fwd_kernel = make_launcher(
+    attnres_fwd_kernel,
+    dynamic_options=() if ATTN_RES_TRITON_AUTOTUNE else ("num_warps", "num_stages"),
+)

@@ -655,9 +655,10 @@ def _gate_all_variants(prefix, block_residual, score_weight, orw, fp8_dtype):
 
 
 def _triton_launch(dev, stream, grid, *args):
-    """attnres_fwd_kernel through Triton's own launch, taking the arguments of
-    attn_res_gate's intj launcher (_attnres_fwd_kernel_launch)."""
-    names = attnres_fwd_kernel.arg_names
+    """attnres_fwd_kernel's JIT function through Triton's own launch, taking the
+    arguments of the intj launcher attn_res_gate calls (attnres_fwd_kernel)."""
+    jit = attnres_fwd_kernel.__self__.options.jit_func
+    names = jit.arg_names
     options = {}
     if ATTN_RES_TRITON_AUTOTUNE:
         names = [n for n in names if n != "BL"]  # the tuner assigns BL
@@ -665,7 +666,7 @@ def _triton_launch(dev, stream, grid, *args):
         num_warps, num_stages, *args = args
         options = {"num_warps": num_warps, "num_stages": num_stages}
     assert len(names) == len(args)
-    attnres_fwd_kernel[grid](**dict(zip(names, args)), **options)
+    jit[grid](**dict(zip(names, args)), **options)
 
 
 def _gate_outputs(out):
@@ -678,7 +679,7 @@ def _assert_gate_matches_triton(monkeypatch, *args, **kwargs):
     """attn_res_gate returns bitwise what a Triton launch of the same kernel
     returns, on its first call and on a repeated one (a launcher cache hit)."""
     with monkeypatch.context() as m:
-        m.setattr(attn_res_module, "_attnres_fwd_kernel_launch", _triton_launch)
+        m.setattr(attn_res_module, "attnres_fwd_kernel", _triton_launch)
         expected = _gate_outputs(attn_res_gate(*args, **kwargs))
     for _ in range(2):
         got = _gate_outputs(attn_res_gate(*args, **kwargs))
@@ -715,7 +716,7 @@ def test_attn_res_gate_compiles_are_bounded_in_token_count():
     D, B = 256, 3
     dtype = torch.bfloat16
     compiles = []
-    jit = attnres_fwd_kernel
+    jit = attnres_fwd_kernel.__self__.options.jit_func
     while not isinstance(jit, JITFunction):  # under @triton.autotune
         jit = jit.fn
 
