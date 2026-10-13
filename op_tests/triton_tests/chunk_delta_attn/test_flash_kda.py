@@ -18,6 +18,7 @@ import math
 
 import pytest
 import torch
+from intj.launcher import Launcher
 
 from aiter.ops.triton._triton_kernels.chunk_delta_attn import chunk_delta_attn_fwd
 from aiter.ops.triton._triton_kernels.chunk_delta_attn import chunk_fwd as _chunk_fwd
@@ -536,7 +537,7 @@ def test_reference_inter_solve_launches_through_intj():
     # The kernel is decorated with its intj launcher, so the reference path
     # has no Triton JIT function left to launch through.
     target = intra_attn.chunk_delta_attn_fwd_kernel_inter_solve_fused
-    assert type(target.__self__).__name__ == "Launcher"
+    assert isinstance(target.__self__, Launcher)
     args = make_inputs(1, 128, 4)
     want, _ = run_reference(*args)
     got, _ = run_reference(*args)
@@ -616,9 +617,15 @@ def test_wide_gluon_k2_launch_matches_triton():
 
 def test_gluon_kda_jits_have_no_captured_layout_globals():
     """intj refuses a JIT that reads globals, and cannot bake layout objects."""
-    with kda_launchers.relaunched(lambda kernel, **_: kernel) as kernels:
-        jits = kernels["k1_prepare_gluon"], kernels["k2_ab_fused_gluon"]
-    for kernel in jits:
+    from aiter.ops.triton._gluon_kernels.gfx950.chunk_delta_attn.flash_kda_k1 import (
+        k1_prepare_gluon,
+    )
+    from aiter.ops.triton._gluon_kernels.gfx950.chunk_delta_attn.flash_kda_k2 import (
+        k2_ab_fused_gluon,
+    )
+
+    for launcher in (k1_prepare_gluon, k2_ab_fused_gluon):
+        kernel = kda_launchers.jit_of(launcher.__self__.options.jit_func)
         _ = kernel.cache_key  # Triton populates used_global_vals lazily.
         assert not kernel.used_global_vals
 

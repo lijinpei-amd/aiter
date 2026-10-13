@@ -4,10 +4,11 @@
 """Fresh FlashKDA launchers for tests.
 
 Each FlashKDA kernel is decorated with its intj launcher, so its name is the
-launcher and the JIT function (and its tuner) is out of reach. A test that
-needs a first call, other tuner configs, a spy or a Triton reference re-runs
-the kernel modules instead, with its own stand-in for ``intj.make_launcher``,
-and gets a launcher that has never been called.
+launcher; ``kernel.__self__.options.jit_func`` is the kernel it launches (the
+tuner chain included), shared with the module. A test that needs a first call,
+other tuner configs, a spy or a Triton reference re-runs the kernel modules
+instead, with its own stand-in for ``intj.make_launcher``, and gets a launcher
+that has never been called over a tuner of its own.
 """
 
 import contextlib
@@ -101,8 +102,8 @@ def spying(record):
 def with_configs(configs):
     """A make_launcher that first gives the named kernels' tuners ``configs``.
 
-    Before make_launcher, which reads them to tell which parameters are tuned;
-    the launcher tunes on its own copy of the tuner, made at its first call.
+    The launcher reads them at its first check() or call, to tell which
+    parameters are tuned, and tunes on its own copy of the tuner.
     """
 
     def make(kernel, **kwargs):

@@ -19,7 +19,7 @@ import weakref
 import pytest
 import torch
 import triton
-from intj.launcher import module_of
+from intj.launcher import Launcher, module_of
 from triton.runtime.jit import JITFunction
 
 from aiter.ops.triton._triton_kernels.chunk_delta_attn import flash_kda as fk
@@ -266,7 +266,7 @@ def test_kernels_are_intj_launchers():
     """No Triton JIT function is left to launch through."""
     for kernel in _launchers():
         assert not isinstance(kernel, JITFunction)
-        assert type(kernel.__self__).__name__ == "Launcher"
+        assert isinstance(kernel.__self__, Launcher)
 
 
 def test_every_launcher_builds():

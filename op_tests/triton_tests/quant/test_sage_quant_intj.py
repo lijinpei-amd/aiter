@@ -4,6 +4,7 @@
 
 import pytest
 import torch
+from intj.launcher import Launcher
 from triton.runtime.jit import JITFunction
 
 from aiter.ops.triton.quant import sage_attention_quant_wrappers as sage
@@ -29,7 +30,7 @@ def test_sage_kernels_are_intj_launchers():
     # function is left to launch through.
     for kernel in _SAGE_KERNELS:
         assert not isinstance(kernel, JITFunction)
-        assert type(kernel.__self__).__name__ == "Launcher"
+        assert isinstance(kernel.__self__, Launcher)
 
 
 def _input():
