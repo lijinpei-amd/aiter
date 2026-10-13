@@ -79,10 +79,10 @@ first call: `kpack` by `get_arch()` in `mla_decode_ref`, chunked_pa_prefill's
 gfx950 decode options, pa_mqa_logits' fp8 pointer types. Until then a
 `delayed=` launcher's `options` is an `intj.launcher.Delayed`, with no
 `jit_func`. A kernel that is `None` when its Gluon module fails to import is
-decorated inside that module, so the imported name is a launcher or `None`. Launchers that
-used to differ only in something now passed per call are one decorated
-kernel: the split-K reduce takes `KERNEL_NAME` and `activation` as str
-constexprs; sage_quant_v, `_combined_routing`, `_moe_gemm_a8w8` and
+decorated inside that module, so the imported name is a launcher or `None`.
+Launchers that used to differ only in something now passed per call are one
+decorated kernel: the split-K reduce takes `KERNEL_NAME` and `activation` as
+str constexprs; sage_quant_v, `_combined_routing`, `_moe_gemm_a8w8` and
 `_sparse_attn_prefill_kernel` each serve two call sites.
 
 Three other forms remain, 12 launchers, only where a decorator cannot give
@@ -472,10 +472,10 @@ keywords. What changed:
   kernels, attn_res and the five fused MXFP4 kernels launch under their
   kernel's name; their JIT-function consumers read it from the launcher (see
   [Launchers](#launchers)). Of the 13 named launchers, the three whose JIT
-  function must keep its own name remain. The
-  AOT tools (`csrc/cpp_itfs/gluon_aot_tools/compile*.py`) take the JIT
-  function from a launcher they load by name; the HSACO symbol is the JIT
-  function's name, which is the attribute's.
+  function must keep its own name remain. The AOT tools
+  (`csrc/cpp_itfs/gluon_aot_tools/compile*.py`) take the JIT function from a
+  launcher they load by name; the HSACO symbol is the JIT function's name,
+  which is the attribute's.
 - **`delayed=` replaces the factories.** `mla_decode_ref`'s two kernels are
   decorated, `kpack` coming from `delayed=`; pa_mqa_logits' six Gluon
   launchers are a module-level table whose annotations come from
@@ -485,37 +485,48 @@ keywords. What changed:
   longer imported without a GPU as it did before the migration, picks them in
   `delayed=`.
 
-Verified on gfx942 (MI300X), `AITER_TRITON_ONLY=1`:
+Verified on gfx942 (MI300X) and gfx950 (MI350X), `AITER_TRITON_ONLY=1`, with
+the dtypes plugin and the torch `per_tensor_quant`/`pertoken_quant` shims:
 
 - **Every launcher checks and builds.** A sweep imports every module under
   `aiter/ops/triton` and every other module that declares a launcher (415),
   first with no visible GPU, then on one GPU, where it calls `check()` and
   then `build()` on every launcher reachable from a module global (also in
-  module-level dicts, lists and namespaces): 416 launchers, 9 of them
-  `delayed=`, none refused. The 13 declared launchers it does not reach are
-  in modules that fail to import here, on the base tree too (FlyDSL, Iris,
-  `mori` and `matplotlib` missing, HIP-only `per_tensor_quant` in
-  triton-only mode, pod_attention), plus the metadata-redirect test's
-  in-function kernel and `test_mla_sparse.py`, a script. Before this change
-  (intj `2783079`): 408 launchers, none refused.
+  module-level dicts, lists and namespaces). gfx942: 419 launchers, 9 of
+  them `delayed=`, none refused; before this change (intj `2783079`), 409,
+  none refused. The 11 declared launchers it does not reach are in modules
+  that fail to import here, on the base tree too (FlyDSL, `mori` and
+  `matplotlib` missing; pod_attention), plus the metadata-redirect test's
+  in-function kernel and `test_mla_sparse.py`, a script. gfx950, where FlyDSL
+  and `matplotlib` are installed: 426 launchers, none refused; 4 not
+  reached.
 - **Imports without a GPU.** 148 of the 415 modules import with
-  `HIP_VISIBLE_DEVICES=""`; each of the others fails on the base tree too
-  (`arch_info` needs a GPU or `jax`, plus the dependencies above), except
-  `kda_launchers.py`, a test helper the base tree does not have, which
-  imports `arch_info`. Before this change chunked_pa_prefill's kernel module
+  `HIP_VISIBLE_DEVICES=""` on gfx942 (151 on gfx950); each of the others
+  fails on the base tree too (`arch_info` needs a GPU or `jax`, plus the
+  dependencies above), except `kda_launchers.py`, a test helper the base tree
+  does not have, which imports `arch_info`. Before this change chunked_pa_prefill's kernel module
   was the one module that imported on the base tree and not here.
-- **Tests.** `test_intj_launch.py` (24 passed, 1 skipped: two GPUs),
-  `test_flash_kda.py` (65 passed, 4 skipped: gfx950 Gluon K2),
-  `test_sage_quant_intj.py` (8 passed, 1 skipped: gfx950 FP4 pack),
-  `test_mxfp4_intj.py` (13 passed), `test_mxfp4_jit_import.py` (61 passed),
-  `test_attn_res.py` (251 passed), `test_mla_decode_rope.py` (240 passed),
-  `test_pa_mqa_logits_offset.py` (105 passed), `test_chunked_pa_prefill.py`
-  (16 passed), `test_pa_decode_gluon.py` (1 passed, 2 failed: the
-  sliding-window sets copy CK headers this checkout lacks, as on the base
-  tree). `test_fused_mxfp4_quant.py` skips all 2356 cases on gfx942.
-- **pa_decode_gluon's AOT scripts.** `pa_decode_gluon_aot_warmup` warms up
-  the JIT functions through the launchers' options: the disassembly of all
-  four HSACOs (dot, large-block dot, reduce) equals the previous revision's.
+- **Tests**, gfx942 / gfx950: `test_intj_launch.py` 24 passed, 1 skipped
+  (two GPUs) on both; `test_flash_kda.py` 65 passed, 4 skipped (gfx950 Gluon
+  K2) / 69 passed; `test_sage_quant_intj.py` 8 passed, 1 skipped (gfx950 FP4
+  pack) / 9 passed; `test_mxfp4_intj.py` 13, `test_mxfp4_jit_import.py` 61,
+  `test_attn_res.py` 251, `test_mla_decode_rope.py` 240,
+  `test_pa_mqa_logits_offset.py` 105 and `test_chunked_pa_prefill.py` 16
+  passed on both; `test_pa_decode_gluon.py` 1 passed, 2 failed on both (the
+  sliding-window sets copy CK headers this checkout lacks; the base tree
+  fails them the same way); `test_fused_mxfp4_quant.py` skips all 2356 cases
+  on gfx942, and on gfx950 1356 passed, 952 skipped, 48 failed: the
+  `test_fused_dynamic_mxfp4_quant_moe_sort` cases, which build the HIP
+  `module_quant` (no CK headers), the same 48 ids as on the base tree.
+- **`delayed=` resolves per GPU.** After `check()`, gfx942 gives `kpack=2`
+  for both `mla_decode_ref` kernels, no chunked_pa_prefill options and
+  `*fp8e4b8` for pa_mqa_logits' pointers; gfx950 gives `kpack=1`,
+  `num_warps=1, num_stages=1, waves_per_eu=2` and `*fp8e4nv`, the values the
+  factories and import-time code computed.
+- **pa_decode_gluon's AOT scripts** (gfx942). `pa_decode_gluon_aot_warmup`
+  warms up the JIT functions through the launchers' options: the disassembly
+  of its HSACOs (dot and large-block dot, each with the reduce kernel) equals
+  the previous revision's.
   The direct launches of `pa_reduce_kernel_test.py` and
   `pa_attention_kernel_test.py` return bitwise the base tree's outputs (MD5).
   Their compiled paths stop where the base tree's do: the reduce kernel's C
