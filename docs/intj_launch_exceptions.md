@@ -705,9 +705,11 @@ them back into the tuple its gather loop indexes: the residuals, padded to
 (`ATTN_RES_SEQ_SLOTS`), which the tuple also took, are stacked into one
 tensor and take the packed layout: one device copy of the residuals, and
 outputs within tolerance of the tuple launch's but not bitwise equal to them
-(29 of 68 cases equal on gfx942, L 17-64). The copy and the packed kernel
-take 0.05-0.47x the GPU time of the tuple launch, whose 32-row tile spills
-(gfx942, L 17 and 32, the N and D of the GPU times below, bf16).
+(29 of 68 cases equal on gfx942, 27 on gfx950, L 17-64). GPU time per call
+at L 17 and 32 (the N and D of the GPU times below, bf16), copy and packed
+kernel against the tuple launch: 0.05-0.47x on gfx942; 0.06-0.66x on gfx950
+except at D=1024 with N of 1 or 64, where it is 1.2-2.0x (N=1: 13.6 vs 16.7
+us at L=17, 13.7 vs 26.0 us at L=32).
 
 Six launchers launch the one kernel, each baking what its layout never
 varies, so a call neither passes nor decodes it. `attnres_fwd_kernel`
@@ -726,17 +728,16 @@ neither. The sequence entry also takes the Python fast paths
 Verified with intj `develop` `2783079`, Triton 3.8.0, `AITER_TRITON_ONLY=1`,
 on gfx942 and gfx950 (MI350X):
 
-- **Tests.** `test_attn_res.py`: 255 passed on both GPUs (the base tree's 251
+- **Tests.** `test_attn_res.py`: 272 passed on both GPUs (the base tree's 251
   plus the sequence launch checked bitwise against a Triton launch of the same
   kernel across L2 buckets, dtypes, output norm, scalars equal to 1.0 and
   token counts, and every residual count from 1 to 17, and 33, against the
-  torch reference), and the same with
-  `ATTN_RES_TRITON_AUTOTUNE=1`, except on gfx942
-  `test_attn_res_gate_out_quant_matches_unfused_quant[64]`, which fails there
-  on the base tree too. `test_mhc.py`, which imports the same kernel package:
-  406 passed, 12 skipped on both GPUs, as on the base tree. Under
-  `torch.compile` the sequence entry works without `fullgraph` and fails
-  with it, before and after (gfx942).
+  torch reference), and the same with `ATTN_RES_TRITON_AUTOTUNE=1`, except on
+  gfx942 `test_attn_res_gate_out_quant_matches_unfused_quant[64]`, which
+  fails there on the base tree too. `test_mhc.py`, which imports the same
+  kernel package: 406 passed, 12 skipped on both GPUs, as on the base tree.
+  Under `torch.compile` the sequence entry works without `fullgraph` and
+  fails with it, before and after (gfx942).
 - **Outputs.** 519 sequence-layout cases (L 1-16, fp32/bf16/fp16, with and
   without the output norm, eps and scale values, leading dimensions, and the
   shape sweep below) are bitwise equal to the base tree's and to upstream
@@ -749,22 +750,27 @@ on gfx942 and gfx950 (MI350X):
   calls per process, median (and range) of 5 alternating processes, pinned to
   the GPU's NUMA node. "Launch" is the kernel call alone, arguments prebuilt.
   Upstream's numbers are the base tree's within 1.5% for the sequence layout.
+  In the same rounds, one sequence launcher passing all 16 slots
+  (`33c4e14a7`) measured 12.1 (gfx942) and 7.25 (gfx950) for the L=2 entry,
+  and within 0.1 us of the numbers below at L=16.
 
   | | gfx942 before | gfx942 after | gfx950 before | gfx950 after |
   | --- | ---: | ---: | ---: | ---: |
-  | sequence entry, L=2 | 66.0 | 11.9 (11.9-12.3) | 33.6 | 7.4 (7.4-7.6) |
-  | sequence entry, L=16 | 110.4 | 18.5 (18.4-18.7) | 61.4 | 10.9 (10.8-11.0) |
-  | sequence launch, L=2 | 37.2 | 4.6 (4.6-4.7) | 22.7 | 3.3 (3.3-3.4) |
-  | sequence launch, L=16 | 62.2 | 5.5 (5.3-5.5) | 39.4 | 3.4 (3.3-3.6) |
-  | packed entry, L=4 | 26.8 | 25.4 (24.8-25.5) | 18.0 | 16.9 (16.7-17.0) |
-  | `attn_res_gate` | 17.3 | 17.0 (16.9-17.2) | 10.7 | 10.7 (10.6-10.9) |
+  | sequence entry, L=2 | 66.2 | 11.6 (11.5-11.7) | 33.7 | 7.0 (7.0-7.3) |
+  | sequence entry, L=16 | 111.7 | 18.6 (18.5-18.7) | 62.6 | 10.7 (10.6-11.0) |
+  | sequence launch, L=2 | 37.2 | 4.4 (4.4-4.5) | 22.6 | 2.9 (2.9-3.2) |
+  | sequence launch, L=16 | 62.5 | 5.4 (5.3-5.4) | 40.0 | 3.1 (3.1-3.4) |
+  | packed entry, L=4 | 26.5 | 25.4 (25.1-25.6) | 18.0 | 17.0 (16.8-17.3) |
+  | `attn_res_gate` | 17.0 | 17.2 (17.0-17.4) | 10.5 | 10.5 (10.4-10.8) |
 
 - **GPU time** (`torch.cuda.Event` over 50 back-to-back launches queued
   behind a sleep, 3 alternating processes; rocprofv3 aborts under this torch):
   L in {2, 4, 8, 16}, N in {1, 64, 4096}, D in {1024, 4096, 7168}, bf16. The
-  after/before ratio of the 36 shapes is 0.995-1.007 on gfx950 and
-  0.995-1.028 on gfx942, median 1.000 on both; the gfx942 outlier (N=1,
-  D=1024, L=2, 3.99 vs 4.10 us) re-measured equal over 200-launch batches
-  (3.96-3.99 vs 3.96-3.97 us), as did the same launch through Triton.
+  after/before ratio of the 36 shapes is 0.989-1.007 on gfx950 and
+  0.982-1.014 on gfx942, median 1.000 on both. Over 200-launch batches the
+  gfx942 extremes re-measured equal (N=64, D=1024, L=2: 4.28 vs 4.28-4.29
+  us, as did the same launch through Triton), or swapped sides between runs
+  (N=64, D=4096, L=16: 23.2-23.3 vs 24.1-24.7 us, then 24.2-24.6 vs
+  23.0-23.1 us).
 
 Not run: CUDA.
