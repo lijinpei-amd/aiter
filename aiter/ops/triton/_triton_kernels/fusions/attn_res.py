@@ -418,7 +418,7 @@ if ATTN_RES_TRITON_AUTOTUNE:
 # The number of sequence-layout residual slots, res0..res15.
 ATTN_RES_SEQ_SLOTS = 16
 
-# Two launchers launch this kernel (or, under ATTN_RES_TRITON_AUTOTUNE, the
+# The launchers below launch this kernel (or, under ATTN_RES_TRITON_AUTOTUNE, the
 # tuner over it, which then assigns BL, num_warps and num_stages). Each bakes
 # the arguments its layout never varies, so a call neither passes nor decodes
 # them: on the decode path every argument costs host time.
@@ -436,44 +436,53 @@ attnres_fwd_kernel = make_launcher(
     },
 )
 
-# layout="sequence": none of what the packed layout adds (prefix, add folds,
-# block_out, FP8 quant, SEPARATE) and no backward checkpoint.
-attnres_fwd_sequence_kernel = make_launcher(
-    _attnres_fwd,
-    dynamic_options=_ATTN_RES_DYNAMIC_OPTIONS,
-    extra_annotation={
-        **dict.fromkeys(
-            (
-                "o_pre",
-                "rstd",
-                "logit",
-                "lse",
-                "res_packed",
-                "prefix",
-                "add_hidden",
-                "add_hidden2",
-                "prefix_out",
-                "block_out",
-                "o_scale",
-            ),
-            Argument(value=None),
+# layout="sequence", one launcher per L2 bucket: none of what the packed
+# layout adds (prefix, add folds, block_out, FP8 quant, SEPARATE), no backward
+# checkpoint, and no residual slot from L2 up.
+_ATTN_RES_SEQ_BAKED = {
+    **dict.fromkeys(
+        (
+            "o_pre",
+            "rstd",
+            "logit",
+            "lse",
+            "res_packed",
+            "prefix",
+            "add_hidden",
+            "add_hidden2",
+            "prefix_out",
+            "block_out",
+            "o_scale",
         ),
-        **dict.fromkeys(
-            (
-                "SAVE_OPRE",
-                "SAVE_STATS",
-                "IS_PACKED",
-                "HAS_PREFIX",
-                "DO_ADD",
-                "DO_ADD2",
-                "WRITE_PREF",
-                "WRITE_BLOCK_CAT",
-                "QUANT_FP8",
-                "SEPARATE",
-            ),
-            Constexpr(value=False),
+        Argument(value=None),
+    ),
+    **dict.fromkeys(
+        (
+            "SAVE_OPRE",
+            "SAVE_STATS",
+            "IS_PACKED",
+            "HAS_PREFIX",
+            "DO_ADD",
+            "DO_ADD2",
+            "WRITE_PREF",
+            "WRITE_BLOCK_CAT",
+            "QUANT_FP8",
+            "SEPARATE",
         ),
-        "HAS_W": Constexpr(value=True),
-        "FP8_MAX": Constexpr(value=1.0),
-    },
-)
+        Constexpr(value=False),
+    ),
+    "HAS_W": Constexpr(value=True),
+    "FP8_MAX": Constexpr(value=1.0),
+}
+attnres_fwd_sequence_kernels = {
+    l2: make_launcher(
+        _attnres_fwd,
+        dynamic_options=_ATTN_RES_DYNAMIC_OPTIONS,
+        extra_annotation={
+            **_ATTN_RES_SEQ_BAKED,
+            **{f"res{i}": Argument(value=None) for i in range(l2, ATTN_RES_SEQ_SLOTS)},
+            "L2": Constexpr(value=l2),
+        },
+    )
+    for l2 in (1, 2, 4, 8, 16)
+}

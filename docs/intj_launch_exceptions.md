@@ -89,7 +89,7 @@ decorated kernel: the split-K reduce takes `KERNEL_NAME` and `activation` as
 str constexprs; sage_quant_v, `_combined_routing`, `_moe_gemm_a8w8` and
 `_sparse_attn_prefill_kernel` each serve two call sites.
 
-Three other forms remain, 13 launchers, only where a decorator cannot give
+Three other forms remain, 17 launchers, only where a decorator cannot give
 what one kernel needs; no `functools.cache` factory is left:
 
 ```python
@@ -100,7 +100,7 @@ _TABLE = {mode: make_launcher(_kernel(mode), delayed=partial(_keywords, mode)) f
 
 | Launcher | Form | Why not a decorator |
 | --- | --- | --- |
-| `attn_res` `attnres_fwd_kernel`, `attnres_fwd_sequence_kernel` | beside the kernel | Under `ATTN_RES_TRITON_AUTOTUNE` the kernel module wraps the kernel in `@triton.autotune` after defining it, and the launchers must wrap the tuner. Both launch one kernel, each baking what its layout never varies (see [attn_res's sequence layout](#attn_ress-sequence-layout)). |
+| `attn_res` `attnres_fwd_kernel`, `attnres_fwd_sequence_kernels` (5) | beside the kernel, table | Under `ATTN_RES_TRITON_AUTOTUNE` the kernel module wraps the kernel in `@triton.autotune` after defining it, and the launchers must wrap the tuner. All six launch one kernel, each baking what its layout (and `L2` bucket, for the sequence layout's table) never varies (see [attn_res's sequence layout](#attn_ress-sequence-layout)). |
 | `aiter/mla.py` `_fwd_kernel_stage2_asm_launch` | named | `aiter/aot/triton/decode_mla.py` and `csrc/cpp_itfs/mla/asm_mla_decode_fwd.py` compile `_fwd_kernel_stage2_asm` ahead of time with Triton's own `triton.tools.compile`, which loads `aiter/mla.py` and takes that attribute as a `JITFunction`; its generated loader looks the kernel up in the HSACO by the same name, so the JIT function cannot move to another one. |
 | `test_mla_stage2_merge.py` `_fwd_kernel_stage2_asm_launch` | named | Sweeps `num_warps`, `num_stages` and `waves_per_eu` per call over `aiter.mla`'s JIT function (above). |
 | `rmsnorm` `_rms_norm_kernel_launch` | named | The kernel is also a device function: the Iris `reduce_scatter_rmsnorm_quant_all_gather` kernel calls it, and a launcher cannot be called from kernel code. |
@@ -136,8 +136,8 @@ Defaults are passed explicitly, values that `@triton.autotune` /
   passed positionally and keyed by value. A value is baked with
   `extra_annotation={name: Constexpr(value=...)}` only where one decorated
   kernel has a single caller (the batched split-K reduce, the chunk-delta
-  solves' `DOT_PRECISION`), or where a launcher serves one layout of a
-  shared kernel (attn_res's two launchers).
+  solves' `DOT_PRECISION`), or where a launcher serves one layout, or one
+  `L2` bucket, of a shared kernel (attn_res's launchers).
 - **Gluon layouts and tuples** are never arguments: intj bakes scalars, not
   layout objects or tuples. A kernel builds them from its constexpr ints and
   strings, inline or through a `gluon.constexpr_function` it calls (the
@@ -707,17 +707,21 @@ tensor and take the packed layout: one device copy of the residuals, and
 outputs within tolerance of the tuple launch's but not bitwise equal to them
 (29 of 68 cases equal on gfx942, L 17-64). The copy and the packed kernel
 take 0.05-0.47x the GPU time of the tuple launch, whose 32-row tile spills
-(gfx942, L 17 and 32, the N and D of the GPU times below, bf16). Two
-launchers launch the one kernel,
-each baking what its layout never varies: `attnres_fwd_kernel`
-(`attn_res_gate`, `layout="packed"`) bakes the 16 slots as `None`, so the
-decode path passes no slot argument (passing them measured 0.4 us more per
-launch on gfx942); `attnres_fwd_sequence_kernel` bakes the packed-only
-pointers and flags. A device table of base pointers was not used: it needs a
-host-to-device copy per call, or a cache keyed by pointer values, where 16
-kernel arguments need neither. The sequence entry also takes the
-Python fast paths `attn_res_gate` uses (no reshape of a 2-D contiguous
-residual, memoized `next_power_of_2`, no INFO-log arguments below that level).
+(gfx942, L 17 and 32, the N and D of the GPU times below, bf16).
+
+Six launchers launch the one kernel, each baking what its layout never
+varies, so a call neither passes nor decodes it. `attnres_fwd_kernel`
+(`attn_res_gate`, `layout="packed"`) bakes the 16 slots as `None` (passing
+them measured 0.4 us more per launch on gfx942).
+`attnres_fwd_sequence_kernels` holds one launcher per `L2` bucket (1, 2, 4,
+8, 16); each bakes the packed-only pointers and flags, `L2`, and the slots
+from `L2` up as `None` (one launcher passing all 16 slots measured 0.27 us
+more per launch at L=2 and 0.10 us at L=8 on gfx942, none at L=16). A device
+table of base pointers was not used: it needs a host-to-device copy per
+call, or a cache keyed by pointer values, where kernel arguments need
+neither. The sequence entry also takes the Python fast paths
+`attn_res_gate` uses (no reshape of a 2-D contiguous residual, memoized
+`next_power_of_2`, no INFO-log arguments below that level).
 
 Verified with intj `develop` `2783079`, Triton 3.8.0, `AITER_TRITON_ONLY=1`,
 on gfx942 and gfx950 (MI350X):

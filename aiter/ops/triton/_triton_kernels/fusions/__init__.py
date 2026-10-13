@@ -3,7 +3,7 @@
 
 from aiter.ops.triton._triton_kernels.fusions.attn_res import (
     attnres_fwd_kernel,
-    attnres_fwd_sequence_kernel,
+    attnres_fwd_sequence_kernels,
 )
 from aiter.ops.triton._triton_kernels.fusions.mhc import (
     _mhc_asymmetric_sinkhorn_kernel,
@@ -26,5 +26,5 @@ __all__ = [
     "_mhc_post_pre_split_kernel",
     "_mhc_reduce_apply_kernel",
     "attnres_fwd_kernel",
-    "attnres_fwd_sequence_kernel",
+    "attnres_fwd_sequence_kernels",
 ]

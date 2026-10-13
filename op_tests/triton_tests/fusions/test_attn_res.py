@@ -10,7 +10,7 @@ import aiter.ops.triton.fusions.attn_res as attn_res_module
 from aiter.ops.triton._triton_kernels.fusions.attn_res import (
     ATTN_RES_TRITON_AUTOTUNE,
     attnres_fwd_kernel,
-    attnres_fwd_sequence_kernel,
+    attnres_fwd_sequence_kernels,
 )
 from aiter.ops.triton.fusions.attn_res import attn_res_fwd, attn_res_gate
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
@@ -939,8 +939,11 @@ def test_attn_res_sequence_matches_triton_launch(monkeypatch, N):
         with monkeypatch.context() as m:
             m.setattr(
                 attn_res_module,
-                "attnres_fwd_sequence_kernel",
-                _triton_launch(attnres_fwd_sequence_kernel),
+                "attnres_fwd_sequence_kernels",
+                {
+                    l2: _triton_launch(k)
+                    for l2, k in attnres_fwd_sequence_kernels.items()
+                },
             )
             expected = attn_res_fwd(*args, layout="sequence")
         for _ in range(2):

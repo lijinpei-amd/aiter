@@ -48,7 +48,7 @@ from aiter.ops.triton._triton_kernels.fusions.attn_res import (
     ATTN_RES_SEQ_SLOTS,
     ATTN_RES_TRITON_AUTOTUNE,
     attnres_fwd_kernel,
-    attnres_fwd_sequence_kernel,
+    attnres_fwd_sequence_kernels,
 )
 from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -60,7 +60,7 @@ _LOGGER = AiterTritonLogger()
 # call against ~10-25us of device work, ~26us of it in JITFunction.run's
 # argument binding, specialization and cache lookup (MI350X/gfx950, N=1 B=8
 # H=7168, quant + close_block). Every layout launches through an intj launcher
-# (attnres_fwd_kernel, attnres_fwd_sequence_kernel), which does that part in C.
+# (attnres_fwd_kernel, attnres_fwd_sequence_kernels), which does that part in C.
 
 
 _POW2_CACHE: dict[int, int] = {}
@@ -241,22 +241,16 @@ def _pick_attn_res_packed_config(tokens: int, l2: int) -> tuple[int, int, int]:
     return num_warps, num_stages, min(bl, l2)
 
 
-def _res_slots(
-    tensors: Sequence[torch.Tensor], L2: int
-) -> tuple[torch.Tensor | None, ...]:
-    # The kernel's res0..res15. Pad the residuals to a power-of-2 length so one
-    # kernel serves an L2 bucket instead of one per L. Padded slots reuse
-    # tensors[0] and are masked out in the kernel; the slots from L2 up are
-    # None, which keeps them out of the kernarg segment.
+def _res_slots(tensors: Sequence[torch.Tensor], L2: int) -> tuple[torch.Tensor, ...]:
+    # The kernel's res0..res{L2-1}; the L2 bucket's launcher bakes the rest as
+    # None. Pad the residuals to a power-of-2 length so one kernel serves an L2
+    # bucket instead of one per L. Padded slots reuse tensors[0] and are masked
+    # out in the kernel.
     for t in tensors:
         assert (
             t.data_ptr() % 16 == 0
         ), "attn_res residual sources must be 16-byte aligned"
-    return (
-        tuple(tensors)
-        + (tensors[0],) * (L2 - len(tensors))
-        + (None,) * (ATTN_RES_SEQ_SLOTS - L2)
-    )
+    return tuple(tensors) + (tensors[0],) * (L2 - len(tensors))
 
 
 def attn_res_fwd(
@@ -337,13 +331,13 @@ def _run_sequence(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm)
         ((), ()) if ATTN_RES_TRITON_AUTOTUNE else ((num_warps, num_stages), (L2,))
     )
     dev, stream = current_device_stream()
-    attnres_fwd_sequence_kernel(
+    attnres_fwd_sequence_kernels[L2](
         dev,
         stream,
         (N,),
         *tune,
         q_flat,
-        *res,  # res0..res15
+        *res,  # res0..res{L2-1}
         w_flat,
         ow_flat,
         o,
@@ -353,7 +347,6 @@ def _run_sequence(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm)
         0,  # stride_res_l
         0,  # stride_bo_n
         0,  # stride_bo_l
-        L2,
         D,
         rms_eps,  # eps
         rms_eps,  # out_eps
