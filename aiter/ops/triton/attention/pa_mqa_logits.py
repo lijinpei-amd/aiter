@@ -27,12 +27,9 @@
 
 import math
 import os
-from functools import partial
 
 import torch
 import triton
-import triton.language as tl
-from intj import NEVER, Aligned, Argument, Assume, PointerRange, make_launcher
 
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
@@ -45,9 +42,8 @@ from aiter.ops.triton._triton_kernels.attention.pa_mqa_logits import (
 )
 from aiter.ops.triton.gluon.pa_decode_gluon import get_cdna_version
 from aiter.ops.triton.gluon.pa_mqa_logits import (
-    _gluon_deepgemm_fp8_paged_mqa_logits,
-    _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle,
-    _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx,
+    _GLUON_JIT_FUNCTIONS,
+    _GLUON_PAGED_MQA_LOGITS_LAUNCHERS,
 )
 from aiter.ops.triton.utils.config_utils import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.device_info import current_device_stream, get_num_sms
@@ -313,116 +309,11 @@ def _aot_metadata_path(
     return f"{AITER_TRITON_CONFIGS_PATH}/paged_mqa_logits/aot/{kernel_str}"
 
 
-def _gluon_kernel(Preshuffle, VarCtxOpt):
-    if not Preshuffle:
-        return _gluon_deepgemm_fp8_paged_mqa_logits
-    if VarCtxOpt:
-        return _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx
-    return _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle
-
-
-def _gluon_launch_keywords(Preshuffle, VarCtxOpt, is_padded_mode):
-    """The make_launcher keywords that need the GPU (get_gfx) for this mode's
-    launcher: the types and specialization facts the hand-written
-    `triton.compile` this replaced spelled out (asserted, not measured: the
-    caller promises them), and the options. A parameter it gives
-    no fact keeps none, except that intj still measures the facts an `Assume`
-    leaves out (the KV pointers' and the index pointers' remaining ones)."""
-    gfx_version = get_gfx()
-    is_gfx1250 = gfx_version == "gfx1250"
-    # gfx942 uses the AMD fnuz e4m3 variant (*fp8e4b8); gfx950 and gfx1250 use
-    # the OCP/IEEE e4m3 variant (*fp8e4nv), matching utils.types.get_fp8_dtypes.
-    fp8_ptr = tl.pointer_type(
-        tl.float8e4b8 if gfx_version == "gfx942" else tl.float8e4nv
-    )
-    i32 = Argument(type=tl.int32, specialize=NEVER)
-    i32_aligned = Argument(type=tl.int32, specialize=Assume(Aligned(16)))
-    # The plain kernel forms per-token KV addresses from the page table, so
-    # a cache past 2 GiB overflows a 32-bit stride product.
-    kv_stride = Argument(
-        type=tl.int32 if Preshuffle else tl.int64,
-        specialize=Assume(Aligned(16)) if is_padded_mode else NEVER,
-    )
-    kv_facts = Assume(Aligned(16)) if is_padded_mode else NEVER
-    annotation = {
-        "batch_size": i32,
-        "next_n": i32,
-        "heads_num": i32_aligned,
-        "Q_buffer": Argument(
-            type=fp8_ptr, specialize=Assume(Aligned(16), PointerRange(32))
-        ),
-        "stride_q_batch": i32_aligned,
-        "stride_q_next_n": i32_aligned,
-        "stride_q_heads": i32_aligned,
-        "KV_buffer": Argument(type=fp8_ptr, specialize=kv_facts),
-        "stride_k_seq": kv_stride,
-        "scale_buffer": Argument(type=tl.pointer_type(tl.float32), specialize=kv_facts),
-        "stride_scale_seq": kv_stride,
-        "context_len_ptr": Argument(
-            type=tl.pointer_type(tl.int32), specialize=Assume(PointerRange(32))
-        ),
-        "kv_indices": Argument(
-            type=tl.pointer_type(tl.int32), specialize=Assume(PointerRange(32))
-        ),
-        "weights": Argument(
-            type=tl.pointer_type(tl.float32),
-            specialize=Assume(Aligned(16), PointerRange(32)),
-        ),
-        "stride_w_batch": i32_aligned,
-        # OutLogits_buffer: NO tt.pointer_range 32 -- the output row base
-        # offset (row * stride_out_batch) can exceed a 32-bit byte offset
-        # for wide dense logits (e.g. max_model_len=1<<20). stride_out_batch
-        # is i64 and the gluon kernel advances the base pointer in 64 bit
-        # (buffer_store voffset stays int32) to avoid the 2**31 overflow.
-        "OutLogits_buffer": Argument(
-            type=tl.pointer_type(tl.float32), specialize=NEVER
-        ),
-        "stride_out_batch": Argument(type=tl.int64, specialize=NEVER),
-        "max_model_len": i32,
-        "max_block_len": i32,
-        "num_block": i32,
-    }
-    if VarCtxOpt:
-        annotation["safe_chunks_per_cta_ptr"] = Argument(
-            type=tl.pointer_type(tl.int32), specialize=NEVER
-        )
-    else:
-        annotation["SplitKV"] = i32
-
-    return {
-        "extra_annotation": annotation,
-        "options": {
-            "num_warps": 1 if is_gfx1250 and Preshuffle else 4,
-            "num_stages": 2,
-        },
-    }
-
-
-# One launcher per (Preshuffle, VarCtxOpt, KV-padded) mode, each stating that
-# mode's types and facts (delayed: they depend on the GPU). The kernels read
-# the import-time constant _Use_2d_instr_shape_mfma_layout. Callers read the
-# returned kernel's hash (the AOT benchmark zips its cache directory).
-_GLUON_PAGED_MQA_LOGITS_LAUNCHERS = {
-    (Preshuffle, VarCtxOpt, is_padded_mode): make_launcher(
-        _gluon_kernel(Preshuffle, VarCtxOpt),
-        dynamic_options=("waves_per_eu",),
-        return_compiled=True,
-        assume_constant_globals=True,
-        delayed=partial(_gluon_launch_keywords, Preshuffle, VarCtxOpt, is_padded_mode),
-    )
-    for Preshuffle, VarCtxOpt in ((False, False), (True, False), (True, True))
-    for is_padded_mode in (False, True)
-}
-
 if enable_aot_gluon_pa_mqa_logits:
     # Every load of these kernels must be of a prebuilt binary: a compile
     # outside AOTMetadataContext raises, and deepgemm_fp8_paged_mqa_logits
     # retries it inside one.
-    require_metadata_redirect(
-        _gluon_deepgemm_fp8_paged_mqa_logits.fn.__name__,
-        _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.fn.__name__,
-        _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx.fn.__name__,
-    )
+    require_metadata_redirect(*(f.__name__ for f in _GLUON_JIT_FUNCTIONS.values()))
 
 
 def deepgemm_fp8_paged_mqa_logits_schedule(
@@ -588,7 +479,7 @@ def deepgemm_fp8_paged_mqa_logits(
             # the prebuilt hsaco/json swapped in; the prebuilt kernel must have
             # this signature. A hit loads nothing, so it needs no context.
             with AOTMetadataContext(
-                _gluon_kernel(Preshuffle, VarCtxOpt).fn.__name__,
+                _GLUON_JIT_FUNCTIONS[Preshuffle, VarCtxOpt].__name__,
                 _aot_metadata_path(
                     heads,
                     ChunkK,

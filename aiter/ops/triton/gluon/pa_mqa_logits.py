@@ -3,11 +3,15 @@
 # ruff: noqa: EXE005  the `#!=----` separators below are decorative
 # comments, not shebangs; ruff's heuristic flags all 66 of them.
 
+from functools import partial
+
 import triton
 import triton.language as tl
+from intj import NEVER, Aligned, Argument, Assume, PointerRange, make_launcher
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.triton.gluon.pa_decode_gluon import get_cdna_version
 
 try:
@@ -56,6 +60,109 @@ def _sum_combine(a, b):
     return a + b
 
 
+def _gluon_launch_keywords(Preshuffle, VarCtxOpt, is_padded_mode):
+    """The make_launcher keywords that need the GPU (get_gfx) for this mode's
+    launcher: the types and specialization facts the hand-written
+    `triton.compile` this replaced spelled out (asserted, not measured: the
+    caller promises them), and the options. A parameter it gives
+    no fact keeps none, except that intj still measures the facts an `Assume`
+    leaves out (the KV pointers' and the index pointers' remaining ones)."""
+    gfx_version = get_gfx()
+    is_gfx1250 = gfx_version == "gfx1250"
+    # gfx942 uses the AMD fnuz e4m3 variant (*fp8e4b8); gfx950 and gfx1250 use
+    # the OCP/IEEE e4m3 variant (*fp8e4nv), matching utils.types.get_fp8_dtypes.
+    fp8_ptr = tl.pointer_type(
+        tl.float8e4b8 if gfx_version == "gfx942" else tl.float8e4nv
+    )
+    i32 = Argument(type=tl.int32, specialize=NEVER)
+    i32_aligned = Argument(type=tl.int32, specialize=Assume(Aligned(16)))
+    # The plain kernel forms per-token KV addresses from the page table, so
+    # a cache past 2 GiB overflows a 32-bit stride product.
+    kv_stride = Argument(
+        type=tl.int32 if Preshuffle else tl.int64,
+        specialize=Assume(Aligned(16)) if is_padded_mode else NEVER,
+    )
+    kv_facts = Assume(Aligned(16)) if is_padded_mode else NEVER
+    annotation = {
+        "batch_size": i32,
+        "next_n": i32,
+        "heads_num": i32_aligned,
+        "Q_buffer": Argument(
+            type=fp8_ptr, specialize=Assume(Aligned(16), PointerRange(32))
+        ),
+        "stride_q_batch": i32_aligned,
+        "stride_q_next_n": i32_aligned,
+        "stride_q_heads": i32_aligned,
+        "KV_buffer": Argument(type=fp8_ptr, specialize=kv_facts),
+        "stride_k_seq": kv_stride,
+        "scale_buffer": Argument(type=tl.pointer_type(tl.float32), specialize=kv_facts),
+        "stride_scale_seq": kv_stride,
+        "context_len_ptr": Argument(
+            type=tl.pointer_type(tl.int32), specialize=Assume(PointerRange(32))
+        ),
+        "kv_indices": Argument(
+            type=tl.pointer_type(tl.int32), specialize=Assume(PointerRange(32))
+        ),
+        "weights": Argument(
+            type=tl.pointer_type(tl.float32),
+            specialize=Assume(Aligned(16), PointerRange(32)),
+        ),
+        "stride_w_batch": i32_aligned,
+        # OutLogits_buffer: NO tt.pointer_range 32 -- the output row base
+        # offset (row * stride_out_batch) can exceed a 32-bit byte offset
+        # for wide dense logits (e.g. max_model_len=1<<20). stride_out_batch
+        # is i64 and the gluon kernel advances the base pointer in 64 bit
+        # (buffer_store voffset stays int32) to avoid the 2**31 overflow.
+        "OutLogits_buffer": Argument(
+            type=tl.pointer_type(tl.float32), specialize=NEVER
+        ),
+        "stride_out_batch": Argument(type=tl.int64, specialize=NEVER),
+        "max_model_len": i32,
+        "max_block_len": i32,
+        "num_block": i32,
+    }
+    if VarCtxOpt:
+        annotation["safe_chunks_per_cta_ptr"] = Argument(
+            type=tl.pointer_type(tl.int32), specialize=NEVER
+        )
+    else:
+        annotation["SplitKV"] = i32
+
+    return {
+        "extra_annotation": annotation,
+        "options": {
+            "num_warps": 1 if is_gfx1250 and Preshuffle else 4,
+            "num_stages": 2,
+        },
+    }
+
+
+# Each Gluon kernel below is the JIT function of two launchers, for a KV cache
+# whose row stride is a multiple of 16 (KV-padded) and for one whose stride may
+# not be: they assume different facts. The decorator is the unpadded mode's;
+# the padded mode's, in _GLUON_PAGED_MQA_LOGITS_LAUNCHERS at the end of this
+# file, is made over the JIT function _jit_function_of records, since a
+# delayed= launcher's options have no jit_func until check().
+_GLUON_JIT_FUNCTIONS = {}  # (Preshuffle, VarCtxOpt) -> JIT function
+
+
+def _jit_function_of(Preshuffle, VarCtxOpt):
+    def record(jit_func):
+        _GLUON_JIT_FUNCTIONS[Preshuffle, VarCtxOpt] = jit_func
+        return jit_func
+
+    return record
+
+
+@make_launcher(
+    dynamic_options=("waves_per_eu",),
+    return_compiled=True,
+    assume_constant_globals=True,
+    delayed=partial(
+        _gluon_launch_keywords, Preshuffle=False, VarCtxOpt=False, is_padded_mode=False
+    ),
+)
+@_jit_function_of(Preshuffle=False, VarCtxOpt=False)
 @gluon.jit
 def _gluon_deepgemm_fp8_paged_mqa_logits(
     batch_size,
@@ -408,6 +515,15 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
     )
 
 
+@make_launcher(
+    dynamic_options=("waves_per_eu",),
+    return_compiled=True,
+    assume_constant_globals=True,
+    delayed=partial(
+        _gluon_launch_keywords, Preshuffle=True, VarCtxOpt=False, is_padded_mode=False
+    ),
+)
+@_jit_function_of(Preshuffle=True, VarCtxOpt=False)
 @gluon.jit
 def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
     batch_size,
@@ -1422,6 +1538,15 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
         )
 
 
+@make_launcher(
+    dynamic_options=("waves_per_eu",),
+    return_compiled=True,
+    assume_constant_globals=True,
+    delayed=partial(
+        _gluon_launch_keywords, Preshuffle=True, VarCtxOpt=True, is_padded_mode=False
+    ),
+)
+@_jit_function_of(Preshuffle=True, VarCtxOpt=True)
 @gluon.jit
 def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
     batch_size,
@@ -2274,3 +2399,30 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
             )
             < max_model_len,
         )
+
+
+# Every launcher of the kernels above, by (Preshuffle, VarCtxOpt, KV-padded)
+# mode, each stating that mode's types and facts (delayed: they depend on the
+# GPU). The kernels read the import-time constant
+# _Use_2d_instr_shape_mfma_layout. Callers read the returned kernel's hash (the
+# AOT benchmark zips its cache directory).
+_GLUON_PAGED_MQA_LOGITS_LAUNCHERS = {
+    (False, False, False): _gluon_deepgemm_fp8_paged_mqa_logits,
+    (True, False, False): _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle,
+    (True, True, False): _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx,
+    **{
+        (Preshuffle, VarCtxOpt, True): make_launcher(
+            jit_func,
+            dynamic_options=("waves_per_eu",),
+            return_compiled=True,
+            assume_constant_globals=True,
+            delayed=partial(
+                _gluon_launch_keywords,
+                Preshuffle=Preshuffle,
+                VarCtxOpt=VarCtxOpt,
+                is_padded_mode=True,
+            ),
+        )
+        for (Preshuffle, VarCtxOpt), jit_func in _GLUON_JIT_FUNCTIONS.items()
+    },
+}
