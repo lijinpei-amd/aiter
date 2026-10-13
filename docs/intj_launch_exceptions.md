@@ -508,7 +508,8 @@ keywords. What changed:
   kernel's name; their JIT-function consumers read it from the launcher (see
   [Launchers](#launchers)). Of the 13 named launchers, the three whose JIT
   function had to keep its own name remained; `aiter.mla`'s stage-2 merge
-  and rmsnorm's kernel are decorated since (see
+  and rmsnorm's kernel are decorated since, and `test_mla_stage2_merge.py`'s
+  stays (see
   [The named launchers as decorators](#the-named-launchers-as-decorators)).
   The AOT tools
   (`csrc/cpp_itfs/gluon_aot_tools/compile*.py`) take the JIT function from a
@@ -1178,11 +1179,14 @@ ms); intj loads it while compiling, so its first run takes under 0.12 ms.
 
 ## The named launchers as decorators
 
-Two of the four named launchers became decorators; the other two launch a
-decorated kernel's JIT function with other options, and stay for a measured
-cost. Base `ba40fc7e2` (none of these files changed up to `00df7c810`);
-gfx942 (triton 3.8.0, torch 2.14+rocm7.2, intj `2783079`), gfx950 compiled
-offline.
+Four named-launcher sites were left at `00df7c810`: the three of the 13
+named launchers whose JIT function had to keep its name (see
+[intj 2783079](#intj-2783079)) and pa_attention_kernel_test's two direct
+launchers, module globals since its factory went. Two became decorators; the
+other two launch a decorated kernel's JIT function with other options, and
+stay for a measured cost. Base `ba40fc7e2` (none of these files changed up
+to `00df7c810`); gfx942 (triton 3.8.0, torch 2.14+rocm7.2, intj
+`2783079`), gfx950 compiled offline.
 
 | Launcher (before) | Now | Why |
 | --- | --- | --- |
@@ -1191,15 +1195,20 @@ offline.
 | `test_mla_stage2_merge.py` `_fwd_kernel_stage2_asm_launch` | still `make_launcher(_fwd_kernel_stage2_asm.__self__.options.jit_func, dynamic_options=(num_warps, num_stages, waves_per_eu))` | See [Launchers](#launchers) and the measurements below. |
 | `pa_attention_kernel_test` `_direct_dot_launch`, `_direct_large_block_dot_launch` | unchanged (over pa_decode_gluon's `jit_func`), reason now in the comment | Making `num_stages` and `waves_per_eu` dynamic on pa_decode_gluon's dot-kernel decorator added 0.05-0.11 us to each production launch (below). |
 
+After these two conversions (`210897263`; the current counts, 426, 5 and
+11, are under
+[attn_res and pa_mqa_logits as decorators](#attn_res-and-pa_mqa_logits-as-decorators)),
 `grep -rE '^\s*@(intj\.)?make_launcher\b' --include=*.py aiter op_tests csrc`
 counts 422 decorator lines (420 at `00df7c810`). The other
 `make_launcher(` calls (`grep -rn 'make_launcher(' --include=*.py aiter
 op_tests csrc` minus the decorator lines; `kda_launchers.py` only re-runs
 decorated kernel modules under a stand-in) went from 8 to 6, declaring 15
-launchers (17 before) plus `HsacoKernel`'s, made at run time. Already a
-decorator but inside a function: `test_metadata_redirect.py` `test_jit`'s
-`empty_kernel`, under `with_custom_metadata_path(temp_dir)` of the test's
-own temp dir.
+launchers (17 before) plus `HsacoKernel`'s, made at run time. Already
+decorators but inside a function, in `test_metadata_redirect.py`, each over
+a prebuilt binary in the test's own temp dir: `test_jit`'s `empty_kernel`
+(under `with_custom_metadata_path(temp_dir)`),
+`test_separate_compile_and_run`'s `empty_kernel` and
+`test_required_redirect_only_on_miss`'s `required_redirect_kernel`.
 
 **Codegen and AOT identity.** A decorator line above a kernel moves its
 `def`, and Triton records source lines in the TTGIR locations and the
