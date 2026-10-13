@@ -286,17 +286,18 @@ def attn_res_fwd(
     if layout not in ("sequence", "packed"):
         raise ValueError(f"layout must be 'sequence' or 'packed', got {layout!r}")
 
-    _LOGGER.info(
-        "ATTN_RES: query=%s rms_weight=%s layout=%s",
-        tuple(query.shape),
-        tuple(rms_weight.shape),
-        layout,
-    )
+    if _LOGGER.get_logger().isEnabledFor(logging.INFO):
+        _LOGGER.info(
+            "ATTN_RES: query=%s rms_weight=%s layout=%s",
+            tuple(query.shape),
+            tuple(rms_weight.shape),
+            layout,
+        )
 
     has_onorm = output_rms_weight is not None
-    q_flat = query.flatten().contiguous()
-    w_flat = rms_weight.flatten().contiguous()
-    ow_flat = output_rms_weight.flatten().contiguous() if has_onorm else None
+    q_flat = _fast_flatten1d(query)
+    w_flat = _fast_flatten1d(rms_weight)
+    ow_flat = _fast_flatten1d(output_rms_weight) if has_onorm else None
 
     runner = _run_packed if layout == "packed" else _run_sequence
     return runner(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm)
@@ -315,11 +316,11 @@ def _run_sequence(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm)
     L = len(residuals)
     if L > ATTN_RES_SEQ_SLOTS:
         raise ValueError(
-            f"attn_res sequence layout takes at most {ATTN_RES_SEQ_SLOTS} residuals, got "
-            f"{L}; use layout='packed'"
+            f"attn_res sequence layout takes at most {ATTN_RES_SEQ_SLOTS} "
+            f"residuals, got {L}; use layout='packed'"
         )
-    flat_residuals = tuple(r.reshape(-1, D).contiguous() for r in residuals)
-    L2 = max(1, triton.next_power_of_2(L))
+    flat_residuals = tuple(_fast_reshape2d(r, D) for r in residuals)
+    L2 = max(1, _next_pow2(L))
     res = _res_slots(flat_residuals, L2)
     N = flat_residuals[0].numel() // D
     dtype = flat_residuals[0].dtype
@@ -356,10 +357,11 @@ def _run_sequence(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm)
         rms_eps,  # out_eps
         scale,
         *bl_arg,
-        triton.next_power_of_2(D),  # BD
+        _next_pow2(D),  # BD
         has_onorm,  # HAS_ONORM
     )
-    return o.view(output_shape)
+    # A no-op view when the residuals are already [N, D], as on decode.
+    return o if o.shape == output_shape else o.view(output_shape)
 
 
 def _run_packed(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm):
