@@ -19,10 +19,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._entry import (
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._frozen import _validate_frozen
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import constexpr_fields
-from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import (
-    _n_reduction_slot,
-    compute_kernel_layout,
-)
+from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import compute_kernel_layout
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
     A_PAYLOAD,
     A_SCALE,
@@ -1040,9 +1037,12 @@ def test_gate_up_small_warp_extent_only_requires_mx_group_for_quantized_output(
 def test_epilogue_modes_preserve_output_geometry(config, epilogue):
     func = KernelFuncConfig(*_func_spec(epilogue))
     tc = KernelTuningConfig(func, *_tuning_spec(config))
+    layout = compute_kernel_layout(tc)
     assert _plain(func.activation_reduction_n()) == 2
-    assert _plain(_n_reduction_slot(func)) == 1
-    assert _plain(compute_kernel_layout(tc).grid_N(4096)) == 16
+    # gu_split halves across two N slots, so one slot's raw columns map 1:1 onto
+    # emitted channels.
+    assert _plain(layout.output_n_slot()) == _plain(tc.MINI_BLOCK_N)
+    assert _plain(layout.grid_N(4096)) == 16
     assert _plain(_validate(tc, 4096, 7168))
 
 

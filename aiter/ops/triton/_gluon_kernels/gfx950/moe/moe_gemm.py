@@ -48,9 +48,10 @@ Memory layout contract (the wrapper hard-asserts it), with ``pack`` = 2 for MXFP
   - ``True``  -- whole halves, gate in ``[0, I)`` and up in ``[I, 2I)``. A mini-N block
     is then one entire operand side, so the activation pairs two accumulator *tiles*
     with identical layouts instead of two registers within a lane's quad, and a warp's
-    32 emitted channels are exactly one MX group. See ``_n_start``. The caller permutes
-    weights, weight scales and bias with ``activations.py::gate_up_split_perm``; the
-    emitted output is bit-identical either way.
+    32 emitted channels are exactly one MX group. See ``KernelLayout.n_start``. The
+    caller permutes weights, weight scales and bias with
+    ``activations.py::gate_up_split_perm``; the emitted output is bit-identical either
+    way.
 
 ``N`` and ``K`` remain compile-time layout parameters. ``NUM_K`` is a separate
 runtime scalar controlling the main loop and remainder. Buffer depths, prologue
@@ -77,16 +78,9 @@ from ._epilogue import _epi_bias_tiles, _epilogue_store, _stage_epilogue_inputs
 from ._lang import optional as _opt
 from ._lang import require_constexpr
 from ._lang import unwrap as _v
-from ._layout import (
-    KernelLayout,
-    _a_payload_hbm_offsets,
-    _a_scale_hbm_offsets,
-    _b_payload_hbm_offsets,
-    _b_scale_hbm_offsets,
-    _slot_index,
-)
+from ._layout import KernelLayout
 from ._lds import LDSManager
-from ._types import A_SCALE, B_SCALE, DotKind, TileSched
+from ._types import A_SCALE, B_SCALE, DotKind, TileSched, _slot_index
 from ._validate import validate, validate_pipeline
 
 _A_SCALE: gl.constexpr = gl.constexpr(A_SCALE)
@@ -518,8 +512,8 @@ def _moe_gemm_body(
 
     # Issued right after the routing scalars it depends on: the gather's table loads are
     # the longest-latency thing in the prologue, so everything below overlaps with them.
-    a_hbm_offs = _a_payload_hbm_offsets(
-        a, rt, block_id, M_e, start_m, func_cfg, tuning_cfg, layout
+    a_hbm_offs = layout.a_payload_hbm_offsets(
+        a, rt, block_id, M_e, start_m, func_cfg, tuning_cfg
     )
 
     # Buffer ops carry a 32-bit offset (2 GB window) and V4-Pro's stacked gemm1 weight is
@@ -535,17 +529,17 @@ def _moe_gemm_body(
     else:
         b_scale_hbm_ptr: gl.constexpr = None
 
-    b_hbm_offs = _b_payload_hbm_offsets(b, pid_n, N, K, func_cfg, tuning_cfg, layout)
+    b_hbm_offs = layout.b_payload_hbm_offsets(b, pid_n, N, K, func_cfg, tuning_cfg)
 
     if require_constexpr(func_cfg.a_has_scale()):
-        a_scale_hbm_offs = _a_scale_hbm_offsets(
-            a, rt, block_id, M_e, start_m, pid_m, K, func_cfg, tuning_cfg, layout
+        a_scale_hbm_offs = layout.a_scale_hbm_offsets(
+            a, rt, block_id, M_e, start_m, pid_m, K, func_cfg, tuning_cfg
         )
     else:
         a_scale_hbm_offs: gl.constexpr = None
     if require_constexpr(func_cfg.b_has_scale()):
-        b_scale_hbm_offs = _b_scale_hbm_offsets(
-            b, pid_n, N, K, func_cfg, tuning_cfg, layout
+        b_scale_hbm_offs = layout.b_scale_hbm_offsets(
+            b, pid_n, N, K, func_cfg, tuning_cfg
         )
     else:
         b_scale_hbm_offs: gl.constexpr = None

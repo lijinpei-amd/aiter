@@ -8,8 +8,10 @@
 **Stale references.** The file:line citations below are against the reviewed commit and
 have not been rebased. In particular `_offsets.py` no longer exists: its offset builders
 (`_a_payload_hbm_offsets`, `_b_payload_hbm_offsets`, `_a_scale_hbm_offsets`,
-`_b_scale_hbm_offsets`, `_gather_rows`) now live in `_layout.py`. Locate a finding by
-symbol name, not by line.
+`_b_scale_hbm_offsets`) are now the `KernelLayout` methods `a_payload_hbm_offsets`,
+`b_payload_hbm_offsets`, `a_scale_hbm_offsets` and `b_scale_hbm_offsets`, and
+`_gather_rows` is a private helper in `_layout.py`. Locate a finding by symbol name,
+not by line.
 
 This report records findings for later triage; it does not implement the suggested
 changes. No correctness or determinism failure was confirmed for the currently

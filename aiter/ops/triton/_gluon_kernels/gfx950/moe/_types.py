@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Dtype / quant-scheme enums, the LDS budget and the host->device NamedTuples of the
-gfx950 Gluon MoE grouped GEMMs.
+"""Dtype / quant-scheme enums, the LDS budget, slot-traversal indexing and the
+host->device NamedTuples of the gfx950 Gluon MoE grouped GEMMs.
 """
 
 from enum import IntEnum, IntFlag
 from typing import NamedTuple
 
+from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from ._lang import (
@@ -26,6 +27,7 @@ from ._lang import (
 from ._lang import (
     const as _c,
 )
+from ._lang import unwrap as _v
 
 __all__ = [
     "A_PAYLOAD",
@@ -60,6 +62,7 @@ __all__ = [
     "TuningSpec",
     "WaitCommitScheme",
     "WarpPipeline",
+    "_slot_index",
     "dq_has_scale",
     "dq_mx_format",
     "dq_pack_divisor",
@@ -92,6 +95,38 @@ LDS_CAP_BYTES = 163840
 LDS_EPILOGUE_RESERVE_BYTES = 4096
 #: What the operand buffers may actually use.
 LDS_USABLE_BYTES = LDS_CAP_BYTES - LDS_EPILOGUE_RESERVE_BYTES
+
+
+@gluon.constexpr_function
+def _slot_index(
+    m_slot_idx,
+    n_slot_idx,
+    num_m_slots_per_block,
+    num_n_slots_per_block,
+):
+    """Position of one M/N slot pair in the N-outer, M-inner traversal.
+
+    This one number is the slot's place in three orderings at once -- the visitation
+    order of the slot loop, the index of its accumulator in the carried tuple, and
+    (under the even schedule) the position of its fill in
+    ``_schedule._buffer_load_order``. They have to agree, which is why they all come
+    from here.
+
+    Down the M axis first, so with two slots on each axis the four slots are visited
+    ``(0,0), (1,0), (0,1), (1,1)`` -- the region order of the reference kernel in
+    gfx950-gluon-tutorials .../a16w16/v8_sliceMN, whose four DOTs are
+    ``(A_top, B_left), (A_bot, B_left), (A_top, B_right), (A_bot, B_right)``.
+
+    With one slot on either axis this is the identity on the old row-major order, so
+    only a genuinely 2-D slot split sees any change.
+    """
+    m_slot_idx, n_slot_idx, num_m_slots_per_block, num_n_slots_per_block = (
+        _v(m_slot_idx),
+        _v(n_slot_idx),
+        _v(num_m_slots_per_block),
+        _v(num_n_slots_per_block),
+    )
+    return n_slot_idx * num_m_slots_per_block + m_slot_idx
 
 
 class ActKind(IntEnum):

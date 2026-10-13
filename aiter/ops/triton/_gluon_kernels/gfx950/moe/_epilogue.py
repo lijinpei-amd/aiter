@@ -19,9 +19,8 @@ from ._lang import MX_GROUP_CE as MX_GROUP
 from ._lang import optional as _opt
 from ._lang import require_constexpr
 from ._lang import unwrap as _v
-from ._layout import _n_split_offs, _n_start, _slot_index
 from ._quant import mxfp4_quant_gluon
-from ._types import DtypeQuant
+from ._types import DtypeQuant, _slot_index
 
 _DQ_MXFP4: gl.constexpr = gl.constexpr(int(DtypeQuant.MXFP4))
 
@@ -135,7 +134,7 @@ def _stage_epilogue_inputs(
                 gamma_lds_ptr, gammas_hbm_ptr, g_offs, mask=g_offs < M_e, other=0.0
             )
         if require_constexpr(func_cfg.has_bias):
-            epi_b_offs = _n_split_offs(
+            epi_b_offs = layout.n_split_offs(
                 pid_n,
                 gl.arange(
                     0,
@@ -143,8 +142,6 @@ def _stage_epilogue_inputs(
                     layout=layout.epilogue_bias_buffer_load_lds_layout(),
                 ),
                 N,
-                func_cfg,
-                tuning_cfg,
             )
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
                 bias_lds_ptr, bias_hbm_base, epi_b_offs
@@ -182,9 +179,7 @@ def _epi_bias_tiles(bias_lds_ptr, bias_hbm_ptr, pid_n, N, func_cfg, tuning_cfg, 
             else:
                 out = out + (
                     gl.load(
-                        bias_hbm_ptr
-                        + _n_start(pid_n, hn, N, func_cfg, tuning_cfg)
-                        + gl.arange(0, MBN)
+                        bias_hbm_ptr + layout.n_start(pid_n, hn, N) + gl.arange(0, MBN)
                     ),
                 )
     return out
