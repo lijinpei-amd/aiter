@@ -10,9 +10,12 @@ annotations, Triton's conversion of annotated scalars and a `tl.constexpr`
 parameter that sets the compile option it is named after. `2783079` adds the
 launcher object, `kernel.__self__` (an `intj.launcher.Launcher`):
 `make_launcher` only records its keywords as `__self__.options`, a
-`MakeLauncherOption` whose `jit_func` is the kernel it launches;
-`__self__.check()` runs, without a GPU, every check the first call would;
-and `delayed=` supplies keywords that need the GPU on the first call (see
+`MakeLauncherOption` whose `jit_func` is the kernel it launches.
+`__self__.check()` runs a `delayed=` launcher's function, which supplies more
+keywords and may query the GPU, then every check that needs neither the GPU
+nor the target. The checks that need the target (an unknown `options=` name,
+an invalid compile option in an autotune config, the C-side checks on bound
+values) wait for `__self__.build()` or the first call (see
 [intj 2783079](#intj-2783079)). Declaring a launcher does no GPU work, but
 needs a host C compiler once per interpreter (intj builds its generic lazy
 stub).
@@ -55,8 +58,8 @@ ABI, not Triton/Gluon `JITFunction`s.
 
 `make_launcher` only records its keywords; the first call checks them
 (arguments, annotations, `@triton.autotune`/`@triton.heuristics`), builds
-and launches, and `kernel.__self__.check()` runs the same checks earlier,
-without a GPU. So a kernel can carry its launcher as a decorator in a
+and launches; `kernel.__self__.check()` runs the checks that need no target
+earlier (see above). So a kernel can carry its launcher as a decorator in a
 module Aiter imports without a GPU. That is the default form:
 
 ```python
@@ -73,13 +76,15 @@ reads `kernel.__self__.options.jit_func`: the pa_decode_gluon AOT compile
 tools and warmup, attn_res's sequence layout (a tuple argument, launched
 through Triton), and the tests that read `arg_names`, `Heuristics`
 predicates or source, or launch a Triton reference. Arguments the decorator
-needs (a `grid_cpp` def, an option constant) sit above the kernel. Options
-that need the GPU come from `delayed=`, a function the launcher runs on its
-first call: `kpack` by `get_arch()` in `mla_decode_ref`, chunked_pa_prefill's
-gfx950 decode options, pa_mqa_logits' fp8 pointer types. Until then a
-`delayed=` launcher's `options` is an `intj.launcher.Delayed`, with no
-`jit_func`. A kernel that is `None` when its Gluon module fails to import is
-decorated inside that module, so the imported name is a launcher or `None`.
+needs (a `grid_cpp` def, an option constant such as `mla_decode_ref`'s,
+whose `kpack` depends on the arch) sit above the kernel. Keywords computed
+only when the launcher is first used come from `delayed=`, a function the
+launcher runs on its first `check()` or call: chunked_pa_prefill's gfx950
+decode options (its `arch_info` import queries the GPU) and pa_mqa_logits'
+per-mode annotations and fp8 pointer types. Until then a `delayed=`
+launcher's `options` is an `intj.launcher.Delayed`, with no `jit_func`. A
+kernel that is `None` when its Gluon module fails to import is decorated
+inside that module, so the imported name is a launcher or `None`.
 Launchers that used to differ only in something now passed per call are one
 decorated kernel: the split-K reduce takes `KERNEL_NAME` and `activation` as
 str constexprs; sage_quant_v, `_combined_routing`, `_moe_gemm_a8w8` and
@@ -97,11 +102,11 @@ _TABLE = {mode: make_launcher(_kernel(mode), delayed=partial(_keywords, mode)) f
 | Launcher | Form | Why not a decorator |
 | --- | --- | --- |
 | `attn_res` `attnres_fwd_kernel` | beside the kernel | Under `ATTN_RES_TRITON_AUTOTUNE` the kernel module wraps the kernel in `@triton.autotune` after defining it, and the launcher must wrap the tuner. |
-| `aiter/mla.py` `_fwd_kernel_stage2_asm_launch` | named | `aot/triton/decode_mla.py` and `csrc/cpp_itfs/mla/asm_mla_decode_fwd.py` compile `_fwd_kernel_stage2_asm` ahead of time with Triton's own `triton.tools.compile`, which loads `aiter/mla.py` and takes that attribute as a `JITFunction`; its generated loader looks the kernel up in the HSACO by the same name, so the JIT function cannot move to another one. |
+| `aiter/mla.py` `_fwd_kernel_stage2_asm_launch` | named | `aiter/aot/triton/decode_mla.py` and `csrc/cpp_itfs/mla/asm_mla_decode_fwd.py` compile `_fwd_kernel_stage2_asm` ahead of time with Triton's own `triton.tools.compile`, which loads `aiter/mla.py` and takes that attribute as a `JITFunction`; its generated loader looks the kernel up in the HSACO by the same name, so the JIT function cannot move to another one. |
 | `test_mla_stage2_merge.py` `_fwd_kernel_stage2_asm_launch` | named | Sweeps `num_warps`, `num_stages` and `waves_per_eu` per call over `aiter.mla`'s JIT function (above). |
 | `rmsnorm` `_rms_norm_kernel_launch` | named | The kernel is also a device function: the Iris `reduce_scatter_rmsnorm_quant_all_gather` kernel calls it, and a launcher cannot be called from kernel code. |
 | `pa_attention_kernel_test` `_direct_dot_launch`, `_direct_large_block_dot_launch` | named | Launch pa_decode_gluon's dot kernels' JIT functions with other options (`num_stages=1`, per-call `waves_per_eu`) than their decorators. |
-| `pa_mqa_logits` `_GLUON_PAGED_MQA_LOGITS_LAUNCHERS` (6) | table | One launcher per (Preshuffle, VarCtx, KV-padded) mode over three Gluon kernels, each with its own hand-written types and `Assume` facts, from `delayed=` (they need `get_gfx()`); `return_compiled=True`. The JIT functions keep their names for the Triton < 3.5 AOT path. |
+| `pa_mqa_logits` `_GLUON_PAGED_MQA_LOGITS_LAUNCHERS` (6) | table | One launcher per (Preshuffle, VarCtx, KV-padded) mode over three Gluon kernels, each with its own hand-written types and `Assume` facts, from `delayed=` (they need `get_gfx()`); `return_compiled=True`. Each JIT function backs two launchers (KV-padded and unpadded facts), which one decorator cannot declare. |
 
 Every call is positional. `current_device_stream()`
 (`aiter/ops/triton/utils/device_info.py`) returns the current device and
@@ -467,7 +472,9 @@ keywords. What changed:
 - **Refusals moved from decoration to `check()`.** The tests that asserted
   that declaring a launcher succeeds (`test_mxfp4_intj.py`'s heuristics
   tests) call `kernel.__self__.check()`; the launcher tests check
-  `isinstance(kernel.__self__, intj.launcher.Launcher)`.
+  `isinstance(kernel.__self__, intj.launcher.Launcher)`. `mla_prefill_reduce`
+  (`aiter/mla.py`), which falls back to a PyTorch loop when its Triton path
+  raises, re-raises `UnsupportedKernel`, now raised by the first call.
 - **`options.jit_func` replaces named launchers.** pa_decode_gluon's three
   kernels, attn_res and the five fused MXFP4 kernels launch under their
   kernel's name; their JIT-function consumers read it from the launcher (see
@@ -476,8 +483,9 @@ keywords. What changed:
   (`csrc/cpp_itfs/gluon_aot_tools/compile*.py`) take the JIT function from a
   launcher they load by name; the HSACO symbol is the JIT function's name,
   which is the attribute's.
-- **`delayed=` replaces the factories.** `mla_decode_ref`'s two kernels are
-  decorated, `kpack` coming from `delayed=`; pa_mqa_logits' six Gluon
+- **No factory is left.** `mla_decode_ref`'s two kernels are decorated with
+  option constants computed at import (the module already queries the GPU
+  there, through `arch_info` and `is_hip()`); pa_mqa_logits' six Gluon
   launchers are a module-level table whose annotations come from
   `delayed=`; pa_attention_kernel_test's two direct launchers are module
   globals. chunked_pa_prefill's kernel module, which queried the GPU at
@@ -489,18 +497,19 @@ Verified on gfx942 (MI300X) and gfx950 (MI350X), `AITER_TRITON_ONLY=1`, with
 the dtypes plugin and the torch `per_tensor_quant`/`pertoken_quant` shims:
 
 - **Every launcher checks and builds.** A sweep imports every module under
-  `aiter/ops/triton` and every other module that declares a launcher (415),
+  `aiter/ops/triton` and every other module that declares a launcher (414),
   first with no visible GPU, then on one GPU, where it calls `check()` and
-  then `build()` on every launcher reachable from a module global (also in
-  module-level dicts, lists and namespaces). gfx942: 419 launchers, 9 of
-  them `delayed=`, none refused; before this change (intj `2783079`), 409,
-  none refused. The 11 declared launchers it does not reach are in modules
-  that fail to import here, on the base tree too (FlyDSL, `mori` and
-  `matplotlib` missing; pod_attention), plus the metadata-redirect test's
-  in-function kernel and `test_mla_sparse.py`, a script. gfx950, where FlyDSL
-  and `matplotlib` are installed: 426 launchers, none refused; 4 not
+  then `build()` (which runs the checks that need the target) on every
+  launcher reachable from a module global (also in module-level dicts, lists
+  and namespaces). gfx942: 419 launchers, 7 of them `delayed=`, none
+  refused; before this change (intj `2783079`), 409, none refused. The 11
+  declared launchers it does not reach are in modules that fail to import
+  here, on the base tree too (FlyDSL, `mori` and `matplotlib` missing;
+  pod_attention), plus the metadata-redirect test's in-function kernel and
+  `test_mla_sparse.py`, a script. gfx950, where FlyDSL and `matplotlib` are
+  installed: 426 launchers, 7 of them `delayed=`, none refused; 4 not
   reached.
-- **Imports without a GPU.** 148 of the 415 modules import with
+- **Imports without a GPU.** 148 of the 414 modules import with
   `HIP_VISIBLE_DEVICES=""` on gfx942 (151 on gfx950); each of the others
   fails on the base tree too (`arch_info` needs a GPU or `jax`, plus the
   dependencies above), except `kda_launchers.py`, a test helper the base tree
@@ -518,11 +527,11 @@ the dtypes plugin and the torch `per_tensor_quant`/`pertoken_quant` shims:
   on gfx942, and on gfx950 1356 passed, 952 skipped, 48 failed: the
   `test_fused_dynamic_mxfp4_quant_moe_sort` cases, which build the HIP
   `module_quant` (no CK headers), the same 48 ids as on the base tree.
-- **`delayed=` resolves per GPU.** After `check()`, gfx942 gives `kpack=2`
-  for both `mla_decode_ref` kernels, no chunked_pa_prefill options and
-  `*fp8e4b8` for pa_mqa_logits' pointers; gfx950 gives `kpack=1`,
-  `num_warps=1, num_stages=1, waves_per_eu=2` and `*fp8e4nv`, the values the
-  factories and import-time code computed.
+- **Arch-dependent keywords resolve per GPU.** gfx942 gives `kpack=2` for
+  both `mla_decode_ref` kernels and, after `check()`, no chunked_pa_prefill
+  options and `*fp8e4b8` for pa_mqa_logits' pointers; gfx950 gives
+  `kpack=1`, `num_warps=1, num_stages=1, waves_per_eu=2` and `*fp8e4nv`, the
+  values the factories and import-time code computed.
 - **pa_decode_gluon's AOT scripts** (gfx942). `pa_decode_gluon_aot_warmup`
   warms up the JIT functions through the launchers' options: the disassembly
   of its HSACOs (dot and large-block dot, each with the reduce kernel) equals
