@@ -1,0 +1,2 @@
+  g4q  impl act         instrs=3116 vgpr=324 agpr=148 sgpr=100 spill=0 sha=0cfa77fb04450594 md5=829d6f9fa3e1   
+  bf16 impl act         instrs=3137 vgpr=324 agpr=152 sgpr=105 spill=0 sha=59d442f663991659 md5=818d94a7cc93   
