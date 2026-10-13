@@ -139,10 +139,10 @@ def _gluon_launch_keywords(Preshuffle, VarCtxOpt, is_padded_mode):
 
 # Each Gluon kernel below is the JIT function of two launchers, for a KV cache
 # whose row stride is a multiple of 16 (KV-padded) and for one whose stride may
-# not be: they assume different facts. The decorator is the unpadded mode's;
-# the padded mode's, in _GLUON_PAGED_MQA_LOGITS_LAUNCHERS at the end of this
-# file, is made over the JIT function _jit_function_of records, since a
-# delayed= launcher's options have no jit_func until check().
+# not be: they assume different facts. The decorator is the mode 132-byte KV
+# tokens take (a plain page of one is unpadded, every preshuffle page padded);
+# the other's, at the end of this file, is made over the JIT function
+# _jit_function_of records: a delayed= launcher has no jit_func until check().
 _GLUON_JIT_FUNCTIONS = {}  # (Preshuffle, VarCtxOpt) -> JIT function
 
 
@@ -520,7 +520,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
     return_compiled=True,
     assume_constant_globals=True,
     delayed=partial(
-        _gluon_launch_keywords, Preshuffle=True, VarCtxOpt=False, is_padded_mode=False
+        _gluon_launch_keywords, Preshuffle=True, VarCtxOpt=False, is_padded_mode=True
     ),
 )
 @_jit_function_of(Preshuffle=True, VarCtxOpt=False)
@@ -1543,7 +1543,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
     return_compiled=True,
     assume_constant_globals=True,
     delayed=partial(
-        _gluon_launch_keywords, Preshuffle=True, VarCtxOpt=True, is_padded_mode=False
+        _gluon_launch_keywords, Preshuffle=True, VarCtxOpt=True, is_padded_mode=True
     ),
 )
 @_jit_function_of(Preshuffle=True, VarCtxOpt=True)
@@ -2403,16 +2403,18 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
 
 # Every launcher of the kernels above, by (Preshuffle, VarCtxOpt, KV-padded)
 # mode, each stating that mode's types and facts (delayed: they depend on the
-# GPU). The kernels read the import-time constant
-# _Use_2d_instr_shape_mfma_layout. Callers read the returned kernel's hash (the
-# AOT benchmark zips its cache directory).
+# GPU): the three decorators, and each kernel's other KV mode. The kernels read
+# the import-time constant _Use_2d_instr_shape_mfma_layout. Callers read the
+# returned kernel's hash (the AOT benchmark zips its cache directory).
 _GLUON_PAGED_MQA_LOGITS_LAUNCHERS = {
     (False, False, False): _gluon_deepgemm_fp8_paged_mqa_logits,
-    (True, False, False): _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle,
-    (True, True, False): _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx,
-    **{
-        (Preshuffle, VarCtxOpt, True): make_launcher(
-            jit_func,
+    (True, False, True): _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle,
+    (True, True, True): _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx,
+}
+_GLUON_PAGED_MQA_LOGITS_LAUNCHERS.update(
+    {
+        (Preshuffle, VarCtxOpt, not padded): make_launcher(
+            _GLUON_JIT_FUNCTIONS[Preshuffle, VarCtxOpt],
             dynamic_options=("waves_per_eu",),
             return_compiled=True,
             assume_constant_globals=True,
@@ -2420,9 +2422,9 @@ _GLUON_PAGED_MQA_LOGITS_LAUNCHERS = {
                 _gluon_launch_keywords,
                 Preshuffle=Preshuffle,
                 VarCtxOpt=VarCtxOpt,
-                is_padded_mode=True,
+                is_padded_mode=not padded,
             ),
         )
-        for (Preshuffle, VarCtxOpt), jit_func in _GLUON_JIT_FUNCTIONS.items()
-    },
-}
+        for Preshuffle, VarCtxOpt, padded in _GLUON_PAGED_MQA_LOGITS_LAUNCHERS
+    }
+)
