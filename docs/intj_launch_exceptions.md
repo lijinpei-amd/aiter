@@ -36,7 +36,6 @@ pending Iris-enabled multi-GPU validation.
 | Site | Target | Reason |
 | --- | --- | --- |
 | `aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/common.py:409` | `torch.library.wrap_triton(_rotary_kernel)` | `torch.library.wrap_triton` is required for `torch.compile` behavior. |
-| `aiter/ops/triton/attention/pa_mqa_logits.py:789` | `kernel` | A precompiled Gluon/AOT kernel, not a `JITFunction`. |
 | `aiter/ops/triton/comms/all_gather.py:226` | `_all_gather_kernel` | Blocked by Iris helpers only: its nested JIT helper calls Iris `put`; intj compatibility lacks Iris-enabled validation. |
 | `aiter/ops/triton/comms/fused/reduce_scatter_rmsnorm_quant_all_gather.py:368` | `fused_pipeline_kernel` | Nested JIT helpers call Iris `load` and `put`; intj compatibility lacks Iris-enabled validation. |
 | `aiter/ops/triton/comms/reduce_scatter.py:236` | `_reduce_scatter_kernel` | Blocked by Iris helpers only: its nested JIT helper calls Iris `load`; intj compatibility lacks Iris-enabled validation. |
@@ -46,7 +45,7 @@ pending Iris-enabled multi-GPU validation.
 | `aiter/ops/triton/utils/device_info.py:57` | `kernel.__self__.options.jit_func` | Only while `torch.compile` traces: Dynamo cannot trace an intj launcher, and `fav3_sage_wrapper_func` must compile with `fullgraph=True` (see [torch.compile of fav3_sage](#torchcompile-of-fav3_sage)). |
 | `csrc/cpp_itfs/utils.py:515` | `self.triton_kernel` | `HsacoKernel._call` preserves the returned kernel alongside its separate HSACO path. |
 | `op_tests/triton_tests/torch_compile/test_compile_constexpr_mutation.py:37` | `_rmsnorm_constexpr_kernel` | Test checks Triton launch behavior under `torch.compile`. |
-| `op_tests/triton_tests/triton_metadata_redirect/test_metadata_redirect.py:5875` | `kernel` | Explicit precompiled `triton.compile` result, not a `JITFunction`. |
+| `op_tests/triton_tests/triton_metadata_redirect/test_metadata_redirect.py:5877` | `kernel` | Explicit precompiled `triton.compile` result, not a `JITFunction`. |
 | `op_tests/triton_tests/utils/causal_conv1d_update_refs.py:656` | `_causal_conv1d_update_kernel_sglang` | `**pdl_kwargs` can include `launch_pdl=True`, which intj cannot launch. |
 | `op_tests/triton_tests/utils/causal_conv1d_update_refs.py:1199` | `_causal_conv1d_update_kernel_vllm` | `launch_pdl=_is_arch_support_pdl()` can request PDL. |
 
@@ -163,14 +162,18 @@ Defaults are passed explicitly, values that `@triton.autotune` /
   state the same types and asserted facts in `extra_annotation`
   (`Argument(type=..., specialize=Assume(Aligned(16), PointerRange(32)))`,
   `NEVER` where the attrs had none), one launcher per
-  (Preshuffle, VarCtx, KV-padded) mode.
+  (Preshuffle, VarCtx, KV-padded) mode. An `Assume` leaves the facts it
+  omits measured, and intj cannot assume one fact and refuse another, so
+  the launchers compile with facts the attrs lacked when they hold:
+  `tt.divisibility` on `context_len_ptr` and `kv_indices`, and
+  `tt.pointer_range` on the padded KV and scale pointers.
 - **A caller that needs the compiled kernel** uses `return_compiled=True`:
   pa_mqa_logits returns the kernel's Triton cache key (the AOT benchmark
-  zips that directory). With `AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1` the
-  launch runs inside `AOTMetadataContext`, so the miss that compiles loads
-  the prebuilt hsaco/json, as `triton.compile` did. pod_attention prints
-  the returned kernel's `n_regs`/`n_spills`, and the metadata-redirect
-  test checks its `metadata.hash`, the same way.
+  zips that directory). With `AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1` a
+  launch that misses compiles and then loads the prebuilt hsaco/json, as
+  `triton.compile` did (see [pa_mqa_logits' AOT mode](#pa_mqa_logits-aot-mode)).
+  pod_attention prints the returned kernel's `n_regs`/`n_spills`, and the
+  metadata-redirect test checks its `metadata.hash`, the same way.
 - **`torch.Tensor` / `tl.tensor` annotations** mean "exactly a tensor" to
   intj (Triton ignores them). A parameter that can be `None` (MHA forward's
   descale, alibi, dropout-mask and sink pointers) is annotated
@@ -774,3 +777,96 @@ on gfx942 and gfx950 (MI350X):
   23.0-23.1 us).
 
 Not run: CUDA.
+
+## pa_mqa_logits' AOT mode
+
+`deepgemm_fp8_paged_mqa_logits` had three Gluon paths: JIT mode and AOT mode
+(`AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1`) on Triton >= 3.5, both through the
+six launchers above, and an AOT loader for Triton < 3.4, the last Triton
+launch in the file: `kernel[grid](...)` on a `functools.cache`d
+`triton.compile` of a signature-only stand-in kernel (with an extra dummy
+pointer argument), its hsaco/json swapped in by `AOTMetadataContext`.
+Upstream launched the same cached `triton.compile` result as a
+`CompiledKernel` in both modes on Triton >= 3.5.
+
+- **The Triton < 3.4 loader is deleted, not migrated: it cannot run.** intj
+  needs Triton >= 3.7, and `make_launcher` refuses an older one already at
+  decoration (`UnsupportedKernel: Triton >=3.7 is required`), so `import
+  aiter` fails at its first module-level launcher (Triton 3.5.1:
+  `_triton_kernels/quant/fast_transpose.py`); this file's own kernel module
+  declares launchers too. Upstream's loader was broken as well: the < 3.5
+  import branch never imported `get_cdna_version`, so the first call raised
+  `NameError` (reached on Triton 3.8 with its version string set to 3.3.1),
+  and the stand-ins lack the `num_block`, `CDNA_VERSION` and `ARCH`
+  parameters its signature names. Nothing on Triton >= 3.7 reached
+  `_compile_deepgemm_fp8_paged_mqa_logits` or the stand-ins; both are gone,
+  with the per-call `triton_version >= Version("3.5.0")` test (0.65 us on
+  MI350X: it parses a `Version` every call).
+- **The AOT context is entered only on a miss.** Every AOT-mode call used to
+  enter `AOTMetadataContext`, though only a launch that misses intj's cache
+  compiles and loads a binary. In AOT mode the module now passes its three
+  Gluon kernels to `require_metadata_redirect` (`triton_metadata_redirect.py`):
+  building one's `CompiledKernel` with no redirect registered on the thread
+  raises `MetadataRedirectMissing`, after Triton's `__init__` has read the
+  files and before anything is loaded on the GPU. The entry launches outside
+  the context and retries only on that exception, inside it; the retry finds
+  the first attempt's compile in Triton's cache, and intj keeps nothing from
+  the failed attempt. A compile of those kernels anywhere else in an
+  AOT-mode process raises instead of loading the binary it compiled.
+  `test_metadata_redirect.py::test_required_redirect_only_on_miss` covers the
+  mechanism and fails with the raise removed.
+
+Verified with intj `2783079`, Triton 3.8.0, `AITER_TRITON_ONLY=1`, on gfx942
+(MI300X) and gfx950 (MI350X, GPU 4), against upstream `874d253dd3`, in both
+modes. No AOT artifact ships in the tree: per GPU, they were made from
+upstream the way `bench_deepgemm_attention.py -aot` makes them (run JIT mode,
+copy the returned key's Triton cache directory to
+`configs/paged_mqa_logits/aot/<name>`), for the configurations below and the
+offset test's.
+
+- **Tests**, the same on both trees and GPUs: `test_pa_mqa_logits_offset.py`
+  105 passed in JIT mode, 2 passed and 103 skipped in AOT mode (only the
+  wide-output test runs there); `test_fp8_mqa_logits.py` 152 passed;
+  `test_metadata_redirect.py` 4 passed on gfx942 (3 upstream), skipped on
+  gfx950. `test_pa_mqa_logits_opus.py` (2) and
+  `test_pa_mqa_logits_mxfp4_opus.py` (4) fail on both trees: their `test_*`
+  functions take arguments pytest does not supply, and they do not reach
+  this kernel.
+- **Outputs**: 16 calls (plain, preshuffle and preshuffle-varctx at batch 1,
+  the offset test's configuration; two seeds; a miss and a hit) are bitwise
+  equal to upstream's in both modes on both GPUs.
+- **Binary**: in AOT mode a configuration's first call enters the context
+  once and the next 200 not at all; the launched kernel's hsaco is the
+  artifact's and its json hash differs from the compile's. A direct launcher
+  call outside the context raises `MetadataRedirectMissing`; a configuration
+  with no artifact raises `FileNotFoundError`, as before. An artifact made by
+  `bench_deepgemm_attention.py -aot` on this tree loads in AOT mode on
+  gfx950 with the JIT run's `logits_diff`.
+- **Host time** (MI350X GPU 4, `taskset` to NUMA node 1; batch 1, one token,
+  64 heads, 128-dim, 256-token context, ChunkK 256, WavePerEU 2): median us
+  per call of six alternating rounds, one process per tree and mode, each
+  the median of 2000 batches of 8 calls with a synchronize after each batch
+  outside the timer; in parentheses the range of the six process medians.
+  "Before" is this branch at `ba40fc7e2`.
+
+  | Mode | `deepgemm_fp8_paged_mqa_logits` | upstream | before | now |
+  | --- | --- | ---: | ---: | ---: |
+  | AOT | plain, page 1 | 23.14 (22.66-23.45) | 20.18 (20.00-20.30) | 18.42 (18.14-18.44) |
+  | AOT | preshuffle, page 16 | 23.37 (23.06-23.78) | 20.33 (20.12-20.43) | 18.62 (18.24-18.74) |
+  | AOT | preshuffle varctx, page 16 | 23.64 (23.48-24.07) | 20.27 (20.21-20.67) | 18.66 (18.19-18.73) |
+  | JIT | plain, page 1 | 23.02 (22.84-23.22) | 19.36 (19.12-19.62) | 18.54 (18.40-18.68) |
+  | JIT | preshuffle, page 16 | 23.33 (22.79-24.24) | 19.48 (19.20-19.83) | 18.68 (18.41-18.80) |
+  | JIT | preshuffle varctx, page 16 | 23.38 (23.18-23.70) | 19.51 (19.23-19.80) | 18.68 (18.40-19.02) |
+
+  The launch alone, replaying the entry's arguments, is 6.62-6.75 us
+  upstream (`CompiledKernel[grid](*args)`) and 2.57-2.60 us through the
+  launcher, before and now, in every row; inside a per-call
+  `AOTMetadataContext` it is 3.03-3.06 us. Not measured on gfx942.
+- **GPU kernel time** (rocprofv3, 500 launches, JIT mode), upstream vs now:
+  17.32 vs 17.39 us (plain, batch 16, 16384-token context) and 10.35 vs
+  10.30 us (preshuffle, page 64). AOT mode loads the same artifact on both
+  trees. No kernel code changed.
+
+Not verified: Triton 3.7 (intj's floor; only 3.8.0 here), a real Triton
+< 3.4, gfx1250, concurrent misses on several threads in AOT mode, and
+plain-kernel artifacts for a padded KV cache (`-p`, `PT` in the name).
