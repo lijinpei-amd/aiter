@@ -8,7 +8,7 @@ from aiter.jit.core import AITER_ROOT_DIR
 
 def compile_kernels():
     compile_args = CompileArgs(
-        path=f"{AITER_ROOT_DIR}/aiter/mla.py",
+        path=f"{AITER_ROOT_DIR}/aiter/aot/triton/mla_jit.py",
         kernel_name="_fwd_kernel_stage2_asm",
         signature="*fp32:16,*fp32:16,*bf16:16,*i32:16,i32,i32,i32,i32,i32,i32,i32,16,512,512,64",
         grid="bs,nheads,1",

@@ -160,6 +160,11 @@ def _mla_decode_reduce_v1_dispatch(
     )
 
 
+# One (token, head) per CTA, no cross-lane reduction: the merge is
+# memory-latency bound, so max occupancy (num_warps=1) beats wider
+# tiles. Measured 1.7-1.9x over num_warps=4 on gfx950 decode shapes.
+# The AOT tools compile the JIT function through aiter/aot/triton/mla_jit.py.
+@make_launcher(grid_arg=2, options={"num_stages": 2, "num_warps": 1, "waves_per_eu": 4})
 @triton.jit(do_not_specialize=["BATCH_NUM"])
 def _fwd_kernel_stage2_asm(
     Mid_O,
@@ -263,16 +268,6 @@ def _fwd_kernel_stage2_asm(
                     Final_lse + cur_qo * stride_lse_bs + cur_head,
                     e_max + tl.log(e_sum),
                 )
-
-
-# One (token, head) per CTA, no cross-lane reduction: the merge is
-# memory-latency bound, so max occupancy (num_warps=1) beats wider
-# tiles. Measured 1.7-1.9x over num_warps=4 on gfx950 decode shapes.
-_fwd_kernel_stage2_asm_launch = make_launcher(
-    _fwd_kernel_stage2_asm,
-    grid_arg=2,
-    options={"num_stages": 2, "num_warps": 1, "waves_per_eu": 4},
-)
 
 
 @functools.lru_cache
@@ -724,7 +719,7 @@ def mla_decode_fwd(
         )
 
         dev, stream = current_device_stream()
-        _fwd_kernel_stage2_asm_launch(
+        _fwd_kernel_stage2_asm(
             dev,
             stream,
             bs,
@@ -1922,7 +1917,7 @@ def mla_decode_fwd_v4_nm(
         final_lse_buf = torch.empty((1,), dtype=dtypes.fp32, device=device)
 
         dev, stream = current_device_stream()
-        _fwd_kernel_stage2_asm_launch(
+        _fwd_kernel_stage2_asm(
             dev,
             stream,
             num_seqs,

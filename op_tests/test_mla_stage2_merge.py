@@ -165,8 +165,10 @@ def run_torch(logits, attn_lse, num_valid, out_dtype):
     return out.to(out_dtype)
 
 
+# aiter.mla's launcher bakes the production options (per-call options cost
+# its launches ~0.45 us); this one sweeps them over the same JIT function.
 _fwd_kernel_stage2_asm_launch = make_launcher(
-    _fwd_kernel_stage2_asm,
+    _fwd_kernel_stage2_asm.__self__.options.jit_func,
     dynamic_options=(
         "num_warps",
         "num_stages",

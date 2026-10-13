@@ -59,7 +59,7 @@ def compile(
 
         bin_size, bin_data = transfer_hsaco(hsaco_path)
         compile_args = CompileArgs(
-            path=f"{AITER_CORE_DIR}/aiter/mla.py",
+            path=f"{AITER_CORE_DIR}/aiter/aot/triton/mla_jit.py",
             kernel_name="_fwd_kernel_stage2_asm",
             signature=f"*fp32:16,*fp32:16,*bf16:16,*i32:16,*i32:16,i32,i32,i32,i32,i32,i32,i32,i32,{num_kv_splits},{triton.next_power_of_2(v_head_dim)},{v_head_dim},{mgcs[gqa_ratio]}",
             grid="bs,nheads,max_seqlen_q",
