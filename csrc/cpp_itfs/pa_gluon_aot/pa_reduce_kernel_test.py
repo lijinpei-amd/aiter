@@ -10,7 +10,7 @@ from jinja2 import Template
 
 import aiter
 from aiter.ops.triton.gluon.pa_decode_gluon import (
-    _paged_attention_decode_v2_reduce_kernel_launch,
+    paged_attention_decode_v2_reduce_kernel,
 )
 from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.test_common import perftest
@@ -267,7 +267,7 @@ def run_direct_kernel(
 
     # Launch the kernel directly
     dev, stream = current_device_stream()
-    _paged_attention_decode_v2_reduce_kernel_launch(
+    paged_attention_decode_v2_reduce_kernel(
         dev,
         stream,
         grid,

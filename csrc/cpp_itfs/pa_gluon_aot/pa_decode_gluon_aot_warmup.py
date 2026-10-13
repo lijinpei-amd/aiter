@@ -254,7 +254,9 @@ def warmup_pa_decode(
 
     attn_grid = (num_seqs, num_kv_heads, max_context_partition_num)
 
-    attn_compiled = attention_kernel.warmup(
+    # pa_decode_gluon's kernels are intj launchers: warm up the JIT functions
+    # they launch.
+    attn_compiled = attention_kernel.__self__.options.jit_func.warmup(
         exp_sums,
         max_logits,
         temporary_output,
@@ -325,7 +327,8 @@ def warmup_pa_decode(
     )
     reduce_grid = (num_seqs, num_kv_heads, 1)
 
-    reduce_compiled = paged_attention_decode_v2_reduce_kernel.warmup(
+    reduce_jit = paged_attention_decode_v2_reduce_kernel.__self__.options.jit_func
+    reduce_compiled = reduce_jit.warmup(
         output_5d,
         exp_sums,
         max_logits,

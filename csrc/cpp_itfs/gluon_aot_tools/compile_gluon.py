@@ -212,6 +212,11 @@ def compile_gluon_kernel(args: CompileGluonArgs):
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     kernel = getattr(mod, args.kernel_name)
+    launcher = getattr(kernel, "__self__", None)
+    if launcher is not None:
+        # Decorated with intj's make_launcher: compile the JIT function the
+        # launcher launches, which has the same name.
+        kernel = launcher.options.jit_func
 
     # Verify this is a Gluon kernel
     if not hasattr(kernel, "is_gluon") or not kernel.is_gluon():

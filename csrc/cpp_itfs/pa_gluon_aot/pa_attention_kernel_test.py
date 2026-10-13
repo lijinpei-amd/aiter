@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 import argparse
-import functools
 import hashlib
 import os
 import random
@@ -475,16 +474,22 @@ def run_compiled_attention_kernel(
     )
 
 
-@functools.cache
-def _direct_launch(kernel):
-    # The large-block kernel reads the import-time constants COMPUTE and
-    # VMEM_LOAD (sched_group_barrier masks) from pa_decode_gluon.
-    return make_launcher(
-        kernel,
+# The direct launch compiles pa_decode_gluon's dot kernels with other options
+# than its own launchers: num_stages=1 and a per-call waves_per_eu. The
+# large-block kernel reads the import-time constants COMPUTE and VMEM_LOAD
+# (sched_group_barrier masks) from pa_decode_gluon.
+_direct_dot_launch, _direct_large_block_dot_launch = (
+    make_launcher(
+        kernel.__self__.options.jit_func,
         dynamic_options=("waves_per_eu",),
         options={"num_stages": 1},
         assume_constant_globals=True,
     )
+    for kernel in (
+        paged_attention_decode_v2_gluon_dot_kernel,
+        paged_attention_decode_v2_gluon_large_block_dot_kernel,
+    )
+)
 
 
 @perftest()
@@ -586,11 +591,11 @@ def run_direct_attention_kernel(
     waves_per_eu = 1
 
     # Use standard kernel
-    kernel = paged_attention_decode_v2_gluon_dot_kernel
+    launch = _direct_dot_launch
     # Select kernel implementation based on block size
     if kv_block_size > context_partition_size:
         # Use large block kernel
-        kernel = paged_attention_decode_v2_gluon_large_block_dot_kernel
+        launch = _direct_large_block_dot_launch
         if value_transposed:
             # Use smaller compute block size for better performance with transposed values
             kv_compute_block_size = 128
@@ -604,7 +609,7 @@ def run_direct_attention_kernel(
 
     # Launch the kernel directly (following _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper)
     dev, stream = current_device_stream()
-    _direct_launch(kernel)(
+    launch(
         dev,
         stream,
         grid,

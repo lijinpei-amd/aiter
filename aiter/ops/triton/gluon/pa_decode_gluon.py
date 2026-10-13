@@ -239,6 +239,9 @@ store_temporary_result.__triton_builtin__ = True
 #     ],
 #     cache_results=True,
 # )
+# Reads the import-time constants MFMA, VMEM_LOAD and COMPUTE
+# (sched_group_barrier masks), like sliding_window_head_1.
+@make_launcher(assume_constant_globals=True)
 @gluon.jit
 def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
@@ -3141,6 +3144,7 @@ def paged_attention_decode_sliding_window(
 #     ],
 #     cache_results=True,
 # )
+@make_launcher
 @gluon.jit
 def paged_attention_decode_v2_gluon_dot_kernel(
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
@@ -4038,6 +4042,7 @@ def paged_attention_decode_ps_reduce_kernel(
     )
 
 
+@make_launcher
 @triton.jit
 def paged_attention_decode_v2_reduce_kernel(
     output_ptr,  # [num_seqs, query_length, num_kv_heads, query_group_size, head_size]
@@ -4272,23 +4277,6 @@ def paged_attention_decode_v2_reduce_kernel(
     )
 
 
-_paged_attention_decode_v2_reduce_kernel_launch = make_launcher(
-    paged_attention_decode_v2_reduce_kernel,
-)
-
-# The large-block kernel (like sliding_window_head_1) reads the import-time
-# constants MFMA, VMEM_LOAD and COMPUTE (sched_group_barrier masks). The
-# dot and reduce kernels keep named launchers: pa_decode_gluon_aot.py compiles
-# the same JIT functions ahead of time through Triton.
-_paged_attention_decode_v2_gluon_large_block_dot_kernel_launch = make_launcher(
-    paged_attention_decode_v2_gluon_large_block_dot_kernel,
-    assume_constant_globals=True,
-)
-_paged_attention_decode_v2_gluon_dot_kernel_launch = make_launcher(
-    paged_attention_decode_v2_gluon_dot_kernel
-)
-
-
 def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     grid,
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
@@ -4445,13 +4433,11 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
 
     if KV_BLOCK_SIZE > CONTEXT_PARTITION_SIZE:
         # Use big block kernel for large block sizes
-        paged_attention_launch = (
-            _paged_attention_decode_v2_gluon_large_block_dot_kernel_launch
-        )
+        paged_attention_launch = paged_attention_decode_v2_gluon_large_block_dot_kernel
 
     else:
         # Use standard kernel for normal block sizes
-        paged_attention_launch = _paged_attention_decode_v2_gluon_dot_kernel_launch
+        paged_attention_launch = paged_attention_decode_v2_gluon_dot_kernel
 
     # Launch the dot kernel
     dev, stream = current_device_stream()
@@ -4653,7 +4639,7 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
         )
     else:
         dev, stream = current_device_stream()
-        _paged_attention_decode_v2_reduce_kernel_launch(
+        paged_attention_decode_v2_reduce_kernel(
             dev,
             stream,
             grid,
