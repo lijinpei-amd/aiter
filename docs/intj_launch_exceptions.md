@@ -1580,11 +1580,16 @@ against upstream `874d253dd3` and against `4caf64244` with intj `2783079`
   | `test_metadata_redirect.py`, JIT / AOT mode | gfx942 4 / 4 passed | the same |
   | `test_pa_mqa_logits_opus.py`, `test_pa_mqa_logits_mxfp4_opus.py` | 2 and 4 failed (`TypeError`: their `test_*` functions take arguments pytest does not supply) | the same |
 
-  The six new cases, `test_pa_mqa_logits_compiles_upstreams_facts`, compare
-  each mode's compiled facts with upstream's attrs on aligned inputs under
-  2 GiB. They all fail with the launchers back on `Assume`, with
-  `Aligned(16)` added to `kv_indices`, and with `stride_out_batch` left
-  `AUTO` (gfx942); the launch tests pass under all three.
+  The six new cases, `test_pa_mqa_logits_compiles_upstreams_facts`, check
+  each mode's keywords, every parameter `Exactly` upstream's facts or
+  `NEVER`, and that the kernel launched on aligned inputs under 2 GiB has
+  upstream's attrs and signature. The keywords check is what catches an
+  `AUTO` integer the inputs give no fact (`batch_size` is 2). On gfx942 all
+  six fail, and the launch tests pass, with the launchers back on `Assume`;
+  with `Aligned(16)` added to `kv_indices`; with `stride_out_batch`, or
+  `batch_size`, `next_n`, `max_block_len` and `num_block`, left `AUTO`;
+  with `stride_out_batch` typed `i32`; and on a copy of intj whose `Exactly`
+  leaves unlisted facts measured.
 - **Check sweep** (gfx942, `intj-aiter-check-sweep.py --build`, GPU phase):
   415 modules, 383 import; all 424 launchers (7 `delayed=`) check and build
   on intj `20e578f`, as before on `2783079`; the same 32 modules fail to

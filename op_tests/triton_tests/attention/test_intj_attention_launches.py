@@ -276,10 +276,41 @@ def test_pa_mqa_logits_launches_each_mode_through_its_launcher(mode, monkeypatch
     torch.testing.assert_close(out, reference, rtol=1e-2, atol=1e-2)
 
 
-def _upstream_facts(padded):
-    """The facts per parameter of upstream's hand-written `triton.compile`
-    (874d253dd3 `_compile_deepgemm_fp8_paged_mqa_logits`'s attrs; the same in
-    every mode and arch but for the KV-padded four), nonempty ones only."""
+def _upstream_compile(mode, gfx):
+    """The signature and the facts per parameter (nonempty ones only) of
+    upstream's hand-written `triton.compile` (874d253dd3
+    `_compile_deepgemm_fp8_paged_mqa_logits`); its attrs are the same in every
+    mode and arch but for the KV-padded four."""
+    preshuffle, varctx, padded = mode
+    fp8 = "*fp8e4b8" if gfx == "gfx942" else "*fp8e4nv"
+    kv_stride = "i32" if preshuffle else "i64"
+    signature = {
+        "batch_size": "i32",
+        "next_n": "i32",
+        "heads_num": "i32",
+        "Q_buffer": fp8,
+        "stride_q_batch": "i32",
+        "stride_q_next_n": "i32",
+        "stride_q_heads": "i32",
+        "KV_buffer": fp8,
+        "stride_k_seq": kv_stride,
+        "scale_buffer": "*fp32",
+        "stride_scale_seq": kv_stride,
+        "context_len_ptr": "*i32",
+        "kv_indices": "*i32",
+        "weights": "*fp32",
+        "stride_w_batch": "i32",
+        "OutLogits_buffer": "*fp32",
+        "stride_out_batch": "i64",
+        "max_model_len": "i32",
+        "max_block_len": "i32",
+        "num_block": "i32",
+        **({"safe_chunks_per_cta_ptr": "*i32"} if varctx else {"SplitKV": "i32"}),
+        **dict.fromkeys(
+            ("ChunkQ", "ChunkK", "KVBlockSize", "HiddenDim", "CDNA_VERSION", "ARCH"),
+            "constexpr",
+        ),
+    }
     d16, r32 = ("tt.divisibility", 16), ("tt.pointer_range", 32)
     kv = {d16} if padded else set()
     facts = {
@@ -297,23 +328,50 @@ def _upstream_facts(padded):
         "weights": {d16, r32},
         "stride_w_batch": {d16},
     }
-    return {name: f for name, f in facts.items() if f}
+    return signature, {name: f for name, f in facts.items() if f}
 
 
 @pytest.mark.parametrize("mode", list(_PA_MQA_LOGITS_MODES), ids=_mode_id)
 @torch.inference_mode()
 def test_pa_mqa_logits_compiles_upstreams_facts(mode, monkeypatch):
-    """Each launcher compiles exactly the specialization facts upstream's
-    hand-written attrs stated, and none it measured: the binary is
-    upstream's. The inputs are aligned and small, so a launcher that left a
-    fact measured (an `Assume` where the attrs listed some facts, `AUTO`
-    where they listed none) would compile it here."""
+    """Each launcher states exactly the facts upstream's hand-written attrs
+    stated and compiles them under upstream's signature: the binary is
+    upstream's.
+
+    The keywords are checked as well as the compile: a fact left measured
+    (`AUTO`, or an `Assume` short of upstream's list) compiles only for
+    inputs that have it, and most of these integers are neither 1 nor
+    multiples of 16. The compile shows the stated facts became upstream's
+    attrs and no runtime parameter became a constexpr; with every pointer
+    aligned and under 2 GiB, a measured pointer fact would show there too."""
+    from intj import NEVER, Aligned, Exactly, PointerRange
+
+    from aiter.jit.utils.chip_info import get_gfx
+    from aiter.ops.triton.gluon import pa_mqa_logits as gluon
+
     launched, _, _ = _launch_pa_mqa_logits_mode(mode, monkeypatch)
     ((_, kernel),) = launched
+    signature, facts = _upstream_compile(mode, get_gfx())
+
+    tt_fact = {
+        Aligned(16): ("tt.divisibility", 16),
+        PointerRange(32): ("tt.pointer_range", 32),
+    }
+    annotation = gluon._gluon_launch_keywords(*mode)["extra_annotation"]
+    assert sorted(annotation) == sorted(
+        name for name, ty in signature.items() if ty != "constexpr"
+    )
+    for name, argument in annotation.items():
+        spec = argument.specialize
+        assert spec is NEVER or isinstance(spec, Exactly), (name, spec)
+        stated = {tt_fact[fact] for fact in getattr(spec, "facts", ())}
+        assert stated == facts.get(name, set()), name
+
     names = kernel.src.fn.arg_names
     compiled = {
-        names[path[0]]: {tuple(fact) for fact in facts}
-        for path, facts in kernel.src.attrs.items()
-        if facts
+        names[path[0]]: {tuple(fact) for fact in path_facts}
+        for path, path_facts in kernel.src.attrs.items()
+        if path_facts
     }
-    assert compiled == _upstream_facts(padded=mode[2])
+    assert compiled == facts
+    assert kernel.src.signature == signature
