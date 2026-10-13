@@ -12,8 +12,8 @@ from aiter.ops.triton.utils.tuned_config_utils import (
     autotune_enabled,
 )
 
-# Dev-time tuning escape hatch (off by default). See the block below the kernel
-# for what this actually does and why it's not the production path.
+# Dev-time tuning escape hatch (off by default). See _attn_res_tuning for what
+# this actually does and why it's not the production path.
 ATTN_RES_TRITON_AUTOTUNE: bool = autotune_enabled("ATTN_RES")
 
 
@@ -40,9 +40,77 @@ _attnres_fwd_kernel_repr = make_kernel_repr(
 )
 
 
+# fla-style tuning escape hatch: ATTN_RES_TRITON_AUTOTUNE=1 lets Triton's own
+# autotune search (BL, num_warps, num_stages) instead of the wrapper's static
+# per-token-count table (aiter/ops/triton/fusions/attn_res.py). This mirrors
+# aiter's existing pattern for a live-search opt-in (see
+# AITER_TRITON_CONV_AUTOTUNE / CHUNK_DELTA_ATTN_TRITON_AUTOTUNE), which itself
+# mirrors fla's approach of keeping @triton.autotune available but not on the
+# hot path by default: fla's `fla_cache_autotune` loads a pre-tuned config from
+# an on-disk cache and only falls back to a live triton.autotune search on a
+# cache miss, so a fresh key never stalls (or breaks CUDAGraph capture on) a
+# production call. aiter has no fla runtime dependency (attn_res is a
+# dependency-free port), so this reproduces the same net effect with aiter's own
+# idiom instead: production always uses the static table (bounded compile cost,
+# CUDAGraph-safe, zero benchmarking on the critical path) with values obtained
+# BY running this autotune search offline (see scratch/tune_attn_res.py) and
+# copying the winners into the static table -- i.e. the disk-cache step happens
+# by hand, once, at tuning time, rather than automatically per-process.
+#
+# `cache_results=True` still gives in-process caching across repeated calls
+# with the same key within a run of this flag, same as fla's `cache_results`
+# kwarg (see aiter/ops/triton/_triton_kernels/chunk_delta_attn/chunk_delta_attn_utils.py).
+def _attn_res_tuning(kernel):
+    """`kernel` under the ATTN_RES_TRITON_AUTOTUNE search, or as is when it is off."""
+    if not ATTN_RES_TRITON_AUTOTUNE:
+        return kernel
+    configs = [
+        triton.Config({"BL": BL}, num_warps=num_warps, num_stages=num_stages)
+        for BL in (1, 2, 4, 8)
+        for num_warps in (4, 8, 16)
+        for num_stages in (1, 2)
+    ]
+    return triton.autotune(
+        configs=autotune_configs("ATTN_RES", configs),
+        key=[
+            "N",
+            "L2",
+            "D",
+            "HAS_ONORM",
+            "IS_PACKED",
+            "HAS_PREFIX",
+            "WRITE_BLOCK_CAT",
+            "QUANT_FP8",
+        ],
+        cache_results=True,
+    )(kernel)
+
+
+# The number of sequence-layout residual slots, res0..res15.
+ATTN_RES_SEQ_SLOTS = 16
+
+# The launchers of this kernel (or, under ATTN_RES_TRITON_AUTOTUNE, of the tuner
+# over it, which then assigns BL, num_warps and num_stages): this decorator and
+# attnres_fwd_sequence_kernels below. Each bakes the arguments its layout never
+# varies, so a call neither passes nor decodes them: on the decode path every
+# argument costs host time.
+_ATTN_RES_DYNAMIC_OPTIONS = (
+    () if ATTN_RES_TRITON_AUTOTUNE else ("num_warps", "num_stages")
+)
+
+
 # num_warps / num_stages / BL come from the static per-token-count table in the
 # wrapper (see _pick_attn_res_config), not from @triton.autotune: a single config
-# per shape keeps compile cost bounded and does not break CUDAGraph capture.
+# per shape keeps compile cost bounded and does not break CUDAGraph capture
+# (_attn_res_tuning tunes only under ATTN_RES_TRITON_AUTOTUNE). The launcher is
+# attn_res_gate's and layout="packed"'s: the sequence layout's slots are unused.
+@make_launcher(
+    dynamic_options=_ATTN_RES_DYNAMIC_OPTIONS,
+    extra_annotation={
+        f"res{i}": Argument(value=None) for i in range(ATTN_RES_SEQ_SLOTS)
+    },
+)
+@_attn_res_tuning
 @triton.jit(repr=_attnres_fwd_kernel_repr, do_not_specialize=["L"])
 def attnres_fwd_kernel(
     q,
@@ -373,72 +441,10 @@ def attnres_fwd_kernel(
     tl.store(o + i_n * D + o_d, b_o.to(o.dtype.element_ty), mask=m_d)
 
 
-# fla-style tuning escape hatch: ATTN_RES_TRITON_AUTOTUNE=1 lets Triton's own
-# autotune search (BL, num_warps, num_stages) instead of the wrapper's static
-# per-token-count table (aiter/ops/triton/fusions/attn_res.py). This mirrors
-# aiter's existing pattern for a live-search opt-in (see
-# AITER_TRITON_CONV_AUTOTUNE / CHUNK_DELTA_ATTN_TRITON_AUTOTUNE), which itself
-# mirrors fla's approach of keeping @triton.autotune available but not on the
-# hot path by default: fla's `fla_cache_autotune` loads a pre-tuned config from
-# an on-disk cache and only falls back to a live triton.autotune search on a
-# cache miss, so a fresh key never stalls (or breaks CUDAGraph capture on) a
-# production call. aiter has no fla runtime dependency (attn_res is a
-# dependency-free port), so this reproduces the same net effect with aiter's own
-# idiom instead: production always uses the static table (bounded compile cost,
-# CUDAGraph-safe, zero benchmarking on the critical path) with values obtained
-# BY running this autotune search offline (see scratch/tune_attn_res.py) and
-# copying the winners into the static table -- i.e. the disk-cache step happens
-# by hand, once, at tuning time, rather than automatically per-process.
-#
-# `cache_results=True` still gives in-process caching across repeated calls
-# with the same key within a run of this flag, same as fla's `cache_results`
-# kwarg (see aiter/ops/triton/_triton_kernels/chunk_delta_attn/chunk_delta_attn_utils.py).
-if ATTN_RES_TRITON_AUTOTUNE:
-    _ATTN_RES_AUTOTUNE_CONFIGS = [
-        triton.Config({"BL": BL}, num_warps=num_warps, num_stages=num_stages)
-        for BL in (1, 2, 4, 8)
-        for num_warps in (4, 8, 16)
-        for num_stages in (1, 2)
-    ]
-    attnres_fwd_kernel = triton.autotune(
-        configs=autotune_configs("ATTN_RES", _ATTN_RES_AUTOTUNE_CONFIGS),
-        key=[
-            "N",
-            "L2",
-            "D",
-            "HAS_ONORM",
-            "IS_PACKED",
-            "HAS_PREFIX",
-            "WRITE_BLOCK_CAT",
-            "QUANT_FP8",
-        ],
-        cache_results=True,
-    )(attnres_fwd_kernel)
-
-# The number of sequence-layout residual slots, res0..res15.
-ATTN_RES_SEQ_SLOTS = 16
-
-# The launchers below launch this kernel (or, under ATTN_RES_TRITON_AUTOTUNE, the
-# tuner over it, which then assigns BL, num_warps and num_stages). Each bakes
-# the arguments its layout never varies, so a call neither passes nor decodes
-# them: on the decode path every argument costs host time.
-_attnres_fwd = attnres_fwd_kernel
-_ATTN_RES_DYNAMIC_OPTIONS = (
-    () if ATTN_RES_TRITON_AUTOTUNE else ("num_warps", "num_stages")
-)
-
-# attn_res_gate and layout="packed": the sequence layout's slots are unused.
-attnres_fwd_kernel = make_launcher(
-    _attnres_fwd,
-    dynamic_options=_ATTN_RES_DYNAMIC_OPTIONS,
-    extra_annotation={
-        f"res{i}": Argument(value=None) for i in range(ATTN_RES_SEQ_SLOTS)
-    },
-)
-
-# layout="sequence", one launcher per L2 bucket: none of what the packed
-# layout adds (prefix, add folds, block_out, FP8 quant, SEPARATE), no backward
-# checkpoint, and no residual slot from L2 up.
+# layout="sequence", one launcher per L2 bucket over the decorated kernel's JIT
+# function (or tuner): none of what the packed layout adds (prefix, add folds,
+# block_out, FP8 quant, SEPARATE), no backward checkpoint, and no residual slot
+# from L2 up.
 _ATTN_RES_SEQ_BAKED = {
     **dict.fromkeys(
         (
@@ -476,7 +482,7 @@ _ATTN_RES_SEQ_BAKED = {
 }
 attnres_fwd_sequence_kernels = {
     l2: make_launcher(
-        _attnres_fwd,
+        attnres_fwd_kernel.__self__.options.jit_func,
         dynamic_options=_ATTN_RES_DYNAMIC_OPTIONS,
         extra_annotation={
             **_ATTN_RES_SEQ_BAKED,
