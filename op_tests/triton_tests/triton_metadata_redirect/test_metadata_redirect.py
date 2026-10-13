@@ -6,12 +6,12 @@ import pytest
 import torch
 import triton
 import triton.language as tl
-from intj import make_launcher
-from triton.backends.compiler import GPUTarget
+from intj import NEVER, Argument, Constexpr, make_launcher
 from triton.tools.compile import CompileArgs, compile_kernel
 
 from aiter import logger
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.device_info import current_device_stream
 from aiter.utility.triton.triton_metadata_redirect import (
     AOTMetadataContext,
     MetadataRedirectMissing,
@@ -5856,28 +5856,36 @@ def test_separate_compile_and_run():
         with open(json_file, "w") as f:
             f.write(aot_kernel0_json)
 
+        # The launcher states the ASTSource triton.compile was given: x_ptr is
+        # *fp32 with no specialization, SIZE is 64.
+        @make_launcher(
+            extra_annotation={
+                "x_ptr": Argument(type=tl.pointer_type(tl.float32), specialize=NEVER),
+                "SIZE": Constexpr(value=64),
+            },
+            return_compiled=True,
+        )
         @triton.jit
         def empty_kernel(x_ptr, SIZE: tl.constexpr):
             return
 
-        # compile for kernel0
-        target = GPUTarget("hip", "gfx942", 64)
-        src = triton.compiler.ASTSource(
-            fn=empty_kernel,
-            signature={
-                "x_ptr": "*fp32",
-            },
-            constexprs={"SIZE": 64},
-        )
-        with AOTMetadataContext("empty_kernel", temp_dir):
-            kernel = triton.compile(src, target=target)
-
-        # run kernel0
         x = torch.zeros((1, 1, 2), dtype=torch.float32, device="cuda")
-        kernel[(1, 1, 1)](x)
+        dev, stream = current_device_stream()
 
-        # check
+        # compile for kernel0: the first launch misses intj's cache and calls
+        # triton.compile on this thread, where the context swaps in the
+        # prebuilt hsaco/json; a zero-volume grid returns the kernel without
+        # running it.
+        with AOTMetadataContext("empty_kernel", temp_dir):
+            kernel = empty_kernel(dev, stream, (0, 1, 1), x)
+
+        # run kernel0: outside the context the launch finds that kernel
+        assert empty_kernel(dev, stream, (1, 1, 1), x) is kernel
+
+        # check: the context served this directory's json and hsaco
         assert kernel.metadata.hash in aot_kernel0_json, "hash not found in json"
+        assert kernel.metadata_group["empty_kernel.hsaco"] == hsaco_file
+        assert kernel.asm["hsaco"] == bytes(aot_kernel0_hsaco)
 
         # compile and run for kernel1
         # ...
