@@ -5,7 +5,8 @@
 """Regression tests for paged MQA logits block paging and input/output offsets.
 
 The non-preshuffle cases check block tables, per-token scales and large KV
-offsets against FP32.
+offsets against FP32. In AOT mode (AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1) the
+wide-output test also checks that the binary it ran is the prebuilt one.
 
 Background
 ----------
@@ -29,16 +30,23 @@ offset (``rows * context_len * 4``) stays well below 2**31 and is therefore
 always computed correctly.
 """
 
+import os
+import re
+
 import pytest
 import torch
 
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.triton.attention import pa_mqa_logits
 from aiter.ops.triton.attention.pa_mqa_logits import (
     deepgemm_fp8_paged_mqa_logits,
+    enable_aot_gluon_pa_mqa_logits,
+    enable_gluon_pa_mqa_logits,
     enable_jit_gluon_pa_mqa_logits_kernel,
 )
+from aiter.ops.triton.utils.config_utils import AITER_TRITON_CONFIGS_PATH
 
 dev = "cuda"
 SEED = 1234
@@ -81,6 +89,21 @@ def _make_inputs(batch_size, next_n, context_len):
     return q_fp8, kv_cache, weights, context_lens, block_tables
 
 
+def _record_gluon_kernels(monkeypatch):
+    """Returns the list every Gluon launch appends its CompiledKernel to."""
+    kernels = []
+    launchers = pa_mqa_logits._GLUON_PAGED_MQA_LOGITS_LAUNCHERS
+    for mode, launch in list(launchers.items()):
+
+        def record(*args, launch=launch):
+            kernel = launch(*args)
+            kernels.append(kernel)
+            return kernel
+
+        monkeypatch.setitem(launchers, mode, record)
+    return kernels
+
+
 def _run(q, kv, w, ctx_lens, block_tables, out_width):
     rows = q.shape[0] * q.shape[1]
     out = torch.full((rows, out_width), SENTINEL, dtype=torch.float32, device=dev)
@@ -105,9 +128,11 @@ def _run(q, kv, w, ctx_lens, block_tables, out_width):
 # rows = batch_size * next_n; both cross the 2**31 boundary at row 512 with
 # max_model_len=1<<20 (516 rows: just past 512; 1024 rows: the GLM con256 shape).
 @pytest.mark.parametrize("batch_size", [129, 256])
-def test_paged_mqa_logits_wide_output_no_tail_drop(batch_size):
+def test_paged_mqa_logits_wide_output_no_tail_drop(batch_size, monkeypatch):
     rows = batch_size * NEXT_N
     assert rows > 512, "shape must cross the 2**31 boundary (needs batch*next_n > 512)"
+    aot = enable_gluon_pa_mqa_logits and enable_aot_gluon_pa_mqa_logits
+    kernels = _record_gluon_kernels(monkeypatch) if aot else []
 
     q, kv, w, ctx_lens, block_tables = _make_inputs(batch_size, NEXT_N, CONTEXT_LEN)
 
@@ -133,6 +158,46 @@ def test_paged_mqa_logits_wide_output_no_tail_drop(batch_size):
     assert torch.equal(
         valid[512:], ref[512:]
     ), "rows >= 512 (past the 2**31 offset boundary) differ from the reference"
+
+    # (3) AOT mode ran the prebuilt binary, not one it compiled: outputs alone
+    # cannot tell, both binaries compute the same logits.
+    assert len(kernels) == (2 if aot else 0)
+    aot_dir = os.path.join(AITER_TRITON_CONFIGS_PATH, "paged_mqa_logits", "aot")
+    for kernel in kernels:
+        for ext in ("json", "hsaco"):
+            path = kernel.metadata_group[f"{kernel.name}.{ext}"]
+            assert os.path.commonpath([aot_dir, path]) == aot_dir, path
+
+
+@pytest.mark.skipif(
+    get_gfx() not in ("gfx942", "gfx950") or enable_jit_gluon_pa_mqa_logits_kernel,
+    reason="Requires the CDNA Gluon paged MQA kernel in AOT mode",
+)
+# Triton's CompiledKernel.__del__ trips over the instance whose __init__ found
+# no json.
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
+def test_paged_mqa_logits_aot_never_runs_its_own_compile(tmp_path, monkeypatch):
+    """AOT mode with no prebuilt hsaco/json for a configuration raises, rather
+    than run the kernel its cache miss compiled."""
+    monkeypatch.setattr(pa_mqa_logits, "AITER_TRITON_CONFIGS_PATH", str(tmp_path))
+    q, kv, w, ctx_lens, block_tables = _make_inputs(1, 1, BLOCK_SIZE)
+    out = torch.empty((1, BLOCK_SIZE), dtype=torch.float32, device=dev)
+    # ChunkK differs from the wide-output test's: a configuration this process
+    # has not launched yet, so the call misses.
+    with pytest.raises(FileNotFoundError, match=re.escape(str(tmp_path))):
+        deepgemm_fp8_paged_mqa_logits(
+            q,
+            kv,
+            w,
+            out,
+            ctx_lens,
+            block_tables,
+            BLOCK_SIZE,
+            Preshuffle=True,
+            KVBlockSize=BLOCK_SIZE,
+            ChunkK=128,
+            WavePerEU=2,
+        )
 
 
 @pytest.mark.skipif(
