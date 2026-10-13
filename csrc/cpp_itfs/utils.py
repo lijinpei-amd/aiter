@@ -570,9 +570,10 @@ class HsacoKernel:
     the current device's current stream, and returns the CompiledKernel. A
     keyword naming no kernel parameter is a compile option (`num_warps`,
     `num_stages`, `waves_per_eu`, ...); an unknown one raises. `grid` is an
-    int, a tuple of 1-3 ints, or a callable over the parameters by name.
-    Construction does no GPU work; the launchers are made and built on the
-    first call.
+    int, a tuple or list of 1-3 ints, or a callable over the parameters by
+    name returning one; the ints are Python ints and the tuple is exactly a
+    tuple (a `torch.Size` or numpy integers raise). Construction does no GPU
+    work; the launchers are made and built on the first call.
     """
 
     def __init__(self, kernel, stream=None):

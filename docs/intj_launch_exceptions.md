@@ -610,22 +610,41 @@ plan; a launch then only picks its arguments out of one tuple:
 - the parameters follow in declaration order, defaults applied;
 - `return_compiled=True`, so the call still returns the `CompiledKernel`
   (no measurable cost);
-- `grid` is an int, a 1-3 tuple or list, or a callable. The callable gets
-  every parameter by name, as Triton's does, and is evaluated in Python
-  before the launch: a `grid_py` launcher (with the grid passed through a
-  thread-local, as `intj.compat` does) measured within 0.1 us of it, in
-  either direction (gfx950 3.55 vs 3.63 us, gfx942 6.84 vs 6.72 us), and
-  Python evaluation keeps one launcher for every grid form;
-- the launch goes on `stream` when one was given (a raw handle, or a
-  `torch.cuda.Stream` and its device), else on the current device's current
-  stream. The Triton path ignored `stream`; the HSACO path used it.
+- `grid` is an int, a 1-3 tuple or list of ints, or a callable returning
+  one. The callable gets every parameter by name, as Triton's does, and is
+  evaluated in Python before the launch: a `grid_py` launcher (with the
+  grid passed through a thread-local, as `intj.compat` does) measured
+  within 0.1 us of it, in either direction (gfx950 3.55 vs 3.63 us, gfx942
+  6.84 vs 6.72 us), and Python evaluation keeps one launcher for every grid
+  form;
+- the launch goes on `stream` when one was given, else on the current
+  device's current stream. A raw handle launches on the current device; a
+  `torch.cuda.Stream` launches on its own device, made current around the
+  launch when it is not. intj launches only on the current device: on
+  another one a kernel-cache miss raises `UnsupportedKernel` and a hit fails
+  in `hipModuleLaunchKernel` ("invalid resource handle"), although intj's
+  `Usage.md` asks for the device to be current only the first time. The
+  Triton path ignored `stream`; the HSACO path used it.
 
 Launchers and plans belong to the JIT function, not to the wrapper, so
 `jit(k)[grid](...)` built per call keeps hitting their kernel caches.
 Refusals are loud: an unknown keyword raises `UnsupportedKernel` (Triton
 raised `KeyError`), `device=`/`stream=` keywords and what intj cannot
 launch (tuple arguments, kernels reading globals, `num_ctas > 1`, ...) raise
-instead of launching through Triton.
+instead of launching through Triton. So do some arguments Triton launched
+(gfx942, checked against upstream's `HsacoKernel`):
+
+- a grid that is a `tuple` subclass, such as `torch.Size` (intj:
+  `TypeError: grid must be an int, tuple or list of ints`);
+- numpy integer grid dimensions, also when a callable grid returns them
+  (`ValueError: grid dimensions must be ints in [0, 2**32)`, misleading for
+  `np.int64(4)`);
+- more than three grid dimensions, where Triton ignores the fourth on
+  (`ValueError: grid must have between 1 and 3 dimensions`);
+- a numpy integer for a constexpr (`TypeError: unsupported argument`).
+
+A callable grid returning a bare int, which Triton refused (`TypeError`),
+now launches.
 
 **`AITER_USE_HSACO=1` stays as it was.** That mode is for deployment
 without compiling at run time: it compiles an HSACO from Triton once, keeps
@@ -688,24 +707,41 @@ launch on gfx950. Two of the nine gfx942 intj processes ran 1.1-1.5 us
 slower in every row, raw launch included (the bimodal per-process launch
 time noted above); the gfx942 machine was shared with other jobs. The
 kernels are the ones Triton compiles (the tests check the AMDGCN is
-identical), so GPU time was not measured.
+identical), so GPU time was not measured. Making a stream's device current
+(above) changed the closures; re-measured the same way against the code
+before it (7 alternating rounds), intj moved by at most 0.02 us on gfx950
+and 0.08 us on gfx942, where the unchanged raw rows moved up to 0.05 us.
+
+**torch.compile.** Under `torch.compile(fullgraph=True)` a call fails with
+`Unsupported`, where upstream's `HsacoKernel` compiles and matches eager
+(gfx942): on a cold kernel at the lock in `_IntjKernel.of` ("Unsupported
+context manager"), after an eager warm-up at the launcher ("Unsupported
+call to a callable object with no traceable `__call__`"). With
+`fullgraph=False` it graph-breaks and matches eager. Not fixed: the
+`torch.compiler.is_compiling()` branch of `launch_on_current_stream`, at
+the top of `__getitem__`, cost 0.08-0.11 us per call on gfx950 and
+0.12-0.20 us on gfx942 (same process, 9 rounds of 1000 batches), on every
+call of a helper nothing compiles; the tree adds that branch only where a
+caller needs `fullgraph=True` (fav3_sage).
 
 **Tests.** `op_tests/cpp/test_hsaco_kernel.py`: positional, keyword and
 defaulted arguments, option keywords (compiled options and AMDGCN equal to
 Triton's), every grid form, the grid function's arguments against
-Triton's, a zero grid, the stream (current, `with torch.cuda.stream`, a
-`torch.cuda.Stream`, a raw handle, a bad one), launchers shared across
-wrappers, and the refusals, with no launch reaching `JITFunction.run`; plus
-outputs equal to a Triton launch and, where `hip` imports, to the HSACO
-path. gfx942 and gfx950 (MI350X): 19 passed, 1 skipped (no hip-python);
-with the stand-in on `PYTHONPATH`, 20 passed on both.
-On gfx942, each of four injected mistakes (ignoring `stream`, unsorted
-option names, the grid's `meta` built from the wrong arguments, a wrong
-default) fails at least one test.
+Triton's, a zero grid, a lone argument by keyword, the stream (current,
+`with torch.cuda.stream`, a `torch.cuda.Stream`, one on another device for
+a kernel-cache miss and a hit, a raw handle, a bad one), launchers shared
+across wrappers, and the refusals, with no launch reaching
+`JITFunction.run`; plus outputs equal to a Triton launch and, where `hip`
+imports, to the HSACO path. gfx942 on two GPUs: 22 passed, 1 skipped (no
+hip-python), 23 passed with the stand-in on `PYTHONPATH`. gfx950 (MI350X),
+one GPU: 20 passed, 3 skipped (also the two-GPU test), 21 passed and 2
+skipped with the stand-in. On gfx942, each of seven injected mistakes
+fails at least one test: ignoring `stream`, unsorted option names, the
+grid's `meta` built from the wrong arguments, a wrong default, no device
+switch for another device's stream, launching it with the current device,
+and `itemgetter` for a one-value plan.
 
-Not verified: `HsacoKernel` under `torch.compile` (intj graph-breaks where
-Dynamo used to trace the Triton launch; no caller compiles it), with real
-hip-python, and on two GPUs.
+Not verified: real hip-python, and two GPUs on gfx950.
 
 ## FlashKDA
 
