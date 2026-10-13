@@ -12,10 +12,12 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable
 from functools import cache, lru_cache, partial
+from operator import itemgetter
 
 from jinja2 import Template
 from packaging.version import Version, parse
@@ -452,7 +454,125 @@ def run_hsaco(
     )
 
 
+class _Slot:
+    """Stands for call argument `index` while a call shape is bound."""
+
+    __slots__ = ("index",)
+
+    def __init__(self, index):
+        self.index = index
+
+
+_INTJ_KERNELS = {}  # id(JITFunction) -> its _IntjKernel, which keeps it alive
+_INTJ_LOCK = threading.Lock()
+
+
+class _IntjKernel:
+    """The intj launchers of one JITFunction, and its call plans.
+
+    Shared by every HsacoKernel over that JITFunction, so `jit(k)[grid](...)`
+    built per call still hits the launchers' kernel caches. A plan maps one
+    call shape (the number of positional arguments and the keyword names, in
+    order) onto a launcher's positional form,
+    `launcher(device, stream, grid, *options, *params)`: the options are the
+    keywords that name no parameter, as Triton takes them, and the parameters
+    come in declaration order with their defaults applied. A shape is bound
+    once, by Python's own rules, so a launch only indexes a tuple.
+    """
+
+    def __init__(self, jit_func):
+        import torch
+
+        self.jit_func = jit_func
+        self.plans = {}  # len(args), or (len(args), *kwargs) -> plan
+        self.launchers = {}  # option names -> intj launcher
+        # As aiter.ops.triton.utils.device_info.current_device_stream, which
+        # this module does not import (it would import aiter).
+        self.current_device = torch.cuda.current_device
+        self.raw_stream = torch._C._cuda_getCurrentRawStream
+
+    @classmethod
+    def of(cls, jit_func):
+        state = _INTJ_KERNELS.get(id(jit_func))
+        if state is None:
+            with _INTJ_LOCK:
+                state = _INTJ_KERNELS.get(id(jit_func))
+                if state is None:
+                    state = _INTJ_KERNELS[id(jit_func)] = cls(jit_func)
+        return state
+
+    def plan(self, nargs, keywords):
+        """Returns (launcher, select, defaults, number of options, parameter
+        names) for calls with `nargs` positional arguments and `keywords`.
+
+        `select((*args, *kwargs.values(), *defaults))` gives the launcher's
+        arguments after the grid; `select` is None when they are `args`.
+        """
+        key = (nargs, *keywords) if keywords else nargs
+        plan = self.plans.get(key)
+        if plan is None:
+            with _INTJ_LOCK:
+                plan = self.plans.get(key)
+                if plan is None:
+                    plan = self.plans[key] = self._make_plan(nargs, keywords)
+        return plan
+
+    def _make_plan(self, nargs, keywords):
+        signature = self.jit_func.signature
+        params = signature.parameters
+        slots = [_Slot(i) for i in range(nargs + len(keywords))]
+        options = tuple(sorted(name for name in keywords if name not in params))
+        bound = signature.bind(
+            *slots[:nargs],
+            **{
+                name: slots[nargs + i]
+                for i, name in enumerate(keywords)
+                if name in params
+            },
+        )
+        bound.apply_defaults()
+        order = [nargs + keywords.index(name) for name in options]
+        defaults = []
+        for value in bound.arguments.values():
+            if type(value) is _Slot:
+                order.append(value.index)
+            else:
+                order.append(len(slots) + len(defaults))
+                defaults.append(value)
+        if not keywords and not defaults:
+            select = None
+        elif len(order) > 1:
+            select = itemgetter(*order)
+        else:
+            select = lambda values, order=tuple(order): tuple(values[i] for i in order)
+        launcher = self.launcher(options)
+        return launcher, select, tuple(defaults), len(options), tuple(params)
+
+    def launcher(self, options):
+        launcher = self.launchers.get(options)
+        if launcher is None:
+            from intj import make_launcher
+
+            # return_compiled: kernel[grid](...) returns the CompiledKernel.
+            launcher = self.launchers[options] = make_launcher(
+                self.jit_func, dynamic_options=options, return_compiled=True
+            )
+        return launcher
+
+
 class HsacoKernel:
+    """`kernel[grid](*args, **kwargs)`, spelled as for a Triton JITFunction.
+
+    With AITER_USE_HSACO=1 it compiles an HSACO from Triton once (cached
+    under BUILD_DIR) and launches it through hip-python. Otherwise it
+    launches through intj, on `stream` when one is given (a raw handle or a
+    `torch.cuda.Stream`), else on the current device's current stream, and
+    returns the CompiledKernel. A keyword naming no kernel parameter is a
+    compile option (`num_warps`, `num_stages`, `waves_per_eu`, ...); an
+    unknown one raises. `grid` is an int, a tuple of 1-3 ints, or a callable
+    over the parameters by name. Construction does no GPU work; the
+    launchers are made and built on the first call.
+    """
 
     def __init__(self, kernel, stream=None):
         import triton
@@ -463,56 +583,111 @@ class HsacoKernel:
             )
         self.triton_kernel = kernel
         self.stream = stream
+        self._intj = None
 
     def __getitem__(self, grid):
-        def _call(*args, **kwargs):
-            if AITER_USE_HSACO:
-                import torch
-                import triton.language as tl
+        if AITER_USE_HSACO:
+            return self._hsaco_call(grid)
+        state = self._intj
+        if state is None:
+            state = self._intj = _IntjKernel.of(self.triton_kernel)
+        if callable(grid):
+            return self._grid_fn_call(state, grid)
 
-                sig = inspect.signature(self.triton_kernel.fn)
-                valid_param_names = set(sig.parameters.keys())
-                filtered_kwargs = {
-                    k: v for k, v in kwargs.items() if k in valid_param_names
-                }
-                bound_args = sig.bind(*args, **filtered_kwargs)
-                bound_args.apply_defaults()
-                constexprs = {}
-                arg_types = []
-                ordered_args_without_constexprs = []
-                for param in sig.parameters.values():
-                    if (
-                        param.name in bound_args.arguments
-                        and param.annotation != tl.constexpr
-                        and bound_args.arguments[param.name] is not None
-                    ):
-                        ordered_args_without_constexprs.append(
-                            bound_args.arguments[param.name]
-                        )
-                        if isinstance(bound_args.arguments[param.name], torch.Tensor):
-                            arg_types.append(
-                                str(bound_args.arguments[param.name].dtype)
-                            )
-                        else:
-                            arg_types.append(
-                                type(bound_args.arguments[param.name]).__name__
-                            )
-                    elif param.annotation == tl.constexpr:
-                        constexprs[param.name] = bound_args.arguments[param.name]
-                constexprs["ARG_TYPES"] = "_".join(arg_types)
-                if not check_hsaco(self.triton_kernel.fn.__name__, constexprs):
-                    compile_hsaco_from_triton(
-                        self.triton_kernel, *args, grid=grid, **kwargs
-                    )
-                return run_hsaco(
-                    self.triton_kernel.fn.__name__,
-                    *ordered_args_without_constexprs,
-                    grid=grid,
-                    stream=self.stream,
-                    constexprs=constexprs,
-                )
+        def _call(*args, **kwargs):
+            plan = state.plans.get((len(args), *kwargs) if kwargs else len(args))
+            if plan is None:
+                plan = state.plan(len(args), tuple(kwargs))
+            launcher, select, defaults, _, _ = plan
+            if select is not None:
+                args = select((*args, *kwargs.values(), *defaults))
+            stream = self.stream
+            if stream is None:
+                device = state.current_device()
+                stream = state.raw_stream(device)
             else:
-                return self.triton_kernel[grid](*args, **kwargs)
+                device, stream = self._stream_handle(stream, state.current_device)
+            return launcher(device, stream, grid, *args)
+
+        return _call
+
+    def _grid_fn_call(self, state, grid_fn):
+        def _call(*args, **kwargs):
+            plan = state.plans.get((len(args), *kwargs) if kwargs else len(args))
+            if plan is None:
+                plan = state.plan(len(args), tuple(kwargs))
+            launcher, select, defaults, n_options, names = plan
+            if select is not None:
+                args = select((*args, *kwargs.values(), *defaults))
+            stream = self.stream
+            if stream is None:
+                device = state.current_device()
+                stream = state.raw_stream(device)
+            else:
+                device, stream = self._stream_handle(stream, state.current_device)
+            # As Triton: the grid function gets every parameter by name.
+            grid = grid_fn(dict(zip(names, args[n_options:])))
+            return launcher(device, stream, grid, *args)
+
+        return _call
+
+    @staticmethod
+    def _stream_handle(stream, current_device):
+        if type(stream) is int:
+            return current_device(), stream
+        handle = getattr(stream, "cuda_stream", None)
+        device = getattr(stream, "device_index", None)
+        if type(handle) is int and type(device) is int:
+            return device, handle
+        raise TypeError(
+            "HsacoKernel: stream must be None, a raw stream handle (int) or a "
+            f"torch.cuda.Stream, got {type(stream).__name__}"
+        )
+
+    def _hsaco_call(self, grid):
+        def _call(*args, **kwargs):
+            import torch
+            import triton.language as tl
+
+            sig = inspect.signature(self.triton_kernel.fn)
+            valid_param_names = set(sig.parameters.keys())
+            filtered_kwargs = {
+                k: v for k, v in kwargs.items() if k in valid_param_names
+            }
+            bound_args = sig.bind(*args, **filtered_kwargs)
+            bound_args.apply_defaults()
+            constexprs = {}
+            arg_types = []
+            ordered_args_without_constexprs = []
+            for param in sig.parameters.values():
+                if (
+                    param.name in bound_args.arguments
+                    and param.annotation != tl.constexpr
+                    and bound_args.arguments[param.name] is not None
+                ):
+                    ordered_args_without_constexprs.append(
+                        bound_args.arguments[param.name]
+                    )
+                    if isinstance(bound_args.arguments[param.name], torch.Tensor):
+                        arg_types.append(str(bound_args.arguments[param.name].dtype))
+                    else:
+                        arg_types.append(
+                            type(bound_args.arguments[param.name]).__name__
+                        )
+                elif param.annotation == tl.constexpr:
+                    constexprs[param.name] = bound_args.arguments[param.name]
+            constexprs["ARG_TYPES"] = "_".join(arg_types)
+            if not check_hsaco(self.triton_kernel.fn.__name__, constexprs):
+                compile_hsaco_from_triton(
+                    self.triton_kernel, *args, grid=grid, **kwargs
+                )
+            return run_hsaco(
+                self.triton_kernel.fn.__name__,
+                *ordered_args_without_constexprs,
+                grid=grid,
+                stream=self.stream,
+                constexprs=constexprs,
+            )
 
         return _call
 
