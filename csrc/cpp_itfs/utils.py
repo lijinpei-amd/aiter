@@ -565,13 +565,14 @@ class HsacoKernel:
 
     With AITER_USE_HSACO=1 it compiles an HSACO from Triton once (cached
     under BUILD_DIR) and launches it through hip-python. Otherwise it
-    launches through intj, on `stream` when one is given (a raw handle or a
-    `torch.cuda.Stream`), else on the current device's current stream, and
-    returns the CompiledKernel. A keyword naming no kernel parameter is a
-    compile option (`num_warps`, `num_stages`, `waves_per_eu`, ...); an
-    unknown one raises. `grid` is an int, a tuple of 1-3 ints, or a callable
-    over the parameters by name. Construction does no GPU work; the
-    launchers are made and built on the first call.
+    launches through intj, on `stream` when one is given (a raw handle, on
+    the current device, or a `torch.cuda.Stream`, on its own device), else on
+    the current device's current stream, and returns the CompiledKernel. A
+    keyword naming no kernel parameter is a compile option (`num_warps`,
+    `num_stages`, `waves_per_eu`, ...); an unknown one raises. `grid` is an
+    int, a tuple of 1-3 ints, or a callable over the parameters by name.
+    Construction does no GPU work; the launchers are made and built on the
+    first call.
     """
 
     def __init__(self, kernel, stream=None):
@@ -602,12 +603,10 @@ class HsacoKernel:
             if select is not None:
                 args = select((*args, *kwargs.values(), *defaults))
             stream = self.stream
-            if stream is None:
-                device = state.current_device()
-                stream = state.raw_stream(device)
-            else:
-                device, stream = self._stream_handle(stream, state.current_device)
-            return launcher(device, stream, grid, *args)
+            if stream is not None:
+                return self._launch_on(stream, state, launcher, grid, args)
+            device = state.current_device()
+            return launcher(device, state.raw_stream(device), grid, *args)
 
         return _call
 
@@ -619,30 +618,37 @@ class HsacoKernel:
             launcher, select, defaults, n_options, names = plan
             if select is not None:
                 args = select((*args, *kwargs.values(), *defaults))
-            stream = self.stream
-            if stream is None:
-                device = state.current_device()
-                stream = state.raw_stream(device)
-            else:
-                device, stream = self._stream_handle(stream, state.current_device)
             # As Triton: the grid function gets every parameter by name.
             grid = grid_fn(dict(zip(names, args[n_options:])))
-            return launcher(device, stream, grid, *args)
+            stream = self.stream
+            if stream is not None:
+                return self._launch_on(stream, state, launcher, grid, args)
+            device = state.current_device()
+            return launcher(device, state.raw_stream(device), grid, *args)
 
         return _call
 
     @staticmethod
-    def _stream_handle(stream, current_device):
+    def _launch_on(stream, state, launcher, grid, args):
+        """Launches on `stream`: a raw handle, on the current device, or a
+        torch.cuda.Stream, on its device, made current for the launch if it
+        is not (intj launches only on the current device)."""
+        current = state.current_device()
         if type(stream) is int:
-            return current_device(), stream
+            return launcher(current, stream, grid, *args)
         handle = getattr(stream, "cuda_stream", None)
         device = getattr(stream, "device_index", None)
-        if type(handle) is int and type(device) is int:
-            return device, handle
-        raise TypeError(
-            "HsacoKernel: stream must be None, a raw stream handle (int) or a "
-            f"torch.cuda.Stream, got {type(stream).__name__}"
-        )
+        if type(handle) is not int or type(device) is not int:
+            raise TypeError(
+                "HsacoKernel: stream must be None, a raw stream handle (int) or "
+                f"a torch.cuda.Stream, got {type(stream).__name__}"
+            )
+        if device == current:
+            return launcher(device, handle, grid, *args)
+        import torch
+
+        with torch.cuda.device(device):
+            return launcher(device, handle, grid, *args)
 
     def _hsaco_call(self, grid):
         def _call(*args, **kwargs):

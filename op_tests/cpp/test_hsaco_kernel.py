@@ -247,6 +247,25 @@ def test_stream(no_triton_run, monkeypatch):
         jit(_add_kernel, stream="s")[(4,)](x, y, out, N, 256)
 
 
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")
+@pytest.mark.parametrize("grid", [(4,), lambda meta: (4,)])
+def test_stream_on_another_device(no_triton_run, monkeypatch, grid):
+    calls = _record_launches(monkeypatch)
+    current = torch.cuda.current_device()
+    other = 1 if current == 0 else 0
+    side = torch.cuda.Stream(device=other)
+    x, y = (t.to(other) for t in _inputs())
+    out = torch.empty_like(x)
+    for _ in range(2):  # a kernel-cache miss, then a hit
+        out.zero_()
+        torch.cuda.synchronize(other)
+        jit(_add_kernel, stream=side)[grid](x, y, out, N, 256)
+        assert calls[-1] == (other, side.cuda_stream)
+        assert torch.cuda.current_device() == current
+        side.synchronize()
+        assert torch.equal(out, x + y)
+
+
 def test_launchers_are_shared_across_wrappers(no_triton_run, monkeypatch):
     calls = _record_launches(monkeypatch)
     x, y = _inputs()
