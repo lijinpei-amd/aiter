@@ -17,7 +17,6 @@ from triton.experimental.gluon import language as gl
 
 from ._lang import pick_warp_pipeline_stage as pick_stage
 from ._lang import require_constexpr
-from ._layout import _slot_index
 from ._schedule import (
     A_PAYLOAD,
     A_SCALE,
@@ -46,6 +45,7 @@ from ._schedule import (
     pipeline_unroll,
     ring_restoration_period,
 )
+from ._types import _slot_index
 
 _A_PAYLOAD: gl.constexpr = gl.constexpr(A_PAYLOAD)
 _A_SCALE: gl.constexpr = gl.constexpr(A_SCALE)

@@ -18,10 +18,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._epilogue import (
     _epi_stage_flush,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import constexpr_fields
-from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import (
-    _n_reduction_slot,
-    compute_kernel_layout,
-)
+from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import compute_kernel_layout
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     ActivationSpec,
     ActKind,
@@ -78,10 +75,10 @@ def _epilogue_config(split, num_warps):
 
 
 @gluon.jit
-def _staging_bytes(block_id, pid_n, mi, ni, epoch, func, tuning, layout):
+def _staging_bytes(block_id, pid_n, mi, ni, epoch, layout):
     RFL: gl.constexpr = layout.dot_result_fragment_layout()
-    REDUCTION: gl.constexpr = _n_reduction_slot(func)
-    OUT_N: gl.constexpr = 128 // REDUCTION
+    OUT_N: gl.constexpr = layout.output_n_slot()
+    REDUCTION: gl.constexpr = 128 // OUT_N
     rows = block_id * 128 + mi * 64 + gl.arange(
         0, 64, layout=gl.SliceLayout(1, RFL)
     )
@@ -120,9 +117,7 @@ def _epilogue_probe(
         payload_smem = gl.allocate_shared_memory(gl.uint8, [128, 64], SH)
         scale_smem = gl.allocate_shared_memory(gl.uint8, [128, 4], SH)
         for mi in gl.static_range(2):
-            payload, scales = _staging_bytes(
-                block_id, pid_n, mi, 0, epoch, func, tuning, layout
-            )
+            payload, scales = _staging_bytes(block_id, pid_n, mi, 0, epoch, layout)
             payload_smem.slice(mi * 64, 64).store(payload)
             scale_smem.slice(mi * 64, 64).store(scales)
         _epi_block_flush(
@@ -145,7 +140,7 @@ def _epilogue_probe(
                     block_id, pid_n, M, func, tuning, layout,
                 )
             payload, scales = _staging_bytes(
-                block_id, pid_n, tile // 2, tile % 2, epoch, func, tuning, layout
+                block_id, pid_n, tile // 2, tile % 2, epoch, layout
             )
             (payload_1 if tile % 2 else payload_0).store(payload)
             (scale_1 if tile % 2 else scale_0).store(scales)

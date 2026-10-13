@@ -13,7 +13,6 @@ from triton.experimental import gluon
 
 from . import _schedule_cache
 from ._lang import unwrap as _v
-from ._layout import _slot_index
 from ._types import (
     A_PAYLOAD,
     A_SCALE,
@@ -25,6 +24,7 @@ from ._types import (
     SCALE,
     A,
     B,
+    _slot_index,
 )
 
 __all__ = [
