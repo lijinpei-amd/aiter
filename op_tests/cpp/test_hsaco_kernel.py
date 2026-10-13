@@ -91,7 +91,8 @@ def _scale_reference(x, alpha, neg=False, clamp=False):
     return v
 
 
-def test_construction_does_no_work():
+def test_construction_does_no_work(monkeypatch):
+    monkeypatch.setattr(utils, "_INTJ_KERNELS", {})
     k = jit(_grid_kernel, stream=7)
     assert isinstance(k, HsacoKernel)
     assert k.triton_kernel is _grid_kernel and k.stream == 7
@@ -172,6 +173,13 @@ def test_compile_option_keywords_match_triton():
 def test_grid_forms(no_triton_run, grid, shape):
     out = torch.zeros(shape, dtype=torch.int32, device="cuda")
     jit(_grid_kernel)[grid](out)
+    assert torch.equal(out, torch.ones_like(out))
+
+
+def test_one_keyword_argument(no_triton_run):
+    # The only argument, by keyword: a plan that selects one value.
+    out = torch.zeros(3, dtype=torch.int32, device="cuda")
+    jit(_grid_kernel)[(3,)](out=out)
     assert torch.equal(out, torch.ones_like(out))
 
 
