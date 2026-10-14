@@ -41,7 +41,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._frozen import (
     _validate_frozen_buffer_counts,
     _validate_frozen_pipeline,
 )
-from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import compute_kernel_layout
+from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import KernelLayout
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     LDS_USABLE_BYTES,
     ActivationSpec,
@@ -305,7 +305,7 @@ def _probe_lds_bytes_uncached(cfg: dict, dq_a, dq_b) -> int:
     tc = _probe_tuning_config(cfg, dq_a, dq_b)
     if _cval(tc.FROZEN_STEP):
         return _compute_frozen_layout(tc).lds_bytes()
-    return compute_kernel_layout(tc).lds_bytes()
+    return KernelLayout(tc).lds_bytes()
 
 
 def _probe_tuning_config(cfg: dict, dq_a, dq_b):
@@ -337,7 +337,7 @@ def _validate_selected_pipeline(tuning_cfg, layout, K):
     if _cval(tuning_cfg.FROZEN_STEP):
         return _validate_frozen_pipeline(tuning_cfg, K)
     if layout is None:
-        layout = compute_kernel_layout(tuning_cfg)
+        layout = KernelLayout(tuning_cfg)
     return _validate_live_pipeline(tuning_cfg, layout, K)
 
 
@@ -1269,7 +1269,7 @@ def _launch_spec(
         grid_n = N // block_n
     else:
         validate_buffer_counts(tuning_cfg_host)
-        layout_host = compute_kernel_layout(tuning_cfg_host)
+        layout_host = KernelLayout(tuning_cfg_host)
         layout_host.num_k_tiles(K)
         grid_n = _cval(layout_host.grid_N(N))
     # Keep each spec in one constexpr so launch specialization sees four leaves.
@@ -1294,7 +1294,7 @@ def _validate_launch_config(tuning_cfg, N, K):
         layout = _compute_frozen_layout(tuning_cfg)
         _validate_frozen(tuning_cfg, N, K, layout)
         return _validate_frozen_pipeline(tuning_cfg, K, layout)
-    layout = compute_kernel_layout(tuning_cfg)
+    layout = KernelLayout(tuning_cfg)
     validate(tuning_cfg, N, K, layout)
     return _validate_selected_pipeline(tuning_cfg, layout, K)
 

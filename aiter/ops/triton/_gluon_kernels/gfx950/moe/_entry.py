@@ -10,7 +10,7 @@ from ._config import KernelFuncConfig, KernelTuningConfig
 from ._frozen import _moe_gemm_body_frozen
 from ._lang import constexpr_fields, require_constexpr
 from ._lang import unwrap_attr as _cv
-from ._layout import compute_kernel_layout
+from ._layout import KernelLayout
 from ._types import QuantExpertTensor, QuantTokenTensor, ResultTensor, RoutingMeta
 from .moe_gemm import _moe_gemm_body as _moe_gemm_body_live
 
@@ -61,7 +61,7 @@ def _moe_gemm_body(
             NUM_K,
         )
     else:
-        layout = compute_kernel_layout(tuning_cfg)
+        layout = KernelLayout(tuning_cfg)
         _moe_gemm_body_live(
             a,
             b,

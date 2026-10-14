@@ -23,7 +23,7 @@ from ._lang import (
     WarpPipeline,
 )
 from ._lang import unwrap as _v
-from ._layout import compute_kernel_layout
+from ._layout import KernelLayout
 from ._schedule import (
     _fill_slots_valid,
     _pipeline_peeled,
@@ -50,12 +50,12 @@ __all__ = [
 def validate(tc, N, K, layout=None):
     """Validate one build: the tuning enums, the layout and the resource budgets.
 
-    ``layout`` is ``tc``'s :func:`compute_kernel_layout` result; a caller that already
-    holds it passes it in, anything else gets one computed here. That optionality is
-    why it comes last here rather than right after ``tc`` as everywhere else.
+    ``layout`` is ``KernelLayout(tc)``; a caller that already holds it passes it in,
+    anything else gets one computed here. That optionality is why it comes last here
+    rather than right after ``tc`` as everywhere else.
     """
     if _v(layout) is None:
-        layout = compute_kernel_layout(tc)
+        layout = KernelLayout(tc)
     fc = tc.func_cfg
     BK = _v(tc.BLOCK_K)
 

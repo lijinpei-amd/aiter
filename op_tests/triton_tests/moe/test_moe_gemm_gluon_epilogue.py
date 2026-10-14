@@ -18,7 +18,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._epilogue import (
     _epi_stage_flush,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import constexpr_fields
-from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import compute_kernel_layout
+from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import KernelLayout
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     ActivationSpec,
     ActKind,
@@ -112,7 +112,7 @@ def _epilogue_probe(
 ):
     func = KernelFuncConfig(*constexpr_fields(FUNC))
     tuning = KernelTuningConfig(func, *constexpr_fields(TUNING))
-    layout = compute_kernel_layout(tuning)
+    layout = KernelLayout(tuning)
     SH: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
     block_id = gl.program_id(0)
     pid_n = gl.program_id(1)

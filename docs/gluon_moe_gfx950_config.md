@@ -60,7 +60,7 @@ Placement is split in two. The tuning config only states the knob policy,
 `allow_component_via_lds((operand, is_scale))` (with the per-kind
 `allow_payload_via_lds()` and `allow_scale_via_lds()`), read from
 `ALLOW_B_VIA_LDS`, `ALLOW_A_SCALE_VIA_LDS` and `ALLOW_B_SCALE_VIA_LDS`; the A
-payload has no knob and is always allowed. `compute_kernel_layout` resolves the
+payload has no knob and is always allowed. `KernelLayout(tuning_cfg)` resolves the
 final placement from that policy and from whether the tile admits a direct-to-LDS
 copy, which adds the automatic register fallback for small A/B payload or scale
 tiles. Pipeline code queries the result on the layout,

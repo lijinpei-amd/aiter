@@ -35,7 +35,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe import _pipeline as P  # noqa: E
 from aiter.ops.triton._gluon_kernels.gfx950.moe import _schedule as S  # noqa: E402
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import DtypeQuant as DQ  # noqa: E402
 from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import (  # noqa: E402
-    compute_kernel_layout,
+    KernelLayout,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (  # noqa: E402
     COMPONENTS,
@@ -148,7 +148,7 @@ def _wait(tc, layout, *a, **kw):
 def dump_case(name, cfg, dq_a, dq_b, K, out):
     try:
         tc = host._probe_tuning_config(cfg, dq_a, dq_b)
-        layout = compute_kernel_layout(tc)
+        layout = KernelLayout(tc)
         validate(tc, N_DEFAULT, K, layout)
     except Exception as exc:  # a rejected config is itself a stable, diffable fact
         out(f"== {name}: REJECTED {type(exc).__name__}: {str(exc).splitlines()[0][:120]}")

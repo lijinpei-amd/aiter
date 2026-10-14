@@ -10,7 +10,7 @@ import torch
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import compute_kernel_layout
+from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import KernelLayout
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lds import LDSManager
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import DtypeQuant
 from aiter.ops.triton.moe import moe_op_gemm_gluon as host
@@ -23,7 +23,7 @@ def _register_load_copy(
     src, dst, tc: gl.constexpr, operand: gl.constexpr, SCALE: gl.constexpr
 ):
     # Unused staging allocations must disappear from the compiled kernel.
-    layout = compute_kernel_layout(tc)
+    layout = KernelLayout(tc)
     lds = LDSManager.alloc(tc.func_cfg, tc, layout)
     if SCALE:
         shape: gl.constexpr = layout.scale_lds_shape_slot(operand)
@@ -59,7 +59,7 @@ def test_register_load_does_not_stage_through_lds(operand, scale, block_k):
         B_SCALE_SHUFFLED=False,
     )
     tc = host._probe_tuning_config(config, DtypeQuant.MXFP4, DtypeQuant.MXFP4)
-    layout = compute_kernel_layout(tc)
+    layout = KernelLayout(tc)
     shape = (
         layout.scale_lds_shape_slot(operand)
         if scale

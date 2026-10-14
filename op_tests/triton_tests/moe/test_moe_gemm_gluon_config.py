@@ -19,7 +19,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._entry import (
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._frozen import _validate_frozen
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import constexpr_fields
-from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import compute_kernel_layout
+from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import KernelLayout
 from aiter.ops.triton._gluon_kernels.gfx950.moe._pipeline import (
     _PipelinePointers,
     _PipelineRegFragments,
@@ -118,7 +118,7 @@ def _plain(value):
 
 
 def _validate(tc, N, K):
-    layout = compute_kernel_layout(tc)
+    layout = KernelLayout(tc)
     validate(tc, N, K, layout)
     return host._validate_selected_pipeline(tc, layout, K)
 
@@ -352,7 +352,7 @@ def test_t256_mxfp8_gemm1_uses_validated_streaming_geometry():
         config, DtypeQuant.MXFP8, DtypeQuant.MXFP8
     )
     assert host._cval(validate(tuning, 4096, 7168))
-    layout = compute_kernel_layout(tuning)
+    layout = KernelLayout(tuning)
     assert host._cval(host._validate_selected_pipeline(tuning, layout, 7168))
     assert host._probe_lds_bytes(
         config, DtypeQuant.MXFP8, DtypeQuant.MXFP8
@@ -489,7 +489,7 @@ def test_commit_scheme_counts_real_payload_and_scale_groups(
 ):
     config["WAIT_COMMIT_SCHEME"] = int(scheme)
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
-    layout = compute_kernel_layout(tc)
+    layout = KernelLayout(tc)
     assert _plain(layout.scale_via_lds(0)) and _plain(layout.scale_via_lds(1))
     assert sum(len(slot) for slot in buffered_groups(tc, layout, None)) == groups
     # commit_per_stage is the predicate the emitter actually branches on; the
@@ -684,7 +684,7 @@ def test_register_storage_options_are_independent(config, storage_mask):
         K_UNROLL=1,
     )
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
-    layout = compute_kernel_layout(tc)
+    layout = KernelLayout(tc)
     assert _plain(layout.payload_via_lds(0))
     assert _plain(layout.payload_via_lds(1)) is not bool(storage_mask & 1)
     assert _plain(layout.scale_via_lds(0)) is not bool(storage_mask & 4)
@@ -745,7 +745,7 @@ def test_all_component_buffer_counts_determine_lcm_unroll(
         ALLOW_B_SCALE_VIA_LDS=False,
     )
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
-    layout = compute_kernel_layout(tc)
+    layout = KernelLayout(tc)
     assert _plain(pipeline_register_period(tc, layout)) == period
     assert _plain(pipeline_unroll(tc, layout)) == expected
     resolved = [count or config["NUM_LDS_BUFFER"] for count in counts]
@@ -761,13 +761,13 @@ def test_lds_depths_constrain_unroll(config):
     config["K_UNROLL"] = 7
     fc = KernelFuncConfig(*_func_spec())
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    assert _plain(pipeline_unroll(tc, compute_kernel_layout(tc))) == 21
+    assert _plain(pipeline_unroll(tc, KernelLayout(tc))) == 21
     config.update(A_NUM_BUFFER=2, B_NUM_BUFFER=4, A_SCALE_NUM_BUFFER=2)
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    assert _plain(pipeline_unroll(tc, compute_kernel_layout(tc))) == 84
+    assert _plain(pipeline_unroll(tc, KernelLayout(tc))) == 84
     config["ALLOW_A_SCALE_VIA_LDS"] = False
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    assert _plain(pipeline_unroll(tc, compute_kernel_layout(tc))) == 84
+    assert _plain(pipeline_unroll(tc, KernelLayout(tc))) == 84
 
 
 def test_small_payload_tiles_use_register_rings(config):
@@ -796,7 +796,7 @@ def test_small_payload_tiles_use_register_rings(config):
         )
     )
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    layout = compute_kernel_layout(tc)
+    layout = KernelLayout(tc)
     # Tuning allows both payloads through LDS; the tiles are too small for the copy,
     # so the layout falls back to registers on its own.
     assert _plain(tc.allow_component_via_lds(A_PAYLOAD))
@@ -841,7 +841,7 @@ def test_absent_scales_do_not_participate_in_depth_unroll_or_validation(
         )
     )
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    layout = compute_kernel_layout(tc)
+    layout = KernelLayout(tc)
     # Placement accessors describe physical policy only. The absent scale streams
     # are still gated by the function configuration at every scheduling caller.
     assert _plain(layout.component_in_reg(A_SCALE))
@@ -871,7 +871,7 @@ def test_inherited_buffer_counts_are_validated_after_resolution(config, depth):
     fc = KernelFuncConfig(*_func_spec())
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
     with pytest.raises(AssertionError, match="A_NUM_BUFFER.*must be at least 2"):
-        host._validate_selected_pipeline(tc, compute_kernel_layout(tc), 7168)
+        host._validate_selected_pipeline(tc, KernelLayout(tc), 7168)
     config.update(dict.fromkeys(host._COMPONENT_BUFFER_KEYS, 2))
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
     assert _plain(_validate(tc, 4096, 7168))
@@ -883,7 +883,7 @@ def test_unroll_must_be_positive_even_with_register_rings(config, unroll, regist
     config.update(K_UNROLL=unroll, ALLOW_A_SCALE_VIA_LDS=not registers)
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     with pytest.raises(AssertionError, match="K_UNROLL must be at least 1"):
-        host._validate_selected_pipeline(tc, compute_kernel_layout(tc), 7168)
+        host._validate_selected_pipeline(tc, KernelLayout(tc), 7168)
 
 
 @pytest.mark.parametrize("depth", [2, 3])
@@ -891,7 +891,7 @@ def test_unroll_must_be_positive_even_with_register_rings(config, unroll, regist
 def test_shared_depth_exact_minimum_and_all_unroll_remainders(config, depth, unroll):
     config.update(NUM_LDS_BUFFER=depth, K_UNROLL=unroll)
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
-    layout = compute_kernel_layout(tc)
+    layout = KernelLayout(tc)
     assert _plain(_pipeline_peeled(tc, layout)) == 1
     effective_unroll = _plain(pipeline_unroll(tc, layout))
     assert effective_unroll == math.lcm(depth, unroll)
@@ -927,7 +927,7 @@ def test_register_weights_require_preshuffle(config):
 def test_independent_register_scales_are_supported(config):
     config.update(ALLOW_A_SCALE_VIA_LDS=False, ALLOW_B_SCALE_VIA_LDS=False)
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
-    layout = compute_kernel_layout(tc)
+    layout = KernelLayout(tc)
     assert _plain(layout.component_in_reg(A_SCALE))
     assert _plain(layout.component_in_reg(B_SCALE))
     assert _plain(layout.component_via_lds(A_PAYLOAD))
@@ -947,7 +947,7 @@ def test_component_buffers_still_require_nonempty_k(config):
     config["A_NUM_BUFFER"] = 2
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     with pytest.raises(AssertionError, match="NUM_K.*must be at least"):
-        host._validate_selected_pipeline(tc, compute_kernel_layout(tc), 0)
+        host._validate_selected_pipeline(tc, KernelLayout(tc), 0)
 
 
 @pytest.mark.parametrize(
@@ -996,7 +996,7 @@ def test_shuffled_k128_scales_constrain_lcm_unroll(config, independent):
         )
     )
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    assert _plain(pipeline_unroll(tc, compute_kernel_layout(tc))) == 6
+    assert _plain(pipeline_unroll(tc, KernelLayout(tc))) == 6
     assert _plain(_validate(tc, 4096, 7168))
     assert host._scale_shuffle_supported(config, 0)
     assert host._scale_shuffle_supported(config, 1)
@@ -1051,7 +1051,7 @@ def test_gate_up_small_warp_extent_only_requires_mx_group_for_quantized_output(
 def test_epilogue_modes_preserve_output_geometry(config, epilogue):
     func = KernelFuncConfig(*_func_spec(epilogue))
     tc = KernelTuningConfig(func, *_tuning_spec(config))
-    layout = compute_kernel_layout(tc)
+    layout = KernelLayout(tc)
     assert _plain(func.activation_reduction_n()) == 2
     # WeightGuHbmLayout.SPLIT halves across two N slots, so one slot's raw columns map 1:1 onto
     # emitted channels.
@@ -1371,7 +1371,7 @@ def test_independent_buffer_waits_match_copy_history(
     elif geometry == "unequal_tiles":
         config.update(MINI_BLOCK_N=64, SCALE_FILL_MID=True)
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
-    layout = compute_kernel_layout(tc)
+    layout = KernelLayout(tc)
     minimum = (
         pipeline_depth(tc, layout)
         + _pipeline_peeled(tc, layout)
@@ -1402,7 +1402,7 @@ def test_independent_buffer_schedule_without_scales(config, scheme, register_b, 
         )
     )
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    layout = compute_kernel_layout(tc)
+    layout = KernelLayout(tc)
     minimum = (
         pipeline_depth(tc, layout)
         + _pipeline_peeled(tc, layout)

@@ -1146,9 +1146,7 @@ def test_epilogue_groups_stop_adding_slack_after_a_drain_producer():
 
 @pytest.mark.parametrize("scale_depths", [(0, 0), (-1, 0), (-7, -3), (1, 1)])
 def test_absent_scale_ring_indices_ignore_invalid_unused_depths(scale_depths):
-    from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import (
-        compute_kernel_layout,
-    )
+    from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import KernelLayout
     from aiter.ops.triton._gluon_kernels.gfx950.moe._types import DtypeQuant
     from aiter.ops.triton.moe import moe_op_gemm_gluon as host
     from op_tests.triton_tests.moe.test_moe_gemm_gluon_registers import (
@@ -1179,7 +1177,7 @@ def test_absent_scale_ring_indices_ignore_invalid_unused_depths(scale_depths):
         tuple((key, host._hashable(value)) for key, value in config.items()),
     )[-1]
     assert validate(tc, 512, 960)
-    layout = compute_kernel_layout(tc)
+    layout = KernelLayout(tc)
     assert pipeline_depth(tc, layout) == 2
     assert schedule.pipeline_register_period(tc, layout) == 1
     for component in (A_SCALE, B_SCALE):
