@@ -16,15 +16,48 @@ by an argument, converts a component, or derives a value.
 depth: gl.constexpr                  # set in __init__: self.depth = gl.constexpr(depth)
 
 depth: gl.constexpr = sched.depth    # @gluon.jit code reads the field as is
-depth = _v(sched.depth)              # constexpr functions and host code unwrap it
+depth = sched.depth.value            # constexpr functions and host code take .value
 ```
 
 - Document a public field with a `#:` comment above its annotation.
 - Keep a field private (`_name`) when only methods read it.
-- A field is a `gl.constexpr`, so host code calls `unwrap` (`_v`) before arithmetic,
-  `is None`, hashing or formatting. A test that runs a jit body as `.fn` and keys on
-  the values it computes passes the aggregate through `_HostView`
+- A field is a `gl.constexpr`, so constexpr functions and host code read it with
+  `.value` before arithmetic, `is None`, hashing or formatting (see
+  [Unwrap by kind](#unwrap-by-kind)). A test that runs a jit body as `.fn` and keys
+  on the values it computes passes the aggregate through `_HostView`
   (`test_moe_gemm_gluon_scale_layout.py`).
+
+## Unwrap by kind
+
+Know whether each value is a `gl.constexpr` or raw, and read it by its kind:
+
+| Kind | Where it comes from | How to read it |
+|---|---|---|
+| Wrapped | an aggregate field declared `gl.constexpr`; a module global `X: gl.constexpr = gl.constexpr(...)`; `tensor.shape[i]` | `.value` |
+| Raw | a `constexpr_function` parameter, including the elements of a tuple, list or NamedTuple parameter; the result of any `constexpr_function` call | as is |
+| Unknown | a value nested in a dict or aggregate argument; code that may receive a duck-typed test fake | `maybe_unwrap` (`_v`) |
+
+```python
+def num_k_tiles(self, K):          # a constexpr_function method
+    BK = self._BLOCK_K.value       # wrapped: a field
+    return K // BK                 # raw: a parameter, and a raw result
+```
+
+- **Raw** because `ConstexprFunction.__call__` unwraps every argument, through
+  lists and tuples, before the body runs, and hands the raw result back to host
+  code, to another constexpr function and to an aggregate constructor. Only a
+  `@gluon.jit` caller gets it re-wrapped.
+- **Accessors** return a raw value: `return self._x.value[idx]`, never a bare
+  `self._x`.
+- **`.value` is the strict unwrap.** On a raw value it raises `AttributeError` at
+  the first compile. An `IntEnum` has a `.value` too, so store enums as
+  `int(enum)`: a raw enum would pass silently.
+- **A leftover `gl.constexpr` fails late.** Arithmetic on it still works and
+  returns another `constexpr`, but `is None` is false, `len()` fails, `isinstance`
+  misses, and its hash is `hash((value, type))`, so dict and set lookups miss.
+- **`maybe_unwrap` marks a real unknown.** `Schedule.__init__` keeps it on config
+  and layout fields because the schedule tests pass a duck-typed fake with raw
+  fields.
 
 ## One method for both operands
 

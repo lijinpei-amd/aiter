@@ -40,8 +40,8 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.language.core import _aggregate as aggregate
 
+from ._lang import maybe_unwrap as _v
 from ._lang import strip_annotate
-from ._lang import unwrap as _v
 from ._types import COMPONENTS, A, _slot_index
 
 __all__ = ["Schedule"]
@@ -339,26 +339,26 @@ class Schedule:
         when the epilogue stages bias or gammas through LDS -- and the argument only
         exists for tests of the drain accounting.
         """
+        # Field reads here stay `_v`: the schedule tests pass a duck-typed fake with
+        # raw fields as the configs and the layout.
         tc = tuning_cfg
         fc = tc.func_cfg
         nm, nn = _v(layout.num_m_slots), _v(layout.num_n_slots)
         slots = nm * nn
-        num_k = _v(layout.num_k_tiles(K))
+        num_k = layout.num_k_tiles(K)
 
         # -- per component -------------------------------------------------------------
         present = tuple(
-            not is_scale or bool(_v(fc.has_scale(op))) for op, is_scale in COMPONENTS
+            not is_scale or bool(fc.has_scale(op)) for op, is_scale in COMPONENTS
         )
-        via_lds = tuple(bool(_v(layout.component_via_lds(c))) for c in COMPONENTS)
-        ring_depth = tuple(
-            _v(tc.num_buffers(op, is_scale)) for op, is_scale in COMPONENTS
-        )
+        via_lds = tuple(bool(layout.component_via_lds(c)) for c in COMPONENTS)
+        ring_depth = tuple(tc.num_buffers(op, is_scale) for op, is_scale in COMPONENTS)
         ratio_k = tuple(
-            _v(layout.scale_ratio_k_step(op)) if is_scale else 1
+            layout.scale_ratio_k_step(op) if is_scale else 1
             for op, is_scale in COMPONENTS
         )
         ratio_non_k = tuple(
-            _v(layout.scale_ratio_non_k_slot(op)) if is_scale else 1
+            layout.scale_ratio_non_k_slot(op) if is_scale else 1
             for op, is_scale in COMPONENTS
         )
         live_span = tuple((d - 1) * r + 1 for d, r in zip(ring_depth, ratio_k))
@@ -432,7 +432,7 @@ class Schedule:
                 reads.append(read)
                 # A same-step register selection in its own fill slot has to read in
                 # the MFMA region, after the fill.
-                configured = bool(_v(tc.ds_read_in_mfma(op, is_scale)))
+                configured = bool(tc.ds_read_in_mfma(op, is_scale))
                 in_mfma.append(
                     configured
                     or (same_step and fill_slots_valid and read == fill_slots[ci][t])
@@ -453,10 +453,10 @@ class Schedule:
 
         # -- policy --------------------------------------------------------------------
         commit = (
-            bool(_v(tc.commit_per_op())),
-            bool(_v(tc.commit_per_slot())),
-            bool(_v(tc.commit_per_stage())),
-            bool(_v(tc.commit_per_stage_whole())),
+            bool(tc.commit_per_op()),
+            bool(tc.commit_per_slot()),
+            bool(tc.commit_per_stage()),
+            bool(tc.commit_per_stage_whole()),
         )
         static_remainder = bool(_v(tc.UNROLL_EPILOGUE))
         # Keep short LDS rings in immediate offsets; register queues and quantized
@@ -642,92 +642,90 @@ class Schedule:
     @gluon.constexpr_function
     def scheduled(self):
         """Whether the steps exist: false for a config ``_validate`` rejects."""
-        return _v(self._steps) is not None
+        return self._steps.value is not None
 
     @gluon.constexpr_function
     def num_steps(self):
-        return len(_v(self._steps))
+        return len(self._steps.value)
 
     @gluon.constexpr_function
     def prologue_step(self, r):
         """The fill-only step ``r``, for ``r`` in ``[1 - depth, 0)``."""
-        r, depth = _v(r), _v(self.depth)
+        depth = self.depth.value
         assert 1 - depth <= r < 0, f"no prologue step {r}"
         return r + depth - 1
 
     @gluon.constexpr_function
     def warmup_step(self):
-        return _v(self.depth) - 1
+        return self.depth.value - 1
 
     @gluon.constexpr_function
     def peeled_step(self, x):
         """The peeled step for K step ``x + 1``."""
-        x = _v(x)
-        assert 0 <= x < _v(self.peeled), f"no peeled step {x}"
-        return _v(self.depth) + x
+        assert 0 <= x < self.peeled.value, f"no peeled step {x}"
+        return self.depth.value + x
 
     @gluon.constexpr_function
     def loop_step(self, u):
         """Position ``u`` of the loop body."""
-        u = _v(u)
-        assert 0 <= u < _v(self.unroll), f"no loop step {u}"
-        return _v(self.depth) + _v(self.peeled) + u
+        assert 0 <= u < self.unroll.value, f"no loop step {u}"
+        return self.depth.value + self.peeled.value + u
 
     @gluon.constexpr_function
     def remainder_step(self, u):
         """Remainder position ``u``; the runtime remainder loop has one step."""
-        u, unroll = _v(u), _v(self.unroll)
-        count = unroll - 1 if _v(self.static_remainder) else 1
+        unroll = self.unroll.value
+        count = unroll - 1 if self.static_remainder.value else 1
         assert 0 <= u < count, f"no remainder step {u}"
-        return _v(self.depth) + _v(self.peeled) + unroll + u
+        return self.depth.value + self.peeled.value + unroll + u
 
     @gluon.constexpr_function
     def drain_step(self, p, j):
         """Drain iteration ``j`` of the copy for ring phase ``p``."""
-        p, j, depth = _v(p), _v(j), _v(self.depth)
-        phases = _v(self.ring_period) if _v(self.static_drain) else 1
+        depth = self.depth.value
+        phases = self.ring_period.value if self.static_drain.value else 1
         assert 0 <= p < phases and 0 <= j < depth - 1, f"no drain step {p, j}"
         return self.num_steps() - (phases - p) * (depth - 1) + j
 
     @gluon.constexpr_function
     def phase(self, step):
         """The step's K phase: its K tile modulo every period the emitter reads."""
-        return _v(self._steps)[_v(step)][2]
+        return self._steps.value[step][2]
 
     @gluon.constexpr_function
     def ki(self, step):
         """Position in an unrolled body, which fixes static ring indices."""
-        return _v(self._steps)[_v(step)][3]
+        return self._steps.value[step][3]
 
     @gluon.constexpr_function
     def in_loop(self, step):
-        return _v(self._steps)[_v(step)][4]
+        return self._steps.value[step][4]
 
     @gluon.constexpr_function
     def static_phase(self, step):
         """Whether a step outside the loop still has a static LDS ring phase."""
-        return _v(self._steps)[_v(step)][5]
+        return self._steps.value[step][5]
 
     @gluon.constexpr_function
     def dot(self, step):
         """Whether the step issues the previous K tile's MFMAs."""
-        return _v(self._steps)[_v(step)][6]
+        return self._steps.value[step][6]
 
     @gluon.constexpr_function
     def is_drain(self, step):
-        return _v(self._steps)[_v(step)][0] == _DRAIN
+        return self._steps.value[step][0] == _DRAIN
 
     # -- per step and slot -------------------------------------------------------------
 
     @gluon.constexpr_function
     def active(self, step, component):
         """Whether the component fills in this step at all."""
-        return _v(self._active)[_v(step)][_ci(component)]
+        return self._active.value[step][_ci(component)]
 
     @gluon.constexpr_function
     def loads(self, step, component):
         """Whether the component issues its producer copy in this step."""
-        return _v(self._loads)[_v(step)][_ci(component)]
+        return self._loads.value[step][_ci(component)]
 
     @gluon.constexpr_function
     def issued(self, step, slot):
@@ -735,7 +733,7 @@ class Schedule:
 
         ``None`` where it copies nothing. Register copies are included.
         """
-        return _v(self._issued)[_v(step)][_v(slot)]
+        return self._issued.value[step][slot]
 
     @gluon.constexpr_function
     def selects(self, step, component):
@@ -745,7 +743,7 @@ class Schedule:
     @gluon.constexpr_function
     def selects_at_phase(self, component, phase):
         ci = _ci(component)
-        return _v(self._present)[ci] and _v(phase) % _v(self._ratio_k)[ci] == 0
+        return self._present.value[ci] and phase % self._ratio_k.value[ci] == 0
 
     @gluon.constexpr_function
     def commits(self, step, slot):
@@ -756,7 +754,7 @@ class Schedule:
         """
         return tuple(
             tuple((COMPONENTS[ci], t) for ci, t in group)
-            for group in _v(self._commits)[_v(step)][_v(slot)]
+            for group in self._commits.value[step][slot]
         )
 
     @gluon.constexpr_function
@@ -766,8 +764,8 @@ class Schedule:
         ``slot=None`` is the tile wait at the head of the step, which per-tile commit
         schemes use; the others wait before each slot.
         """
-        tile, slot_waits = _v(self._waits)[_v(step)]
-        return tile if _v(slot) is None else slot_waits[_v(slot)]
+        tile, slot_waits = self._waits.value[step]
+        return tile if slot is None else slot_waits[slot]
 
     # -- commits -----------------------------------------------------------------------
 
@@ -777,18 +775,18 @@ class Schedule:
 
         It also retires every copy the drain issued after them.
         """
-        return 0 if _v(self.epilogue_groups) > 0 else None
+        return 0 if self.epilogue_groups.value > 0 else None
 
     # -- per component -----------------------------------------------------------------
 
     @gluon.constexpr_function
     def present(self, component):
         """Whether the component exists: a scale only for a scaled operand."""
-        return _v(self._present)[_ci(component)]
+        return self._present.value[_ci(component)]
 
     @gluon.constexpr_function
     def via_lds(self, component):
-        return _v(self._via_lds)[_ci(component)]
+        return self._via_lds.value[_ci(component)]
 
     @gluon.constexpr_function
     def in_reg(self, component):
@@ -798,18 +796,18 @@ class Schedule:
     def has_register_component(self):
         """Whether any present component uses a direct-register ring."""
         return any(
-            p and not lds for p, lds in zip(_v(self._present), _v(self._via_lds))
+            p and not lds for p, lds in zip(self._present.value, self._via_lds.value)
         )
 
     @gluon.constexpr_function
     def ring_depth(self, component):
         """Buffers in the component's ring."""
-        return _v(self._ring_depth)[_ci(component)]
+        return self._ring_depth.value[_ci(component)]
 
     @gluon.constexpr_function
     def ratio_k(self, component):
         """Steps one value spans: the scale K-step ratio, 1 for a payload."""
-        return _v(self._ratio_k)[_ci(component)]
+        return self._ratio_k.value[_ci(component)]
 
     @gluon.constexpr_function
     def live_span(self, component):
@@ -819,7 +817,7 @@ class Schedule:
     @gluon.constexpr_function
     def fill_span(self, component):
         """Inclusive producer-to-selection span ``F``: ``L``, ``L - 1`` in registers."""
-        return _v(self._fill_span)[_ci(component)]
+        return self._fill_span.value[_ci(component)]
 
     @gluon.constexpr_function
     def producer_phase(self, component):
@@ -830,27 +828,27 @@ class Schedule:
     @gluon.constexpr_function
     def fill_slot(self, component, non_k_slot):
         """Slot that copies one non-K slot of the component."""
-        return _v(self._fill_slots)[_ci(component)][_v(non_k_slot)]
+        return self._fill_slots.value[_ci(component)][non_k_slot]
 
     @gluon.constexpr_function
     def read_slot(self, component, non_k_slot):
         """Slot that selects one non-K slot of the component."""
-        return _v(self._read_slots)[_ci(component)][_v(non_k_slot)]
+        return self._read_slots.value[_ci(component)][non_k_slot]
 
     @gluon.constexpr_function
     def read_in_mfma(self, component, non_k_slot):
         """Whether the selection reads in the MFMA region rather than the memory one."""
-        return _v(self._read_in_mfma)[_ci(component)][_v(non_k_slot)]
+        return self._read_in_mfma.value[_ci(component)][non_k_slot]
 
     @gluon.constexpr_function
     def owned(self, slot):
         """Non-K slot each component copies in this slot when it loads, or ``None``."""
-        return _v(self._owned)[_v(slot)]
+        return self._owned.value[slot]
 
     @gluon.constexpr_function
     def selected(self, slot, component):
         """Non-K slot of the component selected in this slot, or ``None``."""
-        return _v(self._selected)[_v(slot)][_ci(component)]
+        return self._selected.value[slot][_ci(component)]
 
     # -- ring indices ------------------------------------------------------------------
 
@@ -867,12 +865,12 @@ class Schedule:
             return 0
         ratio = self.ratio_k(component)
         if self.in_loop(step):
-            origin = _v(self.peeled) + 1
+            origin = self.peeled.value + 1
             current = origin + self.ki(step)
         else:
             origin = self.phase(step)
             current = origin
-        target = current + (self.fill_span(component) - 1 if _v(fill) else 0)
+        target = current + (self.fill_span(component) - 1 if fill else 0)
         return (target // ratio - origin // ratio) % self.ring_depth(component)
 
     @gluon.constexpr_function
@@ -887,24 +885,24 @@ class Schedule:
         depth, ratio = self.ring_depth(component), self.ratio_k(component)
         if not (self.in_loop(step) or self.static_phase(step)):
             return None
-        if _v(self.unroll) % (depth * ratio) != 0:
+        if self.unroll.value % (depth * ratio) != 0:
             return None
-        advance = self.fill_span(component) - 1 if _v(fill) else 0
-        return ((_v(self.peeled) + self.ki(step) + 1 + advance) // ratio) % depth
+        advance = self.fill_span(component) - 1 if fill else 0
+        return ((self.peeled.value + self.ki(step) + 1 + advance) // ratio) % depth
 
     @gluon.constexpr_function
     def soff_unroll(self, step):
         """Whether the step's copies offset one base pointer through ``soffset``."""
-        return self.in_loop(step) and _v(self._soff_unroll)
+        return self.in_loop(step) and self._soff_unroll.value
 
     @gluon.constexpr_function
     def scale_soff_steps(self, component, offset_step):
         """Scale K steps from the body's first scale producer to this body position."""
         ratio = self.ratio_k(component)
-        start = _v(self.peeled) + 1
+        start = self.peeled.value + 1
         producer_phase = self.producer_phase(component)
         first_producer = (start - producer_phase + ratio - 1) // ratio
-        producer = (start + _v(offset_step) - producer_phase) // ratio
+        producer = (start + offset_step - producer_phase) // ratio
         return (producer - first_producer) * ratio
 
 
@@ -915,8 +913,7 @@ def _ci(component):
     A loop rather than ``COMPONENTS.index``: Triton's dependency finder rejects a
     method of a global reachable from a traced body.
     """
-    component = _v(component)
-    key = (_v(component[0]), bool(_v(component[1])))
+    key = (component[0], bool(component[1]))
     for ci, candidate in enumerate(COMPONENTS):
         if candidate == key:
             return ci

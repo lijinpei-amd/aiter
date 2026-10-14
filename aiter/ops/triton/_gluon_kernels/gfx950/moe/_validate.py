@@ -22,7 +22,6 @@ from ._lang import (
     WaitCommitScheme,
     WarpPipeline,
 )
-from ._lang import unwrap as _v
 from ._layout import KernelLayout
 from ._schedule import Schedule
 from ._types import (
@@ -49,30 +48,30 @@ def validate(tc, N, K, layout=None):
     anything else gets one computed here. That optionality is why it comes last here
     rather than right after ``tc`` as everywhere else.
     """
-    if _v(layout) is None:
+    if layout is None:
         layout = KernelLayout(tc)
     fc = tc.func_cfg
-    BK = _v(tc.BLOCK_K)
+    BK = tc.BLOCK_K.value
 
-    assert _v(fc.epilogue) in (
+    assert fc.epilogue.value in (
         int(EpilogueMode.DEFAULT),
         int(EpilogueMode.NOP_ACTIVATION),
         int(EpilogueMode.NOP),
-    ), f"epilogue {_v(fc.epilogue)} is not an EpilogueMode"
-    assert _v(fc.weight_gu_hbm_layout) in (
+    ), f"epilogue {fc.epilogue.value} is not an EpilogueMode"
+    assert fc.weight_gu_hbm_layout.value in (
         int(WeightGuHbmLayout.INTERLEAVED),
         int(WeightGuHbmLayout.SPLIT),
-    ), f"{_v(fc.weight_gu_hbm_layout)} is not a WeightGuHbmLayout"
-    assert _v(tc.SCHED_MODE) in (
+    ), f"{fc.weight_gu_hbm_layout.value} is not a WeightGuHbmLayout"
+    assert tc.SCHED_MODE.value in (
         int(SchedMode.NONE),
         int(SchedMode.IGLP_0),
         int(SchedMode.IGLP_1),
         int(SchedMode.MFMA_16),
         int(SchedMode.MFMA_8),
-    ), f"SCHED_MODE {_v(tc.SCHED_MODE)} is not a SchedMode"
+    ), f"SCHED_MODE {tc.SCHED_MODE.value} is not a SchedMode"
     validate_layout(tc, layout, N, K)
 
-    if not _v(tc.UNROLL_EPILOGUE):
+    if not tc.UNROLL_EPILOGUE.value:
         for idx in (0, 1):
             assert not fc.has_scale(idx) or layout.scale_ratio_k_step(idx) == 1, (
                 "UNROLL_EPILOGUE=False requires every active scale to advance "
@@ -86,19 +85,19 @@ def validate(tc, N, K, layout=None):
     # BLOCK_K window is carried in registers from the previous stage. The pass also
     # rejects a wait inside a stage region, which is why the per-slot wait_group is
     # emitted before the `mfma` region rather than inside the `mem` one.
-    assert _v(tc.WARP_PIPELINE) in (
+    assert tc.WARP_PIPELINE.value in (
         int(WarpPipeline.NONE),
         int(WarpPipeline.COMPILER),
         int(WarpPipeline.MANUAL),
     ), (
-        f"WARP_PIPELINE {_v(tc.WARP_PIPELINE)} is not a WarpPipeline: "
+        f"WARP_PIPELINE {tc.WARP_PIPELINE.value} is not a WarpPipeline: "
         f"NONE {int(WarpPipeline.NONE)}, COMPILER {int(WarpPipeline.COMPILER)}, "
         f"MANUAL {int(WarpPipeline.MANUAL)}"
     )
     if tc.warp_pipeline_enabled():
-        assert _v(layout.num_prefetch_k_slots) == _v(layout.num_k_slots), (
+        assert layout.num_prefetch_k_slots.value == layout.num_k_slots.value, (
             f"WARP_PIPELINE needs VGPR_PREFETCH_K == BLOCK_K (got "
-            f"{_v(tc.VGPR_PREFETCH_K)} vs {BK}): with a partial window the slot's "
+            f"{tc.VGPR_PREFETCH_K.value} vs {BK}): with a partial window the slot's "
             "MFMAs depend on the slot's own ds_read and there is no mem stage to "
             "hide behind them"
         )
@@ -107,7 +106,7 @@ def validate(tc, N, K, layout=None):
     # The live driver carries the complete BLOCK_K stage in registers from the
     # preceding step. There is no partial or disabled handoff after removing the
     # payload K split.
-    pk = _v(tc.VGPR_PREFETCH_K)
+    pk = tc.VGPR_PREFETCH_K.value
     assert pk == BK, (
         f"VGPR_PREFETCH_K must equal BLOCK_K (got {pk} vs {BK}): "
         "the pipeline carries one whole payload K stage"
@@ -115,13 +114,13 @@ def validate(tc, N, K, layout=None):
 
     # -- commit-group granularity --
     # Reject unknown schemes before building the shared copy/group schedule.
-    assert _v(tc.WAIT_COMMIT_SCHEME) in (
+    assert tc.WAIT_COMMIT_SCHEME.value in (
         int(WaitCommitScheme.PER_OP),
         int(WaitCommitScheme.PER_SLOT),
         int(WaitCommitScheme.PER_STAGE_WARP_PIPELINE),
         int(WaitCommitScheme.PER_STAGE_WHOLE),
     ), (
-        f"WAIT_COMMIT_SCHEME {_v(tc.WAIT_COMMIT_SCHEME)} is not a WaitCommitScheme: "
+        f"WAIT_COMMIT_SCHEME {tc.WAIT_COMMIT_SCHEME.value} is not a WaitCommitScheme: "
         f"PER_OP {int(WaitCommitScheme.PER_OP)}, "
         f"PER_SLOT {int(WaitCommitScheme.PER_SLOT)}, "
         f"PER_STAGE_WARP_PIPELINE {int(WaitCommitScheme.PER_STAGE_WARP_PIPELINE)}, "
@@ -144,7 +143,7 @@ def validate_buffer_counts(tc):
                 f"{'A' if operand == 0 else 'B'}{'_SCALE' if scale else ''}_NUM_BUFFER "
                 f"({depth}) must be at least 2"
             )
-    assert _v(tc.K_UNROLL) >= 1, "K_UNROLL must be at least 1"
+    assert tc.K_UNROLL.value >= 1, "K_UNROLL must be at least 1"
     return True
 
 
@@ -152,13 +151,12 @@ def validate_buffer_counts(tc):
 def validate_layout(tc, layout, N, K):
     """Validate storage placement and every tensor/tile shape contract."""
     fc = tc.func_cfg
-    BM, BN, BK = _v(tc.BLOCK_M), _v(tc.BLOCK_N), _v(tc.BLOCK_K)
-    N, K = _v(N), _v(K)
-    instr = _v(tc.mfma_instr_shape)
-    warps = _v(tc.warps_per_cta)
-    tiles = _v(tc.tiles_per_warp)
+    BM, BN, BK = tc.BLOCK_M.value, tc.BLOCK_N.value, tc.BLOCK_K.value
+    instr = tc.mfma_instr_shape.value
+    warps = tc.warps_per_cta.value
+    tiles = tc.tiles_per_warp.value
 
-    assert _v(tc.ALLOW_B_VIA_LDS) or tc.operand_preshuffled(1), (
+    assert tc.ALLOW_B_VIA_LDS.value or tc.operand_preshuffled(1), (
         "ALLOW_B_VIA_LDS=False requires B_PRESHUFFLED"
     )
     validate_buffer_counts(tc)
@@ -199,14 +197,14 @@ def validate_layout(tc, layout, N, K):
     # -- the slot is the unit of LDS allocation, of the global->LDS copy, of the
     #    MFMA and of the accumulator, so it must align to the CTA block;
     #    non-divisible values are illegal, not merely wasteful --
-    assert BM % _v(tc.MINI_BLOCK_M) == 0
-    assert BN % _v(tc.MINI_BLOCK_N) == 0
-    assert _v(tc.MINI_BLOCK_M) % (instr[0] * warps[0] * tiles[0]) == 0, (
-        f"MINI_BLOCK_M {_v(tc.MINI_BLOCK_M)} must be a multiple of "
+    assert BM % tc.MINI_BLOCK_M.value == 0
+    assert BN % tc.MINI_BLOCK_N.value == 0
+    assert tc.MINI_BLOCK_M.value % (instr[0] * warps[0] * tiles[0]) == 0, (
+        f"MINI_BLOCK_M {tc.MINI_BLOCK_M.value} must be a multiple of "
         f"instr[0]*warps[0]*tiles[0] = {instr[0] * warps[0] * tiles[0]}"
     )
-    assert _v(tc.MINI_BLOCK_N) % (instr[1] * warps[1] * tiles[1]) == 0, (
-        f"MINI_BLOCK_N {_v(tc.MINI_BLOCK_N)} must be a multiple of "
+    assert tc.MINI_BLOCK_N.value % (instr[1] * warps[1] * tiles[1]) == 0, (
+        f"MINI_BLOCK_N {tc.MINI_BLOCK_N.value} must be a multiple of "
         f"instr[1]*warps[1]*tiles[1] = {instr[1] * warps[1] * tiles[1]}"
     )
 
@@ -231,9 +229,9 @@ def validate_layout(tc, layout, N, K):
         # The 16-column-blocked global offsets only stay inside the N slot while
         # every extent is a whole number of 16-column, 16-byte blocks.
         pk_b = BK // fc.pack_divisor(1)
-        assert BN % 16 == 0 and _v(tc.MINI_BLOCK_N) % 16 == 0, (
+        assert BN % 16 == 0 and tc.MINI_BLOCK_N.value % 16 == 0, (
             f"B_PRESHUFFLED needs BLOCK_N ({BN}) and MINI_BLOCK_N "
-            f"({_v(tc.MINI_BLOCK_N)}) to be multiples of the 16-column block"
+            f"({tc.MINI_BLOCK_N.value}) to be multiples of the 16-column block"
         )
         assert pk_b % 16 == 0, (
             f"B_PRESHUFFLED needs BLOCK_K/pack ({pk_b}) to be a multiple of the "
@@ -244,11 +242,11 @@ def validate_layout(tc, layout, N, K):
     # (checked by the caller against the tensor's scale_swizzle field)
 
     # -- WeightGuHbmLayout.SPLIT: an N slot must be exactly one operand side --
-    if _v(fc.weight_gu_hbm_layout) == WeightGuHbmLayout.SPLIT:
-        MBN = _v(tc.MINI_BLOCK_N)
-        assert _v(layout.num_n_slots) == 2 and MBN * 2 == BN, (
+    if fc.weight_gu_hbm_layout.value == WeightGuHbmLayout.SPLIT:
+        MBN = tc.MINI_BLOCK_N.value
+        assert layout.num_n_slots.value == 2 and MBN * 2 == BN, (
             f"WeightGuHbmLayout.SPLIT needs exactly two N slots, one per side: got "
-            f"BLOCK_N {BN} / MINI_BLOCK_N {MBN} = {_v(layout.num_n_slots)}"
+            f"BLOCK_N {BN} / MINI_BLOCK_N {MBN} = {layout.num_n_slots.value}"
         )
         assert N % 2 == 0 and (N // 2) % MBN == 0, (
             f"WeightGuHbmLayout.SPLIT needs each half of N ({N}) to be a whole "
@@ -258,7 +256,7 @@ def validate_layout(tc, layout, N, K):
         # whole MX group, or the fused quant's amax crosses the warp boundary. That
         # extent is instr_n * tiles_per_warp_n -- warps tile *above* it, so the
         # warp count is irrelevant here.
-        if _v(fc.output_quant) is not None:
+        if fc.output_quant.value is not None:
             warp_n = instr[1] * tiles[1]
             assert warp_n % MX_GROUP == 0, (
                 f"WeightGuHbmLayout.SPLIT with a fused MX output quant needs a "
@@ -270,13 +268,13 @@ def validate_layout(tc, layout, N, K):
 
     # -- the fused MX output quant groups 32 *emitted* columns, so the raw tile has
     #    to carry 32 * activation_reduction_n of them --
-    elif _v(fc.output_quant) is not None:
+    elif fc.output_quant.value is not None:
         arn = fc.activation_reduction_n()
         assert BN % (MX_GROUP * arn) == 0, (
             f"BLOCK_N {BN} must be a multiple of {MX_GROUP * arn} in raw "
             f"(pre-halving) terms so every MX group is tile-local"
         )
-        assert _v(tc.MINI_BLOCK_N) % (MX_GROUP * arn) == 0
+        assert tc.MINI_BLOCK_N.value % (MX_GROUP * arn) == 0
 
     return True
 
@@ -285,13 +283,13 @@ def validate_layout(tc, layout, N, K):
 def validate_resources(tc, layout):
     """Validate layout-dependent LDS and accumulator resource budgets."""
     # -- resource budgets --
-    lds = _v(layout.lds_bytes)
+    lds = layout.lds_bytes.value
     assert lds <= LDS_USABLE_BYTES, (
         f"LDS {lds} B > {LDS_USABLE_BYTES} B usable ({LDS_CAP_BYTES} cap minus "
         f"{LDS_EPILOGUE_RESERVE_BYTES} B of epilogue scratch): reduce "
-        f"NUM_LDS_BUFFER ({_v(tc.NUM_LDS_BUFFER)}) or the block sizes"
+        f"NUM_LDS_BUFFER ({tc.NUM_LDS_BUFFER.value}) or the block sizes"
     )
-    acc = _v(layout.acc_vgprs_per_lane)
+    acc = layout.acc_vgprs_per_lane.value
     assert acc <= 256, (
         f"fp32 accumulator alone needs {acc} VGPR/lane; 256 is the architectural "
         f"cap and WAVES_PER_EU=2 needs <= 256 total"
@@ -308,23 +306,23 @@ def validate_pipeline(tc, layout, K, schedule=None):
     sound.
     """
     validate_buffer_counts(tc)
-    if _v(schedule) is None:
+    if schedule is None:
         schedule = Schedule(tc, layout, K)
     # Copy ownership maps each component's non-K slots onto slots, so every mapped
     # slot has to exist and no component may copy two of its own non-K slots in one
     # slot -- a slot carries one optional copy per component. Different components
     # sharing a slot is fine, which is what lets a single-slot step copy both
     # operands.
-    assert _v(schedule.fill_slots_valid), (
+    assert schedule.fill_slots_valid.value, (
         f"fill ownership is not a valid mapping for num_m_slots "
-        f"{_v(layout.num_m_slots)} x num_n_slots {_v(layout.num_n_slots)} "
-        f"(MINI_BLOCK_M {_v(tc.MINI_BLOCK_M)} vs BLOCK_M {_v(tc.BLOCK_M)}, "
-        f"MINI_BLOCK_N {_v(tc.MINI_BLOCK_N)} vs BLOCK_N {_v(tc.BLOCK_N)})"
+        f"{layout.num_m_slots.value} x num_n_slots {layout.num_n_slots.value} "
+        f"(MINI_BLOCK_M {tc.MINI_BLOCK_M.value} vs BLOCK_M {tc.BLOCK_M.value}, "
+        f"MINI_BLOCK_N {tc.MINI_BLOCK_N.value} vs BLOCK_N {tc.BLOCK_N.value})"
     )
-    num_k = _v(schedule.num_k)
-    depth = _v(schedule.depth)
-    peeled = _v(schedule.peeled)
-    unroll = _v(schedule.unroll)
+    num_k = schedule.num_k.value
+    depth = schedule.depth.value
+    peeled = schedule.peeled.value
+    unroll = schedule.unroll.value
     assert num_k >= depth + peeled + unroll, (
         f"NUM_K ({num_k}) must be at least PIPELINE_DEPTH ({depth}) "
         f"+ PEELED ({peeled}) + UNROLL ({unroll}) = {depth + peeled + unroll}"

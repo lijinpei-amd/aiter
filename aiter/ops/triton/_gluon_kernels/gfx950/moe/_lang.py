@@ -29,12 +29,12 @@ __all__ = [
     "dq_mx_format",
     "dq_pack_divisor",
     "dq_uses_mfma_scaled",
+    "maybe_unwrap",
     "nop_warp_pipeline_stage",
     "optional",
     "pick_warp_pipeline_stage",
     "require_constexpr",
     "strip_annotate",
-    "unwrap",
     "unwrap_attr",
 ]
 
@@ -143,29 +143,39 @@ class WaitCommitScheme(IntEnum):
 
 
 @gluon.constexpr_function
-def unwrap(x):
-    """Unwrap a ``gl.constexpr``. Must be a ``constexpr_function``, not a plain one:
-    Triton's aggregate hash walker rejects any bare callable an aggregate method
-    references ("Unsupported function referenced"). Called from Python it returns the
-    raw value, so ``list()``/indexing on the result still work."""
-    return x.value if isinstance(x, gl.constexpr) else x
+def maybe_unwrap(x):
+    """Return ``x`` raw, whether or not it arrived as a ``gl.constexpr``.
+
+    For a value of unknown kind only: one nested in a dict or aggregate argument, or
+    one that may come from a duck-typed test fake. Read a known-wrapped value with
+    ``.value`` and use a raw one as is (``agents/CODING_STYLE.md``).
+
+    The ``constexpr_function`` wrapper does the unwrapping: it unwraps every argument,
+    through lists and tuples, before the body runs, so the body only returns it. A
+    plain function would not do, because Triton's dependency finder rejects one
+    reachable from a jit body ("Unsupported function referenced").
+    """
+    return x
+
+
+#: The pre-rename name, kept only for ``_frozen.py``, a snapshot that is not edited.
+unwrap = maybe_unwrap
 
 
 @gluon.constexpr_function
 def dq_has_scale(dq):
-    return unwrap(dq) in (int(DtypeQuant.MXFP4), int(DtypeQuant.MXFP8))
+    return dq in (int(DtypeQuant.MXFP4), int(DtypeQuant.MXFP8))
 
 
 @gluon.constexpr_function
 def dq_pack_divisor(dq):
     """Logical elements per stored container along K."""
-    return 2 if unwrap(dq) == int(DtypeQuant.MXFP4) else 1
+    return 2 if dq == int(DtypeQuant.MXFP4) else 1
 
 
 @gluon.constexpr_function
 def dq_mx_format(dq):
     """The ``a_format`` / ``b_format`` string ``mfma_scaled`` wants."""
-    dq = unwrap(dq)
     if dq == int(DtypeQuant.MXFP4):
         return "e2m1"
     if dq in (int(DtypeQuant.MXFP8), int(DtypeQuant.FP8_E4M3)):
@@ -181,10 +191,7 @@ def dq_uses_mfma_scaled(dq_a, dq_b):
     path reaches the double-rate K=64/128 instructions. Only bf16 x bf16 uses plain
     ``mfma``.
     """
-    return not (
-        unwrap(dq_a) == int(DtypeQuant.BF16)
-        and unwrap(dq_b) == int(DtypeQuant.BF16)
-    )
+    return not (dq_a == int(DtypeQuant.BF16) and dq_b == int(DtypeQuant.BF16))
 
 
 def unwrap_attr(x):
@@ -201,13 +208,13 @@ def const(v):
 @gluon.constexpr_function
 def constexpr_fields(spec):
     """Box spec fields so starred arguments preserve nested tuples and None."""
-    return tuple(gl.constexpr(value) for value in unwrap(spec))
+    return tuple(gl.constexpr(value) for value in spec)
 
 
 @gluon.constexpr_function
 def optional(buf):
     """Wrap an optional shared buffer so an absent one is a constexpr, not raw None."""
-    if buf is None or (isinstance(buf, gl.constexpr) and buf.value is None):
+    if buf is None:
         return gl.constexpr(None)
     return buf
 

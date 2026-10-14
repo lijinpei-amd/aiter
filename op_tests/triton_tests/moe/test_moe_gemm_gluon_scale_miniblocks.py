@@ -8,7 +8,7 @@ import math
 import pytest
 
 from aiter.ops.triton._gluon_kernels.gfx950.moe._frozen import _validate_frozen
-from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import unwrap
+from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import maybe_unwrap
 from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import KernelLayout
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import Schedule
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import DtypeQuant
@@ -178,4 +178,4 @@ def test_scale_k_step_ratio_sets_buffer_span_and_unroll(
         assert layout.scale_ratio_k_step(operand) == ratio
         assert layout.scale_read_k_slots(operand) == ratio
     period = math.lcm(3, 2 * ratio, 3 * ratio)
-    assert unwrap(schedule.unroll) == period
+    assert maybe_unwrap(schedule.unroll) == period

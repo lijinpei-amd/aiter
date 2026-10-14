@@ -28,7 +28,6 @@ from triton.experimental.gluon import language as gl
 from triton.language.core import _aggregate as aggregate
 
 from ._lang import MX_GROUP, WARP_SIZE, require_constexpr, strip_annotate
-from ._lang import unwrap as _v
 from ._types import WeightGuHbmLayout
 
 __all__ = ["KernelLayout"]
@@ -121,10 +120,7 @@ def byte_unit_lds_layout(shape, nk_dim, elem_bits, unit_rows, preshuffled):
     ``shape`` and the returned bases are in *stored* elements; with the 8-bit storage
     both fp8 and packed fp4 use, one element is one byte.
     """
-    shape = [int(x) for x in _v(shape)]
-    nk_dim = _v(nk_dim)
-    elem_bits = _v(elem_bits)
-    unit_rows = _v(unit_rows)
+    shape = [int(x) for x in shape]
     rank = len(shape)
     kd = 1 - nk_dim
     els = lambda nbytes: nbytes * 8 // elem_bits
@@ -316,7 +312,7 @@ def _n_reduction_slot(func_cfg):
     than inside each one -- a slot is a whole operand side, so its width maps 1:1 onto
     emitted channels and two of them collapse into one output tile.
     """
-    if _v(func_cfg.weight_gu_hbm_layout) == WeightGuHbmLayout.SPLIT:
+    if func_cfg.weight_gu_hbm_layout.value == WeightGuHbmLayout.SPLIT:
         return 1
     return func_cfg.activation_reduction_n()
 
@@ -328,14 +324,14 @@ def _scale_dword_delta(delta, k=256):
     The tile is [non-K, BLOCK_K/128] and its row-major linearisation *is* the dword
     index, so a step worth ``d`` dwords is the coordinate ``(d // 2, d % 2)``.
     """
-    b = [int(x) for x in _v(delta)]
+    b = [int(x) for x in delta]
     if b == [0, 0]:
         return [0, 0]
     # CDNA4_SCALE writes byte (n//32)*256 + (k%4)*64 + (n%16)*4 + (k//4)*2 +
     # (n%32)//16; dropping the two within-dword terms and dividing by four
     # leaves the dword index below.
-    width = _v(k) // 128
-    d = (b[0] // 32) * (_v(k) // 4) + (b[1] // 8) * 64 + (b[1] % 4) * 16 + (b[0] % 16)
+    width = k // 128
+    d = (b[0] // 32) * (k // 4) + (b[1] // 8) * 64 + (b[1] % 4) * 16 + (b[0] % 16)
     return [d // width, d % width]
 
 
@@ -477,13 +473,13 @@ class KernelLayout:
         ops = (0, 1)
 
         # -- tile and slot geometry -----------------------------------------------
-        BM, BN, BK = _v(tc.BLOCK_M), _v(tc.BLOCK_N), _v(tc.BLOCK_K)
-        MBM, MBN = _v(tc.MINI_BLOCK_M), _v(tc.MINI_BLOCK_N)
-        instr = _v(tc.mfma_instr_shape)
-        warps = _v(tc.warps_per_cta)
-        tiles_per_warp = _v(tc.tiles_per_warp)
+        BM, BN, BK = tc.BLOCK_M.value, tc.BLOCK_N.value, tc.BLOCK_K.value
+        MBM, MBN = tc.MINI_BLOCK_M.value, tc.MINI_BLOCK_N.value
+        instr = tc.mfma_instr_shape.value
+        warps = tc.warps_per_cta.value
+        tiles_per_warp = tc.tiles_per_warp.value
         is_16x16x128 = list(instr) == [16, 16, 128]
-        gu_split = _v(fc.weight_gu_hbm_layout) == WeightGuHbmLayout.SPLIT
+        gu_split = fc.weight_gu_hbm_layout.value == WeightGuHbmLayout.SPLIT
         num_warps = warps[0] * warps[1]
         threads = num_warps * WARP_SIZE
         elem_ty = tuple(fc.operand_elem_ty(idx) for idx in ops)
@@ -500,11 +496,11 @@ class KernelLayout:
         scale_nonk = (MBM, MBN)
         scale_stage_k = max(256, BK)
         scale_mini_block_nonk = (
-            (_v(tc.SCALE_MINI_BLOCK_M) or MBM) if shuffled[0] else MBM,
-            (_v(tc.SCALE_MINI_BLOCK_N) or MBN) if shuffled[1] else MBN,
+            (tc.SCALE_MINI_BLOCK_M.value or MBM) if shuffled[0] else MBM,
+            (tc.SCALE_MINI_BLOCK_N.value or MBN) if shuffled[1] else MBN,
         )
         scale_mini_block_k = tuple(
-            (_v(tc.SCALE_MINI_BLOCK_K) or scale_stage_k) if shuffled[idx] else BK
+            (tc.SCALE_MINI_BLOCK_K.value or scale_stage_k) if shuffled[idx] else BK
             for idx in ops
         )
 
@@ -529,7 +525,7 @@ class KernelLayout:
                 )
 
         num_k_slots = 1
-        num_prefetch_k_slots = 1 if _v(tc.VGPR_PREFETCH_K) else 0
+        num_prefetch_k_slots = 1 if tc.VGPR_PREFETCH_K.value else 0
         num_m_slots = BM // MBM
         num_n_slots = BN // MBN
         num_lds_slots_non_k = (num_m_slots, num_n_slots)
@@ -570,7 +566,7 @@ class KernelLayout:
         # shapes: k_width 32 has no efficient padded shared layout at all, and 8 with
         # the 16x16x128 shape compiles and runs but computes the wrong answer -- exactly
         # the class of bug no correctness-by-construction argument catches.
-        k_width_override = _v(tc.k_width)
+        k_width_override = tc.k_width.value
         k_width_for = tuple(
             copy_contiguity[idx] if k_width_override is None else k_width_override
             for idx in ops
@@ -672,8 +668,8 @@ class KernelLayout:
             # `transposed` is pinned True: it gives each lane 4 consecutive N elements
             # (a 16 B contiguous store, and a lane-local even/odd gate-up pair for the
             # fused activation) instead of 4 strided M rows.
-            assert _v(
-                tc.transposed
+            assert (
+                tc.transposed.value
             ), "transposed=True is pinned, see the module docstring"
             dot_result_fragment_layout = gl.amd.AMDMFMALayout(
                 version=4,
@@ -1034,7 +1030,7 @@ class KernelLayout:
             vec=1, per_phase=1, max_phase=1, order=[1, 0]
         )
         quant_staging_rows = BM if gu_split else MBM
-        quant_staging_rotates = _v(fc.output_quant) is not None and not gu_split
+        quant_staging_rotates = fc.output_quant.value is not None and not gu_split
 
         # -- resources ------------------------------------------------------------
         # LDS footprint of the components staged there. A staged scale without a tile
@@ -1060,7 +1056,7 @@ class KernelLayout:
         self._BLOCK_N = gl.constexpr(BN)
         self._BLOCK_K = gl.constexpr(BK)
         self._mfma_instr_shape = gl.constexpr(list(instr))
-        self._weight_gu_hbm_layout = gl.constexpr(_v(fc.weight_gu_hbm_layout))
+        self._weight_gu_hbm_layout = gl.constexpr(fc.weight_gu_hbm_layout.value)
         self.num_warps = gl.constexpr(num_warps)
         self.num_k_slots = gl.constexpr(num_k_slots)
         self.num_prefetch_k_slots = gl.constexpr(num_prefetch_k_slots)
@@ -1158,38 +1154,35 @@ class KernelLayout:
     def grid_N(self, N):
         """Number of N tiles. Callable from BOTH host and device.
 
-        Host: take ``.value`` off the returned constexpr before putting it in the grid
-        tuple. grid-M comes from the routing metadata (``RoutingData.n_blocks``), never
-        from ``cdiv``.
+        Host code gets a plain int, ready for the grid tuple. grid-M comes from the
+        routing metadata (``RoutingData.n_blocks``), never from ``cdiv``.
         """
-        N = _v(N)
-        BN = _v(self._BLOCK_N)
+        BN = self._BLOCK_N.value
         assert N % BN == 0, f"N ({N}) must be a multiple of BLOCK_N ({BN})"
         return N // BN
 
     @gluon.constexpr_function
     def num_k_tiles(self, K):
-        K = _v(K)
-        BK = _v(self._BLOCK_K)
+        BK = self._BLOCK_K.value
         assert K % BK == 0, f"K ({K}) must be a multiple of BLOCK_K ({BK})"
         return K // BK
 
     @gluon.constexpr_function
     def num_lds_slots_non_k(self, idx):
         """Slots along one operand's non-K axis, each copied and read independently."""
-        return _v(self._num_lds_slots_non_k)[_v(idx)]
+        return self._num_lds_slots_non_k.value[idx]
 
     @gluon.constexpr_function
     def payload_block_k_storage(self, idx):
         """Stored payload elements along K in one pipeline stage."""
-        return _v(self._payload_block_k_storage)[_v(idx)]
+        return self._payload_block_k_storage.value[idx]
 
     @gluon.constexpr_function
     def fragment_shape_slot(self, idx, is_scale):
         """Register shape for one non-K slot and K slot, of the payload or E8M0."""
-        if _v(is_scale):
-            return list(_v(self._scale_fragment_shape_slot)[_v(idx)])
-        return list(_v(self._payload_fragment_shape_slot)[_v(idx)])
+        if is_scale:
+            return list(self._scale_fragment_shape_slot.value[idx])
+        return list(self._payload_fragment_shape_slot.value[idx])
 
     @gluon.constexpr_function
     def lds_shape_slot(self, idx, is_scale):
@@ -1198,9 +1191,9 @@ class KernelLayout:
         A payload's is in stored (packed) elements; a scale's is E8M0,
         ``[slot non-K extent, BLOCK_K/32]``.
         """
-        if _v(is_scale):
-            return list(_v(self._scale_lds_shape_slot)[_v(idx)])
-        return list(_v(self._payload_lds_shape_slot)[_v(idx)])
+        if is_scale:
+            return list(self._scale_lds_shape_slot.value[idx])
+        return list(self._payload_lds_shape_slot.value[idx])
 
     @gluon.constexpr_function
     def lds_shape_tile(self, idx, is_scale):
@@ -1208,34 +1201,34 @@ class KernelLayout:
 
         A scale's is in its staged representation.
         """
-        if _v(is_scale):
-            return list(_v(self._scale_lds_shape_tile)[_v(idx)])
-        return list(_v(self._payload_lds_shape_tile)[_v(idx)])
+        if is_scale:
+            return list(self._scale_lds_shape_tile.value[idx])
+        return list(self._payload_lds_shape_tile.value[idx])
 
     @gluon.constexpr_function
     def copy_contiguity(self, idx):
         """Elements per lane for a 128-bit direct-to-LDS payload copy."""
-        return _v(self._copy_contiguity)[_v(idx)]
+        return self._copy_contiguity.value[idx]
 
     @gluon.constexpr_function
     def k_width_for(self, idx):
         """``DotOperandLayout.k_width`` for one operand, in *stored* elements."""
-        return _v(self._k_width_for)[_v(idx)]
+        return self._k_width_for.value[idx]
 
     @gluon.constexpr_function
     def payload_hbm_step(self, idx):
         """Stored-element base-pointer increment for one payload K stage."""
-        return _v(self._payload_hbm_step)[_v(idx)]
+        return self._payload_hbm_step.value[idx]
 
     @gluon.constexpr_function
     def lds_unit_rows(self, idx):
         """Non-K extent of one LDS unit."""
-        return _v(self._lds_unit_rows)[_v(idx)]
+        return self._lds_unit_rows.value[idx]
 
     @gluon.constexpr_function
     def byte_unit_lds_ok(self, idx):
         """Does :func:`byte_unit_lds_layout` apply to this operand?"""
-        return _v(self._byte_unit_lds_ok)[_v(idx)]
+        return self._byte_unit_lds_ok.value[idx]
 
     # -- storage placement --------------------------------------------------------
     # Resolved: tuning's ``allow_component_via_lds`` policy and the automatic register
@@ -1246,10 +1239,9 @@ class KernelLayout:
     @gluon.constexpr_function
     def component_via_lds(self, component):
         """Whether ``(operand, is_scale)`` is staged through LDS."""
-        component = _v(component)
-        operand, is_scale = _v(component[0]), bool(_v(component[1]))
+        operand, is_scale = component[0], bool(component[1])
         assert operand in (0, 1), "component operand must be 0 (A) or 1 (B)"
-        return _v(self._component_via_lds)[operand][int(is_scale)]
+        return self._component_via_lds.value[operand][int(is_scale)]
 
     @gluon.constexpr_function
     def component_in_reg(self, component):
@@ -1260,9 +1252,9 @@ class KernelLayout:
 
     @gluon.constexpr_function
     def dot_operand_fragment_layout(self, idx, is_scale):
-        if _v(is_scale):
-            return _v(self._dot_operand_scale_fragment_layout)[_v(idx)]
-        return _v(self._dot_operand_fragment_layout)[_v(idx)]
+        if is_scale:
+            return self._dot_operand_scale_fragment_layout.value[idx]
+        return self._dot_operand_fragment_layout.value[idx]
 
     @gluon.constexpr_function
     def dot_operand_lds_layout(self, idx, is_scale):
@@ -1270,9 +1262,9 @@ class KernelLayout:
 
         Padded for a payload; the identity (K-contiguous) tile for raw E8M0 scales.
         """
-        if _v(is_scale):
-            return _v(self._dot_operand_scale_lds_layout)[_v(idx)]
-        return _v(self._dot_operand_lds_layout)[_v(idx)]
+        if is_scale:
+            return self._dot_operand_scale_lds_layout.value[idx]
+        return self._dot_operand_lds_layout.value[idx]
 
     @gluon.constexpr_function
     def dot_operand_buffer_load_lds_layout(self, idx, is_scale):
@@ -1280,75 +1272,75 @@ class KernelLayout:
 
         32 bits per lane, blocked, for a scale.
         """
-        if _v(is_scale):
-            return _v(self._dot_operand_scale_buffer_load_lds_layout)[_v(idx)]
-        return _v(self._dot_operand_buffer_load_lds_layout)[_v(idx)]
+        if is_scale:
+            return self._dot_operand_scale_buffer_load_lds_layout.value[idx]
+        return self._dot_operand_buffer_load_lds_layout.value[idx]
 
     @gluon.constexpr_function
     def hbm_offset_layout(self, idx, is_scale):
         """Layout used to form one payload slot's or scale tile's HBM offsets."""
-        if _v(is_scale):
-            return _v(self._scale_hbm_offset_layout)[_v(idx)]
-        return _v(self._payload_hbm_offset_layout)[_v(idx)]
+        if is_scale:
+            return self._scale_hbm_offset_layout.value[idx]
+        return self._payload_hbm_offset_layout.value[idx]
 
     # -- scale geometry -----------------------------------------------------------
 
     @gluon.constexpr_function
     def scale_nonk(self, idx):
         """Non-K extent of one shuffled scale tile."""
-        return _v(self._scale_nonk)[_v(idx)]
+        return self._scale_nonk.value[idx]
 
     @gluon.constexpr_function
     def scale_mini_block_nonk(self, idx):
         """Rows or columns in one scale load; raw scales retain payload geometry."""
-        return _v(self._scale_mini_block_nonk)[_v(idx)]
+        return self._scale_mini_block_nonk.value[idx]
 
     @gluon.constexpr_function
     def scale_mini_block_k(self, idx):
         """Scale load K extent in logical payload elements, not E8M0 bytes."""
-        return _v(self._scale_mini_block_k)[_v(idx)]
+        return self._scale_mini_block_k.value[idx]
 
     @gluon.constexpr_function
     def scale_ratio_k_step(self, idx):
         """Number of payload K steps covered by one scale load."""
-        return _v(self._scale_ratio_k_step)[_v(idx)]
+        return self._scale_ratio_k_step.value[idx]
 
     @gluon.constexpr_function
     def scale_ratio_non_k_slot(self, idx):
         """Number of payload non-K slots covered by one scale load."""
-        return _v(self._scale_ratio_non_k_slot)[_v(idx)]
+        return self._scale_ratio_non_k_slot.value[idx]
 
     @gluon.constexpr_function
     def num_scale_tiles(self, idx):
-        return _v(self._num_scale_tiles)[_v(idx)]
+        return self._num_scale_tiles.value[idx]
 
     @gluon.constexpr_function
     def scale_read_k_slots(self, idx):
-        return _v(self._scale_read_k_slots)[_v(idx)]
+        return self._scale_read_k_slots.value[idx]
 
     @gluon.constexpr_function
     def scale_cache_fragments(self, idx):
-        return _v(self._scale_cache_fragments)[_v(idx)]
+        return self._scale_cache_fragments.value[idx]
 
     @gluon.constexpr_function
     def scale_k_phase(self, step):
         """Which K128 half of the packed K256 scale word this stage consumes."""
-        return (_v(step) * _v(self._BLOCK_K) // 128) % 2
+        return (step * self._BLOCK_K.value // 128) % 2
 
     @gluon.constexpr_function
     def scale_hbm_steps(self, idx, steps, phase=0):
         """Scale pointer displacement in units of one payload stage's scale stride."""
         ratio = self.scale_ratio_k_step(idx)
-        return ((_v(phase) + _v(steps)) // ratio) * ratio
+        return ((phase + steps) // ratio) * ratio
 
     @gluon.constexpr_function
     def scale_flat_shape(self, idx):
         """LDS staging shape of a shuffled scale tile (one 256 B run per stripe)."""
-        return list(_v(self._scale_flat_shape)[_v(idx)])
+        return list(self._scale_flat_shape.value[idx])
 
     @gluon.constexpr_function
     def scale_load_shape(self, idx):
-        return list(_v(self._scale_load_shape)[_v(idx)])
+        return list(self._scale_load_shape.value[idx])
 
     @gluon.constexpr_function
     def scale_dword_delta(self, delta, k=256):
@@ -1358,12 +1350,12 @@ class KernelLayout:
     @gluon.constexpr_function
     def scale_packed_ok(self, idx):
         """Can this operand's scale fragment be fed as one dword per lane?"""
-        return _v(self._scale_packed_ok)[_v(idx)]
+        return self._scale_packed_ok.value[idx]
 
     @gluon.constexpr_function
     def scale_packed_sel(self, idx, k_phase=0):
         """Byte selectors in MFMA order, for one K128 half or the full K256 word."""
-        return _v(self._scale_packed_sel)[_v(idx)][_v(k_phase)]
+        return self._scale_packed_sel.value[idx][k_phase]
 
     @gluon.constexpr_function
     def mfma_scale_selector(self, idx, k_phase=0):
@@ -1373,36 +1365,36 @@ class KernelLayout:
     @gluon.constexpr_function
     def packed_scale_shape(self, idx):
         """Physical i32 storage, including both K128 halves even when one is unused."""
-        return list(_v(self._packed_scale_shape)[_v(idx)])
+        return list(self._packed_scale_shape.value[idx])
 
     @gluon.constexpr_function
     def packed_scale_load_shape(self, idx):
-        return list(_v(self._packed_scale_load_shape)[_v(idx)])
+        return list(self._packed_scale_load_shape.value[idx])
 
     # -- scale layouts ------------------------------------------------------------
 
     @gluon.constexpr_function
     def shuffled_scale_read_layout(self, idx, load=False):
         """The [non-K, K] view of the flat LDS run, in fragment order."""
-        return _v(self._shuffled_scale_read_layout)[_v(idx)][int(bool(_v(load)))]
+        return self._shuffled_scale_read_layout.value[idx][int(bool(load))]
 
     @gluon.constexpr_function
     def scale_load_layout(self, idx):
-        return _v(self._scale_load_layout)[_v(idx)]
+        return self._scale_load_layout.value[idx]
 
     @gluon.constexpr_function
     def packed_scale_frag_layout(self, idx):
         """The i32 fragment with its within-dword register bases folded in."""
-        return _v(self._packed_scale_frag_layout)[_v(idx)]
+        return self._packed_scale_frag_layout.value[idx]
 
     @gluon.constexpr_function
     def packed_scale_read_layout(self, idx, load=False):
         """The i32 view of the flat LDS run: one offset bit per dword-address bit."""
-        return _v(self._packed_scale_read_layout)[_v(idx)][int(bool(_v(load)))]
+        return self._packed_scale_read_layout.value[idx][int(bool(load))]
 
     @gluon.constexpr_function
     def packed_scale_load_layout(self, idx):
-        return _v(self._packed_scale_load_layout)[_v(idx)]
+        return self._packed_scale_load_layout.value[idx]
 
     # -- epilogue and emitted-output layouts --------------------------------------
 
@@ -1422,12 +1414,12 @@ class KernelLayout:
         costs anything. It remains unavoidable for the E8M0 scale tile ([64, 2] is 128
         elements against 256 threads), which is why that one is still 2x over.
         """
-        num_warps = _v(self.num_warps)
-        ept = max(1, (_v(extent_m) * _v(extent_n)) // (num_warps * WARP_SIZE))
-        vec = max(1, min(128 // _v(elem_bits), _v(extent_n), ept))
-        lanes_n = max(1, min(WARP_SIZE, _v(extent_n) // vec))
+        num_warps = self.num_warps.value
+        ept = max(1, (extent_m * extent_n) // (num_warps * WARP_SIZE))
+        vec = max(1, min(128 // elem_bits, extent_n, ept))
+        lanes_n = max(1, min(WARP_SIZE, extent_n // vec))
         lanes_m = max(1, WARP_SIZE // lanes_n)
-        warps_m = max(1, min(num_warps, _v(extent_m) // lanes_m))
+        warps_m = max(1, min(num_warps, extent_m // lanes_m))
         warps_n = max(1, num_warps // warps_m)
         return gl.BlockedLayout(
             size_per_thread=[1, vec],
@@ -1439,14 +1431,14 @@ class KernelLayout:
     @gluon.constexpr_function
     def quant_payload_shape(self, rows, output_n=None):
         """Packed E2M1 byte shape for ``rows`` by emitted-output columns."""
-        output_n = _v(self.output_n_slot) if _v(output_n) is None else _v(output_n)
-        return [_v(rows), output_n // 2]
+        output_n = self.output_n_slot.value if output_n is None else output_n
+        return [rows, output_n // 2]
 
     @gluon.constexpr_function
     def quant_scale_shape(self, rows, output_n=None):
         """E8M0 shape for ``rows`` by emitted-output columns."""
-        output_n = _v(self.output_n_slot) if _v(output_n) is None else _v(output_n)
-        return [_v(rows), output_n // MX_GROUP]
+        output_n = self.output_n_slot.value if output_n is None else output_n
+        return [rows, output_n // MX_GROUP]
 
     @gluon.constexpr_function
     def quant_amax_lane_elems(self, extent_m=None, output_n=None):
@@ -1469,15 +1461,15 @@ class KernelLayout:
         16x16), before the first lane base.
         """
         extent_m = (
-            _v(self.accumulator_fragment_shape_slot)[0]
-            if _v(extent_m) is None
-            else _v(extent_m)
+            self.accumulator_fragment_shape_slot.value[0]
+            if extent_m is None
+            else extent_m
         )
-        output_n = _v(self.output_n_slot) if _v(output_n) is None else _v(output_n)
-        if _v(self._weight_gu_hbm_layout) == WeightGuHbmLayout.SPLIT:
-            instr = _v(self._mfma_instr_shape)
+        output_n = self.output_n_slot.value if output_n is None else output_n
+        if self._weight_gu_hbm_layout.value == WeightGuHbmLayout.SPLIT:
+            instr = self._mfma_instr_shape.value
             return max(1, min(MX_GROUP, (instr[0] * instr[1]) // WARP_SIZE))
-        per_lane = (extent_m * output_n) // (_v(self.num_warps) * WARP_SIZE)
+        per_lane = (extent_m * output_n) // (self.num_warps.value * WARP_SIZE)
         return min(MX_GROUP, max(1, per_lane))
 
     # -- resources ----------------------------------------------------------------

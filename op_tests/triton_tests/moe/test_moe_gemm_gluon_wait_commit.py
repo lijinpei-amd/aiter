@@ -11,7 +11,7 @@ import pytest
 
 from aiter.ops.triton._gluon_kernels.gfx950.moe import _lds
 from aiter.ops.triton._gluon_kernels.gfx950.moe import _pipeline as buffered
-from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import unwrap
+from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import maybe_unwrap
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import Schedule
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     A_PAYLOAD,
@@ -233,7 +233,7 @@ class _Descriptor:
         self.tiles = (tc.nm if operand == A else tc.nn) // self.ratio
 
     def index(self, index):
-        stage, tile = divmod(unwrap(index), self.tiles)
+        stage, tile = divmod(maybe_unwrap(index), self.tiles)
         return stage, self.component, tile * self.ratio
 
 
@@ -554,7 +554,7 @@ def test_pipeline_stage_commit_boundaries(
         events.append(("exit", name))
 
     def pick_stage(enabled):
-        assert bool(unwrap(enabled)) == (compiler and in_loop)
+        assert bool(maybe_unwrap(enabled)) == (compiler and in_loop)
         return stage
 
     def buffer_load(pc, ptrs, buffers, *args, **kwargs):

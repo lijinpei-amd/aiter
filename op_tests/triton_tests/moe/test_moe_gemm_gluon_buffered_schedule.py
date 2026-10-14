@@ -18,7 +18,7 @@ import pytest
 
 from aiter.ops.triton._gluon_kernels.gfx950.moe import _pipeline as pipeline
 from aiter.ops.triton._gluon_kernels.gfx950.moe import moe_gemm as kernel
-from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import unwrap
+from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import maybe_unwrap
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import Schedule
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     A_PAYLOAD,
@@ -101,7 +101,11 @@ class _Config(_ScheduleConfig):
     def sizing(self):
         """``(depth, peeled, unroll)``, which do not depend on K."""
         schedule = Schedule(self, self, self.BLOCK_K)
-        return unwrap(schedule.depth), unwrap(schedule.peeled), unwrap(schedule.unroll)
+        return (
+            maybe_unwrap(schedule.depth),
+            maybe_unwrap(schedule.peeled),
+            maybe_unwrap(schedule.unroll),
+        )
 
     def minimum_num_k(self):
         return sum(self.sizing())
@@ -557,7 +561,7 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         pointers, buffers, regs = pipeline._run_buffered_pipeline.fn(
             pc, _pointers(0, 0, 0, 0), num_k
         )
-        main = num_k - unwrap(schedule.depth)
+        main = num_k - maybe_unwrap(schedule.depth)
         assert regs.acc == (main,) * (tc.nm * tc.nn)
         for _ in range(epilogue_groups):
             machine.commit_buffer_load()
@@ -959,9 +963,9 @@ def _straight_line_waits(schedule, tc, last):
     slots = tc.nm * tc.nn
     per_tile = tc.commit_per_stage()
     depth, peeled, unroll = (
-        unwrap(schedule.depth),
-        unwrap(schedule.peeled),
-        unwrap(schedule.unroll),
+        maybe_unwrap(schedule.depth),
+        maybe_unwrap(schedule.peeled),
+        maybe_unwrap(schedule.unroll),
     )
     committed, waits = [], {}
 
@@ -1058,7 +1062,7 @@ def test_every_payload_tile_is_filled_exactly_once(nm, nn, middle):
     tc = _Config(WaitCommitScheme.PER_OP, (3, 3, 3, 3), 0, shape=(nm, nn),
                  middle=middle)
     schedule = Schedule(tc, tc, tc.BLOCK_K)
-    assert unwrap(schedule.fill_slots_valid), "ownership is not a valid mapping"
+    assert maybe_unwrap(schedule.fill_slots_valid), "ownership is not a valid mapping"
     for component in COMPONENTS:
         non_k_slots = nm if component[0] == A else nn
         owners = [
@@ -1155,8 +1159,8 @@ def test_absent_scale_ring_indices_ignore_invalid_unused_depths(scale_depths):
     )[-1]
     assert validate(tc, 512, 960)
     schedule = Schedule(tc, KernelLayout(tc), 960)
-    assert unwrap(schedule.depth) == 2
-    assert unwrap(schedule.register_period) == 1
+    assert maybe_unwrap(schedule.depth) == 2
+    assert maybe_unwrap(schedule.register_period) == 1
     for component in (A_SCALE, B_SCALE):
         for step in (schedule.warmup_step(), schedule.loop_step(1)):
             for fill in (False, True):

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import unwrap
+from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import maybe_unwrap
 from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import KernelLayout
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import Schedule
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
@@ -292,13 +292,21 @@ def test_minimum_uses_resolved_scale_storage_after_preparation(
         DtypeQuant.MXFP8, DtypeQuant.MXFP8,
     )
     raw = Schedule(raw_tc, KernelLayout(raw_tc), case.k)
-    assert unwrap(raw.depth) + unwrap(raw.peeled) + unwrap(raw.unroll) == 9
+    assert (
+        maybe_unwrap(raw.depth) + maybe_unwrap(raw.peeled) + maybe_unwrap(raw.unroll)
+        == 9
+    )
     packed_tc = host._probe_tuning_config(
         dict(cfg, A_SCALE_SORTED_SHUFFLED=True, B_SCALE_SHUFFLED=True),
         DtypeQuant.MXFP8, DtypeQuant.MXFP8,
     )
     packed = Schedule(packed_tc, KernelLayout(packed_tc), case.k)
-    assert unwrap(packed.depth) + unwrap(packed.peeled) + unwrap(packed.unroll) == 6
+    assert (
+        maybe_unwrap(packed.depth)
+        + maybe_unwrap(packed.peeled)
+        + maybe_unwrap(packed.unroll)
+        == 6
+    )
     monkeypatch.setenv("AITER_TRITON_MOE_GLUON_SORTED_SCALES", "1")
     monkeypatch.setenv("AITER_TRITON_MOE_GLUON_SHUFFLED_W_SCALES", "1")
     packed_a = torch.empty(2 * 128 * case.k // 32, dtype=torch.uint8)

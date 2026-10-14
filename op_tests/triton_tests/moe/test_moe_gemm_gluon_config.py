@@ -18,7 +18,10 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._entry import (
     _moe_gluon_gemm2,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._frozen import _validate_frozen
-from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import constexpr_fields, unwrap
+from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import (
+    constexpr_fields,
+    maybe_unwrap,
+)
 from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import KernelLayout
 from aiter.ops.triton._gluon_kernels.gfx950.moe._pipeline import (
     _PipelinePointers,
@@ -116,7 +119,11 @@ def _schedule(tc, layout, num_k=1, epilogue_groups=0):
 
 def _minimum(tc, layout):
     schedule = _schedule(tc, layout)
-    return unwrap(schedule.depth) + unwrap(schedule.peeled) + unwrap(schedule.unroll)
+    return (
+        maybe_unwrap(schedule.depth)
+        + maybe_unwrap(schedule.peeled)
+        + maybe_unwrap(schedule.unroll)
+    )
 
 
 @pytest.mark.parametrize("kernel", [_moe_gluon_gemm1, _moe_gluon_gemm2])
@@ -490,7 +497,9 @@ def test_commit_scheme_counts_real_payload_and_scale_groups(
     assert _plain(layout.component_via_lds((1, True)))
     schedule = _schedule(tc, layout, 64)
     loop = schedule.loop_step(0)
-    slots = _plain(unwrap(layout.num_m_slots)) * _plain(unwrap(layout.num_n_slots))
+    slots = _plain(maybe_unwrap(layout.num_m_slots)) * _plain(
+        maybe_unwrap(layout.num_n_slots)
+    )
     assert sum(len(schedule.commits(loop, slot)) for slot in range(slots)) == groups
     # commit_per_stage is the predicate the emitter actually branches on; the
     # wait_at_stage_head alias it used to go through had no production caller.
@@ -712,8 +721,8 @@ def test_register_storage_options_are_independent(config, storage_mask):
         expected += bn * bk // 32 * 3
     if not storage_mask & 4:
         expected += bm * bk // 32 * 2
-    assert _plain(unwrap(layout.lds_bytes)) == expected
-    assert unwrap(_schedule(tc, layout).unroll) == 6
+    assert _plain(maybe_unwrap(layout.lds_bytes)) == expected
+    assert maybe_unwrap(_schedule(tc, layout).unroll) == 6
     assert _plain(_validate(tc, 4096, 7168))
     assert _plain(_validate(tc, 4096, bk * _minimum(tc, layout)))
     with pytest.raises(AssertionError, match="NUM_K"):
@@ -742,28 +751,28 @@ def test_all_component_buffer_counts_determine_lcm_unroll(
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     layout = KernelLayout(tc)
     schedule = _schedule(tc, layout)
-    assert unwrap(schedule.register_period) == period
-    assert unwrap(schedule.unroll) == expected
+    assert maybe_unwrap(schedule.register_period) == period
+    assert maybe_unwrap(schedule.unroll) == expected
     resolved = [count or config["NUM_LDS_BUFFER"] for count in counts]
     assert [
         _plain(tc.num_buffers(operand, scale))
         for scale in (False, True)
         for operand in (0, 1)
     ] == resolved
-    assert unwrap(schedule.depth) == max(resolved)
+    assert maybe_unwrap(schedule.depth) == max(resolved)
 
 
 def test_lds_depths_constrain_unroll(config):
     config["K_UNROLL"] = 7
     fc = KernelFuncConfig(*_func_spec())
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    assert unwrap(_schedule(tc, KernelLayout(tc)).unroll) == 21
+    assert maybe_unwrap(_schedule(tc, KernelLayout(tc)).unroll) == 21
     config.update(A_NUM_BUFFER=2, B_NUM_BUFFER=4, A_SCALE_NUM_BUFFER=2)
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    assert unwrap(_schedule(tc, KernelLayout(tc)).unroll) == 84
+    assert maybe_unwrap(_schedule(tc, KernelLayout(tc)).unroll) == 84
     config["ALLOW_A_SCALE_VIA_LDS"] = False
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    assert unwrap(_schedule(tc, KernelLayout(tc)).unroll) == 84
+    assert maybe_unwrap(_schedule(tc, KernelLayout(tc)).unroll) == 84
 
 
 def test_small_payload_tiles_use_register_rings(config):
@@ -803,8 +812,8 @@ def test_small_payload_tiles_use_register_rings(config):
     assert not _plain(layout.component_via_lds(B_PAYLOAD))
     assert config["ALLOW_B_VIA_LDS"]
     assert not config["B_PRESHUFFLED"]
-    assert unwrap(_schedule(tc, layout).register_period) == 6
-    assert _plain(unwrap(layout.lds_bytes)) == 0
+    assert maybe_unwrap(_schedule(tc, layout).register_period) == 6
+    assert _plain(maybe_unwrap(layout.lds_bytes)) == 0
     assert _plain(_validate(tc, 64, 512))
 
     # A FROZEN_STEP build is validated by the frozen snapshot's own copy.
@@ -843,12 +852,14 @@ def test_absent_scales_do_not_participate_in_depth_unroll_or_validation(
     assert _plain(layout.component_in_reg(A_SCALE))
     assert _plain(layout.component_in_reg(B_SCALE))
     schedule = _schedule(tc, layout)
-    for slot in range(unwrap(layout.num_m_slots) * unwrap(layout.num_n_slots)):
+    for slot in range(
+        maybe_unwrap(layout.num_m_slots) * maybe_unwrap(layout.num_n_slots)
+    ):
         owned = schedule.owned(slot)
         assert owned[COMPONENTS.index(A_SCALE)] is None
         assert owned[COMPONENTS.index(B_SCALE)] is None
-    assert unwrap(schedule.depth) == 4
-    assert unwrap(schedule.unroll) == 12
+    assert maybe_unwrap(schedule.depth) == 4
+    assert maybe_unwrap(schedule.unroll) == 12
     assert _plain(host._validate_selected_pipeline(tc, layout, 7168))
 
 
@@ -889,8 +900,8 @@ def test_shared_depth_exact_minimum_and_all_unroll_remainders(config, depth, unr
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     layout = KernelLayout(tc)
     schedule = _schedule(tc, layout)
-    assert unwrap(schedule.peeled) == 1
-    effective_unroll = unwrap(schedule.unroll)
+    assert maybe_unwrap(schedule.peeled) == 1
+    effective_unroll = maybe_unwrap(schedule.unroll)
     assert effective_unroll == math.lcm(depth, unroll)
     minimum = depth + 1 + effective_unroll
     for remainder in range(effective_unroll):
@@ -993,7 +1004,7 @@ def test_shuffled_k128_scales_constrain_lcm_unroll(config, independent):
         )
     )
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    assert unwrap(_schedule(tc, KernelLayout(tc)).unroll) == 6
+    assert maybe_unwrap(_schedule(tc, KernelLayout(tc)).unroll) == 6
     assert _plain(_validate(tc, 4096, 7168))
     assert host._scale_shuffle_supported(config, 0)
     assert host._scale_shuffle_supported(config, 1)
@@ -1052,7 +1063,7 @@ def test_epilogue_modes_preserve_output_geometry(config, epilogue):
     assert _plain(func.activation_reduction_n()) == 2
     # WeightGuHbmLayout.SPLIT halves across two N slots, so one slot's raw columns map 1:1 onto
     # emitted channels.
-    assert _plain(unwrap(layout.output_n_slot)) == _plain(tc.MINI_BLOCK_N)
+    assert _plain(maybe_unwrap(layout.output_n_slot)) == _plain(tc.MINI_BLOCK_N)
     assert _plain(layout.grid_N(4096)) == 16
     assert _plain(_validate(tc, 4096, 7168))
 
@@ -1112,9 +1123,9 @@ def _executed_step(schedule, num_k, k_step):
     the main steps end on.
     """
     depth, peeled, unroll = (
-        unwrap(schedule.depth),
-        unwrap(schedule.peeled),
-        unwrap(schedule.unroll),
+        maybe_unwrap(schedule.depth),
+        maybe_unwrap(schedule.peeled),
+        maybe_unwrap(schedule.unroll),
     )
     main = num_k - depth
     if k_step < 0:
@@ -1124,13 +1135,13 @@ def _executed_step(schedule, num_k, k_step):
     if k_step <= peeled:
         return schedule.peeled_step(k_step - 1)
     if k_step > main:
-        static_drain = unwrap(schedule.static_drain)
-        phase = main % unwrap(schedule.ring_period) if static_drain else 0
+        static_drain = maybe_unwrap(schedule.static_drain)
+        phase = main % maybe_unwrap(schedule.ring_period) if static_drain else 0
         return schedule.drain_step(phase, k_step - main - 1)
     loop_end = peeled + (main - peeled) // unroll * unroll
     if k_step <= loop_end:
         return schedule.loop_step((k_step - peeled - 1) % unroll)
-    if unwrap(schedule.static_remainder):
+    if maybe_unwrap(schedule.static_remainder):
         return schedule.remainder_step(k_step - loop_end - 1)
     return schedule.remainder_step(0)
 
@@ -1144,8 +1155,8 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
     exact ring-bank contents and overwrite safety.
     """
     schedule = _schedule(tc, layout, num_k, epilogue_groups)
-    nm = _plain(unwrap(layout.num_m_slots))
-    nn = _plain(unwrap(layout.num_n_slots))
+    nm = _plain(maybe_unwrap(layout.num_m_slots))
+    nn = _plain(maybe_unwrap(layout.num_n_slots))
     nslots = nm * nn
     if (nm, nn) == (2, 2):
         payloads = [
@@ -1225,9 +1236,11 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
         )
 
     committed, group_for_copy, issued, consumed, lds = [], {}, set(), set(), {}
-    depth = unwrap(schedule.depth)
+    depth = maybe_unwrap(schedule.depth)
     main = num_k - depth
-    assert num_k >= depth + unwrap(schedule.peeled) + unwrap(schedule.unroll)
+    assert num_k >= depth + maybe_unwrap(schedule.peeled) + maybe_unwrap(
+        schedule.unroll
+    )
     scheme = _plain(tc.WAIT_COMMIT_SCHEME)
     per_stage = scheme in (
         WaitCommitScheme.PER_STAGE_WHOLE,
