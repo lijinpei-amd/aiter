@@ -512,14 +512,14 @@ def _run_scalar_pipeline(monkeypatch, tc, layout, stages, fused):
         patch.setattr(buffered, "pick_stage", lambda _: lambda _name: nullcontext())
         for name in (
             "_index",
-            "_replace_tile",
+            "_replace_fragments",
             "_rotate",
             "_rotate_buffers",
             "_init_buffers",
             "_fill_slot",
             "_advance",
-            "_read_tile",
-            "_read_scale_tile",
+            "_read_payload",
+            "_read_scale",
             "_read_slot",
             "_step",
             "_step_live",

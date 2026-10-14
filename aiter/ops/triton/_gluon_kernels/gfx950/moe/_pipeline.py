@@ -67,18 +67,18 @@ def _sched_hint(MODE: gl.constexpr):
 class _PipelineConst:
     """Loop-invariant data for a K-pipeline step.
 
-    Hoisted once before the loop: LDS buffers, tile offsets, and per-stage pointer
+    Hoisted once before the loop: LDS buffers, HBM offset grids, and per-step pointer
     increments. Only :class:`_PipelinePointers` and :class:`_PipelineRegFragments`
     cross the back edge.
 
     Every offset grid is a *tuple*, one entry per mini block: ``num_m_slots()`` for the A
-    side, ``num_n_slots()`` for the B side. Each entry is laid out for its own mini tile's
+    side, ``num_n_slots()`` for the B side. Each entry is laid out for its own slot's
     copy layout, which is what keeps every per-mini-block direct-to-LDS copy as wide and
     as coalesced as the whole-tile copy it replaces.
 
     ``a_scale_hbm_offs``/``b_scale_hbm_offs`` serve both direct-to-LDS and register
     loads. Both walk K by advancing their scalar base pointer in
-    :class:`_PipelinePointers` instead of the offset grid, so the tile grid is
+    :class:`_PipelinePointers` instead of the offset grid, so the offset grid is
     computed once and never moves.
 
     The two ``*_scale_stride_k`` are lifted out of the operand tuples rather than kept as
@@ -227,16 +227,16 @@ def _index(
         # two agree. Spelling it this way means the ring index stays right if a
         # register component is ever routed through here.
         advance: gl.constexpr = sched.fill_span(component) - 1 if FILL else 0
-        tile = (step + advance) // ratio
+        k_tile = (step + advance) // ratio
         if require_constexpr(sched.register_period() == 1):
             # Avoid signed ring arithmetic without disturbing live register queues.
-            gl.assume(tile >= 0)
-        out = tile % depth
+            gl.assume(k_tile >= 0)
+        out = k_tile % depth
     return out
 
 
 @gluon.jit
-def _replace_tile(queue, fragments, OFFSET: gl.constexpr):
+def _replace_fragments(queue, fragments, OFFSET: gl.constexpr):
     out = ()
     for j in gl.static_range(len(queue)):
         if require_constexpr(
@@ -249,10 +249,10 @@ def _replace_tile(queue, fragments, OFFSET: gl.constexpr):
 
 
 @gluon.jit
-def _rotate(queue, TILE_COUNT: gl.constexpr):
+def _rotate(queue, SHIFT: gl.constexpr):
     out = ()
     for j in gl.static_range(len(queue)):
-        out += (queue[(j + TILE_COUNT) % len(queue)],)
+        out += (queue[(j + SHIFT) % len(queue)],)
     return out
 
 
@@ -415,7 +415,7 @@ def _fill_slot(
                 pc.a_hbm_offs[ops[0]],
                 a_soff,
             )
-            a = _replace_tile(
+            a = _replace_fragments(
                 a,
                 fragments,
                 (sched.register_index(STEP, _A_PAYLOAD, True) * nm + ops[0]) * mk,
@@ -443,7 +443,7 @@ def _fill_slot(
                 pc.a_scale_hbm_offs[ops[1]],
                 as_soff,
             )
-            a_scale = _replace_tile(
+            a_scale = _replace_fragments(
                 a_scale,
                 fragments,
                 sched.register_index(STEP, _A_SCALE, True)
@@ -461,7 +461,7 @@ def _fill_slot(
                 pc.b_hbm_offs[ops[2]],
                 b_soff,
             )
-            b = _replace_tile(
+            b = _replace_fragments(
                 b,
                 fragments,
                 (sched.register_index(STEP, _B_PAYLOAD, True) * nn + ops[2]) * mk,
@@ -501,7 +501,7 @@ def _fill_slot(
                 pc.b_scale_hbm_offs[ops[3]],
                 bs_soff,
             )
-            b_scale = _replace_tile(
+            b_scale = _replace_fragments(
                 b_scale,
                 fragments,
                 sched.register_index(STEP, _B_SCALE, True)
@@ -557,14 +557,15 @@ def _advance(pc, ptrs, STEP: gl.constexpr):
 
 
 @gluon.jit
-def _read_tile(
+def _read_payload(
     pc,
     buffers,
     step,
     STEP: gl.constexpr,
-    tile: gl.constexpr,
+    non_k_slot: gl.constexpr,
     operand: gl.constexpr,
 ):
+    """Read one non-K slot of an operand's payload, from LDS or its register ring."""
     layout: gl.constexpr = pc.layout
     sched: gl.constexpr = pc.schedule
     component: gl.constexpr = (operand, False)
@@ -574,7 +575,7 @@ def _read_tile(
         payload, _ = pc.lds_ptrs.ds_read_frag(
             operand,
             _index(sched, step, STEP, component, False),
-            tile,
+            non_k_slot,
             k,
             READ_PAYLOAD=not reg_payload,
             READ_SCALE=False,
@@ -584,7 +585,7 @@ def _read_tile(
                 (
                     sched.register_index(STEP, component)
                     * (layout.num_m_slots() if operand == 0 else layout.num_n_slots())
-                    + tile
+                    + non_k_slot
                 )
                 * layout.num_k_slots()
                 + k
@@ -594,15 +595,15 @@ def _read_tile(
 
 
 @gluon.jit
-def _read_scale_tile(
+def _read_scale(
     pc,
     buffers,
     step,
     STEP: gl.constexpr,
-    tile: gl.constexpr,
+    non_k_slot: gl.constexpr,
     operand: gl.constexpr,
 ):
-    """Read all fragments shared by one non-K scale tile and its R K steps."""
+    """Read all fragments shared by one non-K slot of a scale and its R K steps."""
     layout: gl.constexpr = pc.layout
     sched: gl.constexpr = pc.schedule
     component: gl.constexpr = (operand, True)
@@ -610,14 +611,14 @@ def _read_scale_tile(
         fragments = pc.lds_ptrs.ds_read_scale(
             operand,
             _index(sched, step, STEP, component, False),
-            tile,
+            non_k_slot,
         )
     else:
         offset: gl.constexpr = sched.register_index(
             STEP, component
-        ) * layout.scale_cache_fragments(operand) + tile * layout.scale_read_k_slots(
+        ) * layout.scale_cache_fragments(
             operand
-        )
+        ) + non_k_slot * layout.scale_read_k_slots(operand)
         fragments = ()
         for k in gl.static_range(
             layout.scale_ratio_non_k_slot(operand) * layout.scale_read_k_slots(operand)
@@ -645,21 +646,21 @@ def _read_slot(
     bst: gl.constexpr = sched.selected(slot, _B_SCALE)
     a, b, a_scale, b_scale = (), (), (), ()
     if require_constexpr(at is not None and sched.read_in_mfma(_A_PAYLOAD, at) == MFMA):
-        a = _read_tile(pc, buffers, step, STEP, at, 0)
+        a = _read_payload(pc, buffers, step, STEP, at, 0)
     if require_constexpr(
         ast is not None
         and sched.selects(STEP, _A_SCALE)
         and sched.read_in_mfma(_A_SCALE, ast) == MFMA
     ):
-        a_scale = _read_scale_tile(pc, buffers, step, STEP, ast, 0)
+        a_scale = _read_scale(pc, buffers, step, STEP, ast, 0)
     if require_constexpr(bt is not None and sched.read_in_mfma(_B_PAYLOAD, bt) == MFMA):
-        b = _read_tile(pc, buffers, step, STEP, bt, 1)
+        b = _read_payload(pc, buffers, step, STEP, bt, 1)
     if require_constexpr(
         bst is not None
         and sched.selects(STEP, _B_SCALE)
         and sched.read_in_mfma(_B_SCALE, bst) == MFMA
     ):
-        b_scale = _read_scale_tile(pc, buffers, step, STEP, bst, 1)
+        b_scale = _read_scale(pc, buffers, step, STEP, bst, 1)
     return a, b, a_scale, b_scale
 
 
@@ -670,24 +671,24 @@ def _take_operand_pairs(
     tc,
     layout,
     operand: gl.constexpr,
-    tile: gl.constexpr,
+    non_k_slot: gl.constexpr,
     PHASE: gl.constexpr,
 ):
     out = ()
     for k in gl.static_range(layout.num_k_slots()):
         if require_constexpr(tc.func_cfg.has_scale(operand)):
             out += (
-                payload[tile * layout.num_k_slots() + k],
+                payload[non_k_slot * layout.num_k_slots() + k],
                 scale[
-                    tile * layout.scale_read_k_slots(operand)
+                    non_k_slot * layout.scale_read_k_slots(operand)
                     + PHASE % layout.scale_ratio_k_step(operand) * layout.num_k_slots()
                     + k
                 ],
             )
         else:
             out += (
-                payload[tile * layout.num_k_slots() + k],
-                scale[tile * layout.num_k_slots() + k],
+                payload[non_k_slot * layout.num_k_slots() + k],
+                scale[non_k_slot * layout.num_k_slots() + k],
             )
     return out
 
@@ -921,15 +922,15 @@ def _drain_buffered_pipeline(pc, ptrs, buffers, regs, NUM_K):
                 sched.drain_step(0, j),
             )
     a_scale, b_scale = (), ()
-    for tile in gl.static_range(layout.num_m_slots()):
+    for mi in gl.static_range(layout.num_m_slots()):
         pairs = _take_operand_pairs(
-            regs.a_payload, regs.a_scale, tc, layout, 0, tile, sched.num_k() - 1
+            regs.a_payload, regs.a_scale, tc, layout, 0, mi, sched.num_k() - 1
         )
         for k in gl.static_range(layout.num_k_slots()):
             a_scale += (pairs[2 * k + 1],)
-    for tile in gl.static_range(layout.num_n_slots()):
+    for ni in gl.static_range(layout.num_n_slots()):
         pairs = _take_operand_pairs(
-            regs.b_payload, regs.b_scale, tc, layout, 1, tile, sched.num_k() - 1
+            regs.b_payload, regs.b_scale, tc, layout, 1, ni, sched.num_k() - 1
         )
         for k in gl.static_range(layout.num_k_slots()):
             b_scale += (pairs[2 * k + 1],)

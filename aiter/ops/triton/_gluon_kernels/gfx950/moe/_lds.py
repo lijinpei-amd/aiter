@@ -37,7 +37,7 @@ def _buffer_load_to_lds(
     cache: gl.constexpr,
     SOFF: gl.constexpr = 0,
 ):
-    """Copy one tile directly from global memory to LDS.
+    """Copy one non-K slot of a component directly from global memory to LDS.
 
     ``SOFF`` is a byte offset from ``hbm_ptr`` that is uniform across the block. It rides in
     the buffer op's ``soffset`` (SGPR) field, so unlike folding it into ``hbm_offs`` it
@@ -123,14 +123,14 @@ class LDSManager:
     def alloc(func_cfg, tuning_cfg, layout):
         """Static factory -- invoked as ``LDSManager.alloc(...)``, no ``self``.
 
-        The leading axis runs over pipeline buffer *and* mini block
-        (``num_m_slots()`` tiles for A, ``num_n_slots()`` for B), flattened as
-        ``buffer_idx * n_tiles + tile``: a shared allocation takes a layout of the tile's own
-        rank, so two separate leading axes are not expressible. The mini block is a real
-        allocation rather than a slice of one big tile so that each one keeps the padded
-        layout ``compute_efficient_padded_shared_layout`` picked *for its own shape* --
-        that is what makes the per-mini-block direct-to-LDS copy as coalesced and as wide
-        as the whole-tile copy was.
+        The leading axis runs over pipeline buffer *and* non-K slot
+        (``num_m_slots()`` for A, ``num_n_slots()`` for B), flattened as
+        ``buffer_idx * n_slots + non_k_slot``: a shared allocation takes a layout of its
+        own rank, so two separate leading axes are not expressible. Each non-K slot is a
+        real allocation rather than a slice of one big tile so that each one keeps the
+        padded layout ``compute_efficient_padded_shared_layout`` picked *for its own
+        shape* -- that is what makes the per-slot direct-to-LDS copy as coalesced and as
+        wide as the whole-tile copy was.
         """
         a_ty: gl.constexpr = func_cfg.operand_elem_ty(0)
         b_ty: gl.constexpr = func_cfg.operand_elem_ty(1)
@@ -188,12 +188,12 @@ class LDSManager:
         operand: gl.constexpr,
         VIA_LDS: gl.constexpr,
         BUFFER_LOAD_IDX,
-        tile: gl.constexpr,
+        non_k_slot: gl.constexpr,
         hbm_ptr,
         hbm_offs,
         SOFF: gl.constexpr = 0,
     ):
-        """Load one A (0) or B (1) payload tile into LDS or operand registers.
+        """Load one non-K slot of the A (0) or B (1) payload into LDS or registers.
 
         The register path returns the complete BLOCK_K stage as one fragment; its
         offsets must already use the operand fragment layout. The caller owns
@@ -214,7 +214,7 @@ class LDSManager:
                 lds_ptr = self.b_payload_lds_ptr
             _buffer_load_to_lds(
                 lds_ptr.index(
-                    BUFFER_LOAD_IDX * layout.num_lds_slots_non_k(operand) + tile
+                    BUFFER_LOAD_IDX * layout.num_lds_slots_non_k(operand) + non_k_slot
                 ),
                 hbm_ptr,
                 hbm_offs,
@@ -233,13 +233,13 @@ class LDSManager:
         operand: gl.constexpr,
         VIA_LDS: gl.constexpr,
         BUFFER_LOAD_IDX,
-        tile: gl.constexpr,
+        non_k_slot: gl.constexpr,
         hbm_ptr,
         hbm_offs,
         SOFF: gl.constexpr = 0,
         K_PHASE=0,
     ):
-        """Load one scale tile covering one or more complete payload K stages."""
+        """Load one non-K slot of a scale, covering one or more whole K steps."""
         cfg: gl.constexpr = self.tuning_cfg
         layout: gl.constexpr = self.layout
         cache: gl.constexpr = (
@@ -252,7 +252,7 @@ class LDSManager:
             if require_constexpr(
                 self.func_cfg.has_scale(operand)
                 and layout.component_via_lds((operand, True))
-                and tile % ratio == 0
+                and non_k_slot % ratio == 0
             ):
                 if require_constexpr(operand == 0):
                     lds_ptr = self.a_scale_lds_ptr
@@ -261,7 +261,7 @@ class LDSManager:
                 _buffer_load_to_lds(
                     lds_ptr.index(
                         BUFFER_LOAD_IDX * layout.num_scale_tiles(operand)
-                        + tile // ratio
+                        + non_k_slot // ratio
                     ),
                     hbm_ptr,
                     hbm_offs,
@@ -299,7 +299,9 @@ class LDSManager:
             return fragments
 
     @gluon.jit
-    def ds_read_scale(self, operand: gl.constexpr, SCALE_READ_IDX, tile: gl.constexpr):
+    def ds_read_scale(
+        self, operand: gl.constexpr, SCALE_READ_IDX, non_k_slot: gl.constexpr
+    ):
         """Read each scale mini block once and retain all of its consumer fragments."""
         cfg: gl.constexpr = self.tuning_cfg
         layout: gl.constexpr = self.layout
@@ -310,7 +312,7 @@ class LDSManager:
         if require_constexpr(cfg.scale_shuffled(operand)):
             scale_ptr = lds_ptr.index(
                 SCALE_READ_IDX * layout.num_scale_tiles(operand)
-                + tile // layout.scale_ratio_non_k_slot(operand)
+                + non_k_slot // layout.scale_ratio_non_k_slot(operand)
             )
             if require_constexpr(layout.scale_packed_ok(operand)):
                 scale = _ds_read(
@@ -335,7 +337,7 @@ class LDSManager:
             fragments = (
                 _ds_read(
                     lds_ptr.index(
-                        SCALE_READ_IDX * layout.num_scale_tiles(operand) + tile
+                        SCALE_READ_IDX * layout.num_scale_tiles(operand) + non_k_slot
                     ),
                     layout.dot_operand_scale_fragment_layout(operand),
                 ),
@@ -357,13 +359,13 @@ class LDSManager:
         self,
         operand: gl.constexpr,
         DS_READ_IDX,
-        tile: gl.constexpr,
-        mini_idx: gl.constexpr,
+        non_k_slot: gl.constexpr,
+        k_slot: gl.constexpr,
         READ_PAYLOAD: gl.constexpr = True,
         READ_SCALE: gl.constexpr = True,
         SCALE_READ_IDX=None,
     ):
-        """Read one A (0) or B (1) mini-M/N, BLOCK_K fragment from LDS.
+        """Read K slot ``k_slot`` of one non-K slot of A (0) or B (1) from LDS.
 
         An absent or disabled component returns None.
         """
@@ -379,7 +381,7 @@ class LDSManager:
         else:
             payload = _ds_read(
                 payload_lds_ptr.index(
-                    DS_READ_IDX * layout.num_lds_slots_non_k(operand) + tile
+                    DS_READ_IDX * layout.num_lds_slots_non_k(operand) + non_k_slot
                 ),
                 layout.dot_operand_fragment_layout(operand),
             )
@@ -390,10 +392,10 @@ class LDSManager:
             )
             ratio: gl.constexpr = layout.scale_ratio_non_k_slot(operand)
             fragments = self.ds_read_scale(
-                operand, SCALE_READ_IDX, tile // ratio * ratio
+                operand, SCALE_READ_IDX, non_k_slot // ratio * ratio
             )
             scale_val = fragments[
-                (tile % ratio) * layout.scale_read_k_slots(operand) + mini_idx
+                (non_k_slot % ratio) * layout.scale_read_k_slots(operand) + k_slot
             ]
         else:
             scale_val: gl.constexpr = None
