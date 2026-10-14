@@ -24,10 +24,12 @@ from triton.language.core import _aggregate as aggregate
 
 from ._lang import MX_GROUP, WARP_SIZE, require_constexpr, strip_annotate
 from ._lang import unwrap as _v
+from ._types import WeightGuHbmLayout
 
 __all__ = ["KernelLayout", "compute_kernel_layout"]
 
 _NO_SCALE: gl.constexpr = gl.constexpr(None)
+_WEIGHT_GU_SPLIT: gl.constexpr = gl.constexpr(int(WeightGuHbmLayout.SPLIT))
 
 
 @gluon.constexpr_function
@@ -305,11 +307,13 @@ def _n_reduction_slot(func_cfg):
     """Emitted columns per raw column within one N slot.
 
     The block-level ratio is always ``KernelFuncConfig.activation_reduction_n``, but
-    under ``gu_split`` the halving happens *across* two slots rather than inside each
-    one -- a slot is a whole operand side, so its width maps 1:1 onto emitted
-    channels and two of them collapse into one output tile.
+    under ``WeightGuHbmLayout.SPLIT`` the halving happens *across* two slots rather
+    than inside each one -- a slot is a whole operand side, so its width maps 1:1 onto
+    emitted channels and two of them collapse into one output tile.
     """
-    return 1 if func_cfg.gu_split() else func_cfg.activation_reduction_n()
+    if _v(func_cfg.weight_gu_hbm_layout) == WeightGuHbmLayout.SPLIT:
+        return 1
+    return func_cfg.activation_reduction_n()
 
 
 # -- per-quantity derivations ---------------------------------------------------------
@@ -1087,14 +1091,19 @@ def _calc_quant_staging_layout(tc):
 
 @gluon.constexpr_function
 def _calc_quant_staging_rows(tc):
-    return _v(tc.BLOCK_M) if tc.func_cfg.gu_split() else _v(tc.MINI_BLOCK_M)
+    if _v(tc.func_cfg.weight_gu_hbm_layout) == WeightGuHbmLayout.SPLIT:
+        return _v(tc.BLOCK_M)
+    return _v(tc.MINI_BLOCK_M)
 
 
 @gluon.constexpr_function
 def _calc_quant_staging_rotates(tc):
     """Whether the fused-quant staging alternates two per-tile LDS banks."""
     fc = tc.func_cfg
-    return _v(fc.output_quant) is not None and not fc.gu_split()
+    return (
+        _v(fc.output_quant) is not None
+        and _v(fc.weight_gu_hbm_layout) != WeightGuHbmLayout.SPLIT
+    )
 
 
 @gluon.constexpr_function
@@ -1189,7 +1198,7 @@ class KernelLayout:
     _BLOCK_N: gl.constexpr
     _BLOCK_K: gl.constexpr
     _mfma_instr_shape: gl.constexpr
-    _gu_split: gl.constexpr
+    _weight_gu_hbm_layout: gl.constexpr
     _num_warps: gl.constexpr
     _num_k_slots_per_tile: gl.constexpr
     _num_prefetch_k_slots: gl.constexpr
@@ -1718,7 +1727,7 @@ class KernelLayout:
             else _v(extent_m)
         )
         output_n = self.output_n_slot() if _v(output_n) is None else _v(output_n)
-        if _v(self._gu_split):
+        if _v(self._weight_gu_hbm_layout) == WeightGuHbmLayout.SPLIT:
             instr = _v(self._mfma_instr_shape)
             return max(1, min(MX_GROUP, (instr[0] * instr[1]) // WARP_SIZE))
         per_lane = (extent_m * output_n) // (self.num_warps() * WARP_SIZE)
@@ -1743,14 +1752,14 @@ class KernelLayout:
 
     @gluon.jit
     def n_start(self, pid_n, n_slot_idx: gl.constexpr, N):
-        """Raw-N start of slot ``n_slot_idx`` under interleaved or split gate/up packing.
+        """Raw-N start of slot ``n_slot_idx`` under either ``WeightGuHbmLayout``.
 
         Interleaved tiles are contiguous. Split tiles cover the same emitted channels but
         read gate and up from separate halves of N.
         """
         # One N slot's raw-N width (MINI_BLOCK_N) is the accumulator tile's N extent.
         n_slot: gl.constexpr = self.accumulator_fragment_shape_slot()[1]
-        if require_constexpr(self._gu_split):
+        if require_constexpr(self._weight_gu_hbm_layout == _WEIGHT_GU_SPLIT):
             out = pid_n * n_slot + n_slot_idx * (N // 2)
         else:
             out = pid_n * self._BLOCK_N + n_slot_idx * n_slot
@@ -1758,9 +1767,9 @@ class KernelLayout:
 
     @gluon.jit
     def n_split_offs(self, pid_n, i, N):
-        """Map a whole raw-N CTA index tensor through the gate/up packing."""
+        """Map a whole raw-N CTA index tensor through the ``WeightGuHbmLayout``."""
         n_slot: gl.constexpr = self.accumulator_fragment_shape_slot()[1]
-        if require_constexpr(self._gu_split):
+        if require_constexpr(self._weight_gu_hbm_layout == _WEIGHT_GU_SPLIT):
             out = pid_n * n_slot + (i // n_slot) * (N // 2) + i % n_slot
         else:
             out = pid_n * self._BLOCK_N + i
@@ -1954,7 +1963,9 @@ class KernelLayout:
         SCALE_K: gl.constexpr = self.scale_mini_block_k(1)
         SCALE_RATIO: gl.constexpr = self.scale_ratio_non_k_slot(1)
         SPLIT_EXTENT: gl.constexpr = (
-            N_SLOT if func_cfg.gu_split() and SCALE_RATIO > 1 else 0
+            N_SLOT
+            if func_cfg.weight_gu_hbm_layout == _WEIGHT_GU_SPLIT and SCALE_RATIO > 1
+            else 0
         )
 
         if require_constexpr(tuning_cfg.scale_shuffled(1) and self.scale_in_reg(1)):
@@ -2070,7 +2081,7 @@ def compute_kernel_layout(tuning_cfg):
         BLOCK_N=_v(tc.BLOCK_N),
         BLOCK_K=_v(tc.BLOCK_K),
         mfma_instr_shape=list(_v(tc.mfma_instr_shape)),
-        gu_split=fc.gu_split(),
+        weight_gu_hbm_layout=_v(fc.weight_gu_hbm_layout),
         num_warps=_calc_num_warps(tc),
         num_k_slots_per_tile=_calc_num_k_slots_per_tile(tc),
         num_prefetch_k_slots=_calc_num_prefetch_k_slots(tc),

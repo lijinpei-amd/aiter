@@ -20,9 +20,10 @@ from ._lang import optional as _opt
 from ._lang import require_constexpr
 from ._lang import unwrap as _v
 from ._quant import mxfp4_quant_gluon
-from ._types import DtypeQuant, _slot_index
+from ._types import DtypeQuant, WeightGuHbmLayout, _slot_index
 
 _DQ_MXFP4: gl.constexpr = gl.constexpr(int(DtypeQuant.MXFP4))
+_WEIGHT_GU_SPLIT: gl.constexpr = gl.constexpr(int(WeightGuHbmLayout.SPLIT))
 
 
 @aggregate
@@ -357,13 +358,14 @@ def _epilogue_one_tile(
     per slot the moment that slot's last MFMA retires. ``sub`` is the finished
     accumulator for tile ``(mi, ni)``.
 
-    Under ``gate_up_split`` a "tile" is a *pair*: ``sub`` is the gate side (mini-N block
-    ``ni``) and ``lin`` the linear side (block ``ni + 1``), covering the same emitted
-    channels. The activation is then a plain elementwise op between two tensors of
-    identical layout -- no reshape, no split, and none of the ``v_mov_b32`` gathers the
-    interleaved packing needs -- and the tile is ``MBN`` emitted channels wide rather
-    than ``MBN // 2``. ``STAGE_ROW`` is the row this tile occupies in a block-height LDS
-    staging buffer, which is what lets the caller flush all of them in one store.
+    Under ``WeightGuHbmLayout.SPLIT`` a "tile" is a *pair*: ``sub`` is the gate side
+    (mini-N block ``ni``) and ``lin`` the linear side (block ``ni + 1``), covering the
+    same emitted channels. The activation is then a plain elementwise op between two
+    tensors of identical layout -- no reshape, no split, and none of the ``v_mov_b32``
+    gathers the interleaved packing needs -- and the tile is ``MBN`` emitted channels
+    wide rather than ``MBN // 2``. ``STAGE_ROW`` is the row this tile occupies in a
+    block-height LDS staging buffer, which is what lets the caller flush all of them
+    in one store.
     """
     BM: gl.constexpr = tuning_cfg.BLOCK_M
     MBM: gl.constexpr = tuning_cfg.MINI_BLOCK_M
@@ -386,7 +388,7 @@ def _epilogue_one_tile(
         # bias, matching the Triton kernels exactly.
         if require_constexpr(not GATE_PRE):
             sub = sub * x_static_scale
-        if require_constexpr(func_cfg.gu_split()):
+        if require_constexpr(func_cfg.weight_gu_hbm_layout == _WEIGHT_GU_SPLIT):
             lin = lin * x_static_scale
 
     if require_constexpr(func_cfg.has_bias and func_cfg.epilogue < 2):
@@ -394,17 +396,19 @@ def _epilogue_one_tile(
         # tile per side, so each accumulator takes its own.
         if require_constexpr(not GATE_PRE):
             sub = sub + bias_tiles[ni][None, :]
-        if require_constexpr(func_cfg.gu_split()):
+        if require_constexpr(func_cfg.weight_gu_hbm_layout == _WEIGHT_GU_SPLIT):
             lin = lin + bias_tiles[ni + 1][None, :]
 
-    if require_constexpr(func_cfg.gu_split() and func_cfg.epilogue != 0):
+    if require_constexpr(
+        func_cfg.weight_gu_hbm_layout == _WEIGHT_GU_SPLIT and func_cfg.epilogue != 0
+    ):
         # Ablation: the same [MBM, MBN] x 2 -> [MBM, MBN] reduction, minus exp2/rcp.
         out = sub * lin
         gl.static_assert(out.shape[1] == OUT_MBN)
     elif require_constexpr(GATE_PRE):
         out = _swiglu_combine(sub, lin, act.limit, ADD_RESIDUAL=act.add_residual)
         gl.static_assert(out.shape[1] == OUT_MBN)
-    elif require_constexpr(func_cfg.gu_split()):
+    elif require_constexpr(func_cfg.weight_gu_hbm_layout == _WEIGHT_GU_SPLIT):
         out = _swiglu_pair(
             sub,
             lin,
@@ -528,7 +532,7 @@ def _epilogue_one_tile(
             # below it still ran and stored the mini tile to the *unsliced* buffer --
             # which only surfaced as a shape mismatch because the split buffer is
             # block-height. Keep exactly one store path reachable per configuration.
-            if require_constexpr(func_cfg.gu_split()):
+            if require_constexpr(func_cfg.weight_gu_hbm_layout == _WEIGHT_GU_SPLIT):
                 # Block-height staging: every mi writes its own MBM rows of one buffer,
                 # so the caller flushes all NM tiles with a single barrier and a single
                 # store instead of a barrier pair per tile. Split halves the tile count
@@ -681,7 +685,7 @@ def _epilogue_store(
         qp2_lds_ptr: gl.constexpr = None
         qs2_lds_ptr: gl.constexpr = None
 
-    if require_constexpr(func_cfg.gu_split()):
+    if require_constexpr(func_cfg.weight_gu_hbm_layout == _WEIGHT_GU_SPLIT):
         # One pass over mi, pairing the two mini-N blocks: block 0 is the gate side and
         # block 1 the linear side of the *same* emitted channels, so the activation is
         # elementwise between two identically laid out accumulators. Every tile stages

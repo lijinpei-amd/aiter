@@ -62,6 +62,7 @@ __all__ = [
     "TuningSpec",
     "WaitCommitScheme",
     "WarpPipeline",
+    "WeightGuHbmLayout",
     "_slot_index",
     "dq_has_scale",
     "dq_mx_format",
@@ -155,6 +156,22 @@ class TileSched(IntEnum):
     XCD_GROUP_M = 2  # remap_xcd first, then GROUP_M blocking
 
 
+class WeightGuHbmLayout(IntEnum):
+    """Where a gated activation's gate and up columns sit along the weight's raw N
+    axis in HBM.
+
+    A contract with the caller, not a tuning knob: the kernel never permutes, so the
+    weights, weight scales and bias must already be stored this way. Both layouts
+    emit the same ``N / 2`` channels in the same order. Inert without a gated
+    activation.
+    """
+
+    INTERLEAVED = 0  # (g, u, g, u, ...): the pair for channel j is columns 2j, 2j + 1
+    # gate in [0, N/2), up in [N/2, N): the pair for channel j is columns j, N/2 + j.
+    # One N slot then holds one whole side; see activations.py::gate_up_split_perm.
+    SPLIT = 1
+
+
 class FuncSpec(NamedTuple):
     """Plain-Python mirror of :class:`KernelFuncConfig`'s fields, carried as a single
     ``gl.constexpr`` leaf so the launch-time argument specializer walks one item instead
@@ -173,7 +190,7 @@ class FuncSpec(NamedTuple):
     has_x_static_scale: bool
     # Trailing, with a default: every construction site is positional, so a new field
     # anywhere else would silently reinterpret the existing ones.
-    gate_up_split: bool = False
+    weight_gu_hbm_layout: int = int(WeightGuHbmLayout.INTERLEAVED)
     epilogue: int = int(EpilogueMode.DEFAULT)
 
 

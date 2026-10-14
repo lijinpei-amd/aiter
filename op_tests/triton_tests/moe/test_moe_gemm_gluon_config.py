@@ -57,6 +57,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     SchedMode,
     TuningSpec,
     WaitCommitScheme,
+    WeightGuHbmLayout,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import validate
 from aiter.ops.triton.moe import moe_op_gemm_gluon as host
@@ -102,7 +103,7 @@ def _func_spec(epilogue=EpilogueMode.DEFAULT):
         False,
         True,
         False,
-        True,
+        int(WeightGuHbmLayout.SPLIT),
         int(epilogue),
     )
 
@@ -168,7 +169,13 @@ def test_launch_specs_match_kernel_config_field_order(
     config[field] = value
     func = _func_spec(EpilogueMode.NOP)
     if not with_optional_specs:
-        func = func._replace(activation=None, output_quant=None)
+        # SPLIT folds to INTERLEAVED without an activation, so keep the spec consistent
+        # for the round trip; the fold has its own test below.
+        func = func._replace(
+            activation=None,
+            output_quant=None,
+            weight_gu_hbm_layout=int(WeightGuHbmLayout.INTERLEAVED),
+        )
     tuning = _tuning_spec(config)
     host_func = KernelFuncConfig(*func)
     host_tuning = KernelTuningConfig(host_func, *tuning)
@@ -184,6 +191,13 @@ def test_launch_specs_match_kernel_config_field_order(
     for aggregate in (host_tuning, device_tuning):
         for name, expected in tuning._asdict().items():
             assert _plain(getattr(aggregate, name)) == _plain(expected), name
+
+
+def test_weight_gu_hbm_layout_folds_to_interleaved_without_activation():
+    gated = KernelFuncConfig(*_func_spec())
+    assert _plain(gated.weight_gu_hbm_layout) == WeightGuHbmLayout.SPLIT
+    ungated = KernelFuncConfig(*_func_spec()._replace(activation=None))
+    assert _plain(ungated.weight_gu_hbm_layout) == WeightGuHbmLayout.INTERLEAVED
 
 
 def test_trailing_fields_and_older_config_dict_keep_defaults(config):
@@ -1039,7 +1053,7 @@ def test_epilogue_modes_preserve_output_geometry(config, epilogue):
     tc = KernelTuningConfig(func, *_tuning_spec(config))
     layout = compute_kernel_layout(tc)
     assert _plain(func.activation_reduction_n()) == 2
-    # gu_split halves across two N slots, so one slot's raw columns map 1:1 onto
+    # WeightGuHbmLayout.SPLIT halves across two N slots, so one slot's raw columns map 1:1 onto
     # emitted channels.
     assert _plain(layout.output_n_slot()) == _plain(tc.MINI_BLOCK_N)
     assert _plain(layout.grid_N(4096)) == 16

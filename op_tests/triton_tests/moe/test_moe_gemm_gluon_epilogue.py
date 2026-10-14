@@ -25,8 +25,11 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     DtypeQuant,
     FuncSpec,
     TuningSpec,
+    WeightGuHbmLayout,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+_WEIGHT_GU_SPLIT: gl.constexpr = gl.constexpr(int(WeightGuHbmLayout.SPLIT))
 
 
 def _epilogue_config(split, num_warps):
@@ -42,7 +45,7 @@ def _epilogue_config(split, num_warps):
         False,
         False,
         False,
-        split,
+        int(WeightGuHbmLayout.SPLIT if split else WeightGuHbmLayout.INTERLEAVED),
     )
     tuning = TuningSpec(
         BLOCK_M=128,
@@ -113,7 +116,7 @@ def _epilogue_probe(
     SH: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
     block_id = gl.program_id(0)
     pid_n = gl.program_id(1)
-    if func.gu_split():
+    if func.weight_gu_hbm_layout == _WEIGHT_GU_SPLIT:
         payload_smem = gl.allocate_shared_memory(gl.uint8, [128, 64], SH)
         scale_smem = gl.allocate_shared_memory(gl.uint8, [128, 4], SH)
         for mi in gl.static_range(2):

@@ -16,7 +16,7 @@ Each python file is a component, and inter files, the import dependency should b
 * `_config.py`:
     * `KernelFuncConfig` describes what the kernel does, e.g. gemm1/gemm2, various dtype, epilogue.
     * `KernelTuningConfig` is the input tunning knob, it describes, e.g. various tiling size, whether lds is allowed for async load (`allow_*_via_lds`), buffer depth for pipelining.
-    * Both only hold fields and simple rephrasings of their own fields, e.g. `KernelFuncConfig.activation_reduction_n` / `gu_split`. Anything derived from shapes goes to `_layout.py`; build preconditions go to `_validate.py`.
+    * Both only hold fields and simple rephrasings of their own fields, e.g. `KernelFuncConfig.activation_reduction_n`. Anything derived from shapes goes to `_layout.py`; build preconditions go to `_validate.py`.
     * `_config.py` imports nothing from `_layout.py`.
 * `_layout.py`: various layout related things, e.g. compute layout for reg/LDS, get vector width from layout, compute shape/layout of lds buffer, resolve the final reg/LDS placement of each component (`KernelLayout.component_via_lds` / `component_in_reg`, strict complements) from the tuning config's `allow_*_via_lds` policy and whether the tile admits a direct-to-LDS copy.
     * Its only public surface is `compute_kernel_layout` and the methods and fields of `KernelLayout`. That includes the device-side jit methods: the raw-N mapping under gate/up packing (`n_start`, `n_split_offs`) and the HBM offset grids (`a_payload_hbm_offsets`, `b_payload_hbm_offsets`, `a_scale_hbm_offsets`, `b_scale_hbm_offsets`).
