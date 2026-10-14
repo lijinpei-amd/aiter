@@ -4,6 +4,11 @@ Run these after any change in this folder. The scripts are in `tests/`. Everythi
 they need is in the repo: run them from a clone plus the venv, with no `bench_out/`
 or home-directory files. See [Vendored dependencies](#vendored-dependencies).
 
+Run the commands below from this folder, where `tests/` resolves. The shell scripts
+change to the repo root themselves. The compare scripts take labels and find the
+runs under `$OUT` (see [Environment](#rules-that-apply-to-every-check)). A path
+given instead is relative to this folder.
+
 Which checks a change needs:
 
 - **Pure refactor** (code must not change): all three below. The codegen gate is the
@@ -12,13 +17,41 @@ Which checks a change needs:
   The assembly and sha comparisons will differ by design, so explain the differences
   instead of gating on them.
 
+When to run them during a refactor, cheapest first:
+
+1. **Between edit steps:** `tests/gate.sh <label> --fast`, T0 and T0b only, about
+   16 s. Any change to a schedule table or to a `KernelLayout` field shows up here.
+2. **After each round** (each commit-sized step): `tests/gate.sh <label>`, T0–T2a,
+   about 3 minutes cold and 2 warm.
+3. **Once at the end:** `gate.sh --full` and the correctness suite at the same time.
+   Each takes about 5 minutes cold on HIP 4–7, and together they finish in about 5
+   minutes (286 s). With a serial T2d and one process per test file they took 8 and
+   35 minutes:
+
+   ```bash
+   tests/run_suite.sh <label> 4 5 6 7 > /tmp/suite_<label>.txt 2>&1 &
+   GPU=6 ASM_GPU=7 tests/gate.sh <label> --full
+   wait; sed -n '/^total:/,$p' /tmp/suite_<label>.txt
+   python tests/compare_suite.py <base label> <label>
+   ```
+
+   The gate must end in `### verdict: PASS`, and `compare_suite.py` must print
+   `SUITE PASS`. Then run the cold bench, alone on its GPU.
+
 ## Rules that apply to every check
 
-- **Use the same checkout for the baseline and the change.** Do not use a git
-  worktree as the control. A fresh worktree has no built `aiter/jit/*.so`, so the
-  sorted-scale pre-pass silently falls back and 11 of the 20 cells compile different
-  kernels. To get a baseline: `git stash` (or check out the base commit), run the
-  baseline, then restore your change.
+- **Run the baseline and the change on the same code paths.** Either use one
+  checkout (`git stash` or check out the base commit, run the baseline, then restore
+  your change), or a git worktree per side. A worktree is a valid control once its
+  `aiter/jit/*.so` are symlinked from a built tree
+  (`ln -s <built>/aiter/jit/*.so aiter/jit/`). `tests/_env.sh` exports
+  `PYTHONPATH=$REPO`, so `import aiter` resolves to the checkout that holds the
+  script, not to the venv's editable install (the main checkout). Without the `.so`
+  files the sorted-scale pre-pass silently falls back and 11 of the 20 asm-hash cells
+  compile different kernels; `_env.sh` prints a `WARNING` when they are missing. The
+  same holds for a fresh clone. Python run by hand, outside these scripts, needs
+  `PYTHONPATH=<checkout>` as well. On 2026-10-14 a worktree set up this way
+  reproduced the main checkout's gate references, T2b and T2d included.
 - **GPU numbering.** HIP ordinals (`HIP_VISIBLE_DEVICES`, the `GPU=` variables of
   `gate.sh` and `run_suite.sh`) are not amd-smi indices on this machine. HIP 7 is
   physical GPU 5. The cold bench takes the physical (amd-smi) index and maps it to
@@ -29,28 +62,33 @@ Which checks a change needs:
   environment. The `PY` and llc defaults assume `venv/01/` and `llvm-project/` next
   to the checkout. Outputs and baselines go to `$OUT` (default
   `bench_out/gluon_moe_regression/`, untracked); nothing is written into `tests/`.
-- **A fresh clone needs the built `aiter/jit/*.so`.** Build them, or symlink them from
-  a built tree (`ln -s <built>/aiter/jit/*.so aiter/jit/`). Without them the
-  sorted-scale pre-pass silently falls back and the asm hashes change.
 
 ## 1. Codegen and determinism gate: `tests/gate.sh`
 
 ```bash
-GPU=1 ASM_GPU=3 tests/gate.sh baseline --full   # on the unmodified tree, once
-GPU=1 ASM_GPU=3 tests/gate.sh <label> --full    # after the change
+GPU=6 ASM_GPU=7 tests/gate.sh baseline --full   # on the unmodified tree, once
+GPU=6 ASM_GPU=7 tests/gate.sh <label> --fast    # between edit steps
+GPU=6 ASM_GPU=7 tests/gate.sh <label>           # after each round
+GPU=6 ASM_GPU=7 tests/gate.sh <label> --full    # at the end, beside the suite
 ```
 
-The last line must be `### verdict: PASS`. Without `--full`, only T0–T2a run (about
-2 minutes); that is useful while iterating.
+The last line must be `### verdict: PASS`.
+
+| Mode | Runs | Time |
+|---|---|---|
+| `--fast` | T0 and T0b, side by side | about 16 s |
+| default | T0–T2a | about 3 min cold, 2 min warm |
+| `--full` | T0–T2d | about 5 min cold |
 
 | Check | What it covers | Must be |
 |---|---|---|
-| T0 | `scripts/gluon_moe_sched_dump.py`: schedule tables of 35 configs, CPU only | byte-identical |
-| T1 | Symbolic emitter and config tests: `buffered_schedule`, `wait_commit`, `config`, `scale_miniblocks` | all pass (856 at commit `819123dbc`) |
-| T2a | `test_moe_gemm_gluon_frozen.py` | all pass (18) |
-| T2b | Two tuned gemm1 builds (`tests/gemm1_check.py --correctness --quick`) | build identity SAME |
-| T2c | Bit-identical output over 5 runs, both epilogues | sha `59d442f663991659` (bf16) and `0cfa77fb04450594` (mxfp4-out) |
-| T2d | `tests/asm_hash/asm_hash.py`: md5 of the assembly of all 20 dispatchable cells (4 dtypes × 5 token counts), compile only, about 12 min | byte-identical |
+| T0 | `scripts/gluon_moe_sched_dump.py`: schedule tables of 35 configs, CPU only, about 16 s | byte-identical |
+| T0b | `tests/layout_fields.py`: all 70 `KernelLayout` fields of 224 tuning configs, CPU only, about 9 s beside T0 | byte-identical |
+| T1 | Symbolic emitter and config tests: `buffered_schedule`, `wait_commit`, `config`, `scale_miniblocks`, about 1.5 min | all pass (857 at commit `1b24ca9db`) |
+| T2a | `test_moe_gemm_gluon_frozen.py`, about 1 min cold, 10 s warm | all pass (18) |
+| T2b | Two tuned gemm1 builds (`tests/gemm1_check.py --correctness --quick`), about 1.5 min | build identity SAME |
+| T2c | Bit-identical output over 5 runs, both epilogues (part of T2b's run) | sha `59d442f663991659` (bf16) and `0cfa77fb04450594` (mxfp4-out) |
+| T2d | `tests/asm_hash/asm_hash.py`: md5 of the assembly of all 20 dispatchable cells (4 dtypes × 5 token counts), compile only, about 1 min | byte-identical |
 
 Notes:
 
@@ -63,23 +101,86 @@ Notes:
 - T2d's 20 cells are the 2026-09-09 dtype/token definitions, frozen in
   `tests/asm_hash/cells.json`. Its hashes are comparable with older baselines from
   `scripts/gluon_moe_asm_hash.py`.
+- T2d compiles `ASM_HASH_JOBS` cells at a time, 4 by default. Each holds about 5 GB of
+  VRAM while it compiles, so 4 fit beside a nearly full GPU. On a free GPU,
+  `ASM_HASH_JOBS=20` takes about 20 s and needs about 95 GB. The rows print in the
+  fixed cell order, and a cell that times out prints a `FAILED` row.
+- T2d compiles every cell into a fresh Triton cache, so it takes the same time cold
+  or warm. So do T2b's five builds; its probes reuse caches in `$OUT/tmp`.
+- T0b's baseline is `$OUT/layout_fields_baseline.txt` when recorded, otherwise
+  `tests/reference/gate/layout_fields_baseline.txt`, recorded at commit `1b24ca9db`
+  (the other gate references are from `1d3431e50`). T0b differs by design when a
+  change renames, adds or removes a `KernelLayout` field, or adds a sched-dump case
+  (`layout_fields.py` imports that case list, so T0 differs too). Check that the diff
+  shows only that, then accept it with `tests/gate.sh baseline --fast` on the changed
+  tree.
+- A differing check prints its number of hunks, the full diff command, and the
+  first 20 lines of `diff -U0 -F '^== '` (a few hunks), cut to 200 columns. Each
+  hunk is labelled with the `== <config>` it belongs to.
 
 ## 2. Correctness suite: `tests/run_suite.sh` and `tests/compare_suite.py`
 
 ```bash
-tests/run_suite.sh base 1 2 4 6        # baseline tree; arguments are HIP ordinals
-tests/run_suite.sh new 1 2 4 6         # changed tree
-python tests/compare_suite.py bench_out/gluon_moe_regression/suite_base \
-                              bench_out/gluon_moe_regression/suite_new
+tests/run_suite.sh base 4 5 6 7        # baseline tree; arguments are HIP ordinals
+tests/run_suite.sh new 4 5 6 7         # changed tree
+python tests/compare_suite.py base new # labels: $OUT/suite_base, $OUT/suite_new
 ```
 
+`compare_suite.py` also takes suite directories: any argument holding a `/`. It
+fails when a side has no logs or a log lacks a pytest summary, so a mistyped label
+cannot pass.
+
 - **What it runs:** every `op_tests/triton_tests/moe/test_moe_gemm_gluon*.py` (14
-  files), one pytest process per file, spread round-robin over the given GPUs.
-- **Run time:** about 25 minutes on 4 GPUs. A single-process run takes over 2 hours
-  and hits the timeout.
+  files, 1892 tests). `tests/run_suite.py` collects them, keeps light files whole and
+  cuts heavy ones into contiguous work units of about `UNIT_SECONDS` (60 s) of
+  estimated test time, 63 units in all. It runs the units longest first from one
+  queue on `JOBS_PER_GPU` (8) pytest workers per GPU. `UNIT_TIMEOUT` (1800 s) bounds
+  one unit and `COLLECT_TIMEOUT` (300 s) one collection. All four are environment
+  variables. The HIP ordinals have no default: 8 workers per GPU need GPUs that
+  other users' jobs leave mostly free.
+- **Run time:** about 5 minutes cold (286 s) and 1.5 minutes warm on HIP 4–7. The
+  floor is the slowest single test,
+  `test_minimum_k_and_every_reachable_unroll_remainder[packed_registers-mxfp8]` in
+  `registers`, at about 280 s cold. The old runner, one process per file, took 35
+  minutes cold (2088 s) back to back with the new one.
+- **Outputs:** one `$OUT/suite_<label>/<file>[.NN].log` per unit, whose last line is
+  the pytest summary, and `units.json` with each unit's tests, GPU and duration. A
+  rerun of a label deletes the old logs first. The console ends with the per-file
+  totals, `accounted N of N collected tests, 0 broken units: OK`, the longest unit
+  and the wall time.
+- **Broken units fail the comparison.** A unit that crashes, times out or leaves
+  tests unaccounted for gets one `ERROR <test>` line per test.
+- **Collection failures:** a file that fails collection is collected again once, and
+  the console prints the tail of each failed attempt. If the second attempt fails
+  too, the file runs whole as one unit, as `COLLECTION FAILED <file>: running it
+  whole` says. A clean run then counts by its own pytest summary, and the console
+  ends with `collected only when run whole`. Otherwise the unit is broken.
+- **Stopping it:** ending the runner kills every pytest process it started, for any
+  signal including SIGKILL. A signal it inherits as ignored stays ignored, so
+  `nohup` still keeps it alive through a hangup.
+- **Out of GPU memory:** a unit whose failures mention it is rerun once at the end,
+  one worker per GPU. The first log stays as `<unit>.log.oom`, and the console prints
+  `rerun after running out of GPU memory`. If the rerun passes, `compare_suite.py`
+  does not see the first failure.
+- **Weights:** `tests/suite_weights.json` holds the seconds of each test, per test
+  function in collection order, from a cold run. A test it does not know costs its
+  function's or its file's mean. Stale weights only unbalance the units, never the
+  results. To refresh them after adding heavy tests:
+
+  ```bash
+  TRITON_CACHE_DIR=$(mktemp -d) PYTEST_ADDOPTS='--durations=0 --durations-min=0' \
+    tests/run_suite.sh weigh 4 5 6 7
+  python tests/run_suite.py --weigh weigh   # rewrites tests/suite_weights.json
+  ```
+
+  `--weigh` takes the label or the run directory. It replaces the table only once
+  the new one is complete, and refuses a run without durations. Do not redirect its
+  output onto the table: the shell empties the file before the script runs.
+
 - **Pass criterion:** `compare_suite.py` prints `SUITE PASS`, meaning no test that
   passes on the base fails or errors after the change.
-- **Expected numbers:** 1811 passed / 58 failed / 22 skipped at commit `819123dbc`.
+- **Expected numbers:** 1812 passed / 58 failed / 22 skipped at commit `1b24ca9db`
+  (1811 / 58 / 22 at `1d3431e50`, before one more test was added).
 - **The 58 failures already fail at that commit and are tracked separately:**
   - 38 in `buffered_schedule`;
   - 16 in `scale_prep`;
@@ -164,8 +265,8 @@ Otherwise record a fresh baseline.
 
 | Check | Reference | Result |
 |---|---|---|
-| Gate | `reference/gate/{sched,build_id,asm}_baseline.txt`, used automatically by `gate.sh` when `$OUT` has none | verdict PASS. T1 856 passed, T2a 18 passed, determinism shas `59d442f663991659` / `0cfa77fb04450594` 5/5 |
-| Suite | `reference/suite_1d3431e50/*.txt`, the FAILED lines and summary per file | 1811 passed / 58 failed / 22 skipped. Compare with `compare_suite.py tests/reference/suite_1d3431e50 $OUT/suite_<label>` |
+| Gate | `reference/gate/{sched,build_id,asm}_baseline.txt`, used automatically by `gate.sh` when `$OUT` has none. `layout_fields_baseline.txt` (T0b) was recorded later, at `1b24ca9db` | verdict PASS. T1 856 passed, T2a 18 passed, determinism shas `59d442f663991659` / `0cfa77fb04450594` 5/5 |
+| Suite | `reference/suite_1d3431e50/*.txt`, the FAILED lines and summary per file | 1811 passed / 58 failed / 22 skipped. Compare with `compare_suite.py tests/reference/suite_1d3431e50 <label>`. A test was added by `1b24ca9db`, so against that tree or later it reports `SUITE FAIL` on the pass count; run the base suite instead |
 | Cold bench | `reference/cold_1d3431e50_phys5/`, `summary.json` and `report.md`. `summary.json` is the run as recorded, with the pre-`dcef897ca` knob names (`B_IN_REG`, ...); `summary_allow_via_lds.json` is the same run with them renamed to `ALLOW_*_VIA_LDS` and inverted | physical GPU 5 (BDF `0000:96:00.0`), `--tolerant`, 160/160 processes, 0 failures. Compare with `compare_cold.py tests/reference/cold_1d3431e50_phys5 <label>`, on physical GPU 5 only |
 
 Run conditions for the cold bench: physical GPUs 0–3 were running other users' jobs
@@ -209,7 +310,8 @@ Copied, not moved; the originals are untouched. Edits are limited to paths
 | `harness/bench_utils.py` | `bench_out/gluon_scale_ptr_unify_20260907/a4/bench_utils.py` | Only the functions the harness calls. `PY` is the running interpreter, the llc comes from `TRITON_HIP_DS_AGPR_LLC`, and the inert `CLAUDE_JOB_DIR` is no longer set. |
 | `harness/legacy_a4_common.py`, `harness/legacy_fly_build.py` | `bench_out/gluon_flydsl_small_tokens_20260908/{bench_common,fly_build}.py` | Renamed. Lint-only edits. |
 | `harness/legacy_dense_common.py` | `bench_out/gluon_flydsl_a8a16_20260907/bench_common.py` | Renamed. Lint-only edits. |
-| `asm_hash/asm_hash.py`, `asm_hash/cells.json` | `scripts/gluon_moe_asm_hash.py`; cells resolved from `bench_out/gluon_flydsl_dtype_tokens_20260909/cases.json` | Reads the frozen cells. Shares `harness/bench_common.py`: the 0909 and final harnesses had byte-identical copies. |
+| `asm_hash/asm_hash.py`, `asm_hash/cells.json` | `scripts/gluon_moe_asm_hash.py`; cells resolved from `bench_out/gluon_flydsl_dtype_tokens_20260909/cases.json` | Reads the frozen cells. Shares `harness/bench_common.py`: the 0909 and final harnesses had byte-identical copies. Compiles the cells concurrently (`-j`, `ASM_HASH_JOBS`). |
+| `layout_fields.py` | throwaway `dump_layout_fields.py` of the `KernelLayout`-constructor refactor, outside the repo | Paths from `__file__`; refuses to run when `aiter` resolves outside its checkout; clears `AITER_TRITON_MOE_GLUON_*`. The op_tests config builders are copied as literals; the case list is imported from `scripts/gluon_moe_sched_dump.py`. |
 | `gemm1_check.py` | `scripts/gluon_moe_gemm1_check.py` | Correctness path only. The perf path needed `~/moe_rerun/cold_bench.py`. Takes `--job` instead of `CLAUDE_JOB_DIR`. |
 | `probes/ref_probe.py`, `corr_probe.py`, `corr_probe_q.py` | `~/moe_rerun/` | Repo path from `__file__`. Lint-only edits. |
 
