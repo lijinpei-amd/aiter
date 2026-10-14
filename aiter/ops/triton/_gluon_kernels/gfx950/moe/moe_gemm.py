@@ -83,47 +83,11 @@ from ._pipeline import (
     _run_buffered_pipeline,
     _take_reg_pairs,
 )
-from ._types import A_SCALE, B_SCALE, TileSched, _slot_index
+from ._types import TileSched, _slot_index
 from ._validate import validate, validate_pipeline
-
-_A_SCALE: gl.constexpr = gl.constexpr(A_SCALE)
-_B_SCALE: gl.constexpr = gl.constexpr(B_SCALE)
 
 _TS_XCD_GROUP_M: gl.constexpr = gl.constexpr(int(TileSched.XCD_GROUP_M))
 _TS_GROUP_M: gl.constexpr = gl.constexpr(int(TileSched.GROUP_M))
-
-
-@gluon.jit
-def _advance_hbm_ptrs(pc, hbm_ptrs, STEPS: gl.constexpr = 1, K_PHASE: gl.constexpr = 0):
-    """Advance payload and LDS-staged scale sources after their buffer loads."""
-    a_hbm_ptr = hbm_ptrs.a_hbm_ptr + STEPS * pc.a_step
-    b_hbm_ptr = hbm_ptrs.b_hbm_ptr + STEPS * pc.b_step
-    a_scale_hbm_ptr = hbm_ptrs.a_scale_hbm_ptr
-    b_scale_hbm_ptr = hbm_ptrs.b_scale_hbm_ptr
-    if require_constexpr(
-        pc.func_cfg.a_has_scale() and pc.layout.component_via_lds(_A_SCALE)
-    ):
-        a_scale_hbm_ptr = (
-            a_scale_hbm_ptr
-            + pc.layout.scale_hbm_steps(0, STEPS, K_PHASE)
-            * pc.s_step
-            * pc.a_scale_stride_k
-        )
-    if require_constexpr(
-        pc.func_cfg.b_has_scale() and pc.layout.component_via_lds(_B_SCALE)
-    ):
-        b_scale_hbm_ptr = (
-            b_scale_hbm_ptr
-            + pc.layout.scale_hbm_steps(1, STEPS, K_PHASE)
-            * pc.s_step
-            * pc.b_scale_stride_k
-        )
-    return _PipelinePointers(
-        a_hbm_ptr,
-        b_hbm_ptr,
-        a_scale_hbm_ptr,
-        b_scale_hbm_ptr,
-    )
 
 
 @gluon.jit
