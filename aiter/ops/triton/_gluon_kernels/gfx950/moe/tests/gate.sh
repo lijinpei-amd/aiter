@@ -5,10 +5,10 @@
 #
 # Writes $OUT/{sched,layout_fields,build,asm}_<label>.txt and compares them with the
 # *_baseline.txt files in $OUT, falling back to tests/reference/gate/ (recorded at
-# commit 1d3431e50, T0b's at 1b24ca9db; valid only for the same toolchain). To record
-# fresh baselines, run the label `baseline` on the unmodified tree, in the same
-# checkout or in a git worktree with aiter/jit/*.so symlinked from a built tree
-# (without them kernels silently differ; _env.sh warns).
+# commit 1d3431e50, T0b's when the KernelLayout fields went public; valid only for
+# the same toolchain). To record fresh baselines, run the label `baseline` on the
+# unmodified tree, in the same checkout or in a git worktree with aiter/jit/*.so
+# symlinked from a built tree (without them kernels silently differ; _env.sh warns).
 #
 #   T0  schedule tables (CPU only, ~16 s)               byte-identical
 #   T0b KernelLayout fields, 224 configs (CPU, ~9 s)    byte-identical

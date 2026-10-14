@@ -18,6 +18,7 @@ import pytest
 
 from aiter.ops.triton._gluon_kernels.gfx950.moe import _pipeline as pipeline
 from aiter.ops.triton._gluon_kernels.gfx950.moe import moe_gemm as kernel
+from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import unwrap
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import Schedule
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     A_PAYLOAD,
@@ -33,6 +34,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     _slot_index,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import validate
+from op_tests.triton_tests.moe.test_moe_gemm_gluon_scale_layout import _HostView
 from op_tests.triton_tests.moe.test_moe_gemm_gluon_wait_commit import _ScheduleConfig
 
 
@@ -96,27 +98,15 @@ class _Config(_ScheduleConfig):
             if not component[1] or self.has_scale(component[0])
         )
 
-    def component_via_lds(self, component):
-        operand, is_scale = component
-        return (
-            self.scale_via_lds(operand) if is_scale else self.payload_via_lds(operand)
-        )
-
-    def component_in_reg(self, component):
-        return not self.component_via_lds(component)
-
     def sizing(self):
         """``(depth, peeled, unroll)``, which do not depend on K."""
         schedule = Schedule(self, self, self.BLOCK_K)
-        return schedule.depth(), schedule.peeled(), schedule.unroll()
+        return unwrap(schedule.depth), unwrap(schedule.peeled), unwrap(schedule.unroll)
 
     def minimum_num_k(self):
         return sum(self.sizing())
 
-    def num_k_slots(self):
-        return 1
-
-    num_prefetch_k_slots = num_k_slots
+    num_k_slots = num_prefetch_k_slots = 1
 
     def scale_ratio_k_step(self, operand):
         return self.scale_steps[operand] if self.has_scale(operand) else 1
@@ -125,7 +115,7 @@ class _Config(_ScheduleConfig):
         return self.scale_tiles[operand]
 
     def scale_read_k_slots(self, operand):
-        return self.num_k_slots() * self.scale_ratio_k_step(operand)
+        return self.num_k_slots * self.scale_ratio_k_step(operand)
 
     def scale_cache_fragments(self, operand):
         return self.num_lds_slots_non_k(operand) * self.scale_read_k_slots(operand)
@@ -152,9 +142,9 @@ class _Config(_ScheduleConfig):
     def commit_per_stage_whole(self):
         return self.WAIT_COMMIT_SCHEME == WaitCommitScheme.PER_STAGE_WHOLE
 
-    def dot_result_fragment_layout(self):
-        return None
+    dot_result_fragment_layout = None
 
+    @property
     def accumulator_fragment_shape_slot(self):
         return [self.MINI_BLOCK_M, self.MINI_BLOCK_N]
 
@@ -206,7 +196,7 @@ class _Machine:
         tile = pointer
         ratio = tc.scale_ratio_k_step(operand) if is_scale else 1
         nonk = tc.scale_ratio_non_k_slot(operand) if is_scale else 1
-        mk = tc.num_k_slots()
+        mk = tc.num_k_slots
         assert 0 <= tile < self.num_k, "HBM load exceeded the K strip"
         live_span = (tc.depths[component] - 1) * ratio + 1
         fill_span = live_span - int(tc.component_in_reg(component))
@@ -411,7 +401,8 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         tuning_cfg=tc,
         layout=tc,
         func_cfg=tc,
-        schedule=schedule,
+        # Plain field values: the emulated steps key their FIFO on raw K tiles.
+        schedule=_HostView(schedule),
         lds_ptrs=machine,
         a_hbm_offs=tuple(range(tc.nm)),
         b_hbm_offs=tuple(range(tc.nn)),
@@ -518,7 +509,7 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
                     * (
                         tc.scale_cache_fragments(component[0])
                         if component[1]
-                        else (tc.nm if component[0] == A else tc.nn) * tc.num_k_slots()
+                        else (tc.nm if component[0] == A else tc.nn) * tc.num_k_slots
                     )
                 )
                 if component in tc.active_components()
@@ -566,7 +557,7 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         pointers, buffers, regs = pipeline._run_buffered_pipeline.fn(
             pc, _pointers(0, 0, 0, 0), num_k
         )
-        main = num_k - schedule.depth()
+        main = num_k - unwrap(schedule.depth)
         assert regs.acc == (main,) * (tc.nm * tc.nn)
         for _ in range(epilogue_groups):
             machine.commit_buffer_load()
@@ -967,7 +958,11 @@ def _straight_line_waits(schedule, tc, last):
     """
     slots = tc.nm * tc.nn
     per_tile = tc.commit_per_stage()
-    depth, peeled, unroll = schedule.depth(), schedule.peeled(), schedule.unroll()
+    depth, peeled, unroll = (
+        unwrap(schedule.depth),
+        unwrap(schedule.peeled),
+        unwrap(schedule.unroll),
+    )
     committed, waits = [], {}
 
     def required(step, slot):
@@ -1063,7 +1058,7 @@ def test_every_payload_tile_is_filled_exactly_once(nm, nn, middle):
     tc = _Config(WaitCommitScheme.PER_OP, (3, 3, 3, 3), 0, shape=(nm, nn),
                  middle=middle)
     schedule = Schedule(tc, tc, tc.BLOCK_K)
-    assert schedule.fill_slots_valid(), "ownership is not a valid mapping"
+    assert unwrap(schedule.fill_slots_valid), "ownership is not a valid mapping"
     for component in COMPONENTS:
         non_k_slots = nm if component[0] == A else nn
         owners = [
@@ -1160,8 +1155,8 @@ def test_absent_scale_ring_indices_ignore_invalid_unused_depths(scale_depths):
     )[-1]
     assert validate(tc, 512, 960)
     schedule = Schedule(tc, KernelLayout(tc), 960)
-    assert schedule.depth() == 2
-    assert schedule.register_period() == 1
+    assert unwrap(schedule.depth) == 2
+    assert unwrap(schedule.register_period) == 1
     for component in (A_SCALE, B_SCALE):
         for step in (schedule.warmup_step(), schedule.loop_step(1)):
             for fill in (False, True):

@@ -118,10 +118,10 @@ def _drain_last_fused(
     computed, which is why it takes ``GATE_PRE`` to skip recomputing it.
     """
     tc: gl.constexpr = pc.tuning_cfg
-    NM: gl.constexpr = layout.num_m_slots()
-    NN: gl.constexpr = layout.num_n_slots()
-    PF_FRAGS: gl.constexpr = layout.num_prefetch_k_slots()
-    act: gl.constexpr = func_cfg.act()
+    NM: gl.constexpr = layout.num_m_slots
+    NN: gl.constexpr = layout.num_n_slots
+    PF_FRAGS: gl.constexpr = layout.num_prefetch_k_slots
+    act: gl.constexpr = func_cfg.activation
     gl.static_assert(func_cfg.weight_gu_hbm_layout == _WEIGHT_GU_SPLIT and NN == 2)
 
     acc = ()
@@ -136,7 +136,7 @@ def _drain_last_fused(
                 tc,
                 layout,
                 True,
-                (pc.schedule.num_k() - 1) * tc.BLOCK_K // 128 % 2,
+                (pc.schedule.num_k - 1) * tc.BLOCK_K // 128 % 2,
             )
             if require_constexpr(ni == 0):
                 # Gate side: everything up to and including the reciprocal, issued here
@@ -210,24 +210,24 @@ def _moe_gemm_body(
     # ~8.5 GB, so the expert stride is folded into the scalar base in 64-bit; a single
     # expert is ~22 MB and fits comfortably.
     b_hbm_ptr = b.ptr + expt_id.to(gl.int64) * b.stride_e
-    if require_constexpr(func_cfg.a_has_scale()):
+    if require_constexpr(func_cfg.has_scale(0)):
         a_scale_hbm_ptr = a.scale_ptr
     else:
         a_scale_hbm_ptr: gl.constexpr = None
-    if require_constexpr(func_cfg.b_has_scale()):
+    if require_constexpr(func_cfg.has_scale(1)):
         b_scale_hbm_ptr = b.scale_ptr + expt_id.to(gl.int64) * b.scale_stride_e
     else:
         b_scale_hbm_ptr: gl.constexpr = None
 
     b_hbm_offs = layout.b_payload_hbm_offsets(b, pid_n, N, K, func_cfg, tuning_cfg)
 
-    if require_constexpr(func_cfg.a_has_scale()):
+    if require_constexpr(func_cfg.has_scale(0)):
         a_scale_hbm_offs = layout.a_scale_hbm_offsets(
             a, rt, block_id, M_e, start_m, pid_m, K, func_cfg, tuning_cfg
         )
     else:
         a_scale_hbm_offs: gl.constexpr = None
-    if require_constexpr(func_cfg.b_has_scale()):
+    if require_constexpr(func_cfg.has_scale(1)):
         b_scale_hbm_offs = layout.b_scale_hbm_offsets(
             b, pid_n, N, K, func_cfg, tuning_cfg
         )
@@ -239,7 +239,7 @@ def _moe_gemm_body(
     # per-fill pointer bumps (K is the contiguous axis of every operand)
     a_step: gl.constexpr = layout.payload_hbm_step(0)
     b_step: gl.constexpr = layout.payload_hbm_step(1)
-    s_step: gl.constexpr = layout.scale_block_k_storage()
+    s_step: gl.constexpr = layout.scale_block_k_storage
 
     hbm_ptrs = _PipelinePointers(
         a.ptr,
@@ -249,11 +249,11 @@ def _moe_gemm_body(
     )
     # The scale strides only exist on a quantised operand, so they can only be read
     # behind the same predicate that guards every other use of them.
-    if require_constexpr(func_cfg.a_has_scale()):
+    if require_constexpr(func_cfg.has_scale(0)):
         a_scale_stride_k: gl.constexpr = a.scale_stride_k
     else:
         a_scale_stride_k: gl.constexpr = None
-    if require_constexpr(func_cfg.b_has_scale()):
+    if require_constexpr(func_cfg.has_scale(1)):
         b_scale_stride_k: gl.constexpr = b.scale_stride_k
     else:
         b_scale_stride_k: gl.constexpr = None
@@ -296,7 +296,7 @@ def _moe_gemm_body(
     # MFMA is separate and consumes only the fragments already in registers.
     # Fuse its activation where supported by the live step.
     FUSE: gl.constexpr = (
-        func_cfg.weight_gu_hbm_layout == _WEIGHT_GU_SPLIT and layout.num_n_slots() == 2
+        func_cfg.weight_gu_hbm_layout == _WEIGHT_GU_SPLIT and layout.num_n_slots == 2
     )
     regs = _drain_buffered_pipeline(pc, hbm_ptrs, buffers, regs, NUM_K)
     if require_constexpr(not FUSE):

@@ -254,8 +254,9 @@ class Schedule:
     """The expanded K loop of one build: its steps, copies, commits and waits.
 
     Built once as ``Schedule(tuning_cfg, layout, K)``, on the host and in jit code
-    alike. Per-component values are ``COMPONENTS``-aligned tuples, read through
-    accessors that take a component ``(operand, is_scale)``.
+    alike. A value of the whole build is a public field, read directly. Per-component
+    values are ``COMPONENTS``-aligned tuples, read through accessors that take a
+    component ``(operand, is_scale)``.
 
     Every emitted step has an index, ``step``. The steps, in program order:
 
@@ -264,10 +265,10 @@ class Schedule:
     * ``peeled_step(x)``, ``x`` in ``[0, peeled)``: K step ``x + 1``.
     * ``loop_step(u)``, ``u`` in ``[0, unroll)``: the runtime loop body.
     * ``remainder_step(u)``: the steps a whole number of loop bodies leaves over --
-      ``unroll - 1`` guarded static steps, or with ``static_remainder()`` false one
+      ``unroll - 1`` guarded static steps, or with ``static_remainder`` false one
       step in a runtime loop.
     * ``drain_step(p, j)``, ``j`` in ``[0, depth - 1)``: one copy of the drain per
-      ring phase ``p`` with ``static_drain()``, else one (``p == 0``).
+      ring phase ``p`` with ``static_drain``, else one (``p == 0``).
 
     A config that cannot be scheduled -- a fill ownership that is not a mapping, or a
     K too short for the loop -- still gets its sizing, but no steps. ``_validate``
@@ -287,20 +288,40 @@ class Schedule:
     _owned: gl.constexpr
     _selected: gl.constexpr
     # -- sizing ------------------------------------------------------------------------
-    _num_k: gl.constexpr
-    _depth: gl.constexpr
-    _unroll: gl.constexpr
-    _peeled: gl.constexpr
-    _ring_period: gl.constexpr
-    _register_period: gl.constexpr
-    _async_period: gl.constexpr
-    _fill_slots_valid: gl.constexpr
+    #: K tiles in the strip: K // BLOCK_K.
+    num_k: gl.constexpr
+    #: Pipeline depth: the largest live span of a present component, in steps.
+    depth: gl.constexpr
+    #: Steps per loop body: K_UNROLL widened to a whole ring restoration period.
+    unroll: gl.constexpr
+    #: Main steps emitted straight-line between the warm-up step and the loop.
+    peeled: gl.constexpr
+    #: Steps after which every present ring is back at slot zero.
+    ring_period: gl.constexpr
+    #: ``ring_period`` over direct-register rings only; 1 when none rotates.
+    register_period: gl.constexpr
+    #: Steps after which the issued async-copy pattern repeats.
+    async_period: gl.constexpr
+    #: Whether copy ownership maps each component's non-K slots onto slots.
+    fill_slots_valid: gl.constexpr
     # -- policy ------------------------------------------------------------------------
-    _commit: gl.constexpr
+    #: Commit after every LDS copy.
+    commit_per_copy: gl.constexpr
+    #: Commit at the end of every slot's fill, even an empty one.
+    commit_per_slot: gl.constexpr
+    #: Commit once per step, after the last slot's fill, even an empty one.
+    commit_per_tile: gl.constexpr
+    #: Whether a step's tile commit follows the last slot's MFMAs. Otherwise it closes
+    #: the last slot's memory region, inside the warp-pipeline stage. Prologue steps
+    #: have no MFMA and commit after their last fill either way.
+    tile_commit_after_mfma: gl.constexpr
     _soff_unroll: gl.constexpr
-    _static_remainder: gl.constexpr
-    _static_drain: gl.constexpr
-    _epilogue_groups: gl.constexpr
+    #: Whether the remainder is ``unroll - 1`` guarded static steps, not a loop.
+    static_remainder: gl.constexpr
+    #: Whether the drain is emitted once per ring phase, with static indices.
+    static_drain: gl.constexpr
+    #: Commit groups the epilogue issues between the main steps and the drain.
+    epilogue_groups: gl.constexpr
     # -- per step ----------------------------------------------------------------------
     _steps: gl.constexpr
     _active: gl.constexpr
@@ -320,7 +341,7 @@ class Schedule:
         """
         tc = tuning_cfg
         fc = tc.func_cfg
-        nm, nn = _v(layout.num_m_slots()), _v(layout.num_n_slots())
+        nm, nn = _v(layout.num_m_slots), _v(layout.num_n_slots)
         slots = nm * nn
         num_k = _v(layout.num_k_tiles(K))
 
@@ -449,7 +470,7 @@ class Schedule:
         )
         if epilogue_groups is None:
             epilogue_groups = int(
-                bool(_v(layout.epilogue_inputs_via_lds()))
+                bool(_v(layout.epilogue_inputs_via_lds))
                 and bool(_v(fc.has_gammas) or _v(fc.has_bias))
             )
         model = {
@@ -497,19 +518,22 @@ class Schedule:
         self._read_in_mfma = gl.constexpr(tuple(read_in_mfma))
         self._owned = gl.constexpr(owned)
         self._selected = gl.constexpr(selected)
-        self._num_k = gl.constexpr(num_k)
-        self._depth = gl.constexpr(depth)
-        self._unroll = gl.constexpr(unroll)
-        self._peeled = gl.constexpr(peeled)
-        self._ring_period = gl.constexpr(ring_period)
-        self._register_period = gl.constexpr(register_period)
-        self._async_period = gl.constexpr(async_period)
-        self._fill_slots_valid = gl.constexpr(fill_slots_valid)
-        self._commit = gl.constexpr(commit)
+        self.num_k = gl.constexpr(num_k)
+        self.depth = gl.constexpr(depth)
+        self.unroll = gl.constexpr(unroll)
+        self.peeled = gl.constexpr(peeled)
+        self.ring_period = gl.constexpr(ring_period)
+        self.register_period = gl.constexpr(register_period)
+        self.async_period = gl.constexpr(async_period)
+        self.fill_slots_valid = gl.constexpr(fill_slots_valid)
+        self.commit_per_copy = gl.constexpr(commit[0])
+        self.commit_per_slot = gl.constexpr(commit[1])
+        self.commit_per_tile = gl.constexpr(commit[2])
+        self.tile_commit_after_mfma = gl.constexpr(commit[3])
         self._soff_unroll = gl.constexpr(bool(_v(tc.SOFF_UNROLL)))
-        self._static_remainder = gl.constexpr(static_remainder)
-        self._static_drain = gl.constexpr(static_drain)
-        self._epilogue_groups = gl.constexpr(epilogue_groups)
+        self.static_remainder = gl.constexpr(static_remainder)
+        self.static_drain = gl.constexpr(static_drain)
+        self.epilogue_groups = gl.constexpr(epilogue_groups)
 
         main = num_k - depth
         if not fill_slots_valid or main < peeled + unroll:
@@ -613,64 +637,12 @@ class Schedule:
             tuple(waits.get(index, idle) for index in range(len(steps)))
         )
 
-    # -- sizing ------------------------------------------------------------------------
-
-    @gluon.constexpr_function
-    def num_k(self):
-        """K tiles in the strip: K // BLOCK_K."""
-        return _v(self._num_k)
-
-    @gluon.constexpr_function
-    def depth(self):
-        """Pipeline depth: the largest live span of a present component, in steps."""
-        return _v(self._depth)
-
-    @gluon.constexpr_function
-    def unroll(self):
-        """Steps per loop body: K_UNROLL widened to a whole ring restoration period."""
-        return _v(self._unroll)
-
-    @gluon.constexpr_function
-    def peeled(self):
-        """Main steps emitted straight-line between the warm-up step and the loop."""
-        return _v(self._peeled)
-
-    @gluon.constexpr_function
-    def ring_period(self):
-        """Steps after which every present ring is back at slot zero."""
-        return _v(self._ring_period)
-
-    @gluon.constexpr_function
-    def register_period(self):
-        """:meth:`ring_period` over direct-register rings only; 1 when none rotates."""
-        return _v(self._register_period)
-
-    @gluon.constexpr_function
-    def async_period(self):
-        """Steps after which the issued async-copy pattern repeats."""
-        return _v(self._async_period)
-
-    @gluon.constexpr_function
-    def fill_slots_valid(self):
-        """Whether copy ownership maps each component's non-K slots onto slots."""
-        return _v(self._fill_slots_valid)
+    # -- the emitted steps -------------------------------------------------------------
 
     @gluon.constexpr_function
     def scheduled(self):
         """Whether the steps exist: false for a config ``_validate`` rejects."""
         return _v(self._steps) is not None
-
-    # -- the emitted steps -------------------------------------------------------------
-
-    @gluon.constexpr_function
-    def static_remainder(self):
-        """Whether the remainder is ``unroll - 1`` guarded static steps, not a loop."""
-        return _v(self._static_remainder)
-
-    @gluon.constexpr_function
-    def static_drain(self):
-        """Whether the drain is emitted once per ring phase, with static indices."""
-        return _v(self._static_drain)
 
     @gluon.constexpr_function
     def num_steps(self):
@@ -679,43 +651,43 @@ class Schedule:
     @gluon.constexpr_function
     def prologue_step(self, r):
         """The fill-only step ``r``, for ``r`` in ``[1 - depth, 0)``."""
-        r = _v(r)
-        assert 1 - self.depth() <= r < 0, f"no prologue step {r}"
-        return r + self.depth() - 1
+        r, depth = _v(r), _v(self.depth)
+        assert 1 - depth <= r < 0, f"no prologue step {r}"
+        return r + depth - 1
 
     @gluon.constexpr_function
     def warmup_step(self):
-        return self.depth() - 1
+        return _v(self.depth) - 1
 
     @gluon.constexpr_function
     def peeled_step(self, x):
         """The peeled step for K step ``x + 1``."""
         x = _v(x)
-        assert 0 <= x < self.peeled(), f"no peeled step {x}"
-        return self.depth() + x
+        assert 0 <= x < _v(self.peeled), f"no peeled step {x}"
+        return _v(self.depth) + x
 
     @gluon.constexpr_function
     def loop_step(self, u):
         """Position ``u`` of the loop body."""
         u = _v(u)
-        assert 0 <= u < self.unroll(), f"no loop step {u}"
-        return self.depth() + self.peeled() + u
+        assert 0 <= u < _v(self.unroll), f"no loop step {u}"
+        return _v(self.depth) + _v(self.peeled) + u
 
     @gluon.constexpr_function
     def remainder_step(self, u):
         """Remainder position ``u``; the runtime remainder loop has one step."""
-        u = _v(u)
-        count = self.unroll() - 1 if self.static_remainder() else 1
+        u, unroll = _v(u), _v(self.unroll)
+        count = unroll - 1 if _v(self.static_remainder) else 1
         assert 0 <= u < count, f"no remainder step {u}"
-        return self.depth() + self.peeled() + self.unroll() + u
+        return _v(self.depth) + _v(self.peeled) + unroll + u
 
     @gluon.constexpr_function
     def drain_step(self, p, j):
         """Drain iteration ``j`` of the copy for ring phase ``p``."""
-        p, j = _v(p), _v(j)
-        phases = self.ring_period() if self.static_drain() else 1
-        assert 0 <= p < phases and 0 <= j < self.depth() - 1, f"no drain step {p, j}"
-        return self.num_steps() - (phases - p) * (self.depth() - 1) + j
+        p, j, depth = _v(p), _v(j), _v(self.depth)
+        phases = _v(self.ring_period) if _v(self.static_drain) else 1
+        assert 0 <= p < phases and 0 <= j < depth - 1, f"no drain step {p, j}"
+        return self.num_steps() - (phases - p) * (depth - 1) + j
 
     @gluon.constexpr_function
     def phase(self, step):
@@ -800,41 +772,12 @@ class Schedule:
     # -- commits -----------------------------------------------------------------------
 
     @gluon.constexpr_function
-    def commit_per_copy(self):
-        """Commit after every LDS copy."""
-        return _v(self._commit)[0]
-
-    @gluon.constexpr_function
-    def commit_per_slot(self):
-        """Commit at the end of every slot's fill, even an empty one."""
-        return _v(self._commit)[1]
-
-    @gluon.constexpr_function
-    def commit_per_tile(self):
-        """Commit once per step, after the last slot's fill, even an empty one."""
-        return _v(self._commit)[2]
-
-    @gluon.constexpr_function
-    def tile_commit_after_mfma(self):
-        """Whether a step's tile commit follows the last slot's MFMAs.
-
-        Otherwise it closes the last slot's memory region, inside the warp-pipeline
-        stage. Prologue steps have no MFMA and commit after their last fill either way.
-        """
-        return _v(self._commit)[3]
-
-    @gluon.constexpr_function
-    def epilogue_groups(self):
-        """Commit groups the epilogue issues between the main steps and the drain."""
-        return _v(self._epilogue_groups)
-
-    @gluon.constexpr_function
     def epilogue_wait(self):
         """Immediate of the wait that retires the epilogue's copies, or ``None``.
 
         It also retires every copy the drain issued after them.
         """
-        return 0 if self.epilogue_groups() > 0 else None
+        return 0 if _v(self.epilogue_groups) > 0 else None
 
     # -- per component -----------------------------------------------------------------
 
@@ -924,7 +867,7 @@ class Schedule:
             return 0
         ratio = self.ratio_k(component)
         if self.in_loop(step):
-            origin = self.peeled() + 1
+            origin = _v(self.peeled) + 1
             current = origin + self.ki(step)
         else:
             origin = self.phase(step)
@@ -944,10 +887,10 @@ class Schedule:
         depth, ratio = self.ring_depth(component), self.ratio_k(component)
         if not (self.in_loop(step) or self.static_phase(step)):
             return None
-        if self.unroll() % (depth * ratio) != 0:
+        if _v(self.unroll) % (depth * ratio) != 0:
             return None
         advance = self.fill_span(component) - 1 if _v(fill) else 0
-        return ((self.peeled() + self.ki(step) + 1 + advance) // ratio) % depth
+        return ((_v(self.peeled) + self.ki(step) + 1 + advance) // ratio) % depth
 
     @gluon.constexpr_function
     def soff_unroll(self, step):
@@ -958,7 +901,7 @@ class Schedule:
     def scale_soff_steps(self, component, offset_step):
         """Scale K steps from the body's first scale producer to this body position."""
         ratio = self.ratio_k(component)
-        start = self.peeled() + 1
+        start = _v(self.peeled) + 1
         producer_phase = self.producer_phase(component)
         first_producer = (start - producer_phase + ratio - 1) // ratio
         producer = (start + _v(offset_step) - producer_phase) // ratio

@@ -71,8 +71,8 @@ class _PipelineConst:
     increments. Only :class:`_PipelinePointers` and :class:`_PipelineRegFragments`
     cross the back edge.
 
-    Every offset grid is a *tuple*, one entry per mini block: ``num_m_slots()`` for the A
-    side, ``num_n_slots()`` for the B side. Each entry is laid out for its own slot's
+    Every offset grid is a *tuple*, one entry per mini block: ``num_m_slots`` for the A
+    side, ``num_n_slots`` for the B side. Each entry is laid out for its own slot's
     copy layout, which is what keeps every per-mini-block direct-to-LDS copy as wide and
     as coalesced as the whole-tile copy it replaces.
 
@@ -228,7 +228,7 @@ def _index(
         # register component is ever routed through here.
         advance: gl.constexpr = sched.fill_span(component) - 1 if FILL else 0
         k_tile = (step + advance) // ratio
-        if require_constexpr(sched.register_period() == 1):
+        if require_constexpr(sched.register_period == 1):
             # Avoid signed ring arithmetic without disturbing live register queues.
             gl.assume(k_tile >= 0)
         out = k_tile % depth
@@ -258,7 +258,7 @@ def _rotate(queue, SHIFT: gl.constexpr):
 
 @gluon.jit
 def _rotate_buffers(buffers, sched, layout, PHASE: gl.constexpr = 0):
-    mk: gl.constexpr = layout.num_k_slots()
+    mk: gl.constexpr = layout.num_k_slots
     if require_constexpr(sched.selects_at_phase(_A_SCALE, PHASE + 1)):
         a_scale = _rotate(buffers[2], layout.scale_cache_fragments(0))
     else:
@@ -268,8 +268,8 @@ def _rotate_buffers(buffers, sched, layout, PHASE: gl.constexpr = 0):
     else:
         b_scale = buffers[3]
     return (
-        _rotate(buffers[0], layout.num_m_slots() * mk),
-        _rotate(buffers[1], layout.num_n_slots() * mk),
+        _rotate(buffers[0], layout.num_m_slots * mk),
+        _rotate(buffers[1], layout.num_n_slots * mk),
         a_scale,
         b_scale,
     )
@@ -283,24 +283,24 @@ def _init_buffers(pc):
     a, b, a_scale, b_scale = (), (), (), ()
     if require_constexpr(sched.in_reg(_A_PAYLOAD)):
         for _ in gl.static_range(
-            tc.num_buffers(0) * layout.num_m_slots() * layout.num_k_slots()
+            tc.num_buffers(0) * layout.num_m_slots * layout.num_k_slots
         ):
             a += (
                 gl.zeros(
-                    layout.payload_fragment_shape_slot(0),
+                    layout.fragment_shape_slot(0, False),
                     pc.func_cfg.operand_elem_ty(0),
-                    layout.dot_operand_fragment_layout(0),
+                    layout.dot_operand_fragment_layout(0, False),
                 ),
             )
     if require_constexpr(sched.in_reg(_B_PAYLOAD)):
         for _ in gl.static_range(
-            tc.num_buffers(1) * layout.num_n_slots() * layout.num_k_slots()
+            tc.num_buffers(1) * layout.num_n_slots * layout.num_k_slots
         ):
             b += (
                 gl.zeros(
-                    layout.payload_fragment_shape_slot(1),
+                    layout.fragment_shape_slot(1, False),
                     pc.func_cfg.operand_elem_ty(1),
-                    layout.dot_operand_fragment_layout(1),
+                    layout.dot_operand_fragment_layout(1, False),
                 ),
             )
     if require_constexpr(sched.present(_A_SCALE) and sched.in_reg(_A_SCALE)):
@@ -318,9 +318,9 @@ def _init_buffers(pc):
             else:
                 a_scale += (
                     gl.zeros(
-                        layout.scale_fragment_shape_slot(0),
+                        layout.fragment_shape_slot(0, True),
                         gl.uint8,
-                        layout.dot_operand_scale_fragment_layout(0),
+                        layout.dot_operand_fragment_layout(0, True),
                     ),
                 )
     if require_constexpr(sched.present(_B_SCALE) and sched.in_reg(_B_SCALE)):
@@ -338,9 +338,9 @@ def _init_buffers(pc):
             else:
                 b_scale += (
                     gl.zeros(
-                        layout.scale_fragment_shape_slot(1),
+                        layout.fragment_shape_slot(1, True),
                         gl.uint8,
-                        layout.dot_operand_scale_fragment_layout(1),
+                        layout.dot_operand_fragment_layout(1, True),
                     ),
                 )
     return a, b, a_scale, b_scale
@@ -359,13 +359,13 @@ def _fill_slot(
 ):
     layout: gl.constexpr = pc.layout
     sched: gl.constexpr = pc.schedule
-    nm: gl.constexpr = layout.num_m_slots()
-    nn: gl.constexpr = layout.num_n_slots()
+    nm: gl.constexpr = layout.num_m_slots
+    nn: gl.constexpr = layout.num_n_slots
     # One query for what this slot issues this step. The four branches below
     # stay separate because they perform different JIT-visible pointer and
     # tuple operations, but they no longer each restate the gate.
     ops: gl.constexpr = sched.issued(STEP, _slot_index(mi, ni, nm, nn))
-    mk: gl.constexpr = layout.num_k_slots()
+    mk: gl.constexpr = layout.num_k_slots
     offset_step: gl.constexpr = sched.ki(STEP) if sched.soff_unroll(STEP) else 0
     a_soff: gl.constexpr = (
         offset_step
@@ -381,14 +381,14 @@ def _fill_slot(
         sched.scale_soff_steps(_A_SCALE, offset_step)
         * pc.s_step
         * pc.a_scale_stride_k
-        if offset_step and pc.func_cfg.a_has_scale()
+        if offset_step and pc.func_cfg.has_scale(0)
         else 0
     )
     bs_soff: gl.constexpr = (
         sched.scale_soff_steps(_B_SCALE, offset_step)
         * pc.s_step
         * pc.b_scale_stride_k
-        if offset_step and pc.func_cfg.b_has_scale()
+        if offset_step and pc.func_cfg.has_scale(1)
         else 0
     )
     a, b, a_scale, b_scale = buffers
@@ -403,7 +403,7 @@ def _fill_slot(
                 pc.a_hbm_offs[ops[0]],
                 a_soff,
             )
-            if require_constexpr(sched.commit_per_copy()):
+            if require_constexpr(sched.commit_per_copy):
                 pc.lds_ptrs.commit_buffer_load()
         else:
             fragments = pc.lds_ptrs.buffer_load_payload(
@@ -431,7 +431,7 @@ def _fill_slot(
                 pc.a_scale_hbm_offs[ops[1]],
                 as_soff,
             )
-            if require_constexpr(sched.commit_per_copy()):
+            if require_constexpr(sched.commit_per_copy):
                 pc.lds_ptrs.commit_buffer_load()
         else:
             fragments = pc.lds_ptrs.buffer_load_scale(
@@ -476,7 +476,7 @@ def _fill_slot(
                 pc.b_hbm_offs[ops[2]],
                 b_soff,
             )
-            if require_constexpr(sched.commit_per_copy()):
+            if require_constexpr(sched.commit_per_copy):
                 pc.lds_ptrs.commit_buffer_load()
     if require_constexpr(ops[3] is not None):
         if require_constexpr(sched.via_lds(_B_SCALE)):
@@ -489,7 +489,7 @@ def _fill_slot(
                 pc.b_scale_hbm_offs[ops[3]],
                 bs_soff,
             )
-            if require_constexpr(sched.commit_per_copy()):
+            if require_constexpr(sched.commit_per_copy):
                 pc.lds_ptrs.commit_buffer_load()
         else:
             fragments = pc.lds_ptrs.buffer_load_scale(
@@ -509,12 +509,12 @@ def _fill_slot(
                 + ops[3] * layout.scale_read_k_slots(1),
             )
     if require_constexpr(
-        sched.commit_per_slot()
+        sched.commit_per_slot
         or (
             MARK_TILE
-            and sched.commit_per_tile()
-            and mi == layout.num_m_slots() - 1
-            and ni == layout.num_n_slots() - 1
+            and sched.commit_per_tile
+            and mi == layout.num_m_slots - 1
+            and ni == layout.num_n_slots - 1
         )
     ):
         pc.lds_ptrs.commit_buffer_load()
@@ -531,8 +531,8 @@ def _advance(pc, ptrs, STEP: gl.constexpr):
         ptrs.b_scale_hbm_ptr,
     )
     soff: gl.constexpr = sched.soff_unroll(STEP)
-    steps: gl.constexpr = sched.unroll() if soff else 1
-    if require_constexpr(not soff or sched.ki(STEP) + 1 == sched.unroll()):
+    steps: gl.constexpr = sched.unroll if soff else 1
+    if require_constexpr(not soff or sched.ki(STEP) + 1 == sched.unroll):
         if require_constexpr(sched.loads(STEP, _A_PAYLOAD)):
             a += steps * pc.a_step
         if require_constexpr(sched.loads(STEP, _B_PAYLOAD)):
@@ -571,7 +571,7 @@ def _read_payload(
     component: gl.constexpr = (operand, False)
     reg_payload: gl.constexpr = sched.in_reg(component)
     frags = ()
-    for k in gl.static_range(layout.num_k_slots()):
+    for k in gl.static_range(layout.num_k_slots):
         payload, _ = pc.lds_ptrs.ds_read_frag(
             operand,
             _index(sched, step, STEP, component, False),
@@ -584,10 +584,10 @@ def _read_payload(
             payload = buffers[operand][
                 (
                     sched.register_index(STEP, component)
-                    * (layout.num_m_slots() if operand == 0 else layout.num_n_slots())
+                    * (layout.num_m_slots if operand == 0 else layout.num_n_slots)
                     + non_k_slot
                 )
-                * layout.num_k_slots()
+                * layout.num_k_slots
                 + k
             ]
         frags += (payload,)
@@ -639,7 +639,7 @@ def _read_slot(
 ):
     layout: gl.constexpr = pc.layout
     sched: gl.constexpr = pc.schedule
-    slot: gl.constexpr = _slot_index(mi, ni, layout.num_m_slots(), layout.num_n_slots())
+    slot: gl.constexpr = _slot_index(mi, ni, layout.num_m_slots, layout.num_n_slots)
     at: gl.constexpr = sched.selected(slot, _A_PAYLOAD)
     ast: gl.constexpr = sched.selected(slot, _A_SCALE)
     bt: gl.constexpr = sched.selected(slot, _B_PAYLOAD)
@@ -675,20 +675,20 @@ def _take_operand_pairs(
     PHASE: gl.constexpr,
 ):
     out = ()
-    for k in gl.static_range(layout.num_k_slots()):
+    for k in gl.static_range(layout.num_k_slots):
         if require_constexpr(tc.func_cfg.has_scale(operand)):
             out += (
-                payload[non_k_slot * layout.num_k_slots() + k],
+                payload[non_k_slot * layout.num_k_slots + k],
                 scale[
                     non_k_slot * layout.scale_read_k_slots(operand)
-                    + PHASE % layout.scale_ratio_k_step(operand) * layout.num_k_slots()
+                    + PHASE % layout.scale_ratio_k_step(operand) * layout.num_k_slots
                     + k
                 ],
             )
         else:
             out += (
-                payload[non_k_slot * layout.num_k_slots() + k],
-                scale[non_k_slot * layout.num_k_slots() + k],
+                payload[non_k_slot * layout.num_k_slots + k],
+                scale[non_k_slot * layout.num_k_slots + k],
             )
     return out
 
@@ -708,9 +708,9 @@ def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
     DOT: gl.constexpr = sched.dot(STEP)
     warp: gl.constexpr = tc.warp_pipeline_compiler() and IN_LOOP
     region: gl.constexpr = pick_stage(warp)
-    nm: gl.constexpr = layout.num_m_slots()
-    nn: gl.constexpr = layout.num_n_slots()
-    mk: gl.constexpr = layout.num_k_slots()
+    nm: gl.constexpr = layout.num_m_slots
+    nn: gl.constexpr = layout.num_n_slots
+    mk: gl.constexpr = layout.num_k_slots
     a, b, acc = (), (), ()
     a_scale = () if sched.selects(STEP, _A_SCALE) else regs.a_scale
     b_scale = () if sched.selects(STEP, _B_SCALE) else regs.b_scale
@@ -735,8 +735,8 @@ def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
                     pc, ptrs, buffers, step, STEP, mi, ni, MARK_TILE=False
                 )
                 if require_constexpr(
-                    sched.commit_per_tile()
-                    and not sched.tile_commit_after_mfma()
+                    sched.commit_per_tile
+                    and not sched.tile_commit_after_mfma
                     and mi == nm - 1
                     and ni == nn - 1
                 ):
@@ -766,8 +766,8 @@ def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
                 if require_constexpr(mi == nm - 1 and ni == nn - 1):
                     ptrs = _advance(pc, ptrs, STEP)
             if require_constexpr(
-                sched.commit_per_tile()
-                and sched.tile_commit_after_mfma()
+                sched.commit_per_tile
+                and sched.tile_commit_after_mfma
                 and mi == nm - 1
                 and ni == nn - 1
             ):
@@ -785,9 +785,9 @@ def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
         gl.amd.cdna4.sched_barrier(0)
     if require_constexpr(not IN_LOOP):
         buffers = _rotate_buffers(buffers, sched, layout, PHASE)
-    if require_constexpr(not pc.func_cfg.a_has_scale()):
+    if require_constexpr(not pc.func_cfg.has_scale(0)):
         a_scale = a
-    if require_constexpr(not pc.func_cfg.b_has_scale()):
+    if require_constexpr(not pc.func_cfg.has_scale(1)):
         b_scale = b
     return ptrs, buffers, _PipelineRegFragments(a, a_scale, b, b_scale, acc)
 
@@ -806,12 +806,12 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
         "the live pipeline requires WARP_PIPELINE=0 or 1",
     )
     gl.static_assert(
-        layout.num_prefetch_k_slots() == layout.num_k_slots(),
+        layout.num_prefetch_k_slots == layout.num_k_slots,
         "the pipeline requires VGPR_PREFETCH_K == BLOCK_K",
     )
-    depth: gl.constexpr = sched.depth()
-    unroll: gl.constexpr = sched.unroll()
-    peeled: gl.constexpr = sched.peeled()
+    depth: gl.constexpr = sched.depth
+    unroll: gl.constexpr = sched.unroll
+    peeled: gl.constexpr = sched.peeled
     main = NUM_K - depth
     gl.assume(main >= peeled + unroll)
     remaining = main - peeled
@@ -820,8 +820,8 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
     # The relative prologue stage starts at 1 - PIPELINE_DEPTH; each component
     # begins filling when that stage reaches 1 - its own fill span.
     for r in gl.static_range(1 - depth, 0):
-        for ni in gl.static_range(layout.num_n_slots()):
-            for mi in gl.static_range(layout.num_m_slots()):
+        for ni in gl.static_range(layout.num_n_slots):
+            for mi in gl.static_range(layout.num_m_slots):
                 buffers = _fill_slot(
                     pc,
                     ptrs,
@@ -834,13 +834,13 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
         ptrs = _advance(pc, ptrs, sched.prologue_step(r))
         buffers = _rotate_buffers(buffers, sched, layout, r)
     acc = ()
-    for ni in gl.static_range(layout.num_n_slots()):
-        for mi in gl.static_range(layout.num_m_slots()):
+    for ni in gl.static_range(layout.num_n_slots):
+        for mi in gl.static_range(layout.num_m_slots):
             acc += (
                 gl.zeros(
-                    layout.accumulator_fragment_shape_slot(),
+                    layout.accumulator_fragment_shape_slot,
                     pc.func_cfg.mma_acc_dtype,
-                    layout.dot_result_fragment_layout(),
+                    layout.dot_result_fragment_layout,
                 ),
             )
     regs = _PipelineRegFragments((), (), (), (), acc)
@@ -859,7 +859,7 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
                 peeled + base + u + 1,
                 sched.loop_step(u),
             )
-    if require_constexpr(sched.static_remainder()):
+    if require_constexpr(sched.static_remainder):
         # Static expansion keeps short remainders and their LDS indices constant.
         for u in gl.static_range(unroll - 1):
             if unroll_end + u < remaining:
@@ -897,12 +897,12 @@ def _drain_buffered_pipeline(pc, ptrs, buffers, regs, NUM_K):
     tc: gl.constexpr = pc.tuning_cfg
     layout: gl.constexpr = pc.layout
     sched: gl.constexpr = pc.schedule
-    main = NUM_K - sched.depth()
-    if require_constexpr(sched.static_drain()):
-        phase = main % sched.ring_period()
-        for p in gl.static_range(sched.ring_period()):
+    main = NUM_K - sched.depth
+    if require_constexpr(sched.static_drain):
+        phase = main % sched.ring_period
+        for p in gl.static_range(sched.ring_period):
             if phase == p:
-                for j in gl.static_range(sched.depth() - 1):
+                for j in gl.static_range(sched.depth - 1):
                     ptrs, buffers, regs = _step(
                         pc,
                         ptrs,
@@ -912,7 +912,7 @@ def _drain_buffered_pipeline(pc, ptrs, buffers, regs, NUM_K):
                         sched.drain_step(p, j),
                     )
     else:
-        for j in gl.static_range(sched.depth() - 1):
+        for j in gl.static_range(sched.depth - 1):
             ptrs, buffers, regs = _step(
                 pc,
                 ptrs,
@@ -922,17 +922,17 @@ def _drain_buffered_pipeline(pc, ptrs, buffers, regs, NUM_K):
                 sched.drain_step(0, j),
             )
     a_scale, b_scale = (), ()
-    for mi in gl.static_range(layout.num_m_slots()):
+    for mi in gl.static_range(layout.num_m_slots):
         pairs = _take_operand_pairs(
-            regs.a_payload, regs.a_scale, tc, layout, 0, mi, sched.num_k() - 1
+            regs.a_payload, regs.a_scale, tc, layout, 0, mi, sched.num_k - 1
         )
-        for k in gl.static_range(layout.num_k_slots()):
+        for k in gl.static_range(layout.num_k_slots):
             a_scale += (pairs[2 * k + 1],)
-    for ni in gl.static_range(layout.num_n_slots()):
+    for ni in gl.static_range(layout.num_n_slots):
         pairs = _take_operand_pairs(
-            regs.b_payload, regs.b_scale, tc, layout, 1, ni, sched.num_k() - 1
+            regs.b_payload, regs.b_scale, tc, layout, 1, ni, sched.num_k - 1
         )
-        for k in gl.static_range(layout.num_k_slots()):
+        for k in gl.static_range(layout.num_k_slots):
             b_scale += (pairs[2 * k + 1],)
     return _PipelineRegFragments(
         regs.a_payload, a_scale, regs.b_payload, b_scale, regs.acc
@@ -944,36 +944,36 @@ def _last_mfma(pc, regs):
     tc: gl.constexpr = pc.tuning_cfg
     layout: gl.constexpr = pc.layout
     acc = ()
-    for ni in gl.static_range(layout.num_n_slots()):
-        for mi in gl.static_range(layout.num_m_slots()):
+    for ni in gl.static_range(layout.num_n_slots):
+        for mi in gl.static_range(layout.num_m_slots):
             acc += (
                 _maybe_block_dot(
                     _take_reg_pairs(
                         regs.a_payload,
                         regs.a_scale,
-                        mi * layout.num_k_slots(),
-                        layout.num_k_slots(),
+                        mi * layout.num_k_slots,
+                        layout.num_k_slots,
                     ),
                     _take_reg_pairs(
                         regs.b_payload,
                         regs.b_scale,
-                        ni * layout.num_k_slots(),
-                        layout.num_k_slots(),
+                        ni * layout.num_k_slots,
+                        layout.num_k_slots,
                     ),
                     regs.acc[
                         _slot_index(
                             mi,
                             ni,
-                            layout.num_m_slots(),
-                            layout.num_n_slots(),
+                            layout.num_m_slots,
+                            layout.num_n_slots,
                         )
                     ],
-                    layout.num_k_slots(),
+                    layout.num_k_slots,
                     pc.func_cfg,
                     tc,
                     layout,
                     True,
-                    (pc.schedule.num_k() - 1) * tc.BLOCK_K // 128 % 2,
+                    (pc.schedule.num_k - 1) * tc.BLOCK_K // 128 % 2,
                 ),
             )
     return acc

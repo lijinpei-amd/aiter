@@ -80,7 +80,7 @@ def _scale_fragments(scale, cfg, layout, operand: gl.constexpr):
             else:
                 fragment = gl.amd.slice(
                     scale,
-                    layout.scale_fragment_shape_slot(operand),
+                    layout.fragment_shape_slot(operand, True),
                     [n * layout.scale_nonk(operand), k * bk // 32],
                 )
             fragments += (fragment,)
@@ -124,7 +124,7 @@ class LDSManager:
         """Static factory -- invoked as ``LDSManager.alloc(...)``, no ``self``.
 
         The leading axis runs over pipeline buffer *and* non-K slot
-        (``num_m_slots()`` for A, ``num_n_slots()`` for B), flattened as
+        (``num_m_slots`` for A, ``num_n_slots`` for B), flattened as
         ``buffer_idx * n_slots + non_k_slot``: a shared allocation takes a layout of its
         own rank, so two separate leading axes are not expressible. Each non-K slot is a
         real allocation rather than a slice of one big tile so that each one keeps the
@@ -138,16 +138,16 @@ class LDSManager:
         if require_constexpr(layout.component_via_lds(_A_PAYLOAD)):
             a_payload_lds_ptr = gl.allocate_shared_memory(
                 a_ty,
-                layout.payload_lds_shape_tile(0),
-                layout=layout.dot_operand_lds_layout(0),
+                layout.lds_shape_tile(0, False),
+                layout=layout.dot_operand_lds_layout(0, False),
             )
         else:
             a_payload_lds_ptr: gl.constexpr = None
         if require_constexpr(layout.component_via_lds(_B_PAYLOAD)):
             b_payload_lds_ptr = gl.allocate_shared_memory(
                 b_ty,
-                layout.payload_lds_shape_tile(1),
-                layout=layout.dot_operand_lds_layout(1),
+                layout.lds_shape_tile(1, False),
+                layout=layout.dot_operand_lds_layout(1, False),
             )
         else:
             b_payload_lds_ptr: gl.constexpr = None
@@ -156,8 +156,8 @@ class LDSManager:
         ):
             a_scale_lds_ptr = gl.allocate_shared_memory(
                 gl.uint8,
-                layout.scale_lds_shape_tile(0),
-                layout=layout.dot_operand_scale_lds_layout(0),
+                layout.lds_shape_tile(0, True),
+                layout=layout.dot_operand_lds_layout(0, True),
             )
         else:
             a_scale_lds_ptr: gl.constexpr = None
@@ -166,8 +166,8 @@ class LDSManager:
         ):
             b_scale_lds_ptr = gl.allocate_shared_memory(
                 gl.uint8,
-                layout.scale_lds_shape_tile(1),
-                layout=layout.dot_operand_scale_lds_layout(1),
+                layout.lds_shape_tile(1, True),
+                layout=layout.dot_operand_lds_layout(1, True),
             )
         else:
             b_scale_lds_ptr: gl.constexpr = None
@@ -339,7 +339,7 @@ class LDSManager:
                     lds_ptr.index(
                         SCALE_READ_IDX * layout.num_scale_tiles(operand) + non_k_slot
                     ),
-                    layout.dot_operand_scale_fragment_layout(operand),
+                    layout.dot_operand_fragment_layout(operand, True),
                 ),
             )
         return fragments
@@ -383,7 +383,7 @@ class LDSManager:
                 payload_lds_ptr.index(
                     DS_READ_IDX * layout.num_lds_slots_non_k(operand) + non_k_slot
                 ),
-                layout.dot_operand_fragment_layout(operand),
+                layout.dot_operand_fragment_layout(operand, False),
             )
         if require_constexpr(READ_SCALE and self.func_cfg.has_scale(operand)):
             gl.static_assert(

@@ -35,26 +35,26 @@ def _dot(
     kind: gl.constexpr = func_cfg.dot_kind()
     a_sel: gl.constexpr = layout.mfma_scale_selector(0, K_PHASE)
     b_sel: gl.constexpr = layout.mfma_scale_selector(1, K_PHASE)
-    any_packed: gl.constexpr = layout.has_mfma_packed_scale()
+    any_packed: gl.constexpr = layout.has_mfma_packed_scale
     if require_constexpr(kind == _DK_MFMA_SCALED and any_packed):
         if require_constexpr(not func_cfg.has_scale(0)):
             a_scale = gl.full(
-                layout.scale_fragment_shape_slot(0),
+                layout.fragment_shape_slot(0, True),
                 127,
                 gl.uint8,
                 gl.amd.cdna4.get_mfma_scale_layout(
-                    layout.dot_operand_fragment_layout(0),
-                    layout.scale_fragment_shape_slot(0),
+                    layout.dot_operand_fragment_layout(0, False),
+                    layout.fragment_shape_slot(0, True),
                 ),
             )
         if require_constexpr(not func_cfg.has_scale(1)):
             b_scale = gl.full(
-                layout.scale_fragment_shape_slot(1),
+                layout.fragment_shape_slot(1, True),
                 127,
                 gl.uint8,
                 gl.amd.cdna4.get_mfma_scale_layout(
-                    layout.dot_operand_fragment_layout(1),
-                    layout.scale_fragment_shape_slot(1),
+                    layout.dot_operand_fragment_layout(1, False),
+                    layout.fragment_shape_slot(1, True),
                 ),
             )
         # At least one scale tile arrived as pre-packed dwords; the other, if any,

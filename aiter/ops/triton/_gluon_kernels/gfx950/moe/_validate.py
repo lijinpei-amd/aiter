@@ -96,7 +96,7 @@ def validate(tc, N, K, layout=None):
         f"MANUAL {int(WarpPipeline.MANUAL)}"
     )
     if tc.warp_pipeline_enabled():
-        assert layout.num_prefetch_k_slots() == layout.num_k_slots(), (
+        assert _v(layout.num_prefetch_k_slots) == _v(layout.num_k_slots), (
             f"WARP_PIPELINE needs VGPR_PREFETCH_K == BLOCK_K (got "
             f"{_v(tc.VGPR_PREFETCH_K)} vs {BK}): with a partial window the slot's "
             "MFMAs depend on the slot's own ds_read and there is no mem stage to "
@@ -230,7 +230,7 @@ def validate_layout(tc, layout, N, K):
     if tc.operand_preshuffled(1):
         # The 16-column-blocked global offsets only stay inside the N slot while
         # every extent is a whole number of 16-column, 16-byte blocks.
-        pk_b = BK // fc.b_pack_divisor()
+        pk_b = BK // fc.pack_divisor(1)
         assert BN % 16 == 0 and _v(tc.MINI_BLOCK_N) % 16 == 0, (
             f"B_PRESHUFFLED needs BLOCK_N ({BN}) and MINI_BLOCK_N "
             f"({_v(tc.MINI_BLOCK_N)}) to be multiples of the 16-column block"
@@ -246,9 +246,9 @@ def validate_layout(tc, layout, N, K):
     # -- WeightGuHbmLayout.SPLIT: an N slot must be exactly one operand side --
     if _v(fc.weight_gu_hbm_layout) == WeightGuHbmLayout.SPLIT:
         MBN = _v(tc.MINI_BLOCK_N)
-        assert layout.num_n_slots() == 2 and MBN * 2 == BN, (
+        assert _v(layout.num_n_slots) == 2 and MBN * 2 == BN, (
             f"WeightGuHbmLayout.SPLIT needs exactly two N slots, one per side: got "
-            f"BLOCK_N {BN} / MINI_BLOCK_N {MBN} = {layout.num_n_slots()}"
+            f"BLOCK_N {BN} / MINI_BLOCK_N {MBN} = {_v(layout.num_n_slots)}"
         )
         assert N % 2 == 0 and (N // 2) % MBN == 0, (
             f"WeightGuHbmLayout.SPLIT needs each half of N ({N}) to be a whole "
@@ -285,13 +285,13 @@ def validate_layout(tc, layout, N, K):
 def validate_resources(tc, layout):
     """Validate layout-dependent LDS and accumulator resource budgets."""
     # -- resource budgets --
-    lds = layout.lds_bytes()
+    lds = _v(layout.lds_bytes)
     assert lds <= LDS_USABLE_BYTES, (
         f"LDS {lds} B > {LDS_USABLE_BYTES} B usable ({LDS_CAP_BYTES} cap minus "
         f"{LDS_EPILOGUE_RESERVE_BYTES} B of epilogue scratch): reduce "
         f"NUM_LDS_BUFFER ({_v(tc.NUM_LDS_BUFFER)}) or the block sizes"
     )
-    acc = layout.acc_vgprs_per_lane()
+    acc = _v(layout.acc_vgprs_per_lane)
     assert acc <= 256, (
         f"fp32 accumulator alone needs {acc} VGPR/lane; 256 is the architectural "
         f"cap and WAVES_PER_EU=2 needs <= 256 total"
@@ -315,16 +315,16 @@ def validate_pipeline(tc, layout, K, schedule=None):
     # slot -- a slot carries one optional copy per component. Different components
     # sharing a slot is fine, which is what lets a single-slot step copy both
     # operands.
-    assert schedule.fill_slots_valid(), (
+    assert _v(schedule.fill_slots_valid), (
         f"fill ownership is not a valid mapping for num_m_slots "
-        f"{layout.num_m_slots()} x num_n_slots {layout.num_n_slots()} "
+        f"{_v(layout.num_m_slots)} x num_n_slots {_v(layout.num_n_slots)} "
         f"(MINI_BLOCK_M {_v(tc.MINI_BLOCK_M)} vs BLOCK_M {_v(tc.BLOCK_M)}, "
         f"MINI_BLOCK_N {_v(tc.MINI_BLOCK_N)} vs BLOCK_N {_v(tc.BLOCK_N)})"
     )
-    num_k = schedule.num_k()
-    depth = schedule.depth()
-    peeled = schedule.peeled()
-    unroll = schedule.unroll()
+    num_k = _v(schedule.num_k)
+    depth = _v(schedule.depth)
+    peeled = _v(schedule.peeled)
+    unroll = _v(schedule.unroll)
     assert num_k >= depth + peeled + unroll, (
         f"NUM_K ({num_k}) must be at least PIPELINE_DEPTH ({depth}) "
         f"+ PEELED ({peeled}) + UNROLL ({unroll}) = {depth + peeled + unroll}"

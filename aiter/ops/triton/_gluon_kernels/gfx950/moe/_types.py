@@ -90,7 +90,7 @@ COMPONENTS = (A_PAYLOAD, A_SCALE, B_PAYLOAD, B_SCALE)
 LDS_CAP_BYTES = 163840
 #: Headroom the operand buffers must leave for LDS the *compiler* allocates on top of
 #: them -- the epilogue's convert_layout from the MFMA layout to the store layout needs
-#: scratch that `lds_bytes()` cannot see. Empirical: a bf16 64x256 / BLOCK_K=128 tile
+#: scratch that `lds_bytes` cannot see. Empirical: a bf16 64x256 / BLOCK_K=128 tile
 #: whose explicit buffers came to exactly 163840 B was rejected at launch at 166368 B.
 #: Kept small on purpose -- the tuned MXFP4 configs sit at ~153 KiB and must not move.
 LDS_EPILOGUE_RESERVE_BYTES = 4096

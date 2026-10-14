@@ -62,34 +62,20 @@ class _ScheduleConfig:
     def has_scale(self, idx):
         return self.scales[idx]
 
-    def a_has_scale(self):
-        return self.scales[0]
-
-    def b_has_scale(self):
-        return self.scales[1]
-
+    @property
     def num_m_slots(self):
         return self.nm
 
+    @property
     def num_n_slots(self):
         return self.nn
 
     def num_lds_slots_non_k(self, idx):
         return (self.nm, self.nn)[idx]
 
-    def payload_via_lds(self, idx):
-        return self.payload_async[idx]
-
-    def scale_via_lds(self, idx):
-        return self.scale_async[idx]
-
     def component_via_lds(self, component):
         operand, is_scale = component
-        return (
-            self.scale_via_lds(operand)
-            if is_scale
-            else self.payload_via_lds(operand)
-        )
+        return (self.scale_async if is_scale else self.payload_async)[operand]
 
     def component_in_reg(self, component):
         return not self.component_via_lds(component)
@@ -309,7 +295,7 @@ def _steady_step(tc):
 def _trace_emitter(tc, monkeypatch, defer_stage_commit=False):
     tc.ALLOW_B_VIA_LDS = True
     tc.num_buffers = lambda operand, scale=False: 3
-    tc.num_k_slots = lambda: 1
+    tc.num_k_slots = 1
     tc.operand_elem_ty = lambda operand: SimpleNamespace(primitive_bitwidth=8)
     tc.scale_hbm_steps = lambda operand, steps, phase: steps
     sink = _LDSRecorder(tc)
@@ -463,7 +449,7 @@ def test_register_only_slots_need_no_cooperative_fence(scheme, monkeypatch):
 
     waits, barriers = [], []
     tc = _config((4, 2), scheme, False, "register-payloads")
-    tc.num_k_slots = lambda: 1
+    tc.num_k_slots = 1
     tc.warp_pipeline_compiler = lambda: False
     tc.commit_per_stage_warp_pipeline = lambda: (
         scheme == WaitCommitScheme.PER_STAGE_WARP_PIPELINE
@@ -527,7 +513,7 @@ def test_pipeline_stage_commit_boundaries(
 
     events = []
     tc = _config((2, 2), scheme, False, "no-scales")
-    tc.num_k_slots = lambda: 1
+    tc.num_k_slots = 1
     tc.warp_pipeline_compiler = lambda: compiler
     tc.commit_per_stage_warp_pipeline = lambda: (
         scheme == WaitCommitScheme.PER_STAGE_WARP_PIPELINE

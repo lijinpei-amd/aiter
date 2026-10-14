@@ -108,8 +108,9 @@ Notes:
 - T2d compiles every cell into a fresh Triton cache, so it takes the same time cold
   or warm. So do T2b's five builds; its probes reuse caches in `$OUT/tmp`.
 - T0b's baseline is `$OUT/layout_fields_baseline.txt` when recorded, otherwise
-  `tests/reference/gate/layout_fields_baseline.txt`, recorded at commit `1b24ca9db`
-  (T0's `sched_baseline.txt` was re-recorded by the `Schedule` refactor, which
+  `tests/reference/gate/layout_fields_baseline.txt`, re-recorded when the
+  whole-build `KernelLayout` values became public fields (names changed, values did
+  not) (T0's `sched_baseline.txt` was re-recorded by the `Schedule` refactor, which
   changed the dump to one block per emitted step; the other gate references are
   from `1d3431e50`). T0b differs by design when a
   change renames, adds or removes a `KernelLayout` field, or adds a sched-dump case
@@ -271,7 +272,7 @@ Otherwise record a fresh baseline.
 
 | Check | Reference | Result |
 |---|---|---|
-| Gate | `reference/gate/{sched,build_id,asm}_baseline.txt`, used automatically by `gate.sh` when `$OUT` has none. `layout_fields_baseline.txt` (T0b) was recorded later, at `1b24ca9db`, and `sched_baseline.txt` (T0) by the `Schedule` refactor | verdict PASS. T1 856 passed, T2a 18 passed, determinism shas `59d442f663991659` / `0cfa77fb04450594` 5/5 |
+| Gate | `reference/gate/{sched,build_id,asm}_baseline.txt`, used automatically by `gate.sh` when `$OUT` has none. `layout_fields_baseline.txt` (T0b) was recorded later, at `1b24ca9db`, and re-recorded when the `KernelLayout` fields went public; `sched_baseline.txt` (T0) by the `Schedule` refactor | verdict PASS. T1 856 passed, T2a 18 passed, determinism shas `59d442f663991659` / `0cfa77fb04450594` 5/5 |
 | Suite | `reference/suite_1d3431e50/*.txt`, the FAILED lines and summary per file | 1811 passed / 58 failed / 22 skipped. Compare with `compare_suite.py tests/reference/suite_1d3431e50 <label>`. A test was added by `1b24ca9db`, so against that tree or later it reports `SUITE FAIL` on the pass count; run the base suite instead |
 | Cold bench | `reference/cold_1d3431e50_phys5/`, `summary.json` and `report.md`. `summary.json` is the run as recorded, with the pre-`dcef897ca` knob names (`B_IN_REG`, ...); `summary_allow_via_lds.json` is the same run with them renamed to `ALLOW_*_VIA_LDS` and inverted | physical GPU 5 (BDF `0000:96:00.0`), `--tolerant`, 160/160 processes, 0 failures. Compare with `compare_cold.py tests/reference/cold_1d3431e50_phys5 <label>`, on physical GPU 5 only |
 

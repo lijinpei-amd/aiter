@@ -10,6 +10,7 @@ import torch
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import unwrap
 from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import KernelLayout
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lds import LDSManager
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import DtypeQuant
@@ -25,12 +26,8 @@ def _register_load_copy(
     # Unused staging allocations must disappear from the compiled kernel.
     layout = KernelLayout(tc)
     lds = LDSManager.alloc(tc.func_cfg, tc, layout)
-    if SCALE:
-        shape: gl.constexpr = layout.scale_lds_shape_slot(operand)
-        frag_layout: gl.constexpr = layout.dot_operand_scale_fragment_layout(operand)
-    else:
-        shape: gl.constexpr = layout.payload_lds_shape_slot(operand)
-        frag_layout: gl.constexpr = layout.dot_operand_fragment_layout(operand)
+    shape: gl.constexpr = layout.lds_shape_slot(operand, SCALE)
+    frag_layout: gl.constexpr = layout.dot_operand_fragment_layout(operand, SCALE)
     rows = gl.arange(0, shape[0], layout=gl.SliceLayout(1, frag_layout))
     cols = gl.arange(0, shape[1], layout=gl.SliceLayout(0, frag_layout))
     offsets = rows[:, None] * shape[1] + cols[None, :]
@@ -60,16 +57,12 @@ def test_register_load_does_not_stage_through_lds(operand, scale, block_k):
     )
     tc = host._probe_tuning_config(config, DtypeQuant.MXFP4, DtypeQuant.MXFP4)
     layout = KernelLayout(tc)
-    shape = (
-        layout.scale_lds_shape_slot(operand)
-        if scale
-        else layout.payload_lds_shape_slot(operand)
-    )
+    shape = layout.lds_shape_slot(operand, scale)
     elements = shape[0] * shape[1]
     src = (torch.arange(elements + 16, device="cuda") % 251).to(torch.uint8)
     dst = torch.empty(elements, dtype=torch.uint8, device="cuda")
     compiled = _register_load_copy[(1,)](
-        src, dst, tc, operand, scale, num_warps=layout.num_warps()
+        src, dst, tc, operand, scale, num_warps=unwrap(layout.num_warps)
     )
     torch.testing.assert_close(dst, src[16:], rtol=0, atol=0)
     assert compiled.metadata.shared == 0

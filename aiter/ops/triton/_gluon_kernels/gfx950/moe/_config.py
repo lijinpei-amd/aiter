@@ -101,12 +101,7 @@ class KernelFuncConfig:
         )
         self.epilogue = gl.constexpr(int(_v(epilogue)))
 
-    # -- activation accessors (the spec's `activation` is a NamedTuple in a constexpr,
-    #    so unwrap it here rather than at every use site) --
-    @gluon.constexpr_function
-    def act(self):
-        return _v(self.activation)
-
+    # -- activation --
     @gluon.constexpr_function
     def has_activation(self):
         return _v(self.activation) is not None
@@ -121,7 +116,7 @@ class KernelFuncConfig:
     # Everything below is indexed by operand (0 = token / LHS, 1 = expert / RHS). The
     # two operands genuinely differ in the mixed configurations -- a16w4 is bf16 x fp4,
     # a8w4 is fp8 x fp4 -- so nothing here may be keyed on one dtype and applied to
-    # both. `a_*` / `b_*` remain as thin aliases for readability at the use sites.
+    # both.
     @gluon.constexpr_function
     def dtype_quant(self, idx):
         if _v(idx) == 0:
@@ -166,36 +161,12 @@ class KernelFuncConfig:
         return dq_mx_format(self.online_quant(idx))
 
     @gluon.constexpr_function
-    def a_format(self):
-        return dq_mx_format(self.token_online_quant)
-
-    @gluon.constexpr_function
-    def b_format(self):
-        return dq_mx_format(self.expert_online_quant)
-
-    @gluon.constexpr_function
     def has_scale(self, idx):
         return dq_has_scale(self.dtype_quant(idx))
 
     @gluon.constexpr_function
-    def a_has_scale(self):
-        return dq_has_scale(self.token_dtype_quant)
-
-    @gluon.constexpr_function
-    def b_has_scale(self):
-        return dq_has_scale(self.expert_dtype_quant)
-
-    @gluon.constexpr_function
     def pack_divisor(self, idx):
         return dq_pack_divisor(self.dtype_quant(idx))
-
-    @gluon.constexpr_function
-    def a_pack_divisor(self):
-        return dq_pack_divisor(self.token_dtype_quant)
-
-    @gluon.constexpr_function
-    def b_pack_divisor(self):
-        return dq_pack_divisor(self.expert_dtype_quant)
 
     @gluon.constexpr_function
     def operand_elem_ty(self, idx):
@@ -401,42 +372,26 @@ class KernelTuningConfig:
     # (``KernelLayout.component_via_lds`` / ``component_in_reg``) from these.
 
     @gluon.constexpr_function
-    def allow_payload_via_lds(self, idx):
-        """Whether tuning permits staging this operand's payload through LDS.
-
-        ``ALLOW_B_VIA_LDS`` for B; A has no knob and is always permitted. A permitted
-        payload can still land in registers when its tile is too small for the copy;
-        see ``KernelLayout.payload_via_lds``.
-        """
-        return _v(idx) == 0 or bool(_v(self.ALLOW_B_VIA_LDS))
-
-    @gluon.constexpr_function
-    def allow_scale_via_lds(self, idx):
-        """Whether tuning permits staging this operand's scales through LDS.
-
-        ``ALLOW_A_SCALE_VIA_LDS`` / ``ALLOW_B_SCALE_VIA_LDS``. A permitted scale can
-        still land in registers when its tile cannot take a coalesced copy; see
-        ``KernelLayout.scale_via_lds``.
-        """
-        return bool(
-            _v(
-                self.ALLOW_A_SCALE_VIA_LDS
-                if _v(idx) == 0
-                else self.ALLOW_B_SCALE_VIA_LDS
-            )
-        )
-
-    @gluon.constexpr_function
     def allow_component_via_lds(self, component):
-        """The ``allow_*_via_lds`` policy for an ``(operand, is_scale)`` component."""
+        """Whether tuning permits staging an ``(operand, is_scale)`` through LDS.
+
+        A payload reads ``ALLOW_B_VIA_LDS`` for B; A has no knob and is always
+        permitted. A scale reads ``ALLOW_A_SCALE_VIA_LDS`` / ``ALLOW_B_SCALE_VIA_LDS``.
+        A permitted component can still land in registers when its tile cannot take
+        the copy; see ``KernelLayout.component_via_lds``.
+        """
         component = _v(component)
         operand, is_scale = _v(component[0]), bool(_v(component[1]))
         assert operand in (0, 1), "component operand must be 0 (A) or 1 (B)"
-        return (
-            self.allow_scale_via_lds(operand)
-            if is_scale
-            else self.allow_payload_via_lds(operand)
-        )
+        if is_scale:
+            return bool(
+                _v(
+                    self.ALLOW_A_SCALE_VIA_LDS
+                    if operand == 0
+                    else self.ALLOW_B_SCALE_VIA_LDS
+                )
+            )
+        return operand == 0 or bool(_v(self.ALLOW_B_VIA_LDS))
 
     @gluon.constexpr_function
     def operand_preshuffled(self, idx):

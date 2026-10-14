@@ -305,7 +305,7 @@ def _probe_lds_bytes_uncached(cfg: dict, dq_a, dq_b) -> int:
     tc = _probe_tuning_config(cfg, dq_a, dq_b)
     if _cval(tc.FROZEN_STEP):
         return _compute_frozen_layout(tc).lds_bytes()
-    return KernelLayout(tc).lds_bytes()
+    return _cval(KernelLayout(tc).lds_bytes)
 
 
 def _probe_tuning_config(cfg: dict, dq_a, dq_b):
@@ -1415,7 +1415,7 @@ def _sorted_shuffle_a_scales(x_scales, routing_data, gather_indx, K, cfg):
     if x_scales is None or gather_indx is None:
         return None
     block_m = int(cfg["BLOCK_M"])
-    # Mirrors KernelLayout.sorted_shuffled_ok(): the permutation is carried by the
+    # Mirrors KernelLayout.sorted_shuffled_ok: the permutation is carried by the
     # LDS tile's layout. A shuffled scale load covers an integer number of BLOCK_K
     # payload steps; K128 therefore retains each packed K256 group for two steps.
     if (
