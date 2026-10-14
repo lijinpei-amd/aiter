@@ -93,8 +93,8 @@ class _PipelineConst:
     increments. Only :class:`_PipelinePointers` and :class:`_PipelineRegFragments`
     cross the back edge.
 
-    Every offset grid is a *tuple*, one entry per mini block: ``num_m_slots_per_block()`` for the A
-    side, ``num_n_slots_per_block()`` for the B side. Each entry is laid out for its own mini tile's
+    Every offset grid is a *tuple*, one entry per mini block: ``num_m_slots()`` for the A
+    side, ``num_n_slots()`` for the B side. Each entry is laid out for its own mini tile's
     copy layout, which is what keeps every per-mini-block direct-to-LDS copy as wide and
     as coalesced as the whole-tile copy it replaces.
 
@@ -285,7 +285,7 @@ def _rotate(queue, TILE_COUNT: gl.constexpr):
 
 @gluon.jit
 def _rotate_buffers(buffers, tc, layout, PHASE: gl.constexpr = 0):
-    mk: gl.constexpr = layout.num_k_slots_per_tile()
+    mk: gl.constexpr = layout.num_k_slots()
     if require_constexpr(_reads_at_phase(tc, layout, _A_SCALE, PHASE + 1)):
         a_scale = _rotate(buffers[2], layout.scale_cache_fragments(0))
     else:
@@ -295,8 +295,8 @@ def _rotate_buffers(buffers, tc, layout, PHASE: gl.constexpr = 0):
     else:
         b_scale = buffers[3]
     return (
-        _rotate(buffers[0], layout.num_m_slots_per_block() * mk),
-        _rotate(buffers[1], layout.num_n_slots_per_block() * mk),
+        _rotate(buffers[0], layout.num_m_slots() * mk),
+        _rotate(buffers[1], layout.num_n_slots() * mk),
         a_scale,
         b_scale,
     )
@@ -309,9 +309,7 @@ def _init_buffers(pc):
     a, b, a_scale, b_scale = (), (), (), ()
     if require_constexpr(_in_reg(tc, layout, _A_PAYLOAD)):
         for _ in gl.static_range(
-            tc.num_buffers(0)
-            * layout.num_m_slots_per_block()
-            * layout.num_k_slots_per_tile()
+            tc.num_buffers(0) * layout.num_m_slots() * layout.num_k_slots()
         ):
             a += (
                 gl.zeros(
@@ -322,9 +320,7 @@ def _init_buffers(pc):
             )
     if require_constexpr(_in_reg(tc, layout, _B_PAYLOAD)):
         for _ in gl.static_range(
-            tc.num_buffers(1)
-            * layout.num_n_slots_per_block()
-            * layout.num_k_slots_per_tile()
+            tc.num_buffers(1) * layout.num_n_slots() * layout.num_k_slots()
         ):
             b += (
                 gl.zeros(
@@ -407,7 +403,7 @@ def _fill_slot(
     # stay separate because they perform different JIT-visible pointer and
     # tuple operations, but they no longer each restate the gate.
     ops: gl.constexpr = _issued_tiles(tc, layout, mi, ni, STAGE, DRAIN, PHASE)
-    mk: gl.constexpr = layout.num_k_slots_per_tile()
+    mk: gl.constexpr = layout.num_k_slots()
     offset_step: gl.constexpr = KI if _soff_unroll(tc, IN_LOOP) else 0
     a_soff: gl.constexpr = (
         offset_step
@@ -462,7 +458,7 @@ def _fill_slot(
                 fragments,
                 (
                     _register_index(tc, layout, _A_PAYLOAD, PHASE, KI, IN_LOOP, True)
-                    * layout.num_m_slots_per_block()
+                    * layout.num_m_slots()
                     + ops[0]
                 )
                 * mk,
@@ -513,7 +509,7 @@ def _fill_slot(
                 fragments,
                 (
                     _register_index(tc, layout, _B_PAYLOAD, PHASE, KI, IN_LOOP, True)
-                    * layout.num_n_slots_per_block()
+                    * layout.num_n_slots()
                     + ops[2]
                 )
                 * mk,
@@ -565,8 +561,8 @@ def _fill_slot(
         or (
             MARK_STAGE
             and tc.commit_per_stage()
-            and mi == layout.num_m_slots_per_block() - 1
-            and ni == layout.num_n_slots_per_block() - 1
+            and mi == layout.num_m_slots() - 1
+            and ni == layout.num_n_slots() - 1
         )
     ):
         pc.lds_ptrs.commit_buffer_load()
@@ -661,7 +657,7 @@ def _read_tile(
     component: gl.constexpr = (operand, False)
     reg_payload: gl.constexpr = _in_reg(tc, layout, component)
     frags = ()
-    for k in gl.static_range(layout.num_k_slots_per_tile()):
+    for k in gl.static_range(layout.num_k_slots()):
         payload, _ = pc.lds_ptrs.ds_read_frag(
             operand,
             _index(tc, layout, step, component, False, KI, IN_LOOP or STATIC_PHASE),
@@ -674,14 +670,10 @@ def _read_tile(
             payload = buffers[operand][
                 (
                     _register_index(tc, layout, component, PHASE, KI, IN_LOOP)
-                    * (
-                        layout.num_m_slots_per_block()
-                        if operand == 0
-                        else layout.num_n_slots_per_block()
-                    )
+                    * (layout.num_m_slots() if operand == 0 else layout.num_n_slots())
                     + tile
                 )
-                * layout.num_k_slots_per_tile()
+                * layout.num_k_slots()
                 + k
             ]
         frags += (payload,)
@@ -803,22 +795,20 @@ def _take_operand_pairs(
     PHASE: gl.constexpr,
 ):
     out = ()
-    for k in gl.static_range(layout.num_k_slots_per_tile()):
+    for k in gl.static_range(layout.num_k_slots()):
         if require_constexpr(tc.func_cfg.has_scale(operand)):
             out += (
-                payload[tile * layout.num_k_slots_per_tile() + k],
+                payload[tile * layout.num_k_slots() + k],
                 scale[
                     tile * layout.scale_read_k_slots(operand)
-                    + PHASE
-                    % layout.scale_ratio_k_step(operand)
-                    * layout.num_k_slots_per_tile()
+                    + PHASE % layout.scale_ratio_k_step(operand) * layout.num_k_slots()
                     + k
                 ],
             )
         else:
             out += (
-                payload[tile * layout.num_k_slots_per_tile() + k],
-                scale[tile * layout.num_k_slots_per_tile() + k],
+                payload[tile * layout.num_k_slots() + k],
+                scale[tile * layout.num_k_slots() + k],
             )
     return out
 
@@ -844,9 +834,9 @@ def _step_live(
     layout: gl.constexpr = pc.layout
     warp: gl.constexpr = tc.warp_pipeline_compiler() and IN_LOOP
     region: gl.constexpr = pick_stage(warp)
-    nm: gl.constexpr = layout.num_m_slots_per_block()
-    nn: gl.constexpr = layout.num_n_slots_per_block()
-    mk: gl.constexpr = layout.num_k_slots_per_tile()
+    nm: gl.constexpr = layout.num_m_slots()
+    nn: gl.constexpr = layout.num_n_slots()
+    mk: gl.constexpr = layout.num_k_slots()
     a, b, acc = (), (), ()
     a_scale = () if _reads_at_phase(tc, layout, _A_SCALE, PHASE) else regs.a_scale
     b_scale = () if _reads_at_phase(tc, layout, _B_SCALE, PHASE) else regs.b_scale
@@ -988,7 +978,7 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
         "the live pipeline requires WARP_PIPELINE=0 or 1",
     )
     gl.static_assert(
-        layout.num_prefetch_k_slots() == layout.num_k_slots_per_tile(),
+        layout.num_prefetch_k_slots() == layout.num_k_slots(),
         "the pipeline requires VGPR_PREFETCH_K == BLOCK_K",
     )
     depth: gl.constexpr = pipeline_depth(tc, layout)
@@ -1002,8 +992,8 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
     # The relative prologue stage starts at 1 - PIPELINE_DEPTH; each component
     # begins filling when that stage reaches 1 - its own fill span.
     for r in gl.static_range(1 - depth, 0):
-        for ni in gl.static_range(layout.num_n_slots_per_block()):
-            for mi in gl.static_range(layout.num_m_slots_per_block()):
+        for ni in gl.static_range(layout.num_n_slots()):
+            for mi in gl.static_range(layout.num_m_slots()):
                 buffers = _fill_slot(
                     pc,
                     ptrs,
@@ -1025,8 +1015,8 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
         )
         buffers = _rotate_buffers(buffers, tc, layout, r)
     acc = ()
-    for ni in gl.static_range(layout.num_n_slots_per_block()):
-        for mi in gl.static_range(layout.num_m_slots_per_block()):
+    for ni in gl.static_range(layout.num_n_slots()):
+        for mi in gl.static_range(layout.num_m_slots()):
             acc += (
                 gl.zeros(
                     layout.accumulator_fragment_shape_slot(),
@@ -1142,17 +1132,17 @@ def _drain_buffered_pipeline(
                 PHASE=pc.num_k - pipeline_depth(tc, layout) + j + 1,
             )
     a_scale, b_scale = (), ()
-    for tile in gl.static_range(layout.num_m_slots_per_block()):
+    for tile in gl.static_range(layout.num_m_slots()):
         pairs = _take_operand_pairs(
             regs.a_payload, regs.a_scale, tc, layout, 0, tile, pc.num_k - 1
         )
-        for k in gl.static_range(layout.num_k_slots_per_tile()):
+        for k in gl.static_range(layout.num_k_slots()):
             a_scale += (pairs[2 * k + 1],)
-    for tile in gl.static_range(layout.num_n_slots_per_block()):
+    for tile in gl.static_range(layout.num_n_slots()):
         pairs = _take_operand_pairs(
             regs.b_payload, regs.b_scale, tc, layout, 1, tile, pc.num_k - 1
         )
-        for k in gl.static_range(layout.num_k_slots_per_tile()):
+        for k in gl.static_range(layout.num_k_slots()):
             b_scale += (pairs[2 * k + 1],)
     return _PipelineRegFragments(
         regs.a_payload, a_scale, regs.b_payload, b_scale, regs.acc
@@ -1164,31 +1154,31 @@ def _last_mfma(pc, regs):
     tc: gl.constexpr = pc.tuning_cfg
     layout: gl.constexpr = pc.layout
     acc = ()
-    for ni in gl.static_range(layout.num_n_slots_per_block()):
-        for mi in gl.static_range(layout.num_m_slots_per_block()):
+    for ni in gl.static_range(layout.num_n_slots()):
+        for mi in gl.static_range(layout.num_m_slots()):
             acc += (
                 _maybe_block_dot(
                     _take_reg_pairs(
                         regs.a_payload,
                         regs.a_scale,
-                        mi * layout.num_k_slots_per_tile(),
-                        layout.num_k_slots_per_tile(),
+                        mi * layout.num_k_slots(),
+                        layout.num_k_slots(),
                     ),
                     _take_reg_pairs(
                         regs.b_payload,
                         regs.b_scale,
-                        ni * layout.num_k_slots_per_tile(),
-                        layout.num_k_slots_per_tile(),
+                        ni * layout.num_k_slots(),
+                        layout.num_k_slots(),
                     ),
                     regs.acc[
                         _slot_index(
                             mi,
                             ni,
-                            layout.num_m_slots_per_block(),
-                            layout.num_n_slots_per_block(),
+                            layout.num_m_slots(),
+                            layout.num_n_slots(),
                         )
                     ],
-                    layout.num_k_slots_per_tile(),
+                    layout.num_k_slots(),
                     pc.func_cfg,
                     tc,
                     layout,

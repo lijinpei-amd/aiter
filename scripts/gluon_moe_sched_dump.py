@@ -154,7 +154,7 @@ def dump_case(name, cfg, dq_a, dq_b, K, out):
         out(f"== {name}: REJECTED {type(exc).__name__}: {str(exc).splitlines()[0][:120]}")
         return
 
-    nm, nn = layout.num_m_slots_per_block(), layout.num_n_slots_per_block()
+    nm, nn = layout.num_m_slots(), layout.num_n_slots()
     slots = nm * nn
     depth = S.pipeline_depth(tc, layout)
     unroll = S.pipeline_unroll(tc, layout)
@@ -162,7 +162,7 @@ def dump_case(name, cfg, dq_a, dq_b, K, out):
     num_k = layout.num_k_tiles(K)
 
     out(f"== {name}")
-    out(f"  geom NM={nm} NN={nn} slots={slots} mk={layout.num_k_slots_per_tile()} "
+    out(f"  geom NM={nm} NN={nn} slots={slots} mk={layout.num_k_slots()} "
         f"num_k={num_k} scheme={int(tc.WAIT_COMMIT_SCHEME)}")
     out(f"  sizing depth={depth} unroll={unroll} peeled={peeled} "
         f"regperiod={S.pipeline_register_period(tc, layout)} "

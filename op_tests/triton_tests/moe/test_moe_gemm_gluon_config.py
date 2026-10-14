@@ -846,8 +846,8 @@ def test_absent_scales_do_not_participate_in_depth_unroll_or_validation(
     # are still gated by the function configuration at every scheduling caller.
     assert _plain(layout.component_in_reg(A_SCALE))
     assert _plain(layout.component_in_reg(B_SCALE))
-    for ni in range(layout.num_n_slots_per_block()):
-        for mi in range(layout.num_m_slots_per_block()):
+    for ni in range(layout.num_n_slots()):
+        for mi in range(layout.num_m_slots()):
             ops = buffered_ops(tc, layout, mi, ni)
             assert ops[COMPONENTS.index(A_SCALE)] is None
             assert ops[COMPONENTS.index(B_SCALE)] is None
@@ -1116,8 +1116,8 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
     the buffered-pipeline oracle separately checks exact ring-bank contents and
     overwrite safety.
     """
-    nm = _plain(layout.num_m_slots_per_block())
-    nn = _plain(layout.num_n_slots_per_block())
+    nm = _plain(layout.num_m_slots())
+    nn = _plain(layout.num_n_slots())
     nslots = nm * nn
     if (nm, nn) == (2, 2):
         payloads = [

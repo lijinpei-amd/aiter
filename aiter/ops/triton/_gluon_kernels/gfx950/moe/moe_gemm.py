@@ -117,8 +117,8 @@ def _drain_last_fused(
     computed, which is why it takes ``GATE_PRE`` to skip recomputing it.
     """
     tc: gl.constexpr = pc.tuning_cfg
-    NM: gl.constexpr = layout.num_m_slots_per_block()
-    NN: gl.constexpr = layout.num_n_slots_per_block()
+    NM: gl.constexpr = layout.num_m_slots()
+    NN: gl.constexpr = layout.num_n_slots()
     PF_FRAGS: gl.constexpr = layout.num_prefetch_k_slots()
     act: gl.constexpr = func_cfg.act()
     gl.static_assert(func_cfg.weight_gu_hbm_layout == _WEIGHT_GU_SPLIT and NN == 2)
@@ -293,8 +293,7 @@ def _moe_gemm_body(
     # MFMA is separate and consumes only the fragments already in registers.
     # Fuse its activation where supported by the live step.
     FUSE: gl.constexpr = (
-        func_cfg.weight_gu_hbm_layout == _WEIGHT_GU_SPLIT
-        and layout.num_n_slots_per_block() == 2
+        func_cfg.weight_gu_hbm_layout == _WEIGHT_GU_SPLIT and layout.num_n_slots() == 2
     )
     regs = _drain_buffered_pipeline(pc, hbm_ptrs, buffers, regs, NUM_K, epi.groups)
     if require_constexpr(not FUSE):

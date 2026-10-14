@@ -168,7 +168,7 @@ def _epi_bias_tiles(bias_lds_ptr, bias_hbm_ptr, pid_n, N, func_cfg, tuning_cfg, 
     this really is a prefetch -- unlike gammas, see _epi_gamma_tiles.
     """
     MBN: gl.constexpr = tuning_cfg.MINI_BLOCK_N
-    NN: gl.constexpr = layout.num_n_slots_per_block()
+    NN: gl.constexpr = layout.num_n_slots()
     RFL: gl.constexpr = layout.dot_result_fragment_layout()
     out = ()
     if require_constexpr(func_cfg.has_bias):
@@ -200,7 +200,7 @@ def _epi_gamma_tiles(
     """
     BM: gl.constexpr = tuning_cfg.BLOCK_M
     MBM: gl.constexpr = tuning_cfg.MINI_BLOCK_M
-    NM: gl.constexpr = layout.num_m_slots_per_block()
+    NM: gl.constexpr = layout.num_m_slots()
     out = ()
     if require_constexpr(func_cfg.has_gammas and gamma_lds_ptr is None):
         for hm in gl.static_range(NM):
@@ -630,8 +630,8 @@ def _epilogue_store(
     MBM: gl.constexpr = tuning_cfg.MINI_BLOCK_M
     OUT_MBN: gl.constexpr = layout.output_n_slot()
 
-    NN: gl.constexpr = layout.num_n_slots_per_block()
-    NM: gl.constexpr = layout.num_m_slots_per_block()
+    NN: gl.constexpr = layout.num_n_slots()
+    NM: gl.constexpr = layout.num_m_slots()
 
     # Block-level operand loads. Each is invariant in one of the two
     # walk indices -- bias in mi, gammas in ni -- so the per-tile form below issues

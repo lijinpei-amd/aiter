@@ -1,0 +1,2 @@
+    * tile: regsiter/lds tile handled collectively by thread-block. `Tile` is a general concept, which could mean thread-block tile, warp tile, sliced sub-tile etc, in this code base, without furthur modification, tile means the `BLOCK_M * BLOCK_N * BLOCK_K` tile.
+    * slot: sliced sub part of tile. For better performance, tile is sliced into `NUM_M_SLOTS * NUM_N_SLOTS` part, each is called a slot.
