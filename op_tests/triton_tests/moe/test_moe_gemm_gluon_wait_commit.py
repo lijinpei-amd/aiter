@@ -11,9 +11,9 @@ import pytest
 
 from aiter.ops.triton._gluon_kernels.gfx950.moe import _lds
 from aiter.ops.triton._gluon_kernels.gfx950.moe import _pipeline as buffered
-from aiter.ops.triton._gluon_kernels.gfx950.moe import _schedule as schedule
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import unwrap
-from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
+from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import Schedule
+from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     A_PAYLOAD,
     A_SCALE,
     B_PAYLOAD,
@@ -23,11 +23,8 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
     SCALE,
     A,
     B,
-    _groups,
-    _ops,
-    _via_lds,
+    WaitCommitScheme,
 )
-from aiter.ops.triton._gluon_kernels.gfx950.moe._types import WaitCommitScheme
 
 
 @dataclass
@@ -48,6 +45,11 @@ class _ScheduleConfig:
     a_scale_ratio: int = 1
     SOFF_UNROLL: bool = False
     K_UNROLL: int = 1
+    UNROLL_EPILOGUE: bool = True
+    BLOCK_K: int = 256
+    output_quant = None
+    has_gammas = False
+    has_bias = False
     token_cache_modifier: str = ""
     token_scale_cache_modifier: str = ""
     expert_cache_modifier: str = ""
@@ -130,6 +132,26 @@ class _ScheduleConfig:
             WaitCommitScheme.PER_STAGE_WARP_PIPELINE,
             WaitCommitScheme.PER_STAGE_WHOLE,
         )
+
+    def commit_per_stage_warp_pipeline(self):
+        return self.WAIT_COMMIT_SCHEME == WaitCommitScheme.PER_STAGE_WARP_PIPELINE
+
+    def commit_per_stage_whole(self):
+        return self.WAIT_COMMIT_SCHEME == WaitCommitScheme.PER_STAGE_WHOLE
+
+    def ds_read_in_mfma(self, operand, scale=False):
+        return False
+
+    def epilogue_inputs_via_lds(self):
+        return False
+
+    def num_k_tiles(self, K):
+        assert K % self.BLOCK_K == 0
+        return K // self.BLOCK_K
+
+    def make_schedule(self, num_k=64, epilogue_groups=0):
+        """The build's schedule; the default K is long enough for any test depth."""
+        return Schedule(self, self, num_k * self.BLOCK_K, epilogue_groups)
 
 
 def _config(shape, scheme, middle, traffic):
@@ -273,19 +295,31 @@ class _LDSRecorder:
         self.pending.clear()
 
 
+def _steady_step(tc):
+    """A schedule and its runtime-remainder step: steady state at K phase zero.
+
+    Every component fills there and nothing is unrolled, so the step's copies are the
+    slot ownership itself, with dynamic ring indices.
+    """
+    tc.UNROLL_EPILOGUE = False
+    schedule = tc.make_schedule()
+    return schedule, schedule.remainder_step(0)
+
+
 def _trace_emitter(tc, monkeypatch, defer_stage_commit=False):
     tc.ALLOW_B_VIA_LDS = True
     tc.num_buffers = lambda operand, scale=False: 3
-    tc.pipeline_peeled = lambda: 1
     tc.num_k_slots = lambda: 1
     tc.operand_elem_ty = lambda operand: SimpleNamespace(primitive_bitwidth=8)
     tc.scale_hbm_steps = lambda operand, steps, phase: steps
     sink = _LDSRecorder(tc)
+    schedule, step = _steady_step(tc)
     pc = SimpleNamespace(
         lds_ptrs=sink,
         func_cfg=tc,
         tuning_cfg=tc,
         layout=tc,
+        schedule=schedule,
         a_hbm_offs=(0,) * tc.nm,
         b_hbm_offs=(0,) * tc.nn,
         a_scale_hbm_offs=(0,) * tc.nm,
@@ -329,11 +363,10 @@ def _trace_emitter(tc, monkeypatch, defer_stage_commit=False):
                 pointers,
                 buffers,
                 0,
-                None,
-                False,
+                step,
                 slot % tc.nm,
                 slot // tc.nm,
-                MARK_STAGE=not defer_stage_commit,
+                MARK_TILE=not defer_stage_commit,
             )
     if defer_stage_commit:
         assert not any(sink.groups)
@@ -374,28 +407,35 @@ def test_emitted_groups_and_waits_retire_required_copies(
     emitted_copies, emitted_groups = _trace_emitter(tc, monkeypatch)
     assert emitted_copies == tuple(copies)
     assert emitted_groups == expected
-    # Tie the *live* model to the traced emitter, not a parallel one. `_groups` is
-    # stage- and phase-aware; queried at a steady-state step every component is active,
-    # which is the situation this reference describes.
-    assert _groups(tc, tc, None) == expected
+    # Tie the schedule's commit plan to the traced emitter, not a parallel model. At
+    # a steady-state step every component is active, which is the situation this
+    # reference describes.
+    schedule, step = _steady_step(tc)
+    assert (
+        tuple(schedule.commits(step, slot) for slot in range(tc.nm * tc.nn))
+        == expected
+    )
     for slot, operations in enumerate(copies):
-        mi, ni = slot % tc.nm, slot // tc.nm
-        # `_ops` keeps direct-register destinations because the schedule still owns
-        # them; only scales are dropped from the async view, since a register scale
-        # has no commit group while a register payload still occupies its slot.
+        # Ownership keeps direct-register destinations because the schedule still
+        # issues them; only scales are dropped from the async view, since a register
+        # scale has no commit group while a register payload still occupies its slot.
         nominal = tuple(
-            tile
-            if (not component[1] or tile is None or _via_lds(tc, tc, component))
+            non_k_slot
+            if (
+                not component[1]
+                or non_k_slot is None
+                or schedule.via_lds(component)
+            )
             else None
-            for component, tile in zip(COMPONENTS, _ops(tc, tc, mi, ni))
+            for component, non_k_slot in zip(COMPONENTS, schedule.owned(slot))
         )
         assert nominal == tuple(
             dict(operations).get(component) for component in COMPONENTS
         )
 
-    # The live `_wait` is not re-derived here. It is covered end to end by two
+    # The wait plan is not re-derived here. It is covered end to end by two
     # independent FIFO oracles that model every pipeline region rather than a
-    # nominal steady-state stage: `_Machine.check_wait` in
+    # nominal steady-state step: `_Machine` in
     # test_moe_gemm_gluon_buffered_schedule.py, which drives the real emitter, and
     # `_audit_buffer_schedule` in test_moe_gemm_gluon_config.py. This test's job is
     # the ownership/grouping half of the contract, above.
@@ -432,10 +472,12 @@ def test_register_only_slots_need_no_cooperative_fence(scheme, monkeypatch):
     tc.SCHED_MODE = 0
     tc.BLOCK_K = 256
     tc.ds_read_in_mfma = lambda *args: False
+    schedule, step = _steady_step(tc)
     pc = SimpleNamespace(
         tuning_cfg=tc,
         layout=tc,
         func_cfg=tc,
+        schedule=schedule,
         lds_ptrs=SimpleNamespace(
             wait_buffer_load_groups=waits.append, commit_buffer_load=lambda: None
         ),
@@ -454,9 +496,7 @@ def test_register_only_slots_need_no_cooperative_fence(scheme, monkeypatch):
     monkeypatch.setattr(pipeline, "_take_operand_pairs", lambda *args: ())
     monkeypatch.setattr(pipeline, "_PipelineRegFragments", lambda *args: args)
     monkeypatch.setattr(pipeline, "_maybe_block_dot", lambda *args: 0)
-    pipeline._step_live.fn(
-        pc, None, ((), (), (), ()), regs, 1, None, False, 0, False, True, 0
-    )
+    pipeline._step_live.fn(pc, None, ((), (), (), ()), regs, 1, step)
     assert not waits
     assert not barriers
 
@@ -496,10 +536,22 @@ def test_pipeline_stage_commit_boundaries(
     tc.SCHED_MODE = 0
     tc.BLOCK_K = 256
     tc.ds_read_in_mfma = lambda *args: False
+    schedule = tc.make_schedule(epilogue_groups=2)
+    if not dot:
+        step = schedule.warmup_step()
+    elif in_loop:
+        step = schedule.loop_step(0)
+    else:
+        step = schedule.drain_step(0, 0)
+    assert schedule.dot(step) == dot and schedule.in_loop(step) == in_loop
+    assert schedule.is_drain(step) == drain
+    wait = schedule.wait(step)
+    assert wait is not None, "a per-tile step that reads LDS waits once, at its head"
     pc = SimpleNamespace(
         func_cfg=tc,
         tuning_cfg=tc,
         layout=tc,
+        schedule=schedule,
         lds_ptrs=SimpleNamespace(
             wait_buffer_load_groups=lambda count: events.append(("wait", count)),
             commit_buffer_load=lambda: events.append(("commit",)),
@@ -520,16 +572,13 @@ def test_pipeline_stage_commit_boundaries(
         return stage
 
     def buffer_load(pc, ptrs, buffers, *args, **kwargs):
-        assert kwargs["MARK_STAGE"] is False
+        assert kwargs["MARK_TILE"] is False
         events.append(("load",))
         return buffers
 
     monkeypatch.setattr(pipeline, "pick_stage", pick_stage)
     monkeypatch.setattr(pipeline.gl, "static_range", range)
     monkeypatch.setattr(pipeline.gl.amd.cdna4, "sched_barrier", lambda mask: None)
-    # Patch the one authoritative formula: the emitter reaches it through the
-    # scheme-guarded _stage_wait/_slot_waits wrappers, not by name.
-    monkeypatch.setattr(schedule, "_wait", lambda *args, **kw: 3)
     monkeypatch.setattr(pipeline, "_fill_slot", buffer_load)
     monkeypatch.setattr(pipeline, "_read_slot", lambda *args: ((), (), (), ()))
     monkeypatch.setattr(pipeline, "_take_operand_pairs", lambda *args: ())
@@ -539,21 +588,9 @@ def test_pipeline_stage_commit_boundaries(
     monkeypatch.setattr(
         pipeline, "_maybe_block_dot", lambda *args: events.append(("dot",))
     )
-    pipeline._step_live.fn(
-        pc,
-        None,
-        ((), (), (), ()),
-        regs,
-        1,
-        0 if drain else None,
-        drain,
-        0,
-        in_loop,
-        dot,
-        2,
-    )
-    assert [event for event in events if event[0] == "wait"] == [("wait", 3)]
-    assert events[0] == ("wait", 3)
+    pipeline._step_live.fn(pc, None, ((), (), (), ()), regs, 1, step)
+    assert [event for event in events if event[0] == "wait"] == [("wait", wait)]
+    assert events[0] == ("wait", wait)
     # Stage/slot commit schemes retain empty groups during the drain. The FIFO
     # accounting models those exact commits, including their region placement.
     assert events.count(("commit",)) == 1

@@ -18,7 +18,6 @@ from aiter.ops.triton.utils.common_utils import strip_annotate
 from ._lang import MX_GROUP_CE as MX_GROUP
 from ._lang import optional as _opt
 from ._lang import require_constexpr
-from ._lang import unwrap as _v
 from ._quant import mxfp4_quant_gluon
 from ._types import DtypeQuant, WeightGuHbmLayout, _slot_index
 
@@ -29,23 +28,19 @@ _WEIGHT_GU_SPLIT: gl.constexpr = gl.constexpr(int(WeightGuHbmLayout.SPLIT))
 @aggregate
 @strip_annotate
 class _EpilogueInputs:
-    """Optional epilogue vectors and the async groups pending during the drain."""
+    """Optional epilogue vectors, in HBM and, when staged, in LDS."""
 
     bias_hbm_base: gl.tensor | gl.constexpr
     gammas_hbm_ptr: gl.tensor | gl.constexpr
     gamma_lds_ptr: gl.shared_memory_descriptor | gl.constexpr
     bias_lds_ptr: gl.shared_memory_descriptor | gl.constexpr
-    groups: gl.constexpr
 
     @gluon.constexpr_function
-    def __init__(
-        self, bias_hbm_base, gammas_hbm_ptr, gamma_lds_ptr, bias_lds_ptr, groups
-    ):
+    def __init__(self, bias_hbm_base, gammas_hbm_ptr, gamma_lds_ptr, bias_lds_ptr):
         self.bias_hbm_base = _opt(bias_hbm_base)
         self.gammas_hbm_ptr = _opt(gammas_hbm_ptr)
         self.gamma_lds_ptr = _opt(gamma_lds_ptr)
         self.bias_lds_ptr = _opt(bias_lds_ptr)
-        self.groups = gl.constexpr(_v(groups))
 
 
 @gluon.jit
@@ -62,6 +57,7 @@ def _stage_epilogue_inputs(
     func_cfg,
     tuning_cfg,
     layout,
+    schedule,
 ):
     """Prepare bias and gammas, staging them in LDS before the pipeline drain."""
     BM: gl.constexpr = tuning_cfg.BLOCK_M
@@ -83,7 +79,7 @@ def _stage_epilogue_inputs(
     #
     # The drain is not idle, despite what this comment used to claim. Any component
     # whose fill span is shorter than the pipeline depth keeps filling through drain
-    # iteration `pipeline_depth - fill_span` (see _schedule._active). It happens to
+    # iteration `pipeline_depth - fill_span` (see Schedule.active). It happens to
     # issue nothing in the tuned configuration, where every span equals the depth,
     # but that is a property of that configuration and not of the drain.
     #
@@ -115,15 +111,6 @@ def _stage_epilogue_inputs(
     else:
         bias_lds_ptr: gl.constexpr = None
 
-    # They are committed as one group, which the drain's wait accounting places at its
-    # exact FIFO position: after the last main-loop step, before the first drain
-    # iteration. It therefore lengthens the distance only for reads whose newest
-    # required producer is older than it -- in practice the first drain iteration or
-    # two -- and not for the rest. Passing a blanket slack to every drain step, as the
-    # frozen path still does via WAIT_SLACK, would over-wait the later ones.
-    EPI_GROUPS: gl.constexpr = (
-        1 if EPI_LDS and (func_cfg.has_gammas or func_cfg.has_bias) else 0
-    )
     if require_constexpr(EPI_LDS):
         if require_constexpr(func_cfg.has_gammas):
             g_offs = BM * block_id + gl.arange(
@@ -147,15 +134,17 @@ def _stage_epilogue_inputs(
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
                 bias_lds_ptr, bias_hbm_base, epi_b_offs
             )
-        if require_constexpr(func_cfg.has_gammas or func_cfg.has_bias):
-            # EPI_LDS is only a layout-feasibility flag, so it can be set with
-            # neither vector present. Nothing was issued then, and an empty group
-            # would still occupy a FIFO position and lengthen the drain waits that
-            # sit behind it.
+        # They are committed as the groups the schedule counts, which its drain
+        # waits place at their exact FIFO position: after the last main step, before
+        # the first drain step. They therefore lengthen the wait only for reads whose
+        # newest copy is older -- in practice the first drain step or two -- and not
+        # for the rest. Passing a blanket slack to every drain step, as the frozen
+        # path still does via WAIT_SLACK, would over-wait the later ones. There are
+        # none with neither vector present: EPI_LDS is only a layout-feasibility
+        # flag, and an empty group would still occupy a FIFO position.
+        for _ in gl.static_range(schedule.epilogue_groups()):
             gl.amd.cdna4.async_copy.commit_group()
-    return _EpilogueInputs(
-        bias_hbm_base, gammas_hbm_ptr, gamma_lds_ptr, bias_lds_ptr, EPI_GROUPS
-    )
+    return _EpilogueInputs(bias_hbm_base, gammas_hbm_ptr, gamma_lds_ptr, bias_lds_ptr)
 
 
 @gluon.jit

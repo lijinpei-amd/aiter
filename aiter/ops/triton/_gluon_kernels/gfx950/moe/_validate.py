@@ -24,12 +24,7 @@ from ._lang import (
 )
 from ._lang import unwrap as _v
 from ._layout import KernelLayout
-from ._schedule import (
-    _fill_slots_valid,
-    _pipeline_peeled,
-    pipeline_depth,
-    pipeline_unroll,
-)
+from ._schedule import Schedule
 from ._types import (
     LDS_CAP_BYTES,
     LDS_EPILOGUE_RESERVE_BYTES,
@@ -206,17 +201,6 @@ def validate_layout(tc, layout, N, K):
     #    non-divisible values are illegal, not merely wasteful --
     assert BM % _v(tc.MINI_BLOCK_M) == 0
     assert BN % _v(tc.MINI_BLOCK_N) == 0
-    # Fill ownership is a mapping from each component's non-K tile to a slot, so
-    # what it has to satisfy is that every mapped slot exists and no component
-    # owns two of its own tiles in one slot -- the flat _ops() transport carries
-    # one optional tile per component. Different components sharing a slot is
-    # fine, which is what lets a single-slot stage own both operands.
-    assert _fill_slots_valid(tc, layout), (
-        f"fill ownership is not a valid mapping for num_m_slots "
-        f"{layout.num_m_slots()} x num_n_slots "
-        f"{layout.num_n_slots()} (MINI_BLOCK_M {_v(tc.MINI_BLOCK_M)} vs "
-        f"BLOCK_M {BM}, MINI_BLOCK_N {_v(tc.MINI_BLOCK_N)} vs BLOCK_N {BN})"
-    )
     assert _v(tc.MINI_BLOCK_M) % (instr[0] * warps[0] * tiles[0]) == 0, (
         f"MINI_BLOCK_M {_v(tc.MINI_BLOCK_M)} must be a multiple of "
         f"instr[0]*warps[0]*tiles[0] = {instr[0] * warps[0] * tiles[0]}"
@@ -316,13 +300,31 @@ def validate_resources(tc, layout):
 
 
 @gluon.constexpr_function
-def validate_pipeline(tc, layout, K):
-    """Validate the live component rings and runtime-loop lower bound."""
+def validate_pipeline(tc, layout, K, schedule=None):
+    """Validate the live component rings, copy ownership and runtime-loop lower bound.
+
+    ``schedule`` is ``Schedule(tc, layout, K)``; a caller that already holds it passes
+    it in, anything else gets one built here once the ring depths are known to be
+    sound.
+    """
     validate_buffer_counts(tc)
-    num_k = layout.num_k_tiles(K)
-    depth = pipeline_depth(tc, layout)
-    peeled = _pipeline_peeled(tc, layout)
-    unroll = pipeline_unroll(tc, layout)
+    if _v(schedule) is None:
+        schedule = Schedule(tc, layout, K)
+    # Copy ownership maps each component's non-K slots onto slots, so every mapped
+    # slot has to exist and no component may copy two of its own non-K slots in one
+    # slot -- a slot carries one optional copy per component. Different components
+    # sharing a slot is fine, which is what lets a single-slot step copy both
+    # operands.
+    assert schedule.fill_slots_valid(), (
+        f"fill ownership is not a valid mapping for num_m_slots "
+        f"{layout.num_m_slots()} x num_n_slots {layout.num_n_slots()} "
+        f"(MINI_BLOCK_M {_v(tc.MINI_BLOCK_M)} vs BLOCK_M {_v(tc.BLOCK_M)}, "
+        f"MINI_BLOCK_N {_v(tc.MINI_BLOCK_N)} vs BLOCK_N {_v(tc.BLOCK_N)})"
+    )
+    num_k = schedule.num_k()
+    depth = schedule.depth()
+    peeled = schedule.peeled()
+    unroll = schedule.unroll()
     assert num_k >= depth + peeled + unroll, (
         f"NUM_K ({num_k}) must be at least PIPELINE_DEPTH ({depth}) "
         f"+ PEELED ({peeled}) + UNROLL ({unroll}) = {depth + peeled + unroll}"

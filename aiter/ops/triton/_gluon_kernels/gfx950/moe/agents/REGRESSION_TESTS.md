@@ -84,7 +84,7 @@ The last line must be `### verdict: PASS`.
 |---|---|---|
 | T0 | `scripts/gluon_moe_sched_dump.py`: schedule tables of 35 configs, CPU only, about 16 s | byte-identical |
 | T0b | `tests/layout_fields.py`: all 70 `KernelLayout` fields of 224 tuning configs, CPU only, about 9 s beside T0 | byte-identical |
-| T1 | Symbolic emitter and config tests: `buffered_schedule`, `wait_commit`, `config`, `scale_miniblocks`, about 1.5 min | all pass (857 at commit `1b24ca9db`) |
+| T1 | Symbolic emitter and config tests: `buffered_schedule`, `wait_commit`, `config`, `scale_miniblocks`, about 1.5 min | all pass (855 since the `Schedule` refactor, which removed two memo tests; 857 at commit `1b24ca9db`) |
 | T2a | `test_moe_gemm_gluon_frozen.py`, about 1 min cold, 10 s warm | all pass (18) |
 | T2b | Two tuned gemm1 builds (`tests/gemm1_check.py --correctness --quick`), about 1.5 min | build identity SAME |
 | T2c | Bit-identical output over 5 runs, both epilogues (part of T2b's run) | sha `59d442f663991659` (bf16) and `0cfa77fb04450594` (mxfp4-out) |
@@ -109,7 +109,9 @@ Notes:
   or warm. So do T2b's five builds; its probes reuse caches in `$OUT/tmp`.
 - T0b's baseline is `$OUT/layout_fields_baseline.txt` when recorded, otherwise
   `tests/reference/gate/layout_fields_baseline.txt`, recorded at commit `1b24ca9db`
-  (the other gate references are from `1d3431e50`). T0b differs by design when a
+  (T0's `sched_baseline.txt` was re-recorded by the `Schedule` refactor, which
+  changed the dump to one block per emitted step; the other gate references are
+  from `1d3431e50`). T0b differs by design when a
   change renames, adds or removes a `KernelLayout` field, or adds a sched-dump case
   (`layout_fields.py` imports that case list, so T0 differs too). Check that the diff
   shows only that, then accept it with `tests/gate.sh baseline --fast` on the changed
@@ -179,10 +181,14 @@ cannot pass.
 
 - **Pass criterion:** `compare_suite.py` prints `SUITE PASS`, meaning no test that
   passes on the base fails or errors after the change.
-- **Expected numbers:** 1812 passed / 58 failed / 22 skipped at commit `1b24ca9db`
-  (1811 / 58 / 22 at `1d3431e50`, before one more test was added).
-- **The 58 failures already fail at that commit and are tracked separately:**
-  - 38 in `buffered_schedule`;
+- **Expected numbers:** 1848 passed / 20 failed / 22 skipped since the `Schedule`
+  refactor. Before it: 1812 / 58 / 22 at commit `1b24ca9db` (1811 / 58 / 22 at
+  `1d3431e50`, before one more test was added). The refactor fixed the 38
+  `buffered_schedule` failures, whose oracle checked each wait when the old model
+  computed it rather than when the wait issued, and removed two tests of the deleted
+  wait memo, so against an older base `compare_suite.py` reports `SUITE FAIL` on the
+  pass count alone.
+- **The 20 failures already fail before the refactor and are tracked separately:**
   - 16 in `scale_prep`;
   - 4 in `a8_scales`.
 
@@ -265,7 +271,7 @@ Otherwise record a fresh baseline.
 
 | Check | Reference | Result |
 |---|---|---|
-| Gate | `reference/gate/{sched,build_id,asm}_baseline.txt`, used automatically by `gate.sh` when `$OUT` has none. `layout_fields_baseline.txt` (T0b) was recorded later, at `1b24ca9db` | verdict PASS. T1 856 passed, T2a 18 passed, determinism shas `59d442f663991659` / `0cfa77fb04450594` 5/5 |
+| Gate | `reference/gate/{sched,build_id,asm}_baseline.txt`, used automatically by `gate.sh` when `$OUT` has none. `layout_fields_baseline.txt` (T0b) was recorded later, at `1b24ca9db`, and `sched_baseline.txt` (T0) by the `Schedule` refactor | verdict PASS. T1 856 passed, T2a 18 passed, determinism shas `59d442f663991659` / `0cfa77fb04450594` 5/5 |
 | Suite | `reference/suite_1d3431e50/*.txt`, the FAILED lines and summary per file | 1811 passed / 58 failed / 22 skipped. Compare with `compare_suite.py tests/reference/suite_1d3431e50 <label>`. A test was added by `1b24ca9db`, so against that tree or later it reports `SUITE FAIL` on the pass count; run the base suite instead |
 | Cold bench | `reference/cold_1d3431e50_phys5/`, `summary.json` and `report.md`. `summary.json` is the run as recorded, with the pre-`dcef897ca` knob names (`B_IN_REG`, ...); `summary_allow_via_lds.json` is the same run with them renamed to `ALLOW_*_VIA_LDS` and inverted | physical GPU 5 (BDF `0000:96:00.0`), `--tolerant`, 160/160 processes, 0 failures. Compare with `compare_cold.py tests/reference/cold_1d3431e50_phys5 <label>`, on physical GPU 5 only |
 
