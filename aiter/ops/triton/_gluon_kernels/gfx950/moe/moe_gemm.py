@@ -83,6 +83,7 @@ from ._pipeline import (
     _run_buffered_pipeline,
     _take_reg_pairs,
 )
+from ._schedule import Schedule
 from ._types import TileSched, WeightGuHbmLayout, _slot_index
 from ._validate import validate, validate_pipeline
 
@@ -135,7 +136,7 @@ def _drain_last_fused(
                 tc,
                 layout,
                 True,
-                (pc.num_k - 1) * tc.BLOCK_K // 128 % 2,
+                (pc.schedule.num_k() - 1) * tc.BLOCK_K // 128 % 2,
             )
             if require_constexpr(ni == 0):
                 # Gate side: everything up to and including the reciprocal, issued here
@@ -171,7 +172,8 @@ def _moe_gemm_body(
     NUM_K,
 ):
     gl.static_assert(validate(tuning_cfg, N, K, layout))
-    gl.static_assert(validate_pipeline(tuning_cfg, layout, K))
+    schedule = Schedule(tuning_cfg, layout, K)
+    gl.static_assert(validate_pipeline(tuning_cfg, layout, K, schedule))
 
     pid = gl.program_id(0)
     if require_constexpr(tuning_cfg.TILE_SCHED == _TS_XCD_GROUP_M):
@@ -269,7 +271,7 @@ def _moe_gemm_body(
         func_cfg,
         tuning_cfg,
         layout,
-        layout.num_k_tiles(K),
+        schedule,
     )
 
     hbm_ptrs, buffers, regs = _run_buffered_pipeline(pc, hbm_ptrs, NUM_K)
@@ -287,6 +289,7 @@ def _moe_gemm_body(
         func_cfg,
         tuning_cfg,
         layout,
+        schedule,
     )
 
     # Shallower streams finish their remaining fills during the drain. The final
@@ -295,7 +298,7 @@ def _moe_gemm_body(
     FUSE: gl.constexpr = (
         func_cfg.weight_gu_hbm_layout == _WEIGHT_GU_SPLIT and layout.num_n_slots() == 2
     )
-    regs = _drain_buffered_pipeline(pc, hbm_ptrs, buffers, regs, NUM_K, epi.groups)
+    regs = _drain_buffered_pipeline(pc, hbm_ptrs, buffers, regs, NUM_K)
     if require_constexpr(not FUSE):
         regs = _PipelineRegFragments(
             regs.a_payload,
@@ -310,12 +313,12 @@ def _moe_gemm_body(
         x_static_scale = gl.load(x_static_scale_hbm_ptr)
     else:
         x_static_scale: gl.constexpr = None
-    if require_constexpr(epi.groups > 0):
+    if require_constexpr(schedule.epilogue_wait() is not None):
         # Retire the epilogue copies and any newer operand groups issued during
         # the drain. The cooperative fill needs a barrier before each warp reads
         # its mini block. Under FUSE this also makes bias available to the final
         # MFMA's activation; that step issues no further copies or waits.
-        gl.amd.cdna4.async_copy.wait_group(0)
+        gl.amd.cdna4.async_copy.wait_group(schedule.epilogue_wait())
         gl.barrier()
 
     if require_constexpr(FUSE):

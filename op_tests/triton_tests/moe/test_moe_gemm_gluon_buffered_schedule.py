@@ -17,9 +17,9 @@ from types import SimpleNamespace
 import pytest
 
 from aiter.ops.triton._gluon_kernels.gfx950.moe import _pipeline as pipeline
-from aiter.ops.triton._gluon_kernels.gfx950.moe import _schedule as schedule
 from aiter.ops.triton._gluon_kernels.gfx950.moe import moe_gemm as kernel
-from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
+from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import Schedule
+from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     A_PAYLOAD,
     A_SCALE,
     B_PAYLOAD,
@@ -29,12 +29,9 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
     PAYLOAD,
     SCALE,
     A,
-    _pipeline_peeled,
-    _wait,
-    pipeline_depth,
-    pipeline_unroll,
+    WaitCommitScheme,
+    _slot_index,
 )
-from aiter.ops.triton._gluon_kernels.gfx950.moe._types import WaitCommitScheme
 from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import validate
 from op_tests.triton_tests.moe.test_moe_gemm_gluon_wait_commit import _ScheduleConfig
 
@@ -108,10 +105,13 @@ class _Config(_ScheduleConfig):
     def component_in_reg(self, component):
         return not self.component_via_lds(component)
 
-    def pipeline_peeled(self):
-        if not hasattr(self, "_peeled"):
-            self._peeled = _pipeline_peeled(self, self)
-        return self._peeled
+    def sizing(self):
+        """``(depth, peeled, unroll)``, which do not depend on K."""
+        schedule = Schedule(self, self, self.BLOCK_K)
+        return schedule.depth(), schedule.peeled(), schedule.unroll()
+
+    def minimum_num_k(self):
+        return sum(self.sizing())
 
     def num_k_slots(self):
         return 1
@@ -196,6 +196,9 @@ class _Machine:
         self.current_in_loop = False
         self.current_drain = False
         self.events = []
+        # The latest wait as (immediate, groups committed when it issued), held until
+        # the reads it guards are checked against it.
+        self.wait = None
 
     def load(self, component, ring, mini, pointer):
         tc = self.tc
@@ -262,6 +265,8 @@ class _Machine:
         self.outstanding.append(group)
 
     def wait_buffer_load_groups(self, count):
+        assert self.wait is None, "two waits before one read point"
+        self.wait = count, len(self.committed)
         while len(self.outstanding) > count:
             self.completed.update(self.outstanding.pop(0))
 
@@ -298,27 +303,33 @@ class _Machine:
                     required.add((component, mini, self.current_read))
         return required
 
-    def check_wait(
-        self, tc, layout, stage, slot, drain=False, epilogue_groups=0, phase=None
-    ):
-        actual = _wait(tc, layout, stage, slot, drain, epilogue_groups, phase)
+    def check_wait(self, slot):
+        """The wait before this read point retires exactly the copies it reads.
+
+        Checked when the slot first reads, against the FIFO as it stood when the wait
+        issued: the immediate must leave the newest required group retired and every
+        newer one in flight. A per-tile scheme waits once, before slot zero, for the
+        whole step (``slot=None``).
+        """
         required = self.required(slot)
         if required:
+            assert self.wait is not None, (self.current_read, slot, "no wait")
+            actual, committed = self.wait
             youngest = max(
                 i
-                for i, group in enumerate(self.committed)
+                for i, group in enumerate(self.committed[:committed])
                 if required.intersection(group)
             )
-            assert actual == len(self.committed) - youngest - 1, (
+            assert actual == committed - youngest - 1, (
                 self.current_read,
                 slot,
                 actual,
                 youngest,
-                self.committed,
+                self.committed[:committed],
             )
         else:
-            assert actual is None
-        return actual
+            assert self.wait is None, (self.current_read, slot, self.wait)
+        self.wait = None
 
     def read(self, component, ring, mini, k):
         token = component, mini, self.current_read
@@ -394,11 +405,13 @@ class _Machine:
 def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
     machine = _Machine(tc, num_k)
     machine.runtime_ranges = []
-    peeled = tc.pipeline_peeled()
+    schedule = Schedule(tc, tc, num_k * tc.BLOCK_K, epilogue_groups)
+    per_tile = tc.commit_per_stage()
     pc = SimpleNamespace(
         tuning_cfg=tc,
         layout=tc,
         func_cfg=tc,
+        schedule=schedule,
         lds_ptrs=machine,
         a_hbm_offs=tuple(range(tc.nm)),
         b_hbm_offs=tuple(range(tc.nn)),
@@ -409,29 +422,41 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         s_step=1,
         a_scale_stride_k=1,
         b_scale_stride_k=1,
-        num_k=num_k,
     )
     step_fn, fill_fn = pipeline._step.fn, pipeline._fill_slot.fn
+    read_slot_fn = pipeline._read_slot.fn
     read_tile_fn = pipeline._read_tile.fn
     read_scale_tile_fn = pipeline._read_scale_tile.fn
 
+    # Positional layouts: _step(pc, ptrs, buffers, regs, step, STEP),
+    # _fill_slot(pc, ptrs, buffers, step, STEP, mi, ni), _read_slot(pc, buffers, step,
+    # STEP, mi, ni, MFMA), _read_tile/_read_scale_tile(pc, buffers, step, STEP,
+    # non-K slot, operand).
     def step(*args, **kwargs):
+        assert machine.wait is None, "a wait guarded no read"
         machine.current_read = args[4]
-        machine.current_in_loop = kwargs.get("IN_LOOP", False)
-        machine.current_drain = kwargs.get("DRAIN", False)
+        machine.current_in_loop = schedule.in_loop(args[5])
+        machine.current_drain = schedule.is_drain(args[5])
         machine.steps.append((args[4], machine.current_in_loop))
         return step_fn(*args, **kwargs)
 
     def fill(*args, **kwargs):
         machine.current_read = args[3]
-        machine.current_in_loop = kwargs.get(
-            "IN_LOOP", args[9] if len(args) > 9 else False
-        )
-        machine.current_drain = kwargs.get("DRAIN", args[5] if len(args) > 5 else False)
+        machine.current_in_loop = schedule.in_loop(args[4])
+        machine.current_drain = schedule.is_drain(args[4])
         return fill_fn(*args, **kwargs)
 
+    def read_slot(*args, **kwargs):
+        if not args[6]:  # the slot's first read, right after its wait
+            slot = _slot_index(args[4], args[5], tc.nm, tc.nn)
+            if not per_tile:
+                machine.check_wait(slot)
+            elif slot == 0:
+                machine.check_wait(None)
+        return read_slot_fn(*args, **kwargs)
+
     def read_tile(*args, **kwargs):
-        component = (args[4], PAYLOAD)
+        component = (args[5], PAYLOAD)
         if tc.component_in_reg(component):
             machine.events.append(
                 (
@@ -441,13 +466,13 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
                     "select",
                     component,
                     machine.current_read,
-                    args[3],
+                    args[4],
                 )
             )
         return read_tile_fn(*args, **kwargs)
 
     def read_scale_tile(*args, **kwargs):
-        operand = args[4]
+        operand = args[5]
         component = (operand, SCALE)
         if tc.component_in_reg(component):
             ratio = tc.scale_ratio_k_step(operand)
@@ -459,7 +484,7 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
                     "select",
                     component,
                     machine.current_read - machine.current_read % ratio,
-                    args[3],
+                    args[4],
                 )
             )
         return read_scale_tile_fn(*args, **kwargs)
@@ -523,14 +548,10 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         patch.setattr(pipeline, "_PipelinePointers", _pointers)
         patch.setattr(pipeline, "_step", step)
         patch.setattr(pipeline, "_fill_slot", fill)
+        patch.setattr(pipeline, "_read_slot", read_slot)
         patch.setattr(pipeline, "_read_tile", read_tile)
         patch.setattr(pipeline, "_read_scale_tile", read_scale_tile)
         patch.setattr(pipeline, "_init_buffers", init_buffers)
-        patch.setattr(pipeline, "_pipeline_peeled", lambda *_: peeled)
-        # Patch the one authoritative formula, not a caller: the emitter reaches it
-        # through the scheme-guarded _stage_wait/_slot_wait wrappers, so patching
-        # the _pipeline binding would silently stop intercepting.
-        patch.setattr(schedule, "_wait", machine.check_wait)
         patch.setattr(pipeline, "_maybe_block_dot", machine.dot)
         patch.setattr(
             pipeline, "pick_stage", lambda enabled: lambda name: nullcontext()
@@ -545,14 +566,13 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         pointers, buffers, regs = pipeline._run_buffered_pipeline.fn(
             pc, _pointers(0, 0, 0, 0), num_k
         )
-        main = num_k - pipeline_depth(tc, tc)
+        main = num_k - schedule.depth()
         assert regs.acc == (main,) * (tc.nm * tc.nn)
         for _ in range(epilogue_groups):
             machine.commit_buffer_load()
-        regs = pipeline._drain_buffered_pipeline.fn(
-            pc, pointers, buffers, regs, num_k, epilogue_groups
-        )
+        regs = pipeline._drain_buffered_pipeline.fn(pc, pointers, buffers, regs, num_k)
         assert regs.acc == (num_k - 1,) * (tc.nm * tc.nn)
+        assert machine.wait is None, "a wait guarded no read"
         assert pipeline._last_mfma.fn(pc, regs) == (num_k,) * (tc.nm * tc.nn)
 
     expected = {
@@ -596,7 +616,7 @@ def test_unroll_epilogue_selects_remainder_loop(
         scales=False,
         unroll_epilogue=unroll_epilogue,
     )
-    num_k = pipeline_depth(tc, tc) + tc.pipeline_peeled() + pipeline_unroll(tc, tc) + 1
+    num_k = tc.minimum_num_k() + 1
     machine = _execute(tc, num_k, monkeypatch)
     assert any(len(args) == 2 for args in machine.runtime_ranges) is has_runtime_tail
 
@@ -670,14 +690,14 @@ def test_emitted_unified_pipeline_all_reachable_remainders(
     monkeypatch,
 ):
     tc = _Config(scheme, depths, register_mask, **options)
-    minimum = pipeline_depth(tc, tc) + tc.pipeline_peeled() + pipeline_unroll(tc, tc)
+    _, _, unroll = tc.sizing()
     quantum = math.lcm(*tc.scale_steps)
-    first = math.ceil(minimum / quantum) * quantum
-    period = math.lcm(quantum, pipeline_unroll(tc, tc))
+    first = math.ceil(tc.minimum_num_k() / quantum) * quantum
+    period = math.lcm(quantum, unroll)
     for num_k in range(first, first + period, quantum):
         _execute(tc, num_k, monkeypatch)
     # Re-enter the same static register-ring mapping from another runtime loop body.
-    _execute(tc, first + 2 * pipeline_unroll(tc, tc), monkeypatch)
+    _execute(tc, first + 2 * unroll, monkeypatch)
 
 
 def _sched_barrier_stream(machine):
@@ -718,7 +738,7 @@ def test_depth_two_direct_component_selects_after_same_step_fill(
         register_mask,
         unroll=2,
     )
-    num_k = pipeline_depth(tc, tc) + tc.pipeline_peeled() + pipeline_unroll(tc, tc) + 1
+    num_k = tc.minimum_num_k() + 1
     machine = _execute(tc, num_k, monkeypatch)
 
     selections = [
@@ -750,7 +770,7 @@ def test_middle_direct_b_scale_defers_tile_zero_and_preserves_order(
         middle=True,
         read_mask=read_mask,
     )
-    num_k = pipeline_depth(tc, tc) + tc.pipeline_peeled() + pipeline_unroll(tc, tc) + 1
+    num_k = tc.minimum_num_k() + 1
     machine = _execute(tc, num_k, monkeypatch)
 
     for event_read in range(num_k):
@@ -785,9 +805,7 @@ def test_direct_scale_producer_phase_and_soffset_stream_match(
             unroll=2,
             soff=soff,
         )
-        minimum = (
-            pipeline_depth(tc, tc) + tc.pipeline_peeled() + pipeline_unroll(tc, tc)
-        )
+        minimum = tc.minimum_num_k()
         num_k = math.ceil(minimum / ratio) * ratio
         machines.append(_execute(tc, num_k, monkeypatch))
 
@@ -814,11 +832,11 @@ def test_direct_b3_fills_k_plus_2_while_mfma_consumes_k(soff, monkeypatch):
         soff=soff,
     )
     # Exercise one non-loop remainder stage as well as the steady loop and drain.
-    num_k = pipeline_depth(tc, tc) + tc.pipeline_peeled() + pipeline_unroll(tc, tc) + 1
+    num_k = tc.minimum_num_k() + 1
     machine = _execute(tc, num_k, monkeypatch)
 
     in_loop_reads = _assert_direct_b_stage_barriers(machine)
-    assert len(in_loop_reads) == pipeline_unroll(tc, tc) == 3
+    assert len(in_loop_reads) == tc.sizing()[2] == 3
     for read in in_loop_reads:
         assert [
             op
@@ -862,7 +880,7 @@ def test_direct_b2_fills_k_plus_1_while_mfma_consumes_k(soff, monkeypatch):
         soff=soff,
     )
     # Exercise one non-loop remainder stage as well as the steady loop and drain.
-    num_k = pipeline_depth(tc, tc) + tc.pipeline_peeled() + pipeline_unroll(tc, tc) + 1
+    num_k = tc.minimum_num_k() + 1
     machine = _execute(tc, num_k, monkeypatch)
 
     assert {
@@ -877,7 +895,7 @@ def test_direct_b2_fills_k_plus_1_while_mfma_consumes_k(soff, monkeypatch):
     } == {(0, ni) for ni in range(tc.nn)}
 
     in_loop_reads = _assert_direct_b_stage_barriers(machine)
-    assert len(in_loop_reads) == pipeline_unroll(tc, tc) == 6
+    assert len(in_loop_reads) == tc.sizing()[2] == 6
     for read in in_loop_reads:
         assert [
             op
@@ -917,7 +935,7 @@ def test_lds_b_has_only_the_existing_seed_sched_barrier(monkeypatch):
         0,
         scales=False,
     )
-    num_k = pipeline_depth(tc, tc) + tc.pipeline_peeled() + pipeline_unroll(tc, tc) + 1
+    num_k = tc.minimum_num_k() + 1
     machine = _execute(tc, num_k, monkeypatch)
 
     assert any(in_loop for read, in_loop in machine.steps)
@@ -931,11 +949,62 @@ def test_compiler_pipeline_owns_register_stage_ordering(monkeypatch):
         4,
         compiler_pipeline=True,
     )
-    num_k = pipeline_depth(tc, tc) + tc.pipeline_peeled() + pipeline_unroll(tc, tc) + 1
+    num_k = tc.minimum_num_k() + 1
     machine = _execute(tc, num_k, monkeypatch)
 
     assert any(in_loop for _, in_loop in machine.steps)
     assert _sched_barrier_stream(machine) == [(0, False, False, 0)]
+
+
+def _straight_line_waits(schedule, tc, last):
+    """Wait immediates of K steps ``0..last`` as if every one were emitted in a line.
+
+    An independent FIFO over the schedule's public commit plan and selections: the
+    prologue and warm-up steps as emitted, then one step per K tile with the loop
+    body's commit pattern for that K phase -- which is what every step after the
+    warm-up issues. Returns ``{step: tile wait}`` for a per-tile scheme, else
+    ``{step: per-slot waits}``.
+    """
+    slots = tc.nm * tc.nn
+    per_tile = tc.commit_per_stage()
+    depth, peeled, unroll = schedule.depth(), schedule.peeled(), schedule.unroll()
+    committed, waits = [], {}
+
+    def required(step, slot):
+        return {
+            (step - schedule.fill_span(c) + 1, c, schedule.selected(slot, c))
+            for c in COMPONENTS
+            if schedule.selected(slot, c) is not None
+            and schedule.via_lds(c)
+            and schedule.selects_at_phase(c, step)
+        }
+
+    def immediate(need):
+        if not need:
+            return None
+        youngest = max(i for i, group in enumerate(committed) if need & set(group))
+        return len(committed) - youngest - 1
+
+    for step in range(1 - depth, last + 1):
+        if step < 0:
+            index = schedule.prologue_step(step)
+        elif step == 0:
+            index = schedule.warmup_step()
+        else:
+            index = schedule.loop_step((step - peeled - 1) % unroll)
+        if step >= 0 and per_tile:
+            waits[step] = immediate(
+                set().union(*(required(step, slot) for slot in range(slots)))
+            )
+        vector = []
+        for slot in range(slots):
+            if step >= 0 and not per_tile:
+                vector.append(immediate(required(step, slot)))
+            for group in schedule.commits(index, slot):
+                committed.append(tuple((step, c, t) for c, t in group))
+        if step >= 0 and not per_tile:
+            waits[step] = tuple(vector)
+    return waits
 
 
 @pytest.mark.parametrize(
@@ -949,184 +1018,94 @@ def test_compiler_pipeline_owns_register_stage_ordering(monkeypatch):
     ids=["R1", "R2", "R2R4", "R4R1"],
 )
 def test_peeled_wait_prefix_is_minimal(scheme, register_mask, extra):
-    """The peel must cover every startup stage whose wait differs from steady state.
+    """The peel covers exactly the startup steps whose wait differs from the loop's.
 
-    Compared *at the same payload-step phase*, which is what production does
-    (`_schedule._pipeline_peeled` passes `phase=x + 1`). Pinning the steady vector to
-    one phase instead is a different, much weaker criterion: with a scale K-step ratio
-    above one the phases interleave, and a phase-fixed comparison reports a peel far
-    larger than the schedule actually needs.
+    Compared *at the same K phase*: with a scale K-step ratio above one the phases
+    interleave, and pinning the steady reference to one phase is a different, much
+    weaker criterion that reports a peel far larger than the schedule needs. The
+    emitted wait plan must also be the straight-line one: peeled steps keep their own
+    immediates and the loop body carries the steady ones.
     """
     tc = _Config(scheme, (2, 4, 6, 3), register_mask, middle=True, **extra)
-    slots = (None,) if tc.commit_per_stage() else range(tc.nm * tc.nn)
+    depth, peeled, unroll = tc.sizing()
+    schedule = Schedule(tc, tc, (tc.minimum_num_k() + 2 * unroll) * tc.BLOCK_K)
+    settled = unroll * -(-(4 * depth) // unroll)
+    waits = _straight_line_waits(schedule, tc, settled + 2 * depth + unroll)
 
-    def vector(stage, phase):
-        return tuple(_wait(tc, tc, stage, slot, phase=phase) for slot in slots)
+    def steady(step):
+        return waits[step + settled]
 
-    # Startup stage x + 1 runs at phase x + 1; its steady-state counterpart is the
-    # same phase, not a fixed one.
-    differs = [
-        x
-        for x in range(pipeline_depth(tc, tc) * 2)
-        if vector(x + 1, None) != vector(None, x + 1)
-    ]
-    assert tc.pipeline_peeled() == max(1, (max(differs) + 1) if differs else 0)
-    assert all(x < tc.pipeline_peeled() for x in differs)
+    def emitted(index):
+        if tc.commit_per_stage():
+            return schedule.wait(index)
+        return tuple(schedule.wait(index, slot) for slot in range(tc.nm * tc.nn))
+
+    differs = [x for x in range(depth * 2) if waits[x + 1] != steady(x + 1)]
+    assert peeled == max(1, (max(differs) + 1) if differs else 0)
+    assert emitted(schedule.warmup_step()) == waits[0]
+    for x in range(peeled):
+        assert emitted(schedule.peeled_step(x)) == waits[x + 1]
+    for u in range(unroll):
+        assert emitted(schedule.loop_step(u)) == steady(peeled + u + 1)
 
 
 @pytest.mark.parametrize("nn", [1, 2, 3, 4])
 @pytest.mark.parametrize("nm", [1, 2, 3, 4])
 @pytest.mark.parametrize("middle", [False, True])
 def test_every_payload_tile_is_filled_exactly_once(nm, nn, middle):
-    """Fill ownership must be a total, injective map from tiles to slots.
+    """Copy ownership must be a total, injective map from non-K slots to slots.
 
-    A stage needs `NM + NN` payload copies and has `NM * NN` slots. While a slot
-    could own only one copy, that held only for `NM, NN >= 2`; below it a copy was
-    assigned a slot index that does not exist and was silently never issued, so the
-    kernel read whichever stale value the ring still held.
+    A step needs `NM + NN` payload copies and has `NM * NN` slots. While a slot
+    could copy only one non-K slot, that held only for `NM, NN >= 2`; below it a copy
+    was assigned a slot index that does not exist and was silently never issued, so
+    the kernel read whichever stale value the ring still held.
     """
     tc = _Config(WaitCommitScheme.PER_OP, (3, 3, 3, 3), 0, shape=(nm, nn),
                  middle=middle)
-    assert schedule._fill_slots_valid(tc, tc), "ownership is not a valid mapping"
+    schedule = Schedule(tc, tc, tc.BLOCK_K)
+    assert schedule.fill_slots_valid(), "ownership is not a valid mapping"
     for component in COMPONENTS:
-        tiles = nm if component[0] == A else nn
+        non_k_slots = nm if component[0] == A else nn
         owners = [
-            tile
+            non_k_slot
             for slot in range(nm * nn)
-            for tile in (
-                schedule._candidate_ops(tc, tc, slot)[COMPONENTS.index(component)],
-            )
-            if tile is not None
+            for non_k_slot in (schedule.owned(slot)[COMPONENTS.index(component)],)
+            if non_k_slot is not None
         ]
         ratio = tc.scale_ratio_non_k_slot(component[0]) if component[1] else 1
-        expected = [t for t in range(tiles) if t % ratio == 0]
+        expected = [t for t in range(non_k_slots) if t % ratio == 0]
         assert sorted(owners) == expected, (component, owners, expected)
-
-
-def _schedule_fingerprint(tc):
-    """Everything the emitter folds to constants, for one configuration."""
-    nm, nn = tc.nm, tc.nn
-    depth = pipeline_depth(tc, tc)
-    out = [depth, pipeline_unroll(tc, tc), _pipeline_peeled(tc, tc)]
-    for ni in range(nn):
-        for mi in range(nm):
-            out.append(schedule._ops(tc, tc, mi, ni))
-            out.append(
-                tuple(
-                    schedule._component_read_tile(tc, tc, c, mi, ni) for c in COMPONENTS
-                )
-            )
-    for stage in range(1 - depth, depth + 2):
-        out.append(schedule._groups(tc, tc, stage))
-    out.append(schedule._groups(tc, tc, None))
-    for stage in range(depth + 2):
-        out.append(tuple(_wait(tc, tc, stage, s) for s in range(nm * nn)))
-        out.append(_wait(tc, tc, stage, None))
-    return tuple(out)
-
-
-def test_wait_memo_never_serves_a_stale_answer():
-    """Mutating a configuration must change the answer, not hit a stale entry.
-
-    The memo keys on the resolved input surface, rebuilt from accessor results on
-    every call, so a configuration mutated in place -- which the test doubles do --
-    produces a different key rather than reusing the old value. Keying on the
-    configuration object instead would fail exactly here.
-    """
-    from aiter.ops.triton._gluon_kernels.gfx950.moe import _schedule_cache
-
-    _schedule_cache.clear()
-    tc = _Config(WaitCommitScheme.PER_OP, (3, 3, 3, 3), 0)
-    slots = range(tc.nm * tc.nn)
-    probe = lambda: tuple(_wait(tc, tc, 3, s) for s in slots)  # noqa: E731
-
-    cold = probe()
-    warm = probe()
-    assert cold == warm and _schedule_cache.WAIT, "second call should have been served"
-
-    # Same object, different placement: the answer must move with it.
-    tc.scale_async = (False, False)
-    mutated = probe()
-    assert mutated != cold, "a mutated configuration returned its old schedule"
-
-    # And recomputing from scratch agrees with what the memo just returned.
-    _schedule_cache.clear()
-    assert probe() == mutated
-    tc.scale_async = (True, True)
-    assert probe() == cold
-
-
-def test_schedule_spec_is_a_sound_memo_key():
-    """Equal specs imply equal schedules -- the property a memo key must have.
-
-    Only this direction matters. A spec finer than the schedule it keys is safe: the
-    worst it costs is recomputing a result that was already known, and it is expected
-    here because some inputs are inert for some geometries (SCALE_FILL_MID outside
-    the guarded 2x2 split, the depth of an absent scale). A spec *coarser* than the
-    schedule would hand back a wrong answer, which is what this pins down.
-    """
-    configs = []
-    for scheme in WaitCommitScheme:
-        for depths in ((3, 3, 3, 3), (2, 4, 3, 2)):
-            for register_mask in (0, 4, 15):
-                for shape in ((2, 2), (4, 2)):
-                    for middle in (False, True):
-                        for scales in (True, False):
-                            configs.append(
-                                _Config(
-                                    scheme,
-                                    depths,
-                                    register_mask,
-                                    shape=shape,
-                                    middle=middle,
-                                    scales=scales,
-                                )
-                            )
-    seen = {}
-    for tc in configs:
-        spec = schedule.schedule_spec(tc, tc)
-        fingerprint = _schedule_fingerprint(tc)
-        assert hash(spec) is not None
-        if spec in seen:
-            assert seen[spec] == fingerprint, (
-                "two configurations share a spec but not a schedule; the spec is "
-                "missing an input the model reads"
-            )
-        seen[spec] = fingerprint
-    assert len(seen) > 100, "the matrix must actually exercise distinct specs"
 
 
 @pytest.mark.parametrize("shape", [(2, 2), (2, 3), (3, 2), (2, 4), (4, 2)])
 def test_scale_fill_mid_moves_only_the_scale_fill_slots(shape):
-    """`SCALE_FILL_MID` is a fill-ownership knob and nothing else.
+    """`SCALE_FILL_MID` is a copy-ownership knob and nothing else.
 
-    It must not disturb payload ownership, the logical read bindings, or the
-    configured DS-read region. It is also inert outside the guarded 2x2 split, which
-    is easy to forget when reading a config that sets it on a rectangular tile.
+    It must not disturb payload ownership, the selection slots, or the configured
+    DS-read region. It is also inert outside the guarded 2x2 split, which is easy to
+    forget when reading a config that sets it on a rectangular tile.
     """
     off = _Config(WaitCommitScheme.PER_OP, (3, 3, 3, 3), 0, shape=shape, middle=False)
     on = _Config(WaitCommitScheme.PER_OP, (3, 3, 3, 3), 0, shape=shape, middle=True)
+    off_schedule = Schedule(off, off, off.BLOCK_K)
+    on_schedule = Schedule(on, on, on.BLOCK_K)
     nm, nn = shape
     for component in (A_PAYLOAD, B_PAYLOAD):
-        tiles = range(nm if component[0] == A else nn)
-        assert [
-            schedule._component_fill_slot(off, off, component, t) for t in tiles
-        ] == [
-            schedule._component_fill_slot(on, on, component, t) for t in tiles
+        non_k_slots = range(nm if component[0] == A else nn)
+        assert [off_schedule.fill_slot(component, t) for t in non_k_slots] == [
+            on_schedule.fill_slot(component, t) for t in non_k_slots
         ], component
     for component in COMPONENTS:
-        tiles = range(nm if component[0] == A else nn)
-        assert [
-            schedule._component_nominal_read_slot(off, off, component, t) for t in tiles
-        ] == [
-            schedule._component_nominal_read_slot(on, on, component, t) for t in tiles
+        non_k_slots = range(nm if component[0] == A else nn)
+        assert [off_schedule.read_slot(component, t) for t in non_k_slots] == [
+            on_schedule.read_slot(component, t) for t in non_k_slots
         ], component
         assert off.ds_read_in_mfma(*component) == on.ds_read_in_mfma(*component)
 
-    scale_off = [schedule._component_fill_slot(off, off, A_SCALE, t) for t in range(nm)]
-    scale_on = [schedule._component_fill_slot(on, on, A_SCALE, t) for t in range(nm)]
-    b_off = [schedule._component_fill_slot(off, off, B_SCALE, t) for t in range(nn)]
-    b_on = [schedule._component_fill_slot(on, on, B_SCALE, t) for t in range(nn)]
+    scale_off = [off_schedule.fill_slot(A_SCALE, t) for t in range(nm)]
+    scale_on = [on_schedule.fill_slot(A_SCALE, t) for t in range(nm)]
+    b_off = [off_schedule.fill_slot(B_SCALE, t) for t in range(nn)]
+    b_on = [on_schedule.fill_slot(B_SCALE, t) for t in range(nn)]
     if shape == (2, 2):
         # The guarded case: A scale already owns the middle slots, so only B moves.
         assert scale_off == scale_on == [1, 2]
@@ -1138,10 +1117,13 @@ def test_scale_fill_mid_moves_only_the_scale_fill_slots(shape):
 
 def test_epilogue_groups_stop_adding_slack_after_a_drain_producer():
     tc = _Config(WaitCommitScheme.PER_OP, (5, 5, 2, 2), 0, scales=False)
-    # B tile zero is read in slot zero. Its depth-two producer moves past the
-    # epilogue commit at drain iteration one; globally adding slack is unsafe.
-    assert _wait(tc, tc, 0, 0, True, 2) == _wait(tc, tc, 0, 0, True, 0) + 2
-    assert _wait(tc, tc, 1, 0, True, 2) == _wait(tc, tc, 1, 0, True, 0)
+    K = (tc.minimum_num_k() + 3) * tc.BLOCK_K
+    two, none = Schedule(tc, tc, K, 2), Schedule(tc, tc, K, 0)
+    first, second = two.drain_step(0, 0), two.drain_step(0, 1)
+    # B's first N slot is selected in slot zero. Its depth-two producer moves past
+    # the epilogue commit at drain iteration one; globally adding slack is unsafe.
+    assert two.wait(first, 0) == none.wait(first, 0) + 2
+    assert two.wait(second, 0) == none.wait(second, 0)
 
 
 @pytest.mark.parametrize("scale_depths", [(0, 0), (-1, 0), (-7, -3), (1, 1)])
@@ -1177,12 +1159,10 @@ def test_absent_scale_ring_indices_ignore_invalid_unused_depths(scale_depths):
         tuple((key, host._hashable(value)) for key, value in config.items()),
     )[-1]
     assert validate(tc, 512, 960)
-    layout = KernelLayout(tc)
-    assert pipeline_depth(tc, layout) == 2
-    assert schedule.pipeline_register_period(tc, layout) == 1
+    schedule = Schedule(tc, KernelLayout(tc), 960)
+    assert schedule.depth() == 2
+    assert schedule.register_period() == 1
     for component in (A_SCALE, B_SCALE):
-        for in_loop in (False, True):
+        for step in (schedule.warmup_step(), schedule.loop_step(1)):
             for fill in (False, True):
-                assert pipeline._index.fn(
-                    tc, layout, 7, component, fill, 1, in_loop
-                ) == 0
+                assert pipeline._index.fn(schedule, 7, step, component, fill) == 0

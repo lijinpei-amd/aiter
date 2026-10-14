@@ -3,9 +3,9 @@
 
 """Dump every constexpr the gfx950 Gluon MoE emitter consumes, for refactor diffing.
 
-The live pipeline carries no runtime schedule state: `_pipeline.py` reads the schedule
-model at trace time and folds it to constants. So if this dump is unchanged across a
-refactor, and the emitter body is unchanged, the generated machine code is unchanged.
+The live pipeline carries no runtime schedule state: `_pipeline.py` reads the build's
+`Schedule` at trace time and folds it to constants. So if this dump is unchanged across
+a refactor, and the emitter body is unchanged, the generated machine code is unchanged.
 That makes an empty diff here a much cheaper -- and much sharper -- per-step gate than
 a cold benchmark median, which drifts ~7 us between sessions with no code change.
 
@@ -17,9 +17,8 @@ a cold benchmark median, which drifts ~7 us between sessions with no code change
 CPU only: no kernel launch, no compile. It does import Triton, which needs a detectable
 arch, so a GPU must be visible even though none is used.
 
-`_wait()` is undefined for fill-only prologue stages (nothing has been read yet, so the
-demand is unsatisfiable) and raises there; those cells print `unreachable` rather than
-aborting the dump.
+Everything is read from the build's `Schedule`, one block per emitted step, so the dump
+covers exactly the steps `_pipeline.py` expands.
 """
 
 from __future__ import annotations
@@ -31,17 +30,22 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from aiter.ops.triton._gluon_kernels.gfx950.moe import _pipeline as P  # noqa: E402
-from aiter.ops.triton._gluon_kernels.gfx950.moe import _schedule as S  # noqa: E402
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import DtypeQuant as DQ  # noqa: E402
 from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import (  # noqa: E402
     KernelLayout,
 )
+from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (  # noqa: E402
+    Schedule,
+)
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (  # noqa: E402
     COMPONENTS,
     WaitCommitScheme,
+    _slot_index,
 )
-from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import validate  # noqa: E402
+from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import (  # noqa: E402
+    validate,
+    validate_pipeline,
+)
 from aiter.ops.triton.moe import moe_op_gemm_gluon as host  # noqa: E402
 
 CNAME = {c: n for c, n in zip(COMPONENTS, ("A_PAY", "A_SCL", "B_PAY", "B_SCL"))}
@@ -137,12 +141,24 @@ def cases():
     return out
 
 
-def _wait(tc, layout, *a, **kw):
-    """`_wait` is partial: undefined on fill-only prologue stages (see module docstring)."""
-    try:
-        return S._wait(tc, layout, *a, **kw)
-    except ValueError:
-        return "unreachable"
+def _steps(schedule):
+    """Every emitted step, labelled the way `_pipeline.py` expands it."""
+    depth, unroll = schedule.depth(), schedule.unroll()
+    out = [(f"prologue r={r}", schedule.prologue_step(r)) for r in range(1 - depth, 0)]
+    out.append(("warmup", schedule.warmup_step()))
+    out += [
+        (f"peeled x={x}", schedule.peeled_step(x)) for x in range(schedule.peeled())
+    ]
+    out += [(f"loop u={u}", schedule.loop_step(u)) for u in range(unroll)]
+    count = unroll - 1 if schedule.static_remainder() else 1
+    out += [(f"remainder u={u}", schedule.remainder_step(u)) for u in range(count)]
+    phases = schedule.ring_period() if schedule.static_drain() else 1
+    out += [
+        (f"drain p={p} j={j}", schedule.drain_step(p, j))
+        for p in range(phases)
+        for j in range(depth - 1)
+    ]
+    return out
 
 
 def dump_case(name, cfg, dq_a, dq_b, K, out):
@@ -150,93 +166,80 @@ def dump_case(name, cfg, dq_a, dq_b, K, out):
         tc = host._probe_tuning_config(cfg, dq_a, dq_b)
         layout = KernelLayout(tc)
         validate(tc, N_DEFAULT, K, layout)
+        schedule = Schedule(tc, layout, K)
+        validate_pipeline(tc, layout, K, schedule)
     except Exception as exc:  # a rejected config is itself a stable, diffable fact
         out(f"== {name}: REJECTED {type(exc).__name__}: {str(exc).splitlines()[0][:120]}")
         return
 
     nm, nn = layout.num_m_slots(), layout.num_n_slots()
     slots = nm * nn
-    depth = S.pipeline_depth(tc, layout)
-    unroll = S.pipeline_unroll(tc, layout)
-    peeled = S._pipeline_peeled(tc, layout)
-    num_k = layout.num_k_tiles(K)
+    present = [c for c in COMPONENTS if schedule.present(c)]
 
     out(f"== {name}")
     out(f"  geom NM={nm} NN={nn} slots={slots} mk={layout.num_k_slots()} "
-        f"num_k={num_k} scheme={int(tc.WAIT_COMMIT_SCHEME)}")
-    out(f"  sizing depth={depth} unroll={unroll} peeled={peeled} "
-        f"regperiod={S.pipeline_register_period(tc, layout)} "
-        f"hasreg={S._has_register_component(tc, layout)}")
-    out(f"  order {S._buffer_load_order(nm, nn)}")
+        f"num_k={schedule.num_k()} scheme={int(tc.WAIT_COMMIT_SCHEME)}")
+    out(f"  sizing depth={schedule.depth()} unroll={schedule.unroll()} "
+        f"peeled={schedule.peeled()} ring={schedule.ring_period()} "
+        f"regperiod={schedule.register_period()} async={schedule.async_period()} "
+        f"hasreg={schedule.has_register_component()}")
+    out(f"  regions static_remainder={schedule.static_remainder()} "
+        f"static_drain={schedule.static_drain()} "
+        f"epilogue_groups={schedule.epilogue_groups()} "
+        f"epilogue_wait={schedule.epilogue_wait()}")
+    out(f"  commit per_copy={schedule.commit_per_copy()} "
+        f"per_slot={schedule.commit_per_slot()} per_tile={schedule.commit_per_tile()} "
+        f"tile_after_mfma={schedule.tile_commit_after_mfma()}")
 
     for c in COMPONENTS:
-        if not S._present(tc, layout, c):
+        if not schedule.present(c):
             out(f"  {CNAME[c]} absent")
             continue
-        out(f"  {CNAME[c]} D={S._component_depth(tc, layout, c)} "
-            f"R={S._component_ratio(tc, layout, c)} "
-            f"L={S._live_span(tc, layout, c)} F={S._fill_span(tc, layout, c)} "
-            f"via_lds={S._via_lds(tc, layout, c)} "
-            f"pphase={S._producer_phase(tc, layout, c)} "
-            f"nonk_ratio={layout.scale_ratio_non_k_slot(c[0])}")
+        non_k_slots = nm if c[0] == 0 else nn
+        out(f"  {CNAME[c]} D={schedule.ring_depth(c)} R={schedule.ratio_k(c)} "
+            f"L={schedule.live_span(c)} F={schedule.fill_span(c)} "
+            f"via_lds={schedule.via_lds(c)} pphase={schedule.producer_phase(c)} "
+            f"nonk_ratio={layout.scale_ratio_non_k_slot(c[0])} "
+            f"fill_slots={tuple(schedule.fill_slot(c, t) for t in range(non_k_slots))} "
+            f"read_slots={tuple(schedule.read_slot(c, t) for t in range(non_k_slots))} "
+            f"in_mfma={tuple(schedule.read_in_mfma(c, t) for t in range(non_k_slots))}")
 
-    # ownership and read binding, per slot
+    # ownership and selection, per slot
     for ni in range(nn):
         for mi in range(nm):
-            s = S._slot_index(mi, ni, nm, nn)
-            ops = S._ops(tc, layout, mi, ni)
-            reads = [S._component_read_tile(tc, layout, c, mi, ni)
-                     for c in COMPONENTS]
-            mfma = [S._read_in_mfma(tc, layout, c, t) if t is not None else None
-                    for c, t in zip(COMPONENTS, reads)]
-            out(f"  slot{s}(mi={mi},ni={ni}) ops={ops} read={reads} in_mfma={mfma}")
-    for c in COMPONENTS:
-        if not S._present(tc, layout, c):
-            continue
-        n_tiles = nm if c[0] == 0 else nn
-        fill = tuple(S._component_fill_slot(tc, layout, c, t) for t in range(n_tiles))
-        rd = tuple(S._component_read_slot(tc, layout, c, t) for t in range(n_tiles))
-        out(f"  {CNAME[c]} fill_slots={fill} read_slots={rd}")
+            s = _slot_index(mi, ni, nm, nn)
+            selected = tuple(schedule.selected(s, c) for c in COMPONENTS)
+            out(f"  slot{s}(mi={mi},ni={ni}) owned={schedule.owned(s)} "
+                f"selected={selected}")
 
-    # activity and committed groups across every reachable region
-    for stage in range(1 - depth, depth + 2):
-        act = tuple(int(S._active(tc, layout, c, stage)) for c in COMPONENTS)
-        out(f"  active stage={stage} {act} groups={S._groups(tc, layout, stage)}")
-    steady = tuple(int(S._active(tc, layout, c, None)) for c in COMPONENTS)
-    out(f"  active steady {steady} "
-        f"groups={S._groups(tc, layout, None)}")
-    for j in range(depth - 1):
-        act = tuple(int(S._active(tc, layout, c, j, True)) for c in COMPONENTS)
-        out(f"  active drain j={j} {act} groups={S._groups(tc, layout, j, True)}")
+    # every emitted step: what it copies, commits and waits on, and its ring indices
+    for label, step in _steps(schedule):
+        out(f"  step {step} {label}: phase={schedule.phase(step)} "
+            f"ki={schedule.ki(step)} in_loop={schedule.in_loop(step)} "
+            f"static_phase={schedule.static_phase(step)} dot={schedule.dot(step)} "
+            f"soff={schedule.soff_unroll(step)}")
+        act = tuple(int(schedule.active(step, c)) for c in COMPONENTS)
+        loads = tuple(int(schedule.loads(step, c)) for c in COMPONENTS)
+        sel = tuple(int(schedule.selects(step, c)) for c in COMPONENTS)
+        out(f"    active={act} loads={loads} selects={sel}")
+        out(f"    issued={tuple(schedule.issued(step, s) for s in range(slots))}")
+        commits = tuple(
+            tuple(tuple((CNAME[c], t) for c, t in g) for g in schedule.commits(step, s))
+            for s in range(slots)
+        )
+        out(f"    commits={commits}")
+        out(f"    wait tile={schedule.wait(step)} "
+            f"slots={[schedule.wait(step, s) for s in range(slots)]}")
+        for c in present:
+            out(f"    {CNAME[c]} reg={schedule.register_index(step, c)}/"
+                f"{schedule.register_index(step, c, True)} "
+                f"lds={schedule.static_lds_index(step, c, False)}/"
+                f"{schedule.static_lds_index(step, c, True)}")
 
-    # the emitted wait immediates, which are the perf artifact
-    for stage in range(0, depth + 2):
-        w = [_wait(tc, layout, stage, s) for s in range(slots)]
-        head = _wait(tc, layout, stage, None)
-        out(f"  wait startup stage={stage} head={head} slots={w}")
-    for phase in range(peeled + 1, peeled + 1 + unroll):
-        w = [_wait(tc, layout, None, s, phase=phase) for s in range(slots)]
-        head = _wait(tc, layout, None, None, phase=phase)
-        out(f"  wait steady phase={phase} head={head} slots={w}")
-    for epi in (0, 1):
-        for j in range(depth - 1):
-            ph = num_k - depth + j + 1
-            w = [_wait(tc, layout, j, s, True, epi, ph) for s in range(slots)]
-            out(f"  wait drain j={j} epi={epi} phase={ph} "
-                f"head={_wait(tc, layout, j, None, True, epi, ph)} slots={w}")
-
-    # register-ring indices and the soffset stream
-    for c in COMPONENTS:
-        if not S._present(tc, layout, c):
-            continue
-        for fill in (False, True):
-            row = [P._register_index(tc, layout, c, ph, 0, False, fill)
-                   for ph in range(unroll + 2)]
-            loop = [P._register_index(tc, layout, c, 0, ki, True, fill)
-                    for ki in range(unroll)]
-            out(f"  regidx {CNAME[c]} fill={int(fill)} finite={row} in_loop={loop}")
+    # the soffset stream
+    for c in present:
         if c[1]:
-            soff = [P._scale_soff_steps(tc, layout, c, o) for o in range(unroll)]
+            soff = [schedule.scale_soff_steps(c, o) for o in range(schedule.unroll())]
             out(f"  soff {CNAME[c]} {soff}")
 
 

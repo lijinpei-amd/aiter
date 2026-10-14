@@ -11,14 +11,13 @@ import pytest
 import torch
 
 from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import KernelLayout
-from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
+from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import Schedule
+from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     A_PAYLOAD,
     B_PAYLOAD,
-    _pipeline_peeled,
-    pipeline_depth,
-    pipeline_unroll,
+    DtypeQuant,
+    EpilogueMode,
 )
-from aiter.ops.triton._gluon_kernels.gfx950.moe._types import DtypeQuant, EpilogueMode
 from aiter.ops.triton.moe import moe_op_gemm_gluon as host
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import moe_gemm_torch
 from aiter.ops.triton.moe.moe_op_gemm_gluon import moe_gemm_gluon
@@ -643,13 +642,9 @@ def test_minimum_k_and_every_reachable_unroll_remainder(dtype, schedule, monkeyp
         DtypeQuant, {"mxfp4": "MXFP4", "mxfp8": "MXFP8", "bf16": "BF16"}[dtype]
     )
     tc = host._probe_tuning_config(config, dtype_quant, dtype_quant)
-    layout = KernelLayout(tc)
-    minimum = host._cval(
-        pipeline_depth(tc, layout)
-        + _pipeline_peeled(tc, layout)
-        + pipeline_unroll(tc, layout)
-    )
-    unroll = host._cval(pipeline_unroll(tc, layout))
+    sizing = Schedule(tc, KernelLayout(tc), host._cval(tc.BLOCK_K))
+    minimum = sizing.depth() + sizing.peeled() + sizing.unroll()
+    unroll = sizing.unroll()
     stride = 2 if packed else 1
     first = (minimum + stride - 1) // stride * stride
     # Packed K128 operands require complete K256 scale words. These are exactly

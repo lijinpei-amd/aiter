@@ -1,807 +1,980 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Copy ownership and commit/wait accounting for the Gluon MoE pipeline.
+"""The pipelined K loop of one build, evaluated once as a :class:`Schedule`.
 
-Components use ``(operand, is_scale)`` identities throughout the live schedule.
+``Schedule(tuning_cfg, layout, K)`` derives the whole schedule in its constructor and
+holds the results in its fields. ``_pipeline.py`` expands the loop from it alone:
+
+* how many prologue, warm-up, peeled, loop, remainder and drain steps there are, and
+  each step's K phase, unroll position and region;
+* in each step and slot, which non-K slot of each component is copied and which is
+  selected, and whether the selection reads in the memory or the MFMA region;
+* where the async commits go, and the immediate of every async wait.
+
+The public surface is :class:`Schedule`: its constructor, methods and fields.
+Everything else here is internal derivation detail that no other module imports.
+
+Vocabulary, per ``agents/CONCEPTS.md``. The *tile* is the ``BLOCK_M x BLOCK_N x
+BLOCK_K`` block; one pipeline *step* advances it by one ``BLOCK_K``. A *slot* is one
+of its ``num_m_slots x num_n_slots`` parts, numbered by ``_types._slot_index``. A
+*component* is ``(operand, is_scale)``, one of ``_types.COMPONENTS``. A component is
+split along its operand's non-K axis only -- A by M slot, B by N slot -- and that
+per-operand index is a copy's *non-K slot*.
+
+Each component has a ring of ``D`` buffers and a scale K-step ratio ``R`` (1 for a
+payload), so a value lives ``L = (D - 1) * R + 1`` steps. An LDS producer is selected
+``F = L`` steps after it is issued; a direct-register producer skips the DS read and
+is selected after ``F = L - 1``.
+
+Waits are computed in two passes. The first builds the commit plan: for every emitted
+step, the commit groups each slot closes, as sets of ``(component, non-K slot)``
+copies. The second replays the plan in execution order for this build's K, stamping
+each copy with the step that issued it, and reads every wait immediate off the
+replayed commit FIFO (:func:`_replay`).
 """
 
 import math
-from typing import NamedTuple
 
 from triton.experimental import gluon
+from triton.experimental.gluon import language as gl
+from triton.language.core import _aggregate as aggregate
 
-from . import _schedule_cache
+from ._lang import strip_annotate
 from ._lang import unwrap as _v
-from ._types import (
-    A_PAYLOAD,
-    A_SCALE,
-    B_PAYLOAD,
-    B_SCALE,
-    COMPONENTS,
-    OPERANDS,
-    PAYLOAD,
-    SCALE,
-    A,
-    B,
-    _slot_index,
-)
+from ._types import COMPONENTS, A, _slot_index
 
-__all__ = [
-    "A_PAYLOAD",
-    "A_SCALE",
-    "B_PAYLOAD",
-    "B_SCALE",
-    "COMPONENTS",
-    "OPERANDS",
-    "PAYLOAD",
-    "SCALE",
-    "A",
-    "B",
-    "ScheduleSpec",
-    "async_pattern_period",
-    "pipeline_register_period",
-    "ring_restoration_period",
-    "schedule_spec",
-]
+__all__ = ["Schedule"]
 
-
-class ScheduleSpec(NamedTuple):
-    """Every configuration value the schedule model reads, resolved and hashable.
-
-    The model's whole input surface, in one place. Two uses:
-
-    * it states what the schedule actually depends on. Anything not here cannot
-      change the schedule, which is what lets a caller reason about whether a tuning
-      change can move the emitted code;
-    * it is a sound memo key. Neither the tuning aggregate nor the layout aggregate
-      is: Triton builds them with ``eq_default=False``, so they hash by identity and a
-      single compile constructs hundreds of distinct objects for one value, and
-      several of their fields are ``gl.constexpr(list)`` and unhashable outright.
-
-    Built from accessor *results*, never from raw fields: geometry and placement
-    (``nm``, ``nn``, ``ratio_k``, ``via_lds``, ``ratio_non_k``) from the
-    ``KernelLayout`` accessors, which fold in automatic fallbacks, and tuning policy
-    from the tuning configuration, whose test doubles mutate their inputs after
-    construction.
-    """
-
-    nm: int
-    nn: int
-    #: ``(per_op, per_slot, per_stage)`` -- the three granularities the model branches
-    #: on, rather than the four-valued scheme, since the two per-stage schemes differ
-    #: only in where the emitter puts the commit.
-    commit: tuple
-    scale_fill_mid: bool
-    k_unroll: int
-    present: tuple
-    depth: tuple
-    ratio_k: tuple
-    via_lds: tuple
-    ds_read_in_mfma: tuple
-    #: Per operand, not per component: only scales share across non-K slots.
-    ratio_non_k: tuple
+# Step kinds, in program order. A step is one emitted `_step` call, or for the
+# prologue one fill-only expansion.
+_PROLOGUE = 0  # fills only, before anything is selected
+_WARMUP = 1  # step 0: selects the first K tile, issues no MFMA
+_PEELED = 2  # straight-line main steps whose waits differ from the loop body's
+_LOOP = 3  # the runtime loop body
+_REMAINDER = 4  # the main steps a whole number of loop bodies leaves over
+_DRAIN = 5  # after the main steps; only components with spare depth still fill
 
 
 @gluon.constexpr_function
-def schedule_spec(tc, layout):
-    """Resolve the schedule model's input surface from a tuning config and layout."""
-    present = tuple(_present(tc, layout, c) for c in COMPONENTS)
-    via_lds = tuple(bool(_v(layout.component_via_lds(c))) for c in COMPONENTS)
-    return ScheduleSpec(
-        nm=_v(layout.num_m_slots()),
-        nn=_v(layout.num_n_slots()),
-        commit=(
-            bool(_v(tc.commit_per_op())),
-            bool(_v(tc.commit_per_slot())),
-            bool(_v(tc.commit_per_stage())),
-        ),
-        scale_fill_mid=bool(_v(tc.SCALE_FILL_MID)),
-        k_unroll=_v(tc.K_UNROLL),
-        present=present,
-        depth=tuple(_v(tc.num_buffers(c[0], c[1])) for c in COMPONENTS),
-        ratio_k=tuple(_component_ratio(tc, layout, c) for c in COMPONENTS),
-        via_lds=via_lds,
-        ds_read_in_mfma=tuple(
-            bool(_v(tc.ds_read_in_mfma(c[0], c[1]))) for c in COMPONENTS
-        ),
-        ratio_non_k=tuple(_v(layout.scale_ratio_non_k_slot(o)) for o in OPERANDS),
-    )
-
-
-@gluon.constexpr_function
-def _present(tc, layout, component):
-    """Whether a component exists for this operand-format pair."""
-    operand, is_scale = component[0], component[1]
-    return not _v(is_scale) or tc.func_cfg.has_scale(operand)
-
-
-@gluon.constexpr_function
-def _component_depth(tc, layout, component):
-    operand, is_scale = component[0], component[1]
-    return tc.num_buffers(operand, is_scale)
-
-
-@gluon.constexpr_function
-def _component_ratio(tc, layout, component):
-    operand, is_scale = component[0], component[1]
-    return layout.scale_ratio_k_step(operand) if _v(is_scale) else 1
-
-
-@gluon.constexpr_function
-def _live_span(tc, layout, component):
-    """Baseline inclusive lifetime ``L(c)`` in payload K steps."""
-    return (_component_depth(tc, layout, component) - 1) * _component_ratio(
-        tc, layout, component
-    ) + 1
-
-
-@gluon.constexpr_function
-def _via_lds(tc, layout, component):
-    """Resolved placement for one payload or scale component."""
-    return layout.component_via_lds(component)
-
-
-@gluon.constexpr_function
-def _in_reg(tc, layout, component):
-    """Resolved direct-register placement for one present component."""
-    return layout.component_in_reg(component)
-
-
-@gluon.constexpr_function
-def pipeline_depth(tc, layout):
-    """Largest prefetch span, measured in payload steps, of active components."""
-    depth = 0
-    for component in COMPONENTS:
-        if _present(tc, layout, component):
-            depth = max(depth, _live_span(tc, layout, component))
-    return depth
-
-
-@gluon.constexpr_function
-def ring_restoration_period(tc, layout):
-    """Payload steps after which every present component ring is back at slot zero.
-
-    A component's ring period is its depth times its scale K-step ratio, not its live
-    span ``(D - 1) * R + 1``: the span says when a value is consumed, the period says
-    when the ring repeats.
-
-    Distinct from three neighbours it is easy to conflate with. The requested unroll
-    (``K_UNROLL``) is a tuning knob. The effective unroll is this LCM'd with that knob.
-    The register-only period (:func:`pipeline_register_period`) counts the same
-    quantity over direct-register rings alone, because only those need a static index.
-    """
-    period = 1
-    for component in COMPONENTS:
-        if _present(tc, layout, component):
-            period = math.lcm(
-                period,
-                _component_depth(tc, layout, component)
-                * _component_ratio(tc, layout, component),
-            )
-    return period
-
-
-@gluon.constexpr_function
-def pipeline_register_period(tc, layout):
-    """Payload steps after which every present direct-register ring is back at slot zero.
-
-    :func:`ring_restoration_period` restricted to the components ``_in_reg`` places
-    in registers: the LCM of depth times scale K-step ratio over those alone. Absent
-    scales have no ring, and LDS-backed components do not participate.
-
-    Separate because the two have different consumers. LDS slots may use runtime
-    indices, while register tuples need static ones in the main loop, so only the
-    register rings have to return to slot zero for a body to be unrollable. A period
-    of one means no register ring rotates at all.
-    """
-    period = 1
-    for component in COMPONENTS:
-        if _present(tc, layout, component) and _in_reg(tc, layout, component):
-            period = math.lcm(
-                period,
-                _component_depth(tc, layout, component)
-                * _component_ratio(tc, layout, component),
-            )
-    return period
-
-
-@gluon.constexpr_function
-def async_pattern_period(tc, layout):
-    """Payload steps after which the issued async-copy pattern repeats.
-
-    The LCM of the scale K-step ratios over present LDS-backed components; payload
-    components contribute one. Shorter than the ring restoration period, because
-    which copies issue depends only on the K-step phase, not on which ring slot they
-    land in. Direct-register components do not participate -- they issue no async
-    copy -- so this is the period of the commit-group pattern specifically.
-    """
-    period = 1
-    for component in COMPONENTS:
-        if _present(tc, layout, component) and _via_lds(tc, layout, component):
-            period = math.lcm(period, _component_ratio(tc, layout, component))
-    return period
-
-
-@gluon.constexpr_function
-def pipeline_unroll(tc, layout):
-    """Requested unroll, widened to a whole number of every component ring period.
-
-    Including LDS rings keeps every complete body at a fixed ring phase as well as
-    satisfying the static-index requirement of register tuples.
-    """
-    requested = _v(tc.K_UNROLL)
-    assert requested >= 1, "K_UNROLL must be at least 1"
-    return math.lcm(requested, ring_restoration_period(tc, layout))
-
-
-@gluon.constexpr_function
-def _pipeline_peeled(tc, layout):
-    """Smallest initial main prefix after which every wait is invariant.
-
-    The first MFMA is always peeled to retain its visible zero accumulator.
-    By read stage ``pipeline_depth(tc, layout) - 2``, every active component has an
-    entirely full producer history. Checking the finite prefix also handles
-    configurations where shared groups hide some staggered fills.
-    """
-    # These schemes commit even empty prologue slots/stages. Their group
-    # distances already match the steady state when a component first reads.
-    # At depth three or below, the mandatory first peel covers any warmup.
-    if not tc.commit_per_op() or pipeline_depth(tc, layout) <= 3:
-        return 1
-    slots = range(layout.num_m_slots() * layout.num_n_slots())
-    peeled = 1
-    for x in range(max(0, pipeline_depth(tc, layout) - 2)):
-        steady = tuple(_wait(tc, layout, None, slot, phase=x + 1) for slot in slots)
-        if tuple(_wait(tc, layout, x + 1, slot) for slot in slots) != steady:
-            peeled = x + 1
-    return peeled
-
-
-@gluon.constexpr_function
-def _buffer_load_order(NM, NN):
-    """Payload copies as ``(is_a, tile)`` in slot order."""
-    NM, NN = _v(NM), _v(NN)
-    if NM == 2 and NN == 2:
+def _buffer_load_order(nm, nn):
+    """Payload copies as ``(is_a, non-K slot)`` in slot order."""
+    if nm == 2 and nn == 2:
         return [(0, 0), (1, 0), (1, 1), (0, 1)]
     out = []
-    for i in range(max(NM, NN)):
-        if i < NM:
+    for i in range(max(nm, nn)):
+        if i < nm:
             out.append((1, i))
-        if i < NN:
+        if i < nn:
             out.append((0, i))
     return out
 
 
 @gluon.constexpr_function
-def _payload_fill_slots(NM, NN):
-    """Slot that owns each payload tile, as ``(A tiles, B tiles)``.
-
-    The resolved form of :func:`_buffer_load_order`. Ownership is a mapping from a
-    component's non-K tile to a slot, not a position lookup into a shared list --
-    which is what lets several components own copies in the same slot.
+def _payload_fill_slots(nm, nn):
+    """Slot that copies each payload non-K slot, as ``(A mapping, B mapping)``.
 
     Two policies. With both axes split, the interleaved order (and its 2x2 special
-    case) assigns one payload copy per slot, which is what the tuned kernels were
+    case) gives each slot one payload copy, which is what the tuned kernels were
     measured with and must not move.
 
-    With a degenerate axis there are fewer slots than copies -- ``NM + NN`` copies
-    into ``NM * NN`` slots -- so one slot has to own both operands. Fall back to
-    axis-major, ``A(t)`` at ``(mi=t, ni=0)`` and ``B(t)`` at ``(mi=0, ni=t)``, which
-    is total and injective per component for any ``NM, NN >= 1``. Applying it to a
-    split tile would reassign that tile's copies, so it is restricted to the case
-    the interleave cannot express.
+    With a degenerate axis there are fewer slots than copies -- ``nm + nn`` copies
+    into ``nm * nn`` slots -- so one slot copies both operands. Fall back to
+    axis-major, A's M slot ``t`` at ``(mi=t, ni=0)`` and B's N slot ``t`` at
+    ``(mi=0, ni=t)``, which is total and injective per component for any
+    ``nm, nn >= 1``. It is restricted to the case the interleave cannot express,
+    because applying it to a split tile would move that tile's copies.
     """
-    NM, NN = _v(NM), _v(NN)
-    if NM > 1 and NN > 1:
-        order = _buffer_load_order(NM, NN)
+    if nm > 1 and nn > 1:
+        order = _buffer_load_order(nm, nn)
         return (
-            tuple(order.index((1, tile)) for tile in range(NM)),
-            tuple(order.index((0, tile)) for tile in range(NN)),
+            tuple(order.index((1, t)) for t in range(nm)),
+            tuple(order.index((0, t)) for t in range(nn)),
         )
     return (
-        tuple(_slot_index(tile, 0, NM, NN) for tile in range(NM)),
-        tuple(_slot_index(0, tile, NM, NN) for tile in range(NN)),
+        tuple(_slot_index(t, 0, nm, nn) for t in range(nm)),
+        tuple(_slot_index(0, t, nm, nn) for t in range(nn)),
     )
 
 
 @gluon.constexpr_function
-def _component_fill_slots(tc, layout, component):
-    """Slot that owns each non-K tile of one component.
+def _first_non_k_slot(mapping, slot, ratio):
+    """First non-K slot ``mapping`` places in ``slot``, or ``None``.
 
-    ``SCALE_FILL_MID`` is consumed here and nowhere else: downstream ownership,
-    grouping, dependency and emission all read the resolved mapping. Note it is
-    guarded to the 2x2 split, so on any other geometry it is inert -- a rectangular
-    tile that sets it is not testing anything.
+    Only every ``ratio``-th non-K slot counts: a scale shared across non-K slots is
+    copied and selected once, at its first non-K slot.
     """
-    nm, nn = _v(layout.num_m_slots()), _v(layout.num_n_slots())
-    a_slots, b_slots = _payload_fill_slots(nm, nn)
-    if _v(component[1]) and _v(tc.SCALE_FILL_MID) and nm == 2 and nn == 2:
-        return (1, 2)
-    return a_slots if _v(component[0]) == A else b_slots
-
-
-@gluon.constexpr_function
-def _fill_slots_valid(tc, layout):
-    """Every mapped slot exists, and no component owns two tiles in one slot.
-
-    The second half is what keeps the flat ``_ops()`` transport representable: it
-    carries one optional tile per component, so a component may own at most one tile
-    per slot. Different components sharing a slot is fine and expected.
-    """
-    slots = _v(layout.num_m_slots()) * _v(layout.num_n_slots())
-    for component in COMPONENTS:
-        mapping = _component_fill_slots(tc, layout, component)
-        expected = (
-            _v(layout.num_m_slots())
-            if _v(component[0]) == A
-            else _v(layout.num_n_slots())
-        )
-        if len(mapping) != expected:
-            return False
-        if any(slot < 0 or slot >= slots for slot in mapping):
-            return False
-        if len(set(mapping)) != len(mapping):
-            return False
-    return True
-
-
-@gluon.constexpr_function
-def _component_fill_slot(tc, layout, component, tile):
-    """Flattened slot that owns one component/non-K-tile producer."""
-    return _component_fill_slots(tc, layout, component)[_v(tile)]
-
-
-@gluon.constexpr_function
-def _candidate_ops(tc, layout, slot):
-    """Tiles this slot owns, in ``COMPONENTS`` order; ``None`` where it owns none.
-
-    The single inversion of the fill mappings, and the only per-slot ownership view.
-    Scale tiles covered by a wider earlier load are filtered out here rather than
-    being absent from the mapping, so the mappings stay indexed by logical payload
-    tile.
-    """
-    out = []
-    for component in COMPONENTS:
-        tile = None
-        if _present(tc, layout, component):
-            ratio = (
-                _v(layout.scale_ratio_non_k_slot(_v(component[0])))
-                if _v(component[1])
-                else 1
-            )
-            for candidate, owner in enumerate(
-                _component_fill_slots(tc, layout, component)
-            ):
-                if owner == _v(slot) and candidate % ratio == 0:
-                    tile = candidate
-                    break
-        out.append(tile)
-    return tuple(out)
-
-
-@gluon.constexpr_function
-def _component_nominal_read_slot(tc, layout, component, tile):
-    """Payload-owned slot at which a component would normally be selected."""
-    return _component_fill_slots(tc, layout, (component[0], PAYLOAD))[_v(tile)]
-
-
-@gluon.constexpr_function
-def _component_read_slot(tc, layout, component, tile):
-    """Legal selection slot after accounting for a same-step register producer."""
-    nominal = _component_nominal_read_slot(tc, layout, component, tile)
-    if _in_reg(tc, layout, component) and _fill_span(tc, layout, component) == 1:
-        producer = _component_fill_slot(tc, layout, component, tile)
-        if producer > nominal:
-            return producer
-    return nominal
-
-
-@gluon.constexpr_function
-def _component_read_tile(tc, layout, component, mi, ni):
-    """Non-K tile selected in this slot, or ``None`` when this component is idle."""
-    if not _present(tc, layout, component):
-        return None
-    operand, is_scale = component[0], component[1]
-    count = layout.num_m_slots() if operand == A else layout.num_n_slots()
-    slot = _slot_index(
-        mi,
-        ni,
-        layout.num_m_slots(),
-        layout.num_n_slots(),
-    )
-    for tile in range(count):
-        if _v(is_scale) and tile % layout.scale_ratio_non_k_slot(operand) != 0:
-            continue
-        if _component_read_slot(tc, layout, component, tile) == slot:
-            return tile
+    for t, mapped in enumerate(mapping):
+        if mapped == slot and t % ratio == 0:
+            return t
     return None
 
 
 @gluon.constexpr_function
-def _ops(tc, layout, mi, ni):
-    """Tiles in ``COMPONENTS`` order, including direct-register destinations.
+def _step_plan(m, kind, stage, phase):
+    """What one step copies, commits and selects, as the async FIFO sees it.
 
-    The flat four-element transport across the constexpr-to-JIT boundary -- nested
-    tuples do not survive it. A view over :func:`_candidate_ops`, not a second
-    ownership model.
+    ``stage`` places the step for the staggered start and stop: an absolute step
+    before the loop (``None`` inside it, where every component fills), the zero-based
+    iteration in the drain. ``phase`` is its K step, which decides the scale copies
+    and selections. Returns ``(active, loads, issued, commits, demand)``:
+
+    * ``active`` -- whether each component fills here at all. Prologue filling starts
+      at ``1 - F(c)``, so a component with a shorter fill span starts later. The
+      drain keeps filling while ``j < depth - F(c)``: a component whose values live
+      the full pipeline depth has nothing left to fetch, a shallower one does.
+    * ``loads`` -- ``active``, and the K step is the component's producer phase.
+    * ``issued`` -- per slot, the non-K slot each component copies, register copies
+      included.
+    * ``commits`` -- per slot, the groups it closes, of LDS copies only. Per-slot and
+      per-tile schemes commit even an empty group: it still occupies a FIFO position.
+    * ``demand`` -- per slot, the LDS copies its selections read. Register components
+      have no commit group; the compiler tracks their loads itself.
     """
-    return _candidate_ops(
-        tc,
-        layout,
-        _slot_index(mi, ni, layout.num_m_slots(), layout.num_n_slots()),
-    )
-
-
-@gluon.constexpr_function
-def _fill_span(tc, layout, component):
-    """Actual inclusive producer-to-selection span ``F(c)`` in payload steps."""
-    span = _live_span(tc, layout, component)
-    if _in_reg(tc, layout, component):
-        span -= 1
-    return span
-
-
-@gluon.constexpr_function
-def _read_in_mfma(tc, layout, component, tile):
-    """Effective read region, including mandatory same-step fill ordering."""
-    operand, is_scale = component[0], component[1]
-    configured = tc.ds_read_in_mfma(operand, is_scale)
-    if not _in_reg(tc, layout, component) or _fill_span(tc, layout, component) != 1:
-        return configured
-    return configured or _component_read_slot(
-        tc, layout, component, tile
-    ) == _component_fill_slot(tc, layout, component, tile)
-
-
-@gluon.constexpr_function
-def _fills_during_startup(tc, layout, component, step):
-    """Whether a component has begun filling by this absolute payload step.
-
-    Prologue filling starts at ``1 - F(c)``, so a component with a shorter fill span
-    starts later: it does not need its value as early. ``step=None`` is steady state,
-    where every present component fills.
-    """
-    if not _present(tc, layout, component):
-        return False
-    return step is None or step + _fill_span(tc, layout, component) - 1 >= 0
-
-
-@gluon.constexpr_function
-def _fills_during_drain(tc, layout, component, iteration):
-    """Whether a component still fills at this zero-based drain iteration.
-
-    Filling continues while ``j < D - F(c)``. A component whose values live the full
-    pipeline depth has nothing left to fetch once the drain starts; a shallower one
-    keeps going, which is why the drain is not idle.
-    """
-    if not _present(tc, layout, component):
-        return False
-    return iteration < pipeline_depth(tc, layout) - _fill_span(tc, layout, component)
-
-
-@gluon.constexpr_function
-def _active(tc, layout, component, stage, drain=False):
-    """Whether a component fills here, dispatching on the caller's region.
-
-    The two regimes use different origins -- an absolute payload step before the
-    drain, a zero-based iteration within it -- so they are separate predicates and
-    this only chooses between them. See :func:`_read_step` for the same split on the
-    read side.
-    """
-    if drain:
-        return _fills_during_drain(tc, layout, component, stage)
-    return _fills_during_startup(tc, layout, component, stage)
-
-
-@gluon.constexpr_function
-def _producer_phase(tc, layout, component):
-    """Payload-step residue on which this component issues its producer load."""
-    return (1 - _fill_span(tc, layout, component)) % _component_ratio(
-        tc, layout, component
-    )
-
-
-@gluon.constexpr_function
-def _loads_at_phase(tc, layout, component, phase):
-    """Whether a component issues a load at this K-step phase."""
-    return _present(tc, layout, component) and (
-        phase % _component_ratio(tc, layout, component)
-        == _producer_phase(tc, layout, component)
-    )
-
-
-@gluon.constexpr_function
-def _reads_at_phase(tc, layout, component, phase):
-    """Whether this step selects a new value for the component."""
-    return (
-        _present(tc, layout, component)
-        and phase % _component_ratio(tc, layout, component) == 0
-    )
-
-
-@gluon.constexpr_function
-def _issued_tiles(tc, layout, mi, ni, stage, drain=False, phase=0):
-    """Tiles this slot issues at this step, ``COMPONENTS``-aligned; ``None`` for none.
-
-    :func:`_ops` says what the slot *owns*; this applies the step-local filters on top
-    -- staggered startup and drain shutdown, and the scale K-step phase. One query
-    instead of the same three-term predicate repeated per component, and the emitter
-    and the commit-group model now read the same answer rather than two copies of the
-    same conjunction that could drift apart.
-
-    Direct-register destinations are kept. They are part of the step schedule; only
-    the async-group view drops them, which it does by filtering this on placement.
-    """
-    return tuple(
-        tile
-        if (
-            tile is not None
-            and _active(tc, layout, component, stage, drain)
-            and _loads_at_phase(tc, layout, component, phase)
+    present, fill_span, ratio_k = m["present"], m["fill_span"], m["ratio_k"]
+    if kind == _DRAIN:
+        active = tuple(p and stage < m["depth"] - f for p, f in zip(present, fill_span))
+    else:
+        active = tuple(
+            p and (stage is None or stage + f - 1 >= 0)
+            for p, f in zip(present, fill_span)
         )
-        else None
-        for component, tile in zip(COMPONENTS, _ops(tc, layout, mi, ni))
+    loads = tuple(
+        a and phase % r == (1 - f) % r for a, r, f in zip(active, ratio_k, fill_span)
     )
-
-
-@gluon.constexpr_function
-def _has_register_component(tc, layout):
-    """Whether any present live component uses a direct-register ring."""
-    for component in COMPONENTS:
-        if _present(tc, layout, component) and _in_reg(tc, layout, component):
-            return True
-    return False
-
-
-@gluon.constexpr_function
-def _groups(tc, layout, stage, drain=False, phase=None):
-    """Committed groups at a read phase, including empty slot/stage groups."""
-    schedule, whole = [], ()
-    phase = stage if phase is None and stage is not None else phase or 0
-    for ni in range(layout.num_n_slots()):
-        for mi in range(layout.num_m_slots()):
-            # The async view of what this slot issues: the same step schedule the
-            # emitter fills from, minus the direct-register copies, which have no
-            # commit group.
-            ops = tuple(
-                (component, tile)
-                for component, tile in zip(
-                    COMPONENTS, _issued_tiles(tc, layout, mi, ni, stage, drain, phase)
-                )
-                if tile is not None and _via_lds(tc, layout, component)
-            )
-            if tc.commit_per_op():
-                groups = tuple((op,) for op in ops)
-            elif tc.commit_per_slot():
-                groups = (ops,)
-            else:
-                whole += ops
-                groups = (
-                    (whole,)
-                    if mi == layout.num_m_slots() - 1 and ni == layout.num_n_slots() - 1
-                    else ()
-                )
-            schedule.append(groups)
-    return tuple(schedule)
-
-
-@gluon.constexpr_function
-def _read_step(tc, layout, stage, drain):
-    """Absolute payload step this wait point reads at.
-
-    Three coordinates arrive here. ``None`` is steady state, where only the phase
-    matters, so any step late enough for every component to be active will do and
-    ``pipeline_depth`` is the cheapest such. An integer is an absolute startup step.
-    In the drain it is the zero-based drain iteration, whose first read is step one.
-    """
-    if drain:
-        return stage + 1
-    return pipeline_depth(tc, layout) if stage is None else stage
-
-
-@gluon.constexpr_function
-def _required_producers(tc, layout, read_step, slot, phase):
-    """Producer tokens the LDS reads at this point demand.
-
-    ``(producer_step, component, non_k_tile)``. The step is part of the identity
-    because the same copy repeats every ring period, so naming the component and tile
-    alone would match a different iteration's value.
-
-    Direct-register components are absent by construction: they have no commit group,
-    and the compiler tracks their VMEM dependency itself.
-    """
-    nm, nn = layout.num_m_slots(), layout.num_n_slots()
-    out = []
-    for ni in range(nn):
-        for mi in range(nm):
-            if slot is not None and _slot_index(mi, ni, nm, nn) != slot:
-                continue
-            for component in COMPONENTS:
-                tile = _component_read_tile(tc, layout, component, mi, ni)
-                if tile is None:
-                    continue
-                if _via_lds(tc, layout, component) and _reads_at_phase(
-                    tc, layout, component, phase
-                ):
-                    out.append(
-                        (
-                            read_step - _fill_span(tc, layout, component) + 1,
-                            component,
-                            tile,
-                        )
-                    )
-    return tuple(out)
-
-
-@gluon.constexpr_function
-def _committed_before(
-    tc, layout, stage, read_step, slot, drain, epilogue_groups, phase
-):
-    """Commit groups issued before this wait point, oldest first.
-
-    Empty entries are meaningful: a per-slot or per-stage scheme commits even when a
-    slot issued nothing, and an output-epilogue group carries no pipeline producer at
-    all. Both occupy a FIFO position, so both shift the distance to a required group.
-
-    The window starts at ``read_step - pipeline_depth + 1``. That is sufficient and
-    tight: a required producer sits at ``read_step - F(c) + 1`` with ``F(c) = L(c)``
-    for LDS components, and ``L(c) <= pipeline_depth`` by definition, with equality
-    reachable. Truncating older history is free regardless, since the returned count
-    depends only on the suffix after the newest required group.
-    """
-    out = []
-    for step in range(read_step - pipeline_depth(tc, layout) + 1, read_step + 1):
-        step_phase = phase + step - read_step
-        if drain:
-            schedule = (
-                _groups(tc, layout, step - 1, True, step_phase)
-                if step > 0
-                else _groups(tc, layout, None, phase=step_phase)
-            )
+    issued = tuple(
+        tuple(t if t is not None and load else None for t, load in zip(owned, loads))
+        for owned in m["owned"]
+    )
+    per_copy, per_slot = m["commit"][0], m["commit"][1]
+    commits, whole = [], ()
+    for slot, copies in enumerate(issued):
+        ops = tuple(
+            (ci, t) for ci, t in enumerate(copies) if t is not None and m["via_lds"][ci]
+        )
+        if per_copy:
+            groups = tuple((op,) for op in ops)
+        elif per_slot:
+            groups = (ops,)
         else:
-            schedule = _groups(
-                tc, layout, None if stage is None else step, phase=step_phase
-            )
-        for pos, groups in enumerate(schedule):
-            # This step's own slots from `slot` onward commit after the wait.
-            if step == read_step and (slot is None or pos >= slot):
-                break
-            out.extend(
-                tuple((step, component, tile) for component, tile in group)
-                for group in groups
-            )
-        if drain and step == 0:
-            # The epilogue commits between the last main step and the first drain
-            # iteration, so it lands here and nowhere else.
-            out.extend(() for _ in range(epilogue_groups))
-    return tuple(out)
-
-
-@gluon.constexpr_function
-def _wait_count(committed, required):
-    """Groups left outstanding after retiring the newest required producer.
-
-    ``wait_group(n)`` blocks until at most ``n`` groups remain outstanding, so with
-    ``j`` the newest index holding anything required, ``len - j - 1`` retires through
-    ``j`` and no further. One more would leave ``j`` in flight; one fewer would drain
-    newer work for nothing.
-
-    Sound even though retirement is measured against the outstanding set rather than
-    this timeline: retirement is oldest-first, so outstanding is always a suffix of
-    committed. If ``j`` is still in flight the suffix reaches it; if an earlier wait
-    already retired it the instruction is a no-op.
-    """
-    for token in required:
-        assert sum(token in group for group in committed) == 1, (
-            f"required producer {token} must be committed exactly once before its "
-            f"read; found {sum(token in group for group in committed)}"
-        )
-    latest = max(
-        i for i, group in enumerate(committed) if any(t in group for t in required)
-    )
-    return len(committed) - latest - 1
-
-
-@gluon.constexpr_function
-def _wait(tc, layout, stage, slot, drain=False, epilogue_groups=0, phase=None):
-    """Immediate for the ``wait_group`` before this read, or ``None`` for no wait.
-
-    Four independent steps: where we are, what the reads demand, what has committed,
-    how far back the newest demand sits.
-    """
-    read_step = _read_step(tc, layout, stage, drain)
-    phase = read_step if phase is None else phase
-    # Memoized on the resolved input surface rather than the configuration objects.
-    # This is the most expensive constexpr in the kernel -- it walks pipeline_depth
-    # steps of commit groups -- and the emitter asks for it once per slot per step,
-    # which repeats across the unrolled body.
-    key = (
-        schedule_spec(tc, layout),
-        stage,
-        slot,
-        bool(drain),
-        _v(epilogue_groups),
-        phase,
-    )
-    if key in _schedule_cache.WAIT:
-        return _schedule_cache.WAIT[key]
-    required = _required_producers(tc, layout, read_step, slot, phase)
-    if not required:
-        count = None
+            whole += ops
+            groups = (whole,) if slot == len(issued) - 1 else ()
+        commits.append(groups)
+    if kind == _PROLOGUE:
+        demand = ()
     else:
-        committed = _committed_before(
-            tc, layout, stage, read_step, slot, drain, epilogue_groups, phase
+        selects = tuple(p and phase % r == 0 for p, r in zip(present, ratio_k))
+        demand = tuple(
+            tuple(
+                (ci, t)
+                for ci, t in enumerate(selected)
+                if t is not None and m["via_lds"][ci] and selects[ci]
+            )
+            for selected in m["selected"]
         )
-        count = _wait_count(committed, required)
-    if len(_schedule_cache.WAIT) < _schedule_cache.LIMIT:
-        # Subscript assignment only. Any callable reachable from a traced body is
-        # rejected by Triton's dependency finder -- including `WAIT.clear` -- so the
-        # table stops growing at the bound instead of evicting, and `clear()` is for
-        # callers outside tracing.
-        _schedule_cache.WAIT[key] = count
-    return count
+    return active, loads, issued, tuple(commits), demand
 
 
 @gluon.constexpr_function
-def _stage_wait(tc, layout, stage, drain=False, epilogue_groups=0, phase=None):
-    """Wait count for the stage head, or ``None`` when this scheme waits per slot.
-
-    Returning ``None`` for the inapplicable scheme keeps the emitter to one evaluation
-    per site: the caller binds this once and tests it, instead of calling ``_wait``
-    again inside the guard it just passed. ``_wait`` is the single most expensive
-    constexpr in the kernel, so the duplicate mattered.
-    """
-    if not tc.commit_per_stage():
+def _immediate(position, count, step, need, fill_span):
+    """Groups that may stay outstanding once every copy in ``need`` has landed."""
+    if not need:
         return None
-    return _wait(tc, layout, stage, None, drain, epilogue_groups, phase)
+    latest = -1
+    for ci, t in need:
+        copy = (step - fill_span[ci] + 1, ci, t)
+        assert (
+            copy in position
+        ), f"copy {copy} is selected at step {step} but was never committed before it"
+        latest = max(latest, position[copy])
+    return count - latest - 1
 
 
 @gluon.constexpr_function
-def _slot_waits(tc, layout, stage, drain=False, epilogue_groups=0, phase=None):
-    """Per-slot wait counts for one step, indexed by ``_slot_index``.
+def _smaller(a, b):
+    """The tighter of two wait immediates, ``None`` meaning no wait."""
+    return b if a is None else a if b is None else min(a, b)
 
-    A whole vector rather than one query per slot: Gluon refuses a ``gl.constexpr``
-    bound inside a ``static_range`` body ("constexpr cannot be reassigned"), so the
-    emitter cannot hold a per-slot count in a local. Returning the vector lets it bind
-    once at step scope and index, which evaluates ``_wait`` exactly once per slot
-    instead of twice.
+
+@gluon.constexpr_function
+def _replay(orders, fill_span, per_tile, slots):
+    """Wait immediates along execution orders, as ``{key: (tile, slot waits)}``.
+
+    Each order holds one ``(key, step, commits, demand)`` per executed step, in
+    order: ``key`` names the emitted step (``None`` for the epilogue's groups),
+    ``step`` is the absolute K step it executes as, ``commits``/``demand`` its plan.
+    One emitted step can execute many times -- the loop body does, and a remainder
+    step appears in more than one order -- and its single immediate has to hold for
+    every execution, so each key keeps its smallest.
+
+    A copy is ``(step, component, non-K slot)``: the same copy repeats every ring
+    period, so the component and slot alone would match another step's value. A
+    selection at step ``s`` reads the copy issued at ``s - F(c) + 1``.
+
+    ``wait_group(n)`` blocks until at most ``n`` groups are outstanding. With ``j`` the
+    newest group holding a required copy, ``count - j - 1`` retires through ``j`` and
+    no further: one more leaves ``j`` in flight, one fewer drains newer copies for
+    nothing. It holds against the outstanding set as well, which is always a suffix
+    of the order because groups retire oldest-first; if an earlier wait already
+    retired ``j``, the instruction is a no-op.
+
+    A per-tile scheme waits once at the head of the step, for every slot's reads. The
+    others wait before each slot, after the slots before it have committed.
     """
-    slots = layout.num_m_slots() * layout.num_n_slots()
-    if tc.commit_per_stage():
-        # Full length, all ``None``: the emitter then has one uniform test per slot
-        # rather than a separate "is this scheme per-slot at all" guard.
-        return (None,) * slots
-    return tuple(
-        _wait(tc, layout, stage, slot, drain, epilogue_groups, phase)
-        for slot in range(slots)
-    )
+    out = {}
+    for order in orders:
+        position, count = {}, 0
+        for key, step, commits, demand in order:
+            measure = key is not None and bool(demand)
+            if measure:
+                tile, slot_waits = out.get(key, (None, (None,) * slots))
+                slot_waits = list(slot_waits)
+                if per_tile:
+                    need = tuple(copy for copies in demand for copy in copies)
+                    now = _immediate(position, count, step, need, fill_span)
+                    tile = _smaller(tile, now)
+            for slot, groups in enumerate(commits):
+                if measure and not per_tile:
+                    now = _immediate(position, count, step, demand[slot], fill_span)
+                    slot_waits[slot] = _smaller(slot_waits[slot], now)
+                for group in groups:
+                    for ci, t in group:
+                        copy = (step, ci, t)
+                        assert copy not in position, f"copy {copy} committed twice"
+                        position[copy] = count
+                    count += 1
+            if measure:
+                out[key] = (tile, tuple(slot_waits))
+    return out
+
+
+@aggregate
+@strip_annotate
+class Schedule:
+    """The expanded K loop of one build: its steps, copies, commits and waits.
+
+    Built once as ``Schedule(tuning_cfg, layout, K)``, on the host and in jit code
+    alike. Per-component values are ``COMPONENTS``-aligned tuples, read through
+    accessors that take a component ``(operand, is_scale)``.
+
+    Every emitted step has an index, ``step``. The steps, in program order:
+
+    * ``prologue_step(r)``, ``r`` in ``[1 - depth, 0)``: fills only.
+    * ``warmup_step()``: K step 0, selects without an MFMA.
+    * ``peeled_step(x)``, ``x`` in ``[0, peeled)``: K step ``x + 1``.
+    * ``loop_step(u)``, ``u`` in ``[0, unroll)``: the runtime loop body.
+    * ``remainder_step(u)``: the steps a whole number of loop bodies leaves over --
+      ``unroll - 1`` guarded static steps, or with ``static_remainder()`` false one
+      step in a runtime loop.
+    * ``drain_step(p, j)``, ``j`` in ``[0, depth - 1)``: one copy of the drain per
+      ring phase ``p`` with ``static_drain()``, else one (``p == 0``).
+
+    A config that cannot be scheduled -- a fill ownership that is not a mapping, or a
+    K too short for the loop -- still gets its sizing, but no steps. ``_validate``
+    rejects it.
+    """
+
+    # -- per component -----------------------------------------------------------------
+    _present: gl.constexpr
+    _via_lds: gl.constexpr
+    _ring_depth: gl.constexpr
+    _ratio_k: gl.constexpr
+    _fill_span: gl.constexpr
+    _fill_slots: gl.constexpr
+    _read_slots: gl.constexpr
+    _read_in_mfma: gl.constexpr
+    # -- per slot ----------------------------------------------------------------------
+    _owned: gl.constexpr
+    _selected: gl.constexpr
+    # -- sizing ------------------------------------------------------------------------
+    _num_k: gl.constexpr
+    _depth: gl.constexpr
+    _unroll: gl.constexpr
+    _peeled: gl.constexpr
+    _ring_period: gl.constexpr
+    _register_period: gl.constexpr
+    _async_period: gl.constexpr
+    _fill_slots_valid: gl.constexpr
+    # -- policy ------------------------------------------------------------------------
+    _commit: gl.constexpr
+    _soff_unroll: gl.constexpr
+    _static_remainder: gl.constexpr
+    _static_drain: gl.constexpr
+    _epilogue_groups: gl.constexpr
+    # -- per step ----------------------------------------------------------------------
+    _steps: gl.constexpr
+    _active: gl.constexpr
+    _loads: gl.constexpr
+    _issued: gl.constexpr
+    _commits: gl.constexpr
+    _waits: gl.constexpr
+
+    @gluon.constexpr_function
+    def __init__(self, tuning_cfg, layout, K, epilogue_groups=None):
+        """Evaluate the schedule of one build.
+
+        ``epilogue_groups`` is the number of commit groups the epilogue issues between
+        the last main step and the drain. It is derived from the build -- one group
+        when the epilogue stages bias or gammas through LDS -- and the argument only
+        exists for tests of the drain accounting.
+        """
+        tc = tuning_cfg
+        fc = tc.func_cfg
+        nm, nn = _v(layout.num_m_slots()), _v(layout.num_n_slots())
+        slots = nm * nn
+        num_k = _v(layout.num_k_tiles(K))
+
+        # -- per component -------------------------------------------------------------
+        present = tuple(
+            not is_scale or bool(_v(fc.has_scale(op))) for op, is_scale in COMPONENTS
+        )
+        via_lds = tuple(bool(_v(layout.component_via_lds(c))) for c in COMPONENTS)
+        ring_depth = tuple(
+            _v(tc.num_buffers(op, is_scale)) for op, is_scale in COMPONENTS
+        )
+        ratio_k = tuple(
+            _v(layout.scale_ratio_k_step(op)) if is_scale else 1
+            for op, is_scale in COMPONENTS
+        )
+        ratio_non_k = tuple(
+            _v(layout.scale_ratio_non_k_slot(op)) if is_scale else 1
+            for op, is_scale in COMPONENTS
+        )
+        live_span = tuple((d - 1) * r + 1 for d, r in zip(ring_depth, ratio_k))
+        fill_span = tuple(s if lds else s - 1 for s, lds in zip(live_span, via_lds))
+
+        # -- sizing --------------------------------------------------------------------
+        # Pipeline depth: the largest live span. The ring restoration period is when
+        # every ring is back at slot zero -- a ring repeats every D * R steps, not
+        # every live span. Only register rings need a static index, so their own
+        # period decides whether a body can be unrolled; LDS rings take runtime
+        # indices. The async period is when the issued copy pattern repeats, which
+        # depends only on the scale K phase.
+        depth, ring_period, register_period, async_period = 0, 1, 1, 1
+        for ci in range(len(COMPONENTS)):
+            if present[ci]:
+                depth = max(depth, live_span[ci])
+                ring_period = math.lcm(ring_period, ring_depth[ci] * ratio_k[ci])
+                if via_lds[ci]:
+                    async_period = math.lcm(async_period, ratio_k[ci])
+                else:
+                    register_period = math.lcm(
+                        register_period, ring_depth[ci] * ratio_k[ci]
+                    )
+        k_unroll = _v(tc.K_UNROLL)
+        assert k_unroll >= 1, "K_UNROLL must be at least 1"
+        # Widened to a whole number of every ring period, so every complete body
+        # sits at a fixed ring phase and register tuples get static indices.
+        unroll = math.lcm(k_unroll, ring_period)
+
+        # -- copy ownership and selection ----------------------------------------------
+        # SCALE_FILL_MID is consumed here and nowhere else, and only on the 2x2 split:
+        # on any other geometry it is inert.
+        a_slots, b_slots = _payload_fill_slots(nm, nn)
+        fill_mid = bool(_v(tc.SCALE_FILL_MID)) and nm == 2 and nn == 2
+        fill_slots = tuple(
+            (1, 2) if is_scale and fill_mid else (a_slots if op == A else b_slots)
+            for op, is_scale in COMPONENTS
+        )
+        # Every mapped slot exists and no component copies two non-K slots in one
+        # slot: a slot carries one optional copy per component. Different components
+        # sharing a slot is fine and expected.
+        fill_slots_valid = all(
+            len(mapping) == (nm if op == A else nn)
+            and all(0 <= slot < slots for slot in mapping)
+            and len(set(mapping)) == len(mapping)
+            for (op, _), mapping in zip(COMPONENTS, fill_slots)
+        )
+        owned = tuple(
+            tuple(
+                (
+                    _first_non_k_slot(fill_slots[ci], slot, ratio_non_k[ci])
+                    if present[ci]
+                    else None
+                )
+                for ci in range(len(COMPONENTS))
+            )
+            for slot in range(slots)
+        )
+        # A component is selected where its operand's payload is copied, except that
+        # a register producer with F = 1 is selected in the step it is issued, so its
+        # selection cannot precede its copy.
+        read_slots, read_in_mfma = [], []
+        for ci, (op, is_scale) in enumerate(COMPONENTS):
+            payload_slots = a_slots if op == A else b_slots
+            reads, in_mfma = [], []
+            for t in range(len(payload_slots)):
+                read = payload_slots[t]
+                same_step = not via_lds[ci] and fill_span[ci] == 1
+                if same_step and fill_slots_valid and fill_slots[ci][t] > read:
+                    read = fill_slots[ci][t]
+                reads.append(read)
+                # A same-step register selection in its own fill slot has to read in
+                # the MFMA region, after the fill.
+                configured = bool(_v(tc.ds_read_in_mfma(op, is_scale)))
+                in_mfma.append(
+                    configured
+                    or (same_step and fill_slots_valid and read == fill_slots[ci][t])
+                )
+            read_slots.append(tuple(reads))
+            read_in_mfma.append(tuple(in_mfma))
+        selected = tuple(
+            tuple(
+                (
+                    _first_non_k_slot(read_slots[ci], slot, ratio_non_k[ci])
+                    if present[ci]
+                    else None
+                )
+                for ci in range(len(COMPONENTS))
+            )
+            for slot in range(slots)
+        )
+
+        # -- policy --------------------------------------------------------------------
+        commit = (
+            bool(_v(tc.commit_per_op())),
+            bool(_v(tc.commit_per_slot())),
+            bool(_v(tc.commit_per_stage())),
+            bool(_v(tc.commit_per_stage_whole())),
+        )
+        static_remainder = bool(_v(tc.UNROLL_EPILOGUE))
+        # Keep short LDS rings in immediate offsets; register queues and quantized
+        # epilogues need the smaller runtime-indexed drain to avoid allocation
+        # pressure.
+        static_drain = (
+            ring_period <= 3
+            and unroll % ring_period == 0
+            and register_period == 1
+            and _v(fc.output_quant) is None
+        )
+        if epilogue_groups is None:
+            epilogue_groups = int(
+                bool(_v(layout.epilogue_inputs_via_lds()))
+                and bool(_v(fc.has_gammas) or _v(fc.has_bias))
+            )
+        model = {
+            "present": present,
+            "via_lds": via_lds,
+            "ratio_k": ratio_k,
+            "fill_span": fill_span,
+            "depth": depth,
+            "owned": owned,
+            "selected": selected,
+            "commit": commit,
+        }
+
+        # -- peeling -------------------------------------------------------------------
+        # The loop body has one wait immediate per slot for all its executions, so it
+        # takes the smallest. Before the read at step depth - 1, some selections read
+        # copies issued while shallower components had not started filling, which
+        # can need a smaller immediate than the loop does. Peel those steps instead
+        # of letting them tighten every loop iteration. The first main step is always
+        # peeled to retain its visible zero accumulator.
+        peeled = 1
+        if fill_slots_valid:
+            settled = 3 * depth + async_period
+            warm = [
+                (None, r) + _step_plan(model, _PROLOGUE, r, r)[3:]
+                for r in range(1 - depth, 0)
+            ]
+            warm += [
+                (s, s) + _step_plan(model, _PEELED if s else _WARMUP, s, s)[3:]
+                for s in range(settled + 1)
+            ]
+            waits = _replay([warm], fill_span, commit[2], slots)
+            for s in range(1, depth - 1):
+                steady = s + async_period * -(-(2 * depth - s) // async_period)
+                if waits.get(s) != waits.get(steady):
+                    peeled = s
+
+        self._present = gl.constexpr(present)
+        self._via_lds = gl.constexpr(via_lds)
+        self._ring_depth = gl.constexpr(ring_depth)
+        self._ratio_k = gl.constexpr(ratio_k)
+        self._fill_span = gl.constexpr(fill_span)
+        self._fill_slots = gl.constexpr(fill_slots)
+        self._read_slots = gl.constexpr(tuple(read_slots))
+        self._read_in_mfma = gl.constexpr(tuple(read_in_mfma))
+        self._owned = gl.constexpr(owned)
+        self._selected = gl.constexpr(selected)
+        self._num_k = gl.constexpr(num_k)
+        self._depth = gl.constexpr(depth)
+        self._unroll = gl.constexpr(unroll)
+        self._peeled = gl.constexpr(peeled)
+        self._ring_period = gl.constexpr(ring_period)
+        self._register_period = gl.constexpr(register_period)
+        self._async_period = gl.constexpr(async_period)
+        self._fill_slots_valid = gl.constexpr(fill_slots_valid)
+        self._commit = gl.constexpr(commit)
+        self._soff_unroll = gl.constexpr(bool(_v(tc.SOFF_UNROLL)))
+        self._static_remainder = gl.constexpr(static_remainder)
+        self._static_drain = gl.constexpr(static_drain)
+        self._epilogue_groups = gl.constexpr(epilogue_groups)
+
+        main = num_k - depth
+        if not fill_slots_valid or main < peeled + unroll:
+            self._steps = gl.constexpr(None)
+            self._active = gl.constexpr(None)
+            self._loads = gl.constexpr(None)
+            self._issued = gl.constexpr(None)
+            self._commits = gl.constexpr(None)
+            self._waits = gl.constexpr(None)
+            return
+
+        # -- the emitted steps ---------------------------------------------------------
+        # (kind, stage, phase, ki, in_loop, static_phase, dot). `ki` is the position in
+        # an unrolled body, `static_phase` that a finite region still has a static
+        # ring phase.
+        drain_phases = ring_period if static_drain else 1
+        steps = [(_PROLOGUE, r, r, 0, False, False, False) for r in range(1 - depth, 0)]
+        steps.append((_WARMUP, 0, 0, 0, False, False, False))
+        steps += [(_PEELED, x + 1, x + 1, 0, False, False, True) for x in range(peeled)]
+        steps += [
+            (_LOOP, None, peeled + u + 1, u, True, False, True) for u in range(unroll)
+        ]
+        if static_remainder:
+            steps += [
+                (_REMAINDER, None, peeled + u + 1, u, False, True, True)
+                for u in range(unroll - 1)
+            ]
+        else:
+            # Its phase is never read: _validate requires every scale to advance once
+            # per step without a static remainder.
+            steps.append((_REMAINDER, None, 0, 0, False, False, True))
+        steps += [
+            (
+                _DRAIN,
+                j,
+                num_k - depth + j + 1,
+                p + j - peeled if static_drain else 0,
+                False,
+                static_drain,
+                True,
+            )
+            for p in range(drain_phases)
+            for j in range(depth - 1)
+        ]
+        plans = [_step_plan(model, s[0], s[1], s[2]) for s in steps]
+
+        # -- the wait plan -------------------------------------------------------------
+        # Replay this K's execution order. A static remainder step past this K's
+        # remainder never executes, but is still emitted behind a runtime guard, so a
+        # second order runs the longest remainder after the same loop. A drain copy
+        # for another ring phase never executes either; it repeats the executed copy.
+        warmup = depth - 1
+        loop = warmup + 1 + peeled
+        remainder = loop + unroll
+        drain = len(steps) - drain_phases * (depth - 1)
+        remaining = main - peeled
+        iters, rem = remaining // unroll, remaining % unroll
+
+        def entry(index, step):
+            return (index, step, plans[index][3], plans[index][4])
+
+        head = [entry(i, steps[i][1]) for i in range(warmup + 1 + peeled)]
+        head += [
+            entry(loop + u, peeled + it * unroll + u + 1)
+            for it in range(iters)
+            for u in range(unroll)
+        ]
+        base = peeled + iters * unroll
+
+        def tail(count):
+            return [
+                entry(remainder + (u if static_remainder else 0), base + u + 1)
+                for u in range(count)
+            ]
+
+        phase = main % ring_period if static_drain else 0
+        executed = head + tail(rem)
+        executed.append((None, None, (((),) * epilogue_groups,), ()))
+        executed += [
+            entry(drain + phase * (depth - 1) + j, main + j + 1)
+            for j in range(depth - 1)
+        ]
+        orders = [executed]
+        longest = unroll - 1 if static_remainder else 1
+        if rem < longest:
+            orders.append(head + tail(longest))
+        waits = _replay(orders, fill_span, commit[2], slots)
+        for p in range(drain_phases):
+            for j in range(depth - 1):
+                executed_copy = drain + phase * (depth - 1) + j
+                if executed_copy in waits:
+                    waits[drain + p * (depth - 1) + j] = waits[executed_copy]
+        idle = (None, (None,) * slots)
+
+        self._steps = gl.constexpr(tuple(steps))
+        self._active = gl.constexpr(tuple(plan[0] for plan in plans))
+        self._loads = gl.constexpr(tuple(plan[1] for plan in plans))
+        self._issued = gl.constexpr(tuple(plan[2] for plan in plans))
+        self._commits = gl.constexpr(tuple(plan[3] for plan in plans))
+        self._waits = gl.constexpr(
+            tuple(waits.get(index, idle) for index in range(len(steps)))
+        )
+
+    # -- sizing ------------------------------------------------------------------------
+
+    @gluon.constexpr_function
+    def num_k(self):
+        """K tiles in the strip: K // BLOCK_K."""
+        return _v(self._num_k)
+
+    @gluon.constexpr_function
+    def depth(self):
+        """Pipeline depth: the largest live span of a present component, in steps."""
+        return _v(self._depth)
+
+    @gluon.constexpr_function
+    def unroll(self):
+        """Steps per loop body: K_UNROLL widened to a whole ring restoration period."""
+        return _v(self._unroll)
+
+    @gluon.constexpr_function
+    def peeled(self):
+        """Main steps emitted straight-line between the warm-up step and the loop."""
+        return _v(self._peeled)
+
+    @gluon.constexpr_function
+    def ring_period(self):
+        """Steps after which every present ring is back at slot zero."""
+        return _v(self._ring_period)
+
+    @gluon.constexpr_function
+    def register_period(self):
+        """:meth:`ring_period` over direct-register rings only; 1 when none rotates."""
+        return _v(self._register_period)
+
+    @gluon.constexpr_function
+    def async_period(self):
+        """Steps after which the issued async-copy pattern repeats."""
+        return _v(self._async_period)
+
+    @gluon.constexpr_function
+    def fill_slots_valid(self):
+        """Whether copy ownership maps each component's non-K slots onto slots."""
+        return _v(self._fill_slots_valid)
+
+    @gluon.constexpr_function
+    def scheduled(self):
+        """Whether the steps exist: false for a config ``_validate`` rejects."""
+        return _v(self._steps) is not None
+
+    # -- the emitted steps -------------------------------------------------------------
+
+    @gluon.constexpr_function
+    def static_remainder(self):
+        """Whether the remainder is ``unroll - 1`` guarded static steps, not a loop."""
+        return _v(self._static_remainder)
+
+    @gluon.constexpr_function
+    def static_drain(self):
+        """Whether the drain is emitted once per ring phase, with static indices."""
+        return _v(self._static_drain)
+
+    @gluon.constexpr_function
+    def num_steps(self):
+        return len(_v(self._steps))
+
+    @gluon.constexpr_function
+    def prologue_step(self, r):
+        """The fill-only step ``r``, for ``r`` in ``[1 - depth, 0)``."""
+        r = _v(r)
+        assert 1 - self.depth() <= r < 0, f"no prologue step {r}"
+        return r + self.depth() - 1
+
+    @gluon.constexpr_function
+    def warmup_step(self):
+        return self.depth() - 1
+
+    @gluon.constexpr_function
+    def peeled_step(self, x):
+        """The peeled step for K step ``x + 1``."""
+        x = _v(x)
+        assert 0 <= x < self.peeled(), f"no peeled step {x}"
+        return self.depth() + x
+
+    @gluon.constexpr_function
+    def loop_step(self, u):
+        """Position ``u`` of the loop body."""
+        u = _v(u)
+        assert 0 <= u < self.unroll(), f"no loop step {u}"
+        return self.depth() + self.peeled() + u
+
+    @gluon.constexpr_function
+    def remainder_step(self, u):
+        """Remainder position ``u``; the runtime remainder loop has one step."""
+        u = _v(u)
+        count = self.unroll() - 1 if self.static_remainder() else 1
+        assert 0 <= u < count, f"no remainder step {u}"
+        return self.depth() + self.peeled() + self.unroll() + u
+
+    @gluon.constexpr_function
+    def drain_step(self, p, j):
+        """Drain iteration ``j`` of the copy for ring phase ``p``."""
+        p, j = _v(p), _v(j)
+        phases = self.ring_period() if self.static_drain() else 1
+        assert 0 <= p < phases and 0 <= j < self.depth() - 1, f"no drain step {p, j}"
+        return self.num_steps() - (phases - p) * (self.depth() - 1) + j
+
+    @gluon.constexpr_function
+    def phase(self, step):
+        """The step's K phase: its K tile modulo every period the emitter reads."""
+        return _v(self._steps)[_v(step)][2]
+
+    @gluon.constexpr_function
+    def ki(self, step):
+        """Position in an unrolled body, which fixes static ring indices."""
+        return _v(self._steps)[_v(step)][3]
+
+    @gluon.constexpr_function
+    def in_loop(self, step):
+        return _v(self._steps)[_v(step)][4]
+
+    @gluon.constexpr_function
+    def static_phase(self, step):
+        """Whether a step outside the loop still has a static LDS ring phase."""
+        return _v(self._steps)[_v(step)][5]
+
+    @gluon.constexpr_function
+    def dot(self, step):
+        """Whether the step issues the previous K tile's MFMAs."""
+        return _v(self._steps)[_v(step)][6]
+
+    @gluon.constexpr_function
+    def is_drain(self, step):
+        return _v(self._steps)[_v(step)][0] == _DRAIN
+
+    # -- per step and slot -------------------------------------------------------------
+
+    @gluon.constexpr_function
+    def active(self, step, component):
+        """Whether the component fills in this step at all."""
+        return _v(self._active)[_v(step)][_ci(component)]
+
+    @gluon.constexpr_function
+    def loads(self, step, component):
+        """Whether the component issues its producer copy in this step."""
+        return _v(self._loads)[_v(step)][_ci(component)]
+
+    @gluon.constexpr_function
+    def issued(self, step, slot):
+        """Non-K slot each component copies in this slot, ``COMPONENTS``-aligned.
+
+        ``None`` where it copies nothing. Register copies are included.
+        """
+        return _v(self._issued)[_v(step)][_v(slot)]
+
+    @gluon.constexpr_function
+    def selects(self, step, component):
+        """Whether the step selects a new value of the component."""
+        return self.selects_at_phase(component, self.phase(step))
+
+    @gluon.constexpr_function
+    def selects_at_phase(self, component, phase):
+        ci = _ci(component)
+        return _v(self._present)[ci] and _v(phase) % _v(self._ratio_k)[ci] == 0
+
+    @gluon.constexpr_function
+    def commits(self, step, slot):
+        """Commit groups the slot closes in this step, of ``(component, non-K slot)``.
+
+        This is the commit plan the waits are computed from; the emitter issues the
+        same groups through :meth:`commit_per_copy` and its neighbours.
+        """
+        return tuple(
+            tuple((COMPONENTS[ci], t) for ci, t in group)
+            for group in _v(self._commits)[_v(step)][_v(slot)]
+        )
+
+    @gluon.constexpr_function
+    def wait(self, step, slot=None):
+        """Immediate of the async wait before a read, or ``None`` for no wait.
+
+        ``slot=None`` is the tile wait at the head of the step, which per-tile commit
+        schemes use; the others wait before each slot.
+        """
+        tile, slot_waits = _v(self._waits)[_v(step)]
+        return tile if _v(slot) is None else slot_waits[_v(slot)]
+
+    # -- commits -----------------------------------------------------------------------
+
+    @gluon.constexpr_function
+    def commit_per_copy(self):
+        """Commit after every LDS copy."""
+        return _v(self._commit)[0]
+
+    @gluon.constexpr_function
+    def commit_per_slot(self):
+        """Commit at the end of every slot's fill, even an empty one."""
+        return _v(self._commit)[1]
+
+    @gluon.constexpr_function
+    def commit_per_tile(self):
+        """Commit once per step, after the last slot's fill, even an empty one."""
+        return _v(self._commit)[2]
+
+    @gluon.constexpr_function
+    def tile_commit_after_mfma(self):
+        """Whether a step's tile commit follows the last slot's MFMAs.
+
+        Otherwise it closes the last slot's memory region, inside the warp-pipeline
+        stage. Prologue steps have no MFMA and commit after their last fill either way.
+        """
+        return _v(self._commit)[3]
+
+    @gluon.constexpr_function
+    def epilogue_groups(self):
+        """Commit groups the epilogue issues between the main steps and the drain."""
+        return _v(self._epilogue_groups)
+
+    @gluon.constexpr_function
+    def epilogue_wait(self):
+        """Immediate of the wait that retires the epilogue's copies, or ``None``.
+
+        It also retires every copy the drain issued after them.
+        """
+        return 0 if self.epilogue_groups() > 0 else None
+
+    # -- per component -----------------------------------------------------------------
+
+    @gluon.constexpr_function
+    def present(self, component):
+        """Whether the component exists: a scale only for a scaled operand."""
+        return _v(self._present)[_ci(component)]
+
+    @gluon.constexpr_function
+    def via_lds(self, component):
+        return _v(self._via_lds)[_ci(component)]
+
+    @gluon.constexpr_function
+    def in_reg(self, component):
+        return not self.via_lds(component)
+
+    @gluon.constexpr_function
+    def has_register_component(self):
+        """Whether any present component uses a direct-register ring."""
+        return any(
+            p and not lds for p, lds in zip(_v(self._present), _v(self._via_lds))
+        )
+
+    @gluon.constexpr_function
+    def ring_depth(self, component):
+        """Buffers in the component's ring."""
+        return _v(self._ring_depth)[_ci(component)]
+
+    @gluon.constexpr_function
+    def ratio_k(self, component):
+        """Steps one value spans: the scale K-step ratio, 1 for a payload."""
+        return _v(self._ratio_k)[_ci(component)]
+
+    @gluon.constexpr_function
+    def live_span(self, component):
+        """Inclusive lifetime ``L = (D - 1) * R + 1`` in steps."""
+        return (self.ring_depth(component) - 1) * self.ratio_k(component) + 1
+
+    @gluon.constexpr_function
+    def fill_span(self, component):
+        """Inclusive producer-to-selection span ``F``: ``L``, ``L - 1`` in registers."""
+        return _v(self._fill_span)[_ci(component)]
+
+    @gluon.constexpr_function
+    def producer_phase(self, component):
+        """K-step residue on which the component issues its producer copy."""
+        ratio = self.ratio_k(component)
+        return (1 - self.fill_span(component)) % ratio
+
+    @gluon.constexpr_function
+    def fill_slot(self, component, non_k_slot):
+        """Slot that copies one non-K slot of the component."""
+        return _v(self._fill_slots)[_ci(component)][_v(non_k_slot)]
+
+    @gluon.constexpr_function
+    def read_slot(self, component, non_k_slot):
+        """Slot that selects one non-K slot of the component."""
+        return _v(self._read_slots)[_ci(component)][_v(non_k_slot)]
+
+    @gluon.constexpr_function
+    def read_in_mfma(self, component, non_k_slot):
+        """Whether the selection reads in the MFMA region rather than the memory one."""
+        return _v(self._read_in_mfma)[_ci(component)][_v(non_k_slot)]
+
+    @gluon.constexpr_function
+    def owned(self, slot):
+        """Non-K slot each component copies in this slot when it loads, or ``None``."""
+        return _v(self._owned)[_v(slot)]
+
+    @gluon.constexpr_function
+    def selected(self, slot, component):
+        """Non-K slot of the component selected in this slot, or ``None``."""
+        return _v(self._selected)[_v(slot)][_ci(component)]
+
+    # -- ring indices ------------------------------------------------------------------
+
+    @gluon.constexpr_function
+    def register_index(self, step, component, fill=False):
+        """Static register-ring index of the step's selection, or with ``fill`` copy.
+
+        In the loop it is measured from the loop's first step, so the same body
+        position always names the same register; a finite region rotates its tuples
+        after each step, so there logical index zero is the value selected at its
+        own phase.
+        """
+        if not self.present(component):
+            return 0
+        ratio = self.ratio_k(component)
+        if self.in_loop(step):
+            origin = self.peeled() + 1
+            current = origin + self.ki(step)
+        else:
+            origin = self.phase(step)
+            current = origin
+        target = current + (self.fill_span(component) - 1 if _v(fill) else 0)
+        return (target // ratio - origin // ratio) % self.ring_depth(component)
+
+    @gluon.constexpr_function
+    def static_lds_index(self, step, component, fill):
+        """LDS ring index the step reads (or with ``fill`` writes), if static.
+
+        ``None`` when it depends on the runtime step: outside the loop and the static
+        finite regions, or when the body does not cover a whole ring period.
+        """
+        if not self.present(component):
+            return 0
+        depth, ratio = self.ring_depth(component), self.ratio_k(component)
+        if not (self.in_loop(step) or self.static_phase(step)):
+            return None
+        if self.unroll() % (depth * ratio) != 0:
+            return None
+        advance = self.fill_span(component) - 1 if _v(fill) else 0
+        return ((self.peeled() + self.ki(step) + 1 + advance) // ratio) % depth
+
+    @gluon.constexpr_function
+    def soff_unroll(self, step):
+        """Whether the step's copies offset one base pointer through ``soffset``."""
+        return self.in_loop(step) and _v(self._soff_unroll)
+
+    @gluon.constexpr_function
+    def scale_soff_steps(self, component, offset_step):
+        """Scale K steps from the body's first scale producer to this body position."""
+        ratio = self.ratio_k(component)
+        start = self.peeled() + 1
+        producer_phase = self.producer_phase(component)
+        first_producer = (start - producer_phase + ratio - 1) // ratio
+        producer = (start + _v(offset_step) - producer_phase) // ratio
+        return (producer - first_producer) * ratio
 
 
 @gluon.constexpr_function
-def _scale_soff_steps(tc, layout, component, offset_step):
-    """Advance from the first scale producer in an unrolled body."""
-    ratio = _component_ratio(tc, layout, component)
-    start = _pipeline_peeled(tc, layout) + 1
-    producer_phase = _producer_phase(tc, layout, component)
-    first_producer = (start - producer_phase + ratio - 1) // ratio
-    producer = (start + offset_step - producer_phase) // ratio
-    return (producer - first_producer) * ratio
+def _ci(component):
+    """Index of ``(operand, is_scale)`` in ``COMPONENTS``.
 
-
-@gluon.constexpr_function
-def _register_index(tc, layout, component, phase, ki, in_loop, fill=False):
-    """Static register-bank index derived from producer-to-selection timing."""
-    if not _present(tc, layout, component):
-        return 0
-    ratio = _component_ratio(tc, layout, component)
-    if in_loop:
-        origin = _pipeline_peeled(tc, layout) + 1
-        current = origin + ki
-    else:
-        # Finite regions rotate their tuples after each step, so logical bank zero
-        # always denotes the value selected at ``phase``.
-        origin = phase
-        current = phase
-    target = current + (_fill_span(tc, layout, component) - 1 if fill else 0)
-    return (target // ratio - origin // ratio) % _component_depth(tc, layout, component)
+    A loop rather than ``COMPONENTS.index``: Triton's dependency finder rejects a
+    method of a global reachable from a traced body.
+    """
+    component = _v(component)
+    key = (_v(component[0]), bool(_v(component[1])))
+    for ci, candidate in enumerate(COMPONENTS):
+        if candidate == key:
+            return ci
+    raise AssertionError(f"{key} is not a component")

@@ -9,10 +9,7 @@ import pytest
 
 from aiter.ops.triton._gluon_kernels.gfx950.moe._frozen import _validate_frozen
 from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import KernelLayout
-from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
-    _live_span,
-    pipeline_unroll,
-)
+from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import Schedule
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import DtypeQuant
 from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import validate
 from aiter.ops.triton.moe import moe_op_gemm_gluon as host
@@ -173,10 +170,11 @@ def test_scale_k_step_ratio_sets_buffer_span_and_unroll(
         ALLOW_B_SCALE_VIA_LDS=not register_scales,
     )
     layout = KernelLayout(tc)
+    schedule = Schedule(tc, layout, block_k)
     ratio = scale_k // block_k
     for operand, depth in enumerate((2, 3)):
-        assert _live_span(tc, layout, (operand, True)) == (depth - 1) * ratio + 1
+        assert schedule.live_span((operand, True)) == (depth - 1) * ratio + 1
         assert layout.scale_ratio_k_step(operand) == ratio
         assert layout.scale_read_k_slots(operand) == ratio
     period = math.lcm(3, 2 * ratio, 3 * ratio)
-    assert pipeline_unroll(tc, layout) == period
+    assert schedule.unroll() == period

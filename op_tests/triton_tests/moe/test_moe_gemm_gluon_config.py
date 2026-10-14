@@ -24,7 +24,8 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._pipeline import (
     _PipelinePointers,
     _PipelineRegFragments,
 )
-from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
+from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import Schedule
+from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     A_PAYLOAD,
     A_SCALE,
     B_PAYLOAD,
@@ -32,24 +33,9 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
     COMPONENTS,
     SCALE,
     A,
-    B,
-    _pipeline_peeled,
-    pipeline_depth,
-    pipeline_register_period,
-    pipeline_unroll,
-)
-from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
-    _groups as buffered_groups,
-)
-from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
-    _ops as buffered_ops,
-)
-from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
-    _wait as buffered_wait,
-)
-from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     ActivationSpec,
     ActKind,
+    B,
     DSReadOperand,
     DtypeQuant,
     EpilogueMode,
@@ -121,6 +107,16 @@ def _validate(tc, N, K):
     layout = KernelLayout(tc)
     validate(tc, N, K, layout)
     return host._validate_selected_pipeline(tc, layout, K)
+
+
+def _schedule(tc, layout, num_k=1, epilogue_groups=0):
+    """The build's schedule for ``num_k`` K tiles; one tile still gives its sizing."""
+    return Schedule(tc, layout, num_k * _plain(tc.BLOCK_K), epilogue_groups)
+
+
+def _minimum(tc, layout):
+    schedule = _schedule(tc, layout)
+    return schedule.depth() + schedule.peeled() + schedule.unroll()
 
 
 @pytest.mark.parametrize("kernel", [_moe_gluon_gemm1, _moe_gluon_gemm2])
@@ -491,7 +487,10 @@ def test_commit_scheme_counts_real_payload_and_scale_groups(
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     layout = KernelLayout(tc)
     assert _plain(layout.scale_via_lds(0)) and _plain(layout.scale_via_lds(1))
-    assert sum(len(slot) for slot in buffered_groups(tc, layout, None)) == groups
+    schedule = _schedule(tc, layout, 64)
+    loop = schedule.loop_step(0)
+    slots = _plain(layout.num_m_slots()) * _plain(layout.num_n_slots())
+    assert sum(len(schedule.commits(loop, slot)) for slot in range(slots)) == groups
     # commit_per_stage is the predicate the emitter actually branches on; the
     # wait_at_stage_head alias it used to go through had no production caller.
     assert _plain(tc.commit_per_stage()) is stage_head
@@ -713,14 +712,9 @@ def test_register_storage_options_are_independent(config, storage_mask):
     if not storage_mask & 4:
         expected += bm * bk // 32 * 2
     assert _plain(layout.lds_bytes()) == expected
-    assert _plain(pipeline_unroll(tc, layout)) == 6
+    assert _schedule(tc, layout).unroll() == 6
     assert _plain(_validate(tc, 4096, 7168))
-    minimum = (
-        pipeline_depth(tc, layout)
-        + _pipeline_peeled(tc, layout)
-        + pipeline_unroll(tc, layout)
-    )
-    assert _plain(_validate(tc, 4096, bk * _plain(minimum)))
+    assert _plain(_validate(tc, 4096, bk * _minimum(tc, layout)))
     with pytest.raises(AssertionError, match="NUM_K"):
         host._validate_selected_pipeline(tc, layout, bk)
 
@@ -746,28 +740,29 @@ def test_all_component_buffer_counts_determine_lcm_unroll(
     )
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     layout = KernelLayout(tc)
-    assert _plain(pipeline_register_period(tc, layout)) == period
-    assert _plain(pipeline_unroll(tc, layout)) == expected
+    schedule = _schedule(tc, layout)
+    assert schedule.register_period() == period
+    assert schedule.unroll() == expected
     resolved = [count or config["NUM_LDS_BUFFER"] for count in counts]
     assert [
         _plain(tc.num_buffers(operand, scale))
         for scale in (False, True)
         for operand in (0, 1)
     ] == resolved
-    assert _plain(pipeline_depth(tc, layout)) == max(resolved)
+    assert schedule.depth() == max(resolved)
 
 
 def test_lds_depths_constrain_unroll(config):
     config["K_UNROLL"] = 7
     fc = KernelFuncConfig(*_func_spec())
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    assert _plain(pipeline_unroll(tc, KernelLayout(tc))) == 21
+    assert _schedule(tc, KernelLayout(tc)).unroll() == 21
     config.update(A_NUM_BUFFER=2, B_NUM_BUFFER=4, A_SCALE_NUM_BUFFER=2)
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    assert _plain(pipeline_unroll(tc, KernelLayout(tc))) == 84
+    assert _schedule(tc, KernelLayout(tc)).unroll() == 84
     config["ALLOW_A_SCALE_VIA_LDS"] = False
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    assert _plain(pipeline_unroll(tc, KernelLayout(tc))) == 84
+    assert _schedule(tc, KernelLayout(tc)).unroll() == 84
 
 
 def test_small_payload_tiles_use_register_rings(config):
@@ -807,7 +802,7 @@ def test_small_payload_tiles_use_register_rings(config):
     assert not _plain(layout.component_via_lds(B_PAYLOAD))
     assert config["ALLOW_B_VIA_LDS"]
     assert not config["B_PRESHUFFLED"]
-    assert _plain(pipeline_register_period(tc, layout)) == 6
+    assert _schedule(tc, layout).register_period() == 6
     assert _plain(layout.lds_bytes()) == 0
     assert _plain(_validate(tc, 64, 512))
 
@@ -846,13 +841,13 @@ def test_absent_scales_do_not_participate_in_depth_unroll_or_validation(
     # are still gated by the function configuration at every scheduling caller.
     assert _plain(layout.component_in_reg(A_SCALE))
     assert _plain(layout.component_in_reg(B_SCALE))
-    for ni in range(layout.num_n_slots()):
-        for mi in range(layout.num_m_slots()):
-            ops = buffered_ops(tc, layout, mi, ni)
-            assert ops[COMPONENTS.index(A_SCALE)] is None
-            assert ops[COMPONENTS.index(B_SCALE)] is None
-    assert _plain(pipeline_depth(tc, layout)) == 4
-    assert _plain(pipeline_unroll(tc, layout)) == 12
+    schedule = _schedule(tc, layout)
+    for slot in range(layout.num_m_slots() * layout.num_n_slots()):
+        owned = schedule.owned(slot)
+        assert owned[COMPONENTS.index(A_SCALE)] is None
+        assert owned[COMPONENTS.index(B_SCALE)] is None
+    assert schedule.depth() == 4
+    assert schedule.unroll() == 12
     assert _plain(host._validate_selected_pipeline(tc, layout, 7168))
 
 
@@ -892,8 +887,9 @@ def test_shared_depth_exact_minimum_and_all_unroll_remainders(config, depth, unr
     config.update(NUM_LDS_BUFFER=depth, K_UNROLL=unroll)
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     layout = KernelLayout(tc)
-    assert _plain(_pipeline_peeled(tc, layout)) == 1
-    effective_unroll = _plain(pipeline_unroll(tc, layout))
+    schedule = _schedule(tc, layout)
+    assert schedule.peeled() == 1
+    effective_unroll = schedule.unroll()
     assert effective_unroll == math.lcm(depth, unroll)
     minimum = depth + 1 + effective_unroll
     for remainder in range(effective_unroll):
@@ -996,7 +992,7 @@ def test_shuffled_k128_scales_constrain_lcm_unroll(config, independent):
         )
     )
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
-    assert _plain(pipeline_unroll(tc, KernelLayout(tc))) == 6
+    assert _schedule(tc, KernelLayout(tc)).unroll() == 6
     assert _plain(_validate(tc, 4096, 7168))
     assert host._scale_shuffle_supported(config, 0)
     assert host._scale_shuffle_supported(config, 1)
@@ -1107,15 +1103,41 @@ def test_invalid_controls_are_rejected(config, field, value, error):
         validate(tc, 4096, 7168)
 
 
-def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
-    """Compare group waits with a complete chronological copy/read simulation.
+def _executed_step(schedule, num_k, k_step):
+    """Index of the emitted step that executes K step ``k_step`` for this K.
 
-    The oracle records absolute K tiles and group sequence numbers. It does not
-    use the producer-stage arithmetic or truncated timeline used by _wait. It
-    verifies direct-register selection against the independent producer history;
-    the buffered-pipeline oracle separately checks exact ring-bank contents and
-    overwrite safety.
+    Stated from the loop structure alone: the prologue, the warm-up and peeled
+    steps, whole loop bodies, the remainder, then the drain copy for the ring phase
+    the main steps end on.
     """
+    depth, peeled, unroll = schedule.depth(), schedule.peeled(), schedule.unroll()
+    main = num_k - depth
+    if k_step < 0:
+        return schedule.prologue_step(k_step)
+    if k_step == 0:
+        return schedule.warmup_step()
+    if k_step <= peeled:
+        return schedule.peeled_step(k_step - 1)
+    if k_step > main:
+        phase = main % schedule.ring_period() if schedule.static_drain() else 0
+        return schedule.drain_step(phase, k_step - main - 1)
+    loop_end = peeled + (main - peeled) // unroll * unroll
+    if k_step <= loop_end:
+        return schedule.loop_step((k_step - peeled - 1) % unroll)
+    if schedule.static_remainder():
+        return schedule.remainder_step(k_step - loop_end - 1)
+    return schedule.remainder_step(0)
+
+
+def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
+    """Compare the commit and wait plans with a complete chronological simulation.
+
+    The oracle records absolute K tiles and group sequence numbers, and does not use
+    the schedule's replay. It verifies direct-register selection against the
+    independent producer history; the buffered-pipeline oracle separately checks
+    exact ring-bank contents and overwrite safety.
+    """
+    schedule = _schedule(tc, layout, num_k, epilogue_groups)
     nm = _plain(layout.num_m_slots())
     nn = _plain(layout.num_n_slots())
     nslots = nm * nn
@@ -1186,7 +1208,7 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
         assert all(existing[0] != component for existing in read_slots[read_slot])
         read_slots[read_slot].append(copy)
     for slot, expected in enumerate(fill_slots):
-        actual = buffered_ops(tc, layout, slot % nm, slot // nm)
+        actual = schedule.owned(slot)
         assert (
             tuple(
                 (component, tile)
@@ -1197,10 +1219,9 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
         )
 
     committed, group_for_copy, issued, consumed, lds = [], {}, set(), set(), {}
-    depth = _plain(pipeline_depth(tc, layout))
+    depth = schedule.depth()
     main = num_k - depth
-    peeled = _plain(_pipeline_peeled(tc, layout))
-    assert num_k >= depth + peeled + _plain(pipeline_unroll(tc, layout))
+    assert num_k >= depth + schedule.peeled() + schedule.unroll()
     scheme = _plain(tc.WAIT_COMMIT_SCHEME)
     per_stage = scheme in (
         WaitCommitScheme.PER_STAGE_WHOLE,
@@ -1227,22 +1248,9 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
             if required
             else None
         )
-        draining = stage > main
-        relative_stage = stage - main - 1 if draining else stage
-        assert (
-            buffered_wait(
-                tc,
-                layout,
-                relative_stage,
-                slot,
-                draining,
-                epilogue_groups,
-                phase=stage,
-            )
-            == expected
-        )
-        if peeled + 1 <= stage <= main:
-            assert buffered_wait(tc, layout, None, slot, phase=stage) == expected
+        # One immediate serves every execution of an emitted step, so this checks
+        # each loop-body step once per loop iteration.
+        assert schedule.wait(_executed_step(schedule, num_k, stage), slot) == expected
 
     for stage in range(1 - depth, num_k):
         pending_stage = []
@@ -1266,11 +1274,8 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
                 pending_stage.extend(asynchronous)
                 groups = (tuple(pending_stage),) if slot == nslots - 1 else ()
             expected_groups.append(groups)
-        draining = stage > main
-        relative_stage = stage - main - 1 if draining else stage
-        actual_groups = buffered_groups(
-            tc, layout, relative_stage, draining, phase=stage
-        )
+        index = _executed_step(schedule, num_k, stage)
+        actual_groups = tuple(schedule.commits(index, slot) for slot in range(nslots))
         assert actual_groups == tuple(
             tuple(tuple(token[1:] for token in group) for group in groups)
             for groups in expected_groups
@@ -1372,11 +1377,7 @@ def test_independent_buffer_waits_match_copy_history(
         config.update(MINI_BLOCK_N=64, SCALE_FILL_MID=True)
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     layout = KernelLayout(tc)
-    minimum = (
-        pipeline_depth(tc, layout)
-        + _pipeline_peeled(tc, layout)
-        + pipeline_unroll(tc, layout)
-    )
+    minimum = _minimum(tc, layout)
     # Both strips contain warmup, a runtime main body and a complete drain. The
     # second commits output-epilogue copies before shallow queues finish filling.
     _audit_buffer_schedule(tc, layout, minimum)
@@ -1403,10 +1404,6 @@ def test_independent_buffer_schedule_without_scales(config, scheme, register_b, 
     )
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
     layout = KernelLayout(tc)
-    minimum = (
-        pipeline_depth(tc, layout)
-        + _pipeline_peeled(tc, layout)
-        + pipeline_unroll(tc, layout)
-    )
+    minimum = _minimum(tc, layout)
     _audit_buffer_schedule(tc, layout, minimum)
     _audit_buffer_schedule(tc, layout, minimum + 3, epilogue_groups=2)

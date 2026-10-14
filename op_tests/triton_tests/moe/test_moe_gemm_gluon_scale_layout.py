@@ -24,16 +24,12 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._config import (
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import unwrap
 from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import KernelLayout
-from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
+from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import Schedule
+from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     B_PAYLOAD,
     COMPONENTS,
     PAYLOAD,
     SCALE,
-    _pipeline_peeled,
-    pipeline_depth,
-    pipeline_unroll,
-)
-from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     ActivationSpec,
     ActKind,
     DtypeQuant,
@@ -499,7 +495,7 @@ def _run_scalar_pipeline(monkeypatch, tc, layout, stages, fused):
         s_step=4,
         a_scale_stride_k=32,
         b_scale_stride_k=32,
-        num_k=stages,
+        schedule=Schedule(tc.config, layout.config, stages * 128, 0),
     )
 
     def check_assumption(condition, message=""):
@@ -538,7 +534,7 @@ def _run_scalar_pipeline(monkeypatch, tc, layout, stages, fused):
         patch.setattr(kernel, "_maybe_block_dot", sink.dot)
         patch.setattr(kernel, "_take_reg_pairs", kernel._take_reg_pairs.fn)
         ptrs, queues, regs = buffered._run_buffered_pipeline.fn(pc, _Pointers(), stages)
-        final = buffered._drain_buffered_pipeline.fn(pc, ptrs, queues, regs, stages, 0)
+        final = buffered._drain_buffered_pipeline.fn(pc, ptrs, queues, regs, stages)
         if fused:
             acc = kernel._drain_last_fused.fn(pc, final, None, None, fc, tc, layout)
         else:
@@ -577,13 +573,10 @@ def test_pipeline_phases_and_packed_scale_addresses(
         )
     )
     layout = _HostView(KernelLayout(tc.config))
-    minimum_tiles = (
-        pipeline_depth(tc, layout)
-        + _pipeline_peeled(tc, layout)
-        + pipeline_unroll(tc, layout)
-    )
+    sizing = Schedule(tc.config, layout.config, 128)
+    minimum_tiles = sizing.depth() + sizing.peeled() + sizing.unroll()
     minimum = (minimum_tiles + 1) // 2 * 2
-    effective_unroll = pipeline_unroll(tc, layout)
+    effective_unroll = sizing.unroll()
     # Complete K256 scale words constrain NUM_K to even values. Visit the minimum,
     # every reachable remainder, and a longer strip with additional ring wraps.
     lengths = {

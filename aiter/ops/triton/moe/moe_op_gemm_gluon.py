@@ -1146,10 +1146,10 @@ def gluon_supported(
     )
     if pipeline_error is not None:
         return False, pipeline_error
-    # Fill ownership no longer requires both axes split: a single-slot stage owns both
-    # operands' copies, since the slot schedule maps each component's tile to a slot
-    # rather than handing each slot one copy. validate() asserts the mapping invariant
-    # itself as the in-kernel backstop.
+    # Fill ownership no longer requires both axes split: a single-slot step copies both
+    # operands, since the schedule maps each component's non-K slots to slots rather
+    # than handing each slot one copy. validate_pipeline() asserts the mapping
+    # invariant itself as the in-kernel backstop.
     #
     # gate/up split is a separate matter, and a real one: it packs the two operand
     # sides as the two halves of N, so an N slot has to be exactly one side. Refused
