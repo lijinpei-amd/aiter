@@ -215,7 +215,7 @@ class KernelFuncConfig:
 @aggregate
 @strip_annotate
 class KernelTuningConfig:
-    """How the kernel *runs*. Holds the func config so :func:`compute_kernel_layout`
+    """How the kernel *runs*. Holds the func config so ``KernelLayout(tuning_cfg)``
     can see the operand dtypes (an aggregate may hold another aggregate as a typed
     field). Every derived shape and layout lives in the resulting ``KernelLayout``,
     and so does the resolved LDS/register placement: this config only says whether

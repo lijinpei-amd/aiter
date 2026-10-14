@@ -8,7 +8,7 @@ import math
 import pytest
 
 from aiter.ops.triton._gluon_kernels.gfx950.moe._frozen import _validate_frozen
-from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import compute_kernel_layout
+from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import KernelLayout
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
     _live_span,
     pipeline_unroll,
@@ -56,7 +56,7 @@ def test_scale_mini_blocks_only_change_the_shuffled_operand(shuffled):
         SCALE_MINI_BLOCK_N=128,
         SCALE_MINI_BLOCK_K=512,
     )
-    layout = compute_kernel_layout(tc)
+    layout = KernelLayout(tc)
     for operand in range(2):
         assert layout.scale_mini_block_nonk(operand) == (
             128 if shuffled[operand] else 64
@@ -70,7 +70,7 @@ def test_scale_mini_blocks_only_change_the_shuffled_operand(shuffled):
 @pytest.mark.parametrize("block_k", [128, 256, 512])
 def test_shuffled_scale_k_defaults_to_at_least_k256(block_k):
     tc = _config(BLOCK_K=block_k, VGPR_PREFETCH_K=block_k)
-    layout = compute_kernel_layout(tc)
+    layout = KernelLayout(tc)
     expected = max(256, block_k)
     assert layout.scale_mini_block_k(0) == layout.scale_mini_block_k(1) == expected
 
@@ -84,7 +84,7 @@ def test_invalid_unused_scale_minis_are_ignored():
         SCALE_MINI_BLOCK_K=1,
     )
     assert validate(tc, 4096, 7168)
-    layout = compute_kernel_layout(tc)
+    layout = KernelLayout(tc)
     assert layout.scale_mini_block_nonk(0) == layout.scale_mini_block_nonk(1) == 64
     assert layout.scale_mini_block_k(0) == layout.scale_mini_block_k(1) == 128
 
@@ -172,7 +172,7 @@ def test_scale_k_step_ratio_sets_buffer_span_and_unroll(
         ALLOW_A_SCALE_VIA_LDS=not register_scales,
         ALLOW_B_SCALE_VIA_LDS=not register_scales,
     )
-    layout = compute_kernel_layout(tc)
+    layout = KernelLayout(tc)
     ratio = scale_k // block_k
     for operand, depth in enumerate((2, 3)):
         assert _live_span(tc, layout, (operand, True)) == (depth - 1) * ratio + 1

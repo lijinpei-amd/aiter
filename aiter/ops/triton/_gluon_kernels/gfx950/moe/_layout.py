@@ -5,17 +5,22 @@
 
 Every tile shape, register/shared layout, resource count and resolved LDS/register
 placement of a build lives in one :class:`KernelLayout`, evaluated once from the
-tuning configuration by :func:`compute_kernel_layout`. The yes/no knob policy it is
-built on (``allow_component_via_lds``, ``scale_shuffled``, ...) is
+tuning configuration by its constructor, ``KernelLayout(tuning_cfg)``. The yes/no
+knob policy it is built on (``allow_component_via_lds``, ``scale_shuffled``, ...) is
 ``KernelTuningConfig`` methods. The final placement also depends on whether the slot
 admits a direct-to-LDS copy, so it is resolved here. The host (grid, LDS probes) and
 the kernel both read that object, so neither re-derives a layout per query and the
 two cannot drift. The device-side raw-N mapping and HBM offset grids are
 ``KernelLayout`` jit methods.
 
-The public surface is :func:`compute_kernel_layout` and the methods and fields of
-:class:`KernelLayout`. Everything else here is internal derivation detail that no
-other module imports.
+The public surface is :class:`KernelLayout`: its constructor, methods and fields.
+Everything else here is internal derivation detail that no other module imports.
+
+Top to bottom: helpers that take explicit arguments (layout builders such as
+:func:`byte_unit_lds_layout`, the jit HBM-offset grids), then the
+:class:`KernelLayout` aggregate: its fields, the constructor that derives every field
+from the tuning configuration in one pass, computing each quantity once, and the
+accessors.
 """
 
 from triton.experimental import gluon
@@ -26,7 +31,7 @@ from ._lang import MX_GROUP, WARP_SIZE, require_constexpr, strip_annotate
 from ._lang import unwrap as _v
 from ._types import WeightGuHbmLayout
 
-__all__ = ["KernelLayout", "compute_kernel_layout"]
+__all__ = ["KernelLayout"]
 
 _NO_SCALE: gl.constexpr = gl.constexpr(None)
 _WEIGHT_GU_SPLIT: gl.constexpr = gl.constexpr(int(WeightGuHbmLayout.SPLIT))
@@ -316,527 +321,6 @@ def _n_reduction_slot(func_cfg):
     return func_cfg.activation_reduction_n()
 
 
-# -- per-quantity derivations ---------------------------------------------------------
-#
-# One function per layout quantity, each a pure function of the tuning configuration.
-# Only `compute_kernel_layout` and the other derivations here call them; everything
-# else reads the result.
-
-
-@gluon.constexpr_function
-def _calc_num_warps(tc):
-    w = _v(tc.warps_per_cta)
-    return w[0] * w[1]
-
-
-@gluon.constexpr_function
-def _calc_num_k_slots(tc):
-    """Payload fragments per BLOCK_K stage."""
-    return 1
-
-
-@gluon.constexpr_function
-def _calc_num_prefetch_k_slots(tc):
-    """Whether the complete BLOCK_K stage is carried across a pipeline step."""
-    return 1 if _v(tc.VGPR_PREFETCH_K) else 0
-
-
-@gluon.constexpr_function
-def _calc_num_m_slots(tc):
-    """M slots per tile. Operand A and the accumulator split by this."""
-    return _v(tc.BLOCK_M) // _v(tc.MINI_BLOCK_M)
-
-
-@gluon.constexpr_function
-def _calc_num_n_slots(tc):
-    """N slots per tile. Operand B and the accumulator split by this."""
-    return _v(tc.BLOCK_N) // _v(tc.MINI_BLOCK_N)
-
-
-@gluon.constexpr_function
-def _calc_num_lds_slots_non_k(tc, idx):
-    """Slots along one operand's non-K axis, each copied and read independently."""
-    return _calc_num_m_slots(tc) if _v(idx) == 0 else _calc_num_n_slots(tc)
-
-
-@gluon.constexpr_function
-def _calc_payload_block_k_storage(tc, idx):
-    """Stored payload elements along K in one pipeline stage."""
-    return _v(tc.BLOCK_K) // tc.func_cfg.pack_divisor(idx)
-
-
-@gluon.constexpr_function
-def _calc_scale_block_k_storage(tc):
-    """E8M0 elements along K in one pipeline stage."""
-    return _v(tc.BLOCK_K) // MX_GROUP
-
-
-@gluon.constexpr_function
-def _calc_payload_fragment_shape_slot(tc, idx):
-    """Register payload shape for one non-K slot and K slot."""
-    if _v(idx) == 0:
-        return [
-            _v(tc.MINI_BLOCK_M),
-            _v(tc.BLOCK_K) // tc.func_cfg.pack_divisor(0),
-        ]
-    return [
-        _v(tc.BLOCK_K) // tc.func_cfg.pack_divisor(1),
-        _v(tc.MINI_BLOCK_N),
-    ]
-
-
-@gluon.constexpr_function
-def _calc_scale_fragment_shape_slot(tc, idx):
-    """Register E8M0 shape for one non-K slot and K slot."""
-    nonk = _v(tc.MINI_BLOCK_M) if _v(idx) == 0 else _v(tc.MINI_BLOCK_N)
-    return [nonk, _v(tc.BLOCK_K) // MX_GROUP]
-
-
-@gluon.constexpr_function
-def _calc_accumulator_fragment_shape_slot(tc):
-    """Shape of one slot's accumulator."""
-    return [_v(tc.MINI_BLOCK_M), _v(tc.MINI_BLOCK_N)]
-
-
-@gluon.constexpr_function
-def _calc_payload_lds_shape_slot(tc, idx):
-    """Shared shape of one payload slot, in stored (packed) elements.
-
-    This is one slot, not the whole tile: A is split along M into
-    ``num_m_slots()`` slots of ``MINI_BLOCK_M`` rows, and B along N into
-    ``num_n_slots()`` slots of ``MINI_BLOCK_N`` columns. Each slot is
-    allocated, copied, and read as an independent unit, so each gets its own
-    efficient padded layout and fully coalesced direct-to-LDS copy. Slicing one
-    tile-wide buffer would instead give the copy a strided view of a permuted layout.
-    """
-    if _v(idx) == 0:
-        return [
-            _v(tc.MINI_BLOCK_M),
-            _calc_payload_block_k_storage(tc, 0),
-        ]
-    return [
-        _calc_payload_block_k_storage(tc, 1),
-        _v(tc.MINI_BLOCK_N),
-    ]
-
-
-@gluon.constexpr_function
-def _calc_scale_lds_shape_slot(tc, idx):
-    """E8M0 shape of one operand slot: [slot non-K extent, BLOCK_K/32]."""
-    non_k = _v(tc.MINI_BLOCK_M) if _v(idx) == 0 else _v(tc.MINI_BLOCK_N)
-    return [non_k, _calc_scale_block_k_storage(tc)]
-
-
-@gluon.constexpr_function
-def _calc_payload_lds_shape_tile(tc, idx):
-    """Full payload LDS shape of the tile, including ring and slot axes."""
-    return [
-        tc.num_buffers(idx) * _calc_num_lds_slots_non_k(tc, idx)
-    ] + _calc_payload_lds_shape_slot(tc, idx)
-
-
-@gluon.constexpr_function
-def _calc_scale_lds_shape_tile(tc, idx):
-    """Full scale LDS shape of the tile in its staged representation."""
-    idx = _v(idx)
-    if tc.scale_shuffled(idx):
-        num_scale_fill_tiles = _calc_num_scale_tiles(tc, idx)
-        scale_fill_shape = _calc_scale_flat_shape(tc, idx)
-    else:
-        num_scale_fill_tiles = _calc_num_lds_slots_non_k(tc, idx)
-        scale_fill_shape = _calc_scale_lds_shape_slot(tc, idx)
-    return [tc.num_buffers(idx, True) * num_scale_fill_tiles] + scale_fill_shape
-
-
-@gluon.constexpr_function
-def _calc_copy_contiguity(tc, idx):
-    """Elements per lane for a 128-bit direct-to-LDS payload copy.
-
-    Per operand: bf16 gives 8, fp8 and packed-fp4 (stored as uint8) give 16. Using
-    one value for both would allocate and copy the fp4 weight tile as if it were
-    bf16 in every mixed configuration.
-    """
-    return 128 // tc.func_cfg.operand_elem_ty(idx).primitive_bitwidth
-
-
-# -- storage placement ----------------------------------------------------------------
-#
-# The final LDS-or-register decision for each component: the tuning policy
-# (`KernelTuningConfig.allow_component_via_lds`) and whether the slot admits a
-# direct-to-LDS copy. There is no third placement, so a component not staged through
-# LDS is in registers and `KernelLayout.component_in_reg` is defined as the complement.
-
-
-@gluon.constexpr_function
-def _calc_payload_lds_copy_ok(tc, idx):
-    """Whether the payload slot admits a 128-bit-per-lane direct copy into LDS.
-
-    Payload slots that cannot give every wavefront one complete access stay in
-    the register ring. There is deliberately no register-to-LDS fallback.
-    """
-    shape = _calc_payload_lds_shape_slot(tc, idx)
-    vec = _calc_copy_contiguity(tc, idx)
-    return shape[0] * shape[1] >= WARP_SIZE * vec * _calc_num_warps(tc)
-
-
-@gluon.constexpr_function
-def _calc_scale_lds_copy_ok(tc, idx):
-    """Whether one slot's E8M0 scales can be written to LDS with a coalesced copy.
-
-    CDNA4 direct-to-LDS supports only 128-bit or 32-bit per lane and a warp must
-    write one contiguous run, so two shapes are excluded:
-
-    * smaller than ``64 lanes * 4 B`` -- cannot be lowered at all (the A-scale slot
-      at ``BLOCK_M == 16`` with a short ``BLOCK_K``);
-    * a row shorter than 8 scales (``BLOCK_K < 256``) -- one lane then owns a whole
-      row and the reg->shared map is more contiguous than the 32-bit access can
-      cover, which ``canLoadDirectToLDS`` rejects.
-
-    Both fall back to a register ``buffer_load`` straight into the scale fragment
-    layout. That is correct but costs an in-loop register-path global access, which
-    makes every ``wait_group`` conservative -- so the tuner should prefer a BLOCK_K
-    that keeps this True.
-    """
-    if tc.scale_shuffled(idx):
-        # Fragment-ordered in HBM, so the copy is linear and the LDS tile keeps the
-        # same permutation; the read is then a 32-bit ds_read. Staying on LDS also
-        # keeps the warp-broadcast B tile a single fetch rather than one per warp.
-        return True
-    shape = _calc_scale_lds_shape_slot(tc, idx)
-    return shape[0] * shape[1] >= WARP_SIZE * 4 and shape[1] % 4 == 0 and shape[1] >= 8
-
-
-@gluon.constexpr_function
-def _calc_component_via_lds(tc, component):
-    """Final placement of ``(operand, is_scale)``: tuning allows LDS and the copy fits.
-
-    Not gated on whether a scale exists; callers gate absent scales with
-    ``has_scale``.
-    """
-    operand, is_scale = _v(component[0]), bool(_v(component[1]))
-    if not tc.allow_component_via_lds((operand, is_scale)):
-        return False
-    if is_scale:
-        return _calc_scale_lds_copy_ok(tc, operand)
-    return _calc_payload_lds_copy_ok(tc, operand)
-
-
-@gluon.constexpr_function
-def _calc_k_width_for(tc, idx):
-    """``DotOperandLayout.k_width`` for one operand, in *stored* elements.
-
-    It is 128 bits per lane per access, i.e. the same quantity as
-    :meth:`copy_contiguity`: 16 for fp8 and for packed-fp4-in-uint8, 8 for bf16.
-    Verified against a reference GEMM on both f8f6f4 instruction shapes -- k_width
-    32 has no efficient padded shared layout at all, and 8 with the 16x16x128 shape
-    compiles and runs but computes the wrong answer, which is exactly the class of
-    bug no correctness-by-construction argument catches.
-
-    The tuning field is an optional override, not the value itself.
-    """
-    override = _v(tc.k_width)
-    if override is not None:
-        return override
-    return 128 // tc.func_cfg.operand_elem_ty(idx).primitive_bitwidth
-
-
-@gluon.constexpr_function
-def _calc_dot_result_fragment_layout(tc):
-    """AMDMFMALayout for dot / scaled-dot results in register.
-
-    ``transposed`` is pinned True: it gives each lane 4 consecutive N elements (a
-    16 B contiguous store, and a lane-local even/odd gate-up pair for the fused
-    activation) instead of 4 strided M rows.
-    """
-    assert _v(tc.transposed), "transposed=True is pinned, see the module docstring"
-    return gl.amd.AMDMFMALayout(
-        version=4,
-        instr_shape=_v(tc.mfma_instr_shape),
-        transposed=True,
-        warps_per_cta=_v(tc.warps_per_cta),
-        tiles_per_warp=_v(tc.tiles_per_warp),
-    )
-
-
-@gluon.constexpr_function
-def _calc_dot_operand_fragment_layout(tc, idx):
-    return gl.DotOperandLayout(
-        operand_index=_v(idx),
-        parent=_calc_dot_result_fragment_layout(tc),
-        k_width=_calc_k_width_for(tc, idx),
-    )
-
-
-@gluon.constexpr_function
-def _calc_lds_unit_rows(tc, idx):
-    """Non-K extent of one LDS unit.
-
-    A preshuffled operand is blocked 16 rows at a time in HBM and the copy has to
-    stay linear, so the unit is that block. A plain one is read two MFMA tiles at a
-    time (hence the ``tiles_per_warp >= 2`` that ``validate_layout`` insists on), so
-    the unit is 32 and the row permutation has a 5th base to work with.
-    """
-    return 16 if tc.operand_preshuffled(idx) else 32
-
-
-@gluon.constexpr_function
-def _calc_byte_unit_lds_ok(tc, idx):
-    """Does :func:`byte_unit_lds_layout` apply to this operand?
-
-    Only the 16x16x128 B operand shape is in scope -- that is 16x16x128 for fp8 and
-    16x16x256 for packed fp4, both stored 8-bit. The 32x32x64 prefill configs, the
-    bf16 ones (16x16x32 / 32x32x16) and any slot too short for a whole unit keep
-    ``compute_efficient_padded_shared_layout``.
-
-    A non-preshuffled 32-row unit additionally needs the warp to own both of its
-    16-row MFMA tiles, i.e. ``tiles_per_warp >= 2`` on that axis. That is not always
-    reachable -- at ``BLOCK_N`` 64 with warps (1, 4) the CTA's whole N tile is four
-    16-column tiles, so no warp can have two -- hence a gate rather than an assert.
-    """
-    idx = _v(idx)
-    if list(_v(tc.mfma_instr_shape)) != [16, 16, 128]:
-        return False
-    elem_bits = tc.func_cfg.operand_elem_ty(idx).primitive_bitwidth
-    if elem_bits != 8:
-        return False
-    if not tc.operand_preshuffled(idx) and _v(tc.tiles_per_warp)[idx] < 2:
-        return False
-    shape = _calc_payload_lds_shape_slot(tc, idx)
-    rows, kelems = shape[idx], shape[1 - idx]
-    unit_rows = _calc_lds_unit_rows(tc, idx)
-    unit_k = LDS_UNIT_K_BYTES * 8 // elem_bits
-    return rows % unit_rows == 0 and kelems % unit_k == 0
-
-
-@gluon.constexpr_function
-def _calc_dot_operand_lds_layout(tc, idx):
-    """Padded shared layout for a payload operand.
-
-    Both operands are K-packed under the memory-layout contract, so
-    ``is_k_contig=True`` and the plain ``smem.load(dot_layout)`` path applies --
-    ``load_shared_fp4_repacked`` is only needed for an M/N-packed checkpoint, which
-    none of the four models in scope produce.
-    """
-    idx = _v(idx)
-    shape = _calc_payload_lds_shape_slot(tc, idx)
-    if _calc_byte_unit_lds_ok(tc, idx):
-        return byte_unit_lds_layout(
-            shape,
-            idx,
-            tc.func_cfg.operand_elem_ty(idx).primitive_bitwidth,
-            _calc_lds_unit_rows(tc, idx),
-            tc.operand_preshuffled(idx),
-        )
-    layout = gl.amd.cdna4.compute_efficient_padded_shared_layout(
-        _calc_dot_operand_fragment_layout(tc, idx),
-        shape,
-        tc.func_cfg.operand_elem_ty(idx),
-        True,
-    )
-    if layout is not None:
-        return layout
-    # The helper declines whenever the slot holds a single MFMA tile along the
-    # non-K axis (BLOCK_M == instr_shape[0], i.e. the whole decode regime): it has
-    # no row permutation left to build. Fall back to a plain identity-mapped padded
-    # layout whose interval is still >= vec * warpSize, which is the condition
-    # `canLoadDirectToLDS` checks, so the copy stays a 128-bit direct-to-LDS.
-    vec = _calc_copy_contiguity(tc, idx)
-    order = [1, 0] if idx == 0 else [0, 1]
-    return gl.PaddedSharedLayout.with_identity_for(
-        [[WARP_SIZE * vec, vec]], shape, order
-    )
-
-
-@gluon.constexpr_function
-def _calc_dot_operand_buffer_load_lds_layout(tc, idx):
-    """Register layout of the global->LDS copy offsets for a payload operand."""
-    idx = _v(idx)
-    shape = _calc_payload_lds_shape_slot(tc, idx)
-    return _bases_to_distributed(
-        _calc_dot_operand_lds_layout(tc, idx).offset_bases,
-        _calc_copy_contiguity(tc, idx),
-        _calc_num_warps(tc),
-        WARP_SIZE,
-        shape,
-    )
-
-
-@gluon.constexpr_function
-def _calc_payload_hbm_offset_layout(tc, idx):
-    """Layout used to form one payload slot's global-memory offsets."""
-    if _calc_component_via_lds(tc, (idx, False)):
-        return _calc_dot_operand_buffer_load_lds_layout(tc, idx)
-    return _calc_dot_operand_fragment_layout(tc, idx)
-
-
-@gluon.constexpr_function
-def _calc_dot_operand_scale_fragment_layout(tc, idx):
-    idx = _v(idx)
-    shape = _calc_scale_lds_shape_slot(tc, idx)
-    return gl.amd.cdna4.get_mfma_scale_layout(
-        _calc_dot_operand_fragment_layout(tc, idx), shape, MX_GROUP
-    )
-
-
-# -- ScaleSwizzle.SORTED_SHUFFLED --------------------------------------------
-# moe_sort_scales.cuh writes one dword per (chunk, mi, ku, k_lane, n_lane) with
-#     row = chunk*BM + (mi*MN_PACK + im_a)*16 + n_lane
-#     k   = ku*K_PACK*4 + ikxdl*4 + k_lane
-#     byte within the dword = ikxdl*MN_PACK + im_a
-# so n_lane/k_lane index the 64 lanes of a wavefront, im_a/ikxdl the 4 bytes a lane
-# holds, and mi the wave. That is exactly get_mfma_scale_layout's decomposition for
-# a 16x16x128 dot operand with warps_per_cta = (num_warps, 1) and
-# tiles_per_warp = (2, 1) -- verified base-for-base -- so the shuffled buffer is
-# read with a plain contiguous load and no cross-lane movement.
-
-
-@gluon.constexpr_function
-def _calc_scale_mini_block_nonk(tc, idx):
-    """Rows or columns in one scale load; raw scales retain payload geometry."""
-    mini = _calc_scale_nonk(tc, idx)
-    if not tc.scale_shuffled(idx):
-        return mini
-    requested = tc.SCALE_MINI_BLOCK_M if _v(idx) == 0 else tc.SCALE_MINI_BLOCK_N
-    return _v(requested) or mini
-
-
-@gluon.constexpr_function
-def _calc_scale_mini_block_k(tc, idx):
-    """Scale load K extent in logical payload elements, not E8M0 bytes."""
-    if not tc.scale_shuffled(idx):
-        return _v(tc.BLOCK_K)
-    return _v(tc.SCALE_MINI_BLOCK_K) or max(256, _v(tc.BLOCK_K))
-
-
-@gluon.constexpr_function
-def _calc_scale_ratio_k_step(tc, idx):
-    """Number of payload K steps covered by one scale load."""
-    bk = _v(tc.BLOCK_K)
-    return _calc_scale_mini_block_k(tc, idx) // bk
-
-
-@gluon.constexpr_function
-def _calc_scale_ratio_non_k_slot(tc, idx):
-    """Number of payload non-K slots covered by one scale load."""
-    return _calc_scale_mini_block_nonk(tc, idx) // _calc_scale_nonk(tc, idx)
-
-
-@gluon.constexpr_function
-def _calc_num_scale_tiles(tc, idx):
-    return _calc_num_lds_slots_non_k(tc, idx) // _calc_scale_ratio_non_k_slot(tc, idx)
-
-
-@gluon.constexpr_function
-def _calc_scale_read_k_slots(tc, idx):
-    return _calc_scale_ratio_k_step(tc, idx)
-
-
-@gluon.constexpr_function
-def _calc_scale_cache_fragments(tc, idx):
-    return _calc_num_lds_slots_non_k(tc, idx) * _calc_scale_read_k_slots(tc, idx)
-
-
-@gluon.constexpr_function
-def _calc_scale_hbm_offset_layout(tc, idx):
-    """Layout used to form one scale tile's global-memory offsets."""
-    if _calc_component_via_lds(tc, (idx, True)):
-        return _calc_dot_operand_scale_buffer_load_lds_layout(tc, idx)
-    if tc.scale_shuffled(idx):
-        if _calc_scale_packed_ok(tc, idx):
-            return _calc_packed_scale_load_layout(tc, idx)
-        # get_mfma_scale_layout puts the K-group bit before the non-K bit in
-        # reg_bases, so a lane's four bytes land in registers in address order
-        # 0, +2, +1, +3. A widened load fills registers in ascending order; issue
-        # it with those two bases swapped, then convert with only a lane-local
-        # register renumber because the lane and warp bases stay unchanged.
-        frag = _calc_scale_load_layout(tc, idx)
-        lead = [[16, 0], [0, 4]]
-        rest = [list(b) for b in frag.reg_bases if list(b) not in lead]
-        return gl.DistributedLinearLayout(
-            reg_bases=lead + rest,
-            lane_bases=[list(b) for b in frag.lane_bases],
-            warp_bases=[list(b) for b in frag.warp_bases],
-            block_bases=[],
-            shape=list(frag.shape),
-        )
-    return _calc_dot_operand_scale_fragment_layout(tc, idx)
-
-
-@gluon.constexpr_function
-def _calc_scale_nonk(tc, idx):
-    """Non-K extent of one shuffled scale tile.
-
-    The A-side shuffle (SORTED_SHUFFLED) and CDNA4_SCALE both lay the tile out as
-    one 256 B run per 32-row stripe, so a slot that is a whole number of stripes is
-    a contiguous slice and the tile can use the slot extent.
-    """
-    if _v(idx) == 0:
-        return _v(tc.MINI_BLOCK_M)
-    return _v(tc.MINI_BLOCK_N)
-
-
-@gluon.constexpr_function
-def _calc_scale_flat_shape(tc, idx):
-    """LDS staging shape of a shuffled scale tile: one 256 B run per 32-row stripe.
-
-    The tile is staged in HBM byte order rather than fragment order because
-    direct-to-LDS on gfx9 cannot scatter -- each warp must write coalesced, which a
-    fragment-ordered SharedLinearLayout does not (canLoadDirectToLDS rejects it, see
-    TritonAMDGPUToLLVM/Utility.cpp). The bytes therefore sit in (non-K 16, K 4) order
-    while the u8 fragment numbers its registers (K 4, non-K 16); reconciling the two
-    used to cost a v_perm per dword, which is what ``scale_packed_ok`` avoids by
-    handing the dword to the MFMA whole and naming the byte order in a selector list.
-    """
-    return [
-        _calc_scale_mini_block_nonk(tc, idx) // 32,
-        _calc_scale_mini_block_k(tc, idx),
-    ]
-
-
-@gluon.constexpr_function
-def _calc_sorted_shuffled_ok(tc):
-    """Does this config produce the layout the C++ A-scale shuffle was written for?"""
-    # The permutation lives in the LDS tile's SharedLinearLayout, which is a
-    # property of the byte order the shuffle writes -- not of how warps are split.
-    # The warp arrangement is free. The shuffle always packs K256;
-    # a K128 payload stage selects one half.
-    return (
-        list(_v(tc.mfma_instr_shape)) == [16, 16, 128]
-        and _v(tc.BLOCK_M) % 32 == 0
-        # An M slot only has to be a whole number of 32-row stripes: the shuffle
-        # writes one 256 B run per stripe, so a slot is a contiguous slice.
-        and _v(tc.MINI_BLOCK_M) % 32 == 0
-    )
-
-
-@gluon.constexpr_function
-def _calc_shuffled_scale_read_layout(tc, idx, load=False):
-    """The [non-K, K] view of the flat LDS run, in fragment order."""
-    nonk = (
-        _calc_scale_mini_block_nonk(tc, idx) if _v(load) else _calc_scale_nonk(tc, idx)
-    )
-    k = _calc_scale_mini_block_k(tc, idx) if _v(load) else max(256, _v(tc.BLOCK_K))
-    bases = [[16, 0], [0, 4], [1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]]
-    for bit in _ramp(8, k // MX_GROUP):
-        bases += [[0, bit]]
-    stripe = 32
-    while stripe < nonk:
-        bases = bases + [[stripe, 0]]
-        stripe = stripe * 2
-    return gl.SharedLinearLayout(offset_bases=bases)
-
-
-# -- packed (i32) scale operands ------------------------------------------------
-# Every shuffle here puts four scales in a dword, and the matrix instruction can
-# pick one of them with op_sel. So a lane loads the dword whole and hands it to
-# mfma_scaled_packed as an i32, with the byte order named in a selector list --
-# no reinterpret to u8, no register renumbering, no v_perm.
-#
-# CDNA4_SCALE / SORTED_SHUFFLED put non-K +16 and K +4 inside the dword, at byte
-# (nonK) + 2*(K). That fixed pair only works when the fragment happens to hold both
-# steps in registers, so ``scale_packed_ok`` checks it rather than assuming it.
-
-
 @gluon.constexpr_function
 def _scale_dword_delta(delta, k=256):
     """Where a (non-K, K) step lands, as a coordinate of the i32 tile.
@@ -855,320 +339,11 @@ def _scale_dword_delta(delta, k=256):
     return [d // width, d % width]
 
 
-@gluon.constexpr_function
-def _calc_scale_packed_sel(tc, idx, k_phase=0):
-    """Byte selectors in MFMA order, for one K128 half or the full K256 word.
-
-    The instruction index counts non-K major and K minor, so its low two bits are
-    the fragment's first two register bases in that order. CDNA4_SCALE numbers the
-    dword's bytes the other way round, hence the transposition.
-    """
-    if not _calc_scale_packed_ok(tc, idx):
-        return None
-    if _v(tc.BLOCK_K) == 128:
-        return [2 * _v(k_phase), 2 * _v(k_phase) + 1]
-    return [0, 2, 1, 3]
-
-
-@gluon.constexpr_function
-def _calc_has_mfma_packed_scale(tc):
-    """Whether either live MFMA scale operand uses packed dword storage."""
-    return _calc_scale_packed_ok(tc, 0) or _calc_scale_packed_ok(tc, 1)
-
-
-@gluon.constexpr_function
-def _calc_scale_packed_ok(tc, idx):
-    """Can this operand's scale fragment be fed as one dword per lane?
-
-    K256 folds K+4 and non-K+16; K128 folds only non-K+16 and selects
-    its K half separately. Each folded step must be register-private.
-    """
-    if not tc.scale_shuffled(idx) or _v(tc.BLOCK_K) not in (128, 256):
-        return False
-    frag = gl.amd.cdna4.get_mfma_scale_layout(
-        _calc_dot_operand_fragment_layout(tc, idx),
-        _calc_scale_fragment_shape_slot(tc, idx),
-        MX_GROUP,
-    )
-    regs = [list(b) for b in frag.reg_bases]
-    if _v(tc.BLOCK_K) == 128:
-        return len(regs) >= 1 and regs[0] == [16, 0]
-    if len(regs) < 2:
-        return False
-    return regs[0] == [0, 4] and regs[1] == [16, 0]
-
-
-@gluon.constexpr_function
-def _calc_packed_scale_shape(tc, idx):
-    """Physical i32 storage, including both K128 halves even when one is unused."""
-    nonk = _calc_scale_nonk(tc, idx)
-    return [nonk, max(256, _v(tc.BLOCK_K)) // 128]
-
-
-@gluon.constexpr_function
-def _calc_packed_scale_frag_layout(tc, idx):
-    """The i32 fragment with its within-dword register bases folded in."""
-    k = max(256, _v(tc.BLOCK_K))
-    frag = gl.amd.cdna4.get_mfma_scale_layout(
-        _calc_dot_operand_fragment_layout(tc, idx),
-        [_calc_scale_nonk(tc, idx), k // MX_GROUP],
-        MX_GROUP,
-    )
-    return gl.DistributedLinearLayout(
-        reg_bases=[_scale_dword_delta(b, k) for b in frag.reg_bases[2:]],
-        lane_bases=[_scale_dword_delta(b, k) for b in frag.lane_bases],
-        warp_bases=[_scale_dword_delta(b, k) for b in frag.warp_bases],
-        block_bases=[],
-        shape=_calc_packed_scale_shape(tc, idx),
-    )
-
-
-@gluon.constexpr_function
-def _calc_packed_scale_read_layout(tc, idx, load=False):
-    """The i32 view of the flat LDS run: one offset bit per dword-address bit."""
-    k = _calc_scale_mini_block_k(tc, idx) if _v(load) else max(256, _v(tc.BLOCK_K))
-    bases = list(_calc_shuffled_scale_read_layout(tc, idx, load).offset_bases)[2:]
-    return gl.SharedLinearLayout(offset_bases=[_scale_dword_delta(b, k) for b in bases])
-
-
-@gluon.constexpr_function
-def _calc_scale_load_shape(tc, idx):
-    return [
-        _calc_scale_mini_block_nonk(tc, idx),
-        _calc_scale_mini_block_k(tc, idx) // MX_GROUP,
-    ]
-
-
-@gluon.constexpr_function
-def _calc_scale_load_layout(tc, idx):
-    return gl.amd.cdna4.get_mfma_scale_layout(
-        _calc_dot_operand_fragment_layout(tc, idx),
-        _calc_scale_load_shape(tc, idx),
-        MX_GROUP,
-    )
-
-
-@gluon.constexpr_function
-def _calc_packed_scale_load_shape(tc, idx):
-    return [
-        _calc_scale_mini_block_nonk(tc, idx),
-        _calc_scale_mini_block_k(tc, idx) // 128,
-    ]
-
-
-@gluon.constexpr_function
-def _calc_packed_scale_load_layout(tc, idx):
-    frag = _calc_scale_load_layout(tc, idx)
-    k = _calc_scale_mini_block_k(tc, idx)
-    # The two within-dword axes are identified by value, not position.  Wider
-    # scale K tiles insert additional K register bases between them.
-    within_dword = ([0, 4], [16, 0])
-    return gl.DistributedLinearLayout(
-        reg_bases=[
-            _scale_dword_delta(b, k)
-            for b in frag.reg_bases
-            if list(b) not in within_dword
-        ],
-        lane_bases=[_scale_dword_delta(b, k) for b in frag.lane_bases],
-        warp_bases=[_scale_dword_delta(b, k) for b in frag.warp_bases],
-        block_bases=[],
-        shape=_calc_packed_scale_load_shape(tc, idx),
-    )
-
-
-@gluon.constexpr_function
-def _calc_dot_operand_scale_lds_layout(tc, idx):
-    """Identity (K-contiguous) shared tile for the raw E8M0 scales.
-
-    The three LDS goals are not simultaneously satisfiable for the scales: with
-    ``get_mfma_scale_layout`` each lane wants K-scale elements strided by 2 or 4, so
-    the read is ``ds_read_u8`` regardless. An identity tile is what keeps the
-    *write* side (direct-to-LDS) coalesced, which is the side that matters.
-    """
-    # Flat staging tile -- plain identity; fragment order returns on the read.
-    return gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
-
-
-@gluon.constexpr_function
-def _calc_dot_operand_scale_buffer_load_lds_layout(tc, idx):
-    """32-bit-per-lane blocked layout for the scale direct-to-LDS write."""
-    idx = _v(idx)
-    shape = _calc_scale_lds_shape_slot(tc, idx)
-    if tc.scale_shuffled(idx):
-        # Flat run, 4 contiguous bytes per lane.
-        return gl.BlockedLayout(
-            size_per_thread=[1, 4],
-            threads_per_warp=[1, WARP_SIZE],
-            warps_per_cta=[_calc_num_warps(tc), 1],
-            order=[1, 0],
-        )
-    sk = shape[1]
-    lanes_k = sk // 4
-    return gl.BlockedLayout(
-        size_per_thread=[1, 4],
-        threads_per_warp=[WARP_SIZE // lanes_k, lanes_k],
-        warps_per_cta=[_calc_num_warps(tc), 1],
-        order=[1, 0],
-    )
-
-
-@gluon.constexpr_function
-def _calc_output_n_slot(tc):
-    """Emitted columns produced by one N slot."""
-    return _v(tc.MINI_BLOCK_N) // _n_reduction_slot(tc.func_cfg)
-
-
-@gluon.constexpr_function
-def _calc_output_block_n(tc):
-    """Emitted columns produced by the tile's raw BLOCK_N columns."""
-    return _v(tc.BLOCK_N) // tc.func_cfg.activation_reduction_n()
-
-
-@gluon.constexpr_function
-def _calc_epilogue_threads(tc):
-    return _calc_num_warps(tc) * WARP_SIZE
-
-
-@gluon.constexpr_function
-def _calc_epilogue_bias_per_thread(tc):
-    return _v(tc.BLOCK_N) // _calc_epilogue_threads(tc)
-
-
-@gluon.constexpr_function
-def _calc_epilogue_inputs_via_lds(tc):
-    """Whether bias/gamma vectors admit the supported direct-to-LDS copies.
-
-    No knob controls this placement: the vectors go through LDS whenever the copy is
-    legal for the tile.
-    """
-    threads = _calc_epilogue_threads(tc)
-    bpt = _calc_epilogue_bias_per_thread(tc)
-    return threads >= _v(tc.BLOCK_M) and _v(tc.BLOCK_N) % threads == 0 and bpt in (1, 4)
-
-
-@gluon.constexpr_function
-def _calc_epilogue_input_lds_layout(tc):
-    return gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[0])
-
-
-@gluon.constexpr_function
-def _calc_epilogue_gamma_buffer_load_lds_layout(tc):
-    return gl.BlockedLayout([1], [WARP_SIZE], [_calc_num_warps(tc)], [0])
-
-
-@gluon.constexpr_function
-def _calc_epilogue_bias_buffer_load_lds_layout(tc):
-    return gl.BlockedLayout(
-        [_calc_epilogue_bias_per_thread(tc)],
-        [WARP_SIZE],
-        [_calc_num_warps(tc)],
-        [0],
-    )
-
-
-@gluon.constexpr_function
-def _calc_epilogue_gamma_shape(tc):
-    return [_calc_epilogue_threads(tc)]
-
-
-@gluon.constexpr_function
-def _calc_epilogue_bias_shape(tc):
-    return [_v(tc.BLOCK_N)]
-
-
-@gluon.constexpr_function
-def _calc_quant_staging_layout(tc):
-    return gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
-
-
-@gluon.constexpr_function
-def _calc_quant_staging_rows(tc):
-    if _v(tc.func_cfg.weight_gu_hbm_layout) == WeightGuHbmLayout.SPLIT:
-        return _v(tc.BLOCK_M)
-    return _v(tc.MINI_BLOCK_M)
-
-
-@gluon.constexpr_function
-def _calc_quant_staging_rotates(tc):
-    """Whether the fused-quant staging alternates two per-slot LDS banks."""
-    fc = tc.func_cfg
-    return (
-        _v(fc.output_quant) is not None
-        and _v(fc.weight_gu_hbm_layout) != WeightGuHbmLayout.SPLIT
-    )
-
-
-@gluon.constexpr_function
-def _calc_payload_hbm_step(tc, idx):
-    """Stored-element base-pointer increment for one payload K stage."""
-    idx = _v(idx)
-    step = _calc_payload_block_k_storage(tc, idx)
-    if idx == 1 and _v(tc.B_PRESHUFFLED):
-        return step // 16 * 256
-    return step
-
-
-@gluon.constexpr_function
-def _calc_lds_bytes(tc):
-    fc = tc.func_cfg
-    total = 0
-    for idx in (0, 1):
-        shape = _calc_payload_lds_shape_slot(tc, idx)
-        width = fc.operand_elem_ty(idx).primitive_bitwidth // 8
-        # This shape is one slot; a tile holds one non-K slot per split.
-        num_slots = _calc_num_lds_slots_non_k(tc, idx)
-        if _calc_component_via_lds(tc, (idx, False)):
-            total += num_slots * shape[0] * shape[1] * width * tc.num_buffers(idx)
-        if fc.has_scale(idx) and _calc_component_via_lds(tc, (idx, True)):
-            s = _calc_scale_lds_shape_tile(tc, idx)
-            total += s[0] * s[1] * s[2]
-    return total
-
-
-@gluon.constexpr_function
-def _calc_acc_vgprs_per_lane(tc):
-    return _v(tc.BLOCK_M) * _v(tc.BLOCK_N) // (_calc_num_warps(tc) * WARP_SIZE)
-
-
 # -- the computed layout -------------------------------------------------------------
 #
-# Everything above derives one quantity from the tuning configuration on demand. The
-# aggregate below holds all of them, evaluated once per build by
-# `compute_kernel_layout`; kernel code, the schedule model and the host all read the
-# same object instead of re-deriving a layout at every query.
-
-
-@gluon.constexpr_function
-def _calc_geometry_ok(tc):
-    """Whether the tile lattice is sound enough to build register/shared layouts on.
-
-    The N/K-independent part of ``_validate.validate_layout``, as a predicate. A config
-    that fails it still gets its scalar geometry (the host probes LDS footprints of
-    candidates it has not validated yet) but no layout objects, so the descriptive
-    assertion in ``validate_layout`` is what reports it rather than a layout
-    constructor.
-    """
-    BM, BN, BK = _v(tc.BLOCK_M), _v(tc.BLOCK_N), _v(tc.BLOCK_K)
-    MBM, MBN = _v(tc.MINI_BLOCK_M), _v(tc.MINI_BLOCK_N)
-    instr = _v(tc.mfma_instr_shape)
-    warps = _v(tc.warps_per_cta)
-    tiles = _v(tc.tiles_per_warp)
-    if BK % instr[2] or BK % MX_GROUP or BM % MBM or BN % MBN:
-        return False
-    if MBM % (instr[0] * warps[0] * tiles[0]) or MBN % (instr[1] * warps[1] * tiles[1]):
-        return False
-    for idx in (0, 1):
-        if not tc.scale_shuffled(idx):
-            continue
-        tile = BM if idx == 0 else BN
-        nonk = _calc_scale_mini_block_nonk(tc, idx)
-        sk = _calc_scale_mini_block_k(tc, idx)
-        mini = _calc_scale_nonk(tc, idx)
-        if not tile >= nonk >= mini or tile % nonk or nonk % mini or nonk % 32:
-            return False
-        if sk < max(256, BK) or sk & (sk - 1) or sk % BK:
-            return False
-    return True
+# The aggregate below holds every derived quantity of one build, evaluated once by
+# its constructor; kernel code, the schedule model and the host all read the same
+# object instead of re-deriving a layout at every query.
 
 
 @aggregate
@@ -1176,11 +351,12 @@ def _calc_geometry_ok(tc):
 class KernelLayout:
     """Every tile shape, storage size and register/shared layout of one build.
 
-    Built once by :func:`compute_kernel_layout` and passed explicitly to everything
-    that needs a layout. Per-operand values are stored as ``(A, B)`` pairs and read
-    through accessors indexed by operand (0 = A / tokens, 1 = B / experts). ``None``
-    marks a value that does not exist for this build -- a scale layout of an unscaled
-    operand, the LDS layout of a register-resident payload.
+    Built once as ``KernelLayout(tuning_cfg)``, on the host and in jit code alike,
+    and passed explicitly to everything that needs a layout. Per-operand values are
+    stored as ``(A, B)`` pairs and read through accessors indexed by operand (0 = A /
+    tokens, 1 = B / experts). ``None`` marks a value that does not exist for this
+    build -- a scale layout of an unscaled operand, the LDS layout of a
+    register-resident payload.
 
     Accessors that take a free argument (a K extent, a step, a store extent) are
     evaluated from the stored scalars; there is nothing to precompute for them.
@@ -1265,9 +441,702 @@ class KernelLayout:
     _acc_vgprs_per_lane: gl.constexpr
 
     @gluon.constexpr_function
-    def __init__(self, **values):
-        for name, value in values.items():
-            setattr(self, "_" + name, gl.constexpr(value))
+    def __init__(self, tuning_cfg):
+        """Evaluate every field of one build from its tuning configuration.
+
+        Host and device both construct it from the same configuration, so the host's
+        LDS and grid arithmetic and the kernel's tile arithmetic cannot drift. A config
+        whose tile lattice is unsound (``ok`` below) still gets its scalar geometry,
+        but its layout objects are ``None``; ``_validate.validate_layout`` rejects it.
+
+        One pass in dependency order, sectioned like the fields. Each quantity is
+        computed once, as a local that later quantities read, and per-operand values
+        are ``(A, B)`` tuples. The gates are load-bearing, not an optimisation:
+        ``None`` is the documented value of a layout that does not exist for this
+        build, and every field is mangled into jit calls, so building a gated value
+        unconditionally changes the layout even where its constructor would not raise.
+        Some gates also keep a constructor from raising: the raw-scale copy layout at
+        BLOCK_K 64 would divide by zero.
+        """
+        tc = tuning_cfg
+        fc = tc.func_cfg
+        ops = (0, 1)
+
+        # -- tile and slot geometry -----------------------------------------------
+        BM, BN, BK = _v(tc.BLOCK_M), _v(tc.BLOCK_N), _v(tc.BLOCK_K)
+        MBM, MBN = _v(tc.MINI_BLOCK_M), _v(tc.MINI_BLOCK_N)
+        instr = _v(tc.mfma_instr_shape)
+        warps = _v(tc.warps_per_cta)
+        tiles_per_warp = _v(tc.tiles_per_warp)
+        is_16x16x128 = list(instr) == [16, 16, 128]
+        gu_split = _v(fc.weight_gu_hbm_layout) == WeightGuHbmLayout.SPLIT
+        num_warps = warps[0] * warps[1]
+        threads = num_warps * WARP_SIZE
+        elem_ty = tuple(fc.operand_elem_ty(idx) for idx in ops)
+        elem_bits = tuple(ty.primitive_bitwidth for ty in elem_ty)
+        has_scale = tuple(fc.has_scale(idx) for idx in ops)
+        shuffled = tuple(tc.scale_shuffled(idx) for idx in ops)
+        preshuffled = tuple(tc.operand_preshuffled(idx) for idx in ops)
+
+        # Scale tile extents, which the soundness check below reads. Both shuffles
+        # (SORTED_SHUFFLED for A, CDNA4_SCALE for B) lay a tile out as one 256 B run per
+        # 32-row stripe, so a slot that is a whole number of stripes is a contiguous
+        # slice and a scale tile can use the slot extent. A shuffle always packs K256; a
+        # K128 payload stage selects one half, hence the floor on `scale_stage_k`.
+        scale_nonk = (MBM, MBN)
+        scale_stage_k = max(256, BK)
+        scale_mini_block_nonk = (
+            (_v(tc.SCALE_MINI_BLOCK_M) or MBM) if shuffled[0] else MBM,
+            (_v(tc.SCALE_MINI_BLOCK_N) or MBN) if shuffled[1] else MBN,
+        )
+        scale_mini_block_k = tuple(
+            (_v(tc.SCALE_MINI_BLOCK_K) or scale_stage_k) if shuffled[idx] else BK
+            for idx in ops
+        )
+
+        # Whether the tile lattice is sound enough to build register/shared layouts on:
+        # the N/K-independent part of `_validate.validate_layout`, as a predicate. A
+        # config that fails it still gets its scalar geometry (the host probes LDS
+        # footprints of candidates it has not validated yet) but no layout objects, so
+        # the descriptive assertion in `validate_layout` reports it, not a layout
+        # constructor.
+        ok = not (BK % instr[2] or BK % MX_GROUP or BM % MBM or BN % MBN) and not (
+            MBM % (instr[0] * warps[0] * tiles_per_warp[0])
+            or MBN % (instr[1] * warps[1] * tiles_per_warp[1])
+        )
+        for idx in ops:
+            if ok and shuffled[idx]:
+                tile, nonk = (BM, BN)[idx], scale_mini_block_nonk[idx]
+                sk = scale_mini_block_k[idx]
+                ok = (
+                    tile >= nonk >= scale_nonk[idx]
+                    and not (tile % nonk or nonk % scale_nonk[idx] or nonk % 32)
+                    and not (sk < scale_stage_k or sk & (sk - 1) or sk % BK)
+                )
+
+        num_k_slots = 1
+        num_prefetch_k_slots = 1 if _v(tc.VGPR_PREFETCH_K) else 0
+        num_m_slots = BM // MBM
+        num_n_slots = BN // MBN
+        num_lds_slots_non_k = (num_m_slots, num_n_slots)
+        payload_block_k_storage = tuple(BK // fc.pack_divisor(idx) for idx in ops)
+        scale_block_k_storage = BK // MX_GROUP
+        payload_fragment_shape_slot = (
+            [MBM, payload_block_k_storage[0]],
+            [payload_block_k_storage[1], MBN],
+        )
+        scale_fragment_shape_slot = tuple(
+            [nonk, scale_block_k_storage] for nonk in (MBM, MBN)
+        )
+        accumulator_fragment_shape_slot = [MBM, MBN]
+        # One slot, not the whole tile: A splits along M into `num_m_slots` slots of
+        # MINI_BLOCK_M rows, B along N into `num_n_slots` slots of MINI_BLOCK_N columns.
+        # Each slot is allocated, copied and read as an independent unit, so each gets
+        # its own efficient padded layout and fully coalesced direct-to-LDS copy.
+        # Slicing one tile-wide buffer would give the copy a strided view of a permuted
+        # layout.
+        payload_lds_shape_slot = (
+            [MBM, payload_block_k_storage[0]],
+            [payload_block_k_storage[1], MBN],
+        )
+        scale_lds_shape_slot = tuple(
+            [nonk, scale_block_k_storage] for nonk in (MBM, MBN)
+        )
+        payload_lds_shape_tile = tuple(
+            [tc.num_buffers(idx) * num_lds_slots_non_k[idx]]
+            + payload_lds_shape_slot[idx]
+            for idx in ops
+        )
+        # 128 bits per lane: 8 for bf16, 16 for fp8 and packed fp4 (stored as uint8).
+        # Per operand, because one value for both would allocate and copy the fp4 weight
+        # tile as if it were bf16 in every mixed configuration.
+        copy_contiguity = tuple(128 // bits for bits in elem_bits)
+        # k_width is the same 128 bits per lane, in stored elements; the tuning field is
+        # only an override. Verified against a reference GEMM on both f8f6f4 instruction
+        # shapes: k_width 32 has no efficient padded shared layout at all, and 8 with
+        # the 16x16x128 shape compiles and runs but computes the wrong answer -- exactly
+        # the class of bug no correctness-by-construction argument catches.
+        k_width_override = _v(tc.k_width)
+        k_width_for = tuple(
+            copy_contiguity[idx] if k_width_override is None else k_width_override
+            for idx in ops
+        )
+        # A preshuffled B is blocked 16x16 in HBM (see `_blocked_b_hbm_offsets`), so the
+        # pointer advances 256 per 16 stored K elements, one whole block.
+        payload_hbm_step = tuple(
+            step // 16 * 256 if pre else step
+            for step, pre in zip(payload_block_k_storage, preshuffled)
+        )
+        # A preshuffled operand is blocked 16 rows at a time in HBM and the copy has to
+        # stay linear, so the unit is that block. A plain one is read two MFMA tiles at
+        # a time (hence the `tiles_per_warp >= 2` that `validate_layout` insists on), so
+        # the unit is 32 and the row permutation has a 5th base to work with.
+        lds_unit_rows = tuple(16 if pre else 32 for pre in preshuffled)
+        # `byte_unit_lds_layout` covers only the 16x16x128 B operand shape -- 16x16x128
+        # for fp8 and 16x16x256 for packed fp4, both stored 8-bit. The 32x32x64 prefill
+        # configs, the bf16 ones (16x16x32 / 32x32x16) and any slot too short for a
+        # whole unit keep `compute_efficient_padded_shared_layout`. A non-preshuffled
+        # 32-row unit also needs the warp to own both of its 16-row MFMA tiles, i.e.
+        # `tiles_per_warp >= 2` on that axis. That is not always reachable -- at BLOCK_N
+        # 64 with warps (1, 4) the CTA's whole N tile is four 16-column tiles, so no
+        # warp can have two -- hence a gate rather than an assert.
+        byte_unit_lds_ok = []
+        for idx in ops:
+            rows = payload_lds_shape_slot[idx][idx]
+            kelems = payload_lds_shape_slot[idx][1 - idx]
+            unit_k = LDS_UNIT_K_BYTES * 8 // elem_bits[idx]
+            byte_unit_lds_ok.append(
+                is_16x16x128
+                and elem_bits[idx] == 8
+                and bool(preshuffled[idx] or tiles_per_warp[idx] >= 2)
+                and rows % lds_unit_rows[idx] == 0
+                and kelems % unit_k == 0
+            )
+        byte_unit_lds_ok = tuple(byte_unit_lds_ok)
+
+        # -- storage placement ----------------------------------------------------
+        # The final LDS-or-register decision per (operand, is_scale): the tuning
+        # policy (`KernelTuningConfig.allow_component_via_lds`) allows LDS and the slot
+        # admits a direct-to-LDS copy. There is no third placement, so a component not
+        # staged through LDS is in registers.
+        #
+        # A payload slot must give every wavefront one complete 128-bit-per-lane access.
+        # One that cannot stays in the register ring; there is deliberately no
+        # register-to-LDS fallback.
+        #
+        # A shuffled scale is fragment-ordered in HBM, so the copy is linear and the LDS
+        # tile keeps the same permutation; the read is then a 32-bit ds_read. Staying on
+        # LDS also keeps the warp-broadcast B tile a single fetch rather than one per
+        # warp. A raw scale slot is bound by CDNA4 direct-to-LDS, which supports only
+        # 128 or 32 bits per lane, with each warp writing one contiguous run. That
+        # excludes
+        #   * slots smaller than 64 lanes * 4 B, which cannot be lowered at all (the
+        #     A-scale slot at BLOCK_M == 16 with a short BLOCK_K);
+        #   * rows shorter than 8 scales (BLOCK_K < 256): one lane then owns a whole row
+        #     and the reg->shared map is more contiguous than the 32-bit access can
+        #     cover, which `canLoadDirectToLDS` rejects.
+        # Both fall back to a register `buffer_load` straight into the scale fragment
+        # layout. That is correct but costs an in-loop register-path global access,
+        # which makes every `wait_group` conservative -- so the tuner should prefer a
+        # BLOCK_K that keeps the scale on LDS.
+        component_via_lds = []
+        for idx in ops:
+            payload, scale = payload_lds_shape_slot[idx], scale_lds_shape_slot[idx]
+            component_via_lds.append(
+                (
+                    bool(tc.allow_component_via_lds((idx, False)))
+                    and (
+                        payload[0] * payload[1]
+                        >= WARP_SIZE * copy_contiguity[idx] * num_warps
+                    ),
+                    bool(tc.allow_component_via_lds((idx, True)))
+                    and (
+                        bool(shuffled[idx])
+                        or (
+                            scale[0] * scale[1] >= WARP_SIZE * 4
+                            and scale[1] % 4 == 0
+                            and scale[1] >= 8
+                        )
+                    ),
+                )
+            )
+        component_via_lds = tuple(component_via_lds)
+        # `component_via_lds` is not gated on whether a scale exists (callers gate
+        # absent scales with `has_scale`); `scale_via_lds` is.
+        payload_via_lds = tuple(placement[0] for placement in component_via_lds)
+        scale_via_lds = tuple(
+            has_scale[idx] and component_via_lds[idx][1] for idx in ops
+        )
+
+        # -- payload layouts ------------------------------------------------------
+        dot_result_fragment_layout = None
+        dot_operand_fragment_layout = (None, None)
+        dot_operand_lds_layout = [None, None]
+        dot_operand_buffer_load_lds_layout = [None, None]
+        payload_hbm_offset_layout = (None, None)
+        if ok:
+            # `transposed` is pinned True: it gives each lane 4 consecutive N elements
+            # (a 16 B contiguous store, and a lane-local even/odd gate-up pair for the
+            # fused activation) instead of 4 strided M rows.
+            assert _v(
+                tc.transposed
+            ), "transposed=True is pinned, see the module docstring"
+            dot_result_fragment_layout = gl.amd.AMDMFMALayout(
+                version=4,
+                instr_shape=instr,
+                transposed=True,
+                warps_per_cta=warps,
+                tiles_per_warp=tiles_per_warp,
+            )
+            dot_operand_fragment_layout = tuple(
+                gl.DotOperandLayout(
+                    operand_index=idx,
+                    parent=dot_result_fragment_layout,
+                    k_width=k_width_for[idx],
+                )
+                for idx in ops
+            )
+            for idx in ops:
+                if not payload_via_lds[idx]:
+                    continue
+                shape = payload_lds_shape_slot[idx]
+                if byte_unit_lds_ok[idx]:
+                    layout = byte_unit_lds_layout(
+                        shape, idx, elem_bits[idx], lds_unit_rows[idx], preshuffled[idx]
+                    )
+                else:
+                    # Both operands are K-packed under the memory-layout contract, so
+                    # is_k_contig=True and the plain `smem.load(dot_layout)` path
+                    # applies -- `load_shared_fp4_repacked` is only needed for an
+                    # M/N-packed checkpoint, which none of the four models in scope
+                    # produce.
+                    layout = gl.amd.cdna4.compute_efficient_padded_shared_layout(
+                        dot_operand_fragment_layout[idx], shape, elem_ty[idx], True
+                    )
+                    if layout is None:
+                        # The helper declines whenever the slot holds a single MFMA tile
+                        # along the non-K axis (BLOCK_M == instr_shape[0], i.e. the
+                        # whole decode regime): it has no row permutation left to build.
+                        # Fall back to a plain identity-mapped padded layout whose
+                        # interval is still >= vec * warpSize, which is the condition
+                        # `canLoadDirectToLDS` checks, so the copy stays a 128-bit
+                        # direct-to-LDS.
+                        vec = copy_contiguity[idx]
+                        layout = gl.PaddedSharedLayout.with_identity_for(
+                            [[WARP_SIZE * vec, vec]],
+                            shape,
+                            [1, 0] if idx == 0 else [0, 1],
+                        )
+                dot_operand_lds_layout[idx] = layout
+                dot_operand_buffer_load_lds_layout[idx] = _bases_to_distributed(
+                    layout.offset_bases,
+                    copy_contiguity[idx],
+                    num_warps,
+                    WARP_SIZE,
+                    shape,
+                )
+            payload_hbm_offset_layout = tuple(
+                (
+                    dot_operand_buffer_load_lds_layout[idx]
+                    if payload_via_lds[idx]
+                    else dot_operand_fragment_layout[idx]
+                )
+                for idx in ops
+            )
+        dot_operand_lds_layout = tuple(dot_operand_lds_layout)
+        dot_operand_buffer_load_lds_layout = tuple(dot_operand_buffer_load_lds_layout)
+
+        # -- scale geometry -------------------------------------------------------
+        scale_ratio_k_step = tuple(k // BK for k in scale_mini_block_k)
+        scale_ratio_non_k_slot = tuple(
+            scale_mini_block_nonk[idx] // scale_nonk[idx] for idx in ops
+        )
+        # A shuffled scale mini block narrower than the payload slot (which
+        # `validate_layout` rejects) covers no whole slot: it has no tile count, and no
+        # LDS footprint where it is staged there.
+        scale_tiles_ok = tuple(ratio > 0 for ratio in scale_ratio_non_k_slot)
+        num_scale_tiles = tuple(
+            (
+                num_lds_slots_non_k[idx] // scale_ratio_non_k_slot[idx]
+                if scale_tiles_ok[idx]
+                else None
+            )
+            for idx in ops
+        )
+        scale_read_k_slots = scale_ratio_k_step
+        scale_cache_fragments = tuple(
+            num_lds_slots_non_k[idx] * scale_read_k_slots[idx] for idx in ops
+        )
+        # A shuffled tile is staged in HBM byte order rather than fragment order because
+        # direct-to-LDS on gfx9 cannot scatter -- each warp must write coalesced, which
+        # a fragment-ordered SharedLinearLayout does not (`canLoadDirectToLDS` rejects
+        # it, see TritonAMDGPUToLLVM/Utility.cpp). The bytes therefore sit in (non-K 16,
+        # K 4) order while the u8 fragment numbers its registers (K 4, non-K 16);
+        # reconciling the two used to cost a v_perm per dword, which is what
+        # `scale_packed_ok` avoids by handing the dword to the MFMA whole and naming the
+        # byte order in a selector list.
+        scale_flat_shape = tuple(
+            [scale_mini_block_nonk[idx] // 32, scale_mini_block_k[idx]] for idx in ops
+        )
+        # Staged representation: a shuffled scale fills one flat run per scale tile, a
+        # raw one one [slot non-K, BLOCK_K/32] tile per slot.
+        scale_lds_shape_tile = []
+        for idx in ops:
+            if not scale_tiles_ok[idx]:
+                scale_lds_shape_tile.append(None)
+            elif shuffled[idx]:
+                scale_lds_shape_tile.append(
+                    [tc.num_buffers(idx, True) * num_scale_tiles[idx]]
+                    + scale_flat_shape[idx]
+                )
+            else:
+                scale_lds_shape_tile.append(
+                    [tc.num_buffers(idx, True) * num_lds_slots_non_k[idx]]
+                    + scale_lds_shape_slot[idx]
+                )
+        scale_lds_shape_tile = tuple(scale_lds_shape_tile)
+        # ScaleSwizzle.SORTED_SHUFFLED: moe_sort_scales.cuh writes one dword per
+        # (chunk, mi, ku, k_lane, n_lane) with
+        #     row = chunk*BM + (mi*MN_PACK + im_a)*16 + n_lane
+        #     k   = ku*K_PACK*4 + ikxdl*4 + k_lane
+        #     byte within the dword = ikxdl*MN_PACK + im_a
+        # so n_lane/k_lane index the 64 lanes of a wavefront, im_a/ikxdl the 4 bytes a
+        # lane holds, and mi the wave. That is exactly get_mfma_scale_layout's
+        # decomposition for a 16x16x128 dot operand with warps_per_cta = (num_warps, 1)
+        # and tiles_per_warp = (2, 1) -- verified base-for-base -- so the shuffled
+        # buffer is read with a plain contiguous load and no cross-lane movement.
+        #
+        # The permutation lives in the LDS tile's SharedLinearLayout, which is a
+        # property of the byte order the shuffle writes -- not of how warps are split --
+        # so the warp arrangement is free. An M slot only has to be a whole number of
+        # 32-row stripes: the shuffle writes one 256 B run per stripe, so a slot is a
+        # contiguous slice.
+        sorted_shuffled_ok = is_16x16x128 and BM % 32 == 0 and MBM % 32 == 0
+        scale_load_shape = tuple(
+            [scale_mini_block_nonk[idx], scale_mini_block_k[idx] // MX_GROUP]
+            for idx in ops
+        )
+
+        # -- scale layouts --------------------------------------------------------
+        # Identity (K-contiguous) staging tile for raw and shuffled scales alike. For
+        # raw E8M0 scales the three LDS goals are not simultaneously satisfiable: with
+        # `get_mfma_scale_layout` each lane wants K-scale elements strided by 2 or 4,
+        # so the read is `ds_read_u8` regardless, and the identity tile keeps the
+        # *write* side (direct-to-LDS) coalesced, which is the side that matters. A
+        # shuffled tile is a flat run in HBM byte order; its fragment order returns on
+        # the read.
+        scale_lds_layout = gl.SwizzledSharedLayout(
+            vec=1, per_phase=1, max_phase=1, order=[1, 0]
+        )
+        dot_operand_scale_lds_layout = (scale_lds_layout, scale_lds_layout)
+        dot_operand_scale_fragment_layout = [None, None]
+        scale_load_layout = [None, None]
+        dot_operand_scale_buffer_load_lds_layout = [None, None]
+        shuffled_scale_read_layout = [(None, None), (None, None)]
+        for idx in ops:
+            if not (ok and has_scale[idx]):
+                continue
+            frag = dot_operand_fragment_layout[idx]
+            dot_operand_scale_fragment_layout[idx] = gl.amd.cdna4.get_mfma_scale_layout(
+                frag, scale_fragment_shape_slot[idx], MX_GROUP
+            )
+            scale_load_layout[idx] = gl.amd.cdna4.get_mfma_scale_layout(
+                frag, scale_load_shape[idx], MX_GROUP
+            )
+            if scale_via_lds[idx]:
+                # 32 bits per lane. A shuffled tile is a flat run, so one warp covers
+                # 64 lanes x 4 contiguous bytes of it; a raw row of BLOCK_K/32 scales is
+                # split 4 per lane.
+                lanes_k = WARP_SIZE if shuffled[idx] else scale_block_k_storage // 4
+                dot_operand_scale_buffer_load_lds_layout[idx] = gl.BlockedLayout(
+                    size_per_thread=[1, 4],
+                    threads_per_warp=[WARP_SIZE // lanes_k, lanes_k],
+                    warps_per_cta=[num_warps, 1],
+                    order=[1, 0],
+                )
+            # Offset base i is byte 1 << i of the flat run, in the CDNA4_SCALE byte
+            # order spelled out in `_scale_dword_delta`. Index 0 views one stage, index
+            # 1 one scale load.
+            shuffled_scale_read_layout[idx] = tuple(
+                gl.SharedLinearLayout(
+                    offset_bases=[[16, 0], [0, 4]]  # the 4 bytes of a lane's dword
+                    + _pow2_bases(0, 2, [1, 2, 4, 8])  # 16 non-K lanes
+                    + _pow2_bases(1, 2, [1, 2])  # 4 K lanes
+                    + _pow2_bases(1, 2, _ramp(8, k // MX_GROUP))  # the rest of K
+                    + _pow2_bases(0, 2, _ramp(32, nonk))  # further 32-row stripes
+                )
+                for nonk, k in (
+                    (scale_nonk[idx], scale_stage_k),
+                    (scale_mini_block_nonk[idx], scale_mini_block_k[idx]),
+                )
+            )
+        dot_operand_scale_fragment_layout = tuple(dot_operand_scale_fragment_layout)
+        scale_load_layout = tuple(scale_load_layout)
+        dot_operand_scale_buffer_load_lds_layout = tuple(
+            dot_operand_scale_buffer_load_lds_layout
+        )
+        shuffled_scale_read_layout = tuple(shuffled_scale_read_layout)
+
+        # -- packed (i32) scales --------------------------------------------------
+        # Every shuffle here puts four scales in a dword, and the matrix instruction can
+        # pick one of them with op_sel. So a lane loads the dword whole and hands it to
+        # mfma_scaled_packed as an i32, with the byte order named in a selector list --
+        # no reinterpret to u8, no register renumbering, no v_perm.
+        #
+        # CDNA4_SCALE / SORTED_SHUFFLED put non-K +16 and K +4 inside the dword, at byte
+        # (nonK) + 2*(K). That fixed pair only works when the fragment happens to hold
+        # both steps in registers, so `scale_packed_ok` checks it rather than assuming
+        # it: K256 folds K+4 and non-K+16, K128 folds only non-K+16 and selects its K
+        # half separately, and each folded step must be register-private. A shuffled
+        # operand is a scaled one, so under `ok` its fragment layout exists.
+        scale_packed_ok = [False, False]
+        for idx in ops:
+            if ok and shuffled[idx] and BK in (128, 256):
+                regs = [
+                    list(b) for b in dot_operand_scale_fragment_layout[idx].reg_bases
+                ]
+                if BK == 128:
+                    scale_packed_ok[idx] = len(regs) >= 1 and regs[0] == [16, 0]
+                else:
+                    scale_packed_ok[idx] = (
+                        len(regs) >= 2 and regs[0] == [0, 4] and regs[1] == [16, 0]
+                    )
+        scale_packed_ok = tuple(scale_packed_ok)
+        # Selectors per K phase. The instruction index counts non-K major and K minor,
+        # so its low two bits are the fragment's first two register bases in that order.
+        # CDNA4_SCALE numbers the dword's bytes the other way round, hence the
+        # transposition; a K128 stage picks the two bytes of its half instead.
+        scale_packed_sel = tuple(
+            tuple(
+                (
+                    ([2 * k_phase, 2 * k_phase + 1] if BK == 128 else [0, 2, 1, 3])
+                    if scale_packed_ok[idx]
+                    else None
+                )
+                for k_phase in (0, 1)
+            )
+            for idx in ops
+        )
+        has_mfma_packed_scale = scale_packed_ok[0] or scale_packed_ok[1]
+        packed_scale_shape = tuple([nonk, scale_stage_k // 128] for nonk in scale_nonk)
+        packed_scale_load_shape = tuple(
+            [scale_mini_block_nonk[idx], scale_mini_block_k[idx] // 128] for idx in ops
+        )
+        packed_scale_frag_layout = [None, None]
+        packed_scale_read_layout = [(None, None), (None, None)]
+        packed_scale_load_layout = [None, None]
+        for idx in ops:
+            if not (ok and has_scale[idx]):
+                continue
+            frag = gl.amd.cdna4.get_mfma_scale_layout(
+                dot_operand_fragment_layout[idx],
+                [scale_nonk[idx], scale_stage_k // MX_GROUP],
+                MX_GROUP,
+            )
+            packed_scale_frag_layout[idx] = gl.DistributedLinearLayout(
+                reg_bases=[
+                    _scale_dword_delta(b, scale_stage_k) for b in frag.reg_bases[2:]
+                ],
+                lane_bases=[
+                    _scale_dword_delta(b, scale_stage_k) for b in frag.lane_bases
+                ],
+                warp_bases=[
+                    _scale_dword_delta(b, scale_stage_k) for b in frag.warp_bases
+                ],
+                block_bases=[],
+                shape=packed_scale_shape[idx],
+            )
+            packed_scale_read_layout[idx] = tuple(
+                gl.SharedLinearLayout(
+                    offset_bases=[
+                        _scale_dword_delta(b, k) for b in list(view.offset_bases)[2:]
+                    ]
+                )
+                for view, k in zip(
+                    shuffled_scale_read_layout[idx],
+                    (scale_stage_k, scale_mini_block_k[idx]),
+                )
+            )
+            # The two within-dword axes are identified by value, not position. Wider
+            # scale K tiles insert additional K register bases between them.
+            frag = scale_load_layout[idx]
+            k = scale_mini_block_k[idx]
+            within_dword = ([0, 4], [16, 0])
+            packed_scale_load_layout[idx] = gl.DistributedLinearLayout(
+                reg_bases=[
+                    _scale_dword_delta(b, k)
+                    for b in frag.reg_bases
+                    if list(b) not in within_dword
+                ],
+                lane_bases=[_scale_dword_delta(b, k) for b in frag.lane_bases],
+                warp_bases=[_scale_dword_delta(b, k) for b in frag.warp_bases],
+                block_bases=[],
+                shape=packed_scale_load_shape[idx],
+            )
+        packed_scale_frag_layout = tuple(packed_scale_frag_layout)
+        packed_scale_read_layout = tuple(packed_scale_read_layout)
+        packed_scale_load_layout = tuple(packed_scale_load_layout)
+
+        # The layout one scale tile's HBM offsets are formed in: the copy layout when
+        # the scale is staged through LDS, otherwise the register layout the load lands
+        # in.
+        scale_hbm_offset_layout = [None, None]
+        for idx in ops:
+            if not (ok and has_scale[idx]):
+                continue
+            if scale_via_lds[idx]:
+                layout = dot_operand_scale_buffer_load_lds_layout[idx]
+            elif not shuffled[idx]:
+                layout = dot_operand_scale_fragment_layout[idx]
+            elif scale_packed_ok[idx]:
+                layout = packed_scale_load_layout[idx]
+            else:
+                # get_mfma_scale_layout puts the K-group bit before the non-K bit in
+                # reg_bases, so a lane's four bytes land in registers in address order
+                # 0, +2, +1, +3. A widened load fills registers in ascending order;
+                # issue it with those two bases swapped, then convert with only a
+                # lane-local register renumber because the lane and warp bases stay
+                # unchanged.
+                frag = scale_load_layout[idx]
+                lead = [[16, 0], [0, 4]]
+                rest = [list(b) for b in frag.reg_bases if list(b) not in lead]
+                layout = gl.DistributedLinearLayout(
+                    reg_bases=lead + rest,
+                    lane_bases=[list(b) for b in frag.lane_bases],
+                    warp_bases=[list(b) for b in frag.warp_bases],
+                    block_bases=[],
+                    shape=list(frag.shape),
+                )
+            scale_hbm_offset_layout[idx] = layout
+        scale_hbm_offset_layout = tuple(scale_hbm_offset_layout)
+
+        # -- epilogue -------------------------------------------------------------
+        output_n_slot = MBN // _n_reduction_slot(fc)
+        output_block_n = BN // fc.activation_reduction_n()
+        epilogue_threads = threads
+        epilogue_bias_per_thread = BN // epilogue_threads
+        # No knob controls this placement: the bias/gamma vectors go through LDS
+        # whenever the copy is legal for the tile.
+        epilogue_inputs_via_lds = (
+            epilogue_threads >= BM
+            and BN % epilogue_threads == 0
+            and epilogue_bias_per_thread in (1, 4)
+        )
+        epilogue_input_lds_layout = gl.SwizzledSharedLayout(
+            vec=1, per_phase=1, max_phase=1, order=[0]
+        )
+        epilogue_gamma_buffer_load_lds_layout = None
+        epilogue_bias_buffer_load_lds_layout = None
+        if epilogue_inputs_via_lds:
+            epilogue_gamma_buffer_load_lds_layout = gl.BlockedLayout(
+                [1], [WARP_SIZE], [num_warps], [0]
+            )
+            epilogue_bias_buffer_load_lds_layout = gl.BlockedLayout(
+                [epilogue_bias_per_thread], [WARP_SIZE], [num_warps], [0]
+            )
+        epilogue_gamma_shape = [epilogue_threads]
+        epilogue_bias_shape = [BN]
+        quant_staging_layout = gl.SwizzledSharedLayout(
+            vec=1, per_phase=1, max_phase=1, order=[1, 0]
+        )
+        quant_staging_rows = BM if gu_split else MBM
+        quant_staging_rotates = _v(fc.output_quant) is not None and not gu_split
+
+        # -- resources ------------------------------------------------------------
+        # LDS footprint of the components staged there. A staged scale without a tile
+        # count (see `scale_tiles_ok`) has no footprint, so neither has the build.
+        lds_bytes = None
+        if all(scale_tiles_ok[idx] or not scale_via_lds[idx] for idx in ops):
+            lds_bytes = 0
+            for idx in ops:
+                if payload_via_lds[idx]:
+                    # Ring depth x slots x one slot, in stored elements.
+                    tile = payload_lds_shape_tile[idx]
+                    lds_bytes += tile[0] * tile[1] * tile[2] * (elem_bits[idx] // 8)
+                if scale_via_lds[idx]:
+                    tile = scale_lds_shape_tile[idx]
+                    lds_bytes += tile[0] * tile[1] * tile[2]
+        acc_vgprs_per_lane = BM * BN // threads
+
+        # -- fields ---------------------------------------------------------------
+        # Stored last, in declaration order: an aggregate accepts nothing but its
+        # annotated fields, so every intermediate above stays a local.
+
+        # tile and slot geometry
+        self._BLOCK_N = gl.constexpr(BN)
+        self._BLOCK_K = gl.constexpr(BK)
+        self._mfma_instr_shape = gl.constexpr(list(instr))
+        self._weight_gu_hbm_layout = gl.constexpr(_v(fc.weight_gu_hbm_layout))
+        self._num_warps = gl.constexpr(num_warps)
+        self._num_k_slots = gl.constexpr(num_k_slots)
+        self._num_prefetch_k_slots = gl.constexpr(num_prefetch_k_slots)
+        self._num_m_slots = gl.constexpr(num_m_slots)
+        self._num_n_slots = gl.constexpr(num_n_slots)
+        self._num_lds_slots_non_k = gl.constexpr(num_lds_slots_non_k)
+        self._payload_block_k_storage = gl.constexpr(payload_block_k_storage)
+        self._scale_block_k_storage = gl.constexpr(scale_block_k_storage)
+        self._payload_fragment_shape_slot = gl.constexpr(payload_fragment_shape_slot)
+        self._scale_fragment_shape_slot = gl.constexpr(scale_fragment_shape_slot)
+        self._accumulator_fragment_shape_slot = gl.constexpr(
+            accumulator_fragment_shape_slot
+        )
+        self._payload_lds_shape_slot = gl.constexpr(payload_lds_shape_slot)
+        self._scale_lds_shape_slot = gl.constexpr(scale_lds_shape_slot)
+        self._payload_lds_shape_tile = gl.constexpr(payload_lds_shape_tile)
+        self._scale_lds_shape_tile = gl.constexpr(scale_lds_shape_tile)
+        self._copy_contiguity = gl.constexpr(copy_contiguity)
+        self._k_width_for = gl.constexpr(k_width_for)
+        self._payload_hbm_step = gl.constexpr(payload_hbm_step)
+        self._lds_unit_rows = gl.constexpr(lds_unit_rows)
+        self._byte_unit_lds_ok = gl.constexpr(byte_unit_lds_ok)
+
+        # storage placement
+        self._component_via_lds = gl.constexpr(component_via_lds)
+
+        # payload layouts
+        self._dot_result_fragment_layout = gl.constexpr(dot_result_fragment_layout)
+        self._dot_operand_fragment_layout = gl.constexpr(dot_operand_fragment_layout)
+        self._dot_operand_lds_layout = gl.constexpr(dot_operand_lds_layout)
+        self._dot_operand_buffer_load_lds_layout = gl.constexpr(
+            dot_operand_buffer_load_lds_layout
+        )
+        self._payload_hbm_offset_layout = gl.constexpr(payload_hbm_offset_layout)
+
+        # scale geometry
+        self._scale_nonk = gl.constexpr(scale_nonk)
+        self._scale_mini_block_nonk = gl.constexpr(scale_mini_block_nonk)
+        self._scale_mini_block_k = gl.constexpr(scale_mini_block_k)
+        self._scale_ratio_k_step = gl.constexpr(scale_ratio_k_step)
+        self._scale_ratio_non_k_slot = gl.constexpr(scale_ratio_non_k_slot)
+        self._num_scale_tiles = gl.constexpr(num_scale_tiles)
+        self._scale_read_k_slots = gl.constexpr(scale_read_k_slots)
+        self._scale_cache_fragments = gl.constexpr(scale_cache_fragments)
+        self._scale_flat_shape = gl.constexpr(scale_flat_shape)
+        self._sorted_shuffled_ok = gl.constexpr(sorted_shuffled_ok)
+        self._scale_load_shape = gl.constexpr(scale_load_shape)
+        self._scale_packed_ok = gl.constexpr(scale_packed_ok)
+        self._scale_packed_sel = gl.constexpr(scale_packed_sel)
+        self._has_mfma_packed_scale = gl.constexpr(has_mfma_packed_scale)
+        self._packed_scale_shape = gl.constexpr(packed_scale_shape)
+        self._packed_scale_load_shape = gl.constexpr(packed_scale_load_shape)
+
+        # scale layouts
+        self._dot_operand_scale_fragment_layout = gl.constexpr(
+            dot_operand_scale_fragment_layout
+        )
+        self._dot_operand_scale_lds_layout = gl.constexpr(dot_operand_scale_lds_layout)
+        self._dot_operand_scale_buffer_load_lds_layout = gl.constexpr(
+            dot_operand_scale_buffer_load_lds_layout
+        )
+        self._scale_hbm_offset_layout = gl.constexpr(scale_hbm_offset_layout)
+        self._shuffled_scale_read_layout = gl.constexpr(shuffled_scale_read_layout)
+        self._scale_load_layout = gl.constexpr(scale_load_layout)
+        self._packed_scale_frag_layout = gl.constexpr(packed_scale_frag_layout)
+        self._packed_scale_read_layout = gl.constexpr(packed_scale_read_layout)
+        self._packed_scale_load_layout = gl.constexpr(packed_scale_load_layout)
+
+        # epilogue
+        self._output_n_slot = gl.constexpr(output_n_slot)
+        self._output_block_n = gl.constexpr(output_block_n)
+        self._epilogue_threads = gl.constexpr(epilogue_threads)
+        self._epilogue_bias_per_thread = gl.constexpr(epilogue_bias_per_thread)
+        self._epilogue_input_lds_layout = gl.constexpr(epilogue_input_lds_layout)
+        self._epilogue_gamma_buffer_load_lds_layout = gl.constexpr(
+            epilogue_gamma_buffer_load_lds_layout
+        )
+        self._epilogue_bias_buffer_load_lds_layout = gl.constexpr(
+            epilogue_bias_buffer_load_lds_layout
+        )
+        self._epilogue_gamma_shape = gl.constexpr(epilogue_gamma_shape)
+        self._epilogue_bias_shape = gl.constexpr(epilogue_bias_shape)
+        self._epilogue_inputs_via_lds = gl.constexpr(epilogue_inputs_via_lds)
+        self._quant_staging_layout = gl.constexpr(quant_staging_layout)
+        self._quant_staging_rows = gl.constexpr(quant_staging_rows)
+        self._quant_staging_rotates = gl.constexpr(quant_staging_rotates)
+
+        # resources
+        self._lds_bytes = gl.constexpr(lds_bytes)
+        self._acc_vgprs_per_lane = gl.constexpr(acc_vgprs_per_lane)
 
     # -- tile and slot geometry --------------------------------------------------
 
@@ -2018,164 +1887,3 @@ class KernelLayout:
                     * b.scale_stride_k,
                 )
         return b_scale_hbm_offsets_tile
-
-
-@gluon.constexpr_function
-def compute_kernel_layout(tuning_cfg):
-    """Evaluate every layout of one build from its tuning configuration.
-
-    Host and device both call this on the same configuration, so the host's LDS and
-    grid arithmetic and the kernel's tile arithmetic cannot drift. A config whose tile
-    lattice is unsound (see :func:`_calc_geometry_ok`) still gets its scalar geometry,
-    but its layout objects are ``None``; ``_validate.validate_layout`` rejects it.
-    """
-    tc = tuning_cfg
-    fc = tc.func_cfg
-    ok = _calc_geometry_ok(tc)
-    ops = (0, 1)
-
-    def pair(fn, *args):
-        return tuple(fn(tc, idx, *args) for idx in ops)
-
-    def pair_if(cond, fn, *args):
-        return tuple(fn(tc, idx, *args) if ok and cond(idx) else None for idx in ops)
-
-    def always(idx):
-        return True
-
-    def has_scale(idx):
-        return fc.has_scale(idx)
-
-    bools = (False, True)
-    via_lds = tuple(
-        tuple(_calc_component_via_lds(tc, (idx, is_scale)) for is_scale in bools)
-        for idx in ops
-    )
-
-    def payload_via_lds(idx):
-        return via_lds[idx][0]
-
-    def scale_via_lds(idx):
-        return has_scale(idx) and via_lds[idx][1]
-
-    def scale_tiles_ok(idx):
-        # A shuffled scale mini block narrower than the payload slot (which
-        # ``validate_layout`` rejects) covers no whole slot: it has no tile count, and
-        # no LDS footprint where it is staged there.
-        return _calc_scale_ratio_non_k_slot(tc, idx) > 0
-
-    def scale_tiles(fn):
-        return tuple(fn(tc, idx) if scale_tiles_ok(idx) else None for idx in ops)
-
-    lds_ok = all(scale_tiles_ok(idx) or not scale_via_lds(idx) for idx in ops)
-    epilogue_via_lds = _calc_epilogue_inputs_via_lds(tc)
-    return KernelLayout(
-        BLOCK_N=_v(tc.BLOCK_N),
-        BLOCK_K=_v(tc.BLOCK_K),
-        mfma_instr_shape=list(_v(tc.mfma_instr_shape)),
-        weight_gu_hbm_layout=_v(fc.weight_gu_hbm_layout),
-        num_warps=_calc_num_warps(tc),
-        num_k_slots=_calc_num_k_slots(tc),
-        num_prefetch_k_slots=_calc_num_prefetch_k_slots(tc),
-        num_m_slots=_calc_num_m_slots(tc),
-        num_n_slots=_calc_num_n_slots(tc),
-        num_lds_slots_non_k=pair(_calc_num_lds_slots_non_k),
-        payload_block_k_storage=pair(_calc_payload_block_k_storage),
-        scale_block_k_storage=_calc_scale_block_k_storage(tc),
-        payload_fragment_shape_slot=pair(_calc_payload_fragment_shape_slot),
-        scale_fragment_shape_slot=pair(_calc_scale_fragment_shape_slot),
-        accumulator_fragment_shape_slot=_calc_accumulator_fragment_shape_slot(tc),
-        payload_lds_shape_slot=pair(_calc_payload_lds_shape_slot),
-        scale_lds_shape_slot=pair(_calc_scale_lds_shape_slot),
-        payload_lds_shape_tile=pair(_calc_payload_lds_shape_tile),
-        scale_lds_shape_tile=scale_tiles(_calc_scale_lds_shape_tile),
-        copy_contiguity=pair(_calc_copy_contiguity),
-        k_width_for=pair(_calc_k_width_for),
-        payload_hbm_step=pair(_calc_payload_hbm_step),
-        lds_unit_rows=pair(_calc_lds_unit_rows),
-        byte_unit_lds_ok=pair(_calc_byte_unit_lds_ok),
-        component_via_lds=via_lds,
-        dot_result_fragment_layout=_calc_dot_result_fragment_layout(tc) if ok else None,
-        dot_operand_fragment_layout=pair_if(always, _calc_dot_operand_fragment_layout),
-        dot_operand_lds_layout=pair_if(payload_via_lds, _calc_dot_operand_lds_layout),
-        dot_operand_buffer_load_lds_layout=pair_if(
-            payload_via_lds, _calc_dot_operand_buffer_load_lds_layout
-        ),
-        payload_hbm_offset_layout=pair_if(always, _calc_payload_hbm_offset_layout),
-        scale_nonk=pair(_calc_scale_nonk),
-        scale_mini_block_nonk=pair(_calc_scale_mini_block_nonk),
-        scale_mini_block_k=pair(_calc_scale_mini_block_k),
-        scale_ratio_k_step=pair(_calc_scale_ratio_k_step),
-        scale_ratio_non_k_slot=pair(_calc_scale_ratio_non_k_slot),
-        num_scale_tiles=scale_tiles(_calc_num_scale_tiles),
-        scale_read_k_slots=pair(_calc_scale_read_k_slots),
-        scale_cache_fragments=pair(_calc_scale_cache_fragments),
-        scale_flat_shape=pair(_calc_scale_flat_shape),
-        sorted_shuffled_ok=_calc_sorted_shuffled_ok(tc),
-        scale_load_shape=pair(_calc_scale_load_shape),
-        scale_packed_ok=pair(_calc_scale_packed_ok) if ok else (False, False),
-        scale_packed_sel=tuple(
-            tuple(
-                _calc_scale_packed_sel(tc, idx, k_phase) if ok else None
-                for k_phase in (0, 1)
-            )
-            for idx in ops
-        ),
-        has_mfma_packed_scale=_calc_has_mfma_packed_scale(tc) if ok else False,
-        packed_scale_shape=pair(_calc_packed_scale_shape),
-        packed_scale_load_shape=pair(_calc_packed_scale_load_shape),
-        dot_operand_scale_fragment_layout=pair_if(
-            has_scale, _calc_dot_operand_scale_fragment_layout
-        ),
-        dot_operand_scale_lds_layout=pair(_calc_dot_operand_scale_lds_layout),
-        dot_operand_scale_buffer_load_lds_layout=pair_if(
-            scale_via_lds, _calc_dot_operand_scale_buffer_load_lds_layout
-        ),
-        scale_hbm_offset_layout=pair_if(has_scale, _calc_scale_hbm_offset_layout),
-        shuffled_scale_read_layout=tuple(
-            tuple(
-                (
-                    _calc_shuffled_scale_read_layout(tc, idx, load)
-                    if ok and has_scale(idx)
-                    else None
-                )
-                for load in bools
-            )
-            for idx in ops
-        ),
-        scale_load_layout=pair_if(has_scale, _calc_scale_load_layout),
-        packed_scale_frag_layout=pair_if(has_scale, _calc_packed_scale_frag_layout),
-        packed_scale_read_layout=tuple(
-            tuple(
-                (
-                    _calc_packed_scale_read_layout(tc, idx, load)
-                    if ok and has_scale(idx)
-                    else None
-                )
-                for load in bools
-            )
-            for idx in ops
-        ),
-        packed_scale_load_layout=pair_if(has_scale, _calc_packed_scale_load_layout),
-        output_n_slot=_calc_output_n_slot(tc),
-        output_block_n=_calc_output_block_n(tc),
-        epilogue_threads=_calc_epilogue_threads(tc),
-        epilogue_bias_per_thread=_calc_epilogue_bias_per_thread(tc),
-        epilogue_input_lds_layout=_calc_epilogue_input_lds_layout(tc),
-        epilogue_gamma_buffer_load_lds_layout=(
-            _calc_epilogue_gamma_buffer_load_lds_layout(tc)
-            if epilogue_via_lds
-            else None
-        ),
-        epilogue_bias_buffer_load_lds_layout=(
-            _calc_epilogue_bias_buffer_load_lds_layout(tc) if epilogue_via_lds else None
-        ),
-        epilogue_gamma_shape=_calc_epilogue_gamma_shape(tc),
-        epilogue_bias_shape=_calc_epilogue_bias_shape(tc),
-        epilogue_inputs_via_lds=epilogue_via_lds,
-        quant_staging_layout=_calc_quant_staging_layout(tc),
-        quant_staging_rows=_calc_quant_staging_rows(tc),
-        quant_staging_rotates=_calc_quant_staging_rotates(tc),
-        lds_bytes=_calc_lds_bytes(tc) if lds_ok else None,
-        acc_vgprs_per_lane=_calc_acc_vgprs_per_lane(tc),
-    )

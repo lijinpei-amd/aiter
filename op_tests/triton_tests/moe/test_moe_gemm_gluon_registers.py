@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import compute_kernel_layout
+from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import KernelLayout
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
     A_PAYLOAD,
     B_PAYLOAD,
@@ -298,7 +298,7 @@ def test_small_a_payload_uses_register_ring(monkeypatch):
         tiles_per_warp=(1, 2),
         K_UNROLL=3,
     )
-    layout = compute_kernel_layout(
+    layout = KernelLayout(
         host._probe_tuning_config(config, DtypeQuant.BF16, DtypeQuant.BF16)
     )
     assert host._cval(layout.component_in_reg(A_PAYLOAD))
@@ -334,7 +334,7 @@ def test_small_b_payload_uses_register_ring_without_preshuffle(monkeypatch):
         ALLOW_B_VIA_LDS=True,
         B_PRESHUFFLED=False,
     )
-    layout = compute_kernel_layout(
+    layout = KernelLayout(
         host._probe_tuning_config(config, DtypeQuant.BF16, DtypeQuant.BF16)
     )
     assert host._cval(layout.component_via_lds(A_PAYLOAD))
@@ -370,7 +370,7 @@ def test_small_a_and_b_payloads_share_register_pipeline(monkeypatch):
         ALLOW_B_VIA_LDS=True,
         B_PRESHUFFLED=False,
     )
-    layout = compute_kernel_layout(
+    layout = KernelLayout(
         host._probe_tuning_config(config, DtypeQuant.BF16, DtypeQuant.BF16)
     )
     assert host._cval(layout.component_in_reg(A_PAYLOAD))
@@ -643,7 +643,7 @@ def test_minimum_k_and_every_reachable_unroll_remainder(dtype, schedule, monkeyp
         DtypeQuant, {"mxfp4": "MXFP4", "mxfp8": "MXFP8", "bf16": "BF16"}[dtype]
     )
     tc = host._probe_tuning_config(config, dtype_quant, dtype_quant)
-    layout = compute_kernel_layout(tc)
+    layout = KernelLayout(tc)
     minimum = host._cval(
         pipeline_depth(tc, layout)
         + _pipeline_peeled(tc, layout)

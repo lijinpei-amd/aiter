@@ -23,7 +23,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._config import (
     KernelTuningConfig,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import unwrap
-from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import compute_kernel_layout
+from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import KernelLayout
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
     B_PAYLOAD,
     COMPONENTS,
@@ -149,7 +149,7 @@ def test_packed_words_and_selectors_match_producer(
         warps_per_cta=warps,
     )
     assert validate(tc, 4096, 7168)
-    layout = compute_kernel_layout(tc)
+    layout = KernelLayout(tc)
     assert layout.scale_packed_ok(operand)
     byte_layout = layout.dot_operand_scale_fragment_layout(operand)
     word_layout = layout.packed_scale_frag_layout(operand)
@@ -208,7 +208,7 @@ def test_wide_packed_scale_load_layout_matches_producer(scale_k, operand):
         SCALE_MINI_BLOCK_N=256,
         SCALE_MINI_BLOCK_K=scale_k,
     )
-    layout = compute_kernel_layout(tc)
+    layout = KernelLayout(tc)
     nonk = layout.scale_mini_block_nonk(operand)
     producer = [
         (stripe * 32 + row + half_row * 16, ku * 8 + group + half_k * 4)
@@ -285,7 +285,7 @@ def test_dot_helpers_forward_scale_phase(monkeypatch, block_k, dtype, phase):
             VGPR_PREFETCH_K=block_k,
         )
     )
-    layout = _HostView(compute_kernel_layout(tc.config))
+    layout = _HostView(KernelLayout(tc.config))
     fc = _HostView(tc.func_cfg)
     calls = []
 
@@ -576,7 +576,7 @@ def test_pipeline_phases_and_packed_scale_addresses(
             ALLOW_B_SCALE_VIA_LDS=not registers,
         )
     )
-    layout = _HostView(compute_kernel_layout(tc.config))
+    layout = _HostView(KernelLayout(tc.config))
     minimum_tiles = (
         pipeline_depth(tc, layout)
         + _pipeline_peeled(tc, layout)
