@@ -1188,7 +1188,6 @@ class KernelLayout:
     # -- block and slot geometry --
     _BLOCK_N: gl.constexpr
     _BLOCK_K: gl.constexpr
-    _MINI_BLOCK_M: gl.constexpr
     _mfma_instr_shape: gl.constexpr
     _gu_split: gl.constexpr
     _num_warps: gl.constexpr
@@ -1713,7 +1712,11 @@ class KernelLayout:
         ``instr_m * instr_n / WARP_SIZE`` consecutive emitted columns (four for
         16x16), before the first lane base.
         """
-        extent_m = _v(self._MINI_BLOCK_M) if _v(extent_m) is None else _v(extent_m)
+        extent_m = (
+            self.accumulator_fragment_shape_slot()[0]
+            if _v(extent_m) is None
+            else _v(extent_m)
+        )
         output_n = self.output_n_slot() if _v(output_n) is None else _v(output_n)
         if _v(self._gu_split):
             instr = _v(self._mfma_instr_shape)
@@ -2066,7 +2069,6 @@ def compute_kernel_layout(tuning_cfg):
     return KernelLayout(
         BLOCK_N=_v(tc.BLOCK_N),
         BLOCK_K=_v(tc.BLOCK_K),
-        MINI_BLOCK_M=_v(tc.MINI_BLOCK_M),
         mfma_instr_shape=list(_v(tc.mfma_instr_shape)),
         gu_split=fc.gu_split(),
         num_warps=_calc_num_warps(tc),
