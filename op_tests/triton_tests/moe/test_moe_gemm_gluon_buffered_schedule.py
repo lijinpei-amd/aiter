@@ -425,12 +425,12 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
     )
     step_fn, fill_fn = pipeline._step.fn, pipeline._fill_slot.fn
     read_slot_fn = pipeline._read_slot.fn
-    read_tile_fn = pipeline._read_tile.fn
-    read_scale_tile_fn = pipeline._read_scale_tile.fn
+    read_payload_fn = pipeline._read_payload.fn
+    read_scale_fn = pipeline._read_scale.fn
 
     # Positional layouts: _step(pc, ptrs, buffers, regs, step, STEP),
     # _fill_slot(pc, ptrs, buffers, step, STEP, mi, ni), _read_slot(pc, buffers, step,
-    # STEP, mi, ni, MFMA), _read_tile/_read_scale_tile(pc, buffers, step, STEP,
+    # STEP, mi, ni, MFMA), _read_payload/_read_scale(pc, buffers, step, STEP,
     # non-K slot, operand).
     def step(*args, **kwargs):
         assert machine.wait is None, "a wait guarded no read"
@@ -455,7 +455,7 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
                 machine.check_wait(None)
         return read_slot_fn(*args, **kwargs)
 
-    def read_tile(*args, **kwargs):
+    def read_payload(*args, **kwargs):
         component = (args[5], PAYLOAD)
         if tc.component_in_reg(component):
             machine.events.append(
@@ -469,9 +469,9 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
                     args[4],
                 )
             )
-        return read_tile_fn(*args, **kwargs)
+        return read_payload_fn(*args, **kwargs)
 
-    def read_scale_tile(*args, **kwargs):
+    def read_scale(*args, **kwargs):
         operand = args[5]
         component = (operand, SCALE)
         if tc.component_in_reg(component):
@@ -487,7 +487,7 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
                     args[4],
                 )
             )
-        return read_scale_tile_fn(*args, **kwargs)
+        return read_scale_fn(*args, **kwargs)
 
     def check_assumption(value):
         assert value
@@ -531,12 +531,12 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
     with monkeypatch.context() as patch:
         for name in (
             "_index",
-            "_replace_tile",
+            "_replace_fragments",
             "_rotate",
             "_rotate_buffers",
             "_advance",
-            "_read_tile",
-            "_read_scale_tile",
+            "_read_payload",
+            "_read_scale",
             "_read_slot",
             "_step_live",
             "_take_reg_pairs",
@@ -549,8 +549,8 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         patch.setattr(pipeline, "_step", step)
         patch.setattr(pipeline, "_fill_slot", fill)
         patch.setattr(pipeline, "_read_slot", read_slot)
-        patch.setattr(pipeline, "_read_tile", read_tile)
-        patch.setattr(pipeline, "_read_scale_tile", read_scale_tile)
+        patch.setattr(pipeline, "_read_payload", read_payload)
+        patch.setattr(pipeline, "_read_scale", read_scale)
         patch.setattr(pipeline, "_init_buffers", init_buffers)
         patch.setattr(pipeline, "_maybe_block_dot", machine.dot)
         patch.setattr(
