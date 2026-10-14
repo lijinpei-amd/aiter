@@ -64,310 +64,33 @@ The output buffer still carries the leading ``(1, M, N)`` axis that ``reduce_gro
 indexes.
 """
 
-import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
-from triton.language.core import _aggregate as aggregate
 
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu_gate
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from aiter.ops.triton.utils.common_utils import strip_annotate
 
-from ._config import KernelFuncConfig, KernelTuningConfig
 from ._epilogue import _epi_bias_tiles, _epilogue_store, _stage_epilogue_inputs
-from ._lang import optional as _opt
 from ._lang import require_constexpr
-from ._lang import unwrap as _v
-from ._layout import KernelLayout
 from ._lds import LDSManager
-from ._types import A_SCALE, B_SCALE, DotKind, TileSched, _slot_index
+from ._mfma import _maybe_block_dot
+from ._pipeline import (
+    _drain_buffered_pipeline,
+    _last_mfma,
+    _PipelineConst,
+    _PipelinePointers,
+    _PipelineRegFragments,
+    _run_buffered_pipeline,
+    _take_reg_pairs,
+)
+from ._types import A_SCALE, B_SCALE, TileSched, _slot_index
 from ._validate import validate, validate_pipeline
 
 _A_SCALE: gl.constexpr = gl.constexpr(A_SCALE)
 _B_SCALE: gl.constexpr = gl.constexpr(B_SCALE)
-_SG_MFMA: gl.constexpr = gl.constexpr(8)
-_SG_DS_READ: gl.constexpr = gl.constexpr(256)
-_SG_VMEM: gl.constexpr = gl.constexpr(16)
-
-
-@gluon.jit
-def _sched_hint(MODE: gl.constexpr):
-    """Scheduling recipe for one K stage, emitted at the top of its region."""
-    if require_constexpr(MODE == 1):
-        gl.amd.cdna4.iglp_opt(0)
-    elif require_constexpr(MODE == 2):
-        gl.amd.cdna4.iglp_opt(1)
-    elif require_constexpr(MODE == 3):
-        for _ in gl.static_range(4):
-            gl.amd.cdna4.sched_group_barrier(_SG_MFMA, 16, 0)
-            gl.amd.cdna4.sched_group_barrier(_SG_DS_READ, 6, 0)
-            gl.amd.cdna4.sched_group_barrier(_SG_VMEM, 4, 0)
-    elif require_constexpr(MODE == 4):
-        for _ in gl.static_range(8):
-            gl.amd.cdna4.sched_group_barrier(_SG_MFMA, 8, 0)
-            gl.amd.cdna4.sched_group_barrier(_SG_DS_READ, 3, 0)
-            gl.amd.cdna4.sched_group_barrier(_SG_VMEM, 2, 0)
-
 
 _TS_XCD_GROUP_M: gl.constexpr = gl.constexpr(int(TileSched.XCD_GROUP_M))
 _TS_GROUP_M: gl.constexpr = gl.constexpr(int(TileSched.GROUP_M))
-_DK_MFMA: gl.constexpr = gl.constexpr(int(DotKind.MFMA))
-_DK_MFMA_SCALED: gl.constexpr = gl.constexpr(int(DotKind.MFMA_SCALED))
-_DK_UPCAST_MFMA: gl.constexpr = gl.constexpr(int(DotKind.UPCAST_MFMA))
-
-
-@gluon.jit
-def _dot(
-    a,
-    a_scale,
-    b,
-    b_scale,
-    acc,
-    func_cfg,
-    tuning_cfg,
-    layout,
-    K_PHASE: gl.constexpr = 0,
-):
-    """The one matrix instruction, dispatched on the operand pair."""
-    kind: gl.constexpr = func_cfg.dot_kind()
-    a_sel: gl.constexpr = layout.mfma_scale_selector(0, K_PHASE)
-    b_sel: gl.constexpr = layout.mfma_scale_selector(1, K_PHASE)
-    any_packed: gl.constexpr = layout.has_mfma_packed_scale()
-    if require_constexpr(kind == _DK_MFMA_SCALED and any_packed):
-        if require_constexpr(not func_cfg.has_scale(0)):
-            a_scale = gl.full(
-                layout.scale_fragment_shape_slot(0),
-                127,
-                gl.uint8,
-                gl.amd.cdna4.get_mfma_scale_layout(
-                    layout.dot_operand_fragment_layout(0),
-                    layout.scale_fragment_shape_slot(0),
-                ),
-            )
-        if require_constexpr(not func_cfg.has_scale(1)):
-            b_scale = gl.full(
-                layout.scale_fragment_shape_slot(1),
-                127,
-                gl.uint8,
-                gl.amd.cdna4.get_mfma_scale_layout(
-                    layout.dot_operand_fragment_layout(1),
-                    layout.scale_fragment_shape_slot(1),
-                ),
-            )
-        # At least one scale tile arrived as pre-packed dwords; the other, if any,
-        # takes the ordinary path through the same instruction.
-        out = gl.amd.cdna4.mfma_scaled_packed(
-            a=a,
-            a_scale=a_scale,
-            a_scale_sel=a_sel,
-            a_format=func_cfg.mx_format(0),
-            b=b,
-            b_scale=b_scale,
-            b_scale_sel=b_sel,
-            b_format=func_cfg.mx_format(1),
-            acc=acc,
-        )
-    elif require_constexpr(kind == _DK_MFMA_SCALED):
-        out = gl.amd.cdna4.mfma_scaled(
-            a=a,
-            a_scale=a_scale,
-            a_format=func_cfg.mx_format(0),
-            b=b,
-            b_scale=b_scale,
-            b_format=func_cfg.mx_format(1),
-            acc=acc,
-        )
-    elif require_constexpr(kind == _DK_UPCAST_MFMA):
-        out = gl.amd.cdna4.mfma(a, b, acc)
-    else:
-        gl.static_assert(kind == _DK_MFMA)
-        out = gl.amd.cdna4.mfma(a, b, acc)
-    return out
-
-
-_NO_SCALE: gl.constexpr = gl.constexpr(None)
-
-
-@gluon.jit
-def _maybe_block_dot(
-    a_frags,
-    b_frags,
-    acc,
-    N_FRAGS: gl.constexpr,
-    func_cfg,
-    tuning_cfg,
-    layout,
-    DO_MFMA: gl.constexpr,
-    K_PHASE: gl.constexpr = 0,
-):
-    """Accumulate ``N_FRAGS`` whole-stage K fragments when this stage emits MFMA."""
-    if require_constexpr(DO_MFMA):
-        for i in gl.static_range(N_FRAGS):
-            if require_constexpr(func_cfg.has_scale(0)):
-                a_s = a_frags[2 * i + 1]
-            else:
-                a_s = _NO_SCALE
-            if require_constexpr(func_cfg.has_scale(1)):
-                b_s = b_frags[2 * i + 1]
-            else:
-                b_s = _NO_SCALE
-            acc = _dot(
-                a_frags[2 * i],
-                a_s,
-                b_frags[2 * i],
-                b_s,
-                acc,
-                func_cfg,
-                tuning_cfg,
-                layout,
-                (K_PHASE + i * tuning_cfg.BLOCK_K // 128) % 2,
-            )
-    return acc
-
-
-@aggregate
-@strip_annotate
-class _PipelineConst:
-    """Loop-invariant data for a K-pipeline step.
-
-    Hoisted once before the loop: LDS buffers, tile offsets, and per-stage pointer
-    increments. Only :class:`_PipelinePointers` and :class:`_PipelineRegFragments`
-    cross the back edge.
-
-    Every offset grid is a *tuple*, one entry per mini block: ``num_m_slots_per_block()`` for the A
-    side, ``num_n_slots_per_block()`` for the B side. Each entry is laid out for its own mini tile's
-    copy layout, which is what keeps every per-mini-block direct-to-LDS copy as wide and
-    as coalesced as the whole-tile copy it replaces.
-
-    ``a_scale_hbm_offs``/``b_scale_hbm_offs`` serve both direct-to-LDS and register
-    loads. Both walk K by advancing their scalar base pointer in
-    :class:`_PipelinePointers` instead of the offset grid, so the tile grid is
-    computed once and never moves.
-
-    The two ``*_scale_stride_k`` are lifted out of the operand tuples rather than kept as
-    ``a``/``b``: the non-quantised operand types have no such field at all, so it can only
-    be read behind the ``has_scale`` predicate that the caller already evaluates.
-    """
-
-    lds_ptrs: LDSManager
-    a_hbm_offs: tl.tuple | tuple
-    b_hbm_offs: tl.tuple | tuple
-    a_scale_hbm_offs: tl.tuple | tuple | gl.constexpr
-    b_scale_hbm_offs: tl.tuple | tuple | gl.constexpr
-    a_scale_stride_k: gl.constexpr
-    b_scale_stride_k: gl.constexpr
-    a_step: gl.constexpr
-    b_step: gl.constexpr
-    s_step: gl.constexpr
-    func_cfg: KernelFuncConfig
-    tuning_cfg: KernelTuningConfig
-    layout: KernelLayout
-    num_k: gl.constexpr
-
-    @gluon.constexpr_function
-    def __init__(
-        self,
-        lds_ptrs,
-        a_hbm_offs,
-        b_hbm_offs,
-        a_scale_hbm_offs,
-        b_scale_hbm_offs,
-        a_scale_stride_k,
-        b_scale_stride_k,
-        a_step,
-        b_step,
-        s_step,
-        func_cfg,
-        tuning_cfg,
-        layout,
-        num_k,
-    ):
-        self.lds_ptrs = lds_ptrs
-        self.a_hbm_offs = a_hbm_offs
-        self.b_hbm_offs = b_hbm_offs
-        self.a_scale_hbm_offs = _opt(a_scale_hbm_offs)
-        self.b_scale_hbm_offs = _opt(b_scale_hbm_offs)
-        # re-wrapped: the frontend unwraps a constexpr argument before a
-        # constexpr_function sees it, so these arrive as plain ints
-        self.a_scale_stride_k = gl.constexpr(_v(a_scale_stride_k))
-        self.b_scale_stride_k = gl.constexpr(_v(b_scale_stride_k))
-        self.a_step = gl.constexpr(_v(a_step))
-        self.b_step = gl.constexpr(_v(b_step))
-        self.s_step = gl.constexpr(_v(s_step))
-        self.func_cfg = func_cfg
-        self.tuning_cfg = tuning_cfg
-        self.layout = layout
-        self.num_k = gl.constexpr(_v(num_k))
-
-
-@aggregate
-@strip_annotate
-class _PipelinePointers:
-    """HBM addresses carried between K stages, independent of register fragments.
-
-    Every address here is in HBM -- the LDS side of the pipeline is entirely inside
-    ``_PipelineConst.lds_ptrs``. Each operand has one scale pointer: its scale loads
-    either stage through LDS or go straight to registers. The unified queues
-    advance each stream at its fill point, so their pointers can address different
-    K stages. The explicit frozen step retains its original pointer advances.
-    """
-
-    a_hbm_ptr: gl.tensor
-    b_hbm_ptr: gl.tensor
-    a_scale_hbm_ptr: gl.tensor | gl.constexpr
-    b_scale_hbm_ptr: gl.tensor | gl.constexpr
-
-    # constexpr_function, not @gluon.jit: Triton's aggregate metaclass calls __init__
-    # itself from outside kernel scope, which a JITFunction refuses, and a bare Python
-    # function trips its "Unsupported function referenced" member walk. Every argument
-    # is already a Triton value (or a constexpr None for an absent scale) built by the
-    # caller inside the kernel, so there is nothing to trace here anyway.
-    @gluon.constexpr_function
-    def __init__(
-        self,
-        a_hbm_ptr,
-        b_hbm_ptr,
-        a_scale_hbm_ptr,
-        b_scale_hbm_ptr,
-    ):
-        self.a_hbm_ptr = a_hbm_ptr
-        self.b_hbm_ptr = b_hbm_ptr
-        # _opt, not a bare assign: an operand with no scale arrives as raw Python None
-        # (a8w8, bf16), which the field annotation rejects -- it has to be constexpr.
-        self.a_scale_hbm_ptr = _opt(a_scale_hbm_ptr)
-        self.b_scale_hbm_ptr = _opt(b_scale_hbm_ptr)
-
-
-@aggregate
-@strip_annotate
-class _PipelineRegFragments:
-    """Prefetched A/B payloads and scales, plus one accumulator per (ni, mi) slot.
-
-    Operand tuples are ordered by non-K mini block, then whole-stage K fragment. An unscaled
-    operand aliases its payload in the scale tuple; _maybe_block_dot ignores that slot.
-    """
-
-    a_payload: tl.tuple | tuple
-    a_scale: tl.tuple | tuple
-    b_payload: tl.tuple | tuple
-    b_scale: tl.tuple | tuple
-    acc: tl.tuple | tuple
-
-    @gluon.constexpr_function
-    def __init__(self, a_payload, a_scale, b_payload, b_scale, acc):
-        self.a_payload = a_payload
-        self.a_scale = a_scale
-        self.b_payload = b_payload
-        self.b_scale = b_scale
-        self.acc = acc
-
-
-@gluon.jit
-def _take_reg_pairs(payload, scale, LO: gl.constexpr, N: gl.constexpr):
-    out = ()
-    for i in gl.static_range(N):
-        out = out + (payload[LO + i], scale[LO + i])
-    return out
 
 
 @gluon.jit
@@ -676,12 +399,3 @@ def _moe_gemm_body(
         layout,
         GATE_PRE=FUSE,
     )
-
-
-# Imported last: the live driver calls shared helpers from this module. JIT functions
-# resolve these names at compile time, after both modules have loaded.
-from ._pipeline import (
-    _drain_buffered_pipeline,
-    _last_mfma,
-    _run_buffered_pipeline,
-)
