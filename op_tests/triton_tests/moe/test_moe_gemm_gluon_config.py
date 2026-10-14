@@ -20,6 +20,10 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._entry import (
 from aiter.ops.triton._gluon_kernels.gfx950.moe._frozen import _validate_frozen
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import constexpr_fields
 from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import compute_kernel_layout
+from aiter.ops.triton._gluon_kernels.gfx950.moe._pipeline import (
+    _PipelinePointers,
+    _PipelineRegFragments,
+)
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (
     A_PAYLOAD,
     A_SCALE,
@@ -55,10 +59,6 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     WaitCommitScheme,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import validate
-from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_gemm import (
-    _PipelinePointers,
-    _PipelineRegFragments,
-)
 from aiter.ops.triton.moe import moe_op_gemm_gluon as host
 
 

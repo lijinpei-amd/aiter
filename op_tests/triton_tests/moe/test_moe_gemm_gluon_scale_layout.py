@@ -15,6 +15,7 @@ import pytest
 from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton._gluon_kernels.gfx950.moe import _frozen as frozen
+from aiter.ops.triton._gluon_kernels.gfx950.moe import _mfma
 from aiter.ops.triton._gluon_kernels.gfx950.moe import _pipeline as buffered
 from aiter.ops.triton._gluon_kernels.gfx950.moe import moe_gemm as kernel
 from aiter.ops.triton._gluon_kernels.gfx950.moe._config import (
@@ -298,11 +299,11 @@ def test_dot_helpers_forward_scale_phase(monkeypatch, block_k, dtype, phase):
 
     monkeypatch.setattr(gl, "static_range", range)
     monkeypatch.setattr(gl.amd.cdna4, "mfma_scaled_packed", mfma)
-    monkeypatch.setattr(kernel, "_dot", kernel._dot.fn)
+    monkeypatch.setattr(_mfma, "_dot", _mfma._dot.fn)
     args = (("A", "A-scale"), ("B", "B-scale"), 13, 1, fc, tc, layout)
-    assert kernel._maybe_block_dot.fn((), (), 13, 1, fc, tc, layout, False, phase) == 13
+    assert _mfma._maybe_block_dot.fn((), (), 13, 1, fc, tc, layout, False, phase) == 13
     assert calls == []
-    assert kernel._maybe_block_dot.fn(*args, True, phase) == 14
+    assert _mfma._maybe_block_dot.fn(*args, True, phase) == 14
     assert len(calls) == 1
 
 
