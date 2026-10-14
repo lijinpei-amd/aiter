@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import unwrap
 from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import KernelLayout
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import Schedule
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
@@ -643,8 +644,8 @@ def test_minimum_k_and_every_reachable_unroll_remainder(dtype, schedule, monkeyp
     )
     tc = host._probe_tuning_config(config, dtype_quant, dtype_quant)
     sizing = Schedule(tc, KernelLayout(tc), host._cval(tc.BLOCK_K))
-    minimum = sizing.depth() + sizing.peeled() + sizing.unroll()
-    unroll = sizing.unroll()
+    minimum = unwrap(sizing.depth) + unwrap(sizing.peeled) + unwrap(sizing.unroll)
+    unroll = unwrap(sizing.unroll)
     stride = 2 if packed else 1
     first = (minimum + stride - 1) // stride * stride
     # Packed K128 operands require complete K256 scale words. These are exactly

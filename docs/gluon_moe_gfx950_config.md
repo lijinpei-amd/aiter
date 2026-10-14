@@ -57,18 +57,15 @@ requested `K_UNROLL=4` becomes `UNROLL=12`, and requested `K_UNROLL=7` becomes
 rejection of explicit component-depth and register-storage options.
 
 Placement is split in two. The tuning config only states the knob policy,
-`allow_component_via_lds((operand, is_scale))` (with the per-kind
-`allow_payload_via_lds()` and `allow_scale_via_lds()`), read from
+`allow_component_via_lds((operand, is_scale))`, read from
 `ALLOW_B_VIA_LDS`, `ALLOW_A_SCALE_VIA_LDS` and `ALLOW_B_SCALE_VIA_LDS`; the A
 payload has no knob and is always allowed. `KernelLayout(tuning_cfg)` resolves the
 final placement from that policy and from whether the tile admits a direct-to-LDS
 copy, which adds the automatic register fallback for small A/B payload or scale
 tiles. Pipeline code queries the result on the layout,
 `layout.component_via_lds((operand, is_scale))`, and its exact complement
-`layout.component_in_reg(...)`; `payload_via_lds()`/`payload_in_reg()` and
-`scale_via_lds()`/`scale_in_reg()` are the per-kind views of the same table. None of
-these encode whether a scale exists, so callers separately gate scale components
-with the operand format's `has_scale` predicate.
+`layout.component_in_reg(...)`. Neither encodes whether a scale exists, so callers
+separately gate scale components with the operand format's `has_scale` predicate.
 
 Let `PIPELINE_DEPTH` be the largest baseline inclusive live span `L`, measured in
 payload K steps, among present components. For ring depth `D` and K-Step ratio `R`

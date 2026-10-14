@@ -264,7 +264,7 @@ def _gather_rows(
     TODO: stage the table in LDS instead. One BLOCK_M-wide ``buffer_load_to_shared``
     issued next to the routing scalars, committed there, with the ``wait_group`` and the
     LDS read deferred to just before ``pc`` is built, would replace
-    ``num_m_slots()`` register loads per consumer and hide the fetch behind
+    ``num_m_slots`` register loads per consumer and hide the fetch behind
     the whole B-side address computation -- today the scheduler parks
     ``s_waitcnt vmcnt(0)`` ~9 instructions after the load, so the latency is fully
     exposed. It also serves both consumers (payload and scale offsets) from one fetch
@@ -352,11 +352,12 @@ class KernelLayout:
     """Every tile shape, storage size and register/shared layout of one build.
 
     Built once as ``KernelLayout(tuning_cfg)``, on the host and in jit code alike,
-    and passed explicitly to everything that needs a layout. Per-operand values are
-    stored as ``(A, B)`` pairs and read through accessors indexed by operand (0 = A /
-    tokens, 1 = B / experts). ``None`` marks a value that does not exist for this
-    build -- a scale layout of an unscaled operand, the LDS layout of a
-    register-resident payload.
+    and passed explicitly to everything that needs a layout. A value of the whole
+    build is a public field, read directly. Per-operand values are stored as
+    ``(A, B)`` pairs and read through accessors indexed by operand (0 = A / tokens,
+    1 = B / experts), and by ``is_scale`` where the payload and the scale share a
+    concept. ``None`` marks a value that does not exist for this build -- a scale
+    layout of an unscaled operand, the LDS layout of a register-resident payload.
 
     Accessors that take a free argument (a K extent, a step, a store extent) are
     evaluated from the stored scalars; there is nothing to precompute for them.
@@ -367,17 +368,23 @@ class KernelLayout:
     _BLOCK_K: gl.constexpr
     _mfma_instr_shape: gl.constexpr
     _weight_gu_hbm_layout: gl.constexpr
-    _num_warps: gl.constexpr
-    _num_k_slots: gl.constexpr
-    _num_prefetch_k_slots: gl.constexpr
-    _num_m_slots: gl.constexpr
-    _num_n_slots: gl.constexpr
+    num_warps: gl.constexpr
+    #: Payload fragments per BLOCK_K stage.
+    num_k_slots: gl.constexpr
+    #: Whether the complete BLOCK_K stage is carried across a pipeline step.
+    num_prefetch_k_slots: gl.constexpr
+    #: M slots per tile. Operand A and the accumulator split by this.
+    num_m_slots: gl.constexpr
+    #: N slots per tile. Operand B and the accumulator split by this.
+    num_n_slots: gl.constexpr
     _num_lds_slots_non_k: gl.constexpr
     _payload_block_k_storage: gl.constexpr
-    _scale_block_k_storage: gl.constexpr
+    #: E8M0 elements along K in one pipeline stage.
+    scale_block_k_storage: gl.constexpr
     _payload_fragment_shape_slot: gl.constexpr
     _scale_fragment_shape_slot: gl.constexpr
-    _accumulator_fragment_shape_slot: gl.constexpr
+    #: Shape of one slot's accumulator.
+    accumulator_fragment_shape_slot: gl.constexpr
     _payload_lds_shape_slot: gl.constexpr
     _scale_lds_shape_slot: gl.constexpr
     _payload_lds_shape_tile: gl.constexpr
@@ -390,7 +397,8 @@ class KernelLayout:
     # -- storage placement --
     _component_via_lds: gl.constexpr
     # -- payload layouts --
-    _dot_result_fragment_layout: gl.constexpr
+    #: AMDMFMALayout for dot / scaled-dot results in register.
+    dot_result_fragment_layout: gl.constexpr
     _dot_operand_fragment_layout: gl.constexpr
     _dot_operand_lds_layout: gl.constexpr
     _dot_operand_buffer_load_lds_layout: gl.constexpr
@@ -405,11 +413,13 @@ class KernelLayout:
     _scale_read_k_slots: gl.constexpr
     _scale_cache_fragments: gl.constexpr
     _scale_flat_shape: gl.constexpr
-    _sorted_shuffled_ok: gl.constexpr
+    #: Does the tile match the layout the C++ A-scale shuffle writes?
+    sorted_shuffled_ok: gl.constexpr
     _scale_load_shape: gl.constexpr
     _scale_packed_ok: gl.constexpr
     _scale_packed_sel: gl.constexpr
-    _has_mfma_packed_scale: gl.constexpr
+    #: Whether either live MFMA scale operand uses packed dword storage.
+    has_mfma_packed_scale: gl.constexpr
     _packed_scale_shape: gl.constexpr
     _packed_scale_load_shape: gl.constexpr
     # -- scale layouts --
@@ -423,22 +433,26 @@ class KernelLayout:
     _packed_scale_read_layout: gl.constexpr
     _packed_scale_load_layout: gl.constexpr
     # -- epilogue --
-    _output_n_slot: gl.constexpr
-    _output_block_n: gl.constexpr
-    _epilogue_threads: gl.constexpr
-    _epilogue_bias_per_thread: gl.constexpr
-    _epilogue_input_lds_layout: gl.constexpr
-    _epilogue_gamma_buffer_load_lds_layout: gl.constexpr
-    _epilogue_bias_buffer_load_lds_layout: gl.constexpr
-    _epilogue_gamma_shape: gl.constexpr
-    _epilogue_bias_shape: gl.constexpr
-    _epilogue_inputs_via_lds: gl.constexpr
-    _quant_staging_layout: gl.constexpr
-    _quant_staging_rows: gl.constexpr
-    _quant_staging_rotates: gl.constexpr
+    #: Emitted columns produced by one N slot.
+    output_n_slot: gl.constexpr
+    #: Emitted columns produced by the tile's raw BLOCK_N columns.
+    output_block_n: gl.constexpr
+    epilogue_threads: gl.constexpr
+    epilogue_bias_per_thread: gl.constexpr
+    epilogue_input_lds_layout: gl.constexpr
+    epilogue_gamma_buffer_load_lds_layout: gl.constexpr
+    epilogue_bias_buffer_load_lds_layout: gl.constexpr
+    epilogue_gamma_shape: gl.constexpr
+    epilogue_bias_shape: gl.constexpr
+    #: Whether bias/gamma vectors are staged through LDS.
+    epilogue_inputs_via_lds: gl.constexpr
+    quant_staging_layout: gl.constexpr
+    quant_staging_rows: gl.constexpr
+    #: Whether the fused-quant staging alternates two per-slot LDS banks.
+    quant_staging_rotates: gl.constexpr
     # -- resources --
-    _lds_bytes: gl.constexpr
-    _acc_vgprs_per_lane: gl.constexpr
+    lds_bytes: gl.constexpr
+    acc_vgprs_per_lane: gl.constexpr
 
     @gluon.constexpr_function
     def __init__(self, tuning_cfg):
@@ -1047,17 +1061,17 @@ class KernelLayout:
         self._BLOCK_K = gl.constexpr(BK)
         self._mfma_instr_shape = gl.constexpr(list(instr))
         self._weight_gu_hbm_layout = gl.constexpr(_v(fc.weight_gu_hbm_layout))
-        self._num_warps = gl.constexpr(num_warps)
-        self._num_k_slots = gl.constexpr(num_k_slots)
-        self._num_prefetch_k_slots = gl.constexpr(num_prefetch_k_slots)
-        self._num_m_slots = gl.constexpr(num_m_slots)
-        self._num_n_slots = gl.constexpr(num_n_slots)
+        self.num_warps = gl.constexpr(num_warps)
+        self.num_k_slots = gl.constexpr(num_k_slots)
+        self.num_prefetch_k_slots = gl.constexpr(num_prefetch_k_slots)
+        self.num_m_slots = gl.constexpr(num_m_slots)
+        self.num_n_slots = gl.constexpr(num_n_slots)
         self._num_lds_slots_non_k = gl.constexpr(num_lds_slots_non_k)
         self._payload_block_k_storage = gl.constexpr(payload_block_k_storage)
-        self._scale_block_k_storage = gl.constexpr(scale_block_k_storage)
+        self.scale_block_k_storage = gl.constexpr(scale_block_k_storage)
         self._payload_fragment_shape_slot = gl.constexpr(payload_fragment_shape_slot)
         self._scale_fragment_shape_slot = gl.constexpr(scale_fragment_shape_slot)
-        self._accumulator_fragment_shape_slot = gl.constexpr(
+        self.accumulator_fragment_shape_slot = gl.constexpr(
             accumulator_fragment_shape_slot
         )
         self._payload_lds_shape_slot = gl.constexpr(payload_lds_shape_slot)
@@ -1074,7 +1088,7 @@ class KernelLayout:
         self._component_via_lds = gl.constexpr(component_via_lds)
 
         # payload layouts
-        self._dot_result_fragment_layout = gl.constexpr(dot_result_fragment_layout)
+        self.dot_result_fragment_layout = gl.constexpr(dot_result_fragment_layout)
         self._dot_operand_fragment_layout = gl.constexpr(dot_operand_fragment_layout)
         self._dot_operand_lds_layout = gl.constexpr(dot_operand_lds_layout)
         self._dot_operand_buffer_load_lds_layout = gl.constexpr(
@@ -1092,11 +1106,11 @@ class KernelLayout:
         self._scale_read_k_slots = gl.constexpr(scale_read_k_slots)
         self._scale_cache_fragments = gl.constexpr(scale_cache_fragments)
         self._scale_flat_shape = gl.constexpr(scale_flat_shape)
-        self._sorted_shuffled_ok = gl.constexpr(sorted_shuffled_ok)
+        self.sorted_shuffled_ok = gl.constexpr(sorted_shuffled_ok)
         self._scale_load_shape = gl.constexpr(scale_load_shape)
         self._scale_packed_ok = gl.constexpr(scale_packed_ok)
         self._scale_packed_sel = gl.constexpr(scale_packed_sel)
-        self._has_mfma_packed_scale = gl.constexpr(has_mfma_packed_scale)
+        self.has_mfma_packed_scale = gl.constexpr(has_mfma_packed_scale)
         self._packed_scale_shape = gl.constexpr(packed_scale_shape)
         self._packed_scale_load_shape = gl.constexpr(packed_scale_load_shape)
 
@@ -1116,33 +1130,29 @@ class KernelLayout:
         self._packed_scale_load_layout = gl.constexpr(packed_scale_load_layout)
 
         # epilogue
-        self._output_n_slot = gl.constexpr(output_n_slot)
-        self._output_block_n = gl.constexpr(output_block_n)
-        self._epilogue_threads = gl.constexpr(epilogue_threads)
-        self._epilogue_bias_per_thread = gl.constexpr(epilogue_bias_per_thread)
-        self._epilogue_input_lds_layout = gl.constexpr(epilogue_input_lds_layout)
-        self._epilogue_gamma_buffer_load_lds_layout = gl.constexpr(
+        self.output_n_slot = gl.constexpr(output_n_slot)
+        self.output_block_n = gl.constexpr(output_block_n)
+        self.epilogue_threads = gl.constexpr(epilogue_threads)
+        self.epilogue_bias_per_thread = gl.constexpr(epilogue_bias_per_thread)
+        self.epilogue_input_lds_layout = gl.constexpr(epilogue_input_lds_layout)
+        self.epilogue_gamma_buffer_load_lds_layout = gl.constexpr(
             epilogue_gamma_buffer_load_lds_layout
         )
-        self._epilogue_bias_buffer_load_lds_layout = gl.constexpr(
+        self.epilogue_bias_buffer_load_lds_layout = gl.constexpr(
             epilogue_bias_buffer_load_lds_layout
         )
-        self._epilogue_gamma_shape = gl.constexpr(epilogue_gamma_shape)
-        self._epilogue_bias_shape = gl.constexpr(epilogue_bias_shape)
-        self._epilogue_inputs_via_lds = gl.constexpr(epilogue_inputs_via_lds)
-        self._quant_staging_layout = gl.constexpr(quant_staging_layout)
-        self._quant_staging_rows = gl.constexpr(quant_staging_rows)
-        self._quant_staging_rotates = gl.constexpr(quant_staging_rotates)
+        self.epilogue_gamma_shape = gl.constexpr(epilogue_gamma_shape)
+        self.epilogue_bias_shape = gl.constexpr(epilogue_bias_shape)
+        self.epilogue_inputs_via_lds = gl.constexpr(epilogue_inputs_via_lds)
+        self.quant_staging_layout = gl.constexpr(quant_staging_layout)
+        self.quant_staging_rows = gl.constexpr(quant_staging_rows)
+        self.quant_staging_rotates = gl.constexpr(quant_staging_rotates)
 
         # resources
-        self._lds_bytes = gl.constexpr(lds_bytes)
-        self._acc_vgprs_per_lane = gl.constexpr(acc_vgprs_per_lane)
+        self.lds_bytes = gl.constexpr(lds_bytes)
+        self.acc_vgprs_per_lane = gl.constexpr(acc_vgprs_per_lane)
 
     # -- tile and slot geometry --------------------------------------------------
-
-    @gluon.constexpr_function
-    def num_warps(self):
-        return _v(self._num_warps)
 
     @gluon.constexpr_function
     def grid_N(self, N):
@@ -1165,26 +1175,6 @@ class KernelLayout:
         return K // BK
 
     @gluon.constexpr_function
-    def num_k_slots(self):
-        """Payload fragments per BLOCK_K stage."""
-        return _v(self._num_k_slots)
-
-    @gluon.constexpr_function
-    def num_prefetch_k_slots(self):
-        """Whether the complete BLOCK_K stage is carried across a pipeline step."""
-        return _v(self._num_prefetch_k_slots)
-
-    @gluon.constexpr_function
-    def num_m_slots(self):
-        """M slots per tile. Operand A and the accumulator split by this."""
-        return _v(self._num_m_slots)
-
-    @gluon.constexpr_function
-    def num_n_slots(self):
-        """N slots per tile. Operand B and the accumulator split by this."""
-        return _v(self._num_n_slots)
-
-    @gluon.constexpr_function
     def num_lds_slots_non_k(self, idx):
         """Slots along one operand's non-K axis, each copied and read independently."""
         return _v(self._num_lds_slots_non_k)[_v(idx)]
@@ -1195,44 +1185,32 @@ class KernelLayout:
         return _v(self._payload_block_k_storage)[_v(idx)]
 
     @gluon.constexpr_function
-    def scale_block_k_storage(self):
-        """E8M0 elements along K in one pipeline stage."""
-        return _v(self._scale_block_k_storage)
-
-    @gluon.constexpr_function
-    def payload_fragment_shape_slot(self, idx):
-        """Register payload shape for one non-K slot and K slot."""
+    def fragment_shape_slot(self, idx, is_scale):
+        """Register shape for one non-K slot and K slot, of the payload or E8M0."""
+        if _v(is_scale):
+            return list(_v(self._scale_fragment_shape_slot)[_v(idx)])
         return list(_v(self._payload_fragment_shape_slot)[_v(idx)])
 
     @gluon.constexpr_function
-    def scale_fragment_shape_slot(self, idx):
-        """Register E8M0 shape for one non-K slot and K slot."""
-        return list(_v(self._scale_fragment_shape_slot)[_v(idx)])
+    def lds_shape_slot(self, idx, is_scale):
+        """Shared shape of one slot.
 
-    @gluon.constexpr_function
-    def accumulator_fragment_shape_slot(self):
-        """Shape of one slot's accumulator."""
-        return list(_v(self._accumulator_fragment_shape_slot))
-
-    @gluon.constexpr_function
-    def payload_lds_shape_slot(self, idx):
-        """Shared shape of one payload slot, in stored (packed) elements."""
+        A payload's is in stored (packed) elements; a scale's is E8M0,
+        ``[slot non-K extent, BLOCK_K/32]``.
+        """
+        if _v(is_scale):
+            return list(_v(self._scale_lds_shape_slot)[_v(idx)])
         return list(_v(self._payload_lds_shape_slot)[_v(idx)])
 
     @gluon.constexpr_function
-    def scale_lds_shape_slot(self, idx):
-        """E8M0 shape of one operand slot: [slot non-K extent, BLOCK_K/32]."""
-        return list(_v(self._scale_lds_shape_slot)[_v(idx)])
+    def lds_shape_tile(self, idx, is_scale):
+        """Full LDS shape of the tile, including ring and slot axes.
 
-    @gluon.constexpr_function
-    def payload_lds_shape_tile(self, idx):
-        """Full payload LDS shape of the tile, including ring and slot axes."""
+        A scale's is in its staged representation.
+        """
+        if _v(is_scale):
+            return list(_v(self._scale_lds_shape_tile)[_v(idx)])
         return list(_v(self._payload_lds_shape_tile)[_v(idx)])
-
-    @gluon.constexpr_function
-    def scale_lds_shape_tile(self, idx):
-        """Full scale LDS shape of the tile in its staged representation."""
-        return list(_v(self._scale_lds_shape_tile)[_v(idx)])
 
     @gluon.constexpr_function
     def copy_contiguity(self, idx):
@@ -1260,10 +1238,10 @@ class KernelLayout:
         return _v(self._byte_unit_lds_ok)[_v(idx)]
 
     # -- storage placement --------------------------------------------------------
-    # Resolved: tuning's ``allow_*_via_lds`` policy and the automatic register fallback
-    # for slots the direct-to-LDS copy cannot take. Each ``*_in_reg`` is exactly the
-    # complement of its ``*_via_lds``. None of these is gated on whether a scale
-    # exists; callers gate absent scales with ``has_scale``.
+    # Resolved: tuning's ``allow_component_via_lds`` policy and the automatic register
+    # fallback for slots the direct-to-LDS copy cannot take. ``component_in_reg`` is
+    # exactly the complement of ``component_via_lds``. Neither is gated on whether a
+    # scale exists; callers gate absent scales with ``has_scale``.
 
     @gluon.constexpr_function
     def component_via_lds(self, component):
@@ -1278,46 +1256,39 @@ class KernelLayout:
         """Whether ``(operand, is_scale)`` is loaded directly into registers."""
         return not self.component_via_lds(component)
 
-    @gluon.constexpr_function
-    def payload_via_lds(self, idx):
-        return self.component_via_lds((idx, False))
+    # -- payload and scale layouts ------------------------------------------------
 
     @gluon.constexpr_function
-    def payload_in_reg(self, idx):
-        return not self.payload_via_lds(idx)
-
-    @gluon.constexpr_function
-    def scale_via_lds(self, idx):
-        return self.component_via_lds((idx, True))
-
-    @gluon.constexpr_function
-    def scale_in_reg(self, idx):
-        return not self.scale_via_lds(idx)
-
-    # -- payload layouts ----------------------------------------------------------
-
-    @gluon.constexpr_function
-    def dot_result_fragment_layout(self):
-        """AMDMFMALayout for dot / scaled-dot results in register."""
-        return _v(self._dot_result_fragment_layout)
-
-    @gluon.constexpr_function
-    def dot_operand_fragment_layout(self, idx):
+    def dot_operand_fragment_layout(self, idx, is_scale):
+        if _v(is_scale):
+            return _v(self._dot_operand_scale_fragment_layout)[_v(idx)]
         return _v(self._dot_operand_fragment_layout)[_v(idx)]
 
     @gluon.constexpr_function
-    def dot_operand_lds_layout(self, idx):
-        """Padded shared layout for a payload operand staged through LDS."""
+    def dot_operand_lds_layout(self, idx, is_scale):
+        """Shared layout of a component staged through LDS.
+
+        Padded for a payload; the identity (K-contiguous) tile for raw E8M0 scales.
+        """
+        if _v(is_scale):
+            return _v(self._dot_operand_scale_lds_layout)[_v(idx)]
         return _v(self._dot_operand_lds_layout)[_v(idx)]
 
     @gluon.constexpr_function
-    def dot_operand_buffer_load_lds_layout(self, idx):
-        """Register layout of the global->LDS copy offsets for a payload operand."""
+    def dot_operand_buffer_load_lds_layout(self, idx, is_scale):
+        """Register layout of a component's global->LDS copy offsets.
+
+        32 bits per lane, blocked, for a scale.
+        """
+        if _v(is_scale):
+            return _v(self._dot_operand_scale_buffer_load_lds_layout)[_v(idx)]
         return _v(self._dot_operand_buffer_load_lds_layout)[_v(idx)]
 
     @gluon.constexpr_function
-    def payload_hbm_offset_layout(self, idx):
-        """Layout used to form one payload slot's global-memory offsets."""
+    def hbm_offset_layout(self, idx, is_scale):
+        """Layout used to form one payload slot's or scale tile's HBM offsets."""
+        if _v(is_scale):
+            return _v(self._scale_hbm_offset_layout)[_v(idx)]
         return _v(self._payload_hbm_offset_layout)[_v(idx)]
 
     # -- scale geometry -----------------------------------------------------------
@@ -1376,11 +1347,6 @@ class KernelLayout:
         return list(_v(self._scale_flat_shape)[_v(idx)])
 
     @gluon.constexpr_function
-    def sorted_shuffled_ok(self):
-        """Does the tile match the layout the C++ A-scale shuffle writes?"""
-        return _v(self._sorted_shuffled_ok)
-
-    @gluon.constexpr_function
     def scale_load_shape(self, idx):
         return list(_v(self._scale_load_shape)[_v(idx)])
 
@@ -1405,11 +1371,6 @@ class KernelLayout:
         return self.scale_packed_sel(idx, k_phase)
 
     @gluon.constexpr_function
-    def has_mfma_packed_scale(self):
-        """Whether either live MFMA scale operand uses packed dword storage."""
-        return _v(self._has_mfma_packed_scale)
-
-    @gluon.constexpr_function
     def packed_scale_shape(self, idx):
         """Physical i32 storage, including both K128 halves even when one is unused."""
         return list(_v(self._packed_scale_shape)[_v(idx)])
@@ -1419,25 +1380,6 @@ class KernelLayout:
         return list(_v(self._packed_scale_load_shape)[_v(idx)])
 
     # -- scale layouts ------------------------------------------------------------
-
-    @gluon.constexpr_function
-    def dot_operand_scale_fragment_layout(self, idx):
-        return _v(self._dot_operand_scale_fragment_layout)[_v(idx)]
-
-    @gluon.constexpr_function
-    def dot_operand_scale_lds_layout(self, idx):
-        """Identity (K-contiguous) shared tile for the raw E8M0 scales."""
-        return _v(self._dot_operand_scale_lds_layout)[_v(idx)]
-
-    @gluon.constexpr_function
-    def dot_operand_scale_buffer_load_lds_layout(self, idx):
-        """32-bit-per-lane blocked layout for the scale direct-to-LDS write."""
-        return _v(self._dot_operand_scale_buffer_load_lds_layout)[_v(idx)]
-
-    @gluon.constexpr_function
-    def scale_hbm_offset_layout(self, idx):
-        """Layout used to form one scale tile's global-memory offsets."""
-        return _v(self._scale_hbm_offset_layout)[_v(idx)]
 
     @gluon.constexpr_function
     def shuffled_scale_read_layout(self, idx, load=False):
@@ -1480,7 +1422,7 @@ class KernelLayout:
         costs anything. It remains unavoidable for the E8M0 scale tile ([64, 2] is 128
         elements against 256 threads), which is why that one is still 2x over.
         """
-        num_warps = self.num_warps()
+        num_warps = _v(self.num_warps)
         ept = max(1, (_v(extent_m) * _v(extent_n)) // (num_warps * WARP_SIZE))
         vec = max(1, min(128 // _v(elem_bits), _v(extent_n), ept))
         lanes_n = max(1, min(WARP_SIZE, _v(extent_n) // vec))
@@ -1495,72 +1437,16 @@ class KernelLayout:
         )
 
     @gluon.constexpr_function
-    def output_n_slot(self):
-        """Emitted columns produced by one N slot."""
-        return _v(self._output_n_slot)
-
-    @gluon.constexpr_function
-    def output_block_n(self):
-        """Emitted columns produced by the tile's raw BLOCK_N columns."""
-        return _v(self._output_block_n)
-
-    @gluon.constexpr_function
     def quant_payload_shape(self, rows, output_n=None):
         """Packed E2M1 byte shape for ``rows`` by emitted-output columns."""
-        output_n = self.output_n_slot() if _v(output_n) is None else _v(output_n)
+        output_n = _v(self.output_n_slot) if _v(output_n) is None else _v(output_n)
         return [_v(rows), output_n // 2]
 
     @gluon.constexpr_function
     def quant_scale_shape(self, rows, output_n=None):
         """E8M0 shape for ``rows`` by emitted-output columns."""
-        output_n = self.output_n_slot() if _v(output_n) is None else _v(output_n)
+        output_n = _v(self.output_n_slot) if _v(output_n) is None else _v(output_n)
         return [_v(rows), output_n // MX_GROUP]
-
-    @gluon.constexpr_function
-    def epilogue_threads(self):
-        return _v(self._epilogue_threads)
-
-    @gluon.constexpr_function
-    def epilogue_bias_per_thread(self):
-        return _v(self._epilogue_bias_per_thread)
-
-    @gluon.constexpr_function
-    def epilogue_input_lds_layout(self):
-        return _v(self._epilogue_input_lds_layout)
-
-    @gluon.constexpr_function
-    def epilogue_gamma_buffer_load_lds_layout(self):
-        return _v(self._epilogue_gamma_buffer_load_lds_layout)
-
-    @gluon.constexpr_function
-    def epilogue_bias_buffer_load_lds_layout(self):
-        return _v(self._epilogue_bias_buffer_load_lds_layout)
-
-    @gluon.constexpr_function
-    def epilogue_gamma_shape(self):
-        return list(_v(self._epilogue_gamma_shape))
-
-    @gluon.constexpr_function
-    def epilogue_bias_shape(self):
-        return list(_v(self._epilogue_bias_shape))
-
-    @gluon.constexpr_function
-    def epilogue_inputs_via_lds(self):
-        """Whether bias/gamma vectors are staged through LDS."""
-        return _v(self._epilogue_inputs_via_lds)
-
-    @gluon.constexpr_function
-    def quant_staging_layout(self):
-        return _v(self._quant_staging_layout)
-
-    @gluon.constexpr_function
-    def quant_staging_rows(self):
-        return _v(self._quant_staging_rows)
-
-    @gluon.constexpr_function
-    def quant_staging_rotates(self):
-        """Whether the fused-quant staging alternates two per-slot LDS banks."""
-        return _v(self._quant_staging_rotates)
 
     @gluon.constexpr_function
     def quant_amax_lane_elems(self, extent_m=None, output_n=None):
@@ -1583,26 +1469,18 @@ class KernelLayout:
         16x16), before the first lane base.
         """
         extent_m = (
-            self.accumulator_fragment_shape_slot()[0]
+            _v(self.accumulator_fragment_shape_slot)[0]
             if _v(extent_m) is None
             else _v(extent_m)
         )
-        output_n = self.output_n_slot() if _v(output_n) is None else _v(output_n)
+        output_n = _v(self.output_n_slot) if _v(output_n) is None else _v(output_n)
         if _v(self._weight_gu_hbm_layout) == WeightGuHbmLayout.SPLIT:
             instr = _v(self._mfma_instr_shape)
             return max(1, min(MX_GROUP, (instr[0] * instr[1]) // WARP_SIZE))
-        per_lane = (extent_m * output_n) // (self.num_warps() * WARP_SIZE)
+        per_lane = (extent_m * output_n) // (_v(self.num_warps) * WARP_SIZE)
         return min(MX_GROUP, max(1, per_lane))
 
     # -- resources ----------------------------------------------------------------
-
-    @gluon.constexpr_function
-    def lds_bytes(self):
-        return _v(self._lds_bytes)
-
-    @gluon.constexpr_function
-    def acc_vgprs_per_lane(self):
-        return _v(self._acc_vgprs_per_lane)
 
     # -- raw-N mapping and HBM offsets (device) -----------------------------------
     # Jit methods, called on the layout from kernel code. The raw-N mapping reads only
@@ -1619,7 +1497,7 @@ class KernelLayout:
         read gate and up from separate halves of N.
         """
         # One N slot's raw-N width (MINI_BLOCK_N) is the accumulator tile's N extent.
-        n_slot: gl.constexpr = self.accumulator_fragment_shape_slot()[1]
+        n_slot: gl.constexpr = self.accumulator_fragment_shape_slot[1]
         if require_constexpr(self._weight_gu_hbm_layout == _WEIGHT_GU_SPLIT):
             out = pid_n * n_slot + n_slot_idx * (N // 2)
         else:
@@ -1629,7 +1507,7 @@ class KernelLayout:
     @gluon.jit
     def n_split_offs(self, pid_n, i, N):
         """Map a whole raw-N CTA index tensor through the ``WeightGuHbmLayout``."""
-        n_slot: gl.constexpr = self.accumulator_fragment_shape_slot()[1]
+        n_slot: gl.constexpr = self.accumulator_fragment_shape_slot[1]
         if require_constexpr(self._weight_gu_hbm_layout == _WEIGHT_GU_SPLIT):
             out = pid_n * n_slot + (i // n_slot) * (N // 2) + i % n_slot
         else:
@@ -1643,9 +1521,9 @@ class KernelLayout:
         """Gathered A payload offsets, one copy-layout grid per M slot."""
         M_TILE: gl.constexpr = tuning_cfg.BLOCK_M
         M_SLOT: gl.constexpr = tuning_cfg.MINI_BLOCK_M
-        NUM_M_SLOTS: gl.constexpr = self.num_m_slots()
+        NUM_M_SLOTS: gl.constexpr = self.num_m_slots
         PAYLOAD_BLOCK_K_STORAGE: gl.constexpr = self.payload_block_k_storage(0)
-        layout_a_slot: gl.constexpr = self.payload_hbm_offset_layout(0)
+        layout_a_slot: gl.constexpr = self.hbm_offset_layout(0, False)
         a_hbm_offsets_tile = ()
         for m_slot_idx in gl.static_range(NUM_M_SLOTS):
             rows_a_slot = _gather_rows(
@@ -1674,10 +1552,10 @@ class KernelLayout:
     def b_payload_hbm_offsets(self, b, pid_n, N, K, func_cfg, tuning_cfg):
         """B payload offsets for plain or preshuffled weights, one grid per N slot."""
         N_SLOT: gl.constexpr = tuning_cfg.MINI_BLOCK_N
-        NUM_N_SLOTS: gl.constexpr = self.num_n_slots()
+        NUM_N_SLOTS: gl.constexpr = self.num_n_slots
         PAYLOAD_BLOCK_K_STORAGE: gl.constexpr = self.payload_block_k_storage(1)
-        layout_b_slot: gl.constexpr = self.payload_hbm_offset_layout(1)
-        K_STORAGE: gl.constexpr = K // func_cfg.b_pack_divisor()
+        layout_b_slot: gl.constexpr = self.hbm_offset_layout(1, False)
+        K_STORAGE: gl.constexpr = K // func_cfg.pack_divisor(1)
         b_hbm_offsets_tile = ()
         for n_slot_idx in gl.static_range(NUM_N_SLOTS):
             if require_constexpr(tuning_cfg.B_PRESHUFFLED):
@@ -1718,19 +1596,21 @@ class KernelLayout:
         ``[M_SLOT, SCALE_BLOCK_K_STORAGE]`` grid
         over the raw ``(M, K/32)`` tensor. The caller sees a tuple indexed by M slot.
         """
-        if require_constexpr(not func_cfg.a_has_scale()):
+        if require_constexpr(not func_cfg.has_scale(0)):
             return _NO_SCALE
 
         M_TILE: gl.constexpr = tuning_cfg.BLOCK_M
         M_SLOT: gl.constexpr = tuning_cfg.MINI_BLOCK_M
-        NUM_M_SLOTS: gl.constexpr = self.num_m_slots()
-        SCALE_BLOCK_K_STORAGE: gl.constexpr = self.scale_block_k_storage()
-        layout_a_scale_slot: gl.constexpr = self.scale_hbm_offset_layout(0)
+        NUM_M_SLOTS: gl.constexpr = self.num_m_slots
+        SCALE_BLOCK_K_STORAGE: gl.constexpr = self.scale_block_k_storage
+        layout_a_scale_slot: gl.constexpr = self.hbm_offset_layout(0, True)
         SCALE_M: gl.constexpr = self.scale_mini_block_nonk(0)
         SCALE_K: gl.constexpr = self.scale_mini_block_k(0)
         SCALE_RATIO: gl.constexpr = self.scale_ratio_non_k_slot(0)
 
-        if require_constexpr(tuning_cfg.scale_shuffled(0) and self.scale_in_reg(0)):
+        if require_constexpr(
+            tuning_cfg.scale_shuffled(0) and self.component_in_reg((0, True))
+        ):
             a_scale_hbm_offsets_tile = ()
             for m_slot_idx in gl.static_range(NUM_M_SLOTS):
                 a_scale_hbm_offsets_tile = a_scale_hbm_offsets_tile + (
@@ -1751,7 +1631,7 @@ class KernelLayout:
             # row stripe; K128 payload stages reuse the same group before advancing the
             # pointer.
             gl.static_assert(
-                self.sorted_shuffled_ok(),
+                self.sorted_shuffled_ok,
                 "A_SCALE_SORTED_SHUFFLED requires MFMA 16x16x128 "
                 "and whole 32-row A stripes",
             )
@@ -1813,13 +1693,13 @@ class KernelLayout:
         Either a flat CDNA4_SCALE preshuffle run for staging or the raw ``(K/32, N)``
         grid. The caller receives a tuple indexed by N slot.
         """
-        if require_constexpr(not func_cfg.b_has_scale()):
+        if require_constexpr(not func_cfg.has_scale(1)):
             return _NO_SCALE
 
         N_SLOT: gl.constexpr = tuning_cfg.MINI_BLOCK_N
-        NUM_N_SLOTS: gl.constexpr = self.num_n_slots()
-        SCALE_BLOCK_K_STORAGE: gl.constexpr = self.scale_block_k_storage()
-        layout_b_scale_slot: gl.constexpr = self.scale_hbm_offset_layout(1)
+        NUM_N_SLOTS: gl.constexpr = self.num_n_slots
+        SCALE_BLOCK_K_STORAGE: gl.constexpr = self.scale_block_k_storage
+        layout_b_scale_slot: gl.constexpr = self.hbm_offset_layout(1, True)
         SCALE_N: gl.constexpr = self.scale_mini_block_nonk(1)
         SCALE_K: gl.constexpr = self.scale_mini_block_k(1)
         SCALE_RATIO: gl.constexpr = self.scale_ratio_non_k_slot(1)
@@ -1829,7 +1709,9 @@ class KernelLayout:
             else 0
         )
 
-        if require_constexpr(tuning_cfg.scale_shuffled(1) and self.scale_in_reg(1)):
+        if require_constexpr(
+            tuning_cfg.scale_shuffled(1) and self.component_in_reg((1, True))
+        ):
             b_scale_hbm_offsets_tile = ()
             for n_slot_idx in gl.static_range(NUM_N_SLOTS):
                 b_scale_hbm_offsets_tile = b_scale_hbm_offsets_tile + (

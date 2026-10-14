@@ -147,7 +147,7 @@ def test_packed_words_and_selectors_match_producer(
     assert validate(tc, 4096, 7168)
     layout = KernelLayout(tc)
     assert layout.scale_packed_ok(operand)
-    byte_layout = layout.dot_operand_scale_fragment_layout(operand)
+    byte_layout = layout.dot_operand_fragment_layout(operand, True)
     word_layout = layout.packed_scale_frag_layout(operand)
     word_shape = layout.packed_scale_shape(operand)
     producer = _producer_byte_coordinates((mini_m, mini_n)[operand])
@@ -171,7 +171,7 @@ def test_packed_words_and_selectors_match_producer(
         assert reg_count % len(selectors) == 0
         assert 1 << len(word_layout.reg_bases) == reg_count // len(selectors)
         for warp, lane, reg in product(
-            range(layout.num_warps()), range(64), range(reg_count)
+            range(unwrap(layout.num_warps)), range(64), range(reg_count)
         ):
             row, group = _thread_coordinate(byte_layout, reg, lane, warp)
             word_coord = _thread_coordinate(
@@ -230,7 +230,7 @@ def test_wide_packed_scale_load_layout_matches_producer(scale_k, operand):
     nonk_bit, k_bit = registers.index([16, 0]), registers.index([0, 4])
     retained = [bit for bit in range(len(registers)) if bit not in (nonk_bit, k_bit)]
     for warp, lane, reg in product(
-        range(layout.num_warps()), range(64), range(1 << len(registers))
+        range(unwrap(layout.num_warps)), range(64), range(1 << len(registers))
     ):
         selector = ((reg >> nonk_bit) & 1) + 2 * ((reg >> k_bit) & 1)
         word_reg = sum(((reg >> bit) & 1) << pos for pos, bit in enumerate(retained))
@@ -495,7 +495,7 @@ def _run_scalar_pipeline(monkeypatch, tc, layout, stages, fused):
         s_step=4,
         a_scale_stride_k=32,
         b_scale_stride_k=32,
-        schedule=Schedule(tc.config, layout.config, stages * 128, 0),
+        schedule=_HostView(Schedule(tc.config, layout.config, stages * 128, 0)),
     )
 
     def check_assumption(condition, message=""):
@@ -574,9 +574,9 @@ def test_pipeline_phases_and_packed_scale_addresses(
     )
     layout = _HostView(KernelLayout(tc.config))
     sizing = Schedule(tc.config, layout.config, 128)
-    minimum_tiles = sizing.depth() + sizing.peeled() + sizing.unroll()
+    minimum_tiles = unwrap(sizing.depth) + unwrap(sizing.peeled) + unwrap(sizing.unroll)
     minimum = (minimum_tiles + 1) // 2 * 2
-    effective_unroll = sizing.unroll()
+    effective_unroll = unwrap(sizing.unroll)
     # Complete K256 scale words constrain NUM_K to even values. Visit the minimum,
     # every reachable remainder, and a longer strip with additional ring wraps.
     lengths = {

@@ -68,7 +68,7 @@ class ScaleSwizzle(IntEnum):
     # MFMA scale-fragment order, so a stage's scales are a contiguous slice instead of
     # BLOCK_M rows of 8 bytes at a K/32 stride. Only meaningful for operand A, and only
     # for the layout the shuffle was written against -- see
-    # KernelLayout.sorted_shuffled_ok().
+    # KernelLayout.sorted_shuffled_ok.
     SORTED_SHUFFLED = 2
 
 
