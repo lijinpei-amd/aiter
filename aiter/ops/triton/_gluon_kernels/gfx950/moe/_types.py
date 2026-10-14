@@ -27,7 +27,6 @@ from ._lang import (
 from ._lang import (
     const as _c,
 )
-from ._lang import unwrap as _v
 
 __all__ = [
     "A_PAYLOAD",
@@ -121,12 +120,6 @@ def _slot_index(
     With one slot on either axis this is the identity on the old row-major order, so
     only a genuinely 2-D slot split sees any change.
     """
-    m_slot_idx, n_slot_idx, num_m_slots, num_n_slots = (
-        _v(m_slot_idx),
-        _v(n_slot_idx),
-        _v(num_m_slots),
-        _v(num_n_slots),
-    )
     return n_slot_idx * num_m_slots + m_slot_idx
 
 

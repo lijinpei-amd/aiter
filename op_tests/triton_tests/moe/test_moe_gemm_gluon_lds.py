@@ -10,7 +10,7 @@ import torch
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import unwrap
+from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import maybe_unwrap
 from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import KernelLayout
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lds import LDSManager
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import DtypeQuant
@@ -62,7 +62,7 @@ def test_register_load_does_not_stage_through_lds(operand, scale, block_k):
     src = (torch.arange(elements + 16, device="cuda") % 251).to(torch.uint8)
     dst = torch.empty(elements, dtype=torch.uint8, device="cuda")
     compiled = _register_load_copy[(1,)](
-        src, dst, tc, operand, scale, num_warps=unwrap(layout.num_warps)
+        src, dst, tc, operand, scale, num_warps=maybe_unwrap(layout.num_warps)
     )
     torch.testing.assert_close(dst, src[16:], rtol=0, atol=0)
     assert compiled.metadata.shared == 0

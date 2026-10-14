@@ -22,7 +22,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._config import (
     KernelFuncConfig,
     KernelTuningConfig,
 )
-from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import unwrap
+from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import maybe_unwrap
 from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import KernelLayout
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import Schedule
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
@@ -171,7 +171,7 @@ def test_packed_words_and_selectors_match_producer(
         assert reg_count % len(selectors) == 0
         assert 1 << len(word_layout.reg_bases) == reg_count // len(selectors)
         for warp, lane, reg in product(
-            range(unwrap(layout.num_warps)), range(64), range(reg_count)
+            range(maybe_unwrap(layout.num_warps)), range(64), range(reg_count)
         ):
             row, group = _thread_coordinate(byte_layout, reg, lane, warp)
             word_coord = _thread_coordinate(
@@ -230,7 +230,7 @@ def test_wide_packed_scale_load_layout_matches_producer(scale_k, operand):
     nonk_bit, k_bit = registers.index([16, 0]), registers.index([0, 4])
     retained = [bit for bit in range(len(registers)) if bit not in (nonk_bit, k_bit)]
     for warp, lane, reg in product(
-        range(unwrap(layout.num_warps)), range(64), range(1 << len(registers))
+        range(maybe_unwrap(layout.num_warps)), range(64), range(1 << len(registers))
     ):
         selector = ((reg >> nonk_bit) & 1) + 2 * ((reg >> k_bit) & 1)
         word_reg = sum(((reg >> bit) & 1) << pos for pos, bit in enumerate(retained))
@@ -262,7 +262,7 @@ class _HostView:
         self.config = config
 
     def __getattr__(self, name):
-        value = unwrap(getattr(self.config, name))
+        value = maybe_unwrap(getattr(self.config, name))
         if callable(value):
             value = cache(value)
         setattr(self, name, value)
@@ -386,7 +386,7 @@ class _CopyRecorder:
             if is_scale
             else stage * (self.b_step if component == B_PAYLOAD else 128)
         )
-        address = unwrap(pointer + soffset)
+        address = maybe_unwrap(pointer + soffset)
         assert address == expected, (component, tile, stage, address, expected)
         history.append(address)
         if is_scale:
@@ -574,9 +574,13 @@ def test_pipeline_phases_and_packed_scale_addresses(
     )
     layout = _HostView(KernelLayout(tc.config))
     sizing = Schedule(tc.config, layout.config, 128)
-    minimum_tiles = unwrap(sizing.depth) + unwrap(sizing.peeled) + unwrap(sizing.unroll)
+    minimum_tiles = (
+        maybe_unwrap(sizing.depth)
+        + maybe_unwrap(sizing.peeled)
+        + maybe_unwrap(sizing.unroll)
+    )
     minimum = (minimum_tiles + 1) // 2 * 2
-    effective_unroll = unwrap(sizing.unroll)
+    effective_unroll = maybe_unwrap(sizing.unroll)
     # Complete K256 scale words constrain NUM_K to even values. Visit the minimum,
     # every reachable remainder, and a longer strip with additional ring wraps.
     lengths = {
@@ -585,6 +589,6 @@ def test_pipeline_phases_and_packed_scale_addresses(
     }
     lengths.add(minimum + 2 * effective_unroll)
     for stages in sorted(lengths):
-        assert validate(tc, 4096, stages * 128)
-        assert validate_pipeline(tc, layout, stages * 128)
+        assert validate(tc.config, 4096, stages * 128)
+        assert validate_pipeline(tc.config, layout.config, stages * 128)
         _run_scalar_pipeline(monkeypatch, tc, layout, stages, fused)

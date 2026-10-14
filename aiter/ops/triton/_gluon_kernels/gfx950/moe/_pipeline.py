@@ -27,7 +27,6 @@ from ._config import KernelFuncConfig, KernelTuningConfig
 from ._lang import optional as _opt
 from ._lang import pick_warp_pipeline_stage as pick_stage
 from ._lang import require_constexpr
-from ._lang import unwrap as _v
 from ._layout import KernelLayout
 from ._lds import LDSManager
 from ._mfma import _maybe_block_dot
@@ -126,11 +125,11 @@ class _PipelineConst:
         self.b_scale_hbm_offs = _opt(b_scale_hbm_offs)
         # re-wrapped: the frontend unwraps a constexpr argument before a
         # constexpr_function sees it, so these arrive as plain ints
-        self.a_scale_stride_k = gl.constexpr(_v(a_scale_stride_k))
-        self.b_scale_stride_k = gl.constexpr(_v(b_scale_stride_k))
-        self.a_step = gl.constexpr(_v(a_step))
-        self.b_step = gl.constexpr(_v(b_step))
-        self.s_step = gl.constexpr(_v(s_step))
+        self.a_scale_stride_k = gl.constexpr(a_scale_stride_k)
+        self.b_scale_stride_k = gl.constexpr(b_scale_stride_k)
+        self.a_step = gl.constexpr(a_step)
+        self.b_step = gl.constexpr(b_step)
+        self.s_step = gl.constexpr(s_step)
         self.func_cfg = func_cfg
         self.tuning_cfg = tuning_cfg
         self.layout = layout

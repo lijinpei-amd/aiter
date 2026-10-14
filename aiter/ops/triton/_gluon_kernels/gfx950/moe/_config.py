@@ -27,9 +27,6 @@ from ._lang import (
     dq_uses_mfma_scaled,
     strip_annotate,
 )
-from ._lang import (
-    unwrap as _v,
-)
 from ._types import WeightGuHbmLayout
 
 __all__ = ["KernelFuncConfig", "KernelTuningConfig"]
@@ -83,33 +80,33 @@ class KernelFuncConfig:
         weight_gu_hbm_layout=int(WeightGuHbmLayout.INTERLEAVED),
         epilogue=int(EpilogueMode.DEFAULT),
     ):
-        self.token_dtype_quant = gl.constexpr(_v(token_dtype_quant))
-        self.expert_dtype_quant = gl.constexpr(_v(expert_dtype_quant))
-        self.token_online_quant = gl.constexpr(_v(token_online_quant))
-        self.expert_online_quant = gl.constexpr(_v(expert_online_quant))
-        self.mma_acc_dtype = gl.constexpr(_v(mma_acc_dtype))
-        self.activation = gl.constexpr(_v(activation))
-        self.output_quant = gl.constexpr(_v(output_quant))
-        self.has_bias = gl.constexpr(_v(has_bias))
-        self.has_gammas = gl.constexpr(_v(has_gammas))
-        self.has_gather = gl.constexpr(_v(has_gather))
-        self.has_x_static_scale = gl.constexpr(_v(has_x_static_scale))
+        self.token_dtype_quant = gl.constexpr(token_dtype_quant)
+        self.expert_dtype_quant = gl.constexpr(expert_dtype_quant)
+        self.token_online_quant = gl.constexpr(token_online_quant)
+        self.expert_online_quant = gl.constexpr(expert_online_quant)
+        self.mma_acc_dtype = gl.constexpr(mma_acc_dtype)
+        self.activation = gl.constexpr(activation)
+        self.output_quant = gl.constexpr(output_quant)
+        self.has_bias = gl.constexpr(has_bias)
+        self.has_gammas = gl.constexpr(has_gammas)
+        self.has_gather = gl.constexpr(has_gather)
+        self.has_x_static_scale = gl.constexpr(has_x_static_scale)
         self.weight_gu_hbm_layout = gl.constexpr(
-            int(_v(weight_gu_hbm_layout))
-            if _v(activation) is not None
+            int(weight_gu_hbm_layout)
+            if activation is not None
             else int(WeightGuHbmLayout.INTERLEAVED)
         )
-        self.epilogue = gl.constexpr(int(_v(epilogue)))
+        self.epilogue = gl.constexpr(int(epilogue))
 
     # -- activation --
     @gluon.constexpr_function
     def has_activation(self):
-        return _v(self.activation) is not None
+        return self.activation.value is not None
 
     @gluon.constexpr_function
     def activation_reduction_n(self):
         """Emitted columns per raw column. 2 for a gated activation, 1 otherwise."""
-        return 2 if _v(self.activation) is not None else 1
+        return 2 if self.activation.value is not None else 1
 
     # -- dtype accessors --
     #
@@ -119,15 +116,15 @@ class KernelFuncConfig:
     # both.
     @gluon.constexpr_function
     def dtype_quant(self, idx):
-        if _v(idx) == 0:
-            return _v(self.token_dtype_quant)
-        return _v(self.expert_dtype_quant)
+        if idx == 0:
+            return self.token_dtype_quant.value
+        return self.expert_dtype_quant.value
 
     @gluon.constexpr_function
     def online_quant(self, idx):
-        if _v(idx) == 0:
-            return _v(self.token_online_quant)
-        return _v(self.expert_online_quant)
+        if idx == 0:
+            return self.token_online_quant.value
+        return self.expert_online_quant.value
 
     @gluon.constexpr_function
     def dot_kind(self):
@@ -300,70 +297,65 @@ class KernelTuningConfig:
         UNROLL_EPILOGUE=True,
     ):
         self.func_cfg = func_cfg
-        self.BLOCK_M = gl.constexpr(_v(BLOCK_M))
-        self.BLOCK_N = gl.constexpr(_v(BLOCK_N))
-        self.BLOCK_K = gl.constexpr(_v(BLOCK_K))
-        self.K_UNROLL = gl.constexpr(_v(K_UNROLL))
-        self.MINI_BLOCK_M = gl.constexpr(_v(MINI_BLOCK_M))
-        self.MINI_BLOCK_N = gl.constexpr(_v(MINI_BLOCK_N))
-        self.NUM_LDS_BUFFER = gl.constexpr(_v(NUM_LDS_BUFFER))
-        self.mfma_instr_shape = gl.constexpr(list(_v(mfma_instr_shape)))
-        self.warps_per_cta = gl.constexpr(list(_v(warps_per_cta)))
-        self.tiles_per_warp = gl.constexpr(list(_v(tiles_per_warp)))
-        self.k_width = gl.constexpr(_v(k_width))
-        self.transposed = gl.constexpr(_v(transposed))
-        self.WAVES_PER_EU = gl.constexpr(_v(WAVES_PER_EU))
-        self.TILE_SCHED = gl.constexpr(_v(TILE_SCHED))
-        self.GROUP_M = gl.constexpr(_v(GROUP_M))
-        self.NUM_XCDS = gl.constexpr(_v(NUM_XCDS))
-        self.token_cache_modifier = gl.constexpr(_v(token_cache_modifier))
-        self.token_scale_cache_modifier = gl.constexpr(_v(token_scale_cache_modifier))
-        self.expert_cache_modifier = gl.constexpr(_v(expert_cache_modifier))
-        self.expert_scale_cache_modifier = gl.constexpr(_v(expert_scale_cache_modifier))
-        self.result_cache_modifier = gl.constexpr(_v(result_cache_modifier))
-        self.result_scale_cache_modifier = gl.constexpr(_v(result_scale_cache_modifier))
+        self.BLOCK_M = gl.constexpr(BLOCK_M)
+        self.BLOCK_N = gl.constexpr(BLOCK_N)
+        self.BLOCK_K = gl.constexpr(BLOCK_K)
+        self.K_UNROLL = gl.constexpr(K_UNROLL)
+        self.MINI_BLOCK_M = gl.constexpr(MINI_BLOCK_M)
+        self.MINI_BLOCK_N = gl.constexpr(MINI_BLOCK_N)
+        self.NUM_LDS_BUFFER = gl.constexpr(NUM_LDS_BUFFER)
+        self.mfma_instr_shape = gl.constexpr(list(mfma_instr_shape))
+        self.warps_per_cta = gl.constexpr(list(warps_per_cta))
+        self.tiles_per_warp = gl.constexpr(list(tiles_per_warp))
+        self.k_width = gl.constexpr(k_width)
+        self.transposed = gl.constexpr(transposed)
+        self.WAVES_PER_EU = gl.constexpr(WAVES_PER_EU)
+        self.TILE_SCHED = gl.constexpr(TILE_SCHED)
+        self.GROUP_M = gl.constexpr(GROUP_M)
+        self.NUM_XCDS = gl.constexpr(NUM_XCDS)
+        self.token_cache_modifier = gl.constexpr(token_cache_modifier)
+        self.token_scale_cache_modifier = gl.constexpr(token_scale_cache_modifier)
+        self.expert_cache_modifier = gl.constexpr(expert_cache_modifier)
+        self.expert_scale_cache_modifier = gl.constexpr(expert_scale_cache_modifier)
+        self.result_cache_modifier = gl.constexpr(result_cache_modifier)
+        self.result_scale_cache_modifier = gl.constexpr(result_scale_cache_modifier)
         # int, not bool: WarpPipeline has three values and True still lands on COMPILER.
-        self.WARP_PIPELINE = gl.constexpr(int(_v(WARP_PIPELINE)))
-        self.VGPR_PREFETCH_K = gl.constexpr(int(_v(VGPR_PREFETCH_K)))
-        self.A_SCALE_SORTED_SHUFFLED = gl.constexpr(bool(_v(A_SCALE_SORTED_SHUFFLED)))
-        self.B_SCALE_SHUFFLED = gl.constexpr(bool(_v(B_SCALE_SHUFFLED)))
-        self.B_PRESHUFFLED = gl.constexpr(bool(_v(B_PRESHUFFLED)))
-        self.ACT_FAST_RCP = gl.constexpr(bool(_v(ACT_FAST_RCP)))
-        self.WAIT_COMMIT_SCHEME = gl.constexpr(int(_v(WAIT_COMMIT_SCHEME)))
-        self.DS_READ_A_PAYLOAD_IN_MFMA = gl.constexpr(
-            bool(_v(DS_READ_A_PAYLOAD_IN_MFMA))
-        )
-        self.DS_READ_A_SCALE_IN_MFMA = gl.constexpr(bool(_v(DS_READ_A_SCALE_IN_MFMA)))
-        self.DS_READ_B_PAYLOAD_IN_MFMA = gl.constexpr(
-            bool(_v(DS_READ_B_PAYLOAD_IN_MFMA))
-        )
-        self.DS_READ_B_SCALE_IN_MFMA = gl.constexpr(bool(_v(DS_READ_B_SCALE_IN_MFMA)))
-        self.SCHED_MODE = gl.constexpr(int(_v(SCHED_MODE)))
-        self.FROZEN_STEP = gl.constexpr(bool(_v(FROZEN_STEP)))
-        self.SOFF_UNROLL = gl.constexpr(bool(_v(SOFF_UNROLL)))
-        self.SCALE_FILL_MID = gl.constexpr(bool(_v(SCALE_FILL_MID)))
-        self.ALLOW_B_VIA_LDS = gl.constexpr(bool(_v(ALLOW_B_VIA_LDS)))
-        self.ALLOW_B_SCALE_VIA_LDS = gl.constexpr(bool(_v(ALLOW_B_SCALE_VIA_LDS)))
-        self.ALLOW_A_SCALE_VIA_LDS = gl.constexpr(bool(_v(ALLOW_A_SCALE_VIA_LDS)))
-        self.A_NUM_BUFFER = gl.constexpr(int(_v(A_NUM_BUFFER)))
-        self.B_NUM_BUFFER = gl.constexpr(int(_v(B_NUM_BUFFER)))
-        self.A_SCALE_NUM_BUFFER = gl.constexpr(int(_v(A_SCALE_NUM_BUFFER)))
-        self.B_SCALE_NUM_BUFFER = gl.constexpr(int(_v(B_SCALE_NUM_BUFFER)))
-        self.SCALE_MINI_BLOCK_M = gl.constexpr(int(_v(SCALE_MINI_BLOCK_M)))
-        self.SCALE_MINI_BLOCK_N = gl.constexpr(int(_v(SCALE_MINI_BLOCK_N)))
-        self.SCALE_MINI_BLOCK_K = gl.constexpr(int(_v(SCALE_MINI_BLOCK_K)))
-        self.UNROLL_EPILOGUE = gl.constexpr(bool(_v(UNROLL_EPILOGUE)))
+        self.WARP_PIPELINE = gl.constexpr(int(WARP_PIPELINE))
+        self.VGPR_PREFETCH_K = gl.constexpr(int(VGPR_PREFETCH_K))
+        self.A_SCALE_SORTED_SHUFFLED = gl.constexpr(bool(A_SCALE_SORTED_SHUFFLED))
+        self.B_SCALE_SHUFFLED = gl.constexpr(bool(B_SCALE_SHUFFLED))
+        self.B_PRESHUFFLED = gl.constexpr(bool(B_PRESHUFFLED))
+        self.ACT_FAST_RCP = gl.constexpr(bool(ACT_FAST_RCP))
+        self.WAIT_COMMIT_SCHEME = gl.constexpr(int(WAIT_COMMIT_SCHEME))
+        self.DS_READ_A_PAYLOAD_IN_MFMA = gl.constexpr(bool(DS_READ_A_PAYLOAD_IN_MFMA))
+        self.DS_READ_A_SCALE_IN_MFMA = gl.constexpr(bool(DS_READ_A_SCALE_IN_MFMA))
+        self.DS_READ_B_PAYLOAD_IN_MFMA = gl.constexpr(bool(DS_READ_B_PAYLOAD_IN_MFMA))
+        self.DS_READ_B_SCALE_IN_MFMA = gl.constexpr(bool(DS_READ_B_SCALE_IN_MFMA))
+        self.SCHED_MODE = gl.constexpr(int(SCHED_MODE))
+        self.FROZEN_STEP = gl.constexpr(bool(FROZEN_STEP))
+        self.SOFF_UNROLL = gl.constexpr(bool(SOFF_UNROLL))
+        self.SCALE_FILL_MID = gl.constexpr(bool(SCALE_FILL_MID))
+        self.ALLOW_B_VIA_LDS = gl.constexpr(bool(ALLOW_B_VIA_LDS))
+        self.ALLOW_B_SCALE_VIA_LDS = gl.constexpr(bool(ALLOW_B_SCALE_VIA_LDS))
+        self.ALLOW_A_SCALE_VIA_LDS = gl.constexpr(bool(ALLOW_A_SCALE_VIA_LDS))
+        self.A_NUM_BUFFER = gl.constexpr(int(A_NUM_BUFFER))
+        self.B_NUM_BUFFER = gl.constexpr(int(B_NUM_BUFFER))
+        self.A_SCALE_NUM_BUFFER = gl.constexpr(int(A_SCALE_NUM_BUFFER))
+        self.B_SCALE_NUM_BUFFER = gl.constexpr(int(B_SCALE_NUM_BUFFER))
+        self.SCALE_MINI_BLOCK_M = gl.constexpr(int(SCALE_MINI_BLOCK_M))
+        self.SCALE_MINI_BLOCK_N = gl.constexpr(int(SCALE_MINI_BLOCK_N))
+        self.SCALE_MINI_BLOCK_K = gl.constexpr(int(SCALE_MINI_BLOCK_K))
+        self.UNROLL_EPILOGUE = gl.constexpr(bool(UNROLL_EPILOGUE))
 
     @gluon.constexpr_function
     def num_buffers(self, operand, scale=False):
         """Ring depth for one payload or scale; zero inherits NUM_LDS_BUFFER."""
-        operand = _v(operand)
         assert operand in (0, 1), "operand must be 0 (A) or 1 (B)"
-        if _v(scale):
+        if scale:
             depth = self.A_SCALE_NUM_BUFFER if operand == 0 else self.B_SCALE_NUM_BUFFER
         else:
             depth = self.A_NUM_BUFFER if operand == 0 else self.B_NUM_BUFFER
-        return _v(depth) or _v(self.NUM_LDS_BUFFER)
+        return depth.value or self.NUM_LDS_BUFFER.value
 
     # -- storage placement policy and format decisions -----------------------------
     # Yes/no policy read from the knobs above, and nothing else: no shapes. Which
@@ -380,18 +372,16 @@ class KernelTuningConfig:
         A permitted component can still land in registers when its tile cannot take
         the copy; see ``KernelLayout.component_via_lds``.
         """
-        component = _v(component)
-        operand, is_scale = _v(component[0]), bool(_v(component[1]))
+        operand, is_scale = component[0], bool(component[1])
         assert operand in (0, 1), "component operand must be 0 (A) or 1 (B)"
         if is_scale:
-            return bool(
-                _v(
-                    self.ALLOW_A_SCALE_VIA_LDS
-                    if operand == 0
-                    else self.ALLOW_B_SCALE_VIA_LDS
-                )
+            flag = (
+                self.ALLOW_A_SCALE_VIA_LDS
+                if operand == 0
+                else self.ALLOW_B_SCALE_VIA_LDS
             )
-        return operand == 0 or bool(_v(self.ALLOW_B_VIA_LDS))
+            return bool(flag.value)
+        return operand == 0 or bool(self.ALLOW_B_VIA_LDS.value)
 
     @gluon.constexpr_function
     def operand_preshuffled(self, idx):
@@ -401,16 +391,16 @@ class KernelTuningConfig:
         there is no static permutation to bake in. For B it is the ``B_PRESHUFFLED``
         knob, which the caller honours by handing over the permuted weight tensor.
         """
-        return _v(idx) == 1 and _v(self.B_PRESHUFFLED)
+        return idx == 1 and self.B_PRESHUFFLED.value
 
     @gluon.constexpr_function
     def scale_shuffled(self, idx):
         """Is this operand's scale tile already in MFMA fragment order in memory?"""
         if not self.func_cfg.has_scale(idx):
             return False
-        if _v(idx) == 0:
-            return _v(self.A_SCALE_SORTED_SHUFFLED)
-        return _v(self.B_SCALE_SHUFFLED)
+        if idx == 0:
+            return self.A_SCALE_SORTED_SHUFFLED.value
+        return self.B_SCALE_SHUFFLED.value
 
     @gluon.constexpr_function
     def ds_read_in_mfma(self, operand, scale=False):
@@ -419,21 +409,20 @@ class KernelTuningConfig:
         ``operand`` is 0 for A (tokens), 1 for B (experts); ``scale`` selects its
         scale rather than its payload. A component absent from a dtype emits no read.
         """
-        operand = _v(operand)
         assert operand in (0, 1), "operand must be 0 (A) or 1 (B)"
         if operand == 0:
             flag = (
                 self.DS_READ_A_SCALE_IN_MFMA
-                if _v(scale)
+                if scale
                 else self.DS_READ_A_PAYLOAD_IN_MFMA
             )
         else:
             flag = (
                 self.DS_READ_B_SCALE_IN_MFMA
-                if _v(scale)
+                if scale
                 else self.DS_READ_B_PAYLOAD_IN_MFMA
             )
-        return bool(_v(flag))
+        return bool(flag.value)
 
     # -- inter-wave ping-pong (WarpPipeline) ----------------------------------------
     # NONE and COMPILER share the live step body; MANUAL selects the frozen body.
@@ -442,28 +431,28 @@ class KernelTuningConfig:
     @gluon.constexpr_function
     def warp_pipeline_enabled(self):
         """Any ping-pong at all -- what the VGPR_PREFETCH_K precondition keys on."""
-        return _v(self.WARP_PIPELINE) != int(WarpPipeline.NONE)
+        return self.WARP_PIPELINE.value != int(WarpPipeline.NONE)
 
     @gluon.constexpr_function
     def warp_pipeline_compiler(self):
         """Hand the mfma/mem halves to TritonAMDGPUWarpPipeline."""
-        return _v(self.WARP_PIPELINE) == int(WarpPipeline.COMPILER)
+        return self.WARP_PIPELINE.value == int(WarpPipeline.COMPILER)
 
     @gluon.constexpr_function
     def warp_pipeline_manual(self):
         """The hand-emitted rendezvous -- ``_pipeline_step_frozen`` only, for now."""
-        return _v(self.WARP_PIPELINE) == int(WarpPipeline.MANUAL)
+        return self.WARP_PIPELINE.value == int(WarpPipeline.MANUAL)
 
     # -- commit-group granularity (WaitCommitScheme) --------------------------------
     # Emission and wait arithmetic use the same copy schedule and group boundaries.
 
     @gluon.constexpr_function
     def commit_per_op(self):
-        return _v(self.WAIT_COMMIT_SCHEME) == int(WaitCommitScheme.PER_OP)
+        return self.WAIT_COMMIT_SCHEME.value == int(WaitCommitScheme.PER_OP)
 
     @gluon.constexpr_function
     def commit_per_slot(self):
-        return _v(self.WAIT_COMMIT_SCHEME) == int(WaitCommitScheme.PER_SLOT)
+        return self.WAIT_COMMIT_SCHEME.value == int(WaitCommitScheme.PER_SLOT)
 
     @gluon.constexpr_function
     def commit_per_stage(self):
@@ -471,10 +460,10 @@ class KernelTuningConfig:
 
     @gluon.constexpr_function
     def commit_per_stage_warp_pipeline(self):
-        return _v(self.WAIT_COMMIT_SCHEME) == int(
+        return self.WAIT_COMMIT_SCHEME.value == int(
             WaitCommitScheme.PER_STAGE_WARP_PIPELINE
         )
 
     @gluon.constexpr_function
     def commit_per_stage_whole(self):
-        return _v(self.WAIT_COMMIT_SCHEME) == int(WaitCommitScheme.PER_STAGE_WHOLE)
+        return self.WAIT_COMMIT_SCHEME.value == int(WaitCommitScheme.PER_STAGE_WHOLE)

@@ -31,7 +31,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import DtypeQuant as DQ  # noqa: E402
-from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import unwrap  # noqa: E402
+from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import maybe_unwrap  # noqa: E402
 from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import (  # noqa: E402
     KernelLayout,
 )
@@ -144,17 +144,18 @@ def cases():
 
 def _steps(schedule):
     """Every emitted step, labelled the way `_pipeline.py` expands it."""
-    depth, unroll = unwrap(schedule.depth), unwrap(schedule.unroll)
+    depth, unroll = maybe_unwrap(schedule.depth), maybe_unwrap(schedule.unroll)
     out = [(f"prologue r={r}", schedule.prologue_step(r)) for r in range(1 - depth, 0)]
     out.append(("warmup", schedule.warmup_step()))
     out += [
         (f"peeled x={x}", schedule.peeled_step(x))
-        for x in range(unwrap(schedule.peeled))
+        for x in range(maybe_unwrap(schedule.peeled))
     ]
     out += [(f"loop u={u}", schedule.loop_step(u)) for u in range(unroll)]
-    count = unroll - 1 if unwrap(schedule.static_remainder) else 1
+    count = unroll - 1 if maybe_unwrap(schedule.static_remainder) else 1
     out += [(f"remainder u={u}", schedule.remainder_step(u)) for u in range(count)]
-    phases = unwrap(schedule.ring_period) if unwrap(schedule.static_drain) else 1
+    static_drain = maybe_unwrap(schedule.static_drain)
+    phases = maybe_unwrap(schedule.ring_period) if static_drain else 1
     out += [
         (f"drain p={p} j={j}", schedule.drain_step(p, j))
         for p in range(phases)
@@ -174,26 +175,28 @@ def dump_case(name, cfg, dq_a, dq_b, K, out):
         out(f"== {name}: REJECTED {type(exc).__name__}: {str(exc).splitlines()[0][:120]}")
         return
 
-    nm, nn = unwrap(layout.num_m_slots), unwrap(layout.num_n_slots)
+    nm, nn = maybe_unwrap(layout.num_m_slots), maybe_unwrap(layout.num_n_slots)
     slots = nm * nn
     present = [c for c in COMPONENTS if schedule.present(c)]
 
     out(f"== {name}")
-    out(f"  geom NM={nm} NN={nn} slots={slots} mk={unwrap(layout.num_k_slots)} "
-        f"num_k={unwrap(schedule.num_k)} scheme={int(tc.WAIT_COMMIT_SCHEME)}")
-    out(f"  sizing depth={unwrap(schedule.depth)} unroll={unwrap(schedule.unroll)} "
-        f"peeled={unwrap(schedule.peeled)} ring={unwrap(schedule.ring_period)} "
-        f"regperiod={unwrap(schedule.register_period)} "
-        f"async={unwrap(schedule.async_period)} "
+    out(f"  geom NM={nm} NN={nn} slots={slots} mk={maybe_unwrap(layout.num_k_slots)} "
+        f"num_k={maybe_unwrap(schedule.num_k)} scheme={int(tc.WAIT_COMMIT_SCHEME)}")
+    out(f"  sizing depth={maybe_unwrap(schedule.depth)} "
+        f"unroll={maybe_unwrap(schedule.unroll)} "
+        f"peeled={maybe_unwrap(schedule.peeled)} "
+        f"ring={maybe_unwrap(schedule.ring_period)} "
+        f"regperiod={maybe_unwrap(schedule.register_period)} "
+        f"async={maybe_unwrap(schedule.async_period)} "
         f"hasreg={schedule.has_register_component()}")
-    out(f"  regions static_remainder={unwrap(schedule.static_remainder)} "
-        f"static_drain={unwrap(schedule.static_drain)} "
-        f"epilogue_groups={unwrap(schedule.epilogue_groups)} "
+    out(f"  regions static_remainder={maybe_unwrap(schedule.static_remainder)} "
+        f"static_drain={maybe_unwrap(schedule.static_drain)} "
+        f"epilogue_groups={maybe_unwrap(schedule.epilogue_groups)} "
         f"epilogue_wait={schedule.epilogue_wait()}")
-    out(f"  commit per_copy={unwrap(schedule.commit_per_copy)} "
-        f"per_slot={unwrap(schedule.commit_per_slot)} "
-        f"per_tile={unwrap(schedule.commit_per_tile)} "
-        f"tile_after_mfma={unwrap(schedule.tile_commit_after_mfma)}")
+    out(f"  commit per_copy={maybe_unwrap(schedule.commit_per_copy)} "
+        f"per_slot={maybe_unwrap(schedule.commit_per_slot)} "
+        f"per_tile={maybe_unwrap(schedule.commit_per_tile)} "
+        f"tile_after_mfma={maybe_unwrap(schedule.tile_commit_after_mfma)}")
 
     for c in COMPONENTS:
         if not schedule.present(c):
@@ -243,7 +246,7 @@ def dump_case(name, cfg, dq_a, dq_b, K, out):
     # the soffset stream
     for c in present:
         if c[1]:
-            unroll = unwrap(schedule.unroll)
+            unroll = maybe_unwrap(schedule.unroll)
             soff = [schedule.scale_soff_steps(c, o) for o in range(unroll)]
             out(f"  soff {CNAME[c]} {soff}")
 
