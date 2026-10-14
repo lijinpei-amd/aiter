@@ -22,18 +22,26 @@ with no code change.
     python tests/asm_hash/asm_hash.py > after.txt
     diff before.txt after.txt && echo "CODEGEN UNCHANGED"
     python tests/asm_hash/asm_hash.py a4w4:16 a8w4:256   # a subset of the cells
+    python tests/asm_hash/asm_hash.py -j 20              # all twenty at once
 
-Compile only: no launch, no timing, so it does not need an idle GPU.
+Compile only: no launch, no timing, so it does not need an idle GPU. Each cell is its
+own process with its own Triton cache, so cells compile concurrently: ``-j`` (or
+``ASM_HASH_JOBS``) at a time, 4 by default. Each one holds ~5 GB of VRAM while it
+compiles (its inputs), so 4 fit beside a nearly full GPU; ``-j 20`` needs ~95 GB free
+and takes ~20 s instead of ~1 min. Rows print in the fixed cell order once every cell
+is done, so the output does not depend on which finishes first.
 """
 
 from __future__ import annotations
 
+import argparse
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -44,6 +52,8 @@ TOKENS = [(16, 32), (64, 32), (256, 64), (1024, 128), (4096, 128)]
 DTYPES = ["a4w4", "a8w4", "a8w8", "a16w16"]
 HARNESS = HERE.parent / "harness"
 CELLS = HERE / "cells.json"
+TIMEOUT = 1800  # seconds per cell
+JOBS = 4  # concurrent cells; ~5 GB of VRAM each
 
 WORKER = r"""
 import json, sys, hashlib, glob, os
@@ -84,48 +94,73 @@ print("ASM", hashlib.md5("\n".join(lines).encode()).hexdigest()[:12], len(lines)
 """
 
 
+def hash_cell(worker, dtype, tokens):
+    """Compile one cell in a fresh process and cache; return its output row."""
+    cache = Path(tempfile.mkdtemp())
+    env = dict(os.environ)
+    env.update(
+        PYTHONPATH=str(REPO),
+        TRITON_CACHE_DIR=str(cache),
+        AITER_TRITON_USE_HERD="0",
+        TRITON_AMD_NT_ONLY="0",
+        PYTHONDONTWRITEBYTECODE="1",
+    )
+    for name in list(env):
+        if name.startswith("AITER_TRITON_MOE_GLUON_"):
+            env.pop(name)
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(worker), f"gluon_{dtype}", str(tokens)],
+            env=env,
+            cwd=str(REPO),
+            capture_output=True,
+            text=True,
+            timeout=TIMEOUT,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return f"{dtype:7s} t{tokens:<5d} FAILED timeout after {TIMEOUT} s"
+    finally:
+        shutil.rmtree(cache, ignore_errors=True)
+    found = re.search(r"^ASM ([0-9a-f]{12}) (\d+)$", proc.stdout, re.MULTILINE)
+    if found:
+        return f"{dtype:7s} t{tokens:<5d} md5={found.group(1)} instrs={found.group(2)}"
+    tail = (proc.stderr.strip().splitlines() or ["?"])[-1][:100]
+    return f"{dtype:7s} t{tokens:<5d} FAILED {tail}"
+
+
 def main():
-    worker = Path(tempfile.mkdtemp()) / "w.py"
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument(
+        "cells", nargs="*", metavar="dtype:tokens", help="cells; all twenty by default"
+    )
+    ap.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        default=int(os.environ.get("ASM_HASH_JOBS") or JOBS),
+        help=f"cells compiled at once (default: $ASM_HASH_JOBS or {JOBS})",
+    )
+    args = ap.parse_args()
+    cells = [
+        (dtype, tokens)
+        for dtype in DTYPES
+        for tokens, _ in TOKENS
+        if not args.cells or f"{dtype}:{tokens}" in args.cells
+    ]
+    scratch = Path(tempfile.mkdtemp())
+    worker = scratch / "w.py"
     worker.write_text(
         WORKER.format(harness=str(HARNESS), repo=str(REPO), cells=str(CELLS))
     )
-    only = set(sys.argv[1:])  # "dtype:tokens" cells; all twenty by default
-    rows = []
-    for dtype in DTYPES:
-        for tokens, _ in TOKENS:
-            if only and f"{dtype}:{tokens}" not in only:
-                continue
-            cache = Path(tempfile.mkdtemp())
-            env = dict(os.environ)
-            env.update(
-                PYTHONPATH=str(REPO),
-                TRITON_CACHE_DIR=str(cache),
-                AITER_TRITON_USE_HERD="0",
-                TRITON_AMD_NT_ONLY="0",
-                PYTHONDONTWRITEBYTECODE="1",
-            )
-            for name in list(env):
-                if name.startswith("AITER_TRITON_MOE_GLUON_"):
-                    env.pop(name)
-            proc = subprocess.run(
-                [sys.executable, str(worker), f"gluon_{dtype}", str(tokens)],
-                env=env,
-                cwd=str(REPO),
-                capture_output=True,
-                text=True,
-                timeout=1800,
-                check=False,
-            )
-            found = re.search(r"^ASM ([0-9a-f]{12}) (\d+)$", proc.stdout, re.MULTILINE)
-            if found:
-                rows.append(
-                    f"{dtype:7s} t{tokens:<5d} md5={found.group(1)} "
-                    f"instrs={found.group(2)}"
-                )
-            else:
-                tail = (proc.stderr.strip().splitlines() or ["?"])[-1][:100]
-                rows.append(f"{dtype:7s} t{tokens:<5d} FAILED {tail}")
-            shutil.rmtree(cache, ignore_errors=True)
+    try:
+        # Threads only wait on the per-cell processes; map keeps the cell order.
+        with ThreadPoolExecutor(max(1, args.jobs)) as pool:
+            rows = list(pool.map(lambda cell: hash_cell(worker, *cell), cells))
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
     print("\n".join(rows))
 
 
