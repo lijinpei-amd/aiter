@@ -64,6 +64,7 @@ from ._types import (
     TileSched,
     WaitCommitScheme,
     WarpPipeline,
+    WeightGuHbmLayout,
     dq_has_scale,
     dq_mx_format,
     dq_pack_divisor,
@@ -154,7 +155,10 @@ def _gu_split_frozen(fc):
 
     Only meaningful with a gated activation -- the flag is inert otherwise.
     """
-    return bool(_v(fc.gate_up_split)) and _v(fc.activation) is not None
+    return (
+        _v(fc.weight_gu_hbm_layout) == WeightGuHbmLayout.SPLIT
+        and _v(fc.activation) is not None
+    )
 
 
 @gluon.constexpr_function

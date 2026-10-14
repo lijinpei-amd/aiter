@@ -76,6 +76,7 @@ def build_gluon(data, tuning, artifact_dir):
         KernelFuncConfig,
         KernelTuningConfig,
     )
+    from aiter.ops.triton._gluon_kernels.gfx950.moe._types import WeightGuHbmLayout
     from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import validate
     from aiter.ops.triton.moe import moe_op_gemm_gluon as host
 
@@ -143,7 +144,7 @@ def build_gluon(data, tuning, artifact_dir):
     assert activation.alpha == 1.0 and activation.limit is None
     assert not activation.add_residual
     assert not func_spec.has_bias and not func_spec.has_gammas
-    assert func_spec.gate_up_split
+    assert func_spec.weight_gu_hbm_layout == WeightGuHbmLayout.SPLIT
     assert (func_spec.output_quant is not None) == quantized_output
     effective = tuning_spec._asdict()
     requested_effective = dict(

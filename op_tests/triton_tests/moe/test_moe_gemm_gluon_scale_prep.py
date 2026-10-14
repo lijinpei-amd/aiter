@@ -20,6 +20,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     ActKind,
     DtypeQuant,
     ScaleSwizzle,
+    WeightGuHbmLayout,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import validate
 from aiter.ops.triton.moe import moe_op_gemm_gluon as host
@@ -73,7 +74,9 @@ def test_mxfp8_gemm1_default_uses_paired_k128_scales(split):
     assert cfg["tiles_per_warp"] == (2, 2)
     assert cfg["A_SCALE_SORTED_SHUFFLED"] and cfg["B_SCALE_SHUFFLED"]
     assert not cfg["B_PRESHUFFLED"]
-    assert host._cval(spec[1][0]).gate_up_split == split
+    assert host._cval(spec[1][0]).weight_gu_hbm_layout == (
+        WeightGuHbmLayout.SPLIT if split else WeightGuHbmLayout.INTERLEAVED
+    )
 
 
 @pytest.mark.parametrize("overrides", [
@@ -231,7 +234,9 @@ def _capture_launch(case, config, split, monkeypatch):
     assert result is sentinel
     assert captured["a_ptr"] is case.x and captured["b_ptr"] is case.w
     assert captured["NUM_K"] == case.k // host._cval(captured["CFG_TUNING"]).BLOCK_K
-    assert host._cval(captured["CFG_FUNC"]).gate_up_split == split
+    assert host._cval(captured["CFG_FUNC"]).weight_gu_hbm_layout == (
+        WeightGuHbmLayout.SPLIT if split else WeightGuHbmLayout.INTERLEAVED
+    )
     return captured
 
 

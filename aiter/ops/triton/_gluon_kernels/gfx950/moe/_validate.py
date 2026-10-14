@@ -30,7 +30,12 @@ from ._schedule import (
     pipeline_depth,
     pipeline_unroll,
 )
-from ._types import LDS_CAP_BYTES, LDS_EPILOGUE_RESERVE_BYTES, LDS_USABLE_BYTES
+from ._types import (
+    LDS_CAP_BYTES,
+    LDS_EPILOGUE_RESERVE_BYTES,
+    LDS_USABLE_BYTES,
+    WeightGuHbmLayout,
+)
 
 __all__ = [
     "validate",
@@ -59,6 +64,10 @@ def validate(tc, N, K, layout=None):
         int(EpilogueMode.NOP_ACTIVATION),
         int(EpilogueMode.NOP),
     ), f"epilogue {_v(fc.epilogue)} is not an EpilogueMode"
+    assert _v(fc.weight_gu_hbm_layout) in (
+        int(WeightGuHbmLayout.INTERLEAVED),
+        int(WeightGuHbmLayout.SPLIT),
+    ), f"{_v(fc.weight_gu_hbm_layout)} is not a WeightGuHbmLayout"
     assert _v(tc.SCHED_MODE) in (
         int(SchedMode.NONE),
         int(SchedMode.IGLP_0),
@@ -250,16 +259,16 @@ def validate_layout(tc, layout, N, K):
     # -- scale swizzle --
     # (checked by the caller against the tensor's scale_swizzle field)
 
-    # -- gate/up split: an N slot must be exactly one operand side --
-    if fc.gu_split():
+    # -- WeightGuHbmLayout.SPLIT: an N slot must be exactly one operand side --
+    if _v(fc.weight_gu_hbm_layout) == WeightGuHbmLayout.SPLIT:
         MBN = _v(tc.MINI_BLOCK_N)
         assert layout.num_n_slots_per_block() == 2 and MBN * 2 == BN, (
-            f"gate_up_split needs exactly two N slots, one per side: got "
+            f"WeightGuHbmLayout.SPLIT needs exactly two N slots, one per side: got "
             f"BLOCK_N {BN} / MINI_BLOCK_N {MBN} = {layout.num_n_slots_per_block()}"
         )
         assert N % 2 == 0 and (N // 2) % MBN == 0, (
-            f"gate_up_split needs each half of N ({N}) to be a whole number of "
-            f"MINI_BLOCK_N ({MBN}) tiles"
+            f"WeightGuHbmLayout.SPLIT needs each half of N ({N}) to be a whole "
+            f"number of MINI_BLOCK_N ({MBN}) tiles"
         )
         # The whole point of the layout: a warp's emitted N extent has to contain a
         # whole MX group, or the fused quant's amax crosses the warp boundary. That
@@ -268,8 +277,8 @@ def validate_layout(tc, layout, N, K):
         if _v(fc.output_quant) is not None:
             warp_n = instr[1] * tiles[1]
             assert warp_n % MX_GROUP == 0, (
-                f"gate_up_split with a fused MX output quant needs a warp's "
-                f"emitted N extent (instr_n {instr[1]} * tiles_per_warp_n "
+                f"WeightGuHbmLayout.SPLIT with a fused MX output quant needs a "
+                f"warp's emitted N extent (instr_n {instr[1]} * tiles_per_warp_n "
                 f"{tiles[1]} = {warp_n}) to be a multiple of {MX_GROUP}, else the "
                 "amax reduction still crosses warps"
             )

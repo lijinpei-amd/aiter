@@ -42,10 +42,10 @@ Memory layout contract (the wrapper hard-asserts it), with ``pack`` = 2 for MXFP
 * scales       ``(E, K/32, N)`` strided view, K contiguous, strides carried explicitly
 * stage 1: ``N = 2*I``, ``K = H``; stage 2: ``N = H``, ``K = I``
 * stage 1 gate/up arrive pre-fused, in one of two packings along N, selected by
-  ``KernelFuncConfig.gate_up_split``:
+  ``KernelFuncConfig.weight_gu_hbm_layout``:
 
-  - ``False`` (default) -- column-interleaved, even = gate, odd = up
-  - ``True``  -- whole halves, gate in ``[0, I)`` and up in ``[I, 2I)``. A mini-N block
+  - ``INTERLEAVED`` (default) -- column-interleaved, even = gate, odd = up
+  - ``SPLIT`` -- whole halves, gate in ``[0, I)`` and up in ``[I, 2I)``. A mini-N block
     is then one entire operand side, so the activation pairs two accumulator *tiles*
     with identical layouts instead of two registers within a lane's quad, and a warp's
     32 emitted channels are exactly one MX group. See ``KernelLayout.n_start``. The
@@ -83,11 +83,12 @@ from ._pipeline import (
     _run_buffered_pipeline,
     _take_reg_pairs,
 )
-from ._types import TileSched, _slot_index
+from ._types import TileSched, WeightGuHbmLayout, _slot_index
 from ._validate import validate, validate_pipeline
 
 _TS_XCD_GROUP_M: gl.constexpr = gl.constexpr(int(TileSched.XCD_GROUP_M))
 _TS_GROUP_M: gl.constexpr = gl.constexpr(int(TileSched.GROUP_M))
+_WEIGHT_GU_SPLIT: gl.constexpr = gl.constexpr(int(WeightGuHbmLayout.SPLIT))
 
 
 @gluon.jit
@@ -120,7 +121,7 @@ def _drain_last_fused(
     NN: gl.constexpr = layout.num_n_slots_per_block()
     PF_FRAGS: gl.constexpr = layout.num_prefetch_k_slots()
     act: gl.constexpr = func_cfg.act()
-    gl.static_assert(func_cfg.gu_split() and NN == 2)
+    gl.static_assert(func_cfg.weight_gu_hbm_layout == _WEIGHT_GU_SPLIT and NN == 2)
 
     acc = ()
     for ni in gl.static_range(NN):
@@ -291,7 +292,10 @@ def _moe_gemm_body(
     # Shallower streams finish their remaining fills during the drain. The final
     # MFMA is separate and consumes only the fragments already in registers.
     # Fuse its activation where supported by the live step.
-    FUSE: gl.constexpr = func_cfg.gu_split() and layout.num_n_slots_per_block() == 2
+    FUSE: gl.constexpr = (
+        func_cfg.weight_gu_hbm_layout == _WEIGHT_GU_SPLIT
+        and layout.num_n_slots_per_block() == 2
+    )
     regs = _drain_buffered_pipeline(pc, hbm_ptrs, buffers, regs, NUM_K, epi.groups)
     if require_constexpr(not FUSE):
         regs = _PipelineRegFragments(

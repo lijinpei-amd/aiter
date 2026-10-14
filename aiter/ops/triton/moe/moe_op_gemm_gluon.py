@@ -60,6 +60,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     TuningSpec,
     WaitCommitScheme,
     WarpPipeline,
+    WeightGuHbmLayout,
     dq_pack_divisor,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import (
@@ -1243,7 +1244,9 @@ def _launch_spec(
         has_gammas,
         has_gather,
         has_x_static_scale,
-        gate_up_split,
+        int(
+            WeightGuHbmLayout.SPLIT if gate_up_split else WeightGuHbmLayout.INTERLEAVED
+        ),
         epilogue,
     )
     tuning_spec = TuningSpec(*(_hashable(v) for v in _tuning_args(c)))

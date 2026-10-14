@@ -30,6 +30,7 @@ from ._lang import (
 from ._lang import (
     unwrap as _v,
 )
+from ._types import WeightGuHbmLayout
 
 __all__ = ["KernelFuncConfig", "KernelTuningConfig"]
 
@@ -59,13 +60,10 @@ class KernelFuncConfig:
     # the FP8_E4M3 operand carries unit scales through the MMA, so the whole tensor
     # scale has to come back somewhere and the Triton kernels put it exactly here.
     has_x_static_scale: gl.constexpr
-    # Gated-activation operand layout along N. False: interleaved (g,l,g,l), the
-    # packing every caller uses today. True: the two sides are whole halves of the raw
-    # N axis, gate in [0, N/2) and linear in [N/2, N) -- so a mini-N block is one whole
-    # side and the pair for an emitted channel is two *tiles*, not two registers. The
-    # caller's weights, weight scales and bias must be permuted to match; see
-    # ``activations.py::gate_up_split_perm``.
-    gate_up_split: gl.constexpr
+    # WeightGuHbmLayout. Under SPLIT a mini-N block is one whole side, so the pair for
+    # an emitted channel is two *tiles*, not two registers. Folded to INTERLEAVED
+    # without a gated activation, where it is inert, so no use site re-checks that.
+    weight_gu_hbm_layout: gl.constexpr
     epilogue: gl.constexpr  # EpilogueMode
 
     @gluon.constexpr_function
@@ -82,7 +80,7 @@ class KernelFuncConfig:
         has_gammas,
         has_gather,
         has_x_static_scale,
-        gate_up_split=False,
+        weight_gu_hbm_layout=int(WeightGuHbmLayout.INTERLEAVED),
         epilogue=int(EpilogueMode.DEFAULT),
     ):
         self.token_dtype_quant = gl.constexpr(_v(token_dtype_quant))
@@ -96,7 +94,11 @@ class KernelFuncConfig:
         self.has_gammas = gl.constexpr(_v(has_gammas))
         self.has_gather = gl.constexpr(_v(has_gather))
         self.has_x_static_scale = gl.constexpr(_v(has_x_static_scale))
-        self.gate_up_split = gl.constexpr(bool(_v(gate_up_split)))
+        self.weight_gu_hbm_layout = gl.constexpr(
+            int(_v(weight_gu_hbm_layout))
+            if _v(activation) is not None
+            else int(WeightGuHbmLayout.INTERLEAVED)
+        )
         self.epilogue = gl.constexpr(int(_v(epilogue)))
 
     # -- activation accessors (the spec's `activation` is a NamedTuple in a constexpr,
@@ -113,15 +115,6 @@ class KernelFuncConfig:
     def activation_reduction_n(self):
         """Emitted columns per raw column. 2 for a gated activation, 1 otherwise."""
         return 2 if _v(self.activation) is not None else 1
-
-    @gluon.constexpr_function
-    def gu_split(self):
-        """Is the gated pair laid out as two N halves rather than interleaved?
-
-        Only meaningful with a gated activation -- the flag is inert otherwise, so it
-        is folded in here instead of at every use site.
-        """
-        return bool(_v(self.gate_up_split)) and _v(self.activation) is not None
 
     # -- dtype accessors --
     #
