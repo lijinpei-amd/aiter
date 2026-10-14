@@ -279,8 +279,10 @@ def test_pa_mqa_logits_launches_each_mode_through_its_launcher(mode, monkeypatch
 def _upstream_compile(mode, gfx):
     """The signature and the facts per parameter (nonempty ones only) of
     upstream's hand-written `triton.compile` (874d253dd3
-    `_compile_deepgemm_fp8_paged_mqa_logits`); its attrs are the same in every
-    mode and arch but for the KV-padded four."""
+    `_compile_deepgemm_fp8_paged_mqa_logits`, less the false 16-divisibility
+    of `stride_scale_seq` dropped by the upstream fix
+    fix/pa-mqa-logits-scale-stride-divisibility); its attrs are the same in
+    every mode and arch but for the KV-padded three."""
     preshuffle, varctx, padded = mode
     fp8 = "*fp8e4b8" if gfx == "gfx942" else "*fp8e4nv"
     kv_stride = "i32" if preshuffle else "i64"
@@ -322,7 +324,6 @@ def _upstream_compile(mode, gfx):
         "KV_buffer": kv,
         "stride_k_seq": kv,
         "scale_buffer": kv,
-        "stride_scale_seq": kv,
         "context_len_ptr": {r32},
         "kv_indices": {r32},
         "weights": {d16, r32},

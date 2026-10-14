@@ -1512,7 +1512,8 @@ the four KV entries:
 | --- | --- | --- | --- |
 | `heads_num`, `stride_q_batch`, `stride_q_next_n`, `stride_q_heads`, `stride_w_batch` | divisibility 16 | `Exactly(Aligned(16))` | `Assume(Aligned(16))` |
 | `Q_buffer`, `weights` | divisibility 16, pointer range 32 | `Exactly(Aligned(16), PointerRange(32))` | `Assume(Aligned(16), PointerRange(32))` (no fact left to measure) |
-| `KV_buffer`, `stride_k_seq`, `scale_buffer`, `stride_scale_seq` | divisibility 16 when KV-padded, else none | `Exactly(Aligned(16))`, else `NEVER` | `Assume(Aligned(16))` (the pointers' range measured), else `NEVER` |
+| `KV_buffer`, `stride_k_seq`, `scale_buffer` | divisibility 16 when KV-padded, else none | `Exactly(Aligned(16))`, else `NEVER` | `Assume(Aligned(16))` (the pointers' range measured), else `NEVER` |
+| `stride_scale_seq` | divisibility 16 when KV-padded, else none (false; see below) | `NEVER` | `Assume(Aligned(16))`, else `NEVER` |
 | `context_len_ptr`, `kv_indices` | pointer range 32 | `Exactly(PointerRange(32))` | `Assume(PointerRange(32))` (divisibility measured) |
 | the other 8 (`OutLogits_buffer`, `stride_out_batch`, `SplitKV` or `safe_chunks_per_cta_ptr`, ...) | none | `NEVER` | `NEVER` |
 
@@ -1521,8 +1522,12 @@ for Q and KV, `i64` KV strides for the plain kernel and `i32` for
 preshuffle; gfx1250's warp size and its `num_warps`/`waves_per_eu` are
 options, not facts. Upstream's padded attrs promise 16-divisibility of
 `stride_scale_seq`, counted in fp32 elements, which a 144-byte token (the
-benchmark's `-p`) breaks (36); `Exactly` keeps that promise as upstream
-wrote it.
+benchmark's `-p`) breaks (36). The promise never changed the generated code
+(each lane loads its own token's scale), so it was false without
+consequence. The launchers state none for it, as the upstream fix
+(branch `fix/pa-mqa-logits-scale-stride-divisibility`, `6e7c86e11` on
+upstream `057e731ad`, not yet merged) does; the binary is the same either
+way.
 
 Verified with Triton 3.8.0, `AITER_TRITON_ONLY=1`, on gfx942 (MI300X,
 torch 2.14+rocm7.2) and gfx950 (MI350X, GPU 5, torch 2.15.0.dev+rocm7.14),

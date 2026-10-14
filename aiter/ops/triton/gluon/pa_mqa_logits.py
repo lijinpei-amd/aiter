@@ -93,7 +93,13 @@ def _gluon_launch_keywords(Preshuffle, VarCtxOpt, is_padded_mode):
         "KV_buffer": Argument(type=fp8_ptr, specialize=kv_facts),
         "stride_k_seq": kv_stride,
         "scale_buffer": Argument(type=tl.pointer_type(tl.float32), specialize=kv_facts),
-        "stride_scale_seq": kv_stride,
+        # No divisibility: it counts fp32 elements, a quarter of the KV row
+        # stride, so a 16-byte-aligned KV row only makes it a multiple of 4
+        # (36 for the bench's 144-byte tokens with -p). Upstream promised 16;
+        # the hint never changed the generated code.
+        "stride_scale_seq": Argument(
+            type=tl.int32 if Preshuffle else tl.int64, specialize=NEVER
+        ),
         "context_len_ptr": Argument(
             type=tl.pointer_type(tl.int32), specialize=Exactly(PointerRange(32))
         ),
