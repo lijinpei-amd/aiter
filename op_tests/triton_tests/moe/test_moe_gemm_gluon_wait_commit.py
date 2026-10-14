@@ -128,8 +128,7 @@ class _ScheduleConfig:
     def ds_read_in_mfma(self, operand, scale=False):
         return False
 
-    def epilogue_inputs_via_lds(self):
-        return False
+    epilogue_inputs_via_lds = False
 
     def num_k_tiles(self, K):
         assert K % self.BLOCK_K == 0
