@@ -124,7 +124,7 @@ class LDSManager:
         """Static factory -- invoked as ``LDSManager.alloc(...)``, no ``self``.
 
         The leading axis runs over pipeline buffer *and* mini block
-        (``num_m_slots_per_block()`` tiles for A, ``num_n_slots_per_block()`` for B), flattened as
+        (``num_m_slots()`` tiles for A, ``num_n_slots()`` for B), flattened as
         ``buffer_idx * n_tiles + tile``: a shared allocation takes a layout of the tile's own
         rank, so two separate leading axes are not expressible. The mini block is a real
         allocation rather than a slice of one big tile so that each one keeps the padded
@@ -138,7 +138,7 @@ class LDSManager:
         if require_constexpr(layout.component_via_lds(_A_PAYLOAD)):
             a_payload_lds_ptr = gl.allocate_shared_memory(
                 a_ty,
-                layout.payload_lds_shape_block(0),
+                layout.payload_lds_shape_tile(0),
                 layout=layout.dot_operand_lds_layout(0),
             )
         else:
@@ -146,7 +146,7 @@ class LDSManager:
         if require_constexpr(layout.component_via_lds(_B_PAYLOAD)):
             b_payload_lds_ptr = gl.allocate_shared_memory(
                 b_ty,
-                layout.payload_lds_shape_block(1),
+                layout.payload_lds_shape_tile(1),
                 layout=layout.dot_operand_lds_layout(1),
             )
         else:
@@ -156,7 +156,7 @@ class LDSManager:
         ):
             a_scale_lds_ptr = gl.allocate_shared_memory(
                 gl.uint8,
-                layout.scale_lds_shape_block(0),
+                layout.scale_lds_shape_tile(0),
                 layout=layout.dot_operand_scale_lds_layout(0),
             )
         else:
@@ -166,7 +166,7 @@ class LDSManager:
         ):
             b_scale_lds_ptr = gl.allocate_shared_memory(
                 gl.uint8,
-                layout.scale_lds_shape_block(1),
+                layout.scale_lds_shape_tile(1),
                 layout=layout.dot_operand_scale_lds_layout(1),
             )
         else:
@@ -214,8 +214,7 @@ class LDSManager:
                 lds_ptr = self.b_payload_lds_ptr
             _buffer_load_to_lds(
                 lds_ptr.index(
-                    BUFFER_LOAD_IDX * layout.num_lds_slots_per_block_non_k(operand)
-                    + tile
+                    BUFFER_LOAD_IDX * layout.num_lds_slots_non_k(operand) + tile
                 ),
                 hbm_ptr,
                 hbm_offs,
@@ -380,7 +379,7 @@ class LDSManager:
         else:
             payload = _ds_read(
                 payload_lds_ptr.index(
-                    DS_READ_IDX * layout.num_lds_slots_per_block_non_k(operand) + tile
+                    DS_READ_IDX * layout.num_lds_slots_non_k(operand) + tile
                 ),
                 layout.dot_operand_fragment_layout(operand),
             )

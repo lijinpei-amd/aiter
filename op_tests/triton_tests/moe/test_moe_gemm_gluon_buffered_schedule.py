@@ -113,10 +113,10 @@ class _Config(_ScheduleConfig):
             self._peeled = _pipeline_peeled(self, self)
         return self._peeled
 
-    def num_k_slots_per_tile(self):
+    def num_k_slots(self):
         return 1
 
-    num_prefetch_k_slots = num_k_slots_per_tile
+    num_prefetch_k_slots = num_k_slots
 
     def scale_ratio_k_step(self, operand):
         return self.scale_steps[operand] if self.has_scale(operand) else 1
@@ -125,12 +125,10 @@ class _Config(_ScheduleConfig):
         return self.scale_tiles[operand]
 
     def scale_read_k_slots(self, operand):
-        return self.num_k_slots_per_tile() * self.scale_ratio_k_step(operand)
+        return self.num_k_slots() * self.scale_ratio_k_step(operand)
 
     def scale_cache_fragments(self, operand):
-        return self.num_lds_slots_per_block_non_k(operand) * self.scale_read_k_slots(
-            operand
-        )
+        return self.num_lds_slots_non_k(operand) * self.scale_read_k_slots(operand)
 
     def scale_hbm_steps(self, operand, steps, phase):
         ratio = self.scale_ratio_k_step(operand)
@@ -205,7 +203,7 @@ class _Machine:
         tile = pointer
         ratio = tc.scale_ratio_k_step(operand) if is_scale else 1
         nonk = tc.scale_ratio_non_k_slot(operand) if is_scale else 1
-        mk = tc.num_k_slots_per_tile()
+        mk = tc.num_k_slots()
         assert 0 <= tile < self.num_k, "HBM load exceeded the K strip"
         live_span = (tc.depths[component] - 1) * ratio + 1
         fill_span = live_span - int(tc.component_in_reg(component))
@@ -495,8 +493,7 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
                     * (
                         tc.scale_cache_fragments(component[0])
                         if component[1]
-                        else (tc.nm if component[0] == A else tc.nn)
-                        * tc.num_k_slots_per_tile()
+                        else (tc.nm if component[0] == A else tc.nn) * tc.num_k_slots()
                     )
                 )
                 if component in tc.active_components()

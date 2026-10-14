@@ -101,7 +101,7 @@ def validate(tc, N, K, layout=None):
         f"MANUAL {int(WarpPipeline.MANUAL)}"
     )
     if tc.warp_pipeline_enabled():
-        assert layout.num_prefetch_k_slots() == layout.num_k_slots_per_tile(), (
+        assert layout.num_prefetch_k_slots() == layout.num_k_slots(), (
             f"WARP_PIPELINE needs VGPR_PREFETCH_K == BLOCK_K (got "
             f"{_v(tc.VGPR_PREFETCH_K)} vs {BK}): with a partial window the slot's "
             "MFMAs depend on the slot's own ds_read and there is no mem stage to "
@@ -212,9 +212,9 @@ def validate_layout(tc, layout, N, K):
     # one optional tile per component. Different components sharing a slot is
     # fine, which is what lets a single-slot stage own both operands.
     assert _fill_slots_valid(tc, layout), (
-        f"fill ownership is not a valid mapping for num_m_slots_per_block "
-        f"{layout.num_m_slots_per_block()} x num_n_slots_per_block "
-        f"{layout.num_n_slots_per_block()} (MINI_BLOCK_M {_v(tc.MINI_BLOCK_M)} vs "
+        f"fill ownership is not a valid mapping for num_m_slots "
+        f"{layout.num_m_slots()} x num_n_slots "
+        f"{layout.num_n_slots()} (MINI_BLOCK_M {_v(tc.MINI_BLOCK_M)} vs "
         f"BLOCK_M {BM}, MINI_BLOCK_N {_v(tc.MINI_BLOCK_N)} vs BLOCK_N {BN})"
     )
     assert _v(tc.MINI_BLOCK_M) % (instr[0] * warps[0] * tiles[0]) == 0, (
@@ -262,9 +262,9 @@ def validate_layout(tc, layout, N, K):
     # -- WeightGuHbmLayout.SPLIT: an N slot must be exactly one operand side --
     if _v(fc.weight_gu_hbm_layout) == WeightGuHbmLayout.SPLIT:
         MBN = _v(tc.MINI_BLOCK_N)
-        assert layout.num_n_slots_per_block() == 2 and MBN * 2 == BN, (
+        assert layout.num_n_slots() == 2 and MBN * 2 == BN, (
             f"WeightGuHbmLayout.SPLIT needs exactly two N slots, one per side: got "
-            f"BLOCK_N {BN} / MINI_BLOCK_N {MBN} = {layout.num_n_slots_per_block()}"
+            f"BLOCK_N {BN} / MINI_BLOCK_N {MBN} = {layout.num_n_slots()}"
         )
         assert N % 2 == 0 and (N // 2) % MBN == 0, (
             f"WeightGuHbmLayout.SPLIT needs each half of N ({N}) to be a whole "

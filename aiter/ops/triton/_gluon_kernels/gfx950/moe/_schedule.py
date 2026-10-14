@@ -89,8 +89,8 @@ def schedule_spec(tc, layout):
     present = tuple(_present(tc, layout, c) for c in COMPONENTS)
     via_lds = tuple(bool(_v(layout.component_via_lds(c))) for c in COMPONENTS)
     return ScheduleSpec(
-        nm=_v(layout.num_m_slots_per_block()),
-        nn=_v(layout.num_n_slots_per_block()),
+        nm=_v(layout.num_m_slots()),
+        nn=_v(layout.num_n_slots()),
         commit=(
             bool(_v(tc.commit_per_op())),
             bool(_v(tc.commit_per_slot())),
@@ -249,7 +249,7 @@ def _pipeline_peeled(tc, layout):
     # At depth three or below, the mandatory first peel covers any warmup.
     if not tc.commit_per_op() or pipeline_depth(tc, layout) <= 3:
         return 1
-    slots = range(layout.num_m_slots_per_block() * layout.num_n_slots_per_block())
+    slots = range(layout.num_m_slots() * layout.num_n_slots())
     peeled = 1
     for x in range(max(0, pipeline_depth(tc, layout) - 2)):
         steady = tuple(_wait(tc, layout, None, slot, phase=x + 1) for slot in slots)
@@ -314,7 +314,7 @@ def _component_fill_slots(tc, layout, component):
     guarded to the 2x2 split, so on any other geometry it is inert -- a rectangular
     tile that sets it is not testing anything.
     """
-    nm, nn = _v(layout.num_m_slots_per_block()), _v(layout.num_n_slots_per_block())
+    nm, nn = _v(layout.num_m_slots()), _v(layout.num_n_slots())
     a_slots, b_slots = _payload_fill_slots(nm, nn)
     if _v(component[1]) and _v(tc.SCALE_FILL_MID) and nm == 2 and nn == 2:
         return (1, 2)
@@ -329,13 +329,13 @@ def _fill_slots_valid(tc, layout):
     carries one optional tile per component, so a component may own at most one tile
     per slot. Different components sharing a slot is fine and expected.
     """
-    slots = _v(layout.num_m_slots_per_block()) * _v(layout.num_n_slots_per_block())
+    slots = _v(layout.num_m_slots()) * _v(layout.num_n_slots())
     for component in COMPONENTS:
         mapping = _component_fill_slots(tc, layout, component)
         expected = (
-            _v(layout.num_m_slots_per_block())
+            _v(layout.num_m_slots())
             if _v(component[0]) == A
-            else _v(layout.num_n_slots_per_block())
+            else _v(layout.num_n_slots())
         )
         if len(mapping) != expected:
             return False
@@ -403,16 +403,12 @@ def _component_read_tile(tc, layout, component, mi, ni):
     if not _present(tc, layout, component):
         return None
     operand, is_scale = component[0], component[1]
-    count = (
-        layout.num_m_slots_per_block()
-        if operand == A
-        else layout.num_n_slots_per_block()
-    )
+    count = layout.num_m_slots() if operand == A else layout.num_n_slots()
     slot = _slot_index(
         mi,
         ni,
-        layout.num_m_slots_per_block(),
-        layout.num_n_slots_per_block(),
+        layout.num_m_slots(),
+        layout.num_n_slots(),
     )
     for tile in range(count):
         if _v(is_scale) and tile % layout.scale_ratio_non_k_slot(operand) != 0:
@@ -433,9 +429,7 @@ def _ops(tc, layout, mi, ni):
     return _candidate_ops(
         tc,
         layout,
-        _slot_index(
-            mi, ni, layout.num_m_slots_per_block(), layout.num_n_slots_per_block()
-        ),
+        _slot_index(mi, ni, layout.num_m_slots(), layout.num_n_slots()),
     )
 
 
@@ -565,8 +559,8 @@ def _groups(tc, layout, stage, drain=False, phase=None):
     """Committed groups at a read phase, including empty slot/stage groups."""
     schedule, whole = [], ()
     phase = stage if phase is None and stage is not None else phase or 0
-    for ni in range(layout.num_n_slots_per_block()):
-        for mi in range(layout.num_m_slots_per_block()):
+    for ni in range(layout.num_n_slots()):
+        for mi in range(layout.num_m_slots()):
             # The async view of what this slot issues: the same step schedule the
             # emitter fills from, minus the direct-register copies, which have no
             # commit group.
@@ -585,8 +579,7 @@ def _groups(tc, layout, stage, drain=False, phase=None):
                 whole += ops
                 groups = (
                     (whole,)
-                    if mi == layout.num_m_slots_per_block() - 1
-                    and ni == layout.num_n_slots_per_block() - 1
+                    if mi == layout.num_m_slots() - 1 and ni == layout.num_n_slots() - 1
                     else ()
                 )
             schedule.append(groups)
@@ -618,7 +611,7 @@ def _required_producers(tc, layout, read_step, slot, phase):
     Direct-register components are absent by construction: they have no commit group,
     and the compiler tracks their VMEM dependency itself.
     """
-    nm, nn = layout.num_m_slots_per_block(), layout.num_n_slots_per_block()
+    nm, nn = layout.num_m_slots(), layout.num_n_slots()
     out = []
     for ni in range(nn):
         for mi in range(nm):
@@ -774,7 +767,7 @@ def _slot_waits(tc, layout, stage, drain=False, epilogue_groups=0, phase=None):
     once at step scope and index, which evaluates ``_wait`` exactly once per slot
     instead of twice.
     """
-    slots = layout.num_m_slots_per_block() * layout.num_n_slots_per_block()
+    slots = layout.num_m_slots() * layout.num_n_slots()
     if tc.commit_per_stage():
         # Full length, all ``None``: the emitter then has one uniform test per slot
         # rather than a separate "is this scheme per-slot at all" guard.
