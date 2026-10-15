@@ -78,7 +78,7 @@ class _Config(_ScheduleConfig):
         self.SOFF_UNROLL = soff
         self.FROZEN_STEP = False
         self.SCHED_MODE = 0
-        self.MINI_BLOCK_M = self.MINI_BLOCK_N = 1
+        self.SLOT_M = self.SLOT_N = 1
         self.BLOCK_K = 128 if packed else 256
         self.mma_acc_dtype = None
         self.output_quant = None
@@ -150,7 +150,7 @@ class _Config(_ScheduleConfig):
 
     @property
     def accumulator_fragment_shape_slot(self):
-        return [self.MINI_BLOCK_M, self.MINI_BLOCK_N]
+        return [self.SLOT_M, self.SLOT_N]
 
 
 @dataclass(frozen=True)

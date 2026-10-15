@@ -18,8 +18,8 @@ from op_tests.triton_tests.moe.test_moe_gemm_gluon_scale_layout import _config
 
 
 @pytest.mark.parametrize("axis,value", [("M", 128), ("N", 128), ("K", 512)])
-def test_scale_mini_block_config_and_environment_aliases(monkeypatch, axis, value):
-    field = f"SCALE_MINI_BLOCK_{axis}"
+def test_scale_slot_config_and_environment_aliases(monkeypatch, axis, value):
+    field = f"SCALE_SLOT_{axis}"
     for name in tuple(host.os.environ):
         if name.startswith("AITER_TRITON_MOE_GLUON_"):
             monkeypatch.delenv(name)
@@ -46,20 +46,20 @@ def test_scale_mini_block_config_and_environment_aliases(monkeypatch, axis, valu
 @pytest.mark.parametrize(
     "shuffled", [(False, False), (True, False), (False, True), (True, True)]
 )
-def test_scale_mini_blocks_only_change_the_shuffled_operand(shuffled):
+def test_scale_slots_only_change_the_shuffled_operand(shuffled):
     tc = _config(
         A_SCALE_SORTED_SHUFFLED=shuffled[0],
         B_SCALE_SHUFFLED=shuffled[1],
-        SCALE_MINI_BLOCK_M=128,
-        SCALE_MINI_BLOCK_N=128,
-        SCALE_MINI_BLOCK_K=512,
+        SCALE_SLOT_M=128,
+        SCALE_SLOT_N=128,
+        SCALE_SLOT_K=512,
     )
     layout = KernelLayout(tc)
     for operand in range(2):
-        assert layout.scale_mini_block_nonk(operand) == (
+        assert layout.scale_slot_nonk(operand) == (
             128 if shuffled[operand] else 64
         )
-        assert layout.scale_mini_block_k(operand) == (512 if shuffled[operand] else 128)
+        assert layout.scale_slot_k(operand) == (512 if shuffled[operand] else 128)
         assert layout.scale_ratio_k_step(operand) == (4 if shuffled[operand] else 1)
         assert layout.scale_ratio_non_k_slot(operand) == (2 if shuffled[operand] else 1)
     assert validate(tc, 4096, 7168)
@@ -70,35 +70,35 @@ def test_shuffled_scale_k_defaults_to_at_least_k256(block_k):
     tc = _config(BLOCK_K=block_k, VGPR_PREFETCH_K=block_k)
     layout = KernelLayout(tc)
     expected = max(256, block_k)
-    assert layout.scale_mini_block_k(0) == layout.scale_mini_block_k(1) == expected
+    assert layout.scale_slot_k(0) == layout.scale_slot_k(1) == expected
 
 
-def test_invalid_unused_scale_minis_are_ignored():
+def test_invalid_unused_scale_slots_are_ignored():
     tc = _config(
         A_SCALE_SORTED_SHUFFLED=False,
         B_SCALE_SHUFFLED=False,
-        SCALE_MINI_BLOCK_M=-1,
-        SCALE_MINI_BLOCK_N=3,
-        SCALE_MINI_BLOCK_K=1,
+        SCALE_SLOT_M=-1,
+        SCALE_SLOT_N=3,
+        SCALE_SLOT_K=1,
     )
     assert validate(tc, 4096, 7168)
     layout = KernelLayout(tc)
-    assert layout.scale_mini_block_nonk(0) == layout.scale_mini_block_nonk(1) == 64
-    assert layout.scale_mini_block_k(0) == layout.scale_mini_block_k(1) == 128
+    assert layout.scale_slot_nonk(0) == layout.scale_slot_nonk(1) == 64
+    assert layout.scale_slot_k(0) == layout.scale_slot_k(1) == 128
 
 
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("SCALE_MINI_BLOCK_M", 32),
-        ("SCALE_MINI_BLOCK_M", 256),
-        ("SCALE_MINI_BLOCK_N", 32),
-        ("SCALE_MINI_BLOCK_N", 256),
-        ("SCALE_MINI_BLOCK_K", 128),
-        ("SCALE_MINI_BLOCK_K", 384),
+        ("SCALE_SLOT_M", 32),
+        ("SCALE_SLOT_M", 256),
+        ("SCALE_SLOT_N", 32),
+        ("SCALE_SLOT_N", 256),
+        ("SCALE_SLOT_K", 128),
+        ("SCALE_SLOT_K", 384),
     ],
 )
-def test_invalid_shuffled_scale_minis_are_rejected(field, value):
+def test_invalid_shuffled_scale_slots_are_rejected(field, value):
     with pytest.raises(AssertionError):
         validate(_config(**{field: value}), 4096, 7168)
 
@@ -112,10 +112,10 @@ def test_shuffled_scale_k_must_divide_total_k(K):
     scale geometry to the runtime K extent: a `S_K` that divides `BLOCK_K` cleanly but
     not `K` leaves a short final scale load with no payload steps to cover.
     """
-    tc = _config(SCALE_MINI_BLOCK_K=256)
+    tc = _config(SCALE_SLOT_K=256)
     assert K % 256 != 0, "pick a K the scale extent cannot tile"
     with pytest.raises(
-        AssertionError, match="K must contain complete SCALE_MINI_BLOCK_K tiles"
+        AssertionError, match="K must contain complete SCALE_SLOT_K tiles"
     ):
         validate(tc, 4096, K)
     # The same configuration is legal as soon as K is a whole number of scale loads.
@@ -125,7 +125,7 @@ def test_shuffled_scale_k_must_divide_total_k(K):
 def test_shuffled_scale_k_cannot_be_narrower_than_payload_k():
     tc = _config(
         BLOCK_K=512,
-        SCALE_MINI_BLOCK_K=256,
+        SCALE_SLOT_K=256,
         VGPR_PREFETCH_K=512,
     )
     with pytest.raises(AssertionError):
@@ -135,12 +135,12 @@ def test_shuffled_scale_k_cannot_be_narrower_than_payload_k():
 def test_frozen_shuffled_scales_reject_k_wider_than_256():
     tc = _config(
         BLOCK_K=512,
-        SCALE_MINI_BLOCK_K=512,
+        SCALE_SLOT_K=512,
         VGPR_PREFETCH_K=512,
         FROZEN_STEP=True,
     )
     with pytest.raises(
-        AssertionError, match="BLOCK_K == SCALE_MINI_BLOCK_K == 256"
+        AssertionError, match="BLOCK_K == SCALE_SLOT_K == 256"
     ):
         _validate_frozen(tc, 4096, 7168)
 
@@ -162,7 +162,7 @@ def test_scale_k_step_ratio_sets_buffer_span_and_unroll(
 ):
     tc = _config(
         BLOCK_K=block_k,
-        SCALE_MINI_BLOCK_K=scale_k,
+        SCALE_SLOT_K=scale_k,
         VGPR_PREFETCH_K=block_k,
         K_UNROLL=3,
         A_SCALE_NUM_BUFFER=2,

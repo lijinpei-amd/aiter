@@ -75,8 +75,8 @@ def case():
         cfg.update(
             BLOCK_N=256,
             BLOCK_K=128,
-            MINI_BLOCK_M=64,
-            MINI_BLOCK_N=128,
+            SLOT_M=64,
+            SLOT_N=128,
             mfma_instr_shape=(16, 16, 128),
             warps_per_cta=(1, 4),
             tiles_per_warp=(2, 2),
@@ -226,15 +226,15 @@ def test_public_mxfp8_gemm1_restores_only_unavailable_raw_scale(
     ],
     ids=["mn", "mnk", "register-k1024", "a-only", "b-only", "raw-ignores"],
 )
-def test_independent_scale_mini_blocks(
+def test_independent_scale_slots(
     case, monkeypatch, scheme, scale_shape, shuffled, registers, depths, split, soff
 ):
     """Cover scale cadence, shared M/N tiles, skipped reads, and raw-scale isolation."""
     config = dict(
         case.config,
-        SCALE_MINI_BLOCK_M=scale_shape[0],
-        SCALE_MINI_BLOCK_N=scale_shape[1],
-        SCALE_MINI_BLOCK_K=scale_shape[2],
+        SCALE_SLOT_M=scale_shape[0],
+        SCALE_SLOT_N=scale_shape[1],
+        SCALE_SLOT_K=scale_shape[2],
         A_SCALE_SORTED_SHUFFLED=shuffled[0],
         B_SCALE_SHUFFLED=shuffled[1],
         ALLOW_A_SCALE_VIA_LDS=not registers,

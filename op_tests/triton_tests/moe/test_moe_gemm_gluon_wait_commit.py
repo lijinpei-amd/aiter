@@ -89,7 +89,7 @@ class _ScheduleConfig:
     def num_scale_tiles(self, idx):
         return self.num_lds_slots_non_k(idx) // self.scale_ratio_non_k_slot(idx)
 
-    def scale_mini_block_k(self, idx):
+    def scale_slot_k(self, idx):
         return 256
 
     def scale_ratio_k_step(self, idx):

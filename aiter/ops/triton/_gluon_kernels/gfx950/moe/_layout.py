@@ -229,13 +229,13 @@ def _shuffled_scale_stage_offsets(
     nonk0,
     stripes: gl.constexpr,
     K,
-    scale_mini_k: gl.constexpr = 256,
+    scale_slot_k: gl.constexpr = 256,
     split_extent: gl.constexpr = 0,
     split_stride=0,
 ):
     """Flat HBM offsets for shuffled scales starting at logical non-K row ``nonk0``."""
     stripe = gl.arange(0, stripes, layout=gl.SliceLayout(1, layout))[:, None]
-    byte = gl.arange(0, scale_mini_k, layout=gl.SliceLayout(0, layout))[None, :]
+    byte = gl.arange(0, scale_slot_k, layout=gl.SliceLayout(0, layout))[None, :]
     if require_constexpr(not split_extent):
         return (nonk0 // 32 + stripe) * K + byte
     row = stripe * 32
@@ -400,9 +400,9 @@ class KernelLayout:
     _dot_operand_buffer_load_lds_layout: gl.constexpr
     _payload_hbm_offset_layout: gl.constexpr
     # -- scale geometry --
-    _scale_nonk: gl.constexpr
-    _scale_mini_block_nonk: gl.constexpr
-    _scale_mini_block_k: gl.constexpr
+    _slot_nonk: gl.constexpr
+    _scale_slot_nonk: gl.constexpr
+    _scale_slot_k: gl.constexpr
     _scale_ratio_k_step: gl.constexpr
     _scale_ratio_non_k_slot: gl.constexpr
     _num_scale_tiles: gl.constexpr
@@ -474,7 +474,7 @@ class KernelLayout:
 
         # -- tile and slot geometry -----------------------------------------------
         BM, BN, BK = tc.BLOCK_M.value, tc.BLOCK_N.value, tc.BLOCK_K.value
-        MBM, MBN = tc.MINI_BLOCK_M.value, tc.MINI_BLOCK_N.value
+        SLOT_M, SLOT_N = tc.SLOT_M.value, tc.SLOT_N.value
         instr = tc.mfma_instr_shape.value
         warps = tc.warps_per_cta.value
         tiles_per_warp = tc.tiles_per_warp.value
@@ -488,19 +488,20 @@ class KernelLayout:
         shuffled = tuple(tc.scale_shuffled(idx) for idx in ops)
         preshuffled = tuple(tc.operand_preshuffled(idx) for idx in ops)
 
-        # Scale tile extents, which the soundness check below reads. Both shuffles
-        # (SORTED_SHUFFLED for A, CDNA4_SCALE for B) lay a tile out as one 256 B run per
-        # 32-row stripe, so a slot that is a whole number of stripes is a contiguous
-        # slice and a scale tile can use the slot extent. A shuffle always packs K256; a
-        # K128 payload stage selects one half, hence the floor on `scale_stage_k`.
-        scale_nonk = (MBM, MBN)
+        # Non-K slot extents, which the scale soundness check below reads. Both
+        # shuffles (SORTED_SHUFFLED for A, CDNA4_SCALE for B) lay a scale out as one
+        # 256 B run per 32-row stripe, so a slot that is a whole number of stripes is a
+        # contiguous slice and its scale fragment can use the slot extent. A shuffle
+        # always packs K256; a K128 payload stage selects one half, hence the floor on
+        # `scale_stage_k`.
+        slot_nonk = (SLOT_M, SLOT_N)
         scale_stage_k = max(256, BK)
-        scale_mini_block_nonk = (
-            (tc.SCALE_MINI_BLOCK_M.value or MBM) if shuffled[0] else MBM,
-            (tc.SCALE_MINI_BLOCK_N.value or MBN) if shuffled[1] else MBN,
+        scale_slot_nonk = (
+            (tc.SCALE_SLOT_M.value or SLOT_M) if shuffled[0] else SLOT_M,
+            (tc.SCALE_SLOT_N.value or SLOT_N) if shuffled[1] else SLOT_N,
         )
-        scale_mini_block_k = tuple(
-            (tc.SCALE_MINI_BLOCK_K.value or scale_stage_k) if shuffled[idx] else BK
+        scale_slot_k = tuple(
+            (tc.SCALE_SLOT_K.value or scale_stage_k) if shuffled[idx] else BK
             for idx in ops
         )
 
@@ -510,47 +511,49 @@ class KernelLayout:
         # footprints of candidates it has not validated yet) but no layout objects, so
         # the descriptive assertion in `validate_layout` reports it, not a layout
         # constructor.
-        ok = not (BK % instr[2] or BK % MX_GROUP or BM % MBM or BN % MBN) and not (
-            MBM % (instr[0] * warps[0] * tiles_per_warp[0])
-            or MBN % (instr[1] * warps[1] * tiles_per_warp[1])
+        ok = not (
+            BK % instr[2] or BK % MX_GROUP or BM % SLOT_M or BN % SLOT_N
+        ) and not (
+            SLOT_M % (instr[0] * warps[0] * tiles_per_warp[0])
+            or SLOT_N % (instr[1] * warps[1] * tiles_per_warp[1])
         )
         for idx in ops:
             if ok and shuffled[idx]:
-                tile, nonk = (BM, BN)[idx], scale_mini_block_nonk[idx]
-                sk = scale_mini_block_k[idx]
+                tile, nonk = (BM, BN)[idx], scale_slot_nonk[idx]
+                sk = scale_slot_k[idx]
                 ok = (
-                    tile >= nonk >= scale_nonk[idx]
-                    and not (tile % nonk or nonk % scale_nonk[idx] or nonk % 32)
+                    tile >= nonk >= slot_nonk[idx]
+                    and not (tile % nonk or nonk % slot_nonk[idx] or nonk % 32)
                     and not (sk < scale_stage_k or sk & (sk - 1) or sk % BK)
                 )
 
         num_k_slots = 1
         num_prefetch_k_slots = 1 if tc.VGPR_PREFETCH_K.value else 0
-        num_m_slots = BM // MBM
-        num_n_slots = BN // MBN
+        num_m_slots = BM // SLOT_M
+        num_n_slots = BN // SLOT_N
         num_lds_slots_non_k = (num_m_slots, num_n_slots)
         payload_block_k_storage = tuple(BK // fc.pack_divisor(idx) for idx in ops)
         scale_block_k_storage = BK // MX_GROUP
         payload_fragment_shape_slot = (
-            [MBM, payload_block_k_storage[0]],
-            [payload_block_k_storage[1], MBN],
+            [SLOT_M, payload_block_k_storage[0]],
+            [payload_block_k_storage[1], SLOT_N],
         )
         scale_fragment_shape_slot = tuple(
-            [nonk, scale_block_k_storage] for nonk in (MBM, MBN)
+            [nonk, scale_block_k_storage] for nonk in (SLOT_M, SLOT_N)
         )
-        accumulator_fragment_shape_slot = [MBM, MBN]
+        accumulator_fragment_shape_slot = [SLOT_M, SLOT_N]
         # One slot, not the whole tile: A splits along M into `num_m_slots` slots of
-        # MINI_BLOCK_M rows, B along N into `num_n_slots` slots of MINI_BLOCK_N columns.
+        # SLOT_M rows, B along N into `num_n_slots` slots of SLOT_N columns.
         # Each slot is allocated, copied and read as an independent unit, so each gets
         # its own efficient padded layout and fully coalesced direct-to-LDS copy.
         # Slicing one tile-wide buffer would give the copy a strided view of a permuted
         # layout.
         payload_lds_shape_slot = (
-            [MBM, payload_block_k_storage[0]],
-            [payload_block_k_storage[1], MBN],
+            [SLOT_M, payload_block_k_storage[0]],
+            [payload_block_k_storage[1], SLOT_N],
         )
         scale_lds_shape_slot = tuple(
-            [nonk, scale_block_k_storage] for nonk in (MBM, MBN)
+            [nonk, scale_block_k_storage] for nonk in (SLOT_M, SLOT_N)
         )
         payload_lds_shape_tile = tuple(
             [tc.num_buffers(idx) * num_lds_slots_non_k[idx]]
@@ -737,11 +740,11 @@ class KernelLayout:
         dot_operand_buffer_load_lds_layout = tuple(dot_operand_buffer_load_lds_layout)
 
         # -- scale geometry -------------------------------------------------------
-        scale_ratio_k_step = tuple(k // BK for k in scale_mini_block_k)
+        scale_ratio_k_step = tuple(k // BK for k in scale_slot_k)
         scale_ratio_non_k_slot = tuple(
-            scale_mini_block_nonk[idx] // scale_nonk[idx] for idx in ops
+            scale_slot_nonk[idx] // slot_nonk[idx] for idx in ops
         )
-        # A shuffled scale mini block narrower than the payload slot (which
+        # A shuffled scale slot narrower than the payload slot (which
         # `validate_layout` rejects) covers no whole slot: it has no tile count, and no
         # LDS footprint where it is staged there.
         scale_tiles_ok = tuple(ratio > 0 for ratio in scale_ratio_non_k_slot)
@@ -766,7 +769,7 @@ class KernelLayout:
         # `scale_packed_ok` avoids by handing the dword to the MFMA whole and naming the
         # byte order in a selector list.
         scale_flat_shape = tuple(
-            [scale_mini_block_nonk[idx] // 32, scale_mini_block_k[idx]] for idx in ops
+            [scale_slot_nonk[idx] // 32, scale_slot_k[idx]] for idx in ops
         )
         # Staged representation: a shuffled scale fills one flat run per scale tile, a
         # raw one one [slot non-K, BLOCK_K/32] tile per slot.
@@ -801,10 +804,9 @@ class KernelLayout:
         # so the warp arrangement is free. An M slot only has to be a whole number of
         # 32-row stripes: the shuffle writes one 256 B run per stripe, so a slot is a
         # contiguous slice.
-        sorted_shuffled_ok = is_16x16x128 and BM % 32 == 0 and MBM % 32 == 0
+        sorted_shuffled_ok = is_16x16x128 and BM % 32 == 0 and SLOT_M % 32 == 0
         scale_load_shape = tuple(
-            [scale_mini_block_nonk[idx], scale_mini_block_k[idx] // MX_GROUP]
-            for idx in ops
+            [scale_slot_nonk[idx], scale_slot_k[idx] // MX_GROUP] for idx in ops
         )
 
         # -- scale layouts --------------------------------------------------------
@@ -856,8 +858,8 @@ class KernelLayout:
                     + _pow2_bases(0, 2, _ramp(32, nonk))  # further 32-row stripes
                 )
                 for nonk, k in (
-                    (scale_nonk[idx], scale_stage_k),
-                    (scale_mini_block_nonk[idx], scale_mini_block_k[idx]),
+                    (slot_nonk[idx], scale_stage_k),
+                    (scale_slot_nonk[idx], scale_slot_k[idx]),
                 )
             )
         dot_operand_scale_fragment_layout = tuple(dot_operand_scale_fragment_layout)
@@ -908,9 +910,9 @@ class KernelLayout:
             for idx in ops
         )
         has_mfma_packed_scale = scale_packed_ok[0] or scale_packed_ok[1]
-        packed_scale_shape = tuple([nonk, scale_stage_k // 128] for nonk in scale_nonk)
+        packed_scale_shape = tuple([nonk, scale_stage_k // 128] for nonk in slot_nonk)
         packed_scale_load_shape = tuple(
-            [scale_mini_block_nonk[idx], scale_mini_block_k[idx] // 128] for idx in ops
+            [scale_slot_nonk[idx], scale_slot_k[idx] // 128] for idx in ops
         )
         packed_scale_frag_layout = [None, None]
         packed_scale_read_layout = [(None, None), (None, None)]
@@ -920,7 +922,7 @@ class KernelLayout:
                 continue
             frag = gl.amd.cdna4.get_mfma_scale_layout(
                 dot_operand_fragment_layout[idx],
-                [scale_nonk[idx], scale_stage_k // MX_GROUP],
+                [slot_nonk[idx], scale_stage_k // MX_GROUP],
                 MX_GROUP,
             )
             packed_scale_frag_layout[idx] = gl.DistributedLinearLayout(
@@ -944,13 +946,13 @@ class KernelLayout:
                 )
                 for view, k in zip(
                     shuffled_scale_read_layout[idx],
-                    (scale_stage_k, scale_mini_block_k[idx]),
+                    (scale_stage_k, scale_slot_k[idx]),
                 )
             )
             # The two within-dword axes are identified by value, not position. Wider
             # scale K tiles insert additional K register bases between them.
             frag = scale_load_layout[idx]
-            k = scale_mini_block_k[idx]
+            k = scale_slot_k[idx]
             within_dword = ([0, 4], [16, 0])
             packed_scale_load_layout[idx] = gl.DistributedLinearLayout(
                 reg_bases=[
@@ -1001,7 +1003,7 @@ class KernelLayout:
         scale_hbm_offset_layout = tuple(scale_hbm_offset_layout)
 
         # -- epilogue -------------------------------------------------------------
-        output_n_slot = MBN // _n_reduction_slot(fc)
+        output_n_slot = SLOT_N // _n_reduction_slot(fc)
         output_block_n = BN // fc.activation_reduction_n()
         epilogue_threads = threads
         epilogue_bias_per_thread = BN // epilogue_threads
@@ -1029,7 +1031,7 @@ class KernelLayout:
         quant_staging_layout = gl.SwizzledSharedLayout(
             vec=1, per_phase=1, max_phase=1, order=[1, 0]
         )
-        quant_staging_rows = BM if gu_split else MBM
+        quant_staging_rows = BM if gu_split else SLOT_M
         quant_staging_rotates = fc.output_quant.value is not None and not gu_split
 
         # -- resources ------------------------------------------------------------
@@ -1093,9 +1095,9 @@ class KernelLayout:
         self._payload_hbm_offset_layout = gl.constexpr(payload_hbm_offset_layout)
 
         # scale geometry
-        self._scale_nonk = gl.constexpr(scale_nonk)
-        self._scale_mini_block_nonk = gl.constexpr(scale_mini_block_nonk)
-        self._scale_mini_block_k = gl.constexpr(scale_mini_block_k)
+        self._slot_nonk = gl.constexpr(slot_nonk)
+        self._scale_slot_nonk = gl.constexpr(scale_slot_nonk)
+        self._scale_slot_k = gl.constexpr(scale_slot_k)
         self._scale_ratio_k_step = gl.constexpr(scale_ratio_k_step)
         self._scale_ratio_non_k_slot = gl.constexpr(scale_ratio_non_k_slot)
         self._num_scale_tiles = gl.constexpr(num_scale_tiles)
@@ -1286,19 +1288,19 @@ class KernelLayout:
     # -- scale geometry -----------------------------------------------------------
 
     @gluon.constexpr_function
-    def scale_nonk(self, idx):
-        """Non-K extent of one shuffled scale tile."""
-        return self._scale_nonk.value[idx]
+    def slot_nonk(self, idx):
+        """Non-K extent of the operand's non-K slot, ``SLOT_M`` or ``SLOT_N``."""
+        return self._slot_nonk.value[idx]
 
     @gluon.constexpr_function
-    def scale_mini_block_nonk(self, idx):
-        """Rows or columns in one scale load; raw scales retain payload geometry."""
-        return self._scale_mini_block_nonk.value[idx]
+    def scale_slot_nonk(self, idx):
+        """Non-K extent of one scale slot; a raw scale's is its payload slot's."""
+        return self._scale_slot_nonk.value[idx]
 
     @gluon.constexpr_function
-    def scale_mini_block_k(self, idx):
-        """Scale load K extent in logical payload elements, not E8M0 bytes."""
-        return self._scale_mini_block_k.value[idx]
+    def scale_slot_k(self, idx):
+        """K extent of one scale slot, in logical payload elements, not E8M0 bytes."""
+        return self._scale_slot_k.value[idx]
 
     @gluon.constexpr_function
     def scale_ratio_k_step(self, idx):
@@ -1488,7 +1490,7 @@ class KernelLayout:
         Interleaved tiles are contiguous. Split tiles cover the same emitted channels but
         read gate and up from separate halves of N.
         """
-        # One N slot's raw-N width (MINI_BLOCK_N) is the accumulator tile's N extent.
+        # One N slot's raw-N width (SLOT_N) is the accumulator tile's N extent.
         n_slot: gl.constexpr = self.accumulator_fragment_shape_slot[1]
         if require_constexpr(self._weight_gu_hbm_layout == _WEIGHT_GU_SPLIT):
             out = pid_n * n_slot + n_slot_idx * (N // 2)
@@ -1512,7 +1514,7 @@ class KernelLayout:
     ):
         """Gathered A payload offsets, one copy-layout grid per M slot."""
         M_TILE: gl.constexpr = tuning_cfg.BLOCK_M
-        M_SLOT: gl.constexpr = tuning_cfg.MINI_BLOCK_M
+        M_SLOT: gl.constexpr = tuning_cfg.SLOT_M
         NUM_M_SLOTS: gl.constexpr = self.num_m_slots
         PAYLOAD_BLOCK_K_STORAGE: gl.constexpr = self.payload_block_k_storage(0)
         layout_a_slot: gl.constexpr = self.hbm_offset_layout(0, False)
@@ -1543,7 +1545,7 @@ class KernelLayout:
     @gluon.jit
     def b_payload_hbm_offsets(self, b, pid_n, N, K, func_cfg, tuning_cfg):
         """B payload offsets for plain or preshuffled weights, one grid per N slot."""
-        N_SLOT: gl.constexpr = tuning_cfg.MINI_BLOCK_N
+        N_SLOT: gl.constexpr = tuning_cfg.SLOT_N
         NUM_N_SLOTS: gl.constexpr = self.num_n_slots
         PAYLOAD_BLOCK_K_STORAGE: gl.constexpr = self.payload_block_k_storage(1)
         layout_b_slot: gl.constexpr = self.hbm_offset_layout(1, False)
@@ -1592,12 +1594,12 @@ class KernelLayout:
             return _NO_SCALE
 
         M_TILE: gl.constexpr = tuning_cfg.BLOCK_M
-        M_SLOT: gl.constexpr = tuning_cfg.MINI_BLOCK_M
+        M_SLOT: gl.constexpr = tuning_cfg.SLOT_M
         NUM_M_SLOTS: gl.constexpr = self.num_m_slots
         SCALE_BLOCK_K_STORAGE: gl.constexpr = self.scale_block_k_storage
         layout_a_scale_slot: gl.constexpr = self.hbm_offset_layout(0, True)
-        SCALE_M: gl.constexpr = self.scale_mini_block_nonk(0)
-        SCALE_K: gl.constexpr = self.scale_mini_block_k(0)
+        SCALE_M: gl.constexpr = self.scale_slot_nonk(0)
+        SCALE_K: gl.constexpr = self.scale_slot_k(0)
         SCALE_RATIO: gl.constexpr = self.scale_ratio_non_k_slot(0)
 
         if require_constexpr(
@@ -1639,7 +1641,7 @@ class KernelLayout:
             # One scale tile per M slot. It is a whole number of 32-row stripes and
             # stripes are contiguous, so slot m_slot_idx is just the run starting
             # m_slot_idx * (M_SLOT // 32) stripes into this pid_m's chunk.
-            # Slots sharing a scale mini block get the same base
+            # Slots sharing a scale slot get the same base
             # offsets; only the owner actually issues the copy.
             SCALE_FILL_SHAPE: gl.constexpr = self.scale_flat_shape(0)
             a_scale_hbm_offsets_tile = ()
@@ -1688,12 +1690,12 @@ class KernelLayout:
         if require_constexpr(not func_cfg.has_scale(1)):
             return _NO_SCALE
 
-        N_SLOT: gl.constexpr = tuning_cfg.MINI_BLOCK_N
+        N_SLOT: gl.constexpr = tuning_cfg.SLOT_N
         NUM_N_SLOTS: gl.constexpr = self.num_n_slots
         SCALE_BLOCK_K_STORAGE: gl.constexpr = self.scale_block_k_storage
         layout_b_scale_slot: gl.constexpr = self.hbm_offset_layout(1, True)
-        SCALE_N: gl.constexpr = self.scale_mini_block_nonk(1)
-        SCALE_K: gl.constexpr = self.scale_mini_block_k(1)
+        SCALE_N: gl.constexpr = self.scale_slot_nonk(1)
+        SCALE_K: gl.constexpr = self.scale_slot_k(1)
         SCALE_RATIO: gl.constexpr = self.scale_ratio_non_k_slot(1)
         SPLIT_EXTENT: gl.constexpr = (
             N_SLOT

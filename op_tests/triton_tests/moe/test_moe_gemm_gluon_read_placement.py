@@ -30,8 +30,8 @@ def _config(mask=0, pipeline=WarpPipeline.NONE):
         BLOCK_N=256,
         BLOCK_K=256,
         K_UNROLL=3,
-        MINI_BLOCK_M=64,
-        MINI_BLOCK_N=128,
+        SLOT_M=64,
+        SLOT_N=128,
         NUM_LDS_BUFFER=3,
         mfma_instr_shape=(16, 16, 128),
         warps_per_cta=(1, 4),
@@ -253,11 +253,11 @@ def test_rectangular_read_schedule(case, pipeline, scheme, shape):
     config = _config(mask=15, pipeline=pipeline)
     config["WAIT_COMMIT_SCHEME"] = int(scheme)
     if shape == (4, 2):
-        config["MINI_BLOCK_M"] = 32
+        config["SLOT_M"] = 32
     else:
-        config.update(MINI_BLOCK_N=64, warps_per_cta=(2, 2))
+        config.update(SLOT_N=64, warps_per_cta=(2, 2))
     _assert_repeated_output(
-        case, config, f"{shape} mini tiles, {scheme.name}, pipeline={pipeline.name}",
+        case, config, f"{shape} slots, {scheme.name}, pipeline={pipeline.name}",
         split=shape != (2, 4),
     )
 

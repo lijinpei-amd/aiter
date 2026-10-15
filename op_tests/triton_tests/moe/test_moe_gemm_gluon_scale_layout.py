@@ -62,8 +62,8 @@ def _config(dtype=DtypeQuant.MXFP8, fused=True, **overrides):
         "BLOCK_N": 128,
         "BLOCK_K": 128,
         "K_UNROLL": 6,
-        "MINI_BLOCK_M": 64,
-        "MINI_BLOCK_N": 64,
+        "SLOT_M": 64,
+        "SLOT_N": 64,
         "NUM_LDS_BUFFER": 3,
         "mfma_instr_shape": (16, 16, 128),
         "warps_per_cta": (2, 2),
@@ -127,21 +127,21 @@ def _producer_byte_coordinates(nonk):
     "block_k,dtype", [(128, DtypeQuant.MXFP8), (256, DtypeQuant.MXFP4)]
 )
 @pytest.mark.parametrize(
-    "warps,mini_m,mini_n",
+    "warps,slot_m,slot_n",
     [((2, 4), 64, 128), ((1, 4), 64, 128), ((4, 1), 128, 64), ((2, 2), 64, 64)],
 )
 @pytest.mark.parametrize("operand", [0, 1], ids=["A", "B"])
 def test_packed_words_and_selectors_match_producer(
-    block_k, dtype, warps, mini_m, mini_n, operand
+    block_k, dtype, warps, slot_m, slot_n, operand
 ):
     tc = _config(
         dtype,
         BLOCK_K=block_k,
         VGPR_PREFETCH_K=block_k,
-        BLOCK_M=mini_m * 2,
-        BLOCK_N=mini_n * 2,
-        MINI_BLOCK_M=mini_m,
-        MINI_BLOCK_N=mini_n,
+        BLOCK_M=slot_m * 2,
+        BLOCK_N=slot_n * 2,
+        SLOT_M=slot_m,
+        SLOT_N=slot_n,
         warps_per_cta=warps,
     )
     assert validate(tc, 4096, 7168)
@@ -150,7 +150,7 @@ def test_packed_words_and_selectors_match_producer(
     byte_layout = layout.dot_operand_fragment_layout(operand, True)
     word_layout = layout.packed_scale_frag_layout(operand)
     word_shape = layout.packed_scale_shape(operand)
-    producer = _producer_byte_coordinates((mini_m, mini_n)[operand])
+    producer = _producer_byte_coordinates((slot_m, slot_n)[operand])
     assert word_shape[0] * word_shape[1] * 4 == len(producer)
 
     # Invert the actual LDS read layout to find each fragment word's physical
@@ -198,14 +198,14 @@ def test_packed_words_and_selectors_match_producer(
 def test_wide_packed_scale_load_layout_matches_producer(scale_k, operand):
     tc = _config(
         BLOCK_N=256,
-        MINI_BLOCK_N=128,
+        SLOT_N=128,
         warps_per_cta=(1, 4),
-        SCALE_MINI_BLOCK_M=128,
-        SCALE_MINI_BLOCK_N=256,
-        SCALE_MINI_BLOCK_K=scale_k,
+        SCALE_SLOT_M=128,
+        SCALE_SLOT_N=256,
+        SCALE_SLOT_K=scale_k,
     )
     layout = KernelLayout(tc)
-    nonk = layout.scale_mini_block_nonk(operand)
+    nonk = layout.scale_slot_nonk(operand)
     producer = [
         (stripe * 32 + row + half_row * 16, ku * 8 + group + half_k * 4)
         for stripe in range(nonk // 32)

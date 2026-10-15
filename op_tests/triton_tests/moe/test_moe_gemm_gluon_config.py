@@ -70,8 +70,8 @@ def config():
         128, 4096, 7168, DtypeQuant.MXFP4, DtypeQuant.MXFP4
     )
     cfg.update(
-        MINI_BLOCK_M=64,
-        MINI_BLOCK_N=128,
+        SLOT_M=64,
+        SLOT_N=128,
         mfma_instr_shape=(16, 16, 128),
         warps_per_cta=(2, 2),
         tiles_per_warp=(2, 2),
@@ -160,9 +160,9 @@ def test_a_scale_row_stride_preserves_sub_16_byte_alignment(kernel):
         ("B_NUM_BUFFER", 2),
         ("A_SCALE_NUM_BUFFER", 1),
         ("B_SCALE_NUM_BUFFER", 6),
-        ("SCALE_MINI_BLOCK_M", 128),
-        ("SCALE_MINI_BLOCK_N", 256),
-        ("SCALE_MINI_BLOCK_K", 512),
+        ("SCALE_SLOT_M", 128),
+        ("SCALE_SLOT_N", 256),
+        ("SCALE_SLOT_K", 512),
     ],
 )
 def test_launch_specs_match_kernel_config_field_order(
@@ -278,6 +278,55 @@ def test_cache_modifier_environment_names(
 
 
 @pytest.mark.parametrize(
+    "legacy,renamed,field",
+    [
+        ("MINI_BLOCK_M", "SLOT_M", "SLOT_M"),
+        ("MINI_BLOCK_N", "SLOT_N", "SLOT_N"),
+        ("SCALE_MINI_BLOCK_M", "SCALE_SLOT_M", "SCALE_SLOT_M"),
+        ("SCALE_MINI_BLOCK_N", "SCALE_SLOT_N", "SCALE_SLOT_N"),
+        ("SCALE_MINI_BLOCK_K", "SCALE_SLOT_K", "SCALE_SLOT_K"),
+        ("scale_mini_block_m", "scale_slot_m", "SCALE_SLOT_M"),
+        ("scale_mini_block_n", "scale_slot_n", "SCALE_SLOT_N"),
+        ("scale_mini_block_k", "scale_slot_k", "SCALE_SLOT_K"),
+    ],
+)
+def test_legacy_slot_config_names(config, legacy, renamed, field):
+    config.pop(field, None)
+    config[legacy] = 96
+    # A raw launch config is renamed before the host reads any slot key from it.
+    canonical = host._canonical_slot_keys(config)
+    assert canonical[renamed] == 96 and legacy not in canonical
+    assert getattr(_tuning_spec(config), field) == 96
+
+    config[field] = 128
+    with pytest.raises(ValueError, match="disagree"):
+        _tuning_spec(config)
+
+
+@pytest.mark.parametrize("canonical", list(host._LEGACY_SLOT_KEYS))
+def test_legacy_slot_environment_names(monkeypatch, canonical):
+    prefix = "AITER_TRITON_MOE_GLUON_"
+    legacy = host._LEGACY_SLOT_KEYS[canonical]
+    monkeypatch.delenv(prefix + canonical, raising=False)
+    monkeypatch.setenv(prefix + legacy, "64")
+    assert host._env_slot_int(canonical, 0) == 64
+    monkeypatch.setenv(prefix + canonical, "128")
+    assert host._env_slot_int(canonical, 0) == 128
+
+
+def test_legacy_scale_slot_environment_reaches_the_config(monkeypatch):
+    for name in tuple(os.environ):
+        if name.startswith("AITER_TRITON_MOE_GLUON_"):
+            monkeypatch.delenv(name)
+    monkeypatch.setenv("AITER_TRITON_MOE_GLUON_SCALE_MINI_BLOCK_K", "512")
+    config = host.get_gluon_config_uncached(
+        128, 4096, 7168, DtypeQuant.MXFP4, DtypeQuant.MXFP4
+    )
+    assert config["SCALE_SLOT_K"] == 512
+    assert "SCALE_MINI_BLOCK_K" not in config
+
+
+@pytest.mark.parametrize(
     "M,n_expts_tot,block_m,expected",
     [
         (2048, 33, 64, 1),
@@ -332,8 +381,8 @@ def test_t256_mxfp8_gemm1_uses_validated_streaming_geometry():
         "BLOCK_M": 64,
         "BLOCK_N": 128,
         "BLOCK_K": 256,
-        "MINI_BLOCK_M": 32,
-        "MINI_BLOCK_N": 64,
+        "SLOT_M": 32,
+        "SLOT_N": 64,
         "mfma_instr_shape": (16, 16, 128),
         "warps_per_cta": (2, 2),
         "tiles_per_warp": (1, 2),
@@ -375,8 +424,8 @@ def test_t256_mxfp8_gemm1_uses_validated_streaming_geometry():
     # hint used to be part of what it toggled; it is now unconditional, because it
     # measured as a win at every block size rather than only the streaming one.
     assert reused["expert_cache_modifier"] == ".cg"
-    assert (reused["MINI_BLOCK_N"], reused["warps_per_cta"]) != (
-        expected["MINI_BLOCK_N"],
+    assert (reused["SLOT_N"], reused["warps_per_cta"]) != (
+        expected["SLOT_N"],
         expected["warps_per_cta"],
     )
 
@@ -421,14 +470,14 @@ def test_t256_mxfp8_gemm1_geometry_override_is_narrow(overrides):
         # override, so it does not fall back to the bare ladder. What matters here is
         # that it is not wearing the T=256 geometry.
         assert selected != baseline
-        assert (selected["BLOCK_K"], selected["MINI_BLOCK_M"]) != (256, 32)
+        assert (selected["BLOCK_K"], selected["SLOT_M"]) != (256, 32)
         assert selected["BLOCK_M"] == 32
     elif overrides == {"dq_b": DtypeQuant.MXFP4}:
         # MXFP4 weights at block_m 64 also carry their own measured override now. The
         # point of this case is still that it does not inherit the MXFP8 one: that
-        # tile is BLOCK_N 128 with MINI_BLOCK_N 64, this one is 256 with 128.
+        # tile is BLOCK_N 128 with SLOT_N 64, this one is 256 with 128.
         assert selected != baseline
-        assert (selected["BLOCK_N"], selected["MINI_BLOCK_N"]) == (256, 128)
+        assert (selected["BLOCK_N"], selected["SLOT_N"]) == (256, 128)
     else:
         assert selected == baseline
 
@@ -710,7 +759,7 @@ def test_register_storage_options_are_independent(config, storage_mask):
         assert _plain(tc.allow_component_via_lds(component)) is via_lds
         assert _plain(layout.component_via_lds(component)) is via_lds
         assert _plain(layout.component_in_reg(component)) is not via_lds
-    # Full-block byte counts make a shared scale fill tile and mini-tile splitting
+    # Full-block byte counts make a shared scale fill tile and slot splitting
     # irrelevant to the allocation budget. Register storage removes only its own
     # allocation; every remaining component uses its individual ring depth.
     bm, bn, bk = (config[key] for key in ("BLOCK_M", "BLOCK_N", "BLOCK_K"))
@@ -780,8 +829,8 @@ def test_small_payload_tiles_use_register_rings(config):
         BLOCK_M=64,
         BLOCK_N=64,
         BLOCK_K=32,
-        MINI_BLOCK_M=32,
-        MINI_BLOCK_N=32,
+        SLOT_M=32,
+        SLOT_N=32,
         VGPR_PREFETCH_K=32,
         mfma_instr_shape=(16, 16, 16),
         warps_per_cta=(2, 2),
@@ -1038,7 +1087,7 @@ def test_gate_up_small_warp_extent_only_requires_mx_group_for_quantized_output(
     """Boxed None must not impose quantization constraints on FP32 tuning tiles."""
     config.update(
         BLOCK_N=128,
-        MINI_BLOCK_N=64,
+        SLOT_N=64,
         warps_per_cta=(1, 4),
         tiles_per_warp=(2, 1),
         B_PRESHUFFLED=True,
@@ -1063,7 +1112,7 @@ def test_epilogue_modes_preserve_output_geometry(config, epilogue):
     assert _plain(func.activation_reduction_n()) == 2
     # WeightGuHbmLayout.SPLIT halves across two N slots, so one slot's raw columns map 1:1 onto
     # emitted channels.
-    assert _plain(maybe_unwrap(layout.output_n_slot)) == _plain(tc.MINI_BLOCK_N)
+    assert _plain(maybe_unwrap(layout.output_n_slot)) == _plain(tc.SLOT_N)
     assert _plain(layout.grid_N(4096)) == 16
     assert _plain(_validate(tc, 4096, 7168))
 
@@ -1390,10 +1439,10 @@ def test_independent_buffer_waits_match_copy_history(
     )
     if geometry == "middle_shared_a":
         config.update(
-            SCALE_FILL_MID=True, A_SCALE_SORTED_SHUFFLED=True, SCALE_MINI_BLOCK_M=128
+            SCALE_FILL_MID=True, A_SCALE_SORTED_SHUFFLED=True, SCALE_SLOT_M=128
         )
     elif geometry == "unequal_tiles":
-        config.update(MINI_BLOCK_N=64, SCALE_FILL_MID=True)
+        config.update(SLOT_N=64, SCALE_FILL_MID=True)
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     layout = KernelLayout(tc)
     minimum = _minimum(tc, layout)

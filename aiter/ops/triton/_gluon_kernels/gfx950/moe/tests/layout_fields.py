@@ -19,7 +19,7 @@ aggregate's JIT mangle. A config whose layout raises prints the exception instea
 Configs: every scripts/gluon_moe_sched_dump.py case plus deltas on it; the host
 ladder for E33 top-8 gemm1/gemm2 across dtypes and token counts, raw and after scale
 shuffle / B preshuffle, both ``weight_gu_hbm_layout`` values; and the configs the
-op_tests layout tests build (config, scale layout/mini-blocks, registers, LDS,
+op_tests layout tests build (config, scale layout/scale slots, registers, LDS,
 epilogue), copied as literals. Includes unsound geometries and ones that raise.
 
 Builds through ``compute_kernel_layout(tc)`` when ``_layout`` has it, else
@@ -174,8 +174,8 @@ def _config_fixture():
     """test_moe_gemm_gluon_config.config (a pytest fixture)."""
     cfg = host.get_gluon_config_uncached(128, 4096, 7168, DQ.MXFP4, DQ.MXFP4)
     cfg.update(
-        MINI_BLOCK_M=64,
-        MINI_BLOCK_N=128,
+        SLOT_M=64,
+        SLOT_N=128,
         mfma_instr_shape=(16, 16, 128),
         warps_per_cta=(2, 2),
         tiles_per_warp=(2, 2),
@@ -203,7 +203,7 @@ def _config_func_spec(epilogue=EpilogueMode.DEFAULT):
 
 
 def _scale_config(dtype=DQ.MXFP8, fused=True, **overrides):
-    """test_moe_gemm_gluon_scale_layout._config (also scale_miniblocks')."""
+    """test_moe_gemm_gluon_scale_layout._config (also scale_slots')."""
     fc = KernelFuncConfig(
         dtype,
         dtype,
@@ -224,8 +224,8 @@ def _scale_config(dtype=DQ.MXFP8, fused=True, **overrides):
         "BLOCK_N": 128,
         "BLOCK_K": 128,
         "K_UNROLL": 6,
-        "MINI_BLOCK_M": 64,
-        "MINI_BLOCK_N": 64,
+        "SLOT_M": 64,
+        "SLOT_N": 64,
         "NUM_LDS_BUFFER": 3,
         "mfma_instr_shape": (16, 16, 128),
         "warps_per_cta": (2, 2),
@@ -258,8 +258,8 @@ def _register_config(dtype):
         BLOCK_N=256,
         BLOCK_K=256,
         K_UNROLL=3,
-        MINI_BLOCK_M=64,
-        MINI_BLOCK_N=128,
+        SLOT_M=64,
+        SLOT_N=128,
         NUM_LDS_BUFFER=3,
         mfma_instr_shape=(16, 16, 128),
         warps_per_cta=(1, 4),
@@ -323,8 +323,8 @@ def _epilogue_config(split, num_warps):
         BLOCK_N=256,
         BLOCK_K=256,
         K_UNROLL=1,
-        MINI_BLOCK_M=64,
-        MINI_BLOCK_N=128,
+        SLOT_M=64,
+        SLOT_N=128,
         NUM_LDS_BUFFER=2,
         mfma_instr_shape=(16, 16, 128),
         warps_per_cta=(num_warps // 4, 4),
@@ -414,14 +414,14 @@ def _effective_cfg(cfg, dq_a, dq_b, N, K, swiglu):
         and dq_a in scaled
         and host._scale_shuffle_supported(c, 0)
         and int(c["BLOCK_M"]) % 32 == 0
-        and int(c["MINI_BLOCK_M"]) % 32 == 0
+        and int(c["SLOT_M"]) % 32 == 0
         and K % 256 == 0
     )
     b_sh = (
         bool(c.get("B_SCALE_SHUFFLED", False))
         and dq_b in scaled
         and host._scale_shuffle_supported(c, 1)
-        and int(c["MINI_BLOCK_N"]) % 32 == 0
+        and int(c["SLOT_N"]) % 32 == 0
         and N % 32 == 0
         and (K // 32) % 8 == 0
     )
@@ -534,7 +534,7 @@ def sched_cases():
                 "ALLOW_B_SCALE_VIA_LDS": False,
                 "warps_per_cta": (1, 4),
                 "tiles_per_warp": (2, 1),
-                "MINI_BLOCK_N": 64,
+                "SLOT_N": 64,
                 "BLOCK_N": 128,
             },
         ),
@@ -546,19 +546,19 @@ def sched_cases():
                 "ALLOW_A_SCALE_VIA_LDS": False,
                 "warps_per_cta": (4, 1),
                 "tiles_per_warp": (1, 2),
-                "MINI_BLOCK_M": 64,
+                "SLOT_M": 64,
             },
         ),
-        # A scale mini block narrower than the slot, staged in registers instead of
+        # A scale slot narrower than the payload slot, staged in registers instead of
         # LDS: no scale tiles, but the LDS footprint still exists.
         (
             "ascale-narrow-reg",
             DQ.MXFP4,
             DQ.MXFP4,
-            {"SCALE_MINI_BLOCK_M": 32, "ALLOW_A_SCALE_VIA_LDS": False},
+            {"SCALE_SLOT_M": 32, "ALLOW_A_SCALE_VIA_LDS": False},
         ),
-        ("ascale-narrow-lds", DQ.MXFP4, DQ.MXFP4, {"SCALE_MINI_BLOCK_M": 32}),
-        ("bscale-narrow-lds", DQ.MXFP4, DQ.MXFP4, {"SCALE_MINI_BLOCK_N": 32}),
+        ("ascale-narrow-lds", DQ.MXFP4, DQ.MXFP4, {"SCALE_SLOT_M": 32}),
+        ("bscale-narrow-lds", DQ.MXFP4, DQ.MXFP4, {"SCALE_SLOT_N": 32}),
         # bf16 x MXFP4 / fp8 x MXFP4 operand mixes (gluon_supported refuses the
         # former; the layout is still built and must keep its value or exception).
         (
@@ -570,17 +570,17 @@ def sched_cases():
         ("fp8w4", DQ.FP8_E4M3, DQ.MXFP4, {}),
         # Unsound lattice: BLOCK_K not a multiple of the MFMA K.
         ("bk64-unsound", DQ.MXFP4, DQ.MXFP4, {"BLOCK_K": 64, "VGPR_PREFETCH_K": 64}),
-        # Mini block that does not divide the block: unsound, scalar geometry only.
-        ("mini48-unsound", DQ.MXFP4, DQ.MXFP4, {"MINI_BLOCK_M": 48}),
-        # Mini block that is not a whole number of warp tiles: unsound.
+        # Slot that does not divide the block: unsound, scalar geometry only.
+        ("slot48-unsound", DQ.MXFP4, DQ.MXFP4, {"SLOT_M": 48}),
+        # Slot that is not a whole number of warp tiles: unsound.
         (
-            "mini32-tiles4-unsound",
+            "slot32-tiles4-unsound",
             DQ.MXFP4,
             DQ.MXFP4,
-            {"MINI_BLOCK_M": 32, "tiles_per_warp": (4, 2)},
+            {"SLOT_M": 32, "tiles_per_warp": (4, 2)},
         ),
-        # Zero-size mini block: the scalar geometry itself raises.
-        ("mini0-raises", DQ.MXFP4, DQ.MXFP4, {"MINI_BLOCK_M": 0}),
+        # Zero-size slot: the scalar geometry itself raises.
+        ("slot0-raises", DQ.MXFP4, DQ.MXFP4, {"SLOT_M": 0}),
     )
     for name, dq_a, dq_b, over in extra:
         _, cfg, a, b, _K = SD._case(name, dq_a, dq_b, **over)
@@ -640,8 +640,8 @@ def config_test_cases():
             "BLOCK_M": 64,
             "BLOCK_N": 64,
             "BLOCK_K": 32,
-            "MINI_BLOCK_M": 32,
-            "MINI_BLOCK_N": 32,
+            "SLOT_M": 32,
+            "SLOT_N": 32,
             "VGPR_PREFETCH_K": 32,
             "mfma_instr_shape": (16, 16, 16),
             "warps_per_cta": (2, 2),
@@ -659,7 +659,7 @@ def config_test_cases():
             f"gate_up_small_warp_oq{oq}",
             {
                 "BLOCK_N": 128,
-                "MINI_BLOCK_N": 64,
+                "SLOT_N": 64,
                 "warps_per_cta": (1, 4),
                 "tiles_per_warp": (2, 1),
                 "B_PRESHUFFLED": True,
@@ -677,10 +677,10 @@ def config_test_cases():
             counts,
             SCALE_FILL_MID=True,
             A_SCALE_SORTED_SHUFFLED=True,
-            SCALE_MINI_BLOCK_M=128,
+            SCALE_SLOT_M=128,
         ),
     )
-    add("unequal_tiles", dict(counts, MINI_BLOCK_N=64, SCALE_FILL_MID=True))
+    add("unequal_tiles", dict(counts, SLOT_N=64, SCALE_FILL_MID=True))
     # test_independent_buffer_schedule_without_scales
     for reg_b in (False, True):
         add(
@@ -701,7 +701,7 @@ def config_test_cases():
 
 
 def scale_layout_test_cases():
-    """test_moe_gemm_gluon_scale_layout.py and test_moe_gemm_gluon_scale_miniblocks.py.
+    """test_moe_gemm_gluon_scale_layout.py and test_moe_gemm_gluon_scale_slots.py.
 
     Both build through _scale_config (MXFP8, BLOCK_K 128, both scales shuffled,
     gate/up split by default).
@@ -716,21 +716,21 @@ def scale_layout_test_cases():
     add("mxfp4", DQ.MXFP4)
     # test_packed_words_and_selectors_match_producer
     for bk, dt in ((128, DQ.MXFP8), (256, DQ.MXFP4)):
-        for warps, mini_m, mini_n in (
+        for warps, slot_m, slot_n in (
             ((2, 4), 64, 128),
             ((1, 4), 64, 128),
             ((4, 1), 128, 64),
             ((2, 2), 64, 64),
         ):
             add(
-                f"packed-bk{bk}-w{warps[0]}x{warps[1]}-m{mini_m}-n{mini_n}",
+                f"packed-bk{bk}-w{warps[0]}x{warps[1]}-m{slot_m}-n{slot_n}",
                 dt,
                 BLOCK_K=bk,
                 VGPR_PREFETCH_K=bk,
-                BLOCK_M=mini_m * 2,
-                BLOCK_N=mini_n * 2,
-                MINI_BLOCK_M=mini_m,
-                MINI_BLOCK_N=mini_n,
+                BLOCK_M=slot_m * 2,
+                BLOCK_N=slot_n * 2,
+                SLOT_M=slot_m,
+                SLOT_N=slot_n,
                 warps_per_cta=warps,
             )
     # test_wide_packed_scale_load_layout_matches_producer
@@ -738,11 +738,11 @@ def scale_layout_test_cases():
         add(
             f"wide-sk{sk}",
             BLOCK_N=256,
-            MINI_BLOCK_N=128,
+            SLOT_N=128,
             warps_per_cta=(1, 4),
-            SCALE_MINI_BLOCK_M=128,
-            SCALE_MINI_BLOCK_N=256,
-            SCALE_MINI_BLOCK_K=sk,
+            SCALE_SLOT_M=128,
+            SCALE_SLOT_N=256,
+            SCALE_SLOT_K=sk,
         )
     # test_invalid_packed_k128_configs_are_rejected
     add("bk64-unsound", BLOCK_K=64, VGPR_PREFETCH_K=64)
@@ -759,40 +759,40 @@ def scale_layout_test_cases():
         ALLOW_A_SCALE_VIA_LDS=False,
         ALLOW_B_SCALE_VIA_LDS=False,
     )
-    # test_scale_mini_blocks_only_change_the_shuffled_operand
+    # test_scale_slots_only_change_the_shuffled_operand
     for sa, sb in ((False, False), (True, False), (False, True), (True, True)):
         add(
-            f"mini-shuffled{int(sa)}{int(sb)}",
+            f"scale-slot-shuffled{int(sa)}{int(sb)}",
             A_SCALE_SORTED_SHUFFLED=sa,
             B_SCALE_SHUFFLED=sb,
-            SCALE_MINI_BLOCK_M=128,
-            SCALE_MINI_BLOCK_N=128,
-            SCALE_MINI_BLOCK_K=512,
+            SCALE_SLOT_M=128,
+            SCALE_SLOT_N=128,
+            SCALE_SLOT_K=512,
         )
     # test_shuffled_scale_k_defaults_to_at_least_k256
     for bk in (128, 256, 512):
         add(f"default-sk-bk{bk}", BLOCK_K=bk, VGPR_PREFETCH_K=bk)
-    # test_invalid_unused_scale_minis_are_ignored
+    # test_invalid_unused_scale_slots_are_ignored
     add(
-        "unused-minis",
+        "unused-scale-slots",
         A_SCALE_SORTED_SHUFFLED=False,
         B_SCALE_SHUFFLED=False,
-        SCALE_MINI_BLOCK_M=-1,
-        SCALE_MINI_BLOCK_N=3,
-        SCALE_MINI_BLOCK_K=1,
+        SCALE_SLOT_M=-1,
+        SCALE_SLOT_N=3,
+        SCALE_SLOT_K=1,
     )
-    # test_invalid_shuffled_scale_minis_are_rejected (32 is narrower than the slot)
+    # test_invalid_shuffled_scale_slots_are_rejected (32 is narrower than the slot)
     for field, value in (
-        ("SCALE_MINI_BLOCK_M", 32),
-        ("SCALE_MINI_BLOCK_M", 256),
-        ("SCALE_MINI_BLOCK_N", 32),
-        ("SCALE_MINI_BLOCK_N", 256),
-        ("SCALE_MINI_BLOCK_K", 128),
-        ("SCALE_MINI_BLOCK_K", 384),
+        ("SCALE_SLOT_M", 32),
+        ("SCALE_SLOT_M", 256),
+        ("SCALE_SLOT_N", 32),
+        ("SCALE_SLOT_N", 256),
+        ("SCALE_SLOT_K", 128),
+        ("SCALE_SLOT_K", 384),
     ):
         add(f"invalid-{field}-{value}", **{field: value})
     # test_shuffled_scale_k_cannot_be_narrower_than_payload_k
-    add("sk-narrower-than-bk", BLOCK_K=512, SCALE_MINI_BLOCK_K=256, VGPR_PREFETCH_K=512)
+    add("sk-narrower-than-bk", BLOCK_K=512, SCALE_SLOT_K=256, VGPR_PREFETCH_K=512)
     return out
 
 
@@ -822,7 +822,7 @@ def register_test_cases():
     add(
         "small-a",
         "bf16",
-        dict(small, MINI_BLOCK_M=16, MINI_BLOCK_N=128, warps_per_cta=(1, 4)),
+        dict(small, SLOT_M=16, SLOT_N=128, warps_per_cta=(1, 4)),
     )
     # test_small_b_payload_uses_register_ring_without_preshuffle
     add(
@@ -831,8 +831,8 @@ def register_test_cases():
         dict(
             small,
             BLOCK_N=32,
-            MINI_BLOCK_M=64,
-            MINI_BLOCK_N=16,
+            SLOT_M=64,
+            SLOT_N=16,
             warps_per_cta=(4, 1),
             ALLOW_B_VIA_LDS=True,
             B_PRESHUFFLED=False,
@@ -845,8 +845,8 @@ def register_test_cases():
         dict(
             small,
             BLOCK_N=64,
-            MINI_BLOCK_M=32,
-            MINI_BLOCK_N=32,
+            SLOT_M=32,
+            SLOT_N=32,
             warps_per_cta=(2, 2),
             ALLOW_B_VIA_LDS=True,
             B_PRESHUFFLED=False,
@@ -881,9 +881,9 @@ def register_test_cases():
                 dtype,
                 {
                     "BLOCK_K": bk,
-                    "SCALE_MINI_BLOCK_K": sk,
-                    "SCALE_MINI_BLOCK_M": 128,
-                    "SCALE_MINI_BLOCK_N": 256,
+                    "SCALE_SLOT_K": sk,
+                    "SCALE_SLOT_M": 128,
+                    "SCALE_SLOT_N": 256,
                     "VGPR_PREFETCH_K": bk,
                     "NUM_LDS_BUFFER": 2,
                     "K_UNROLL": 2,

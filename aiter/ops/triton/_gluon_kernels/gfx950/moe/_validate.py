@@ -175,36 +175,36 @@ def validate_layout(tc, layout, N, K):
             continue
         axis = "M" if idx == 0 else "N"
         block = BM if idx == 0 else BN
-        nonk, sk = layout.scale_mini_block_nonk(idx), layout.scale_mini_block_k(idx)
-        mini = layout.scale_nonk(idx)
-        assert block >= nonk >= mini, (
-            f"BLOCK_{axis} >= SCALE_MINI_BLOCK_{axis} >= MINI_BLOCK_{axis} is required"
+        nonk, sk = layout.scale_slot_nonk(idx), layout.scale_slot_k(idx)
+        slot = layout.slot_nonk(idx)
+        assert block >= nonk >= slot, (
+            f"BLOCK_{axis} >= SCALE_SLOT_{axis} >= SLOT_{axis} is required"
         )
-        assert block % nonk == 0 and nonk % mini == 0, (
-            f"SCALE_MINI_BLOCK_{axis} must divide BLOCK_{axis} and be a multiple of MINI_BLOCK_{axis}"
+        assert block % nonk == 0 and nonk % slot == 0, (
+            f"SCALE_SLOT_{axis} must divide BLOCK_{axis} and be a multiple of SLOT_{axis}"
         )
         assert nonk % 32 == 0, (
-            f"SCALE_MINI_BLOCK_{axis} must contain whole 32-row stripes"
+            f"SCALE_SLOT_{axis} must contain whole 32-row stripes"
         )
         assert sk >= max(256, BK), (
-            "SCALE_MINI_BLOCK_K must be at least 256 and at least BLOCK_K"
+            "SCALE_SLOT_K must be at least 256 and at least BLOCK_K"
         )
         assert sk & (sk - 1) == 0 and sk % BK == 0, (
-            "SCALE_MINI_BLOCK_K must be a power of two and a multiple of BLOCK_K"
+            "SCALE_SLOT_K must be a power of two and a multiple of BLOCK_K"
         )
-        assert K % sk == 0, "K must contain complete SCALE_MINI_BLOCK_K tiles"
+        assert K % sk == 0, "K must contain complete SCALE_SLOT_K tiles"
 
     # -- the slot is the unit of LDS allocation, of the global->LDS copy, of the
     #    MFMA and of the accumulator, so it must align to the CTA block;
     #    non-divisible values are illegal, not merely wasteful --
-    assert BM % tc.MINI_BLOCK_M.value == 0
-    assert BN % tc.MINI_BLOCK_N.value == 0
-    assert tc.MINI_BLOCK_M.value % (instr[0] * warps[0] * tiles[0]) == 0, (
-        f"MINI_BLOCK_M {tc.MINI_BLOCK_M.value} must be a multiple of "
+    assert BM % tc.SLOT_M.value == 0
+    assert BN % tc.SLOT_N.value == 0
+    assert tc.SLOT_M.value % (instr[0] * warps[0] * tiles[0]) == 0, (
+        f"SLOT_M {tc.SLOT_M.value} must be a multiple of "
         f"instr[0]*warps[0]*tiles[0] = {instr[0] * warps[0] * tiles[0]}"
     )
-    assert tc.MINI_BLOCK_N.value % (instr[1] * warps[1] * tiles[1]) == 0, (
-        f"MINI_BLOCK_N {tc.MINI_BLOCK_N.value} must be a multiple of "
+    assert tc.SLOT_N.value % (instr[1] * warps[1] * tiles[1]) == 0, (
+        f"SLOT_N {tc.SLOT_N.value} must be a multiple of "
         f"instr[1]*warps[1]*tiles[1] = {instr[1] * warps[1] * tiles[1]}"
     )
 
@@ -229,9 +229,9 @@ def validate_layout(tc, layout, N, K):
         # The 16-column-blocked global offsets only stay inside the N slot while
         # every extent is a whole number of 16-column, 16-byte blocks.
         pk_b = BK // fc.pack_divisor(1)
-        assert BN % 16 == 0 and tc.MINI_BLOCK_N.value % 16 == 0, (
-            f"B_PRESHUFFLED needs BLOCK_N ({BN}) and MINI_BLOCK_N "
-            f"({tc.MINI_BLOCK_N.value}) to be multiples of the 16-column block"
+        assert BN % 16 == 0 and tc.SLOT_N.value % 16 == 0, (
+            f"B_PRESHUFFLED needs BLOCK_N ({BN}) and SLOT_N "
+            f"({tc.SLOT_N.value}) to be multiples of the 16-column block"
         )
         assert pk_b % 16 == 0, (
             f"B_PRESHUFFLED needs BLOCK_K/pack ({pk_b}) to be a multiple of the "
@@ -243,14 +243,14 @@ def validate_layout(tc, layout, N, K):
 
     # -- WeightGuHbmLayout.SPLIT: an N slot must be exactly one operand side --
     if fc.weight_gu_hbm_layout.value == WeightGuHbmLayout.SPLIT:
-        MBN = tc.MINI_BLOCK_N.value
-        assert layout.num_n_slots.value == 2 and MBN * 2 == BN, (
+        SLOT_N = tc.SLOT_N.value
+        assert layout.num_n_slots.value == 2 and SLOT_N * 2 == BN, (
             f"WeightGuHbmLayout.SPLIT needs exactly two N slots, one per side: got "
-            f"BLOCK_N {BN} / MINI_BLOCK_N {MBN} = {layout.num_n_slots.value}"
+            f"BLOCK_N {BN} / SLOT_N {SLOT_N} = {layout.num_n_slots.value}"
         )
-        assert N % 2 == 0 and (N // 2) % MBN == 0, (
+        assert N % 2 == 0 and (N // 2) % SLOT_N == 0, (
             f"WeightGuHbmLayout.SPLIT needs each half of N ({N}) to be a whole "
-            f"number of MINI_BLOCK_N ({MBN}) tiles"
+            f"number of SLOT_N ({SLOT_N}) tiles"
         )
         # The whole point of the layout: a warp's emitted N extent has to contain a
         # whole MX group, or the fused quant's amax crosses the warp boundary. That
@@ -264,7 +264,7 @@ def validate_layout(tc, layout, N, K):
                 f"{tiles[1]} = {warp_n}) to be a multiple of {MX_GROUP}, else the "
                 "amax reduction still crosses warps"
             )
-            assert MBN % MX_GROUP == 0
+            assert SLOT_N % MX_GROUP == 0
 
     # -- the fused MX output quant groups 32 *emitted* columns, so the raw tile has
     #    to carry 32 * activation_reduction_n of them --
@@ -274,7 +274,7 @@ def validate_layout(tc, layout, N, K):
             f"BLOCK_N {BN} must be a multiple of {MX_GROUP * arn} in raw "
             f"(pre-halving) terms so every MX group is tile-local"
         )
-        assert tc.MINI_BLOCK_N.value % (MX_GROUP * arn) == 0
+        assert tc.SLOT_N.value % (MX_GROUP * arn) == 0
 
     return True
 
@@ -316,8 +316,8 @@ def validate_pipeline(tc, layout, K, schedule=None):
     assert schedule.fill_slots_valid.value, (
         f"fill ownership is not a valid mapping for num_m_slots "
         f"{layout.num_m_slots.value} x num_n_slots {layout.num_n_slots.value} "
-        f"(MINI_BLOCK_M {tc.MINI_BLOCK_M.value} vs BLOCK_M {tc.BLOCK_M.value}, "
-        f"MINI_BLOCK_N {tc.MINI_BLOCK_N.value} vs BLOCK_N {tc.BLOCK_N.value})"
+        f"(SLOT_M {tc.SLOT_M.value} vs BLOCK_M {tc.BLOCK_M.value}, "
+        f"SLOT_N {tc.SLOT_N.value} vs BLOCK_N {tc.BLOCK_N.value})"
     )
     num_k = schedule.num_k.value
     depth = schedule.depth.value

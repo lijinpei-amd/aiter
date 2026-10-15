@@ -293,13 +293,13 @@ class KernelTuningConfig:
     VGPR_PREFETCH_K: gl.constexpr
     # Shuffled-scale K load extent in logical payload elements. Zero means
     # max(256, BLOCK_K); an explicit value is at least that wide and divisible by BLOCK_K.
-    SCALE_MINI_BLOCK_K: gl.constexpr
+    SCALE_SLOT_K: gl.constexpr
     # tiling of BLOCK_M / BLOCK_N for the final streaming write of results
-    MINI_BLOCK_M: gl.constexpr
-    MINI_BLOCK_N: gl.constexpr
-    # Number of mini (MINI_BLOCK_M, MINI_BLOCK_N) tiles to stage in lds in advance.
+    SLOT_M: gl.constexpr
+    SLOT_N: gl.constexpr
+    # Number of (SLOT_M, SLOT_N) slots to stage in lds in advance.
     # This is the knob that bounds live accumulator registers.
-    MINI_PRESTORE_MN: gl.constexpr
+    SLOT_PRESTORE_MN: gl.constexpr
     # number of lds buffers to use, determines pipeline depth
     NUM_LDS_BUFFER: gl.constexpr
     # MFMA shape. NUM_WARPS is derived as prod(warps_per_cta), not carried separately.
@@ -399,7 +399,7 @@ epilogue                                # NUM_LDS_BUFFER-1 mma-only iterations, 
 ```
 
 Shuffled scales retain an independent, possibly wider K extent. Let
-`SCALE_K = SCALE_MINI_BLOCK_K or max(256, BLOCK_K)`. Validation requires
+`SCALE_K = SCALE_SLOT_K or max(256, BLOCK_K)`. Validation requires
 `SCALE_K >= max(256, BLOCK_K)`, a power-of-two `SCALE_K`, `SCALE_K % BLOCK_K == 0`, and
 `K % SCALE_K == 0`; one scale load is retained for `SCALE_K / BLOCK_K` payload steps, and
 the current step selects its corresponding K phase.
@@ -448,7 +448,7 @@ never stored. Assert the fill count equals `cdiv(K, BLOCK_K)` in the constexpr l
 
 Divisibility lattice for the rest: `BLOCK_K % mfma_k == 0` (`mfma_k` = 64 or 128 for the CDNA4
 scaled f8f6f4 pipes, 16/32 for bf16); `VGPR_PREFETCH_K == BLOCK_K` because the pipeline carries
-one whole payload stage; `MINI_PRESTORE_MN <= NUM_MINI_BLOCK_M * NUM_MINI_BLOCK_N`; and, whenever
+one whole payload stage; `SLOT_PRESTORE_MN <= NUM_M_SLOTS * NUM_N_SLOTS`; and, whenever
 `scale_swizzle == CDNA4_SCALE`, the effective `SCALE_K` is a power of two, is at least
 `max(256, BLOCK_K)`, divides total `K`, and is divisible by `BLOCK_K`.
 
@@ -466,7 +466,7 @@ NUM_LDS_BUFFER * (A + A_scale + B + B_scale) + out_buf + out_scale_buf <= 163840
 Worked example, BLOCK_M=128 / BLOCK_N=256 / BLOCK_K=256 MXFP4: A = 16 KiB, A_scale = 1 KiB,
 B = 32 KiB, B_scale = 2 KiB → **51 KiB per stage**, so 3 buffers already take 153 KiB. A *full-tile*
 `out_buf` would be another 64 KiB bf16 / 128 KiB fp32 and does not fit — which is exactly why the
-M/N mini-blocks exist. At MINI_BLOCK_M=128, MINI_BLOCK_N=32 emitted, fp32, `out_buf` is 16 KiB and
+M/N slots exist. At SLOT_M=128, SLOT_N=32 emitted, fp32, `out_buf` is 16 KiB and
 fits with `NUM_LDS_BUFFER=2`. `pick_gemm_num_stages(..., use_async_padding=True)`
 (`aiter/ops/triton/utils/gemm_config_utils.py:294`) already does this arithmetic and can be reused.
 
@@ -474,7 +474,7 @@ fits with `NUM_LDS_BUFFER=2`. `pick_gemm_num_stages(..., use_async_padding=True)
 fp32 accumulator alone is `BLOCK_M * BLOCK_N / (NUM_WARPS * 64)` VGPR/lane = 64 at
 128×256 with 8 warps, 128 at BLOCK_N=512. `VGPR_PREFETCH_K == BLOCK_K` keeps one whole
 payload-stage fragment live on top of that, and `WAVES_PER_EU = 2` is only reachable at ≤256 VGPR.
-State a target VGPR/lane and waves/EU per regime, and note that `MINI_PRESTORE_MN` exists precisely
+State a target VGPR/lane and waves/EU per regime, and note that `SLOT_PRESTORE_MN` exists precisely
 to drain accumulator registers early so the next tile can start.
 
 ### LDS layout goals
@@ -566,13 +566,13 @@ class LDSManager:
         return b_val, b_scale_val
 
     @gluon.jit
-    def fill_a_lds(self, idx, a: QuantTokenTensor, a_coord, mini_idx: gl.constexpr):
+    def fill_a_lds(self, idx, a: QuantTokenTensor, a_coord, slot_idx: gl.constexpr):
         # issue buffer_load_to_shared for token and token scale. The scale coordinate is derived
         # from a_coord. Must pass mask=/other= for the ragged tail (see "Edge cases").
         ...
 
     @gluon.jit
-    def fill_b_lds(self, idx, b: QuantExpertTensor, b_coord, mini_idx: gl.constexpr):
+    def fill_b_lds(self, idx, b: QuantExpertTensor, b_coord, slot_idx: gl.constexpr):
         # same for expert / expert-scale
         ...
 
@@ -591,24 +591,24 @@ class LDSManager:
     @gluon.jit
     def reshape_result(self, res):
         # split the [BLOCK_M, BLOCK_N] accumulator into a tuple of
-        # NUM_MINI_BLOCK_M * NUM_MINI_BLOCK_N tiles of shape [MINI_BLOCK_M, MINI_BLOCK_N],
+        # NUM_M_SLOTS * NUM_N_SLOTS slots of shape [SLOT_M, SLOT_N],
         # as a register-only view: no cross-lane data movement, no instruction emitted.
         # Implemented with gl.amd.slice, NOT reshape/permute/split — see below.
         ...
 
     @gluon.jit
-    def store_res_lds(self, res_mini_blocks: gl.tuple,
-                      mini_m_idx: gl.constexpr, mini_n_idx: gl.constexpr):
-        # stage one mini-block in LDS so the epilogue can read it back grouped by 32 emitted
+    def store_res_lds(self, res_slots: gl.tuple,
+                      m_slot_idx: gl.constexpr, n_slot_idx: gl.constexpr):
+        # stage one slot in LDS so the epilogue can read it back grouped by 32 emitted
         # columns for the MX amax. Followed by gl.barrier().
         ...
 
     @gluon.jit
     def store_res_hbm(self, res_ptr, res_scale_ptr, bias_ptr, gammas_ptr, res_coord,
-                      res_mini_blocks: gl.tuple,
-                      mini_m_idx: gl.constexpr, mini_n_idx: gl.constexpr):
+                      res_slots: gl.tuple,
+                      m_slot_idx: gl.constexpr, n_slot_idx: gl.constexpr):
         # apply the epilogue in order (bias -> activation -> gammas -> output_quant) and
-        # buffer_store the mini-block. The scale coordinate is derived from res_coord.
+        # buffer_store the slot. The scale coordinate is derived from res_coord.
         ...
 ```
 
@@ -634,20 +634,20 @@ trailing axis of size 2. The primitive that does what is wanted is
 requires the lane and warp dim bases to match between source and destination, which means:
 
 ```
-MINI_BLOCK_M % (instr_shape[0] * warps_per_cta[0] * tiles_per_warp[0]) == 0
-MINI_BLOCK_N % (instr_shape[1] * warps_per_cta[1] * tiles_per_warp[1]) == 0
-BLOCK_M % MINI_BLOCK_M == 0    and    BLOCK_N % MINI_BLOCK_N == 0
+SLOT_M % (instr_shape[0] * warps_per_cta[0] * tiles_per_warp[0]) == 0
+SLOT_N % (instr_shape[1] * warps_per_cta[1] * tiles_per_warp[1]) == 0
+BLOCK_M % SLOT_M == 0    and    BLOCK_N % SLOT_N == 0
 ```
 
-With 32×32 MFMA and `warps_per_cta=[4,1]` that pins `MINI_BLOCK_M` at 128 and steps `MINI_BLOCK_N`
+With 32×32 MFMA and `warps_per_cta=[4,1]` that pins `SLOT_M` at 128 and steps `SLOT_N`
 in 32s. Non-divisible values are **illegal, not merely wasteful**, so implement it as a
 `gl.static_range` over `gl.amd.slice` with the above as constexpr asserts.
 
-Note the mini M/N block machinery is **not** optional under the fused-quant decision: with
-`MINI_BLOCK_M = BLOCK_M` and `MINI_BLOCK_N = BLOCK_N` a full-tile `out_buf` does not fit in LDS
+Note the M/N slot machinery is **not** optional under the fused-quant decision: with
+`SLOT_M = BLOCK_M` and `SLOT_N = BLOCK_N` a full-tile `out_buf` does not fit in LDS
 alongside the operand buffers (see the budget above). If you need a simplification to get a first
 kernel running, drop `output_quant` (emit bf16, keep the standalone `mxfp4_quant` launch) and set
-`out_buf = None` — then, and only then, `MINI_BLOCK_* = BLOCK_*` is viable.
+`out_buf = None` — then, and only then, `SLOT_* = BLOCK_*` is viable.
 
 ### Edge cases
 

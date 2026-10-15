@@ -70,9 +70,9 @@ class _PipelineConst:
     increments. Only :class:`_PipelinePointers` and :class:`_PipelineRegFragments`
     cross the back edge.
 
-    Every offset grid is a *tuple*, one entry per mini block: ``num_m_slots`` for the A
+    Every offset grid is a *tuple*, one entry per non-K slot: ``num_m_slots`` for the A
     side, ``num_n_slots`` for the B side. Each entry is laid out for its own slot's
-    copy layout, which is what keeps every per-mini-block direct-to-LDS copy as wide and
+    copy layout, which is what keeps every per-slot direct-to-LDS copy as wide and
     as coalesced as the whole-tile copy it replaces.
 
     ``a_scale_hbm_offs``/``b_scale_hbm_offs`` serve both direct-to-LDS and register
@@ -179,7 +179,7 @@ class _PipelinePointers:
 class _PipelineRegFragments:
     """Prefetched A/B payloads and scales, plus one accumulator per (ni, mi) slot.
 
-    Operand tuples are ordered by non-K mini block, then whole-stage K fragment. An unscaled
+    Operand tuples are ordered by non-K slot, then whole-stage K fragment. An unscaled
     operand aliases its payload in the scale tuple; _maybe_block_dot ignores that slot.
     """
 

@@ -45,7 +45,7 @@ for the exact minimum K and current scheduling rules.
 | BF16 | 64 | 16,16,32 | 1,4 | 3,3,3,3 | 3 | 1 | 3 | A payload |
 
 All three use `expert_cache_modifier=".cg"`, BLOCK_M=128, BLOCK_N=256,
-MINI_BLOCK_M=64, MINI_BLOCK_N=128, and full-stage K prefetching. The complete
+SLOT_M=64, SLOT_N=128, and full-stage K prefetching. The complete
 JSON dictionaries also pin scale layout, instruction tiling, and other controls.
 
 ## Reproduce or extend the search
