@@ -290,8 +290,8 @@ def test_small_a_payload_uses_register_ring(monkeypatch):
     config = _register_config("bf16")
     config.update(
         BLOCK_K=32,
-        MINI_BLOCK_M=16,
-        MINI_BLOCK_N=128,
+        SLOT_M=16,
+        SLOT_N=128,
         VGPR_PREFETCH_K=32,
         mfma_instr_shape=(16, 16, 16),
         warps_per_cta=(1, 4),
@@ -324,8 +324,8 @@ def test_small_b_payload_uses_register_ring_without_preshuffle(monkeypatch):
     config.update(
         BLOCK_N=32,
         BLOCK_K=32,
-        MINI_BLOCK_M=64,
-        MINI_BLOCK_N=16,
+        SLOT_M=64,
+        SLOT_N=16,
         VGPR_PREFETCH_K=32,
         mfma_instr_shape=(16, 16, 16),
         warps_per_cta=(4, 1),
@@ -360,8 +360,8 @@ def test_small_a_and_b_payloads_share_register_pipeline(monkeypatch):
     config.update(
         BLOCK_N=64,
         BLOCK_K=32,
-        MINI_BLOCK_M=32,
-        MINI_BLOCK_N=32,
+        SLOT_M=32,
+        SLOT_N=32,
         VGPR_PREFETCH_K=32,
         mfma_instr_shape=(16, 16, 16),
         warps_per_cta=(2, 2),
@@ -394,7 +394,7 @@ def test_unquantized_gate_up_split_allows_small_warp_extent(register_case):
     config = _register_config(register_case.dtype)
     config.update(
         BLOCK_N=128,
-        MINI_BLOCK_N=64,
+        SLOT_N=64,
         tiles_per_warp=(2, 1),
         ALLOW_B_VIA_LDS=False,
         A_SCALE_SORTED_SHUFFLED=False,
@@ -440,9 +440,9 @@ def test_scale_and_payload_k_load_units_are_independent(
     config = _register_config(register_case.dtype)
     config.update(
         BLOCK_K=block_k,
-        SCALE_MINI_BLOCK_K=scale_k,
-        SCALE_MINI_BLOCK_M=128,
-        SCALE_MINI_BLOCK_N=256,
+        SCALE_SLOT_K=scale_k,
+        SCALE_SLOT_M=128,
+        SCALE_SLOT_N=256,
         VGPR_PREFETCH_K=block_k,
         NUM_LDS_BUFFER=2,
         K_UNROLL=2,
@@ -460,7 +460,7 @@ def test_register_operands_cover_whole_block_k(register_case, mask):
     config = _register_config(register_case.dtype)
     config.update(
         BLOCK_N=128,
-        MINI_BLOCK_N=64,
+        SLOT_N=64,
         BLOCK_K=256,
         VGPR_PREFETCH_K=256,
         warps_per_cta=(2, 2),

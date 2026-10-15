@@ -45,7 +45,7 @@ Memory layout contract (the wrapper hard-asserts it), with ``pack`` = 2 for MXFP
   ``KernelFuncConfig.weight_gu_hbm_layout``:
 
   - ``INTERLEAVED`` (default) -- column-interleaved, even = gate, odd = up
-  - ``SPLIT`` -- whole halves, gate in ``[0, I)`` and up in ``[I, 2I)``. A mini-N block
+  - ``SPLIT`` -- whole halves, gate in ``[0, I)`` and up in ``[I, 2I)``. An N slot
     is then one entire operand side, so the activation pairs two accumulator *tiles*
     with identical layouts instead of two registers within a lane's quad, and a warp's
     32 emitted channels are exactly one MX group. See ``KernelLayout.n_start``. The
@@ -110,7 +110,7 @@ def _drain_last_fused(
 
     :func:`_slot_index` is N outer, so the visit order is ``(0,0), (1,0), (0,1), (1,1)``
     and every gate-side accumulator is final before the first linear-side MFMA issues.
-    The silu for mini-M block ``mi`` therefore lands *between* MFMA clusters and its
+    The silu for M slot ``mi`` therefore lands *between* MFMA clusters and its
     exp2/rcp retire under them.
 
     Returns the accumulator tuple with each ``ni == 0`` slot replaced by
@@ -308,7 +308,7 @@ def _moe_gemm_body(
             _last_mfma(pc, regs),
         )
 
-    # Hoisted out of the mini-tile loop: one scalar load, not one per tile.
+    # Hoisted out of the slot loop: one scalar load, not one per tile.
     if require_constexpr(func_cfg.has_x_static_scale):
         x_static_scale = gl.load(x_static_scale_hbm_ptr)
     else:
@@ -316,7 +316,7 @@ def _moe_gemm_body(
     if require_constexpr(schedule.epilogue_wait() is not None):
         # Retire the epilogue copies and any newer operand groups issued during
         # the drain. The cooperative fill needs a barrier before each warp reads
-        # its mini block. Under FUSE this also makes bias available to the final
+        # its slot. Under FUSE this also makes bias available to the final
         # MFMA's activation; that step issues no further copies or waits.
         gl.amd.cdna4.async_copy.wait_group(schedule.epilogue_wait())
         gl.barrier()

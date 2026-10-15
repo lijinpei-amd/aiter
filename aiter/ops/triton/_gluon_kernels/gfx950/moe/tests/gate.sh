@@ -68,7 +68,7 @@ if [[ "$MODE" != "--fast" ]]; then
     op_tests/triton_tests/moe/test_moe_gemm_gluon_buffered_schedule.py \
     op_tests/triton_tests/moe/test_moe_gemm_gluon_wait_commit.py \
     op_tests/triton_tests/moe/test_moe_gemm_gluon_config.py \
-    op_tests/triton_tests/moe/test_moe_gemm_gluon_scale_miniblocks.py \
+    op_tests/triton_tests/moe/test_moe_gemm_gluon_scale_slots.py \
     -k "not all_reachable_remainders and not independent_buffer" 2>&1 | tail -1)
   echo "T1 symbolic        $out"
   [[ "$out" == *failed* || "$out" == *error* ]] && fail=1

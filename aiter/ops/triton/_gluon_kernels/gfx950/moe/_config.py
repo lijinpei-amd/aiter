@@ -57,7 +57,7 @@ class KernelFuncConfig:
     # the FP8_E4M3 operand carries unit scales through the MMA, so the whole tensor
     # scale has to come back somewhere and the Triton kernels put it exactly here.
     has_x_static_scale: gl.constexpr
-    # WeightGuHbmLayout. Under SPLIT a mini-N block is one whole side, so the pair for
+    # WeightGuHbmLayout. Under SPLIT an N slot is one whole side, so the pair for
     # an emitted channel is two *tiles*, not two registers. Folded to INTERLEAVED
     # without a gated activation, where it is inert, so no use site re-checks that.
     weight_gu_hbm_layout: gl.constexpr
@@ -198,8 +198,8 @@ class KernelTuningConfig:
     BLOCK_N: gl.constexpr
     BLOCK_K: gl.constexpr
     K_UNROLL: gl.constexpr
-    MINI_BLOCK_M: gl.constexpr
-    MINI_BLOCK_N: gl.constexpr
+    SLOT_M: gl.constexpr
+    SLOT_N: gl.constexpr
     NUM_LDS_BUFFER: gl.constexpr
     mfma_instr_shape: gl.constexpr
     warps_per_cta: gl.constexpr
@@ -238,9 +238,9 @@ class KernelTuningConfig:
     B_NUM_BUFFER: gl.constexpr
     A_SCALE_NUM_BUFFER: gl.constexpr
     B_SCALE_NUM_BUFFER: gl.constexpr
-    SCALE_MINI_BLOCK_M: gl.constexpr
-    SCALE_MINI_BLOCK_N: gl.constexpr
-    SCALE_MINI_BLOCK_K: gl.constexpr
+    SCALE_SLOT_M: gl.constexpr
+    SCALE_SLOT_N: gl.constexpr
+    SCALE_SLOT_K: gl.constexpr
     UNROLL_EPILOGUE: gl.constexpr
 
     @gluon.constexpr_function
@@ -251,8 +251,8 @@ class KernelTuningConfig:
         BLOCK_N,
         BLOCK_K,
         K_UNROLL,
-        MINI_BLOCK_M,
-        MINI_BLOCK_N,
+        SLOT_M,
+        SLOT_N,
         NUM_LDS_BUFFER,
         mfma_instr_shape,
         warps_per_cta,
@@ -291,9 +291,9 @@ class KernelTuningConfig:
         B_NUM_BUFFER=0,
         A_SCALE_NUM_BUFFER=0,
         B_SCALE_NUM_BUFFER=0,
-        SCALE_MINI_BLOCK_M=0,
-        SCALE_MINI_BLOCK_N=0,
-        SCALE_MINI_BLOCK_K=0,
+        SCALE_SLOT_M=0,
+        SCALE_SLOT_N=0,
+        SCALE_SLOT_K=0,
         UNROLL_EPILOGUE=True,
     ):
         self.func_cfg = func_cfg
@@ -301,8 +301,8 @@ class KernelTuningConfig:
         self.BLOCK_N = gl.constexpr(BLOCK_N)
         self.BLOCK_K = gl.constexpr(BLOCK_K)
         self.K_UNROLL = gl.constexpr(K_UNROLL)
-        self.MINI_BLOCK_M = gl.constexpr(MINI_BLOCK_M)
-        self.MINI_BLOCK_N = gl.constexpr(MINI_BLOCK_N)
+        self.SLOT_M = gl.constexpr(SLOT_M)
+        self.SLOT_N = gl.constexpr(SLOT_N)
         self.NUM_LDS_BUFFER = gl.constexpr(NUM_LDS_BUFFER)
         self.mfma_instr_shape = gl.constexpr(list(mfma_instr_shape))
         self.warps_per_cta = gl.constexpr(list(warps_per_cta))
@@ -342,9 +342,9 @@ class KernelTuningConfig:
         self.B_NUM_BUFFER = gl.constexpr(int(B_NUM_BUFFER))
         self.A_SCALE_NUM_BUFFER = gl.constexpr(int(A_SCALE_NUM_BUFFER))
         self.B_SCALE_NUM_BUFFER = gl.constexpr(int(B_SCALE_NUM_BUFFER))
-        self.SCALE_MINI_BLOCK_M = gl.constexpr(int(SCALE_MINI_BLOCK_M))
-        self.SCALE_MINI_BLOCK_N = gl.constexpr(int(SCALE_MINI_BLOCK_N))
-        self.SCALE_MINI_BLOCK_K = gl.constexpr(int(SCALE_MINI_BLOCK_K))
+        self.SCALE_SLOT_M = gl.constexpr(int(SCALE_SLOT_M))
+        self.SCALE_SLOT_N = gl.constexpr(int(SCALE_SLOT_N))
+        self.SCALE_SLOT_K = gl.constexpr(int(SCALE_SLOT_K))
         self.UNROLL_EPILOGUE = gl.constexpr(bool(UNROLL_EPILOGUE))
 
     @gluon.constexpr_function

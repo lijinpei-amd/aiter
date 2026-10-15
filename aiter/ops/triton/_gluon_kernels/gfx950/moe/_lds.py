@@ -52,8 +52,8 @@ def _buffer_load_to_lds(
 @gluon.jit
 def _scale_fragments(scale, cfg, layout, operand: gl.constexpr):
     """Split one shuffled scale load in registers, retaining whole packed words."""
-    nonk: gl.constexpr = layout.scale_mini_block_nonk(operand)
-    sk: gl.constexpr = layout.scale_mini_block_k(operand)
+    nonk: gl.constexpr = layout.scale_slot_nonk(operand)
+    sk: gl.constexpr = layout.scale_slot_k(operand)
     bk: gl.constexpr = cfg.BLOCK_K
     packed: gl.constexpr = layout.scale_packed_ok(operand)
     fragments = ()
@@ -70,8 +70,8 @@ def _scale_fragments(scale, cfg, layout, operand: gl.constexpr):
                     words = gl.reshape(scale, [nonk // 32, sk // 256, 64])
                     words = gl.amd.slice(
                         words,
-                        [layout.scale_nonk(operand) // 32, max(256, bk) // 256, 64],
-                        [n * layout.scale_nonk(operand) // 32, k * bk // 256, 0],
+                        [layout.slot_nonk(operand) // 32, max(256, bk) // 256, 64],
+                        [n * layout.slot_nonk(operand) // 32, k * bk // 256, 0],
                     )
                     fragment = gl.convert_layout(
                         gl.reshape(words, layout.packed_scale_shape(operand)),
@@ -81,7 +81,7 @@ def _scale_fragments(scale, cfg, layout, operand: gl.constexpr):
                 fragment = gl.amd.slice(
                     scale,
                     layout.fragment_shape_slot(operand, True),
-                    [n * layout.scale_nonk(operand), k * bk // 32],
+                    [n * layout.slot_nonk(operand), k * bk // 32],
                 )
             fragments += (fragment,)
     return fragments
@@ -302,7 +302,7 @@ class LDSManager:
     def ds_read_scale(
         self, operand: gl.constexpr, SCALE_READ_IDX, non_k_slot: gl.constexpr
     ):
-        """Read each scale mini block once and retain all of its consumer fragments."""
+        """Read each scale slot once and retain all of its consumer fragments."""
         cfg: gl.constexpr = self.tuning_cfg
         layout: gl.constexpr = self.layout
         if require_constexpr(operand == 0):

@@ -526,9 +526,9 @@ def test_gemm1_fused_mxfp4_out(m, n, k, n_expts_tot, n_expts_act, act, device="c
 # changes. Run against the fused MXFP4 output specifically, because that is where the
 # split earns its keep (a warp's 32 emitted channels become exactly one MX group).
 # (E, topk) = (33, 8) on purpose: that is what makes the routing pick BLOCK_M 128, and
-# the split layout needs both mini-block axes split (validate() rejects NN != 2). The
+# the split layout needs both slot axes split (validate() rejects NN != 2). The
 # 128-expert shapes the neighbouring tests use land on BLOCK_M 32, where there is only
-# one mini-N block and the whole Gluon path is off anyway.
+# one N slot and the whole Gluon path is off anyway.
 @pytest.mark.parametrize(
     "m, n, k, n_expts_tot, n_expts_act",
     [

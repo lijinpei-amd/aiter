@@ -84,8 +84,8 @@ def _stage_epilogue_inputs(
     # but that is a property of that configuration and not of the drain.
     #
     # Both tiles are flat: `.index()` drops the leading axis but keeps the layout's rank,
-    # so a [rows, mini] tile cannot be viewed as one mini block. `.slice(start, length)`
-    # preserves rank, so a 1-D tile slices cleanly into per-mini-block views.
+    # so a [rows, slot] tile cannot be viewed as one slot. `.slice(start, length)`
+    # preserves rank, so a 1-D tile slices cleanly into per-slot views.
     #
     # The gammas tile is EPI_T elements, not BLOCK_M: buffer_load_to_shared requires
     # exactly 32 or 128 bits per thread, so the copy has to cover one element per thread
@@ -149,14 +149,14 @@ def _stage_epilogue_inputs(
 
 @gluon.jit
 def _epi_bias_tiles(bias_lds_ptr, bias_hbm_ptr, pid_n, N, func_cfg, tuning_cfg, layout):
-    """Block-level bias, one tensor per mini-N block.
+    """Block-level bias, one tensor per N slot.
 
     Invariant in mi, so NN of them cover the block where the per-tile form issued
     NM*NN. From LDS when the staging constraints hold, else straight from global.
     The LDS read carries the accumulator's own N slice layout, which is nameable, so
     this really is a prefetch -- unlike gammas, see _epi_gamma_tiles.
     """
-    MBN: gl.constexpr = tuning_cfg.MINI_BLOCK_N
+    SLOT_N: gl.constexpr = tuning_cfg.SLOT_N
     NN: gl.constexpr = layout.num_n_slots
     RFL: gl.constexpr = layout.dot_result_fragment_layout
     out = ()
@@ -164,12 +164,12 @@ def _epi_bias_tiles(bias_lds_ptr, bias_hbm_ptr, pid_n, N, func_cfg, tuning_cfg, 
         for hn in gl.static_range(NN):
             if require_constexpr(bias_lds_ptr is not None):
                 out = out + (
-                    bias_lds_ptr.slice(hn * MBN, MBN).load(gl.SliceLayout(0, RFL)),
+                    bias_lds_ptr.slice(hn * SLOT_N, SLOT_N).load(gl.SliceLayout(0, RFL)),
                 )
             else:
                 out = out + (
                     gl.load(
-                        bias_hbm_ptr + layout.n_start(pid_n, hn, N) + gl.arange(0, MBN)
+                        bias_hbm_ptr + layout.n_start(pid_n, hn, N) + gl.arange(0, SLOT_N)
                     ),
                 )
     return out
@@ -179,21 +179,21 @@ def _epi_bias_tiles(bias_lds_ptr, bias_hbm_ptr, pid_n, N, func_cfg, tuning_cfg, 
 def _epi_gamma_tiles(
     gamma_lds_ptr, gammas_hbm_ptr, block_id, M_e, func_cfg, tuning_cfg, layout
 ):
-    """Block-level gammas, one tensor per mini-M block -- global path only.
+    """Block-level gammas, one tensor per M slot -- global path only.
 
     When gammas live in LDS this returns empty on purpose: gammas multiplies the
     *post-swiglu* tensor, whose layout is a sliced linear layout that swiglu's N
     reduction produces and no config accessor names, so the read has to happen inside
-    _epilogue_one_tile off `out.type.layout`. That is a ds_read of MINI_BLOCK_M
+    _epilogue_one_tile off `out.type.layout`. That is a ds_read of SLOT_M
     elements against data that landed long before, not a global load.
     """
     BM: gl.constexpr = tuning_cfg.BLOCK_M
-    MBM: gl.constexpr = tuning_cfg.MINI_BLOCK_M
+    SLOT_M: gl.constexpr = tuning_cfg.SLOT_M
     NM: gl.constexpr = layout.num_m_slots
     out = ()
     if require_constexpr(func_cfg.has_gammas and gamma_lds_ptr is None):
         for hm in gl.static_range(NM):
-            hoffs = BM * block_id + hm * MBM + gl.arange(0, MBM)
+            hoffs = BM * block_id + hm * SLOT_M + gl.arange(0, SLOT_M)
             out = out + (gl.load(gammas_hbm_ptr + hoffs, mask=hoffs < M_e, other=0.0),)
     return out
 
@@ -217,27 +217,27 @@ def _epi_stage_flush(
     tuning_cfg,
     layout,
 ):
-    """Read one staged MXFP4 mini tile back out of LDS and store it.
+    """Read one staged MXFP4 slot back out of LDS and store it.
 
     The second half of :func:`_epilogue_one_tile`'s staged store, split out so
     ``rotating epilogue`` can run it one iteration behind the write that produced it.
     """
     BM: gl.constexpr = tuning_cfg.BLOCK_M
     BN: gl.constexpr = tuning_cfg.BLOCK_N
-    MBM: gl.constexpr = tuning_cfg.MINI_BLOCK_M
-    MBN: gl.constexpr = tuning_cfg.MINI_BLOCK_N
+    SLOT_M: gl.constexpr = tuning_cfg.SLOT_M
+    SLOT_N: gl.constexpr = tuning_cfg.SLOT_N
     ARN: gl.constexpr = func_cfg.activation_reduction_n()
-    OUT_MBN: gl.constexpr = layout.output_n_slot
-    P_COLS: gl.constexpr = layout.quant_payload_shape(MBM, OUT_MBN)[1]
-    S_COLS: gl.constexpr = layout.quant_scale_shape(MBM, OUT_MBN)[1]
-    PL: gl.constexpr = layout.result_store_layout(MBM, P_COLS, 8)
-    SL: gl.constexpr = layout.result_store_layout(MBM, S_COLS, 8)
-    raw_n0 = pid_n * BN + ni * MBN
+    OUT_SLOT_N: gl.constexpr = layout.output_n_slot
+    P_COLS: gl.constexpr = layout.quant_payload_shape(SLOT_M, OUT_SLOT_N)[1]
+    S_COLS: gl.constexpr = layout.quant_scale_shape(SLOT_M, OUT_SLOT_N)[1]
+    PL: gl.constexpr = layout.result_store_layout(SLOT_M, P_COLS, 8)
+    SL: gl.constexpr = layout.result_store_layout(SLOT_M, S_COLS, 8)
+    raw_n0 = pid_n * BN + ni * SLOT_N
     n0 = raw_n0 // ARN
     # The caller's fenced barrier has retired every wave's staging writes.
     pv = gl.amd.cdna4.async_copy.load_shared_relaxed(qp_lds_ptr, PL)
     sv = gl.amd.cdna4.async_copy.load_shared_relaxed(qs_lds_ptr, SL)
-    pm = BM * block_id + mi * MBM + gl.arange(0, MBM, layout=gl.SliceLayout(1, PL))
+    pm = BM * block_id + mi * SLOT_M + gl.arange(0, SLOT_M, layout=gl.SliceLayout(1, PL))
     pn = gl.arange(0, P_COLS, layout=gl.SliceLayout(0, PL))
     gl.amd.cdna4.buffer_store(
         pv,
@@ -245,7 +245,7 @@ def _epi_stage_flush(
         pm[:, None] * y_stride_m + (n0 // 2 + pn)[None, :] * y_stride_n,
         mask=(pm < M_e)[:, None],
     )
-    sm = BM * block_id + mi * MBM + gl.arange(0, MBM, layout=gl.SliceLayout(1, SL))
+    sm = BM * block_id + mi * SLOT_M + gl.arange(0, SLOT_M, layout=gl.SliceLayout(1, SL))
     sn = gl.arange(0, S_COLS, layout=gl.SliceLayout(0, SL))
     gl.amd.cdna4.buffer_store(
         sv,
@@ -274,16 +274,16 @@ def _epi_block_flush(
 ):
     """Read the WHOLE staged MXFP4 block back out of LDS and store it.
 
-    The gate/up-split twin of :func:`_epi_stage_flush`. Split collapses the two mini-N
-    blocks into one output tile, so a mini tile already spans the CTA's full emitted
+    The gate/up-split twin of :func:`_epi_stage_flush`. Split collapses the two N
+    slots into one output tile, so a slot already spans the CTA's full emitted
     width and the only axis left to walk is M -- which means every tile can stage into
     its own rows of one block-height buffer and the drain needs a single barrier and a
     single pair of stores rather than one per tile.
     """
     BM: gl.constexpr = tuning_cfg.BLOCK_M
-    OUT_MBN: gl.constexpr = layout.output_n_slot
-    P_COLS: gl.constexpr = layout.quant_payload_shape(BM, OUT_MBN)[1]
-    S_COLS: gl.constexpr = layout.quant_scale_shape(BM, OUT_MBN)[1]
+    OUT_SLOT_N: gl.constexpr = layout.output_n_slot
+    P_COLS: gl.constexpr = layout.quant_payload_shape(BM, OUT_SLOT_N)[1]
+    S_COLS: gl.constexpr = layout.quant_scale_shape(BM, OUT_SLOT_N)[1]
     PL: gl.constexpr = layout.result_store_layout(BM, P_COLS, 8)
     SL: gl.constexpr = layout.result_store_layout(BM, S_COLS, 8)
     n0 = pid_n * layout.output_block_n
@@ -341,31 +341,31 @@ def _epilogue_one_tile(
     STAGE_ROW: gl.constexpr = 0,
     GATE_PRE: gl.constexpr = False,
 ):
-    """bias -> activation -> gammas -> output_quant -> store, for ONE mini tile.
+    """bias -> activation -> gammas -> output_quant -> store, for ONE slot.
 
     Lifted verbatim out of :func:`_epilogue_store` so the fused drain step can call it
     per slot the moment that slot's last MFMA retires. ``sub`` is the finished
     accumulator for tile ``(mi, ni)``.
 
     Under ``WeightGuHbmLayout.SPLIT`` a "tile" is a *pair*: ``sub`` is the gate side
-    (mini-N block ``ni``) and ``lin`` the linear side (block ``ni + 1``), covering the
+    (N slot ``ni``) and ``lin`` the linear side (slot ``ni + 1``), covering the
     same emitted channels. The activation is then a plain elementwise op between two
     tensors of identical layout -- no reshape, no split, and none of the ``v_mov_b32``
-    gathers the interleaved packing needs -- and the tile is ``MBN`` emitted channels
-    wide rather than ``MBN // 2``. ``STAGE_ROW`` is the row this tile occupies in a
+    gathers the interleaved packing needs -- and the tile is ``SLOT_N`` emitted channels
+    wide rather than ``SLOT_N // 2``. ``STAGE_ROW`` is the row this tile occupies in a
     block-height LDS staging buffer, which is what lets the caller flush all of them
     in one store.
     """
     BM: gl.constexpr = tuning_cfg.BLOCK_M
-    MBM: gl.constexpr = tuning_cfg.MINI_BLOCK_M
+    SLOT_M: gl.constexpr = tuning_cfg.SLOT_M
     ARN: gl.constexpr = func_cfg.activation_reduction_n()
-    OUT_MBN: gl.constexpr = layout.output_n_slot
-    P_COLS: gl.constexpr = layout.quant_payload_shape(MBM, OUT_MBN)[1]
-    S_COLS: gl.constexpr = layout.quant_scale_shape(MBM, OUT_MBN)[1]
+    OUT_SLOT_N: gl.constexpr = layout.output_n_slot
+    P_COLS: gl.constexpr = layout.quant_payload_shape(SLOT_M, OUT_SLOT_N)[1]
+    S_COLS: gl.constexpr = layout.quant_scale_shape(SLOT_M, OUT_SLOT_N)[1]
     act: gl.constexpr = func_cfg.activation
     out_ty: gl.constexpr = y_hbm_ptr.dtype.element_ty
     store_layout: gl.constexpr = layout.result_store_layout(
-        MBM, OUT_MBN, out_ty.primitive_bitwidth
+        SLOT_M, OUT_SLOT_N, out_ty.primitive_bitwidth
     )
 
     # GATE_PRE: the peeled last K step already applied the static scale, the bias and
@@ -391,12 +391,12 @@ def _epilogue_one_tile(
     if require_constexpr(
         func_cfg.weight_gu_hbm_layout == _WEIGHT_GU_SPLIT and func_cfg.epilogue != 0
     ):
-        # Ablation: the same [MBM, MBN] x 2 -> [MBM, MBN] reduction, minus exp2/rcp.
+        # Ablation: the same [SLOT_M, SLOT_N] x 2 -> [SLOT_M, SLOT_N] reduction, minus exp2/rcp.
         out = sub * lin
-        gl.static_assert(out.shape[1] == OUT_MBN)
+        gl.static_assert(out.shape[1] == OUT_SLOT_N)
     elif require_constexpr(GATE_PRE):
         out = _swiglu_combine(sub, lin, act.limit, ADD_RESIDUAL=act.add_residual)
-        gl.static_assert(out.shape[1] == OUT_MBN)
+        gl.static_assert(out.shape[1] == OUT_SLOT_N)
     elif require_constexpr(func_cfg.weight_gu_hbm_layout == _WEIGHT_GU_SPLIT):
         out = _swiglu_pair(
             sub,
@@ -406,14 +406,14 @@ def _epilogue_one_tile(
             ADD_RESIDUAL=act.add_residual,
             FAST_RCP=tuning_cfg.ACT_FAST_RCP,
         )
-        gl.static_assert(out.shape[1] == OUT_MBN)
+        gl.static_assert(out.shape[1] == OUT_SLOT_N)
     elif require_constexpr(func_cfg.has_activation() and func_cfg.epilogue != 0):
         # Ablation: the same reshape/split reduction _swiglu does, minus exp2/rcp/clip.
         gate, linear = tl.split(
             tl.reshape(sub, (sub.shape[0], sub.shape[1] // 2, 2))
         )
         out = gate * linear
-        gl.static_assert(out.shape[1] == OUT_MBN)
+        gl.static_assert(out.shape[1] == OUT_SLOT_N)
     elif require_constexpr(func_cfg.has_activation()):
         out = _swiglu(
             sub,
@@ -423,7 +423,7 @@ def _epilogue_one_tile(
             FAST_RCP=tuning_cfg.ACT_FAST_RCP,
             GROUP=3,
         )
-        gl.static_assert(out.shape[1] == OUT_MBN)
+        gl.static_assert(out.shape[1] == OUT_SLOT_N)
     else:
         gl.static_assert(ARN == 1)
         out = sub
@@ -433,7 +433,7 @@ def _epilogue_one_tile(
             # Only a ds_read: the global copy that filled this ran before the
             # drain. `out.type.layout` is the one way to name the post-swiglu
             # layout, so the read has to sit here rather than above the walk.
-            g = gamma_lds_ptr.slice(mi * MBM, MBM).load(
+            g = gamma_lds_ptr.slice(mi * SLOT_M, SLOT_M).load(
                 gl.SliceLayout(1, out.type.layout)
             )
         else:
@@ -441,16 +441,16 @@ def _epilogue_one_tile(
         out = out * g[:, None]
 
     # Emitted-channel base. The CTA tile is BLOCK_N // ARN emitted channels wide in both
-    # packings -- what differs is only how many mini blocks that is (2 interleaved, 1
-    # split, where ni is always the gate block and OUT_MBN is the whole width).
-    out_n0 = pid_n * layout.output_block_n + ni * OUT_MBN
+    # packings -- what differs is only how many N slots that is (2 interleaved, 1
+    # split, where ni is always the gate slot and OUT_SLOT_N is the whole width).
+    out_n0 = pid_n * layout.output_block_n + ni * OUT_SLOT_N
     if require_constexpr(func_cfg.output_quant is None):
         val = gl.convert_layout(
             out.to(out_ty), store_layout, assert_trivial=False
         )
-        sm = gl.arange(0, MBM, layout=gl.SliceLayout(1, store_layout))
-        sn = gl.arange(0, OUT_MBN, layout=gl.SliceLayout(0, store_layout))
-        rows = BM * block_id + mi * MBM + sm
+        sm = gl.arange(0, SLOT_M, layout=gl.SliceLayout(1, store_layout))
+        sn = gl.arange(0, OUT_SLOT_N, layout=gl.SliceLayout(0, store_layout))
+        rows = BM * block_id + mi * SLOT_M + sm
         gl.amd.cdna4.buffer_store(
             val,
             y_hbm_ptr,
@@ -479,14 +479,14 @@ def _epilogue_one_tile(
         # Split, a warp owns 32 emitted columns -- exactly one group -- and validate()
         # enforces it, so the whole reduction stays inside the wave.
         gl.static_assert(func_cfg.output_quant == _DQ_MXFP4)
-        gl.static_assert(OUT_MBN % MX_GROUP == 0)
+        gl.static_assert(OUT_SLOT_N % MX_GROUP == 0)
         # LANE_ELEMS splits the amax: how many of the tile's elements one lane owns,
         # so the inner reduction is in-lane fp32 (free |v| modifiers) and only the
         # outer one goes cross-lane. Getting it wrong is not incorrect, just slower --
         # a mismatched split adds permlane steps instead of removing them.
-        LANE_ELEMS: gl.constexpr = layout.quant_amax_lane_elems(MBM, OUT_MBN)
+        LANE_ELEMS: gl.constexpr = layout.quant_amax_lane_elems(SLOT_M, OUT_SLOT_N)
         payload, scale = mxfp4_quant_gluon(
-            out, OUT_MBN, MBM, MX_GROUP, LANE_ELEMS
+            out, OUT_SLOT_N, SLOT_M, MX_GROUP, LANE_ELEMS
         )
         # Fresh M ranges per store: reusing one auto-layout `offs_m` across two
         # differently-laid-out stores makes GluonResolveAutoEncodings fail with
@@ -514,21 +514,21 @@ def _epilogue_one_tile(
             # Two barriers per tile because one buffer serves all NM*NN tiles: one so
             # every lane's write is visible before the reads, one so the reads finish
             # before the next tile overwrites the buffer.
-            PL: gl.constexpr = layout.result_store_layout(MBM, P_COLS, 8)
-            SL: gl.constexpr = layout.result_store_layout(MBM, S_COLS, 8)
+            PL: gl.constexpr = layout.result_store_layout(SLOT_M, P_COLS, 8)
+            SL: gl.constexpr = layout.result_store_layout(SLOT_M, S_COLS, 8)
             # if/elif/else, not early returns: a `return` from inside a nested
             # `if require_constexpr(...)` here does NOT stop the trace, so the code
-            # below it still ran and stored the mini tile to the *unsliced* buffer --
+            # below it still ran and stored the slot to the *unsliced* buffer --
             # which only surfaced as a shape mismatch because the split buffer is
             # block-height. Keep exactly one store path reachable per configuration.
             if require_constexpr(func_cfg.weight_gu_hbm_layout == _WEIGHT_GU_SPLIT):
-                # Block-height staging: every mi writes its own MBM rows of one buffer,
+                # Block-height staging: every mi writes its own SLOT_M rows of one buffer,
                 # so the caller flushes all NM tiles with a single barrier and a single
                 # store instead of a barrier pair per tile. Split halves the tile count
                 # too (each covers both sides), so the drain goes from NM*NN staging
                 # round-trips to one.
-                qp_lds_ptr.slice(STAGE_ROW, MBM).store(payload)
-                qs_lds_ptr.slice(STAGE_ROW, MBM).store(scale)
+                qp_lds_ptr.slice(STAGE_ROW, SLOT_M).store(payload)
+                qs_lds_ptr.slice(STAGE_ROW, SLOT_M).store(scale)
             elif require_constexpr(STAGE_ONLY):
                 # rotating epilogue: stage and leave it; the caller flushes this buffer one
                 # iteration later, after its own barrier.
@@ -543,8 +543,8 @@ def _epilogue_one_tile(
                 payload_v = gl.amd.cdna4.async_copy.load_shared_relaxed(qp_lds_ptr, PL)
                 scale_v = gl.amd.cdna4.async_copy.load_shared_relaxed(qs_lds_ptr, SL)
 
-                pm = BM * block_id + mi * MBM + gl.arange(
-                    0, MBM, layout=gl.SliceLayout(1, PL)
+                pm = BM * block_id + mi * SLOT_M + gl.arange(
+                    0, SLOT_M, layout=gl.SliceLayout(1, PL)
                 )
                 pn = gl.arange(0, P_COLS, layout=gl.SliceLayout(0, PL))
                 gl.amd.cdna4.buffer_store(
@@ -554,8 +554,8 @@ def _epilogue_one_tile(
                     + (out_n0 // 2 + pn)[None, :] * y_stride_n,
                     mask=(pm < M_e)[:, None],
                 )
-                sm = BM * block_id + mi * MBM + gl.arange(
-                    0, MBM, layout=gl.SliceLayout(1, SL)
+                sm = BM * block_id + mi * SLOT_M + gl.arange(
+                    0, SLOT_M, layout=gl.SliceLayout(1, SL)
                 )
                 sn = gl.arange(0, S_COLS, layout=gl.SliceLayout(0, SL))
                 gl.amd.cdna4.buffer_store(
@@ -566,7 +566,7 @@ def _epilogue_one_tile(
                     mask=(sm < M_e)[:, None],
                 )
         else:
-            pm = BM * block_id + mi * MBM + gl.arange(0, MBM)
+            pm = BM * block_id + mi * SLOT_M + gl.arange(0, SLOT_M)
             gl.store(
                 y_hbm_ptr
                 + pm[:, None] * y_stride_m
@@ -574,7 +574,7 @@ def _epilogue_one_tile(
                 payload,
                 mask=(pm < M_e)[:, None],
             )
-            sm = BM * block_id + mi * MBM + gl.arange(0, MBM)
+            sm = BM * block_id + mi * SLOT_M + gl.arange(0, SLOT_M)
             gl.store(
                 ys_hbm_ptr
                 + sm[:, None] * ys_stride_m
@@ -608,16 +608,16 @@ def _epilogue_store(
     layout,
     GATE_PRE: gl.constexpr = False,
 ):
-    """bias -> activation -> gammas -> output_quant -> store, per mini (M, N) tile.
+    """bias -> activation -> gammas -> output_quant -> store, per (M, N) slot.
 
     The order is fixed and matches ``_triton_kernels/moe/moe_op_gemm_a4w4.py``; the
     clamp and the multiply happen in fp32 before any cast. ``acc`` arrives already split
-    into one tensor per mini tile -- the K pipeline accumulates that way -- so the
+    into one tensor per slot -- the K pipeline accumulates that way -- so the
     epilogue walks the same tiling and consumes them one at a time, which lets the
-    compiler kill each mini accumulator before the next tile's epilogue.
+    compiler kill each slot's accumulator before the next slot's epilogue.
     """
-    MBM: gl.constexpr = tuning_cfg.MINI_BLOCK_M
-    OUT_MBN: gl.constexpr = layout.output_n_slot
+    SLOT_M: gl.constexpr = tuning_cfg.SLOT_M
+    OUT_SLOT_N: gl.constexpr = layout.output_n_slot
 
     NN: gl.constexpr = layout.num_n_slots
     NM: gl.constexpr = layout.num_m_slots
@@ -639,24 +639,24 @@ def _epilogue_store(
     # Staging for the MXFP4 payload store, bouncing it through LDS so the global store
     # vectorises -- worth ~16 us on the 4-wave a4w4 gemm1, see _epilogue_one_tile.
     #
-    # ONE mini tile's worth, reused across the walk: NM*NN buffers would cost NM*NN
+    # ONE slot's worth, reused across the walk: NM*NN buffers would cost NM*NN
     # times the LDS for no gain, since the tiles are stored one after another anyway.
     # Allocated here so it dominates every use; the pipeline's buffers are dead by this
     # point, so Triton's liveness-based shared allocator overlays this on top of them
     # and the kernel's LDS footprint does not grow at all.
     QSH: gl.constexpr = layout.quant_staging_layout
     ROT: gl.constexpr = layout.quant_staging_rotates
-    # Split stages the whole block, not one mini tile: NM tiles into one buffer, flushed
+    # Split stages the whole block, not one slot: NM slots into one buffer, flushed
     # once at the end of the walk. Costs NM x the LDS (still a few KB, overlaid on the
     # dead pipeline buffers) and buys NM-1 barrier pairs and one wide store instead of
     # NM narrow ones.
     QROWS: gl.constexpr = layout.quant_staging_rows
     if require_constexpr(func_cfg.output_quant is not None):
         qp_lds_ptr = gl.allocate_shared_memory(
-            gl.uint8, layout.quant_payload_shape(QROWS, OUT_MBN), layout=QSH
+            gl.uint8, layout.quant_payload_shape(QROWS, OUT_SLOT_N), layout=QSH
         )
         qs_lds_ptr = gl.allocate_shared_memory(
-            gl.uint8, layout.quant_scale_shape(QROWS, OUT_MBN), layout=QSH
+            gl.uint8, layout.quant_scale_shape(QROWS, OUT_SLOT_N), layout=QSH
         )
     else:
         qp_lds_ptr: gl.constexpr = None
@@ -665,20 +665,20 @@ def _epilogue_store(
         # Second bank for rotating epilogue. Same overlay argument as above, so the footprint
         # still does not grow.
         qp2_lds_ptr = gl.allocate_shared_memory(
-            gl.uint8, layout.quant_payload_shape(MBM, OUT_MBN), layout=QSH
+            gl.uint8, layout.quant_payload_shape(SLOT_M, OUT_SLOT_N), layout=QSH
         )
         qs2_lds_ptr = gl.allocate_shared_memory(
-            gl.uint8, layout.quant_scale_shape(MBM, OUT_MBN), layout=QSH
+            gl.uint8, layout.quant_scale_shape(SLOT_M, OUT_SLOT_N), layout=QSH
         )
     else:
         qp2_lds_ptr: gl.constexpr = None
         qs2_lds_ptr: gl.constexpr = None
 
     if require_constexpr(func_cfg.weight_gu_hbm_layout == _WEIGHT_GU_SPLIT):
-        # One pass over mi, pairing the two mini-N blocks: block 0 is the gate side and
-        # block 1 the linear side of the *same* emitted channels, so the activation is
+        # One pass over mi, pairing the two N slots: slot 0 is the gate side and
+        # slot 1 the linear side of the *same* emitted channels, so the activation is
         # elementwise between two identically laid out accumulators. Every tile stages
-        # into its own MBM rows of the block-height buffer, then one barrier pair and
+        # into its own SLOT_M rows of the block-height buffer, then one barrier pair and
         # one store flushes the lot.
         for mi in gl.static_range(NM):
             _epilogue_one_tile(
@@ -706,7 +706,7 @@ def _epilogue_store(
                 qp_lds_ptr,
                 qs_lds_ptr,
                 lin=acc[_slot_index(mi, 1, NM, NN)],
-                STAGE_ROW=mi * MBM,
+                STAGE_ROW=mi * SLOT_M,
                 GATE_PRE=GATE_PRE,
             )
         if require_constexpr(func_cfg.output_quant is not None):

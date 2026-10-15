@@ -100,11 +100,20 @@ _INVERTED_KNOB_RENAMES = {
     "B_SCALE_IN_REG": "ALLOW_B_SCALE_VIA_LDS",
     "A_SCALE_IN_REG": "ALLOW_A_SCALE_VIA_LDS",
 }
-_SCALE_MINI_BLOCK_KEYS = (
-    "SCALE_MINI_BLOCK_M",
-    "SCALE_MINI_BLOCK_N",
-    "SCALE_MINI_BLOCK_K",
+_SCALE_SLOT_KEYS = (
+    "SCALE_SLOT_M",
+    "SCALE_SLOT_N",
+    "SCALE_SLOT_K",
 )
+#: Slot extents under their pre-slot names. Still accepted, as config keys and as
+#: ``AITER_TRITON_MOE_GLUON_<name>`` variables; the new name wins in the environment.
+_LEGACY_SLOT_KEYS = {
+    "SLOT_M": "MINI_BLOCK_M",
+    "SLOT_N": "MINI_BLOCK_N",
+    "SCALE_SLOT_M": "SCALE_MINI_BLOCK_M",
+    "SCALE_SLOT_N": "SCALE_MINI_BLOCK_N",
+    "SCALE_SLOT_K": "SCALE_MINI_BLOCK_K",
+}
 _DS_READ_FIELDS = (
     ("DS_READ_A_PAYLOAD_IN_MFMA", DSReadOperand.A),
     ("DS_READ_A_SCALE_IN_MFMA", DSReadOperand.A_SCALE),
@@ -184,15 +193,41 @@ def _env_int(name: str, default: int) -> int:
     return default if v is None else int(v)
 
 
-def _mini_block_override(name: str, default: int, block: int, warp_gran: int) -> int:
-    """A MINI_BLOCK_M/N environment override, ignored unless it tiles the CTA block.
+def _env_slot_int(name: str, default: int) -> int:
+    """A slot extent from the environment, under its name or its legacy name."""
+    prefix = "AITER_TRITON_MOE_GLUON_"
+    legacy = _env_int(prefix + _LEGACY_SLOT_KEYS[name], default)
+    return _env_int(prefix + name, legacy)
 
-    MINI_BLOCK splits the LDS staging area, the global->LDS copy and the accumulator,
+
+def _canonical_slot_keys(c: dict) -> dict:
+    """``c`` with its legacy slot keys renamed, upper- or lowercase.
+
+    Lowercase is accepted for the scale slots only, as it was before the rename. A
+    legacy key that disagrees with its new name is rejected.
+    """
+    renames = list(_LEGACY_SLOT_KEYS.items()) + [
+        (key.lower(), _LEGACY_SLOT_KEYS[key].lower()) for key in _SCALE_SLOT_KEYS
+    ]
+    for name, legacy in renames:
+        if legacy in c:
+            value = c[legacy]
+            if name in c and c[name] != value:
+                raise ValueError(f"{name} and legacy {legacy} disagree")
+            c = {k: v for k, v in c.items() if k != legacy}
+            c[name] = value
+    return c
+
+
+def _slot_override(name: str, default: int, block: int, warp_gran: int) -> int:
+    """A SLOT_M/N environment override, ignored unless it tiles the CTA block.
+
+    The slot splits the LDS staging area, the global->LDS copy and the accumulator,
     not just the epilogue, so an override that is not a whole number of warp tiles
     dividing the block would be rejected by ``validate()`` -- fall back rather than
     fail the launch.
     """
-    value = _env_int("AITER_TRITON_MOE_GLUON_" + name, default)
+    value = _env_slot_int(name, default)
     if 0 < value <= block and block % value == 0 and value % warp_gran == 0:
         return value
     return default
@@ -265,7 +300,7 @@ def _pick_warps(block_m: int, block_n: int, num_warps: int, instr) -> tuple:
 
     Splitting N is what the caller's ``gran_n`` is derived from, so a split whose N
     granularity does not divide ``block_n`` is not merely suboptimal -- it makes the
-    caller's ``mini_n`` alignment walk step past ``block_n`` forever. The N constraint
+    caller's ``slot_n`` alignment walk step past ``block_n`` forever. The N constraint
     is therefore mandatory and the M constraint is only a preference. ``(num_warps, 1)``
     is the guaranteed-safe floor: ``block_n`` is always a multiple of ``instr[1]``.
     """
@@ -486,15 +521,13 @@ def get_gluon_config_uncached(
         assert bn % warp_gran_n == 0, (
             f"BLOCK_N {bn} not a multiple of warp N-granularity {warp_gran_n}"
         )
-        mini_n = min(bn, warp_gran_n * 2)
-        while mini_n % warp_gran_n:
-            mini_n += warp_gran_n
-        mini_m = _mini_block_override(
-            "MINI_BLOCK_M", block_m, block_m, warp_gran_m
-        )
-        mini_n = _mini_block_override("MINI_BLOCK_N", mini_n, bn, warp_gran_n)
+        slot_n = min(bn, warp_gran_n * 2)
+        while slot_n % warp_gran_n:
+            slot_n += warp_gran_n
+        slot_m = _slot_override("SLOT_M", block_m, block_m, warp_gran_m)
+        slot_n = _slot_override("SLOT_N", slot_n, bn, warp_gran_n)
         out_instr, out_warps, out_tiles = instr, warps, (1, 1)
-        out_bk, out_mini_m, out_mini_n = bk, mini_m, mini_n
+        out_bk, out_slot_m, out_slot_n = bk, slot_m, slot_n
         if _env_int("AITER_TRITON_MOE_GLUON_FLY", 0) and block_m == 128:
             # The operand shape moe_sort_scales was written against, and the one the
             # FlyDSL port runs: 4 waves each owning 32 contiguous M rows (two 16-row
@@ -542,11 +575,11 @@ def get_gluon_config_uncached(
             out_bk = 256
             # Each payload stage carries one whole BLOCK_K fragment. M/N can still be
             # split into pipeline slots, while shuffled scales have independent extents.
-            out_mini_m = _mini_block_override(
-                "MINI_BLOCK_M", block_m, block_m, out_instr[0] * out_warps[0]
+            out_slot_m = _slot_override(
+                "SLOT_M", block_m, block_m, out_instr[0] * out_warps[0]
             )
-            out_mini_n = _mini_block_override(
-                "MINI_BLOCK_N",
+            out_slot_n = _slot_override(
+                "SLOT_N",
                 bn,
                 bn,
                 out_instr[1] * out_warps[1] * out_tiles[1],
@@ -562,9 +595,9 @@ def get_gluon_config_uncached(
             tm, tn = out_tiles
             gm2 = out_instr[0] * out_warps[0] * 2
             gn2 = out_instr[1] * out_warps[1] * 2
-            if tm < 2 and block_m % gm2 == 0 and out_mini_m % gm2 == 0:
+            if tm < 2 and block_m % gm2 == 0 and out_slot_m % gm2 == 0:
                 tm = 2
-            if tn < 2 and bn % gn2 == 0 and out_mini_n % gn2 == 0:
+            if tn < 2 and bn % gn2 == 0 and out_slot_n % gn2 == 0:
                 tn = 2
             out_tiles = (tm, tn)
         return {
@@ -574,15 +607,12 @@ def get_gluon_config_uncached(
             # The effective factor is the LCM of this request, every active
             # payload/scale buffer period and the shuffled-scale K cadence.
             "K_UNROLL": _env_int("AITER_TRITON_MOE_GLUON_K_UNROLL", n_buf),
-            "MINI_BLOCK_M": out_mini_m,
-            "MINI_BLOCK_N": out_mini_n,
+            "SLOT_M": out_slot_m,
+            "SLOT_N": out_slot_n,
             # Zero inherits the corresponding payload M/N extent. Shuffled scale K
             # defaults to max(256, BLOCK_K); an override must be at least that wide
             # and an integer multiple of BLOCK_K.
-            **{
-                key: _env_int("AITER_TRITON_MOE_GLUON_" + key, 0)
-                for key in _SCALE_MINI_BLOCK_KEYS
-            },
+            **{key: _env_slot_int(key, 0) for key in _SCALE_SLOT_KEYS},
             "NUM_LDS_BUFFER": n_buf,
             # Zero inherits NUM_LDS_BUFFER in the common component pipeline.
             "A_NUM_BUFFER": _env_int("AITER_TRITON_MOE_GLUON_A_NUM_BUFFER", 0),
@@ -816,8 +846,8 @@ def _default_launch_config(
             c,
             BLOCK_N=128,
             BLOCK_K=256,
-            MINI_BLOCK_M=32,
-            MINI_BLOCK_N=64,
+            SLOT_M=32,
+            SLOT_N=64,
             mfma_instr_shape=(16, 16, 128),
             warps_per_cta=(2, 2),
             tiles_per_warp=(1, 2),
@@ -856,7 +886,7 @@ def _default_launch_config(
         # FlyDSL on the same shapes is 132.1/133.6 and 241.5/242.5, so this is parity
         # rather than a partial recovery. The `.cg` hint on the expert stream is most
         # of it and comes from the block_m <= 32 rule above; what is set here is the
-        # geometry that hint needs -- and, decisively, MINI_BLOCK_M/N at the warp
+        # geometry that hint needs -- and, decisively, SLOT_M/N at the warp
         # granularity rather than the whole tile. Leaving them at the tile gives one
         # slot per axis, which gate/up split refuses outright, so these shapes fell
         # back to the Triton kernel and none of the tuning above ever ran.
@@ -866,8 +896,8 @@ def _default_launch_config(
             # a8w4 halves the weight bytes per K step, so it can afford twice the K
             # depth inside the same LDS budget; a8w8 cannot.
             BLOCK_K=512 if dq_b == DtypeQuant.MXFP4 else 256,
-            MINI_BLOCK_M=16,
-            MINI_BLOCK_N=64,
+            SLOT_M=16,
+            SLOT_N=64,
             mfma_instr_shape=(16, 16, 128),
             warps_per_cta=(1, 4),
             tiles_per_warp=(1, 1),
@@ -890,8 +920,8 @@ def _default_launch_config(
             c,
             BLOCK_N=256,
             BLOCK_K=128,
-            MINI_BLOCK_M=64,
-            MINI_BLOCK_N=128,
+            SLOT_M=64,
+            SLOT_N=128,
             mfma_instr_shape=(16, 16, 128),
             warps_per_cta=(1, 4),
             tiles_per_warp=(2, 2),
@@ -925,15 +955,15 @@ def _default_launch_config(
         # The divisibility terms above are exactly _preshuffled_b's preconditions, so
         # a config that asks for registers is always one it can serve.
         #
-        # Splitting MINI_BLOCK to 64x128 also gives this shape two N slots, so unlike
+        # Splitting the slot to 64x128 also gives this shape two N slots, so unlike
         # every other block_m 64/128 cell it does not fall off the Gluon path for a
         # gate/up-split caller.
         c = dict(
             c,
             BLOCK_N=256,
             BLOCK_K=256,
-            MINI_BLOCK_M=64,
-            MINI_BLOCK_N=128,
+            SLOT_M=64,
+            SLOT_N=128,
             mfma_instr_shape=(16, 16, 128),
             warps_per_cta=(1, 4),
             tiles_per_warp=(4, 2),
@@ -959,13 +989,13 @@ def _default_launch_config(
         # with one warp tile per slot, which is both much slower than the tuned
         # 16x16x128 shape and -- because the warp split then spans the whole N tile --
         # impossible to cut into the two N slots a gate/up-split caller needs. Those
-        # are the same defect: MINI_BLOCK is not splittable *because* the geometry is
+        # are the same defect: the slot is not splittable *because* the geometry is
         # wrong. Measured on H7168-I2048-E33-k8, tuned vs the automatic geometry with
-        # its MINI_BLOCK split so it can run at all:
+        # its slot split so it can run at all:
         #
         #   T=1024   199.4 vs 277.1 us      T=4096   604.7 vs 897.8 us
         #
-        # bench_out/gluon_larget_a4bf16_20260921. Splitting MINI_BLOCK on the
+        # bench_out/gluon_larget_a4bf16_20260921. Splitting the slot on the
         # automatic geometry is nearly free on its own (+0.9% / +0.5%, bit-identical
         # output, bench_out/mini_block_split_20260921) -- it simply is not the tile
         # worth running.
@@ -973,8 +1003,8 @@ def _default_launch_config(
             c,
             BLOCK_N=256,
             BLOCK_K=256,
-            MINI_BLOCK_M=block_m // 2,
-            MINI_BLOCK_N=128,
+            SLOT_M=block_m // 2,
+            SLOT_N=128,
             mfma_instr_shape=(16, 16, 128),
             warps_per_cta=(1, 4),
             tiles_per_warp=(2, 2),
@@ -995,7 +1025,7 @@ def _default_launch_config(
     ):
         # Same defect for BF16, and worse: the automatic tile is BLOCK_N 64 with the
         # warps split (4, 2), so N is exactly one warp granularity wide and no
-        # MINI_BLOCK split exists at all. The tuned tile is four times wider in N with
+        # slot split exists at all. The tuned tile is four times wider in N with
         # a shallow K stage. Measured: T=1024 680.2 vs 723.7 us for the automatic
         # geometry, T=4096 2193.5 vs 2252.7 us, T=256 436.0 vs 513.2 us
         # (bench_out/gluon_larget_a4bf16_20260921, gluon_bm64_cg_20260921).
@@ -1003,8 +1033,8 @@ def _default_launch_config(
             c,
             BLOCK_N=256,
             BLOCK_K=64,
-            MINI_BLOCK_M=block_m // 2,
-            MINI_BLOCK_N=128,
+            SLOT_M=block_m // 2,
+            SLOT_N=128,
             mfma_instr_shape=(32, 32, 16),
             warps_per_cta=(2, 4) if block_m == 128 else (1, 4),
             tiles_per_warp=(1, 1),
@@ -1158,17 +1188,17 @@ def gluon_supported(
     # Until the fill-ownership restriction was lifted this was unreachable, because
     # every tile that fails it also failed the both-axes-split rule.
     if gate_up_split and apply_swiglu:
-        n_slots = cfg["BLOCK_N"] // cfg["MINI_BLOCK_N"]
+        n_slots = cfg["BLOCK_N"] // cfg["SLOT_N"]
         if n_slots != 2:
             return False, (
                 f"gate_up_split needs exactly two N slots, one per operand side: "
-                f"BLOCK_N {cfg['BLOCK_N']} / MINI_BLOCK_N {cfg['MINI_BLOCK_N']} "
+                f"BLOCK_N {cfg['BLOCK_N']} / SLOT_N {cfg['SLOT_N']} "
                 f"= {n_slots}"
             )
-        if N % 2 or (N // 2) % cfg["MINI_BLOCK_N"]:
+        if N % 2 or (N // 2) % cfg["SLOT_N"]:
             return False, (
                 f"gate_up_split needs each half of N ({N}) to be a whole number of "
-                f"MINI_BLOCK_N ({cfg['MINI_BLOCK_N']}) blocks"
+                f"SLOT_N ({cfg['SLOT_N']}) blocks"
             )
     if _probe_lds_bytes(cfg, dq_a, dq_b) > LDS_USABLE_BYTES:
         return False, "no tile of this shape fits the LDS budget"
@@ -1216,7 +1246,7 @@ def _launch_spec(
     from triton.experimental.gluon import language as gl
 
     c = (
-        dict(config_items)
+        _canonical_slot_keys(dict(config_items))
         if config_items
         else _default_launch_config(
             block_m,
@@ -1374,13 +1404,11 @@ def _sorted_token_id_map(expt_data, gather_indx, n_expts_act, block_m, n_blocks,
 def _scale_shuffle_supported(cfg, operand):
     """Whether this operand can consume the packed K256 scale byte order."""
     block_k = int(cfg["BLOCK_K"])
-    configured_scale_k = cfg.get("SCALE_MINI_BLOCK_K", 0)
-    if "scale_mini_block_k" in cfg:
-        configured_scale_k = cfg["scale_mini_block_k"]
+    configured_scale_k = cfg.get("SCALE_SLOT_K", 0)
+    if "scale_slot_k" in cfg:
+        configured_scale_k = cfg["scale_slot_k"]
     if not configured_scale_k:
-        configured_scale_k = _env_int(
-            "AITER_TRITON_MOE_GLUON_SCALE_MINI_BLOCK_K", 0
-        )
+        configured_scale_k = _env_slot_int("SCALE_SLOT_K", 0)
     scale_k = int(configured_scale_k) or max(256, block_k)
     if (
         tuple(cfg["mfma_instr_shape"]) != (16, 16, 128)
@@ -1424,10 +1452,10 @@ def _sorted_shuffle_a_scales(x_scales, routing_data, gather_indx, K, cfg):
         or x_scales.shape[1] != K // MX_GROUP_SIZE
         or not x_scales.is_contiguous()
         or block_m % 32 != 0
-        # The buffer is one 256 B run per 32-row stripe, so a mini block that is a
+        # The buffer is one 256 B run per 32-row stripe, so a slot that is a
         # whole number of stripes is a contiguous slice of it; the kernel indexes the
         # slice with a stripe offset. It does not have to be the whole block.
-        or int(cfg["MINI_BLOCK_M"]) % 32 != 0
+        or int(cfg["SLOT_M"]) % 32 != 0
         or K % 256 != 0
     ):
         return None
@@ -1539,9 +1567,9 @@ def _shuffled_b_scales(w_scales, cfg):
         return None
     if (
         not _scale_shuffle_supported(cfg, 1)
-        # Stripe-based like the A shuffle: one 256 B run per 32 columns, so a mini
-        # block that is a whole number of stripes is a contiguous slice of the tile.
-        or int(cfg["MINI_BLOCK_N"]) % 32 != 0
+        # Stripe-based like the A shuffle: one 256 B run per 32 columns, so a slot
+        # that is a whole number of stripes is a contiguous slice of the tile.
+        or int(cfg["SLOT_N"]) % 32 != 0
         or w_scales.shape[-1] % 32 != 0
         or w_scales.shape[-2] % 8 != 0
     ):
@@ -1711,9 +1739,10 @@ def moe_gemm_gluon(
     :func:`gluon_supported` must have said yes for these tensors first.
     An explicit config's ``BLOCK_M`` must match ``routing_data.block_m`` because
     the routing offsets and block map are built for that geometry.
-    ``scale_mini_block_m``, ``scale_mini_block_n`` and ``scale_mini_block_k``
-    (also accepted in uppercase) set shuffled-scale load extents independently
-    of the payload slots. K counts logical payload elements; its scale storage
+    ``scale_slot_m``, ``scale_slot_n`` and ``scale_slot_k``
+    (also accepted in uppercase, and under the legacy ``scale_mini_block_*`` names)
+    set the scale slots, the shuffled-scale load extents, independently of the
+    payload slots. K counts logical payload elements; its scale storage
     extent is K / 32. Zero inherits the payload M/N extent, while shuffled scale
     K defaults to ``max(256, BLOCK_K)``. An explicit scale K must be a power-of-two
     multiple of ``BLOCK_K``, at least that wide, and divide total K. Unshuffled
@@ -2161,6 +2190,7 @@ _TUNING_KEYS = TuningSpec._fields
 
 def _tuning_args(c: dict) -> tuple:
     """Keep older config dictionaries valid when optional tuning fields are added."""
+    c = _canonical_slot_keys(c)
     aliases = {
         "token_mod": "token_cache_modifier",
         "token_scale_mod": "token_scale_cache_modifier",
@@ -2192,7 +2222,7 @@ def _tuning_args(c: dict) -> tuple:
         if canonical and canonical != alias:
             raise ValueError("A_SCALE_NUM_BUFFER and A_SCALE_NUMB_BUFFER disagree")
         c = dict(c, A_SCALE_NUM_BUFFER=alias)
-    for canonical in _SCALE_MINI_BLOCK_KEYS:
+    for canonical in _SCALE_SLOT_KEYS:
         alias = canonical.lower()
         value = c.get(canonical, 0)
         if alias in c:
@@ -2200,7 +2230,7 @@ def _tuning_args(c: dict) -> tuple:
                 raise ValueError(f"{canonical} and {alias} disagree")
             value = c[alias]
         if not value:
-            value = _env_int("AITER_TRITON_MOE_GLUON_" + canonical, 0)
+            value = _env_slot_int(canonical, 0)
         c = dict(c, **{canonical: value})
     return tuple(
         c[k] if k in c else TuningSpec._field_defaults[k] for k in _TUNING_KEYS

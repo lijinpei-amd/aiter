@@ -513,13 +513,13 @@ def _calc_num_prefetch_k_slots_frozen(tc):
 @gluon.constexpr_function
 def _calc_num_m_slots_per_block_frozen(tc):
     """M slots per CTA block. Operand A and the accumulator split by this."""
-    return _v(tc.BLOCK_M) // _v(tc.MINI_BLOCK_M)
+    return _v(tc.BLOCK_M) // _v(tc.SLOT_M)
 
 
 @gluon.constexpr_function
 def _calc_num_n_slots_per_block_frozen(tc):
     """N slots per CTA block. Operand B and the accumulator split by this."""
-    return _v(tc.BLOCK_N) // _v(tc.MINI_BLOCK_N)
+    return _v(tc.BLOCK_N) // _v(tc.SLOT_N)
 
 
 @gluon.constexpr_function
@@ -547,7 +547,7 @@ def _calc_scale_block_k_storage_frozen(tc):
 @gluon.constexpr_function
 def _calc_scale_fragment_shape_slot_frozen(tc, idx):
     """Register E8M0 shape for one non-K slot and K slot."""
-    nonk = _v(tc.MINI_BLOCK_M) if _v(idx) == 0 else _v(tc.MINI_BLOCK_N)
+    nonk = _v(tc.SLOT_M) if _v(idx) == 0 else _v(tc.SLOT_N)
     return [nonk, _v(tc.BLOCK_K) // MX_GROUP_INT]
 
 
@@ -556,19 +556,19 @@ def _calc_payload_lds_shape_slot_frozen(tc, idx):
     """Shared shape of one payload slot, in stored (packed) elements."""
     if _v(idx) == 0:
         return [
-            _v(tc.MINI_BLOCK_M),
+            _v(tc.SLOT_M),
             _calc_payload_block_k_storage_frozen(tc, 0),
         ]
     return [
         _calc_payload_block_k_storage_frozen(tc, 1),
-        _v(tc.MINI_BLOCK_N),
+        _v(tc.SLOT_N),
     ]
 
 
 @gluon.constexpr_function
 def _calc_scale_lds_shape_slot_frozen(tc, idx):
     """E8M0 shape of one operand slot: [slot non-K extent, BLOCK_K/32]."""
-    non_k = _v(tc.MINI_BLOCK_M) if _v(idx) == 0 else _v(tc.MINI_BLOCK_N)
+    non_k = _v(tc.SLOT_M) if _v(idx) == 0 else _v(tc.SLOT_N)
     return [non_k, _calc_scale_block_k_storage_frozen(tc)]
 
 
@@ -777,7 +777,7 @@ def _calc_scale_mini_block_nonk_frozen(tc, idx):
     mini = _calc_scale_nonk_frozen(tc, idx)
     if not _scale_shuffled_frozen(tc, idx):
         return mini
-    requested = tc.SCALE_MINI_BLOCK_M if _v(idx) == 0 else tc.SCALE_MINI_BLOCK_N
+    requested = tc.SCALE_SLOT_M if _v(idx) == 0 else tc.SCALE_SLOT_N
     return _v(requested) or mini
 
 
@@ -786,7 +786,7 @@ def _calc_scale_mini_block_k_frozen(tc, idx):
     """Scale load K extent in logical payload elements, not E8M0 bytes."""
     if not _scale_shuffled_frozen(tc, idx):
         return _v(tc.BLOCK_K)
-    return _v(tc.SCALE_MINI_BLOCK_K) or max(256, _v(tc.BLOCK_K))
+    return _v(tc.SCALE_SLOT_K) or max(256, _v(tc.BLOCK_K))
 
 
 @gluon.constexpr_function
@@ -841,8 +841,8 @@ def _calc_scale_hbm_offset_layout_frozen(tc, idx):
 def _calc_scale_nonk_frozen(tc, idx):
     """Non-K extent of one shuffled scale tile: the slot extent."""
     if _v(idx) == 0:
-        return _v(tc.MINI_BLOCK_M)
-    return _v(tc.MINI_BLOCK_N)
+        return _v(tc.SLOT_M)
+    return _v(tc.SLOT_N)
 
 
 @gluon.constexpr_function
@@ -860,7 +860,7 @@ def _calc_sorted_shuffled_ok_frozen(tc):
     return (
         list(_v(tc.mfma_instr_shape)) == [16, 16, 128]
         and _v(tc.BLOCK_M) % 32 == 0
-        and _v(tc.MINI_BLOCK_M) % 32 == 0
+        and _v(tc.SLOT_M) % 32 == 0
     )
 
 
@@ -1046,7 +1046,7 @@ def _calc_dot_operand_scale_buffer_load_lds_layout_frozen(tc, idx):
 @gluon.constexpr_function
 def _calc_output_n_slot_frozen(tc):
     """Emitted columns produced by one logical N-slot epilogue tile."""
-    return _v(tc.MINI_BLOCK_N) // _n_reduction_slot_frozen(tc.func_cfg)
+    return _v(tc.SLOT_N) // _n_reduction_slot_frozen(tc.func_cfg)
 
 
 @gluon.constexpr_function
@@ -1110,7 +1110,7 @@ def _calc_quant_staging_layout_frozen(tc):
 
 @gluon.constexpr_function
 def _calc_quant_staging_rows_frozen(tc):
-    return _v(tc.BLOCK_M) if _gu_split_frozen(tc.func_cfg) else _v(tc.MINI_BLOCK_M)
+    return _v(tc.BLOCK_M) if _gu_split_frozen(tc.func_cfg) else _v(tc.SLOT_M)
 
 
 @gluon.constexpr_function
@@ -1161,7 +1161,7 @@ def _calc_geometry_ok_frozen(tc):
     than a layout constructor.
     """
     BM, BN, BK = _v(tc.BLOCK_M), _v(tc.BLOCK_N), _v(tc.BLOCK_K)
-    MBM, MBN = _v(tc.MINI_BLOCK_M), _v(tc.MINI_BLOCK_N)
+    MBM, MBN = _v(tc.SLOT_M), _v(tc.SLOT_N)
     instr = _v(tc.mfma_instr_shape)
     warps = _v(tc.warps_per_cta)
     tiles = _v(tc.tiles_per_warp)
@@ -1642,7 +1642,7 @@ def _compute_frozen_layout(tuning_cfg):
     epilogue_via_lds = _calc_epilogue_inputs_via_lds_frozen(tc)
     return _FrozenLayout(
         BLOCK_K=_v(tc.BLOCK_K),
-        MINI_BLOCK_M=_v(tc.MINI_BLOCK_M),
+        MINI_BLOCK_M=_v(tc.SLOT_M),
         mfma_instr_shape=list(_v(tc.mfma_instr_shape)),
         gu_split=_gu_split_frozen(fc),
         num_warps=_calc_num_warps_frozen(tc),
@@ -1851,9 +1851,9 @@ def _n_start_frozen(pid_n, n_slot_idx: gl.constexpr, N, func_cfg, tuning_cfg):
     read gate and up from separate halves of N.
     """
     if require_constexpr(_gu_split_frozen(func_cfg)):
-        out = pid_n * tuning_cfg.MINI_BLOCK_N + n_slot_idx * (N // 2)
+        out = pid_n * tuning_cfg.SLOT_N + n_slot_idx * (N // 2)
     else:
-        out = pid_n * tuning_cfg.BLOCK_N + n_slot_idx * tuning_cfg.MINI_BLOCK_N
+        out = pid_n * tuning_cfg.BLOCK_N + n_slot_idx * tuning_cfg.SLOT_N
     return out
 
 
@@ -1951,7 +1951,7 @@ def _a_payload_hbm_offsets_frozen(
 ):
     """Gathered A payload offsets, one copy-layout grid per M slot."""
     M_BLOCK: gl.constexpr = tuning_cfg.BLOCK_M
-    M_SLOT: gl.constexpr = tuning_cfg.MINI_BLOCK_M
+    M_SLOT: gl.constexpr = tuning_cfg.SLOT_M
     NUM_M_SLOTS_PER_BLOCK: gl.constexpr = layout.num_m_slots_per_block()
     PAYLOAD_BLOCK_K_STORAGE: gl.constexpr = layout.payload_block_k_storage(0)
     layout_a_slot: gl.constexpr = layout.payload_hbm_offset_layout(0)
@@ -1983,7 +1983,7 @@ def _a_payload_hbm_offsets_frozen(
 @gluon.jit
 def _b_payload_hbm_offsets_frozen(b, pid_n, N, K, func_cfg, tuning_cfg, layout):
     """B payload offsets for plain or preshuffled weights, one grid per N slot."""
-    N_SLOT: gl.constexpr = tuning_cfg.MINI_BLOCK_N
+    N_SLOT: gl.constexpr = tuning_cfg.SLOT_N
     NUM_N_SLOTS_PER_BLOCK: gl.constexpr = layout.num_n_slots_per_block()
     PAYLOAD_BLOCK_K_STORAGE: gl.constexpr = layout.payload_block_k_storage(1)
     layout_b_slot: gl.constexpr = layout.payload_hbm_offset_layout(1)
@@ -2033,7 +2033,7 @@ def _a_scale_hbm_offsets_frozen(
         return _NO_SCALE
 
     M_BLOCK: gl.constexpr = tuning_cfg.BLOCK_M
-    M_SLOT: gl.constexpr = tuning_cfg.MINI_BLOCK_M
+    M_SLOT: gl.constexpr = tuning_cfg.SLOT_M
     NUM_M_SLOTS_PER_BLOCK: gl.constexpr = layout.num_m_slots_per_block()
     SCALE_BLOCK_K_STORAGE: gl.constexpr = layout.scale_block_k_storage()
     layout_a_scale_slot: gl.constexpr = layout.scale_hbm_offset_layout(0)
@@ -2128,7 +2128,7 @@ def _b_scale_hbm_offsets_frozen(b, pid_n, N, K, func_cfg, tuning_cfg, layout):
     if require_constexpr(not _has_scale_frozen(func_cfg, 1)):
         return _NO_SCALE
 
-    N_SLOT: gl.constexpr = tuning_cfg.MINI_BLOCK_N
+    N_SLOT: gl.constexpr = tuning_cfg.SLOT_N
     NUM_N_SLOTS_PER_BLOCK: gl.constexpr = layout.num_n_slots_per_block()
     SCALE_BLOCK_K_STORAGE: gl.constexpr = layout.scale_block_k_storage()
     layout_b_scale_slot: gl.constexpr = layout.scale_hbm_offset_layout(1)
@@ -3560,7 +3560,7 @@ def _init_buffers_frozen(pc):
             a += (
                 gl.zeros(
                     [
-                        tc.MINI_BLOCK_M,
+                        tc.SLOT_M,
                         tc.BLOCK_K // _pack_divisor_frozen(pc.func_cfg, 0),
                     ],
                     _operand_elem_ty_frozen(pc.func_cfg, 0),
@@ -3575,7 +3575,7 @@ def _init_buffers_frozen(pc):
         ):
             b += (
                 gl.zeros(
-                    [tc.BLOCK_K // _pack_divisor_frozen(pc.func_cfg, 1), tc.MINI_BLOCK_N],
+                    [tc.BLOCK_K // _pack_divisor_frozen(pc.func_cfg, 1), tc.SLOT_N],
                     _operand_elem_ty_frozen(pc.func_cfg, 1),
                     layout.dot_operand_fragment_layout(1),
                 ),
@@ -3597,7 +3597,7 @@ def _init_buffers_frozen(pc):
             else:
                 a_scale += (
                     gl.zeros(
-                        [tc.MINI_BLOCK_M, tc.BLOCK_K // 32],
+                        [tc.SLOT_M, tc.BLOCK_K // 32],
                         gl.uint8,
                         layout.dot_operand_scale_fragment_layout(0),
                     ),
@@ -3619,7 +3619,7 @@ def _init_buffers_frozen(pc):
             else:
                 b_scale += (
                     gl.zeros(
-                        [tc.MINI_BLOCK_N, tc.BLOCK_K // 32],
+                        [tc.SLOT_N, tc.BLOCK_K // 32],
                         gl.uint8,
                         layout.dot_operand_scale_fragment_layout(1),
                     ),
@@ -3685,7 +3685,7 @@ def _run_frozen_pipeline(pc, ptrs, NUM_K):
         for mi in gl.static_range(layout.num_m_slots_per_block()):
             acc += (
                 gl.zeros(
-                    [tc.MINI_BLOCK_M, tc.MINI_BLOCK_N],
+                    [tc.SLOT_M, tc.SLOT_N],
                     pc.func_cfg.mma_acc_dtype,
                     layout.dot_result_fragment_layout(),
                 ),
@@ -4001,7 +4001,7 @@ _DQ_MXFP4: gl.constexpr = gl.constexpr(int(DtypeQuant.MXFP4))
 @gluon.jit
 def _n_split_offs_frozen(pid_n, i, N, func_cfg, tuning_cfg):
     """Map a whole raw-N CTA index tensor through the gate/up packing."""
-    n_slot: gl.constexpr = tuning_cfg.MINI_BLOCK_N
+    n_slot: gl.constexpr = tuning_cfg.SLOT_N
     if require_constexpr(_gu_split_frozen(func_cfg)):
         out = pid_n * n_slot + (i // n_slot) * (N // 2) + i % n_slot
     else:
@@ -4133,7 +4133,7 @@ def _epi_bias_tiles_frozen(
     bias_lds_ptr, bias_hbm_ptr, pid_n, N, func_cfg, tuning_cfg, layout
 ):
     """Block-level bias, one tensor per mini-N block, from LDS when staged there."""
-    MBN: gl.constexpr = tuning_cfg.MINI_BLOCK_N
+    MBN: gl.constexpr = tuning_cfg.SLOT_N
     NN: gl.constexpr = layout.num_n_slots_per_block()
     RFL: gl.constexpr = layout.dot_result_fragment_layout()
     out = ()
@@ -4164,7 +4164,7 @@ def _epi_gamma_tiles_frozen(
     _epilogue_one_tile_frozen off the post-swiglu ``out.type.layout``.
     """
     BM: gl.constexpr = tuning_cfg.BLOCK_M
-    MBM: gl.constexpr = tuning_cfg.MINI_BLOCK_M
+    MBM: gl.constexpr = tuning_cfg.SLOT_M
     NM: gl.constexpr = layout.num_m_slots_per_block()
     out = ()
     if require_constexpr(func_cfg.has_gammas and gamma_lds_ptr is None):
@@ -4196,8 +4196,8 @@ def _epi_stage_flush_frozen(
     """Read one staged MXFP4 mini tile back out of LDS and store it."""
     BM: gl.constexpr = tuning_cfg.BLOCK_M
     BN: gl.constexpr = tuning_cfg.BLOCK_N
-    MBM: gl.constexpr = tuning_cfg.MINI_BLOCK_M
-    MBN: gl.constexpr = tuning_cfg.MINI_BLOCK_N
+    MBM: gl.constexpr = tuning_cfg.SLOT_M
+    MBN: gl.constexpr = tuning_cfg.SLOT_N
     ARN: gl.constexpr = _activation_reduction_n_frozen(func_cfg)
     OUT_MBN: gl.constexpr = layout.output_n_slot()
     P_COLS: gl.constexpr = layout.quant_payload_shape(MBM, OUT_MBN)[1]
@@ -4314,7 +4314,7 @@ def _epilogue_one_tile_frozen(
     buffer.
     """
     BM: gl.constexpr = tuning_cfg.BLOCK_M
-    MBM: gl.constexpr = tuning_cfg.MINI_BLOCK_M
+    MBM: gl.constexpr = tuning_cfg.SLOT_M
     ARN: gl.constexpr = _activation_reduction_n_frozen(func_cfg)
     OUT_MBN: gl.constexpr = layout.output_n_slot()
     P_COLS: gl.constexpr = layout.quant_payload_shape(MBM, OUT_MBN)[1]
@@ -4523,7 +4523,7 @@ def _epilogue_store_frozen(
     ``acc`` arrives already split into one tensor per mini tile, so the epilogue walks
     the same tiling and consumes them one at a time.
     """
-    MBM: gl.constexpr = tuning_cfg.MINI_BLOCK_M
+    MBM: gl.constexpr = tuning_cfg.SLOT_M
     OUT_MBN: gl.constexpr = layout.output_n_slot()
 
     NN: gl.constexpr = layout.num_n_slots_per_block()
@@ -5000,44 +5000,44 @@ def _validate_frozen_layout(tc, layout, N, K):
         nonk, sk = layout.scale_mini_block_nonk(idx), layout.scale_mini_block_k(idx)
         mini = layout.scale_nonk(idx)
         assert block >= nonk >= mini, (
-            f"BLOCK_{axis} >= SCALE_MINI_BLOCK_{axis} >= MINI_BLOCK_{axis} is required"
+            f"BLOCK_{axis} >= SCALE_SLOT_{axis} >= SLOT_{axis} is required"
         )
         assert block % nonk == 0 and nonk % mini == 0, (
-            f"SCALE_MINI_BLOCK_{axis} must divide BLOCK_{axis} and be a multiple of MINI_BLOCK_{axis}"
+            f"SCALE_SLOT_{axis} must divide BLOCK_{axis} and be a multiple of SLOT_{axis}"
         )
         assert nonk % 32 == 0, (
-            f"SCALE_MINI_BLOCK_{axis} must contain whole 32-row stripes"
+            f"SCALE_SLOT_{axis} must contain whole 32-row stripes"
         )
         assert sk >= max(256, BK), (
-            "SCALE_MINI_BLOCK_K must be at least 256 and at least BLOCK_K"
+            "SCALE_SLOT_K must be at least 256 and at least BLOCK_K"
         )
         assert sk & (sk - 1) == 0 and sk % BK == 0, (
-            "SCALE_MINI_BLOCK_K must be a power of two and a multiple of BLOCK_K"
+            "SCALE_SLOT_K must be a power of two and a multiple of BLOCK_K"
         )
-        assert K % sk == 0, "K must contain complete SCALE_MINI_BLOCK_K tiles"
+        assert K % sk == 0, "K must contain complete SCALE_SLOT_K tiles"
         if _v(tc.FROZEN_STEP):
             assert BK == 256 and sk == BK and layout.scale_ratio_non_k_slot(idx) == 1, (
                 "FROZEN_STEP shuffled scales require BLOCK_K == "
-                "SCALE_MINI_BLOCK_K == 256 and one scale tile per payload slot; "
+                "SCALE_SLOT_K == 256 and one scale tile per payload slot; "
                 "use the live pipeline for independent scale mini blocks"
             )
 
     # -- the slot is the unit of LDS allocation, of the global->LDS copy, of the
     #    MFMA and of the accumulator, so it must align to the CTA block --
-    assert BM % _v(tc.MINI_BLOCK_M) == 0
-    assert BN % _v(tc.MINI_BLOCK_N) == 0
+    assert BM % _v(tc.SLOT_M) == 0
+    assert BN % _v(tc.SLOT_N) == 0
     assert _fill_slots_valid_frozen(tc, layout), (
         f"fill ownership is not a valid mapping for num_m_slots_per_block "
         f"{layout.num_m_slots_per_block()} x num_n_slots_per_block "
-        f"{layout.num_n_slots_per_block()} (MINI_BLOCK_M {_v(tc.MINI_BLOCK_M)} vs "
-        f"BLOCK_M {BM}, MINI_BLOCK_N {_v(tc.MINI_BLOCK_N)} vs BLOCK_N {BN})"
+        f"{layout.num_n_slots_per_block()} (SLOT_M {_v(tc.SLOT_M)} vs "
+        f"BLOCK_M {BM}, SLOT_N {_v(tc.SLOT_N)} vs BLOCK_N {BN})"
     )
-    assert _v(tc.MINI_BLOCK_M) % (instr[0] * warps[0] * tiles[0]) == 0, (
-        f"MINI_BLOCK_M {_v(tc.MINI_BLOCK_M)} must be a multiple of "
+    assert _v(tc.SLOT_M) % (instr[0] * warps[0] * tiles[0]) == 0, (
+        f"SLOT_M {_v(tc.SLOT_M)} must be a multiple of "
         f"instr[0]*warps[0]*tiles[0] = {instr[0] * warps[0] * tiles[0]}"
     )
-    assert _v(tc.MINI_BLOCK_N) % (instr[1] * warps[1] * tiles[1]) == 0, (
-        f"MINI_BLOCK_N {_v(tc.MINI_BLOCK_N)} must be a multiple of "
+    assert _v(tc.SLOT_N) % (instr[1] * warps[1] * tiles[1]) == 0, (
+        f"SLOT_N {_v(tc.SLOT_N)} must be a multiple of "
         f"instr[1]*warps[1]*tiles[1] = {instr[1] * warps[1] * tiles[1]}"
     )
 
@@ -5056,9 +5056,9 @@ def _validate_frozen_layout(tc, layout, N, K):
         # The 16-column-blocked global offsets only stay inside the N slot while
         # every extent is a whole number of 16-column, 16-byte blocks.
         pk_b = BK // _pack_divisor_frozen(fc, 1)
-        assert BN % 16 == 0 and _v(tc.MINI_BLOCK_N) % 16 == 0, (
-            f"B_PRESHUFFLED needs BLOCK_N ({BN}) and MINI_BLOCK_N "
-            f"({_v(tc.MINI_BLOCK_N)}) to be multiples of the 16-column block"
+        assert BN % 16 == 0 and _v(tc.SLOT_N) % 16 == 0, (
+            f"B_PRESHUFFLED needs BLOCK_N ({BN}) and SLOT_N "
+            f"({_v(tc.SLOT_N)}) to be multiples of the 16-column block"
         )
         assert pk_b % 16 == 0, (
             f"B_PRESHUFFLED needs BLOCK_K/pack ({pk_b}) to be a multiple of the "
@@ -5067,14 +5067,14 @@ def _validate_frozen_layout(tc, layout, N, K):
 
     # -- gate/up split: an N slot must be exactly one operand side --
     if _gu_split_frozen(fc):
-        MBN = _v(tc.MINI_BLOCK_N)
+        MBN = _v(tc.SLOT_N)
         assert layout.num_n_slots_per_block() == 2 and MBN * 2 == BN, (
             f"gate_up_split needs exactly two N slots, one per side: got "
-            f"BLOCK_N {BN} / MINI_BLOCK_N {MBN} = {layout.num_n_slots_per_block()}"
+            f"BLOCK_N {BN} / SLOT_N {MBN} = {layout.num_n_slots_per_block()}"
         )
         assert N % 2 == 0 and (N // 2) % MBN == 0, (
             f"gate_up_split needs each half of N ({N}) to be a whole number of "
-            f"MINI_BLOCK_N ({MBN}) tiles"
+            f"SLOT_N ({MBN}) tiles"
         )
         # A warp's emitted N extent has to contain a whole MX group, or the fused
         # quant's amax crosses the warp boundary.
@@ -5096,7 +5096,7 @@ def _validate_frozen_layout(tc, layout, N, K):
             f"BLOCK_N {BN} must be a multiple of {MX_GROUP_INT * arn} in raw "
             f"(pre-halving) terms so every MX group is tile-local"
         )
-        assert _v(tc.MINI_BLOCK_N) % (MX_GROUP_INT * arn) == 0
+        assert _v(tc.SLOT_N) % (MX_GROUP_INT * arn) == 0
 
     return True
 

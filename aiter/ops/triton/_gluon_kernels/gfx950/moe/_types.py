@@ -199,8 +199,8 @@ class TuningSpec(NamedTuple):
     #: Requested unroll factor. The effective factor is its LCM with every active
     #: LDS/register ring period and shuffled-scale K cadence.
     K_UNROLL: int
-    MINI_BLOCK_M: int
-    MINI_BLOCK_N: int
+    SLOT_M: int
+    SLOT_N: int
     NUM_LDS_BUFFER: int
     mfma_instr_shape: tuple
     warps_per_cta: tuple
@@ -247,7 +247,7 @@ class TuningSpec(NamedTuple):
     FROZEN_STEP: bool = False
     #: Advance HBM pointers per unrolled body and address its steps through soffset.
     SOFF_UNROLL: bool = False
-    #: At a 2x2 mini-tile split, fill scales in the two middle slots.
+    #: At a 2x2 slot split, fill scales in the two middle slots.
     SCALE_FILL_MID: bool = False
     #: Allow B's payload through LDS. False forces preshuffled B directly into
     #: registers at its global-load slot. Either payload may also resolve to registers
@@ -264,14 +264,15 @@ class TuningSpec(NamedTuple):
     B_NUM_BUFFER: int = 0
     A_SCALE_NUM_BUFFER: int = 0
     B_SCALE_NUM_BUFFER: int = 0
-    #: Independent shuffled-scale load extents. Zero follows the payload slot
-    #: extent, with K at least 256 logical elements (eight stored scale bytes).
-    #: A configured K extent must be a power-of-two multiple of BLOCK_K that divides
-    #: total K, so one physical scale load covers complete payload K steps.
+    #: Scale slot extents (agents/CONCEPTS.md): the shuffled-scale load extents,
+    #: independent of the payload slot. Zero follows the payload slot extent, with K
+    #: at least 256 logical elements (eight stored scale bytes). A configured K extent
+    #: must be a power-of-two multiple of BLOCK_K that divides total K, so one
+    #: physical scale load covers complete payload K steps.
     #: These fields are ignored for operands whose scales are not shuffled.
-    SCALE_MINI_BLOCK_M: int = 0
-    SCALE_MINI_BLOCK_N: int = 0
-    SCALE_MINI_BLOCK_K: int = 0
+    SCALE_SLOT_M: int = 0
+    SCALE_SLOT_N: int = 0
+    SCALE_SLOT_K: int = 0
     #: Statically expand the finite main-loop remainder after complete unrolled bodies.
     UNROLL_EPILOGUE: bool = True
 

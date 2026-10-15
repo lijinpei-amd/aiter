@@ -84,7 +84,7 @@ The last line must be `### verdict: PASS`.
 |---|---|---|
 | T0 | `scripts/gluon_moe_sched_dump.py`: schedule tables of 35 configs, CPU only, about 16 s | byte-identical |
 | T0b | `tests/layout_fields.py`: all 70 `KernelLayout` fields of 224 tuning configs, CPU only, about 9 s beside T0 | byte-identical |
-| T1 | Symbolic emitter and config tests: `buffered_schedule`, `wait_commit`, `config`, `scale_miniblocks`, about 1.5 min | all pass (855 since the `Schedule` refactor, which removed two memo tests; 857 at commit `1b24ca9db`) |
+| T1 | Symbolic emitter and config tests: `buffered_schedule`, `wait_commit`, `config`, `scale_slots`, about 1.5 min | all pass (869 since the slot rename, which added 14 legacy-name tests; 855 after the `Schedule` refactor, which removed two memo tests; 857 at commit `1b24ca9db`) |
 | T2a | `test_moe_gemm_gluon_frozen.py`, about 1 min cold, 10 s warm | all pass (18) |
 | T2b | Two tuned gemm1 builds (`tests/gemm1_check.py --correctness --quick`), about 1.5 min | build identity SAME |
 | T2c | Bit-identical output over 5 runs, both epilogues (part of T2b's run) | sha `59d442f663991659` (bf16) and `0cfa77fb04450594` (mxfp4-out) |
@@ -109,10 +109,11 @@ Notes:
   or warm. So do T2b's five builds; its probes reuse caches in `$OUT/tmp`.
 - T0b's baseline is `$OUT/layout_fields_baseline.txt` when recorded, otherwise
   `tests/reference/gate/layout_fields_baseline.txt`, re-recorded when the
-  whole-build `KernelLayout` values became public fields (names changed, values did
-  not) (T0's `sched_baseline.txt` was re-recorded by the `Schedule` refactor, which
-  changed the dump to one block per emitted step; the other gate references are
-  from `1d3431e50`). T0b differs by design when a
+  whole-build `KernelLayout` values became public fields and again by the slot
+  rename (both times names changed, values did not) (T0's `sched_baseline.txt` was
+  re-recorded by the `Schedule` refactor, which changed the dump to one block per
+  emitted step; the other gate references are from `1d3431e50`). T0b differs by
+  design when a
   change renames, adds or removes a `KernelLayout` field, or adds a sched-dump case
   (`layout_fields.py` imports that case list, so T0 differs too). Check that the diff
   shows only that, then accept it with `tests/gate.sh baseline --fast` on the changed
@@ -182,8 +183,10 @@ cannot pass.
 
 - **Pass criterion:** `compare_suite.py` prints `SUITE PASS`, meaning no test that
   passes on the base fails or errors after the change.
-- **Expected numbers:** 1848 passed / 20 failed / 22 skipped since the `Schedule`
-  refactor. Before it: 1812 / 58 / 22 at commit `1b24ca9db` (1811 / 58 / 22 at
+- **Expected numbers:** 1862 passed / 20 failed / 22 skipped since the slot rename,
+  which added 14 tests and renamed `scale_miniblocks` to `scale_slots` and its
+  `mini_block` tests to `slot`. Against an older base, rename those IDs in a copy
+  of the base logs first. 1848 / 20 / 22 after the `Schedule` refactor. Before it: 1812 / 58 / 22 at commit `1b24ca9db` (1811 / 58 / 22 at
   `1d3431e50`, before one more test was added). The refactor fixed the 38
   `buffered_schedule` failures, whose oracle checked each wait when the old model
   computed it rather than when the wait issued, and removed two tests of the deleted
@@ -272,7 +275,7 @@ Otherwise record a fresh baseline.
 
 | Check | Reference | Result |
 |---|---|---|
-| Gate | `reference/gate/{sched,build_id,asm}_baseline.txt`, used automatically by `gate.sh` when `$OUT` has none. `layout_fields_baseline.txt` (T0b) was recorded later, at `1b24ca9db`, and re-recorded when the `KernelLayout` fields went public; `sched_baseline.txt` (T0) by the `Schedule` refactor | verdict PASS. T1 856 passed, T2a 18 passed, determinism shas `59d442f663991659` / `0cfa77fb04450594` 5/5 |
+| Gate | `reference/gate/{sched,build_id,asm}_baseline.txt`, used automatically by `gate.sh` when `$OUT` has none. `layout_fields_baseline.txt` (T0b) was recorded later, at `1b24ca9db`, and re-recorded when the `KernelLayout` fields went public and by the slot rename; `sched_baseline.txt` (T0) by the `Schedule` refactor | verdict PASS. T1 856 passed, T2a 18 passed, determinism shas `59d442f663991659` / `0cfa77fb04450594` 5/5 |
 | Suite | `reference/suite_1d3431e50/*.txt`, the FAILED lines and summary per file | 1811 passed / 58 failed / 22 skipped. Compare with `compare_suite.py tests/reference/suite_1d3431e50 <label>`. A test was added by `1b24ca9db`, so against that tree or later it reports `SUITE FAIL` on the pass count; run the base suite instead |
 | Cold bench | `reference/cold_1d3431e50_phys5/`, `summary.json` and `report.md`. `summary.json` is the run as recorded, with the pre-`dcef897ca` knob names (`B_IN_REG`, ...); `summary_allow_via_lds.json` is the same run with them renamed to `ALLOW_*_VIA_LDS` and inverted | physical GPU 5 (BDF `0000:96:00.0`), `--tolerant`, 160/160 processes, 0 failures. Compare with `compare_cold.py tests/reference/cold_1d3431e50_phys5 <label>`, on physical GPU 5 only |
 
@@ -313,11 +316,11 @@ Copied, not moved; the originals are untouched. Edits are limited to paths
 
 | In `tests/` | Origin | Changes |
 |---|---|---|
-| `harness/run_bench.py`, `worker.py`, `bench_common.py`, `case_config.py`, `fly_build.py`, `cases.json`, `base_cases.json` | `bench_out/gluon_flydsl_final_20260924/` | Runs, cache and lock go to `$HARNESS_OUT`. `cases.json` points at the local `base_cases.json`. The hashed-source list names the vendored files. `libtriton.so` is located through the imported `triton` package. |
+| `harness/run_bench.py`, `worker.py`, `bench_common.py`, `case_config.py`, `fly_build.py`, `cases.json`, `base_cases.json` | `bench_out/gluon_flydsl_final_20260924/` | Runs, cache and lock go to `$HARNESS_OUT`. `cases.json` points at the local `base_cases.json`. Its Gluon configs use the slot key names (`SLOT_*`, `SCALE_SLOT_*`) and drop the removed `MINI_BLOCK_K`; the host still accepts the old names. The hashed-source list names the vendored files. `libtriton.so` is located through the imported `triton` package. |
 | `harness/bench_utils.py` | `bench_out/gluon_scale_ptr_unify_20260907/a4/bench_utils.py` | Only the functions the harness calls. `PY` is the running interpreter, the llc comes from `TRITON_HIP_DS_AGPR_LLC`, and the inert `CLAUDE_JOB_DIR` is no longer set. |
 | `harness/legacy_a4_common.py`, `harness/legacy_fly_build.py` | `bench_out/gluon_flydsl_small_tokens_20260908/{bench_common,fly_build}.py` | Renamed. Lint-only edits. |
 | `harness/legacy_dense_common.py` | `bench_out/gluon_flydsl_a8a16_20260907/bench_common.py` | Renamed. Lint-only edits. |
-| `asm_hash/asm_hash.py`, `asm_hash/cells.json` | `scripts/gluon_moe_asm_hash.py`; cells resolved from `bench_out/gluon_flydsl_dtype_tokens_20260909/cases.json` | Reads the frozen cells. Shares `harness/bench_common.py`: the 0909 and final harnesses had byte-identical copies. Compiles the cells concurrently (`-j`, `ASM_HASH_JOBS`). |
+| `asm_hash/asm_hash.py`, `asm_hash/cells.json` | `scripts/gluon_moe_asm_hash.py`; cells resolved from `bench_out/gluon_flydsl_dtype_tokens_20260909/cases.json` | Reads the frozen cells. The cells use the slot key names and drop the removed `MINI_BLOCK_K`; values are unchanged. Shares `harness/bench_common.py`: the 0909 and final harnesses had byte-identical copies. Compiles the cells concurrently (`-j`, `ASM_HASH_JOBS`). |
 | `layout_fields.py` | throwaway `dump_layout_fields.py` of the `KernelLayout`-constructor refactor, outside the repo | Paths from `__file__`; refuses to run when `aiter` resolves outside its checkout; clears `AITER_TRITON_MOE_GLUON_*`. The op_tests config builders are copied as literals; the case list is imported from `scripts/gluon_moe_sched_dump.py`. |
 | `gemm1_check.py` | `scripts/gluon_moe_gemm1_check.py` | Correctness path only. The perf path needed `~/moe_rerun/cold_bench.py`. Takes `--job` instead of `CLAUDE_JOB_DIR`. |
 | `probes/ref_probe.py`, `corr_probe.py`, `corr_probe_q.py` | `~/moe_rerun/` | Repo path from `__file__`. Lint-only edits. |

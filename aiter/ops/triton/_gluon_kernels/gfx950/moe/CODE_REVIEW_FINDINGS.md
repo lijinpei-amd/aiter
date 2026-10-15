@@ -164,7 +164,7 @@ sanitize the flag and shape.
 - `_layout.py:1338-1344` provides `make_scale_swizzle_check`, but nothing in this
   directory calls it, and that helper checks only a lower K bound.
 
-**Impact:** `MINI_BLOCK_N < 32` creates a zero-height allocation, nonmultiples of 32
+**Impact:** `SLOT_N < 32` creates a zero-height allocation, nonmultiples of 32
 truncate rows, and `BLOCK_K > 256` can underallocate or copy only part of a stage.
 
 **Suggested fix:** validate B shuffled scales in `validate_layout`: positive non-K

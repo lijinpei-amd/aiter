@@ -55,7 +55,7 @@ CNAME = {c: n for c, n in zip(COMPONENTS, ("A_PAY", "A_SCL", "B_PAY", "B_SCL"))}
 #: only configuration whose perf is recorded. Every case below is a delta from it.
 BASE = dict(
     BLOCK_M=128, BLOCK_N=256, BLOCK_K=256, K_UNROLL=3,
-    MINI_BLOCK_M=64, MINI_BLOCK_N=128, NUM_LDS_BUFFER=3,
+    SLOT_M=64, SLOT_N=128, NUM_LDS_BUFFER=3,
     mfma_instr_shape=(16, 16, 128), warps_per_cta=(1, 4), tiles_per_warp=(2, 2),
     k_width=None, transposed=True, WAVES_PER_EU=0, TILE_SCHED=2, GROUP_M=4, NUM_XCDS=8,
     token_cache_modifier="", token_scale_cache_modifier="",
@@ -63,7 +63,7 @@ BASE = dict(
     result_cache_modifier="", result_scale_cache_modifier="",
     WARP_PIPELINE=1, VGPR_PREFETCH_K=256,
     A_SCALE_SORTED_SHUFFLED=True, B_SCALE_SHUFFLED=True, B_PRESHUFFLED=False,
-    SCALE_MINI_BLOCK_M=128, SCALE_FILL_MID=True,
+    SCALE_SLOT_M=128, SCALE_FILL_MID=True,
     WAIT_COMMIT_SCHEME=int(WaitCommitScheme.PER_OP),
 )
 
@@ -84,8 +84,8 @@ def _case(name, dq_a, dq_b, K=K_DEFAULT, **over):
 def _production_cases():
     """Every shape the dispatcher actually selects, split to the finest legal geometry.
 
-    MINI_BLOCK is pinned to the warp granularity `instr * warps * tiles`, the smallest
-    value `validate()` accepts, i.e. the most slots this tile can be cut into. Where
+    The slot extent is pinned to the warp granularity `instr * warps * tiles`, the
+    smallest value `validate()` accepts, i.e. the most slots this tile can be cut into. Where
     that still leaves NM == 1 or NN == 1 the case reports REJECTED: those are the
     shapes the fill schedule cannot express today, and the entry is here so the
     diff shows them becoming expressible.
@@ -99,8 +99,8 @@ def _production_cases():
                 block_m, N_DEFAULT, K_DEFAULT, dq_a, dq_b, False, True,
                 stream_expert_payload=seb))
             i, w, t = cfg["mfma_instr_shape"], cfg["warps_per_cta"], cfg["tiles_per_warp"]
-            cfg["MINI_BLOCK_M"] = i[0] * w[0] * t[0]
-            cfg["MINI_BLOCK_N"] = i[1] * w[1] * t[1]
+            cfg["SLOT_M"] = i[0] * w[0] * t[0]
+            cfg["SLOT_N"] = i[1] * w[1] * t[1]
             out.append((f"prod-{label}-t{tokens}", cfg, dq_a, dq_b, K_DEFAULT))
     return out
 
@@ -116,9 +116,9 @@ def cases():
     out.append(_case("tuned-mxfp4-fillmid0", DQ.MXFP4, DQ.MXFP4, SCALE_FILL_MID=False))
     # 3. scale K-step ratio R > 1 (one scale load covers several payload stages)
     out.append(_case("mxfp4-bk128-sk256-R2", DQ.MXFP4, DQ.MXFP4, BLOCK_K=128,
-                     VGPR_PREFETCH_K=128, SCALE_MINI_BLOCK_K=256, K_UNROLL=1))
+                     VGPR_PREFETCH_K=128, SCALE_SLOT_K=256, K_UNROLL=1))
     out.append(_case("mxfp4-bk128-sk512-R4", DQ.MXFP4, DQ.MXFP4, BLOCK_K=128,
-                     VGPR_PREFETCH_K=128, SCALE_MINI_BLOCK_K=512, K_UNROLL=1))
+                     VGPR_PREFETCH_K=128, SCALE_SLOT_K=512, K_UNROLL=1))
     # 4. direct-register placement, per component and at the D=2 same-step boundary
     out.append(_case("breg", DQ.MXFP4, DQ.MXFP4, ALLOW_B_VIA_LDS=False,
                      B_PRESHUFFLED=True))
@@ -132,7 +132,7 @@ def cases():
                      A_NUM_BUFFER=2, B_NUM_BUFFER=3, A_SCALE_NUM_BUFFER=3,
                      B_SCALE_NUM_BUFFER=2))
     # 6. slot geometry: the 2x2 reference order, and a rectangle
-    out.append(_case("slots-4x2", DQ.MXFP4, DQ.MXFP4, MINI_BLOCK_M=32))
+    out.append(_case("slots-4x2", DQ.MXFP4, DQ.MXFP4, SLOT_M=32))
     # 7. read placement in the MFMA region rather than the memory region
     out.append(_case("ds-read-mfma", DQ.MXFP4, DQ.MXFP4,
                      DS_READ_A_PAYLOAD_IN_MFMA=True, DS_READ_A_SCALE_IN_MFMA=True,

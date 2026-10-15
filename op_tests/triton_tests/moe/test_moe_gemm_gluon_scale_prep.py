@@ -53,7 +53,7 @@ def _spec(**overrides):
 def _config(block_k=128):
     config = dict(_spec()[4], BLOCK_K=block_k, VGPR_PREFETCH_K=block_k)
     if block_k == 256:
-        config.update(BLOCK_N=128, MINI_BLOCK_N=64, NUM_LDS_BUFFER=2,
+        config.update(BLOCK_N=128, SLOT_N=64, NUM_LDS_BUFFER=2,
                       warps_per_cta=(2, 2))
     return config
 
@@ -63,7 +63,7 @@ def test_mxfp8_gemm1_default_uses_paired_k128_scales(split):
     spec = _spec(gate_up_split=split)
     cfg = spec[4]
     assert tuple(cfg[name] for name in (
-        "BLOCK_M", "BLOCK_N", "BLOCK_K", "MINI_BLOCK_M", "MINI_BLOCK_N",
+        "BLOCK_M", "BLOCK_N", "BLOCK_K", "SLOT_M", "SLOT_N",
         "NUM_LDS_BUFFER", "K_UNROLL", "VGPR_PREFETCH_K",
     )) == (128, 256, 128, 64, 128, 3, 6, 128)
     assert cfg["mfma_instr_shape"] == (16, 16, 128)
@@ -155,7 +155,7 @@ def test_incompatible_k128_geometry_refuses_scale_preparation(field, value):
 )
 def test_scale_shuffle_requires_valid_scale_k(block_k, scale_k, expected):
     cfg = _config(block_k)
-    cfg["SCALE_MINI_BLOCK_K"] = scale_k
+    cfg["SCALE_SLOT_K"] = scale_k
     assert host._scale_shuffle_supported(cfg, 0) is expected
     assert host._scale_shuffle_supported(cfg, 1) is expected
 
