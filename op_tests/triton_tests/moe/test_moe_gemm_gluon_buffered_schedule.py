@@ -121,7 +121,7 @@ class _Config(_ScheduleConfig):
     def scale_read_k_slots(self, operand):
         return self.num_k_slots * self.scale_slot_ratio_k(operand)
 
-    def scale_cache_fragments(self, operand):
+    def scale_fragments_per_buffer(self, operand):
         return self.num_lds_slots_non_k(operand) * self.scale_read_k_slots(operand)
 
     def operand_elem_ty(self, operand):
@@ -507,7 +507,7 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
                 * (
                     tc.depths[component]
                     * (
-                        tc.scale_cache_fragments(component[0])
+                        tc.scale_fragments_per_buffer(component[0])
                         if component[1]
                         else (tc.nm if component[0] == A else tc.nn) * tc.num_k_slots
                     )
