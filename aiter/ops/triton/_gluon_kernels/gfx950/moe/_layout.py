@@ -294,31 +294,31 @@ class KernelLayout:
         storage_dtype = tuple(fc.operand_elem_ty(idx) for idx in ops)
         storage_bits = tuple(ty.primitive_bitwidth for ty in storage_dtype)
         has_scale = tuple(fc.has_scale(idx) for idx in ops)
-        shuffled = tuple(tc.scale_shuffled(idx) for idx in ops)
-        preshuffled = tuple(tc.operand_preshuffled(idx) for idx in ops)
+        scale_preshuffled = tuple(tc.scale_shuffled(idx) for idx in ops)
+        payload_preshuffled = tuple(tc.operand_preshuffled(idx) for idx in ops)
 
         slot_nonk = (SLOT_M, SLOT_N)
         scale_stage_k = max(256, BK)
         scale_slot_nonk = (
-            (tc.SCALE_SLOT_M.value or SLOT_M) if shuffled[0] else SLOT_M,
-            (tc.SCALE_SLOT_N.value or SLOT_N) if shuffled[1] else SLOT_N,
+            (tc.SCALE_SLOT_M.value or SLOT_M) if scale_preshuffled[0] else SLOT_M,
+            (tc.SCALE_SLOT_N.value or SLOT_N) if scale_preshuffled[1] else SLOT_N,
         )
         scale_slot_k = tuple(
-            (tc.SCALE_SLOT_K.value or scale_stage_k) if shuffled[idx] else BK
+            (tc.SCALE_SLOT_K.value or scale_stage_k) if scale_preshuffled[idx] else BK
             for idx in ops
         )
 
-        ok = not (
+        geometry_ok = not (
             BK % instr[2] or BK % MX_GROUP or BM % SLOT_M or BN % SLOT_N
         ) and not (
             SLOT_M % (instr[0] * warps[0] * tiles_per_warp[0])
             or SLOT_N % (instr[1] * warps[1] * tiles_per_warp[1])
         )
         for idx in ops:
-            if ok and shuffled[idx]:
+            if geometry_ok and scale_preshuffled[idx]:
                 tile, nonk = (BM, BN)[idx], scale_slot_nonk[idx]
                 sk = scale_slot_k[idx]
-                ok = (
+                geometry_ok = (
                     tile >= nonk >= slot_nonk[idx]
                     and not (tile % nonk or nonk % slot_nonk[idx] or nonk % 32)
                     and not (sk < scale_stage_k or sk & (sk - 1) or sk % BK)
@@ -358,9 +358,9 @@ class KernelLayout:
         )
         payload_hbm_step = tuple(
             step // 16 * 256 if pre else step
-            for step, pre in zip(payload_block_k_storage, preshuffled)
+            for step, pre in zip(payload_block_k_storage, payload_preshuffled)
         )
-        lds_unit_rows = tuple(16 if pre else 32 for pre in preshuffled)
+        lds_unit_rows = tuple(16 if pre else 32 for pre in payload_preshuffled)
         payload_byte_unit_lds_ok = []
         for idx in ops:
             rows = payload_shape_slot[idx][idx]
@@ -369,7 +369,7 @@ class KernelLayout:
             payload_byte_unit_lds_ok.append(
                 is_16x16x128
                 and storage_bits[idx] == 8
-                and bool(preshuffled[idx] or tiles_per_warp[idx] >= 2)
+                and bool(payload_preshuffled[idx] or tiles_per_warp[idx] >= 2)
                 and rows % lds_unit_rows[idx] == 0
                 and k_storage % unit_k == 0
             )
@@ -391,7 +391,7 @@ class KernelLayout:
                     ),
                     bool(tc.allow_component_via_lds((idx, True)))
                     and (
-                        bool(shuffled[idx])
+                        bool(scale_preshuffled[idx])
                         or (
                             scale[0] * scale[1] >= WARP_SIZE * 4
                             and scale[1] % 4 == 0
@@ -411,7 +411,7 @@ class KernelLayout:
         payload_lds_layout = [None, None]
         dot_operand_buffer_load_lds_layout = [None, None]
         payload_hbm_offset_layout = (None, None)
-        if ok:
+        if geometry_ok:
             assert (
                 tc.transposed.value
             ), "transposed=True is pinned, see the module docstring"
@@ -440,7 +440,7 @@ class KernelLayout:
                         idx,
                         storage_bits[idx],
                         lds_unit_rows[idx],
-                        preshuffled[idx],
+                        payload_preshuffled[idx],
                     )
                 else:
                     layout = gl.amd.cdna4.compute_efficient_padded_shared_layout(
@@ -499,7 +499,7 @@ class KernelLayout:
         for idx in ops:
             if not scale_slots_ok[idx]:
                 scale_shape_tile.append(None)
-            elif shuffled[idx]:
+            elif scale_preshuffled[idx]:
                 scale_shape_tile.append(
                     [tc.num_buffers(idx, True) * scale_num_slots[idx]]
                     + scale_lds_shape_scale_slot[idx]
@@ -522,7 +522,7 @@ class KernelLayout:
         dot_operand_scale_buffer_load_lds_layout = [None, None]
         scale_lds_view_layout_scale_slot = [None, None]
         for idx in ops:
-            if not (ok and has_scale[idx]):
+            if not (geometry_ok and has_scale[idx]):
                 continue
             frag = payload_fragment_layout[idx]
             scale_fragment_layout[idx] = gl.amd.cdna4.get_mfma_scale_layout(
@@ -532,7 +532,9 @@ class KernelLayout:
                 frag, scale_fragment_shape_scale_slot[idx], MX_GROUP
             )
             if scale_via_lds[idx]:
-                lanes_k = WARP_SIZE if shuffled[idx] else scale_block_k_storage // 4
+                lanes_k = (
+                    WARP_SIZE if scale_preshuffled[idx] else scale_block_k_storage // 4
+                )
                 dot_operand_scale_buffer_load_lds_layout[idx] = gl.BlockedLayout(
                     size_per_thread=[1, 4],
                     threads_per_warp=[WARP_SIZE // lanes_k, lanes_k],
@@ -556,7 +558,7 @@ class KernelLayout:
 
         scale_packed_ok = [False, False]
         for idx in ops:
-            if ok and shuffled[idx] and BK in (128, 256):
+            if geometry_ok and scale_preshuffled[idx] and BK in (128, 256):
                 regs = [list(b) for b in scale_fragment_layout[idx].reg_bases]
                 if BK == 128:
                     scale_packed_ok[idx] = len(regs) >= 1 and regs[0] == [16, 0]
@@ -587,7 +589,7 @@ class KernelLayout:
         packed_scale_lds_view_layout_scale_slot = [None, None]
         packed_scale_fragment_layout_scale_slot = [None, None]
         for idx in ops:
-            if not (ok and has_scale[idx]):
+            if not (geometry_ok and has_scale[idx]):
                 continue
             frag = gl.amd.cdna4.get_mfma_scale_layout(
                 payload_fragment_layout[idx],
@@ -639,11 +641,11 @@ class KernelLayout:
 
         scale_hbm_offset_layout = [None, None]
         for idx in ops:
-            if not (ok and has_scale[idx]):
+            if not (geometry_ok and has_scale[idx]):
                 continue
             if scale_via_lds[idx]:
                 layout = dot_operand_scale_buffer_load_lds_layout[idx]
-            elif not shuffled[idx]:
+            elif not scale_preshuffled[idx]:
                 layout = scale_fragment_layout[idx]
             elif scale_packed_ok[idx]:
                 layout = packed_scale_fragment_layout_scale_slot[idx]
