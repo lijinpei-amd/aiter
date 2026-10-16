@@ -138,7 +138,7 @@ class LDSManager:
         if require_constexpr(layout.component_via_lds(_A_PAYLOAD)):
             a_payload_lds_ptr = gl.allocate_shared_memory(
                 a_ty,
-                layout.lds_shape_tile(0, False),
+                layout.shape_tile(0, False),
                 layout=layout.lds_layout(0, False),
             )
         else:
@@ -146,7 +146,7 @@ class LDSManager:
         if require_constexpr(layout.component_via_lds(_B_PAYLOAD)):
             b_payload_lds_ptr = gl.allocate_shared_memory(
                 b_ty,
-                layout.lds_shape_tile(1, False),
+                layout.shape_tile(1, False),
                 layout=layout.lds_layout(1, False),
             )
         else:
@@ -156,7 +156,7 @@ class LDSManager:
         ):
             a_scale_lds_ptr = gl.allocate_shared_memory(
                 gl.uint8,
-                layout.lds_shape_tile(0, True),
+                layout.shape_tile(0, True),
                 layout=layout.lds_layout(0, True),
             )
         else:
@@ -166,7 +166,7 @@ class LDSManager:
         ):
             b_scale_lds_ptr = gl.allocate_shared_memory(
                 gl.uint8,
-                layout.lds_shape_tile(1, True),
+                layout.shape_tile(1, True),
                 layout=layout.lds_layout(1, True),
             )
         else:

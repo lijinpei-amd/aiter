@@ -407,7 +407,8 @@ class KernelLayout:
     # fragments in registers. Its shapes and layouts spell out what, where and how much:
     # `scale_<fragment|lds_view>_<layout|shape>_<slot|scale_slot>`.
     # - `fragment`: registers. `lds_view`: the LDS view a `ds_read` reads from. The two
-    #   share a shape, named after the fragment; `lds_shape` is the allocation's.
+    #   share a shape, named after the fragment; `lds_shape` is the allocation's. The
+    #   tile exists only in LDS, so its shape is plain `shape_tile`.
     # - `slot`: one MFMA step's operand, one non-K slot by one step (packed: by K256,
     #   a dword's K extent). `scale_slot`: what one copy lands, spanning
     #   `scale_slot_ratio_non_k` non-K slots and `scale_slot_k / BLOCK_K` steps.
@@ -419,7 +420,7 @@ class KernelLayout:
     # allocation stays u8. The slot fragment is the shared
     # `fragment_layout(idx, True)`. LDS is never read a slot at a time, so
     # no `lds_view` is per slot.
-    _scale_lds_shape_tile: gl.constexpr
+    _scale_shape_tile: gl.constexpr
     _scale_lds_shape_scale_slot: gl.constexpr
     _scale_lds_shape_slot: gl.constexpr
     _scale_fragment_shape_scale_slot: gl.constexpr
@@ -805,21 +806,21 @@ class KernelLayout:
         )
         # Staged representation: a shuffled scale fills one flat run per scale slot, a
         # raw one one [slot non-K, BLOCK_K/32] tile per slot.
-        scale_lds_shape_tile = []
+        scale_shape_tile = []
         for idx in ops:
             if not scale_slots_ok[idx]:
-                scale_lds_shape_tile.append(None)
+                scale_shape_tile.append(None)
             elif shuffled[idx]:
-                scale_lds_shape_tile.append(
+                scale_shape_tile.append(
                     [tc.num_buffers(idx, True) * scale_num_slots[idx]]
                     + scale_lds_shape_scale_slot[idx]
                 )
             else:
-                scale_lds_shape_tile.append(
+                scale_shape_tile.append(
                     [tc.num_buffers(idx, True) * num_lds_slots_non_k[idx]]
                     + scale_lds_shape_slot[idx]
                 )
-        scale_lds_shape_tile = tuple(scale_lds_shape_tile)
+        scale_shape_tile = tuple(scale_shape_tile)
         scale_fragment_shape_scale_slot = tuple(
             [scale_slot_nonk[idx], scale_slot_k[idx] // MX_GROUP] for idx in ops
         )
@@ -1099,7 +1100,7 @@ class KernelLayout:
                     tile = payload_shape_tile[idx]
                     lds_bytes += tile[0] * tile[1] * tile[2] * (storage_bits[idx] // 8)
                 if scale_via_lds[idx]:
-                    tile = scale_lds_shape_tile[idx]
+                    tile = scale_shape_tile[idx]
                     lds_bytes += tile[0] * tile[1] * tile[2]
         acc_vgprs_per_lane = BM * BN // threads
 
@@ -1143,7 +1144,7 @@ class KernelLayout:
         self._scale_packed_ok = gl.constexpr(scale_packed_ok)
         self._scale_packed_sel = gl.constexpr(scale_packed_sel)
         self.any_scale_packed = gl.constexpr(any_scale_packed)
-        self._scale_lds_shape_tile = gl.constexpr(scale_lds_shape_tile)
+        self._scale_shape_tile = gl.constexpr(scale_shape_tile)
         self._scale_lds_shape_scale_slot = gl.constexpr(scale_lds_shape_scale_slot)
         self._scale_lds_shape_slot = gl.constexpr(scale_lds_shape_slot)
         self._scale_fragment_shape_scale_slot = gl.constexpr(
@@ -1240,13 +1241,13 @@ class KernelLayout:
         return list(self._payload_shape_slot.value[idx])
 
     @gluon.constexpr_function
-    def lds_shape_tile(self, idx, is_scale):
+    def shape_tile(self, idx, is_scale):
         """Full LDS shape of the tile, including ring and slot axes.
 
         A scale's is in its staged representation.
         """
         if is_scale:
-            return list(self._scale_lds_shape_tile.value[idx])
+            return list(self._scale_shape_tile.value[idx])
         return list(self._payload_shape_tile.value[idx])
 
     @gluon.constexpr_function
