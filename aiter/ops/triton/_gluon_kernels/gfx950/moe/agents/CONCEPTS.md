@@ -10,3 +10,4 @@
         * A scale, `A_SCALE_SORTED_SHUFFLED` (`ScaleSwizzle.SORTED_SHUFFLED`): the same fragment order as the B scale, but also gathered into routing order. Written on every call by `moe_sort_scales.cuh`, and valid only when `KernelLayout.sorted_shuffled_ok` holds.
         * A payload is never preshuffled: its token rows are gathered per launch, so no fixed permutation exists.
         * Not a preshuffle: `WeightGuHbmLayout` (gate/up `INTERLEAVED` vs `SPLIT`) reorders B along N, but it is a separate layout choice, not one of the shuffle flags.
+    * storage/pack_divisor: for non sub-byte dtype(fp8, fp16, fp32),  storage dtype/shape is same as logical dtype/shape, and pack_divisor is 1; for fp4, two elements are packed into a int8 in k-dimension, therefore, logical refers to fp4 and its shape, storage refers to int8 and it shape, and pack_divisor is 2.
