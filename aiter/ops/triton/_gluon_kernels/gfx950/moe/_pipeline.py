@@ -311,7 +311,7 @@ def _init_buffers(pc):
                     gl.zeros(
                         layout.packed_scale_shape(0),
                         gl.int32,
-                        layout.packed_scale_frag_layout(0),
+                        layout.packed_scale_frag_layout1(0),
                     ),
                 )
             else:
@@ -331,7 +331,7 @@ def _init_buffers(pc):
                     gl.zeros(
                         layout.packed_scale_shape(1),
                         gl.int32,
-                        layout.packed_scale_frag_layout(1),
+                        layout.packed_scale_frag_layout1(1),
                     ),
                 )
             else:

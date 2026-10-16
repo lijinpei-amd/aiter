@@ -75,7 +75,7 @@ def _scale_fragments(scale, cfg, layout, operand: gl.constexpr):
                     )
                     fragment = gl.convert_layout(
                         gl.reshape(words, layout.packed_scale_shape(operand)),
-                        layout.packed_scale_frag_layout(operand),
+                        layout.packed_scale_frag_layout1(operand),
                     )
             else:
                 fragment = gl.amd.slice(
@@ -318,10 +318,10 @@ class LDSManager:
                 scale = _ds_read(
                     scale_ptr.reinterpret(
                         gl.int32,
-                        layout.packed_scale_load_shape(operand),
+                        layout.packed_scale_lds_shape2(operand),
                         layout.packed_scale_read_layout(operand, True),
                     ),
-                    layout.packed_scale_load_layout(operand),
+                    layout.packed_scale_frag_layout2(operand),
                 )
             else:
                 scale = _ds_read(

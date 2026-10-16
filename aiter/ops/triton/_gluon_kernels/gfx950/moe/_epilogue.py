@@ -228,7 +228,7 @@ def _epi_stage_flush(
     SLOT_N: gl.constexpr = tuning_cfg.SLOT_N
     ARN: gl.constexpr = func_cfg.activation_reduction_n()
     OUT_SLOT_N: gl.constexpr = layout.output_n_slot
-    P_COLS: gl.constexpr = layout.quant_payload_shape(SLOT_M, OUT_SLOT_N)[1]
+    P_COLS: gl.constexpr = layout.quant_payload_storage_shape(SLOT_M, OUT_SLOT_N)[1]
     S_COLS: gl.constexpr = layout.quant_scale_shape(SLOT_M, OUT_SLOT_N)[1]
     PL: gl.constexpr = layout.result_store_layout(SLOT_M, P_COLS, 8)
     SL: gl.constexpr = layout.result_store_layout(SLOT_M, S_COLS, 8)
@@ -282,7 +282,7 @@ def _epi_block_flush(
     """
     BM: gl.constexpr = tuning_cfg.BLOCK_M
     OUT_SLOT_N: gl.constexpr = layout.output_n_slot
-    P_COLS: gl.constexpr = layout.quant_payload_shape(BM, OUT_SLOT_N)[1]
+    P_COLS: gl.constexpr = layout.quant_payload_storage_shape(BM, OUT_SLOT_N)[1]
     S_COLS: gl.constexpr = layout.quant_scale_shape(BM, OUT_SLOT_N)[1]
     PL: gl.constexpr = layout.result_store_layout(BM, P_COLS, 8)
     SL: gl.constexpr = layout.result_store_layout(BM, S_COLS, 8)
@@ -360,7 +360,7 @@ def _epilogue_one_tile(
     SLOT_M: gl.constexpr = tuning_cfg.SLOT_M
     ARN: gl.constexpr = func_cfg.activation_reduction_n()
     OUT_SLOT_N: gl.constexpr = layout.output_n_slot
-    P_COLS: gl.constexpr = layout.quant_payload_shape(SLOT_M, OUT_SLOT_N)[1]
+    P_COLS: gl.constexpr = layout.quant_payload_storage_shape(SLOT_M, OUT_SLOT_N)[1]
     S_COLS: gl.constexpr = layout.quant_scale_shape(SLOT_M, OUT_SLOT_N)[1]
     act: gl.constexpr = func_cfg.activation
     out_ty: gl.constexpr = y_hbm_ptr.dtype.element_ty
@@ -653,7 +653,7 @@ def _epilogue_store(
     QROWS: gl.constexpr = layout.quant_staging_rows
     if require_constexpr(func_cfg.output_quant is not None):
         qp_lds_ptr = gl.allocate_shared_memory(
-            gl.uint8, layout.quant_payload_shape(QROWS, OUT_SLOT_N), layout=QSH
+            gl.uint8, layout.quant_payload_storage_shape(QROWS, OUT_SLOT_N), layout=QSH
         )
         qs_lds_ptr = gl.allocate_shared_memory(
             gl.uint8, layout.quant_scale_shape(QROWS, OUT_SLOT_N), layout=QSH
@@ -665,7 +665,7 @@ def _epilogue_store(
         # Second bank for rotating epilogue. Same overlay argument as above, so the footprint
         # still does not grow.
         qp2_lds_ptr = gl.allocate_shared_memory(
-            gl.uint8, layout.quant_payload_shape(SLOT_M, OUT_SLOT_N), layout=QSH
+            gl.uint8, layout.quant_payload_storage_shape(SLOT_M, OUT_SLOT_N), layout=QSH
         )
         qs2_lds_ptr = gl.allocate_shared_memory(
             gl.uint8, layout.quant_scale_shape(SLOT_M, OUT_SLOT_N), layout=QSH

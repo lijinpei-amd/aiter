@@ -733,7 +733,7 @@ def scale_layout_test_cases():
                 SLOT_N=slot_n,
                 warps_per_cta=warps,
             )
-    # test_wide_packed_scale_load_layout_matches_producer
+    # test_wide_packed_scale_frag_layout2_matches_producer
     for sk in (256, 512, 1024):
         add(
             f"wide-sk{sk}",
