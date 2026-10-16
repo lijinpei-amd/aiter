@@ -124,10 +124,6 @@ class _Config(_ScheduleConfig):
     def scale_cache_fragments(self, operand):
         return self.num_lds_slots_non_k(operand) * self.scale_read_k_slots(operand)
 
-    def scale_hbm_steps(self, operand, steps, phase):
-        ratio = self.scale_ratio_k_step(operand)
-        return (steps + phase) // ratio * ratio
-
     def operand_elem_ty(self, operand):
         return SimpleNamespace(primitive_bitwidth=8)
 

@@ -296,7 +296,6 @@ def _trace_emitter(tc, monkeypatch, defer_stage_commit=False):
     tc.num_buffers = lambda operand, scale=False: 3
     tc.num_k_slots = 1
     tc.operand_elem_ty = lambda operand: SimpleNamespace(primitive_bitwidth=8)
-    tc.scale_hbm_steps = lambda operand, steps, phase: steps
     sink = _LDSRecorder(tc)
     schedule, step = _steady_step(tc)
     pc = SimpleNamespace(

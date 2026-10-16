@@ -169,7 +169,7 @@ def test_packed_words_and_selectors_match_producer(
     assert word_shape[0] * word_shape[1] * 4 == len(producer)
 
     # Invert the actual LDS view layout to find each fragment word's physical
-    # address, rather than reusing production's scale_dword_delta formula. The read
+    # address, rather than reusing production's _scale_dword_delta formula. The read
     # views a whole scale slot, which by default is this one fragment.
     assert layout.scale_fragment_shape_scale_slot(operand) == word_shape
     read_bases = layout.scale_lds_view_layout_scale_slot(operand).offset_bases

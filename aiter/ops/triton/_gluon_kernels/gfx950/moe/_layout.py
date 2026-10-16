@@ -385,14 +385,10 @@ class KernelLayout:
     # -- operand payload --
     _payload_block_k_storage: gl.constexpr
     _payload_hbm_step: gl.constexpr
-    _copy_contiguity: gl.constexpr
-    _k_width_for: gl.constexpr
-    _lds_unit_rows: gl.constexpr
     _byte_unit_lds_ok: gl.constexpr
     _payload_lds_shape_tile: gl.constexpr
     _payload_fragment_shape_slot: gl.constexpr
     _payload_hbm_offset_layout: gl.constexpr
-    _dot_operand_buffer_load_lds_layout: gl.constexpr
     _dot_operand_lds_layout: gl.constexpr
     _dot_operand_fragment_layout: gl.constexpr
     # -- operand scale --
@@ -432,7 +428,6 @@ class KernelLayout:
     _scale_fragment_shape_scale_slot: gl.constexpr
     _scale_fragment_shape_slot: gl.constexpr
     _scale_hbm_offset_layout: gl.constexpr
-    _dot_operand_scale_buffer_load_lds_layout: gl.constexpr
     _scale_lds_view_layout_scale_slot: gl.constexpr
     _scale_fragment_layout_scale_slot: gl.constexpr
     _dot_operand_scale_fragment_layout: gl.constexpr
@@ -453,7 +448,6 @@ class KernelLayout:
     epilogue_input_lds_layout: gl.constexpr
     epilogue_gamma_shape: gl.constexpr
     epilogue_gamma_buffer_load_lds_layout: gl.constexpr
-    epilogue_bias_per_thread: gl.constexpr
     epilogue_bias_shape: gl.constexpr
     epilogue_bias_buffer_load_lds_layout: gl.constexpr
     quant_staging_rows: gl.constexpr
@@ -1127,16 +1121,10 @@ class KernelLayout:
         # operand payload
         self._payload_block_k_storage = gl.constexpr(payload_block_k_storage)
         self._payload_hbm_step = gl.constexpr(payload_hbm_step)
-        self._copy_contiguity = gl.constexpr(copy_contiguity)
-        self._k_width_for = gl.constexpr(k_width_for)
-        self._lds_unit_rows = gl.constexpr(lds_unit_rows)
         self._byte_unit_lds_ok = gl.constexpr(byte_unit_lds_ok)
         self._payload_lds_shape_tile = gl.constexpr(payload_lds_shape_tile)
         self._payload_fragment_shape_slot = gl.constexpr(payload_fragment_shape_slot)
         self._payload_hbm_offset_layout = gl.constexpr(payload_hbm_offset_layout)
-        self._dot_operand_buffer_load_lds_layout = gl.constexpr(
-            dot_operand_buffer_load_lds_layout
-        )
         self._dot_operand_lds_layout = gl.constexpr(dot_operand_lds_layout)
         self._dot_operand_fragment_layout = gl.constexpr(dot_operand_fragment_layout)
 
@@ -1160,9 +1148,6 @@ class KernelLayout:
         )
         self._scale_fragment_shape_slot = gl.constexpr(scale_fragment_shape_slot)
         self._scale_hbm_offset_layout = gl.constexpr(scale_hbm_offset_layout)
-        self._dot_operand_scale_buffer_load_lds_layout = gl.constexpr(
-            dot_operand_scale_buffer_load_lds_layout
-        )
         self._scale_lds_view_layout_scale_slot = gl.constexpr(
             scale_lds_view_layout_scale_slot
         )
@@ -1190,7 +1175,6 @@ class KernelLayout:
         self.epilogue_gamma_buffer_load_lds_layout = gl.constexpr(
             epilogue_gamma_buffer_load_lds_layout
         )
-        self.epilogue_bias_per_thread = gl.constexpr(epilogue_bias_per_thread)
         self.epilogue_bias_shape = gl.constexpr(epilogue_bias_shape)
         self.epilogue_bias_buffer_load_lds_layout = gl.constexpr(
             epilogue_bias_buffer_load_lds_layout
@@ -1263,24 +1247,9 @@ class KernelLayout:
         return list(self._payload_lds_shape_tile.value[idx])
 
     @gluon.constexpr_function
-    def copy_contiguity(self, idx):
-        """Storage elements per lane for a 128-bit direct-to-LDS payload copy."""
-        return self._copy_contiguity.value[idx]
-
-    @gluon.constexpr_function
-    def k_width_for(self, idx):
-        """``DotOperandLayout.k_width`` for one operand, in storage elements."""
-        return self._k_width_for.value[idx]
-
-    @gluon.constexpr_function
     def payload_hbm_step(self, idx):
         """Base-pointer increment for one payload K stage, in storage elements."""
         return self._payload_hbm_step.value[idx]
-
-    @gluon.constexpr_function
-    def lds_unit_rows(self, idx):
-        """Non-K extent of one LDS unit."""
-        return self._lds_unit_rows.value[idx]
 
     @gluon.constexpr_function
     def byte_unit_lds_ok(self, idx):
@@ -1324,16 +1293,6 @@ class KernelLayout:
         if is_scale:
             return self.identity_lds_layout.value
         return self._dot_operand_lds_layout.value[idx]
-
-    @gluon.constexpr_function
-    def dot_operand_buffer_load_lds_layout(self, idx, is_scale):
-        """Register layout of a component's global->LDS copy offsets.
-
-        32 bits per lane, blocked, for a scale.
-        """
-        if is_scale:
-            return self._dot_operand_scale_buffer_load_lds_layout.value[idx]
-        return self._dot_operand_buffer_load_lds_layout.value[idx]
 
     @gluon.constexpr_function
     def hbm_offset_layout(self, idx, is_scale):
@@ -1386,17 +1345,6 @@ class KernelLayout:
         return self._scale_cache_fragments.value[idx]
 
     @gluon.constexpr_function
-    def scale_k_phase(self, step):
-        """Which K128 half of the packed K256 scale word this stage consumes."""
-        return (step * self._BLOCK_K.value // 128) % 2
-
-    @gluon.constexpr_function
-    def scale_hbm_steps(self, idx, steps, phase=0):
-        """Scale pointer displacement in units of one payload stage's scale stride."""
-        ratio = self.scale_ratio_k_step(idx)
-        return ((phase + steps) // ratio) * ratio
-
-    @gluon.constexpr_function
     def scale_lds_shape_scale_slot(self, idx):
         """LDS allocation shape of one shuffled scale slot: a 256 B run per stripe."""
         return list(self._scale_lds_shape_scale_slot.value[idx])
@@ -1408,11 +1356,6 @@ class KernelLayout:
         In i32 dwords when :meth:`scale_packed_ok`, else in u8.
         """
         return list(self._scale_fragment_shape_scale_slot.value[idx])
-
-    @gluon.constexpr_function
-    def scale_dword_delta(self, delta, k=256):
-        """Where a (non-K, K) step lands, as a coordinate of the i32 tile."""
-        return _scale_dword_delta(delta, k)
 
     @gluon.constexpr_function
     def scale_packed_ok(self, idx):
