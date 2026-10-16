@@ -430,7 +430,7 @@ class KernelLayout:
     _scale_hbm_offset_layout: gl.constexpr
     _scale_lds_view_layout_scale_slot: gl.constexpr
     _scale_fragment_layout_scale_slot: gl.constexpr
-    _dot_operand_scale_fragment_layout: gl.constexpr
+    _scale_fragment_layout: gl.constexpr
     # -- result --
     acc_vgprs_per_lane: gl.constexpr
     #: Shape of one slot's accumulator.
@@ -836,7 +836,7 @@ class KernelLayout:
         identity_lds_layout = gl.SwizzledSharedLayout(
             vec=1, per_phase=1, max_phase=1, order=[1, 0]
         )
-        dot_operand_scale_fragment_layout = [None, None]
+        scale_fragment_layout = [None, None]
         scale_fragment_layout_scale_slot = [None, None]
         dot_operand_scale_buffer_load_lds_layout = [None, None]
         scale_lds_view_layout_scale_slot = [None, None]
@@ -844,7 +844,7 @@ class KernelLayout:
             if not (ok and has_scale[idx]):
                 continue
             frag = payload_fragment_layout[idx]
-            dot_operand_scale_fragment_layout[idx] = gl.amd.cdna4.get_mfma_scale_layout(
+            scale_fragment_layout[idx] = gl.amd.cdna4.get_mfma_scale_layout(
                 frag, scale_fragment_shape_slot[idx], MX_GROUP
             )
             scale_fragment_layout_scale_slot[idx] = gl.amd.cdna4.get_mfma_scale_layout(
@@ -871,7 +871,7 @@ class KernelLayout:
                 + _pow2_bases(1, 2, _ramp(8, k // MX_GROUP))  # the rest of K
                 + _pow2_bases(0, 2, _ramp(32, nonk))  # further 32-row stripes
             )
-        dot_operand_scale_fragment_layout = tuple(dot_operand_scale_fragment_layout)
+        scale_fragment_layout = tuple(scale_fragment_layout)
         scale_fragment_layout_scale_slot = tuple(scale_fragment_layout_scale_slot)
         dot_operand_scale_buffer_load_lds_layout = tuple(
             dot_operand_scale_buffer_load_lds_layout
@@ -893,9 +893,7 @@ class KernelLayout:
         scale_packed_ok = [False, False]
         for idx in ops:
             if ok and shuffled[idx] and BK in (128, 256):
-                regs = [
-                    list(b) for b in dot_operand_scale_fragment_layout[idx].reg_bases
-                ]
+                regs = [list(b) for b in scale_fragment_layout[idx].reg_bases]
                 if BK == 128:
                     scale_packed_ok[idx] = len(regs) >= 1 and regs[0] == [16, 0]
                 else:
@@ -991,7 +989,7 @@ class KernelLayout:
             if scale_via_lds[idx]:
                 layout = dot_operand_scale_buffer_load_lds_layout[idx]
             elif not shuffled[idx]:
-                layout = dot_operand_scale_fragment_layout[idx]
+                layout = scale_fragment_layout[idx]
             elif scale_packed_ok[idx]:
                 layout = packed_scale_fragment_layout_scale_slot[idx]
             else:
@@ -1049,11 +1047,11 @@ class KernelLayout:
             )
             for idx in ops
         )
-        dot_operand_scale_fragment_layout = tuple(
+        scale_fragment_layout = tuple(
             (
                 packed_scale_fragment_layout_slot[idx]
                 if scale_packed_ok[idx]
-                else dot_operand_scale_fragment_layout[idx]
+                else scale_fragment_layout[idx]
             )
             for idx in ops
         )
@@ -1158,9 +1156,7 @@ class KernelLayout:
         self._scale_fragment_layout_scale_slot = gl.constexpr(
             scale_fragment_layout_scale_slot
         )
-        self._dot_operand_scale_fragment_layout = gl.constexpr(
-            dot_operand_scale_fragment_layout
-        )
+        self._scale_fragment_layout = gl.constexpr(scale_fragment_layout)
 
         # result
         self.acc_vgprs_per_lane = gl.constexpr(acc_vgprs_per_lane)
@@ -1284,7 +1280,7 @@ class KernelLayout:
     def fragment_layout(self, idx, is_scale):
         """Register layout of one slot fragment; i32 for a packed scale."""
         if is_scale:
-            return self._dot_operand_scale_fragment_layout.value[idx]
+            return self._scale_fragment_layout.value[idx]
         return self._payload_fragment_layout.value[idx]
 
     @gluon.constexpr_function
