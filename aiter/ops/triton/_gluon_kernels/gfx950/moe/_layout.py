@@ -420,7 +420,7 @@ class KernelLayout:
     # and carried as i32, a dword's four E8M0 bytes in one register. So its fragment
     # shapes and layouts and its LDS view are the i32 ones, and u8 otherwise; its LDS
     # allocation stays u8. The slot fragment is the shared
-    # `dot_operand_fragment_layout(idx, True)`. LDS is never read a slot at a time, so
+    # `fragment_layout(idx, True)`. LDS is never read a slot at a time, so
     # no `lds_view` is per slot.
     _scale_lds_shape_tile: gl.constexpr
     _scale_lds_shape_scale_slot: gl.constexpr
@@ -1281,14 +1281,14 @@ class KernelLayout:
     # -- payload and scale layouts ------------------------------------------------
 
     @gluon.constexpr_function
-    def dot_operand_fragment_layout(self, idx, is_scale):
+    def fragment_layout(self, idx, is_scale):
         """Register layout of one slot fragment; i32 for a packed scale."""
         if is_scale:
             return self._dot_operand_scale_fragment_layout.value[idx]
         return self._payload_fragment_layout.value[idx]
 
     @gluon.constexpr_function
-    def dot_operand_lds_layout(self, idx, is_scale):
+    def lds_layout(self, idx, is_scale):
         """Shared layout of a component staged through LDS.
 
         Padded for a payload; :attr:`identity_lds_layout` for a scale, a K-contiguous
@@ -1336,7 +1336,7 @@ class KernelLayout:
         return self._scale_ratio_non_k_slot.value[idx]
 
     @gluon.constexpr_function
-    def num_scale_slots(self, idx):
+    def scale_num_slots(self, idx):
         return self._scale_num_slots.value[idx]
 
     @gluon.constexpr_function

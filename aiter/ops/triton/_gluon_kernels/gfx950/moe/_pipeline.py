@@ -288,7 +288,7 @@ def _init_buffers(pc):
                 gl.zeros(
                     layout.fragment_shape_slot(0, False),
                     pc.func_cfg.operand_elem_ty(0),
-                    layout.dot_operand_fragment_layout(0, False),
+                    layout.fragment_layout(0, False),
                 ),
             )
     if require_constexpr(sched.in_reg(_B_PAYLOAD)):
@@ -299,7 +299,7 @@ def _init_buffers(pc):
                 gl.zeros(
                     layout.fragment_shape_slot(1, False),
                     pc.func_cfg.operand_elem_ty(1),
-                    layout.dot_operand_fragment_layout(1, False),
+                    layout.fragment_layout(1, False),
                 ),
             )
     if require_constexpr(sched.present(_A_SCALE) and sched.in_reg(_A_SCALE)):
@@ -310,7 +310,7 @@ def _init_buffers(pc):
                 gl.zeros(
                     layout.fragment_shape_slot(0, True),
                     layout.scale_fragment_dtype(0),
-                    layout.dot_operand_fragment_layout(0, True),
+                    layout.fragment_layout(0, True),
                 ),
             )
     if require_constexpr(sched.present(_B_SCALE) and sched.in_reg(_B_SCALE)):
@@ -321,7 +321,7 @@ def _init_buffers(pc):
                 gl.zeros(
                     layout.fragment_shape_slot(1, True),
                     layout.scale_fragment_dtype(1),
-                    layout.dot_operand_fragment_layout(1, True),
+                    layout.fragment_layout(1, True),
                 ),
             )
     return a, b, a_scale, b_scale
