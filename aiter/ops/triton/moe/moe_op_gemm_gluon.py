@@ -779,8 +779,17 @@ def get_gluon_config_uncached(
     # just as well. Shorten K first.
     shrink_n_first = dq_a in _SCALED or dq_b in _SCALED
 
+    def _over_budget(c):
+        # KernelLayout asserts its tile geometry, and an env override (SLOT_*,
+        # SCALE_SLOT_*, FLY_TILES_*) can break it. Shrinking cannot repair that, so
+        # stop here and let gluon_supported's _pipeline_error report it as a fallback.
+        try:
+            return _probe_lds_bytes(c, dq_a, dq_b) > LDS_USABLE_BYTES
+        except AssertionError:
+            return False
+
     cfg = _build(block_n, block_k, nb)
-    while _probe_lds_bytes(cfg, dq_a, dq_b) > LDS_USABLE_BYTES:
+    while _over_budget(cfg):
         can_n = block_n > gran_n and N % (block_n // 2) == 0
         can_k = block_k > min_k and K % (block_k // 2) == 0
         first, second = (can_n, can_k) if shrink_n_first else (can_k, can_n)

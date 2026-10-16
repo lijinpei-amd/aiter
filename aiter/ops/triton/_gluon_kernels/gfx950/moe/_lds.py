@@ -271,7 +271,7 @@ class LDSManager:
         else:
             gl.static_assert(self.func_cfg.has_scale(operand))
             gl.static_assert(layout.component_in_reg((operand, True)))
-            if require_constexpr(cfg.scale_shuffled(operand)):
+            if require_constexpr(cfg.preshuffled(operand, True)):
                 if require_constexpr(layout.scale_packed_ok(operand)):
                     scale = gl.amd.cdna4.buffer_load(
                         ptr=hbm_ptr.to(gl.pointer_type(gl.int32)),
@@ -309,7 +309,7 @@ class LDSManager:
             lds_ptr = self.a_scale_lds_ptr
         else:
             lds_ptr = self.b_scale_lds_ptr
-        if require_constexpr(cfg.scale_shuffled(operand)):
+        if require_constexpr(cfg.preshuffled(operand, True)):
             scale_ptr = lds_ptr.index(
                 SCALE_READ_IDX * layout.scale_num_slots(operand)
                 + non_k_slot // layout.scale_slot_ratio_non_k(operand)
