@@ -405,39 +405,42 @@ class KernelLayout:
     _scale_slot_k: gl.constexpr
     _scale_ratio_k_step: gl.constexpr
     _scale_ratio_non_k_slot: gl.constexpr
-    _num_scale_tiles: gl.constexpr
+    _num_scale_slots: gl.constexpr
     _scale_read_k_slots: gl.constexpr
     _scale_cache_fragments: gl.constexpr
-    _scale_flat_shape: gl.constexpr
+    _scale_lds_shape_scale_slot: gl.constexpr
     #: Does the tile match the layout the C++ A-scale shuffle writes?
     sorted_shuffled_ok: gl.constexpr
-    _scale_load_shape: gl.constexpr
+    _scale_fragment_shape_scale_slot: gl.constexpr
     _scale_packed_ok: gl.constexpr
     _scale_packed_sel: gl.constexpr
     #: Whether either live MFMA scale operand uses packed dword storage.
     has_mfma_packed_scale: gl.constexpr
-    _packed_scale_shape: gl.constexpr
-    # The shape of frag2 and of the LDS view it is read from. There is no
-    # `packed_scale_lds_shape1`: LDS is only read a whole scale slot at a time, and
-    # each frag1 is sliced out of the result in registers.
-    _packed_scale_lds_shape2: gl.constexpr
+    _packed_scale_fragment_shape_slot: gl.constexpr
+    _packed_scale_fragment_shape_scale_slot: gl.constexpr
     # -- scale layouts --
     _dot_operand_scale_fragment_layout: gl.constexpr
     _dot_operand_scale_lds_layout: gl.constexpr
     _dot_operand_scale_buffer_load_lds_layout: gl.constexpr
     _scale_hbm_offset_layout: gl.constexpr
-    _shuffled_scale_read_layout: gl.constexpr
-    _scale_load_layout: gl.constexpr
-    # Two i32 register layouts of a packed scale, both with a dword's four E8M0 bytes
-    # folded into one register. frag1 is one MFMA step's operand: one non-K slot by one
-    # K256 stage (`packed_scale_shape`). frag2 is one whole scale slot as a single copy
-    # lands it (`packed_scale_lds_shape2`), spanning `scale_ratio_non_k_slot` non-K
-    # slots and `scale_slot_k / BLOCK_K` steps. `_lds._scale_fragments` slices each
-    # frag1 out of a frag2; when a scale slot is one non-K slot by one stage, the two
-    # cover the same tensor.
-    _packed_scale_frag_layout1: gl.constexpr
-    _packed_scale_read_layout: gl.constexpr
-    _packed_scale_frag_layout2: gl.constexpr
+    # A shuffled scale is read a whole scale slot at a time and split into per-slot
+    # fragments in registers. These names spell out what, where and how much:
+    # `[packed_]scale_<fragment|lds_view>_<layout|shape>_<slot|scale_slot>`.
+    # - `packed_`: i32, a dword's four E8M0 bytes folded into one register; else u8.
+    # - `fragment`: registers. `lds_view`: the LDS view a `ds_read` reads from. The two
+    #   share a shape, named after the fragment; `lds_shape` is the allocation's.
+    # - `slot`: one MFMA step's operand, one non-K slot by one step (packed: by K256,
+    #   a dword's K extent). `scale_slot`: what one copy lands, spanning
+    #   `scale_ratio_non_k_slot` non-K slots and `scale_slot_k / BLOCK_K` steps.
+    #   `_lds._scale_fragments` slices each slot out of a scale slot; when the two
+    #   have the same extent, they cover the same tensor.
+    # The u8 slot fragment is the shared `dot_operand_fragment_layout(idx, True)`. LDS
+    # is never read a slot at a time, so no `lds_view` is per slot.
+    _scale_lds_view_layout_scale_slot: gl.constexpr
+    _scale_fragment_layout_scale_slot: gl.constexpr
+    _packed_scale_fragment_layout_slot: gl.constexpr
+    _packed_scale_lds_view_layout_scale_slot: gl.constexpr
+    _packed_scale_fragment_layout_scale_slot: gl.constexpr
     # -- epilogue --
     #: Emitted columns produced by one N slot.
     output_n_slot: gl.constexpr
@@ -764,11 +767,11 @@ class KernelLayout:
         # A shuffled scale slot narrower than the payload slot (which
         # `validate_layout` rejects) covers no whole slot: it has no tile count, and no
         # LDS footprint where it is staged there.
-        scale_tiles_ok = tuple(ratio > 0 for ratio in scale_ratio_non_k_slot)
-        num_scale_tiles = tuple(
+        scale_slots_ok = tuple(ratio > 0 for ratio in scale_ratio_non_k_slot)
+        num_scale_slots = tuple(
             (
                 num_lds_slots_non_k[idx] // scale_ratio_non_k_slot[idx]
-                if scale_tiles_ok[idx]
+                if scale_slots_ok[idx]
                 else None
             )
             for idx in ops
@@ -777,7 +780,7 @@ class KernelLayout:
         scale_cache_fragments = tuple(
             num_lds_slots_non_k[idx] * scale_read_k_slots[idx] for idx in ops
         )
-        # A shuffled tile is staged in HBM byte order rather than fragment order because
+        # A shuffled scale slot is staged in HBM byte order, not fragment order, because
         # direct-to-LDS on gfx9 cannot scatter -- each warp must write coalesced, which
         # a fragment-ordered SharedLinearLayout does not (`canLoadDirectToLDS` rejects
         # it, see TritonAMDGPUToLLVM/Utility.cpp). The bytes therefore sit in (non-K 16,
@@ -785,19 +788,19 @@ class KernelLayout:
         # reconciling the two used to cost a v_perm per dword, which is what
         # `scale_packed_ok` avoids by handing the dword to the MFMA whole and naming the
         # byte order in a selector list.
-        scale_flat_shape = tuple(
+        scale_lds_shape_scale_slot = tuple(
             [scale_slot_nonk[idx] // 32, scale_slot_k[idx]] for idx in ops
         )
-        # Staged representation: a shuffled scale fills one flat run per scale tile, a
+        # Staged representation: a shuffled scale fills one flat run per scale slot, a
         # raw one one [slot non-K, BLOCK_K/32] tile per slot.
         scale_lds_shape_tile = []
         for idx in ops:
-            if not scale_tiles_ok[idx]:
+            if not scale_slots_ok[idx]:
                 scale_lds_shape_tile.append(None)
             elif shuffled[idx]:
                 scale_lds_shape_tile.append(
-                    [tc.num_buffers(idx, True) * num_scale_tiles[idx]]
-                    + scale_flat_shape[idx]
+                    [tc.num_buffers(idx, True) * num_scale_slots[idx]]
+                    + scale_lds_shape_scale_slot[idx]
                 )
             else:
                 scale_lds_shape_tile.append(
@@ -822,7 +825,7 @@ class KernelLayout:
         # 32-row stripes: the shuffle writes one 256 B run per stripe, so a slot is a
         # contiguous slice.
         sorted_shuffled_ok = is_16x16x128 and BM % 32 == 0 and SLOT_M % 32 == 0
-        scale_load_shape = tuple(
+        scale_fragment_shape_scale_slot = tuple(
             [scale_slot_nonk[idx], scale_slot_k[idx] // MX_GROUP] for idx in ops
         )
 
@@ -832,16 +835,16 @@ class KernelLayout:
         # `get_mfma_scale_layout` each lane wants K-scale elements strided by 2 or 4,
         # so the read is `ds_read_u8` regardless, and the identity tile keeps the
         # *write* side (direct-to-LDS) coalesced, which is the side that matters. A
-        # shuffled tile is a flat run in HBM byte order; its fragment order returns on
-        # the read.
+        # shuffled scale slot is a flat run in HBM byte order; its fragment order
+        # returns on the read.
         scale_lds_layout = gl.SwizzledSharedLayout(
             vec=1, per_phase=1, max_phase=1, order=[1, 0]
         )
         dot_operand_scale_lds_layout = (scale_lds_layout, scale_lds_layout)
         dot_operand_scale_fragment_layout = [None, None]
-        scale_load_layout = [None, None]
+        scale_fragment_layout_scale_slot = [None, None]
         dot_operand_scale_buffer_load_lds_layout = [None, None]
-        shuffled_scale_read_layout = [None, None]
+        scale_lds_view_layout_scale_slot = [None, None]
         for idx in ops:
             if not (ok and has_scale[idx]):
                 continue
@@ -849,13 +852,13 @@ class KernelLayout:
             dot_operand_scale_fragment_layout[idx] = gl.amd.cdna4.get_mfma_scale_layout(
                 frag, scale_fragment_shape_slot[idx], MX_GROUP
             )
-            scale_load_layout[idx] = gl.amd.cdna4.get_mfma_scale_layout(
-                frag, scale_load_shape[idx], MX_GROUP
+            scale_fragment_layout_scale_slot[idx] = gl.amd.cdna4.get_mfma_scale_layout(
+                frag, scale_fragment_shape_scale_slot[idx], MX_GROUP
             )
             if scale_via_lds[idx]:
-                # 32 bits per lane. A shuffled tile is a flat run, so one warp covers
-                # 64 lanes x 4 contiguous bytes of it; a raw row of BLOCK_K/32 scales is
-                # split 4 per lane.
+                # 32 bits per lane. A shuffled scale slot is a flat run, so one warp
+                # covers 64 lanes x 4 contiguous bytes of it; a raw row of BLOCK_K/32
+                # scales is split 4 per lane.
                 lanes_k = WARP_SIZE if shuffled[idx] else scale_block_k_storage // 4
                 dot_operand_scale_buffer_load_lds_layout[idx] = gl.BlockedLayout(
                     size_per_thread=[1, 4],
@@ -866,7 +869,7 @@ class KernelLayout:
             # Offset base i is byte 1 << i of one scale slot's flat run, in the
             # CDNA4_SCALE byte order spelled out in `_scale_dword_delta`.
             nonk, k = scale_slot_nonk[idx], scale_slot_k[idx]
-            shuffled_scale_read_layout[idx] = gl.SharedLinearLayout(
+            scale_lds_view_layout_scale_slot[idx] = gl.SharedLinearLayout(
                 offset_bases=[[16, 0], [0, 4]]  # the 4 bytes of a lane's dword
                 + _pow2_bases(0, 2, [1, 2, 4, 8])  # 16 non-K lanes
                 + _pow2_bases(1, 2, [1, 2])  # 4 K lanes
@@ -874,11 +877,11 @@ class KernelLayout:
                 + _pow2_bases(0, 2, _ramp(32, nonk))  # further 32-row stripes
             )
         dot_operand_scale_fragment_layout = tuple(dot_operand_scale_fragment_layout)
-        scale_load_layout = tuple(scale_load_layout)
+        scale_fragment_layout_scale_slot = tuple(scale_fragment_layout_scale_slot)
         dot_operand_scale_buffer_load_lds_layout = tuple(
             dot_operand_scale_buffer_load_lds_layout
         )
-        shuffled_scale_read_layout = tuple(shuffled_scale_read_layout)
+        scale_lds_view_layout_scale_slot = tuple(scale_lds_view_layout_scale_slot)
 
         # -- packed (i32) scales --------------------------------------------------
         # Every shuffle here puts four scales in a dword, and the matrix instruction can
@@ -921,13 +924,15 @@ class KernelLayout:
             for idx in ops
         )
         has_mfma_packed_scale = scale_packed_ok[0] or scale_packed_ok[1]
-        packed_scale_shape = tuple([nonk, scale_stage_k // 128] for nonk in slot_nonk)
-        packed_scale_lds_shape2 = tuple(
+        packed_scale_fragment_shape_slot = tuple(
+            [nonk, scale_stage_k // 128] for nonk in slot_nonk
+        )
+        packed_scale_fragment_shape_scale_slot = tuple(
             [scale_slot_nonk[idx], scale_slot_k[idx] // 128] for idx in ops
         )
-        packed_scale_frag_layout1 = [None, None]
-        packed_scale_read_layout = [None, None]
-        packed_scale_frag_layout2 = [None, None]
+        packed_scale_fragment_layout_slot = [None, None]
+        packed_scale_lds_view_layout_scale_slot = [None, None]
+        packed_scale_fragment_layout_scale_slot = [None, None]
         for idx in ops:
             if not (ok and has_scale[idx]):
                 continue
@@ -936,7 +941,7 @@ class KernelLayout:
                 [slot_nonk[idx], scale_stage_k // MX_GROUP],
                 MX_GROUP,
             )
-            packed_scale_frag_layout1[idx] = gl.DistributedLinearLayout(
+            packed_scale_fragment_layout_slot[idx] = gl.DistributedLinearLayout(
                 reg_bases=[
                     _scale_dword_delta(b, scale_stage_k) for b in frag.reg_bases[2:]
                 ],
@@ -947,20 +952,22 @@ class KernelLayout:
                     _scale_dword_delta(b, scale_stage_k) for b in frag.warp_bases
                 ],
                 block_bases=[],
-                shape=packed_scale_shape[idx],
+                shape=packed_scale_fragment_shape_slot[idx],
             )
-            packed_scale_read_layout[idx] = gl.SharedLinearLayout(
+            packed_scale_lds_view_layout_scale_slot[idx] = gl.SharedLinearLayout(
                 offset_bases=[
                     _scale_dword_delta(b, scale_slot_k[idx])
-                    for b in list(shuffled_scale_read_layout[idx].offset_bases)[2:]
+                    for b in list(scale_lds_view_layout_scale_slot[idx].offset_bases)[
+                        2:
+                    ]
                 ]
             )
             # The two within-dword axes are identified by value, not position. Wider
             # scale K tiles insert additional K register bases between them.
-            frag = scale_load_layout[idx]
+            frag = scale_fragment_layout_scale_slot[idx]
             k = scale_slot_k[idx]
             within_dword = ([0, 4], [16, 0])
-            packed_scale_frag_layout2[idx] = gl.DistributedLinearLayout(
+            packed_scale_fragment_layout_scale_slot[idx] = gl.DistributedLinearLayout(
                 reg_bases=[
                     _scale_dword_delta(b, k)
                     for b in frag.reg_bases
@@ -969,13 +976,17 @@ class KernelLayout:
                 lane_bases=[_scale_dword_delta(b, k) for b in frag.lane_bases],
                 warp_bases=[_scale_dword_delta(b, k) for b in frag.warp_bases],
                 block_bases=[],
-                shape=packed_scale_lds_shape2[idx],
+                shape=packed_scale_fragment_shape_scale_slot[idx],
             )
-        packed_scale_frag_layout1 = tuple(packed_scale_frag_layout1)
-        packed_scale_read_layout = tuple(packed_scale_read_layout)
-        packed_scale_frag_layout2 = tuple(packed_scale_frag_layout2)
+        packed_scale_fragment_layout_slot = tuple(packed_scale_fragment_layout_slot)
+        packed_scale_lds_view_layout_scale_slot = tuple(
+            packed_scale_lds_view_layout_scale_slot
+        )
+        packed_scale_fragment_layout_scale_slot = tuple(
+            packed_scale_fragment_layout_scale_slot
+        )
 
-        # The layout one scale tile's HBM offsets are formed in: the copy layout when
+        # The layout one scale slot's HBM offsets are formed in: the copy layout when
         # the scale is staged through LDS, otherwise the register layout the load lands
         # in.
         scale_hbm_offset_layout = [None, None]
@@ -987,7 +998,7 @@ class KernelLayout:
             elif not shuffled[idx]:
                 layout = dot_operand_scale_fragment_layout[idx]
             elif scale_packed_ok[idx]:
-                layout = packed_scale_frag_layout2[idx]
+                layout = packed_scale_fragment_layout_scale_slot[idx]
             else:
                 # get_mfma_scale_layout puts the K-group bit before the non-K bit in
                 # reg_bases, so a lane's four bytes land in registers in address order
@@ -995,7 +1006,7 @@ class KernelLayout:
                 # issue it with those two bases swapped, then convert with only a
                 # lane-local register renumber because the lane and warp bases stay
                 # unchanged.
-                frag = scale_load_layout[idx]
+                frag = scale_fragment_layout_scale_slot[idx]
                 lead = [[16, 0], [0, 4]]
                 rest = [list(b) for b in frag.reg_bases if list(b) not in lead]
                 layout = gl.DistributedLinearLayout(
@@ -1042,9 +1053,9 @@ class KernelLayout:
 
         # -- resources ------------------------------------------------------------
         # LDS footprint of the components staged there. A staged scale without a tile
-        # count (see `scale_tiles_ok`) has no footprint, so neither has the build.
+        # count (see `scale_slots_ok`) has no footprint, so neither has the build.
         lds_bytes = None
-        if all(scale_tiles_ok[idx] or not scale_via_lds[idx] for idx in ops):
+        if all(scale_slots_ok[idx] or not scale_via_lds[idx] for idx in ops):
             lds_bytes = 0
             for idx in ops:
                 if payload_via_lds[idx]:
@@ -1106,17 +1117,23 @@ class KernelLayout:
         self._scale_slot_k = gl.constexpr(scale_slot_k)
         self._scale_ratio_k_step = gl.constexpr(scale_ratio_k_step)
         self._scale_ratio_non_k_slot = gl.constexpr(scale_ratio_non_k_slot)
-        self._num_scale_tiles = gl.constexpr(num_scale_tiles)
+        self._num_scale_slots = gl.constexpr(num_scale_slots)
         self._scale_read_k_slots = gl.constexpr(scale_read_k_slots)
         self._scale_cache_fragments = gl.constexpr(scale_cache_fragments)
-        self._scale_flat_shape = gl.constexpr(scale_flat_shape)
+        self._scale_lds_shape_scale_slot = gl.constexpr(scale_lds_shape_scale_slot)
         self.sorted_shuffled_ok = gl.constexpr(sorted_shuffled_ok)
-        self._scale_load_shape = gl.constexpr(scale_load_shape)
+        self._scale_fragment_shape_scale_slot = gl.constexpr(
+            scale_fragment_shape_scale_slot
+        )
         self._scale_packed_ok = gl.constexpr(scale_packed_ok)
         self._scale_packed_sel = gl.constexpr(scale_packed_sel)
         self.has_mfma_packed_scale = gl.constexpr(has_mfma_packed_scale)
-        self._packed_scale_shape = gl.constexpr(packed_scale_shape)
-        self._packed_scale_lds_shape2 = gl.constexpr(packed_scale_lds_shape2)
+        self._packed_scale_fragment_shape_slot = gl.constexpr(
+            packed_scale_fragment_shape_slot
+        )
+        self._packed_scale_fragment_shape_scale_slot = gl.constexpr(
+            packed_scale_fragment_shape_scale_slot
+        )
 
         # scale layouts
         self._dot_operand_scale_fragment_layout = gl.constexpr(
@@ -1127,11 +1144,21 @@ class KernelLayout:
             dot_operand_scale_buffer_load_lds_layout
         )
         self._scale_hbm_offset_layout = gl.constexpr(scale_hbm_offset_layout)
-        self._shuffled_scale_read_layout = gl.constexpr(shuffled_scale_read_layout)
-        self._scale_load_layout = gl.constexpr(scale_load_layout)
-        self._packed_scale_frag_layout1 = gl.constexpr(packed_scale_frag_layout1)
-        self._packed_scale_read_layout = gl.constexpr(packed_scale_read_layout)
-        self._packed_scale_frag_layout2 = gl.constexpr(packed_scale_frag_layout2)
+        self._scale_lds_view_layout_scale_slot = gl.constexpr(
+            scale_lds_view_layout_scale_slot
+        )
+        self._scale_fragment_layout_scale_slot = gl.constexpr(
+            scale_fragment_layout_scale_slot
+        )
+        self._packed_scale_fragment_layout_slot = gl.constexpr(
+            packed_scale_fragment_layout_slot
+        )
+        self._packed_scale_lds_view_layout_scale_slot = gl.constexpr(
+            packed_scale_lds_view_layout_scale_slot
+        )
+        self._packed_scale_fragment_layout_scale_slot = gl.constexpr(
+            packed_scale_fragment_layout_scale_slot
+        )
 
         # epilogue
         self.output_n_slot = gl.constexpr(output_n_slot)
@@ -1286,7 +1313,7 @@ class KernelLayout:
 
     @gluon.constexpr_function
     def hbm_offset_layout(self, idx, is_scale):
-        """Layout used to form one payload slot's or scale tile's HBM offsets."""
+        """Layout used to form one payload slot's or scale slot's HBM offsets."""
         if is_scale:
             return self._scale_hbm_offset_layout.value[idx]
         return self._payload_hbm_offset_layout.value[idx]
@@ -1319,8 +1346,8 @@ class KernelLayout:
         return self._scale_ratio_non_k_slot.value[idx]
 
     @gluon.constexpr_function
-    def num_scale_tiles(self, idx):
-        return self._num_scale_tiles.value[idx]
+    def num_scale_slots(self, idx):
+        return self._num_scale_slots.value[idx]
 
     @gluon.constexpr_function
     def scale_read_k_slots(self, idx):
@@ -1342,13 +1369,14 @@ class KernelLayout:
         return ((phase + steps) // ratio) * ratio
 
     @gluon.constexpr_function
-    def scale_flat_shape(self, idx):
-        """LDS staging shape of a shuffled scale tile (one 256 B run per stripe)."""
-        return list(self._scale_flat_shape.value[idx])
+    def scale_lds_shape_scale_slot(self, idx):
+        """LDS allocation shape of one shuffled scale slot: a 256 B run per stripe."""
+        return list(self._scale_lds_shape_scale_slot.value[idx])
 
     @gluon.constexpr_function
-    def scale_load_shape(self, idx):
-        return list(self._scale_load_shape.value[idx])
+    def scale_fragment_shape_scale_slot(self, idx):
+        """u8 shape of one scale slot, its fragment's and its LDS view's."""
+        return list(self._scale_fragment_shape_scale_slot.value[idx])
 
     @gluon.constexpr_function
     def scale_dword_delta(self, delta, k=256):
@@ -1371,47 +1399,48 @@ class KernelLayout:
         return self.scale_packed_sel(idx, k_phase)
 
     @gluon.constexpr_function
-    def packed_scale_shape(self, idx):
-        """Physical i32 storage, including both K128 halves even when one is unused."""
-        return list(self._packed_scale_shape.value[idx])
+    def packed_scale_fragment_shape_slot(self, idx):
+        """i32 shape of one slot, with both K128 halves even when one is unused."""
+        return list(self._packed_scale_fragment_shape_slot.value[idx])
 
     @gluon.constexpr_function
-    def packed_scale_lds_shape2(self, idx):
-        """i32 shape of one whole scale slot: :meth:`packed_scale_frag_layout2`'s."""
-        return list(self._packed_scale_lds_shape2.value[idx])
+    def packed_scale_fragment_shape_scale_slot(self, idx):
+        """i32 shape of one scale slot, its fragment's and its LDS view's."""
+        return list(self._packed_scale_fragment_shape_scale_slot.value[idx])
 
     # -- scale layouts ------------------------------------------------------------
 
     @gluon.constexpr_function
-    def shuffled_scale_read_layout(self, idx):
-        """The [non-K, K] view of one scale slot's flat LDS run, in fragment order."""
-        return self._shuffled_scale_read_layout.value[idx]
+    def scale_lds_view_layout_scale_slot(self, idx):
+        """u8 [non-K, K] view of one scale slot's flat LDS run, in fragment order."""
+        return self._scale_lds_view_layout_scale_slot.value[idx]
 
     @gluon.constexpr_function
-    def scale_load_layout(self, idx):
-        return self._scale_load_layout.value[idx]
+    def scale_fragment_layout_scale_slot(self, idx):
+        """One whole scale slot's u8 scale, as a single copy or read lands it."""
+        return self._scale_fragment_layout_scale_slot.value[idx]
 
     @gluon.constexpr_function
-    def packed_scale_frag_layout1(self, idx):
-        """One MFMA step's i32 scale: one non-K slot by one K256 stage.
+    def packed_scale_fragment_layout_slot(self, idx):
+        """One MFMA step's i32 scale: one non-K slot by K256.
 
-        Sliced out of :meth:`packed_scale_frag_layout2`, the whole scale slot.
+        Sliced out of :meth:`packed_scale_fragment_layout_scale_slot`.
         """
-        return self._packed_scale_frag_layout1.value[idx]
+        return self._packed_scale_fragment_layout_slot.value[idx]
 
     @gluon.constexpr_function
-    def packed_scale_read_layout(self, idx):
-        """A scale slot's flat LDS run as i32: one offset bit per dword-address bit."""
-        return self._packed_scale_read_layout.value[idx]
+    def packed_scale_lds_view_layout_scale_slot(self, idx):
+        """i32 view of one scale slot's flat LDS run: an offset bit per dword bit."""
+        return self._packed_scale_lds_view_layout_scale_slot.value[idx]
 
     @gluon.constexpr_function
-    def packed_scale_frag_layout2(self, idx):
+    def packed_scale_fragment_layout_scale_slot(self, idx):
         """One whole scale slot's i32 scale, as a single copy lands it in registers.
 
         Spans ``scale_ratio_non_k_slot`` non-K slots and ``scale_slot_k / BLOCK_K``
-        steps; each :meth:`packed_scale_frag_layout1` is sliced out of it.
+        steps; each :meth:`packed_scale_fragment_layout_slot` is sliced out of it.
         """
-        return self._packed_scale_frag_layout2.value[idx]
+        return self._packed_scale_fragment_layout_scale_slot.value[idx]
 
     # -- epilogue and emitted-output layouts --------------------------------------
 
@@ -1653,12 +1682,12 @@ class KernelLayout:
             # stripe, and consecutive stripes are one whole K sweep apart. Keeping the
             # copy 1-D is what lets it vectorise -- in the [M_TILE, SK] view a lane's four
             # bytes straddle both axes and nothing can widen the access.
-            # One scale tile per M slot. It is a whole number of 32-row stripes and
-            # stripes are contiguous, so slot m_slot_idx is just the run starting
-            # m_slot_idx * (M_SLOT // 32) stripes into this pid_m's chunk.
-            # Slots sharing a scale slot get the same base
-            # offsets; only the owner actually issues the copy.
-            SCALE_FILL_SHAPE: gl.constexpr = self.scale_flat_shape(0)
+            # One scale slot per SCALE_RATIO M slots. It is a whole number of 32-row
+            # stripes and stripes are contiguous, so it is just the run starting
+            # (m_slot_idx // SCALE_RATIO) * (SCALE_M // 32) stripes into this pid_m's
+            # chunk. Slots sharing a scale slot get the same base offsets; only the
+            # owner actually issues the copy.
+            SCALE_FILL_SHAPE: gl.constexpr = self.scale_lds_shape_scale_slot(0)
             a_scale_hbm_offsets_tile = ()
             for m_slot_idx in gl.static_range(NUM_M_SLOTS):
                 a_scale_hbm_offsets_tile = a_scale_hbm_offsets_tile + (
@@ -1741,9 +1770,9 @@ class KernelLayout:
             # (N/32, K) bytes, and within a 32-row stripe lane L of a stage reads the
             # dword at stage*256 + L*4. Same shape as the A-side shuffle, but done
             # offline -- the weights are static, so this costs nothing at run time.
-            # One scale tile per N slot; stripes are contiguous, so slot n_slot_idx
-            # starts n_slot_idx * (N_SLOT // 32) stripes into this pid_n's run.
-            SCALE_FILL_SHAPE: gl.constexpr = self.scale_flat_shape(1)
+            # One scale slot per SCALE_RATIO N slots; stripes are contiguous, so it
+            # starts where its first N slot does.
+            SCALE_FILL_SHAPE: gl.constexpr = self.scale_lds_shape_scale_slot(1)
             b_scale_hbm_offsets_tile = ()
             for n_slot_idx in gl.static_range(NUM_N_SLOTS):
                 b_scale_hbm_offsets_tile = b_scale_hbm_offsets_tile + (

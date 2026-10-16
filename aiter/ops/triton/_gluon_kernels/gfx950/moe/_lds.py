@@ -74,8 +74,10 @@ def _scale_fragments(scale, cfg, layout, operand: gl.constexpr):
                         [n * layout.slot_nonk(operand) // 32, k * bk // 256, 0],
                     )
                     fragment = gl.convert_layout(
-                        gl.reshape(words, layout.packed_scale_shape(operand)),
-                        layout.packed_scale_frag_layout1(operand),
+                        gl.reshape(
+                            words, layout.packed_scale_fragment_shape_slot(operand)
+                        ),
+                        layout.packed_scale_fragment_layout_slot(operand),
                     )
             else:
                 fragment = gl.amd.slice(
@@ -260,7 +262,7 @@ class LDSManager:
                     lds_ptr = self.b_scale_lds_ptr
                 _buffer_load_to_lds(
                     lds_ptr.index(
-                        BUFFER_LOAD_IDX * layout.num_scale_tiles(operand)
+                        BUFFER_LOAD_IDX * layout.num_scale_slots(operand)
                         + non_k_slot // ratio
                     ),
                     hbm_ptr,
@@ -288,7 +290,7 @@ class LDSManager:
                             contiguity=4,
                             soffset=SOFF,
                         ),
-                        layout.scale_load_layout(operand),
+                        layout.scale_fragment_layout_scale_slot(operand),
                     )
                 fragments = _scale_fragments(scale, cfg, layout, operand)
             else:
@@ -311,33 +313,33 @@ class LDSManager:
             lds_ptr = self.b_scale_lds_ptr
         if require_constexpr(cfg.scale_shuffled(operand)):
             scale_ptr = lds_ptr.index(
-                SCALE_READ_IDX * layout.num_scale_tiles(operand)
+                SCALE_READ_IDX * layout.num_scale_slots(operand)
                 + non_k_slot // layout.scale_ratio_non_k_slot(operand)
             )
             if require_constexpr(layout.scale_packed_ok(operand)):
                 scale = _ds_read(
                     scale_ptr.reinterpret(
                         gl.int32,
-                        layout.packed_scale_lds_shape2(operand),
-                        layout.packed_scale_read_layout(operand),
+                        layout.packed_scale_fragment_shape_scale_slot(operand),
+                        layout.packed_scale_lds_view_layout_scale_slot(operand),
                     ),
-                    layout.packed_scale_frag_layout2(operand),
+                    layout.packed_scale_fragment_layout_scale_slot(operand),
                 )
             else:
                 scale = _ds_read(
                     scale_ptr.reinterpret(
                         gl.uint8,
-                        layout.scale_load_shape(operand),
-                        layout.shuffled_scale_read_layout(operand),
+                        layout.scale_fragment_shape_scale_slot(operand),
+                        layout.scale_lds_view_layout_scale_slot(operand),
                     ),
-                    layout.scale_load_layout(operand),
+                    layout.scale_fragment_layout_scale_slot(operand),
                 )
             fragments = _scale_fragments(scale, cfg, layout, operand)
         else:
             fragments = (
                 _ds_read(
                     lds_ptr.index(
-                        SCALE_READ_IDX * layout.num_scale_tiles(operand) + non_k_slot
+                        SCALE_READ_IDX * layout.num_scale_slots(operand) + non_k_slot
                     ),
                     layout.dot_operand_fragment_layout(operand, True),
                 ),
