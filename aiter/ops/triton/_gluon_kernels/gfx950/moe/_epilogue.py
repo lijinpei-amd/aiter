@@ -644,7 +644,7 @@ def _epilogue_store(
     # Allocated here so it dominates every use; the pipeline's buffers are dead by this
     # point, so Triton's liveness-based shared allocator overlays this on top of them
     # and the kernel's LDS footprint does not grow at all.
-    QSH: gl.constexpr = layout.identity_lds_layout
+    QSH: gl.constexpr = layout.quant_staging_layout
     ROT: gl.constexpr = layout.quant_staging_rotates
     # Split stages the whole block, not one slot: NM slots into one buffer, flushed
     # once at the end of the walk. Costs NM x the LDS (still a few KB, overlaid on the
