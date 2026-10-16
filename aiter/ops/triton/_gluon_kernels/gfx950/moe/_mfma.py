@@ -43,7 +43,7 @@ def _dot(
                 127,
                 gl.uint8,
                 gl.amd.cdna4.get_mfma_scale_layout(
-                    layout.dot_operand_fragment_layout(0, False),
+                    layout.fragment_layout(0, False),
                     layout.fragment_shape_slot(0, True),
                 ),
             )
@@ -53,7 +53,7 @@ def _dot(
                 127,
                 gl.uint8,
                 gl.amd.cdna4.get_mfma_scale_layout(
-                    layout.dot_operand_fragment_layout(1, False),
+                    layout.fragment_layout(1, False),
                     layout.fragment_shape_slot(1, True),
                 ),
             )

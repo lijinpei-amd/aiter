@@ -86,7 +86,7 @@ class _ScheduleConfig:
     def scale_ratio_non_k_slot(self, idx):
         return self.a_scale_ratio if idx == 0 else 1
 
-    def num_scale_slots(self, idx):
+    def scale_num_slots(self, idx):
         return self.num_lds_slots_non_k(idx) // self.scale_ratio_non_k_slot(idx)
 
     def scale_slot_k(self, idx):

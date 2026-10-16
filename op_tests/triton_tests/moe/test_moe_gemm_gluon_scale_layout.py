@@ -113,7 +113,7 @@ def _byte_fragment_layout(layout, operand, shape):
     oracle the i32 layouts are checked against.
     """
     return gl.amd.cdna4.get_mfma_scale_layout(
-        layout.dot_operand_fragment_layout(operand, False), shape, 32
+        layout.fragment_layout(operand, False), shape, 32
     )
 
 
@@ -163,7 +163,7 @@ def test_packed_words_and_selectors_match_producer(
         operand,
         [layout.slot_nonk(operand), maybe_unwrap(layout.scale_block_k_storage)],
     )
-    word_layout = layout.dot_operand_fragment_layout(operand, True)
+    word_layout = layout.fragment_layout(operand, True)
     word_shape = layout.fragment_shape_slot(operand, True)
     producer = _producer_byte_coordinates((slot_m, slot_n)[operand])
     assert word_shape[0] * word_shape[1] * 4 == len(producer)

@@ -75,7 +75,7 @@ def _scale_fragments(scale, cfg, layout, operand: gl.constexpr):
                     )
                     fragment = gl.convert_layout(
                         gl.reshape(words, layout.fragment_shape_slot(operand, True)),
-                        layout.dot_operand_fragment_layout(operand, True),
+                        layout.fragment_layout(operand, True),
                     )
             else:
                 fragment = gl.amd.slice(
@@ -139,7 +139,7 @@ class LDSManager:
             a_payload_lds_ptr = gl.allocate_shared_memory(
                 a_ty,
                 layout.lds_shape_tile(0, False),
-                layout=layout.dot_operand_lds_layout(0, False),
+                layout=layout.lds_layout(0, False),
             )
         else:
             a_payload_lds_ptr: gl.constexpr = None
@@ -147,7 +147,7 @@ class LDSManager:
             b_payload_lds_ptr = gl.allocate_shared_memory(
                 b_ty,
                 layout.lds_shape_tile(1, False),
-                layout=layout.dot_operand_lds_layout(1, False),
+                layout=layout.lds_layout(1, False),
             )
         else:
             b_payload_lds_ptr: gl.constexpr = None
@@ -157,7 +157,7 @@ class LDSManager:
             a_scale_lds_ptr = gl.allocate_shared_memory(
                 gl.uint8,
                 layout.lds_shape_tile(0, True),
-                layout=layout.dot_operand_lds_layout(0, True),
+                layout=layout.lds_layout(0, True),
             )
         else:
             a_scale_lds_ptr: gl.constexpr = None
@@ -167,7 +167,7 @@ class LDSManager:
             b_scale_lds_ptr = gl.allocate_shared_memory(
                 gl.uint8,
                 layout.lds_shape_tile(1, True),
-                layout=layout.dot_operand_lds_layout(1, True),
+                layout=layout.lds_layout(1, True),
             )
         else:
             b_scale_lds_ptr: gl.constexpr = None
@@ -260,7 +260,7 @@ class LDSManager:
                     lds_ptr = self.b_scale_lds_ptr
                 _buffer_load_to_lds(
                     lds_ptr.index(
-                        BUFFER_LOAD_IDX * layout.num_scale_slots(operand)
+                        BUFFER_LOAD_IDX * layout.scale_num_slots(operand)
                         + non_k_slot // ratio
                     ),
                     hbm_ptr,
@@ -311,7 +311,7 @@ class LDSManager:
             lds_ptr = self.b_scale_lds_ptr
         if require_constexpr(cfg.scale_shuffled(operand)):
             scale_ptr = lds_ptr.index(
-                SCALE_READ_IDX * layout.num_scale_slots(operand)
+                SCALE_READ_IDX * layout.scale_num_slots(operand)
                 + non_k_slot // layout.scale_ratio_non_k_slot(operand)
             )
             scale = _ds_read(
@@ -327,9 +327,9 @@ class LDSManager:
             fragments = (
                 _ds_read(
                     lds_ptr.index(
-                        SCALE_READ_IDX * layout.num_scale_slots(operand) + non_k_slot
+                        SCALE_READ_IDX * layout.scale_num_slots(operand) + non_k_slot
                     ),
-                    layout.dot_operand_fragment_layout(operand, True),
+                    layout.fragment_layout(operand, True),
                 ),
             )
         return fragments
@@ -373,7 +373,7 @@ class LDSManager:
                 payload_lds_ptr.index(
                     DS_READ_IDX * layout.num_lds_slots_non_k(operand) + non_k_slot
                 ),
-                layout.dot_operand_fragment_layout(operand, False),
+                layout.fragment_layout(operand, False),
             )
         if require_constexpr(READ_SCALE and self.func_cfg.has_scale(operand)):
             gl.static_assert(

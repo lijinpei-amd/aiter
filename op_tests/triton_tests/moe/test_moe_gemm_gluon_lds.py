@@ -27,7 +27,7 @@ def _register_load_copy(
     layout = KernelLayout(tc)
     lds = LDSManager.alloc(tc.func_cfg, tc, layout)
     shape: gl.constexpr = layout.lds_shape_slot(operand, SCALE)
-    frag_layout: gl.constexpr = layout.dot_operand_fragment_layout(operand, SCALE)
+    frag_layout: gl.constexpr = layout.fragment_layout(operand, SCALE)
     rows = gl.arange(0, shape[0], layout=gl.SliceLayout(1, frag_layout))
     cols = gl.arange(0, shape[1], layout=gl.SliceLayout(0, frag_layout))
     offsets = rows[:, None] * shape[1] + cols[None, :]
