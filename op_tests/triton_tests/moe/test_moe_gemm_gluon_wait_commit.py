@@ -83,16 +83,16 @@ class _ScheduleConfig:
     def scale_shuffled(self, idx):
         return idx == 0 and self.a_scale_ratio > 1
 
-    def scale_ratio_non_k_slot(self, idx):
+    def scale_slot_ratio_non_k(self, idx):
         return self.a_scale_ratio if idx == 0 else 1
 
     def scale_num_slots(self, idx):
-        return self.num_lds_slots_non_k(idx) // self.scale_ratio_non_k_slot(idx)
+        return self.num_lds_slots_non_k(idx) // self.scale_slot_ratio_non_k(idx)
 
     def scale_slot_k(self, idx):
         return 256
 
-    def scale_ratio_k_step(self, idx):
+    def scale_slot_ratio_k(self, idx):
         return 1
 
     def buffer_live_span(self, idx, scale=False):
@@ -102,7 +102,7 @@ class _ScheduleConfig:
         return 3
 
     def scale_read_k_slots(self, idx):
-        return self.scale_ratio_k_step(idx)
+        return self.scale_slot_ratio_k(idx)
 
     def scale_cache_fragments(self, idx):
         return self.num_lds_slots_non_k(idx) * self.scale_read_k_slots(idx)

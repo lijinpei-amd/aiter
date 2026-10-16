@@ -1443,8 +1443,8 @@ def _sorted_shuffle_a_scales(x_scales, routing_data, gather_indx, K, cfg):
     if x_scales is None or gather_indx is None:
         return None
     block_m = int(cfg["BLOCK_M"])
-    # Mirrors KernelLayout.sorted_shuffled_ok: the permutation is carried by the
-    # LDS tile's layout. A shuffled scale load covers an integer number of BLOCK_K
+    # Mirrors KernelLayout.payload_a_sorted_shuffled_ok: the permutation is carried by
+    # the LDS tile's layout. A shuffled scale load covers an integer number of BLOCK_K
     # payload steps; K128 therefore retains each packed K256 group for two steps.
     if (
         not _scale_shuffle_supported(cfg, 0)

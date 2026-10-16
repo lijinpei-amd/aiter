@@ -206,7 +206,7 @@ def dump_case(name, cfg, dq_a, dq_b, K, out):
         out(f"  {CNAME[c]} D={schedule.ring_depth(c)} R={schedule.ratio_k(c)} "
             f"L={schedule.live_span(c)} F={schedule.fill_span(c)} "
             f"via_lds={schedule.via_lds(c)} pphase={schedule.producer_phase(c)} "
-            f"nonk_ratio={layout.scale_ratio_non_k_slot(c[0])} "
+            f"nonk_ratio={layout.scale_slot_ratio_non_k(c[0])} "
             f"fill_slots={tuple(schedule.fill_slot(c, t) for t in range(non_k_slots))} "
             f"read_slots={tuple(schedule.read_slot(c, t) for t in range(non_k_slots))} "
             f"in_mfma={tuple(schedule.read_in_mfma(c, t) for t in range(non_k_slots))}")

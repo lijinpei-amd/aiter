@@ -57,11 +57,11 @@ def _scale_fragments(scale, cfg, layout, operand: gl.constexpr):
     bk: gl.constexpr = cfg.BLOCK_K
     packed: gl.constexpr = layout.scale_packed_ok(operand)
     fragments = ()
-    for n in gl.static_range(layout.scale_ratio_non_k_slot(operand)):
+    for n in gl.static_range(layout.scale_slot_ratio_non_k(operand)):
         for k in gl.static_range(sk // bk):
             if require_constexpr(packed):
                 if require_constexpr(
-                    layout.scale_ratio_non_k_slot(operand) == 1 and sk == max(256, bk)
+                    layout.scale_slot_ratio_non_k(operand) == 1 and sk == max(256, bk)
                 ):
                     fragment = scale
                 else:
@@ -247,7 +247,7 @@ class LDSManager:
             if operand == 0
             else cfg.expert_scale_cache_modifier
         )
-        ratio: gl.constexpr = layout.scale_ratio_non_k_slot(operand)
+        ratio: gl.constexpr = layout.scale_slot_ratio_non_k(operand)
         if require_constexpr(VIA_LDS):
             if require_constexpr(
                 self.func_cfg.has_scale(operand)
@@ -312,7 +312,7 @@ class LDSManager:
         if require_constexpr(cfg.scale_shuffled(operand)):
             scale_ptr = lds_ptr.index(
                 SCALE_READ_IDX * layout.scale_num_slots(operand)
-                + non_k_slot // layout.scale_ratio_non_k_slot(operand)
+                + non_k_slot // layout.scale_slot_ratio_non_k(operand)
             )
             scale = _ds_read(
                 scale_ptr.reinterpret(
@@ -380,7 +380,7 @@ class LDSManager:
                 layout.component_via_lds((operand, True)),
                 "ds_read_frag only reads LDS-staged scales",
             )
-            ratio: gl.constexpr = layout.scale_ratio_non_k_slot(operand)
+            ratio: gl.constexpr = layout.scale_slot_ratio_non_k(operand)
             fragments = self.ds_read_scale(
                 operand, SCALE_READ_IDX, non_k_slot // ratio * ratio
             )

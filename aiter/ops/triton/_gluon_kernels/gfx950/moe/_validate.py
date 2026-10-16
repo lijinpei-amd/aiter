@@ -73,7 +73,7 @@ def validate(tc, N, K, layout=None):
 
     if not tc.UNROLL_EPILOGUE.value:
         for idx in (0, 1):
-            assert not fc.has_scale(idx) or layout.scale_ratio_k_step(idx) == 1, (
+            assert not fc.has_scale(idx) or layout.scale_slot_ratio_k(idx) == 1, (
                 "UNROLL_EPILOGUE=False requires every active scale to advance "
                 "once per payload step"
             )

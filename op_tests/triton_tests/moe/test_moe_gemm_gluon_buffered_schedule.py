@@ -88,7 +88,7 @@ class _Config(_ScheduleConfig):
 
     def buffer_live_span(self, operand, scale=False):
         return (self.num_buffers(operand, scale) - 1) * (
-            self.scale_ratio_k_step(operand) if scale else 1
+            self.scale_slot_ratio_k(operand) if scale else 1
         ) + 1
 
     def active_components(self):
@@ -112,14 +112,14 @@ class _Config(_ScheduleConfig):
 
     num_k_slots = num_prefetch_k_slots = 1
 
-    def scale_ratio_k_step(self, operand):
+    def scale_slot_ratio_k(self, operand):
         return self.scale_steps[operand] if self.has_scale(operand) else 1
 
-    def scale_ratio_non_k_slot(self, operand):
+    def scale_slot_ratio_non_k(self, operand):
         return self.scale_non_k_slots[operand]
 
     def scale_read_k_slots(self, operand):
-        return self.num_k_slots * self.scale_ratio_k_step(operand)
+        return self.num_k_slots * self.scale_slot_ratio_k(operand)
 
     def scale_cache_fragments(self, operand):
         return self.num_lds_slots_non_k(operand) * self.scale_read_k_slots(operand)
@@ -194,8 +194,8 @@ class _Machine:
         tc = self.tc
         operand, is_scale = component
         tile = pointer
-        ratio = tc.scale_ratio_k_step(operand) if is_scale else 1
-        nonk = tc.scale_ratio_non_k_slot(operand) if is_scale else 1
+        ratio = tc.scale_slot_ratio_k(operand) if is_scale else 1
+        nonk = tc.scale_slot_ratio_non_k(operand) if is_scale else 1
         mk = tc.num_k_slots
         assert 0 <= tile < self.num_k, "HBM load exceeded the K strip"
         live_span = (tc.depths[component] - 1) * ratio + 1
@@ -286,8 +286,8 @@ class _Machine:
                     component
                 ):
                     if component[1] and (
-                        self.current_read % tc.scale_ratio_k_step(operand)
-                        or mini % tc.scale_ratio_non_k_slot(operand)
+                        self.current_read % tc.scale_slot_ratio_k(operand)
+                        or mini % tc.scale_slot_ratio_non_k(operand)
                     ):
                         continue
                     required.add((component, mini, self.current_read))
@@ -382,8 +382,8 @@ class _Machine:
                         (
                             scale.component,
                             scale.mini
-                            - scale.mini % tc.scale_ratio_non_k_slot(operand),
-                            accumulator - accumulator % tc.scale_ratio_k_step(operand),
+                            - scale.mini % tc.scale_slot_ratio_non_k(operand),
+                            accumulator - accumulator % tc.scale_slot_ratio_k(operand),
                         )
                     )
         token = a[0].mini, b[0].mini, accumulator
@@ -466,7 +466,7 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         operand = args[5]
         component = (operand, SCALE)
         if tc.component_in_reg(component):
-            ratio = tc.scale_ratio_k_step(operand)
+            ratio = tc.scale_slot_ratio_k(operand)
             machine.events.append(
                 (
                     machine.current_read,
@@ -572,12 +572,12 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         for mini in range(
             0,
             tc.nm if component[0] == A else tc.nn,
-            tc.scale_ratio_non_k_slot(component[0]) if component[1] else 1,
+            tc.scale_slot_ratio_non_k(component[0]) if component[1] else 1,
         )
         for tile in range(
             0,
             num_k,
-            tc.scale_ratio_k_step(component[0]) if component[1] else 1,
+            tc.scale_slot_ratio_k(component[0]) if component[1] else 1,
         )
     }
     assert machine.loads == expected
@@ -1067,7 +1067,7 @@ def test_every_payload_tile_is_filled_exactly_once(nm, nn, middle):
             for non_k_slot in (schedule.owned(slot)[COMPONENTS.index(component)],)
             if non_k_slot is not None
         ]
-        ratio = tc.scale_ratio_non_k_slot(component[0]) if component[1] else 1
+        ratio = tc.scale_slot_ratio_non_k(component[0]) if component[1] else 1
         expected = [t for t in range(non_k_slots) if t % ratio == 0]
         assert sorted(owners) == expected, (component, owners, expected)
 
