@@ -359,7 +359,11 @@ class KernelLayout:
     evaluated from the stored scalars; there is nothing to precompute for them.
     """
 
-    # -- tile and slot geometry --
+    # Grouped by what they describe: the tile, the operands (payload, scale, packed
+    # scale), the result and the epilogue. Each value keeps its fields together:
+    # scalars, then shapes, then layouts, each from HBM through LDS to registers and
+    # from the whole tile down to one slot.
+    # -- tile --
     _BLOCK_N: gl.constexpr
     _BLOCK_K: gl.constexpr
     _mfma_instr_shape: gl.constexpr
@@ -373,34 +377,27 @@ class KernelLayout:
     num_m_slots: gl.constexpr
     #: N slots per tile. Operand B and the accumulator split by this.
     num_n_slots: gl.constexpr
+    # -- operand placement --
+    _component_via_lds: gl.constexpr
+    # -- operand payload --
+    _slot_nonk: gl.constexpr
     _num_lds_slots_non_k: gl.constexpr
     _payload_block_k_storage: gl.constexpr
-    #: E8M0 elements along K in one pipeline stage.
-    scale_block_k_storage: gl.constexpr
-    _payload_fragment_shape_slot: gl.constexpr
-    _scale_fragment_shape_slot: gl.constexpr
-    #: Shape of one slot's accumulator.
-    accumulator_fragment_shape_slot: gl.constexpr
-    _payload_lds_shape_slot: gl.constexpr
-    _scale_lds_shape_slot: gl.constexpr
-    _payload_lds_shape_tile: gl.constexpr
-    _scale_lds_shape_tile: gl.constexpr
+    _payload_hbm_step: gl.constexpr
     _copy_contiguity: gl.constexpr
     _k_width_for: gl.constexpr
-    _payload_hbm_step: gl.constexpr
     _lds_unit_rows: gl.constexpr
     _byte_unit_lds_ok: gl.constexpr
-    # -- storage placement --
-    _component_via_lds: gl.constexpr
-    # -- payload layouts --
-    #: AMDMFMALayout for dot / scaled-dot results in register.
-    dot_result_fragment_layout: gl.constexpr
-    _dot_operand_fragment_layout: gl.constexpr
-    _dot_operand_lds_layout: gl.constexpr
-    _dot_operand_buffer_load_lds_layout: gl.constexpr
+    _payload_lds_shape_tile: gl.constexpr
+    _payload_lds_shape_slot: gl.constexpr
+    _payload_fragment_shape_slot: gl.constexpr
     _payload_hbm_offset_layout: gl.constexpr
-    # -- scale geometry --
-    _slot_nonk: gl.constexpr
+    _dot_operand_buffer_load_lds_layout: gl.constexpr
+    _dot_operand_lds_layout: gl.constexpr
+    _dot_operand_fragment_layout: gl.constexpr
+    # -- operand scale --
+    #: E8M0 elements along K in one pipeline stage.
+    scale_block_k_storage: gl.constexpr
     _scale_slot_nonk: gl.constexpr
     _scale_slot_k: gl.constexpr
     _scale_ratio_k_step: gl.constexpr
@@ -408,23 +405,10 @@ class KernelLayout:
     _num_scale_slots: gl.constexpr
     _scale_read_k_slots: gl.constexpr
     _scale_cache_fragments: gl.constexpr
-    _scale_lds_shape_scale_slot: gl.constexpr
     #: Does the tile match the layout the C++ A-scale shuffle writes?
     sorted_shuffled_ok: gl.constexpr
-    _scale_fragment_shape_scale_slot: gl.constexpr
-    _scale_packed_ok: gl.constexpr
-    _scale_packed_sel: gl.constexpr
-    #: Whether either live MFMA scale operand uses packed dword storage.
-    has_mfma_packed_scale: gl.constexpr
-    _packed_scale_fragment_shape_slot: gl.constexpr
-    _packed_scale_fragment_shape_scale_slot: gl.constexpr
-    # -- scale layouts --
-    _dot_operand_scale_fragment_layout: gl.constexpr
-    _dot_operand_scale_lds_layout: gl.constexpr
-    _dot_operand_scale_buffer_load_lds_layout: gl.constexpr
-    _scale_hbm_offset_layout: gl.constexpr
     # A shuffled scale is read a whole scale slot at a time and split into per-slot
-    # fragments in registers. These names spell out what, where and how much:
+    # fragments in registers. Its shapes and layouts spell out what, where and how much:
     # `[packed_]scale_<fragment|lds_view>_<layout|shape>_<slot|scale_slot>`.
     # - `packed_`: i32, a dword's four E8M0 bytes folded into one register; else u8.
     # - `fragment`: registers. `lds_view`: the LDS view a `ds_read` reads from. The two
@@ -436,32 +420,53 @@ class KernelLayout:
     #   have the same extent, they cover the same tensor.
     # The u8 slot fragment is the shared `dot_operand_fragment_layout(idx, True)`. LDS
     # is never read a slot at a time, so no `lds_view` is per slot.
+    _scale_lds_shape_tile: gl.constexpr
+    _scale_lds_shape_scale_slot: gl.constexpr
+    _scale_lds_shape_slot: gl.constexpr
+    _scale_fragment_shape_scale_slot: gl.constexpr
+    _scale_fragment_shape_slot: gl.constexpr
+    _scale_hbm_offset_layout: gl.constexpr
+    _dot_operand_scale_buffer_load_lds_layout: gl.constexpr
+    _dot_operand_scale_lds_layout: gl.constexpr
     _scale_lds_view_layout_scale_slot: gl.constexpr
     _scale_fragment_layout_scale_slot: gl.constexpr
-    _packed_scale_fragment_layout_slot: gl.constexpr
+    _dot_operand_scale_fragment_layout: gl.constexpr
+    # -- operand packed scale --
+    _scale_packed_ok: gl.constexpr
+    _scale_packed_sel: gl.constexpr
+    #: Whether either live MFMA scale operand uses packed dword storage.
+    has_mfma_packed_scale: gl.constexpr
+    _packed_scale_fragment_shape_scale_slot: gl.constexpr
+    _packed_scale_fragment_shape_slot: gl.constexpr
     _packed_scale_lds_view_layout_scale_slot: gl.constexpr
     _packed_scale_fragment_layout_scale_slot: gl.constexpr
+    _packed_scale_fragment_layout_slot: gl.constexpr
+    # -- result --
+    acc_vgprs_per_lane: gl.constexpr
+    #: Shape of one slot's accumulator.
+    accumulator_fragment_shape_slot: gl.constexpr
+    #: AMDMFMALayout for dot / scaled-dot results in register.
+    dot_result_fragment_layout: gl.constexpr
     # -- epilogue --
     #: Emitted columns produced by one N slot.
     output_n_slot: gl.constexpr
     #: Emitted columns produced by the tile's raw BLOCK_N columns.
     output_block_n: gl.constexpr
     epilogue_threads: gl.constexpr
-    epilogue_bias_per_thread: gl.constexpr
-    epilogue_input_lds_layout: gl.constexpr
-    epilogue_gamma_buffer_load_lds_layout: gl.constexpr
-    epilogue_bias_buffer_load_lds_layout: gl.constexpr
-    epilogue_gamma_shape: gl.constexpr
-    epilogue_bias_shape: gl.constexpr
     #: Whether bias/gamma vectors are staged through LDS.
     epilogue_inputs_via_lds: gl.constexpr
-    quant_staging_layout: gl.constexpr
+    epilogue_input_lds_layout: gl.constexpr
+    epilogue_gamma_shape: gl.constexpr
+    epilogue_gamma_buffer_load_lds_layout: gl.constexpr
+    epilogue_bias_per_thread: gl.constexpr
+    epilogue_bias_shape: gl.constexpr
+    epilogue_bias_buffer_load_lds_layout: gl.constexpr
     quant_staging_rows: gl.constexpr
     #: Whether the fused-quant staging alternates two per-slot LDS banks.
     quant_staging_rotates: gl.constexpr
+    quant_staging_layout: gl.constexpr
     # -- resources --
     lds_bytes: gl.constexpr
-    acc_vgprs_per_lane: gl.constexpr
 
     @gluon.constexpr_function
     def __init__(self, tuning_cfg):
@@ -472,7 +477,7 @@ class KernelLayout:
         whose tile lattice is unsound (``ok`` below) still gets its scalar geometry,
         but its layout objects are ``None``; ``_validate.validate_layout`` rejects it.
 
-        One pass in dependency order, sectioned like the fields. Each quantity is
+        One pass in dependency order, not in field order. Each quantity is
         computed once, as a local that later quantities read, and per-operand values
         are ``(A, B)`` tuples. The gates are load-bearing, not an optimisation:
         ``None`` is the documented value of a layout that does not exist for this
@@ -1071,7 +1076,7 @@ class KernelLayout:
         # Stored last, in declaration order: an aggregate accepts nothing but its
         # annotated fields, so every intermediate above stays a local.
 
-        # tile and slot geometry
+        # tile
         self._BLOCK_N = gl.constexpr(BN)
         self._BLOCK_K = gl.constexpr(BK)
         self._mfma_instr_shape = gl.constexpr(list(instr))
@@ -1081,38 +1086,31 @@ class KernelLayout:
         self.num_prefetch_k_slots = gl.constexpr(num_prefetch_k_slots)
         self.num_m_slots = gl.constexpr(num_m_slots)
         self.num_n_slots = gl.constexpr(num_n_slots)
-        self._num_lds_slots_non_k = gl.constexpr(num_lds_slots_non_k)
-        self._payload_block_k_storage = gl.constexpr(payload_block_k_storage)
-        self.scale_block_k_storage = gl.constexpr(scale_block_k_storage)
-        self._payload_fragment_shape_slot = gl.constexpr(payload_fragment_shape_slot)
-        self._scale_fragment_shape_slot = gl.constexpr(scale_fragment_shape_slot)
-        self.accumulator_fragment_shape_slot = gl.constexpr(
-            accumulator_fragment_shape_slot
-        )
-        self._payload_lds_shape_slot = gl.constexpr(payload_lds_shape_slot)
-        self._scale_lds_shape_slot = gl.constexpr(scale_lds_shape_slot)
-        self._payload_lds_shape_tile = gl.constexpr(payload_lds_shape_tile)
-        self._scale_lds_shape_tile = gl.constexpr(scale_lds_shape_tile)
-        self._copy_contiguity = gl.constexpr(copy_contiguity)
-        self._k_width_for = gl.constexpr(k_width_for)
-        self._payload_hbm_step = gl.constexpr(payload_hbm_step)
-        self._lds_unit_rows = gl.constexpr(lds_unit_rows)
-        self._byte_unit_lds_ok = gl.constexpr(byte_unit_lds_ok)
 
-        # storage placement
+        # operand placement
         self._component_via_lds = gl.constexpr(component_via_lds)
 
-        # payload layouts
-        self.dot_result_fragment_layout = gl.constexpr(dot_result_fragment_layout)
-        self._dot_operand_fragment_layout = gl.constexpr(dot_operand_fragment_layout)
-        self._dot_operand_lds_layout = gl.constexpr(dot_operand_lds_layout)
+        # operand payload
+        self._slot_nonk = gl.constexpr(slot_nonk)
+        self._num_lds_slots_non_k = gl.constexpr(num_lds_slots_non_k)
+        self._payload_block_k_storage = gl.constexpr(payload_block_k_storage)
+        self._payload_hbm_step = gl.constexpr(payload_hbm_step)
+        self._copy_contiguity = gl.constexpr(copy_contiguity)
+        self._k_width_for = gl.constexpr(k_width_for)
+        self._lds_unit_rows = gl.constexpr(lds_unit_rows)
+        self._byte_unit_lds_ok = gl.constexpr(byte_unit_lds_ok)
+        self._payload_lds_shape_tile = gl.constexpr(payload_lds_shape_tile)
+        self._payload_lds_shape_slot = gl.constexpr(payload_lds_shape_slot)
+        self._payload_fragment_shape_slot = gl.constexpr(payload_fragment_shape_slot)
+        self._payload_hbm_offset_layout = gl.constexpr(payload_hbm_offset_layout)
         self._dot_operand_buffer_load_lds_layout = gl.constexpr(
             dot_operand_buffer_load_lds_layout
         )
-        self._payload_hbm_offset_layout = gl.constexpr(payload_hbm_offset_layout)
+        self._dot_operand_lds_layout = gl.constexpr(dot_operand_lds_layout)
+        self._dot_operand_fragment_layout = gl.constexpr(dot_operand_fragment_layout)
 
-        # scale geometry
-        self._slot_nonk = gl.constexpr(slot_nonk)
+        # operand scale
+        self.scale_block_k_storage = gl.constexpr(scale_block_k_storage)
         self._scale_slot_nonk = gl.constexpr(scale_slot_nonk)
         self._scale_slot_k = gl.constexpr(scale_slot_k)
         self._scale_ratio_k_step = gl.constexpr(scale_ratio_k_step)
@@ -1120,38 +1118,38 @@ class KernelLayout:
         self._num_scale_slots = gl.constexpr(num_scale_slots)
         self._scale_read_k_slots = gl.constexpr(scale_read_k_slots)
         self._scale_cache_fragments = gl.constexpr(scale_cache_fragments)
-        self._scale_lds_shape_scale_slot = gl.constexpr(scale_lds_shape_scale_slot)
         self.sorted_shuffled_ok = gl.constexpr(sorted_shuffled_ok)
+        self._scale_lds_shape_tile = gl.constexpr(scale_lds_shape_tile)
+        self._scale_lds_shape_scale_slot = gl.constexpr(scale_lds_shape_scale_slot)
+        self._scale_lds_shape_slot = gl.constexpr(scale_lds_shape_slot)
         self._scale_fragment_shape_scale_slot = gl.constexpr(
             scale_fragment_shape_scale_slot
         )
-        self._scale_packed_ok = gl.constexpr(scale_packed_ok)
-        self._scale_packed_sel = gl.constexpr(scale_packed_sel)
-        self.has_mfma_packed_scale = gl.constexpr(has_mfma_packed_scale)
-        self._packed_scale_fragment_shape_slot = gl.constexpr(
-            packed_scale_fragment_shape_slot
-        )
-        self._packed_scale_fragment_shape_scale_slot = gl.constexpr(
-            packed_scale_fragment_shape_scale_slot
-        )
-
-        # scale layouts
-        self._dot_operand_scale_fragment_layout = gl.constexpr(
-            dot_operand_scale_fragment_layout
-        )
-        self._dot_operand_scale_lds_layout = gl.constexpr(dot_operand_scale_lds_layout)
+        self._scale_fragment_shape_slot = gl.constexpr(scale_fragment_shape_slot)
+        self._scale_hbm_offset_layout = gl.constexpr(scale_hbm_offset_layout)
         self._dot_operand_scale_buffer_load_lds_layout = gl.constexpr(
             dot_operand_scale_buffer_load_lds_layout
         )
-        self._scale_hbm_offset_layout = gl.constexpr(scale_hbm_offset_layout)
+        self._dot_operand_scale_lds_layout = gl.constexpr(dot_operand_scale_lds_layout)
         self._scale_lds_view_layout_scale_slot = gl.constexpr(
             scale_lds_view_layout_scale_slot
         )
         self._scale_fragment_layout_scale_slot = gl.constexpr(
             scale_fragment_layout_scale_slot
         )
-        self._packed_scale_fragment_layout_slot = gl.constexpr(
-            packed_scale_fragment_layout_slot
+        self._dot_operand_scale_fragment_layout = gl.constexpr(
+            dot_operand_scale_fragment_layout
+        )
+
+        # operand packed scale
+        self._scale_packed_ok = gl.constexpr(scale_packed_ok)
+        self._scale_packed_sel = gl.constexpr(scale_packed_sel)
+        self.has_mfma_packed_scale = gl.constexpr(has_mfma_packed_scale)
+        self._packed_scale_fragment_shape_scale_slot = gl.constexpr(
+            packed_scale_fragment_shape_scale_slot
+        )
+        self._packed_scale_fragment_shape_slot = gl.constexpr(
+            packed_scale_fragment_shape_slot
         )
         self._packed_scale_lds_view_layout_scale_slot = gl.constexpr(
             packed_scale_lds_view_layout_scale_slot
@@ -1159,29 +1157,38 @@ class KernelLayout:
         self._packed_scale_fragment_layout_scale_slot = gl.constexpr(
             packed_scale_fragment_layout_scale_slot
         )
+        self._packed_scale_fragment_layout_slot = gl.constexpr(
+            packed_scale_fragment_layout_slot
+        )
+
+        # result
+        self.acc_vgprs_per_lane = gl.constexpr(acc_vgprs_per_lane)
+        self.accumulator_fragment_shape_slot = gl.constexpr(
+            accumulator_fragment_shape_slot
+        )
+        self.dot_result_fragment_layout = gl.constexpr(dot_result_fragment_layout)
 
         # epilogue
         self.output_n_slot = gl.constexpr(output_n_slot)
         self.output_block_n = gl.constexpr(output_block_n)
         self.epilogue_threads = gl.constexpr(epilogue_threads)
-        self.epilogue_bias_per_thread = gl.constexpr(epilogue_bias_per_thread)
+        self.epilogue_inputs_via_lds = gl.constexpr(epilogue_inputs_via_lds)
         self.epilogue_input_lds_layout = gl.constexpr(epilogue_input_lds_layout)
+        self.epilogue_gamma_shape = gl.constexpr(epilogue_gamma_shape)
         self.epilogue_gamma_buffer_load_lds_layout = gl.constexpr(
             epilogue_gamma_buffer_load_lds_layout
         )
+        self.epilogue_bias_per_thread = gl.constexpr(epilogue_bias_per_thread)
+        self.epilogue_bias_shape = gl.constexpr(epilogue_bias_shape)
         self.epilogue_bias_buffer_load_lds_layout = gl.constexpr(
             epilogue_bias_buffer_load_lds_layout
         )
-        self.epilogue_gamma_shape = gl.constexpr(epilogue_gamma_shape)
-        self.epilogue_bias_shape = gl.constexpr(epilogue_bias_shape)
-        self.epilogue_inputs_via_lds = gl.constexpr(epilogue_inputs_via_lds)
-        self.quant_staging_layout = gl.constexpr(quant_staging_layout)
         self.quant_staging_rows = gl.constexpr(quant_staging_rows)
         self.quant_staging_rotates = gl.constexpr(quant_staging_rotates)
+        self.quant_staging_layout = gl.constexpr(quant_staging_layout)
 
         # resources
         self.lds_bytes = gl.constexpr(lds_bytes)
-        self.acc_vgprs_per_lane = gl.constexpr(acc_vgprs_per_lane)
 
     # -- tile and slot geometry --------------------------------------------------
 
