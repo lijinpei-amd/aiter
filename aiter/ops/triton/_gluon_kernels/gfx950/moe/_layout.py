@@ -393,16 +393,16 @@ class KernelLayout:
     scale_block_k_storage: gl.constexpr
     _scale_slot_nonk: gl.constexpr
     _scale_slot_k: gl.constexpr
-    _scale_ratio_k_step: gl.constexpr
-    _scale_ratio_non_k_slot: gl.constexpr
+    _scale_slot_ratio_k: gl.constexpr
+    _scale_slot_ratio_non_k: gl.constexpr
     _scale_num_slots: gl.constexpr
     _scale_cache_fragments: gl.constexpr
     #: Does the tile match the layout the C++ A-scale shuffle writes?
-    sorted_shuffled_ok: gl.constexpr
+    payload_a_sorted_shuffled_ok: gl.constexpr
     _scale_packed_ok: gl.constexpr
     _scale_packed_sel: gl.constexpr
     #: Whether either live MFMA scale operand uses packed dword storage.
-    has_mfma_packed_scale: gl.constexpr
+    any_scale_packed: gl.constexpr
     # A shuffled scale is read a whole scale slot at a time and split into per-slot
     # fragments in registers. Its shapes and layouts spell out what, where and how much:
     # `scale_<fragment|lds_view>_<layout|shape>_<slot|scale_slot>`.
@@ -410,7 +410,7 @@ class KernelLayout:
     #   share a shape, named after the fragment; `lds_shape` is the allocation's.
     # - `slot`: one MFMA step's operand, one non-K slot by one step (packed: by K256,
     #   a dword's K extent). `scale_slot`: what one copy lands, spanning
-    #   `scale_ratio_non_k_slot` non-K slots and `scale_slot_k / BLOCK_K` steps.
+    #   `scale_slot_ratio_non_k` non-K slots and `scale_slot_k / BLOCK_K` steps.
     #   `_lds._scale_fragments` slices each slot out of a scale slot; when the two
     #   have the same extent, they cover the same tensor.
     # A packed scale (`scale_packed_ok`) never exists as u8 in registers: it is read
@@ -752,23 +752,23 @@ class KernelLayout:
         dot_operand_buffer_load_lds_layout = tuple(dot_operand_buffer_load_lds_layout)
 
         # -- scale geometry -------------------------------------------------------
-        scale_ratio_k_step = tuple(k // BK for k in scale_slot_k)
-        scale_ratio_non_k_slot = tuple(
+        scale_slot_ratio_k = tuple(k // BK for k in scale_slot_k)
+        scale_slot_ratio_non_k = tuple(
             scale_slot_nonk[idx] // slot_nonk[idx] for idx in ops
         )
         # A shuffled scale slot narrower than the payload slot (which
         # `validate_layout` rejects) covers no whole slot: it has no tile count, and no
         # LDS footprint where it is staged there.
-        scale_slots_ok = tuple(ratio > 0 for ratio in scale_ratio_non_k_slot)
+        scale_slots_ok = tuple(ratio > 0 for ratio in scale_slot_ratio_non_k)
         scale_num_slots = tuple(
             (
-                num_lds_slots_non_k[idx] // scale_ratio_non_k_slot[idx]
+                num_lds_slots_non_k[idx] // scale_slot_ratio_non_k[idx]
                 if scale_slots_ok[idx]
                 else None
             )
             for idx in ops
         )
-        scale_read_k_slots = tuple(num_k_slots * ratio for ratio in scale_ratio_k_step)
+        scale_read_k_slots = tuple(num_k_slots * ratio for ratio in scale_slot_ratio_k)
         scale_cache_fragments = tuple(
             num_lds_slots_non_k[idx] * scale_read_k_slots[idx] for idx in ops
         )
@@ -816,7 +816,9 @@ class KernelLayout:
         # so the warp arrangement is free. An M slot only has to be a whole number of
         # 32-row stripes: the shuffle writes one 256 B run per stripe, so a slot is a
         # contiguous slice.
-        sorted_shuffled_ok = is_16x16x128 and BM % 32 == 0 and SLOT_M % 32 == 0
+        payload_a_sorted_shuffled_ok = (
+            is_16x16x128 and BM % 32 == 0 and SLOT_M % 32 == 0
+        )
         scale_fragment_shape_scale_slot = tuple(
             [scale_slot_nonk[idx], scale_slot_k[idx] // MX_GROUP] for idx in ops
         )
@@ -912,7 +914,7 @@ class KernelLayout:
             )
             for idx in ops
         )
-        has_mfma_packed_scale = scale_packed_ok[0] or scale_packed_ok[1]
+        any_scale_packed = scale_packed_ok[0] or scale_packed_ok[1]
         packed_scale_fragment_shape_slot = tuple(
             [nonk, scale_stage_k // 128] for nonk in slot_nonk
         )
@@ -1132,14 +1134,14 @@ class KernelLayout:
         self.scale_block_k_storage = gl.constexpr(scale_block_k_storage)
         self._scale_slot_nonk = gl.constexpr(scale_slot_nonk)
         self._scale_slot_k = gl.constexpr(scale_slot_k)
-        self._scale_ratio_k_step = gl.constexpr(scale_ratio_k_step)
-        self._scale_ratio_non_k_slot = gl.constexpr(scale_ratio_non_k_slot)
+        self._scale_slot_ratio_k = gl.constexpr(scale_slot_ratio_k)
+        self._scale_slot_ratio_non_k = gl.constexpr(scale_slot_ratio_non_k)
         self._scale_num_slots = gl.constexpr(scale_num_slots)
         self._scale_cache_fragments = gl.constexpr(scale_cache_fragments)
-        self.sorted_shuffled_ok = gl.constexpr(sorted_shuffled_ok)
+        self.payload_a_sorted_shuffled_ok = gl.constexpr(payload_a_sorted_shuffled_ok)
         self._scale_packed_ok = gl.constexpr(scale_packed_ok)
         self._scale_packed_sel = gl.constexpr(scale_packed_sel)
-        self.has_mfma_packed_scale = gl.constexpr(has_mfma_packed_scale)
+        self.any_scale_packed = gl.constexpr(any_scale_packed)
         self._scale_lds_shape_tile = gl.constexpr(scale_lds_shape_tile)
         self._scale_lds_shape_scale_slot = gl.constexpr(scale_lds_shape_scale_slot)
         self._scale_lds_shape_slot = gl.constexpr(scale_lds_shape_slot)
@@ -1322,14 +1324,14 @@ class KernelLayout:
         return self._scale_slot_k.value[idx]
 
     @gluon.constexpr_function
-    def scale_ratio_k_step(self, idx):
+    def scale_slot_ratio_k(self, idx):
         """Number of payload K steps covered by one scale load."""
-        return self._scale_ratio_k_step.value[idx]
+        return self._scale_slot_ratio_k.value[idx]
 
     @gluon.constexpr_function
-    def scale_ratio_non_k_slot(self, idx):
+    def scale_slot_ratio_non_k(self, idx):
         """Number of payload non-K slots covered by one scale load."""
-        return self._scale_ratio_non_k_slot.value[idx]
+        return self._scale_slot_ratio_non_k.value[idx]
 
     @gluon.constexpr_function
     def scale_num_slots(self, idx):
@@ -1338,7 +1340,7 @@ class KernelLayout:
     @gluon.constexpr_function
     def scale_read_k_slots(self, idx):
         """K slots one scale slot covers: one per K slot of each step it spans."""
-        return self.num_k_slots.value * self._scale_ratio_k_step.value[idx]
+        return self.num_k_slots.value * self._scale_slot_ratio_k.value[idx]
 
     @gluon.constexpr_function
     def scale_cache_fragments(self, idx):
@@ -1391,7 +1393,7 @@ class KernelLayout:
         """One whole scale slot's scale, as a single copy or read lands it.
 
         In i32 dwords when :meth:`scale_packed_ok`, else in u8. Spans
-        ``scale_ratio_non_k_slot`` non-K slots and ``scale_slot_k / BLOCK_K``
+        ``scale_slot_ratio_non_k`` non-K slots and ``scale_slot_k / BLOCK_K``
         steps; each slot fragment is sliced out of it.
         """
         return self._scale_fragment_layout_scale_slot.value[idx]
@@ -1598,7 +1600,7 @@ class KernelLayout:
         layout_a_scale_slot: gl.constexpr = self.hbm_offset_layout(0, True)
         SCALE_M: gl.constexpr = self.scale_slot_nonk(0)
         SCALE_K: gl.constexpr = self.scale_slot_k(0)
-        SCALE_RATIO: gl.constexpr = self.scale_ratio_non_k_slot(0)
+        SCALE_RATIO: gl.constexpr = self.scale_slot_ratio_non_k(0)
 
         if require_constexpr(
             tuning_cfg.scale_shuffled(0) and self.component_in_reg((0, True))
@@ -1623,7 +1625,7 @@ class KernelLayout:
             # row stripe; K128 payload stages reuse the same group before advancing the
             # pointer.
             gl.static_assert(
-                self.sorted_shuffled_ok,
+                self.payload_a_sorted_shuffled_ok,
                 "A_SCALE_SORTED_SHUFFLED requires MFMA 16x16x128 "
                 "and whole 32-row A stripes",
             )
@@ -1694,7 +1696,7 @@ class KernelLayout:
         layout_b_scale_slot: gl.constexpr = self.hbm_offset_layout(1, True)
         SCALE_N: gl.constexpr = self.scale_slot_nonk(1)
         SCALE_K: gl.constexpr = self.scale_slot_k(1)
-        SCALE_RATIO: gl.constexpr = self.scale_ratio_non_k_slot(1)
+        SCALE_RATIO: gl.constexpr = self.scale_slot_ratio_non_k(1)
         SPLIT_EXTENT: gl.constexpr = (
             N_SLOT
             if func_cfg.weight_gu_hbm_layout == _WEIGHT_GU_SPLIT and SCALE_RATIO > 1

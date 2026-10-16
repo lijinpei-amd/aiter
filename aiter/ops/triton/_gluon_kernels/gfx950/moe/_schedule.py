@@ -354,11 +354,11 @@ class Schedule:
         via_lds = tuple(bool(layout.component_via_lds(c)) for c in COMPONENTS)
         ring_depth = tuple(tc.num_buffers(op, is_scale) for op, is_scale in COMPONENTS)
         ratio_k = tuple(
-            layout.scale_ratio_k_step(op) if is_scale else 1
+            layout.scale_slot_ratio_k(op) if is_scale else 1
             for op, is_scale in COMPONENTS
         )
         ratio_non_k = tuple(
-            layout.scale_ratio_non_k_slot(op) if is_scale else 1
+            layout.scale_slot_ratio_non_k(op) if is_scale else 1
             for op, is_scale in COMPONENTS
         )
         live_span = tuple((d - 1) * r + 1 for d, r in zip(ring_depth, ratio_k))

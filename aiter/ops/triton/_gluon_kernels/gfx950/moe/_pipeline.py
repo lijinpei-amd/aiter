@@ -600,7 +600,7 @@ def _read_scale(
         )
         fragments = ()
         for k in gl.static_range(
-            layout.scale_ratio_non_k_slot(operand) * layout.scale_read_k_slots(operand)
+            layout.scale_slot_ratio_non_k(operand) * layout.scale_read_k_slots(operand)
         ):
             fragments += (buffers[operand + 2][offset + k],)
     return fragments
@@ -660,7 +660,7 @@ def _take_operand_pairs(
                 payload[non_k_slot * layout.num_k_slots + k],
                 scale[
                     non_k_slot * layout.scale_read_k_slots(operand)
-                    + PHASE % layout.scale_ratio_k_step(operand) * layout.num_k_slots
+                    + PHASE % layout.scale_slot_ratio_k(operand) * layout.num_k_slots
                     + k
                 ],
             )

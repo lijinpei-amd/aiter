@@ -396,7 +396,7 @@ class _CopyRecorder:
         assert offsets == tile
         operand, is_scale = component
         history = self.addresses[component, tile]
-        ratio = self.layout.scale_ratio_k_step(operand) if is_scale else 1
+        ratio = self.layout.scale_slot_ratio_k(operand) if is_scale else 1
         stage = len(history) * ratio
         expected = (
             (stage // 2) * 256
@@ -441,7 +441,7 @@ class _CopyRecorder:
 
     def _read(self, component, tile, slot):
         operand, is_scale = component
-        ratio = self.layout.scale_ratio_k_step(operand) if is_scale else 1
+        ratio = self.layout.scale_slot_ratio_k(operand) if is_scale else 1
         stage = len(self.reads[component, tile]) * ratio
         assert slot == stage // ratio % self.depths[component]
         self.reads[component, tile].append(stage)

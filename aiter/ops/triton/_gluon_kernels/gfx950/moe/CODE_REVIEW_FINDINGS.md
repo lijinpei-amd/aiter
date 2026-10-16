@@ -159,7 +159,7 @@ sanitize the flag and shape.
 - `_layout.py:493-509` sends every shuffled scale through LDS.
 - `_layout.py:803-820` represents it as `[nonk // 32, 256]`, which requires whole
   32-row stripes and implements one K256 physical run.
-- The A sorted/shuffled branch has a `sorted_shuffled_ok()` assertion at
+- The A sorted/shuffled branch has a `payload_a_sorted_shuffled_ok()` assertion at
   `_offsets.py:168-178`; the B branch at `_offsets.py:259-277` has no equivalent.
 - `_layout.py:1338-1344` provides `make_scale_swizzle_check`, but nothing in this
   directory calls it, and that helper checks only a lower K bound.
