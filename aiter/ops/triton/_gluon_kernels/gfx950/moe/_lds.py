@@ -319,7 +319,7 @@ class LDSManager:
                     scale_ptr.reinterpret(
                         gl.int32,
                         layout.packed_scale_lds_shape2(operand),
-                        layout.packed_scale_read_layout(operand, True),
+                        layout.packed_scale_read_layout(operand),
                     ),
                     layout.packed_scale_frag_layout2(operand),
                 )
@@ -328,7 +328,7 @@ class LDSManager:
                     scale_ptr.reinterpret(
                         gl.uint8,
                         layout.scale_load_shape(operand),
-                        layout.shuffled_scale_read_layout(operand, True),
+                        layout.shuffled_scale_read_layout(operand),
                     ),
                     layout.scale_load_layout(operand),
                 )

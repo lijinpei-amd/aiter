@@ -841,7 +841,7 @@ class KernelLayout:
         dot_operand_scale_fragment_layout = [None, None]
         scale_load_layout = [None, None]
         dot_operand_scale_buffer_load_lds_layout = [None, None]
-        shuffled_scale_read_layout = [(None, None), (None, None)]
+        shuffled_scale_read_layout = [None, None]
         for idx in ops:
             if not (ok and has_scale[idx]):
                 continue
@@ -863,21 +863,15 @@ class KernelLayout:
                     warps_per_cta=[num_warps, 1],
                     order=[1, 0],
                 )
-            # Offset base i is byte 1 << i of the flat run, in the CDNA4_SCALE byte
-            # order spelled out in `_scale_dword_delta`. Index 0 views one stage, index
-            # 1 one scale load.
-            shuffled_scale_read_layout[idx] = tuple(
-                gl.SharedLinearLayout(
-                    offset_bases=[[16, 0], [0, 4]]  # the 4 bytes of a lane's dword
-                    + _pow2_bases(0, 2, [1, 2, 4, 8])  # 16 non-K lanes
-                    + _pow2_bases(1, 2, [1, 2])  # 4 K lanes
-                    + _pow2_bases(1, 2, _ramp(8, k // MX_GROUP))  # the rest of K
-                    + _pow2_bases(0, 2, _ramp(32, nonk))  # further 32-row stripes
-                )
-                for nonk, k in (
-                    (slot_nonk[idx], scale_stage_k),
-                    (scale_slot_nonk[idx], scale_slot_k[idx]),
-                )
+            # Offset base i is byte 1 << i of one scale slot's flat run, in the
+            # CDNA4_SCALE byte order spelled out in `_scale_dword_delta`.
+            nonk, k = scale_slot_nonk[idx], scale_slot_k[idx]
+            shuffled_scale_read_layout[idx] = gl.SharedLinearLayout(
+                offset_bases=[[16, 0], [0, 4]]  # the 4 bytes of a lane's dword
+                + _pow2_bases(0, 2, [1, 2, 4, 8])  # 16 non-K lanes
+                + _pow2_bases(1, 2, [1, 2])  # 4 K lanes
+                + _pow2_bases(1, 2, _ramp(8, k // MX_GROUP))  # the rest of K
+                + _pow2_bases(0, 2, _ramp(32, nonk))  # further 32-row stripes
             )
         dot_operand_scale_fragment_layout = tuple(dot_operand_scale_fragment_layout)
         scale_load_layout = tuple(scale_load_layout)
@@ -932,7 +926,7 @@ class KernelLayout:
             [scale_slot_nonk[idx], scale_slot_k[idx] // 128] for idx in ops
         )
         packed_scale_frag_layout1 = [None, None]
-        packed_scale_read_layout = [(None, None), (None, None)]
+        packed_scale_read_layout = [None, None]
         packed_scale_frag_layout2 = [None, None]
         for idx in ops:
             if not (ok and has_scale[idx]):
@@ -955,16 +949,11 @@ class KernelLayout:
                 block_bases=[],
                 shape=packed_scale_shape[idx],
             )
-            packed_scale_read_layout[idx] = tuple(
-                gl.SharedLinearLayout(
-                    offset_bases=[
-                        _scale_dword_delta(b, k) for b in list(view.offset_bases)[2:]
-                    ]
-                )
-                for view, k in zip(
-                    shuffled_scale_read_layout[idx],
-                    (scale_stage_k, scale_slot_k[idx]),
-                )
+            packed_scale_read_layout[idx] = gl.SharedLinearLayout(
+                offset_bases=[
+                    _scale_dword_delta(b, scale_slot_k[idx])
+                    for b in list(shuffled_scale_read_layout[idx].offset_bases)[2:]
+                ]
             )
             # The two within-dword axes are identified by value, not position. Wider
             # scale K tiles insert additional K register bases between them.
@@ -1394,9 +1383,9 @@ class KernelLayout:
     # -- scale layouts ------------------------------------------------------------
 
     @gluon.constexpr_function
-    def shuffled_scale_read_layout(self, idx, load=False):
-        """The [non-K, K] view of the flat LDS run, in fragment order."""
-        return self._shuffled_scale_read_layout.value[idx][int(bool(load))]
+    def shuffled_scale_read_layout(self, idx):
+        """The [non-K, K] view of one scale slot's flat LDS run, in fragment order."""
+        return self._shuffled_scale_read_layout.value[idx]
 
     @gluon.constexpr_function
     def scale_load_layout(self, idx):
@@ -1411,9 +1400,9 @@ class KernelLayout:
         return self._packed_scale_frag_layout1.value[idx]
 
     @gluon.constexpr_function
-    def packed_scale_read_layout(self, idx, load=False):
-        """The i32 view of the flat LDS run: one offset bit per dword-address bit."""
-        return self._packed_scale_read_layout.value[idx][int(bool(load))]
+    def packed_scale_read_layout(self, idx):
+        """A scale slot's flat LDS run as i32: one offset bit per dword-address bit."""
+        return self._packed_scale_read_layout.value[idx]
 
     @gluon.constexpr_function
     def packed_scale_frag_layout2(self, idx):

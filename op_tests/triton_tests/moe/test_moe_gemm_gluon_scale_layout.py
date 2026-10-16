@@ -154,7 +154,9 @@ def test_packed_words_and_selectors_match_producer(
     assert word_shape[0] * word_shape[1] * 4 == len(producer)
 
     # Invert the actual LDS read layout to find each fragment word's physical
-    # address, rather than reusing production's scale_dword_delta formula.
+    # address, rather than reusing production's scale_dword_delta formula. The read
+    # views a whole scale slot, which by default is this one fragment.
+    assert layout.packed_scale_lds_shape2(operand) == word_shape
     read_bases = layout.packed_scale_read_layout(operand).offset_bases
     physical_word = {
         tuple(_coordinate(read_bases, offset)): offset
@@ -215,11 +217,11 @@ def test_wide_packed_scale_frag_layout2_matches_producer(scale_k, operand):
         for half_k in range(2)
         for half_row in range(2)
     ]
-    byte_bases = layout.shuffled_scale_read_layout(operand, True).offset_bases
+    byte_bases = layout.shuffled_scale_read_layout(operand).offset_bases
     assert [
         tuple(_coordinate(byte_bases, offset)) for offset in range(len(producer))
     ] == producer
-    word_bases = layout.packed_scale_read_layout(operand, True).offset_bases
+    word_bases = layout.packed_scale_read_layout(operand).offset_bases
     physical_word = {
         tuple(_coordinate(word_bases, offset)): offset
         for offset in range(len(producer) // 4)
