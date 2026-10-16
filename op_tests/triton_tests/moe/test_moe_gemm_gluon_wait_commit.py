@@ -80,8 +80,8 @@ class _ScheduleConfig:
     def component_in_reg(self, component):
         return not self.component_via_lds(component)
 
-    def scale_shuffled(self, idx):
-        return idx == 0 and self.a_scale_ratio > 1
+    def preshuffled(self, idx, is_scale=False):
+        return is_scale and idx == 0 and self.a_scale_ratio > 1
 
     def scale_slot_ratio_non_k(self, idx):
         return self.a_scale_ratio if idx == 0 else 1

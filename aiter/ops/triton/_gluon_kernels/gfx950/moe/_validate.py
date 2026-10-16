@@ -156,7 +156,7 @@ def validate_layout(tc, layout, N, K):
     warps = tc.warps_per_cta.value
     tiles = tc.tiles_per_warp.value
 
-    assert tc.ALLOW_B_VIA_LDS.value or tc.operand_preshuffled(1), (
+    assert tc.ALLOW_B_VIA_LDS.value or tc.preshuffled(1), (
         "ALLOW_B_VIA_LDS=False requires B_PRESHUFFLED"
     )
     validate_buffer_counts(tc)
@@ -165,48 +165,12 @@ def validate_layout(tc, layout, N, K):
     assert N % BN == 0, f"N {N} % BLOCK_N {BN} != 0; the wrapper must fall back"
     assert K % BK == 0, f"K {K} % BLOCK_K {BK} != 0; the wrapper must fall back"
 
-    # -- divisibility lattice --
-    assert BK % instr[2] == 0
-    assert BK % MX_GROUP == 0
-
-    # -- shuffled scale geometry --
+    # -- shuffled scale K extent; KernelLayout asserts the tile and slot geometry --
     for idx in (0, 1):
-        if not tc.scale_shuffled(idx):
-            continue
-        axis = "M" if idx == 0 else "N"
-        block = BM if idx == 0 else BN
-        nonk, sk = layout.scale_slot_nonk(idx), layout.scale_slot_k(idx)
-        slot = layout.slot_nonk(idx)
-        assert block >= nonk >= slot, (
-            f"BLOCK_{axis} >= SCALE_SLOT_{axis} >= SLOT_{axis} is required"
-        )
-        assert block % nonk == 0 and nonk % slot == 0, (
-            f"SCALE_SLOT_{axis} must divide BLOCK_{axis} and be a multiple of SLOT_{axis}"
-        )
-        assert nonk % 32 == 0, (
-            f"SCALE_SLOT_{axis} must contain whole 32-row stripes"
-        )
-        assert sk >= max(256, BK), (
-            "SCALE_SLOT_K must be at least 256 and at least BLOCK_K"
-        )
-        assert sk & (sk - 1) == 0 and sk % BK == 0, (
-            "SCALE_SLOT_K must be a power of two and a multiple of BLOCK_K"
-        )
-        assert K % sk == 0, "K must contain complete SCALE_SLOT_K tiles"
-
-    # -- the slot is the unit of LDS allocation, of the global->LDS copy, of the
-    #    MFMA and of the accumulator, so it must align to the CTA block;
-    #    non-divisible values are illegal, not merely wasteful --
-    assert BM % tc.SLOT_M.value == 0
-    assert BN % tc.SLOT_N.value == 0
-    assert tc.SLOT_M.value % (instr[0] * warps[0] * tiles[0]) == 0, (
-        f"SLOT_M {tc.SLOT_M.value} must be a multiple of "
-        f"instr[0]*warps[0]*tiles[0] = {instr[0] * warps[0] * tiles[0]}"
-    )
-    assert tc.SLOT_N.value % (instr[1] * warps[1] * tiles[1]) == 0, (
-        f"SLOT_N {tc.SLOT_N.value} must be a multiple of "
-        f"instr[1]*warps[1]*tiles[1] = {instr[1] * warps[1] * tiles[1]}"
-    )
+        if tc.preshuffled(idx, True):
+            assert K % layout.scale_slot_k(idx) == 0, (
+                "K must contain complete SCALE_SLOT_K tiles"
+            )
 
     # -- MFMA shape must fit the tile --
     assert BM % (instr[0] * warps[0] * tiles[0]) == 0
@@ -220,12 +184,12 @@ def validate_layout(tc, layout, N, K):
     # this, so the assert can only fire if that gate is ever loosened without this
     # being revisited -- which is the point of stating it here.
     for idx in (0, 1):
-        if layout.payload_byte_unit_lds_ok(idx) and not tc.operand_preshuffled(idx):
+        if layout.payload_byte_unit_lds_ok(idx) and not tc.preshuffled(idx):
             assert tiles[idx] >= 2, (
                 f"operand {idx} is not preshuffled, so its LDS unit is 32 rows and "
                 f"tiles_per_warp[{idx}] must be >= 2 (got {tiles[idx]})"
             )
-    if tc.operand_preshuffled(1):
+    if tc.preshuffled(1):
         # The 16-column-blocked global offsets only stay inside the N slot while
         # every extent is a whole number of 16-column, 16-byte blocks.
         pk_b = BK // fc.pack_divisor(1)

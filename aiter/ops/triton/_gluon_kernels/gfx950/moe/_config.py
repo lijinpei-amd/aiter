@@ -384,18 +384,18 @@ class KernelTuningConfig:
         return operand == 0 or bool(self.ALLOW_B_VIA_LDS.value)
 
     @gluon.constexpr_function
-    def operand_preshuffled(self, idx):
-        """Is this operand's payload already blocked 16-column in HBM?
+    def preshuffled(self, idx, is_scale=False):
+        """Is this component already stored in HBM in the order the MFMA reads it?
 
-        Never for A: the token rows are gathered per launch from the routing order, so
-        there is no static permutation to bake in. For B it is the ``B_PRESHUFFLED``
-        knob, which the caller honours by handing over the permuted weight tensor.
+        A payload is blocked 16-column. Never for A: the token rows are gathered per
+        launch from the routing order, so there is no static permutation to bake in.
+        For B it is the ``B_PRESHUFFLED`` knob, which the caller honours by handing
+        over the permuted weight tensor. A scale is in MFMA fragment order, set by
+        ``A_SCALE_SORTED_SHUFFLED`` or ``B_SCALE_SHUFFLED``; never for an unscaled
+        operand.
         """
-        return idx == 1 and self.B_PRESHUFFLED.value
-
-    @gluon.constexpr_function
-    def scale_shuffled(self, idx):
-        """Is this operand's scale tile already in MFMA fragment order in memory?"""
+        if not is_scale:
+            return idx == 1 and self.B_PRESHUFFLED.value
         if not self.func_cfg.has_scale(idx):
             return False
         if idx == 0:
