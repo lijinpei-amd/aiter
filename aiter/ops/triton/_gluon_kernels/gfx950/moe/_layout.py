@@ -385,12 +385,12 @@ class KernelLayout:
     # -- operand payload --
     _payload_block_k_storage: gl.constexpr
     _payload_hbm_step: gl.constexpr
-    _byte_unit_lds_ok: gl.constexpr
+    _payload_byte_unit_lds_ok: gl.constexpr
     _payload_lds_shape_tile: gl.constexpr
     _payload_fragment_shape_slot: gl.constexpr
     _payload_hbm_offset_layout: gl.constexpr
-    _dot_operand_lds_layout: gl.constexpr
-    _dot_operand_fragment_layout: gl.constexpr
+    _payload_lds_layout: gl.constexpr
+    _payload_fragment_layout: gl.constexpr
     # -- operand scale --
     #: E8M0 elements along K in one pipeline stage.
     scale_block_k_storage: gl.constexpr
@@ -398,7 +398,7 @@ class KernelLayout:
     _scale_slot_k: gl.constexpr
     _scale_ratio_k_step: gl.constexpr
     _scale_ratio_non_k_slot: gl.constexpr
-    _num_scale_slots: gl.constexpr
+    _scale_num_slots: gl.constexpr
     _scale_cache_fragments: gl.constexpr
     #: Does the tile match the layout the C++ A-scale shuffle writes?
     sorted_shuffled_ok: gl.constexpr
@@ -567,7 +567,7 @@ class KernelLayout:
         # 128 bits per lane, in storage elements: 8 for bf16, 16 for fp8 and fp4 (uint8).
         # Per operand, because one value for both would allocate and copy the fp4 weight
         # tile as if it were bf16 in every mixed configuration.
-        copy_contiguity = tuple(128 // bits for bits in storage_bits)
+        payload_copy_contiguity = tuple(128 // bits for bits in storage_bits)
         # k_width is the same 128 bits per lane, in storage elements; the tuning field is
         # only an override. Verified against a reference GEMM on both f8f6f4 instruction
         # shapes: k_width 32 has no efficient padded shared layout at all, and 8 with
@@ -575,7 +575,11 @@ class KernelLayout:
         # the class of bug no correctness-by-construction argument catches.
         k_width_override = tc.k_width.value
         k_width_for = tuple(
-            copy_contiguity[idx] if k_width_override is None else k_width_override
+            (
+                payload_copy_contiguity[idx]
+                if k_width_override is None
+                else k_width_override
+            )
             for idx in ops
         )
         # A preshuffled B is blocked 16x16 in HBM (see `_blocked_b_hbm_offsets`), so the
@@ -597,19 +601,19 @@ class KernelLayout:
         # `tiles_per_warp >= 2` on that axis. That is not always reachable -- at BLOCK_N
         # 64 with warps (1, 4) the CTA's whole N tile is four 16-column tiles, so no
         # warp can have two -- hence a gate rather than an assert.
-        byte_unit_lds_ok = []
+        payload_byte_unit_lds_ok = []
         for idx in ops:
             rows = payload_lds_shape_slot[idx][idx]
             k_storage = payload_lds_shape_slot[idx][1 - idx]
             unit_k = LDS_UNIT_K_BYTES * 8 // storage_bits[idx]
-            byte_unit_lds_ok.append(
+            payload_byte_unit_lds_ok.append(
                 is_16x16x128
                 and storage_bits[idx] == 8
                 and bool(preshuffled[idx] or tiles_per_warp[idx] >= 2)
                 and rows % lds_unit_rows[idx] == 0
                 and k_storage % unit_k == 0
             )
-        byte_unit_lds_ok = tuple(byte_unit_lds_ok)
+        payload_byte_unit_lds_ok = tuple(payload_byte_unit_lds_ok)
 
         # -- storage placement ----------------------------------------------------
         # The final LDS-or-register decision per (operand, is_scale): the tuning
@@ -644,7 +648,7 @@ class KernelLayout:
                     bool(tc.allow_component_via_lds((idx, False)))
                     and (
                         payload[0] * payload[1]
-                        >= WARP_SIZE * copy_contiguity[idx] * num_warps
+                        >= WARP_SIZE * payload_copy_contiguity[idx] * num_warps
                     ),
                     bool(tc.allow_component_via_lds((idx, True)))
                     and (
@@ -667,8 +671,8 @@ class KernelLayout:
 
         # -- payload layouts ------------------------------------------------------
         dot_result_fragment_layout = None
-        dot_operand_fragment_layout = (None, None)
-        dot_operand_lds_layout = [None, None]
+        payload_fragment_layout = (None, None)
+        payload_lds_layout = [None, None]
         dot_operand_buffer_load_lds_layout = [None, None]
         payload_hbm_offset_layout = (None, None)
         if ok:
@@ -685,7 +689,7 @@ class KernelLayout:
                 warps_per_cta=warps,
                 tiles_per_warp=tiles_per_warp,
             )
-            dot_operand_fragment_layout = tuple(
+            payload_fragment_layout = tuple(
                 gl.DotOperandLayout(
                     operand_index=idx,
                     parent=dot_result_fragment_layout,
@@ -697,7 +701,7 @@ class KernelLayout:
                 if not payload_via_lds[idx]:
                     continue
                 shape = payload_lds_shape_slot[idx]
-                if byte_unit_lds_ok[idx]:
+                if payload_byte_unit_lds_ok[idx]:
                     layout = byte_unit_lds_layout(
                         shape,
                         idx,
@@ -712,7 +716,7 @@ class KernelLayout:
                     # M/N-packed checkpoint, which none of the four models in scope
                     # produce.
                     layout = gl.amd.cdna4.compute_efficient_padded_shared_layout(
-                        dot_operand_fragment_layout[idx],
+                        payload_fragment_layout[idx],
                         shape,
                         storage_dtype[idx],
                         True,
@@ -725,16 +729,16 @@ class KernelLayout:
                         # interval is still >= vec * warpSize, which is the condition
                         # `canLoadDirectToLDS` checks, so the copy stays a 128-bit
                         # direct-to-LDS.
-                        vec = copy_contiguity[idx]
+                        vec = payload_copy_contiguity[idx]
                         layout = gl.PaddedSharedLayout.with_identity_for(
                             [[WARP_SIZE * vec, vec]],
                             shape,
                             [1, 0] if idx == 0 else [0, 1],
                         )
-                dot_operand_lds_layout[idx] = layout
+                payload_lds_layout[idx] = layout
                 dot_operand_buffer_load_lds_layout[idx] = _bases_to_distributed(
                     layout.offset_bases,
-                    copy_contiguity[idx],
+                    payload_copy_contiguity[idx],
                     num_warps,
                     WARP_SIZE,
                     shape,
@@ -743,11 +747,11 @@ class KernelLayout:
                 (
                     dot_operand_buffer_load_lds_layout[idx]
                     if payload_via_lds[idx]
-                    else dot_operand_fragment_layout[idx]
+                    else payload_fragment_layout[idx]
                 )
                 for idx in ops
             )
-        dot_operand_lds_layout = tuple(dot_operand_lds_layout)
+        payload_lds_layout = tuple(payload_lds_layout)
         dot_operand_buffer_load_lds_layout = tuple(dot_operand_buffer_load_lds_layout)
 
         # -- scale geometry -------------------------------------------------------
@@ -759,7 +763,7 @@ class KernelLayout:
         # `validate_layout` rejects) covers no whole slot: it has no tile count, and no
         # LDS footprint where it is staged there.
         scale_slots_ok = tuple(ratio > 0 for ratio in scale_ratio_non_k_slot)
-        num_scale_slots = tuple(
+        scale_num_slots = tuple(
             (
                 num_lds_slots_non_k[idx] // scale_ratio_non_k_slot[idx]
                 if scale_slots_ok[idx]
@@ -790,7 +794,7 @@ class KernelLayout:
                 scale_lds_shape_tile.append(None)
             elif shuffled[idx]:
                 scale_lds_shape_tile.append(
-                    [tc.num_buffers(idx, True) * num_scale_slots[idx]]
+                    [tc.num_buffers(idx, True) * scale_num_slots[idx]]
                     + scale_lds_shape_scale_slot[idx]
                 )
             else:
@@ -839,7 +843,7 @@ class KernelLayout:
         for idx in ops:
             if not (ok and has_scale[idx]):
                 continue
-            frag = dot_operand_fragment_layout[idx]
+            frag = payload_fragment_layout[idx]
             dot_operand_scale_fragment_layout[idx] = gl.amd.cdna4.get_mfma_scale_layout(
                 frag, scale_fragment_shape_slot[idx], MX_GROUP
             )
@@ -928,7 +932,7 @@ class KernelLayout:
             if not (ok and has_scale[idx]):
                 continue
             frag = gl.amd.cdna4.get_mfma_scale_layout(
-                dot_operand_fragment_layout[idx],
+                payload_fragment_layout[idx],
                 [slot_nonk[idx], scale_stage_k // MX_GROUP],
                 MX_GROUP,
             )
@@ -1121,12 +1125,12 @@ class KernelLayout:
         # operand payload
         self._payload_block_k_storage = gl.constexpr(payload_block_k_storage)
         self._payload_hbm_step = gl.constexpr(payload_hbm_step)
-        self._byte_unit_lds_ok = gl.constexpr(byte_unit_lds_ok)
+        self._payload_byte_unit_lds_ok = gl.constexpr(payload_byte_unit_lds_ok)
         self._payload_lds_shape_tile = gl.constexpr(payload_lds_shape_tile)
         self._payload_fragment_shape_slot = gl.constexpr(payload_fragment_shape_slot)
         self._payload_hbm_offset_layout = gl.constexpr(payload_hbm_offset_layout)
-        self._dot_operand_lds_layout = gl.constexpr(dot_operand_lds_layout)
-        self._dot_operand_fragment_layout = gl.constexpr(dot_operand_fragment_layout)
+        self._payload_lds_layout = gl.constexpr(payload_lds_layout)
+        self._payload_fragment_layout = gl.constexpr(payload_fragment_layout)
 
         # operand scale
         self.scale_block_k_storage = gl.constexpr(scale_block_k_storage)
@@ -1134,7 +1138,7 @@ class KernelLayout:
         self._scale_slot_k = gl.constexpr(scale_slot_k)
         self._scale_ratio_k_step = gl.constexpr(scale_ratio_k_step)
         self._scale_ratio_non_k_slot = gl.constexpr(scale_ratio_non_k_slot)
-        self._num_scale_slots = gl.constexpr(num_scale_slots)
+        self._scale_num_slots = gl.constexpr(scale_num_slots)
         self._scale_cache_fragments = gl.constexpr(scale_cache_fragments)
         self.sorted_shuffled_ok = gl.constexpr(sorted_shuffled_ok)
         self._scale_packed_ok = gl.constexpr(scale_packed_ok)
@@ -1252,9 +1256,9 @@ class KernelLayout:
         return self._payload_hbm_step.value[idx]
 
     @gluon.constexpr_function
-    def byte_unit_lds_ok(self, idx):
+    def payload_byte_unit_lds_ok(self, idx):
         """Does :func:`byte_unit_lds_layout` apply to this operand?"""
-        return self._byte_unit_lds_ok.value[idx]
+        return self._payload_byte_unit_lds_ok.value[idx]
 
     # -- storage placement --------------------------------------------------------
     # Resolved: tuning's ``allow_component_via_lds`` policy and the automatic register
@@ -1281,7 +1285,7 @@ class KernelLayout:
         """Register layout of one slot fragment; i32 for a packed scale."""
         if is_scale:
             return self._dot_operand_scale_fragment_layout.value[idx]
-        return self._dot_operand_fragment_layout.value[idx]
+        return self._payload_fragment_layout.value[idx]
 
     @gluon.constexpr_function
     def dot_operand_lds_layout(self, idx, is_scale):
@@ -1292,7 +1296,7 @@ class KernelLayout:
         """
         if is_scale:
             return self.identity_lds_layout.value
-        return self._dot_operand_lds_layout.value[idx]
+        return self._payload_lds_layout.value[idx]
 
     @gluon.constexpr_function
     def hbm_offset_layout(self, idx, is_scale):
@@ -1333,7 +1337,7 @@ class KernelLayout:
 
     @gluon.constexpr_function
     def num_scale_slots(self, idx):
-        return self._num_scale_slots.value[idx]
+        return self._scale_num_slots.value[idx]
 
     @gluon.constexpr_function
     def scale_read_k_slots(self, idx):

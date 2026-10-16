@@ -589,8 +589,8 @@ def get_gluon_config_uncached(
         # (_layout.py::byte_unit_lds_layout), which only describes what a warp reads
         # while the warp owns both 16-row MFMA tiles of the unit -- so validate()
         # requires tiles_per_warp >= 2 on that axis. Raise it here wherever the tile
-        # divides; where it does not (BLOCK_M = 16), byte_unit_lds_ok() is False anyway
-        # and the operand keeps compute_efficient_padded_shared_layout.
+        # divides; where it does not (BLOCK_M = 16), payload_byte_unit_lds_ok() is
+        # False anyway and the operand keeps compute_efficient_padded_shared_layout.
         if tuple(out_instr) == (16, 16, 128):
             tm, tn = out_tiles
             gm2 = out_instr[0] * out_warps[0] * 2
