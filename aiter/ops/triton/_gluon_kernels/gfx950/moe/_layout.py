@@ -383,6 +383,8 @@ class KernelLayout:
     _payload_block_k_storage: gl.constexpr
     _payload_hbm_step: gl.constexpr
     _payload_byte_unit_lds_ok: gl.constexpr
+    #: Does the tile match the layout the C++ A-scale shuffle writes?
+    payload_a_sorted_shuffled_ok: gl.constexpr
     _payload_shape_tile: gl.constexpr
     _payload_shape_slot: gl.constexpr
     _payload_hbm_offset_layout: gl.constexpr
@@ -397,8 +399,6 @@ class KernelLayout:
     _scale_slot_ratio_non_k: gl.constexpr
     _scale_num_slots: gl.constexpr
     _scale_cache_fragments: gl.constexpr
-    #: Does the tile match the layout the C++ A-scale shuffle writes?
-    payload_a_sorted_shuffled_ok: gl.constexpr
     _scale_packed_ok: gl.constexpr
     _scale_packed_sel: gl.constexpr
     #: Whether either live MFMA scale operand uses packed dword storage.
@@ -612,6 +612,26 @@ class KernelLayout:
             )
         payload_byte_unit_lds_ok = tuple(payload_byte_unit_lds_ok)
 
+        # ScaleSwizzle.SORTED_SHUFFLED: moe_sort_scales.cuh writes one dword per
+        # (chunk, mi, ku, k_lane, n_lane) with
+        #     row = chunk*BM + (mi*MN_PACK + im_a)*16 + n_lane
+        #     k   = ku*K_PACK*4 + ikxdl*4 + k_lane
+        #     byte within the dword = ikxdl*MN_PACK + im_a
+        # so n_lane/k_lane index the 64 lanes of a wavefront, im_a/ikxdl the 4 bytes a
+        # lane holds, and mi the wave. That is exactly get_mfma_scale_layout's
+        # decomposition for a 16x16x128 dot operand with warps_per_cta = (num_warps, 1)
+        # and tiles_per_warp = (2, 1) -- verified base-for-base -- so the shuffled
+        # buffer is read with a plain contiguous load and no cross-lane movement.
+        #
+        # The permutation lives in the LDS tile's SharedLinearLayout, which is a
+        # property of the byte order the shuffle writes -- not of how warps are split --
+        # so the warp arrangement is free. An M slot only has to be a whole number of
+        # 32-row stripes: the shuffle writes one 256 B run per stripe, so a slot is a
+        # contiguous slice.
+        payload_a_sorted_shuffled_ok = (
+            is_16x16x128 and BM % 32 == 0 and SLOT_M % 32 == 0
+        )
+
         # -- storage placement ----------------------------------------------------
         # The final LDS-or-register decision per (operand, is_scale): the tuning
         # policy (`KernelTuningConfig.allow_component_via_lds`) allows LDS and the slot
@@ -800,25 +820,6 @@ class KernelLayout:
                     + scale_lds_shape_slot[idx]
                 )
         scale_lds_shape_tile = tuple(scale_lds_shape_tile)
-        # ScaleSwizzle.SORTED_SHUFFLED: moe_sort_scales.cuh writes one dword per
-        # (chunk, mi, ku, k_lane, n_lane) with
-        #     row = chunk*BM + (mi*MN_PACK + im_a)*16 + n_lane
-        #     k   = ku*K_PACK*4 + ikxdl*4 + k_lane
-        #     byte within the dword = ikxdl*MN_PACK + im_a
-        # so n_lane/k_lane index the 64 lanes of a wavefront, im_a/ikxdl the 4 bytes a
-        # lane holds, and mi the wave. That is exactly get_mfma_scale_layout's
-        # decomposition for a 16x16x128 dot operand with warps_per_cta = (num_warps, 1)
-        # and tiles_per_warp = (2, 1) -- verified base-for-base -- so the shuffled
-        # buffer is read with a plain contiguous load and no cross-lane movement.
-        #
-        # The permutation lives in the LDS tile's SharedLinearLayout, which is a
-        # property of the byte order the shuffle writes -- not of how warps are split --
-        # so the warp arrangement is free. An M slot only has to be a whole number of
-        # 32-row stripes: the shuffle writes one 256 B run per stripe, so a slot is a
-        # contiguous slice.
-        payload_a_sorted_shuffled_ok = (
-            is_16x16x128 and BM % 32 == 0 and SLOT_M % 32 == 0
-        )
         scale_fragment_shape_scale_slot = tuple(
             [scale_slot_nonk[idx], scale_slot_k[idx] // MX_GROUP] for idx in ops
         )
@@ -1124,6 +1125,7 @@ class KernelLayout:
         self._payload_block_k_storage = gl.constexpr(payload_block_k_storage)
         self._payload_hbm_step = gl.constexpr(payload_hbm_step)
         self._payload_byte_unit_lds_ok = gl.constexpr(payload_byte_unit_lds_ok)
+        self.payload_a_sorted_shuffled_ok = gl.constexpr(payload_a_sorted_shuffled_ok)
         self._payload_shape_tile = gl.constexpr(payload_shape_tile)
         self._payload_shape_slot = gl.constexpr(payload_shape_slot)
         self._payload_hbm_offset_layout = gl.constexpr(payload_hbm_offset_layout)
@@ -1138,7 +1140,6 @@ class KernelLayout:
         self._scale_slot_ratio_non_k = gl.constexpr(scale_slot_ratio_non_k)
         self._scale_num_slots = gl.constexpr(scale_num_slots)
         self._scale_cache_fragments = gl.constexpr(scale_cache_fragments)
-        self.payload_a_sorted_shuffled_ok = gl.constexpr(payload_a_sorted_shuffled_ok)
         self._scale_packed_ok = gl.constexpr(scale_packed_ok)
         self._scale_packed_sel = gl.constexpr(scale_packed_sel)
         self.any_scale_packed = gl.constexpr(any_scale_packed)
