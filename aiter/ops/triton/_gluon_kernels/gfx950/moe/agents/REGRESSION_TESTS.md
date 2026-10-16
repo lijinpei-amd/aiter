@@ -83,7 +83,7 @@ The last line must be `### verdict: PASS`.
 | Check | What it covers | Must be |
 |---|---|---|
 | T0 | `scripts/gluon_moe_sched_dump.py`: schedule tables of 35 configs, CPU only, about 16 s | byte-identical |
-| T0b | `tests/layout_fields.py`: all 70 `KernelLayout` fields of 224 tuning configs, CPU only, about 9 s beside T0 | byte-identical |
+| T0b | `tests/layout_fields.py`: all 65 `KernelLayout` fields of 224 tuning configs, CPU only, about 9 s beside T0 | byte-identical |
 | T1 | Symbolic emitter and config tests: `buffered_schedule`, `wait_commit`, `config`, `scale_slots`, about 1.5 min | all pass (869 since the slot rename, which added 14 legacy-name tests; 855 after the `Schedule` refactor, which removed two memo tests; 857 at commit `1b24ca9db`) |
 | T2a | `test_moe_gemm_gluon_frozen.py`, about 1 min cold, 10 s warm | all pass (18) |
 | T2b | Two tuned gemm1 builds (`tests/gemm1_check.py --correctness --quick`), about 1.5 min | build identity SAME |

@@ -74,10 +74,8 @@ def _scale_fragments(scale, cfg, layout, operand: gl.constexpr):
                         [n * layout.slot_nonk(operand) // 32, k * bk // 256, 0],
                     )
                     fragment = gl.convert_layout(
-                        gl.reshape(
-                            words, layout.packed_scale_fragment_shape_slot(operand)
-                        ),
-                        layout.packed_scale_fragment_layout_slot(operand),
+                        gl.reshape(words, layout.fragment_shape_slot(operand, True)),
+                        layout.dot_operand_fragment_layout(operand, True),
                     )
             else:
                 fragment = gl.amd.slice(
@@ -316,24 +314,14 @@ class LDSManager:
                 SCALE_READ_IDX * layout.num_scale_slots(operand)
                 + non_k_slot // layout.scale_ratio_non_k_slot(operand)
             )
-            if require_constexpr(layout.scale_packed_ok(operand)):
-                scale = _ds_read(
-                    scale_ptr.reinterpret(
-                        gl.int32,
-                        layout.packed_scale_fragment_shape_scale_slot(operand),
-                        layout.packed_scale_lds_view_layout_scale_slot(operand),
-                    ),
-                    layout.packed_scale_fragment_layout_scale_slot(operand),
-                )
-            else:
-                scale = _ds_read(
-                    scale_ptr.reinterpret(
-                        gl.uint8,
-                        layout.scale_fragment_shape_scale_slot(operand),
-                        layout.scale_lds_view_layout_scale_slot(operand),
-                    ),
-                    layout.scale_fragment_layout_scale_slot(operand),
-                )
+            scale = _ds_read(
+                scale_ptr.reinterpret(
+                    layout.scale_fragment_dtype(operand),
+                    layout.scale_fragment_shape_scale_slot(operand),
+                    layout.scale_lds_view_layout_scale_slot(operand),
+                ),
+                layout.scale_fragment_layout_scale_slot(operand),
+            )
             fragments = _scale_fragments(scale, cfg, layout, operand)
         else:
             fragments = (

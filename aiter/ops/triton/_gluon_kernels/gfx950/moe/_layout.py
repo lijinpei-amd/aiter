@@ -359,10 +359,10 @@ class KernelLayout:
     evaluated from the stored scalars; there is nothing to precompute for them.
     """
 
-    # Grouped by what they describe: the tile, the operands (payload, scale, packed
-    # scale), the result and the epilogue. Each value keeps its fields together:
-    # scalars, then shapes, then layouts, each from HBM through LDS to registers and
-    # from the whole tile down to one slot.
+    # Grouped by what they describe: the tile, the operands (payload, scale), the
+    # result and the epilogue. Each value keeps its fields together: scalars, then
+    # shapes, then layouts, each from HBM through LDS to registers and from the whole
+    # tile down to one slot.
     # -- tile --
     _BLOCK_N: gl.constexpr
     _BLOCK_K: gl.constexpr
@@ -407,10 +407,13 @@ class KernelLayout:
     _scale_cache_fragments: gl.constexpr
     #: Does the tile match the layout the C++ A-scale shuffle writes?
     sorted_shuffled_ok: gl.constexpr
+    _scale_packed_ok: gl.constexpr
+    _scale_packed_sel: gl.constexpr
+    #: Whether either live MFMA scale operand uses packed dword storage.
+    has_mfma_packed_scale: gl.constexpr
     # A shuffled scale is read a whole scale slot at a time and split into per-slot
     # fragments in registers. Its shapes and layouts spell out what, where and how much:
-    # `[packed_]scale_<fragment|lds_view>_<layout|shape>_<slot|scale_slot>`.
-    # - `packed_`: i32, a dword's four E8M0 bytes folded into one register; else u8.
+    # `scale_<fragment|lds_view>_<layout|shape>_<slot|scale_slot>`.
     # - `fragment`: registers. `lds_view`: the LDS view a `ds_read` reads from. The two
     #   share a shape, named after the fragment; `lds_shape` is the allocation's.
     # - `slot`: one MFMA step's operand, one non-K slot by one step (packed: by K256,
@@ -418,8 +421,12 @@ class KernelLayout:
     #   `scale_ratio_non_k_slot` non-K slots and `scale_slot_k / BLOCK_K` steps.
     #   `_lds._scale_fragments` slices each slot out of a scale slot; when the two
     #   have the same extent, they cover the same tensor.
-    # The u8 slot fragment is the shared `dot_operand_fragment_layout(idx, True)`. LDS
-    # is never read a slot at a time, so no `lds_view` is per slot.
+    # A packed scale (`scale_packed_ok`) never exists as u8 in registers: it is read
+    # and carried as i32, a dword's four E8M0 bytes in one register. So its fragment
+    # shapes and layouts and its LDS view are the i32 ones, and u8 otherwise; its LDS
+    # allocation stays u8. The slot fragment is the shared
+    # `dot_operand_fragment_layout(idx, True)`. LDS is never read a slot at a time, so
+    # no `lds_view` is per slot.
     _scale_lds_shape_tile: gl.constexpr
     _scale_lds_shape_scale_slot: gl.constexpr
     _scale_lds_shape_slot: gl.constexpr
@@ -431,16 +438,6 @@ class KernelLayout:
     _scale_lds_view_layout_scale_slot: gl.constexpr
     _scale_fragment_layout_scale_slot: gl.constexpr
     _dot_operand_scale_fragment_layout: gl.constexpr
-    # -- operand packed scale --
-    _scale_packed_ok: gl.constexpr
-    _scale_packed_sel: gl.constexpr
-    #: Whether either live MFMA scale operand uses packed dword storage.
-    has_mfma_packed_scale: gl.constexpr
-    _packed_scale_fragment_shape_scale_slot: gl.constexpr
-    _packed_scale_fragment_shape_slot: gl.constexpr
-    _packed_scale_lds_view_layout_scale_slot: gl.constexpr
-    _packed_scale_fragment_layout_scale_slot: gl.constexpr
-    _packed_scale_fragment_layout_slot: gl.constexpr
     # -- result --
     acc_vgprs_per_lane: gl.constexpr
     #: Shape of one slot's accumulator.
@@ -1024,6 +1021,50 @@ class KernelLayout:
             scale_hbm_offset_layout[idx] = layout
         scale_hbm_offset_layout = tuple(scale_hbm_offset_layout)
 
+        # A packed scale never exists as u8 in registers, so from here on its
+        # fragment shapes and layouts and its LDS view are the i32 ones. The u8 ones
+        # were only needed above, to test and derive the packing.
+        scale_fragment_shape_slot = tuple(
+            (
+                packed_scale_fragment_shape_slot[idx]
+                if scale_packed_ok[idx]
+                else scale_fragment_shape_slot[idx]
+            )
+            for idx in ops
+        )
+        scale_fragment_shape_scale_slot = tuple(
+            (
+                packed_scale_fragment_shape_scale_slot[idx]
+                if scale_packed_ok[idx]
+                else scale_fragment_shape_scale_slot[idx]
+            )
+            for idx in ops
+        )
+        scale_lds_view_layout_scale_slot = tuple(
+            (
+                packed_scale_lds_view_layout_scale_slot[idx]
+                if scale_packed_ok[idx]
+                else scale_lds_view_layout_scale_slot[idx]
+            )
+            for idx in ops
+        )
+        scale_fragment_layout_scale_slot = tuple(
+            (
+                packed_scale_fragment_layout_scale_slot[idx]
+                if scale_packed_ok[idx]
+                else scale_fragment_layout_scale_slot[idx]
+            )
+            for idx in ops
+        )
+        dot_operand_scale_fragment_layout = tuple(
+            (
+                packed_scale_fragment_layout_slot[idx]
+                if scale_packed_ok[idx]
+                else dot_operand_scale_fragment_layout[idx]
+            )
+            for idx in ops
+        )
+
         # -- epilogue -------------------------------------------------------------
         output_n_slot = SLOT_N // _n_reduction_slot(fc)
         output_block_n = BN // fc.activation_reduction_n()
@@ -1119,6 +1160,9 @@ class KernelLayout:
         self._scale_read_k_slots = gl.constexpr(scale_read_k_slots)
         self._scale_cache_fragments = gl.constexpr(scale_cache_fragments)
         self.sorted_shuffled_ok = gl.constexpr(sorted_shuffled_ok)
+        self._scale_packed_ok = gl.constexpr(scale_packed_ok)
+        self._scale_packed_sel = gl.constexpr(scale_packed_sel)
+        self.has_mfma_packed_scale = gl.constexpr(has_mfma_packed_scale)
         self._scale_lds_shape_tile = gl.constexpr(scale_lds_shape_tile)
         self._scale_lds_shape_scale_slot = gl.constexpr(scale_lds_shape_scale_slot)
         self._scale_lds_shape_slot = gl.constexpr(scale_lds_shape_slot)
@@ -1139,26 +1183,6 @@ class KernelLayout:
         )
         self._dot_operand_scale_fragment_layout = gl.constexpr(
             dot_operand_scale_fragment_layout
-        )
-
-        # operand packed scale
-        self._scale_packed_ok = gl.constexpr(scale_packed_ok)
-        self._scale_packed_sel = gl.constexpr(scale_packed_sel)
-        self.has_mfma_packed_scale = gl.constexpr(has_mfma_packed_scale)
-        self._packed_scale_fragment_shape_scale_slot = gl.constexpr(
-            packed_scale_fragment_shape_scale_slot
-        )
-        self._packed_scale_fragment_shape_slot = gl.constexpr(
-            packed_scale_fragment_shape_slot
-        )
-        self._packed_scale_lds_view_layout_scale_slot = gl.constexpr(
-            packed_scale_lds_view_layout_scale_slot
-        )
-        self._packed_scale_fragment_layout_scale_slot = gl.constexpr(
-            packed_scale_fragment_layout_scale_slot
-        )
-        self._packed_scale_fragment_layout_slot = gl.constexpr(
-            packed_scale_fragment_layout_slot
         )
 
         # result
@@ -1221,7 +1245,11 @@ class KernelLayout:
 
     @gluon.constexpr_function
     def fragment_shape_slot(self, idx, is_scale):
-        """Register shape for one non-K slot and K slot: payload storage, or E8M0."""
+        """Register shape for one non-K slot and K slot.
+
+        Payload storage elements, or for a scale E8M0 bytes, or i32 dwords with
+        both K128 halves when :meth:`scale_packed_ok`.
+        """
         if is_scale:
             return list(self._scale_fragment_shape_slot.value[idx])
         return list(self._payload_fragment_shape_slot.value[idx])
@@ -1294,6 +1322,7 @@ class KernelLayout:
 
     @gluon.constexpr_function
     def dot_operand_fragment_layout(self, idx, is_scale):
+        """Register layout of one slot fragment; i32 for a packed scale."""
         if is_scale:
             return self._dot_operand_scale_fragment_layout.value[idx]
         return self._dot_operand_fragment_layout.value[idx]
@@ -1382,7 +1411,10 @@ class KernelLayout:
 
     @gluon.constexpr_function
     def scale_fragment_shape_scale_slot(self, idx):
-        """u8 shape of one scale slot, its fragment's and its LDS view's."""
+        """Shape of one scale slot, its fragment's and its LDS view's.
+
+        In i32 dwords when :meth:`scale_packed_ok`, else in u8.
+        """
         return list(self._scale_fragment_shape_scale_slot.value[idx])
 
     @gluon.constexpr_function
@@ -1396,6 +1428,11 @@ class KernelLayout:
         return self._scale_packed_ok.value[idx]
 
     @gluon.constexpr_function
+    def scale_fragment_dtype(self, idx):
+        """Element type of the scale's fragments and LDS view: i32 when packed."""
+        return gl.int32 if self._scale_packed_ok.value[idx] else gl.uint8
+
+    @gluon.constexpr_function
     def scale_packed_sel(self, idx, k_phase=0):
         """Byte selectors in MFMA order, for one K128 half or the full K256 word."""
         return self._scale_packed_sel.value[idx][k_phase]
@@ -1405,49 +1442,26 @@ class KernelLayout:
         """Packed-scale selector for the live MFMA path, or ``None``."""
         return self.scale_packed_sel(idx, k_phase)
 
-    @gluon.constexpr_function
-    def packed_scale_fragment_shape_slot(self, idx):
-        """i32 shape of one slot, with both K128 halves even when one is unused."""
-        return list(self._packed_scale_fragment_shape_slot.value[idx])
-
-    @gluon.constexpr_function
-    def packed_scale_fragment_shape_scale_slot(self, idx):
-        """i32 shape of one scale slot, its fragment's and its LDS view's."""
-        return list(self._packed_scale_fragment_shape_scale_slot.value[idx])
-
     # -- scale layouts ------------------------------------------------------------
 
     @gluon.constexpr_function
     def scale_lds_view_layout_scale_slot(self, idx):
-        """u8 [non-K, K] view of one scale slot's flat LDS run, in fragment order."""
+        """[non-K, K] view of one scale slot's flat LDS run, in fragment order.
+
+        In i32 dwords when :meth:`scale_packed_ok`, an offset bit per dword bit;
+        else in u8.
+        """
         return self._scale_lds_view_layout_scale_slot.value[idx]
 
     @gluon.constexpr_function
     def scale_fragment_layout_scale_slot(self, idx):
-        """One whole scale slot's u8 scale, as a single copy or read lands it."""
+        """One whole scale slot's scale, as a single copy or read lands it.
+
+        In i32 dwords when :meth:`scale_packed_ok`, else in u8. Spans
+        ``scale_ratio_non_k_slot`` non-K slots and ``scale_slot_k / BLOCK_K``
+        steps; each slot fragment is sliced out of it.
+        """
         return self._scale_fragment_layout_scale_slot.value[idx]
-
-    @gluon.constexpr_function
-    def packed_scale_fragment_layout_slot(self, idx):
-        """One MFMA step's i32 scale: one non-K slot by K256.
-
-        Sliced out of :meth:`packed_scale_fragment_layout_scale_slot`.
-        """
-        return self._packed_scale_fragment_layout_slot.value[idx]
-
-    @gluon.constexpr_function
-    def packed_scale_lds_view_layout_scale_slot(self, idx):
-        """i32 view of one scale slot's flat LDS run: an offset bit per dword bit."""
-        return self._packed_scale_lds_view_layout_scale_slot.value[idx]
-
-    @gluon.constexpr_function
-    def packed_scale_fragment_layout_scale_slot(self, idx):
-        """One whole scale slot's i32 scale, as a single copy lands it in registers.
-
-        Spans ``scale_ratio_non_k_slot`` non-K slots and ``scale_slot_k / BLOCK_K``
-        steps; each :meth:`packed_scale_fragment_layout_slot` is sliced out of it.
-        """
-        return self._packed_scale_fragment_layout_scale_slot.value[idx]
 
     # -- epilogue and emitted-output layouts --------------------------------------
 

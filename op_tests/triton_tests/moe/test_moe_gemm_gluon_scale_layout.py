@@ -106,6 +106,17 @@ def _thread_coordinate(layout, reg, lane, warp):
     return tuple(parts[0][axis] ^ parts[1][axis] ^ parts[2][axis] for axis in (0, 1))
 
 
+def _byte_fragment_layout(layout, operand, shape):
+    """The u8 layout the MFMA takes a scale fragment of ``shape`` in.
+
+    A packed scale never exists as u8, so the layout no longer stores it; it is the
+    oracle the i32 layouts are checked against.
+    """
+    return gl.amd.cdna4.get_mfma_scale_layout(
+        layout.dot_operand_fragment_layout(operand, False), shape, 32
+    )
+
+
 def _producer_byte_coordinates(nonk):
     """Independent producer order for one K256 tile, without gate/up interleave.
 
@@ -147,17 +158,21 @@ def test_packed_words_and_selectors_match_producer(
     assert validate(tc, 4096, 7168)
     layout = KernelLayout(tc)
     assert layout.scale_packed_ok(operand)
-    byte_layout = layout.dot_operand_fragment_layout(operand, True)
-    word_layout = layout.packed_scale_fragment_layout_slot(operand)
-    word_shape = layout.packed_scale_fragment_shape_slot(operand)
+    byte_layout = _byte_fragment_layout(
+        layout,
+        operand,
+        [layout.slot_nonk(operand), maybe_unwrap(layout.scale_block_k_storage)],
+    )
+    word_layout = layout.dot_operand_fragment_layout(operand, True)
+    word_shape = layout.fragment_shape_slot(operand, True)
     producer = _producer_byte_coordinates((slot_m, slot_n)[operand])
     assert word_shape[0] * word_shape[1] * 4 == len(producer)
 
     # Invert the actual LDS view layout to find each fragment word's physical
     # address, rather than reusing production's scale_dword_delta formula. The read
     # views a whole scale slot, which by default is this one fragment.
-    assert layout.packed_scale_fragment_shape_scale_slot(operand) == word_shape
-    read_bases = layout.packed_scale_lds_view_layout_scale_slot(operand).offset_bases
+    assert layout.scale_fragment_shape_scale_slot(operand) == word_shape
+    read_bases = layout.scale_lds_view_layout_scale_slot(operand).offset_bases
     physical_word = {
         tuple(_coordinate(read_bases, offset)): offset
         for offset in range(len(producer) // 4)
@@ -219,17 +234,15 @@ def test_wide_packed_scale_fragment_layout_scale_slot_matches_producer(
         for half_k in range(2)
         for half_row in range(2)
     ]
-    byte_bases = layout.scale_lds_view_layout_scale_slot(operand).offset_bases
-    assert [
-        tuple(_coordinate(byte_bases, offset)) for offset in range(len(producer))
-    ] == producer
-    word_bases = layout.packed_scale_lds_view_layout_scale_slot(operand).offset_bases
+    assert layout.scale_packed_ok(operand)
+    word_bases = layout.scale_lds_view_layout_scale_slot(operand).offset_bases
     physical_word = {
         tuple(_coordinate(word_bases, offset)): offset
         for offset in range(len(producer) // 4)
     }
-    byte_layout = layout.scale_fragment_layout_scale_slot(operand)
-    word_layout = layout.packed_scale_fragment_layout_scale_slot(operand)
+    assert len(physical_word) == len(producer) // 4
+    byte_layout = _byte_fragment_layout(layout, operand, [nonk, scale_k // 32])
+    word_layout = layout.scale_fragment_layout_scale_slot(operand)
     registers = [list(basis) for basis in byte_layout.reg_bases]
     nonk_bit, k_bit = registers.index([16, 0]), registers.index([0, 4])
     retained = [bit for bit in range(len(registers)) if bit not in (nonk_bit, k_bit)]
