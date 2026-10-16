@@ -380,8 +380,6 @@ class KernelLayout:
     # -- operand placement --
     _component_via_lds: gl.constexpr
     # -- operand payload --
-    _slot_nonk: gl.constexpr
-    _num_lds_slots_non_k: gl.constexpr
     _payload_block_k_storage: gl.constexpr
     _payload_hbm_step: gl.constexpr
     _copy_contiguity: gl.constexpr
@@ -389,7 +387,6 @@ class KernelLayout:
     _lds_unit_rows: gl.constexpr
     _byte_unit_lds_ok: gl.constexpr
     _payload_lds_shape_tile: gl.constexpr
-    _payload_lds_shape_slot: gl.constexpr
     _payload_fragment_shape_slot: gl.constexpr
     _payload_hbm_offset_layout: gl.constexpr
     _dot_operand_buffer_load_lds_layout: gl.constexpr
@@ -403,7 +400,6 @@ class KernelLayout:
     _scale_ratio_k_step: gl.constexpr
     _scale_ratio_non_k_slot: gl.constexpr
     _num_scale_slots: gl.constexpr
-    _scale_read_k_slots: gl.constexpr
     _scale_cache_fragments: gl.constexpr
     #: Does the tile match the layout the C++ A-scale shuffle writes?
     sorted_shuffled_ok: gl.constexpr
@@ -562,11 +558,9 @@ class KernelLayout:
         # Each slot is allocated, copied and read as an independent unit, so each gets
         # its own efficient padded layout and fully coalesced direct-to-LDS copy.
         # Slicing one tile-wide buffer would give the copy a strided view of a permuted
-        # layout.
-        payload_lds_shape_slot = (
-            [SLOT_M, payload_block_k_storage[0]],
-            [payload_block_k_storage[1], SLOT_N],
-        )
+        # layout. With one K slot per stage, a slot is read whole into one fragment, so
+        # it is allocated in the fragment's shape.
+        payload_lds_shape_slot = payload_fragment_shape_slot
         scale_lds_shape_slot = tuple(
             [nonk, scale_block_k_storage] for nonk in (SLOT_M, SLOT_N)
         )
@@ -778,7 +772,7 @@ class KernelLayout:
             )
             for idx in ops
         )
-        scale_read_k_slots = scale_ratio_k_step
+        scale_read_k_slots = tuple(num_k_slots * ratio for ratio in scale_ratio_k_step)
         scale_cache_fragments = tuple(
             num_lds_slots_non_k[idx] * scale_read_k_slots[idx] for idx in ops
         )
@@ -832,17 +826,16 @@ class KernelLayout:
         )
 
         # -- scale layouts --------------------------------------------------------
-        # Identity (K-contiguous) staging tile for raw and shuffled scales alike. For
-        # raw E8M0 scales the three LDS goals are not simultaneously satisfiable: with
-        # `get_mfma_scale_layout` each lane wants K-scale elements strided by 2 or 4,
-        # so the read is `ds_read_u8` regardless, and the identity tile keeps the
-        # *write* side (direct-to-LDS) coalesced, which is the side that matters. A
-        # shuffled scale slot is a flat run in HBM byte order; its fragment order
-        # returns on the read.
+        # Identity (K-contiguous) staging tile for raw and shuffled scales and both
+        # operands alike, so it is stored once. For raw E8M0 scales the three LDS goals
+        # are not simultaneously satisfiable: with `get_mfma_scale_layout` each lane
+        # wants K-scale elements strided by 2 or 4, so the read is `ds_read_u8`
+        # regardless, and the identity tile keeps the *write* side (direct-to-LDS)
+        # coalesced, which is the side that matters. A shuffled scale slot is a flat run
+        # in HBM byte order; its fragment order returns on the read.
         scale_lds_layout = gl.SwizzledSharedLayout(
             vec=1, per_phase=1, max_phase=1, order=[1, 0]
         )
-        dot_operand_scale_lds_layout = (scale_lds_layout, scale_lds_layout)
         dot_operand_scale_fragment_layout = [None, None]
         scale_fragment_layout_scale_slot = [None, None]
         dot_operand_scale_buffer_load_lds_layout = [None, None]
@@ -1132,8 +1125,6 @@ class KernelLayout:
         self._component_via_lds = gl.constexpr(component_via_lds)
 
         # operand payload
-        self._slot_nonk = gl.constexpr(slot_nonk)
-        self._num_lds_slots_non_k = gl.constexpr(num_lds_slots_non_k)
         self._payload_block_k_storage = gl.constexpr(payload_block_k_storage)
         self._payload_hbm_step = gl.constexpr(payload_hbm_step)
         self._copy_contiguity = gl.constexpr(copy_contiguity)
@@ -1141,7 +1132,6 @@ class KernelLayout:
         self._lds_unit_rows = gl.constexpr(lds_unit_rows)
         self._byte_unit_lds_ok = gl.constexpr(byte_unit_lds_ok)
         self._payload_lds_shape_tile = gl.constexpr(payload_lds_shape_tile)
-        self._payload_lds_shape_slot = gl.constexpr(payload_lds_shape_slot)
         self._payload_fragment_shape_slot = gl.constexpr(payload_fragment_shape_slot)
         self._payload_hbm_offset_layout = gl.constexpr(payload_hbm_offset_layout)
         self._dot_operand_buffer_load_lds_layout = gl.constexpr(
@@ -1157,7 +1147,6 @@ class KernelLayout:
         self._scale_ratio_k_step = gl.constexpr(scale_ratio_k_step)
         self._scale_ratio_non_k_slot = gl.constexpr(scale_ratio_non_k_slot)
         self._num_scale_slots = gl.constexpr(num_scale_slots)
-        self._scale_read_k_slots = gl.constexpr(scale_read_k_slots)
         self._scale_cache_fragments = gl.constexpr(scale_cache_fragments)
         self.sorted_shuffled_ok = gl.constexpr(sorted_shuffled_ok)
         self._scale_packed_ok = gl.constexpr(scale_packed_ok)
@@ -1174,7 +1163,7 @@ class KernelLayout:
         self._dot_operand_scale_buffer_load_lds_layout = gl.constexpr(
             dot_operand_scale_buffer_load_lds_layout
         )
-        self._dot_operand_scale_lds_layout = gl.constexpr(dot_operand_scale_lds_layout)
+        self._dot_operand_scale_lds_layout = gl.constexpr(scale_lds_layout)
         self._scale_lds_view_layout_scale_slot = gl.constexpr(
             scale_lds_view_layout_scale_slot
         )
@@ -1236,7 +1225,7 @@ class KernelLayout:
     @gluon.constexpr_function
     def num_lds_slots_non_k(self, idx):
         """Slots along one operand's non-K axis, each copied and read independently."""
-        return self._num_lds_slots_non_k.value[idx]
+        return (self.num_m_slots.value, self.num_n_slots.value)[idx]
 
     @gluon.constexpr_function
     def payload_block_k_storage(self, idx):
@@ -1258,12 +1247,12 @@ class KernelLayout:
     def lds_shape_slot(self, idx, is_scale):
         """Shared shape of one slot.
 
-        A payload's is a storage shape; a scale's is E8M0,
+        A payload's is a storage shape, its fragment's; a scale's is E8M0,
         ``[slot non-K extent, BLOCK_K/32]``.
         """
         if is_scale:
             return list(self._scale_lds_shape_slot.value[idx])
-        return list(self._payload_lds_shape_slot.value[idx])
+        return list(self._payload_fragment_shape_slot.value[idx])
 
     @gluon.constexpr_function
     def lds_shape_tile(self, idx, is_scale):
@@ -1331,10 +1320,11 @@ class KernelLayout:
     def dot_operand_lds_layout(self, idx, is_scale):
         """Shared layout of a component staged through LDS.
 
-        Padded for a payload; the identity (K-contiguous) tile for raw E8M0 scales.
+        Padded for a payload; for a scale, one identity (K-contiguous) tile shared by
+        both operands.
         """
         if is_scale:
-            return self._dot_operand_scale_lds_layout.value[idx]
+            return self._dot_operand_scale_lds_layout.value
         return self._dot_operand_lds_layout.value[idx]
 
     @gluon.constexpr_function
@@ -1358,8 +1348,11 @@ class KernelLayout:
 
     @gluon.constexpr_function
     def slot_nonk(self, idx):
-        """Non-K extent of the operand's non-K slot, ``SLOT_M`` or ``SLOT_N``."""
-        return self._slot_nonk.value[idx]
+        """Non-K extent of the operand's non-K slot, ``SLOT_M`` or ``SLOT_N``.
+
+        The accumulator slot's extent along the same axis.
+        """
+        return self.accumulator_fragment_shape_slot.value[idx]
 
     @gluon.constexpr_function
     def scale_slot_nonk(self, idx):
@@ -1387,7 +1380,8 @@ class KernelLayout:
 
     @gluon.constexpr_function
     def scale_read_k_slots(self, idx):
-        return self._scale_read_k_slots.value[idx]
+        """K slots one scale slot covers: one per K slot of each step it spans."""
+        return self.num_k_slots.value * self._scale_ratio_k_step.value[idx]
 
     @gluon.constexpr_function
     def scale_cache_fragments(self, idx):
