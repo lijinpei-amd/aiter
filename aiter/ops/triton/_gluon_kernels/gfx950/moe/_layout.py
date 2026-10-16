@@ -377,17 +377,14 @@ class KernelLayout:
     num_m_slots: gl.constexpr
     #: N slots per tile. Operand B and the accumulator split by this.
     num_n_slots: gl.constexpr
-    #: Unswizzled row-major 2-D shared layout: the scale staging tile and the
-    #: fused-quant staging buffer.
-    identity_lds_layout: gl.constexpr
     # -- operand placement --
     _component_via_lds: gl.constexpr
     # -- operand payload --
     _payload_block_k_storage: gl.constexpr
     _payload_hbm_step: gl.constexpr
     _payload_byte_unit_lds_ok: gl.constexpr
-    _payload_lds_shape_tile: gl.constexpr
-    _payload_fragment_shape_slot: gl.constexpr
+    _payload_shape_tile: gl.constexpr
+    _payload_shape_slot: gl.constexpr
     _payload_hbm_offset_layout: gl.constexpr
     _payload_lds_layout: gl.constexpr
     _payload_fragment_layout: gl.constexpr
@@ -428,6 +425,7 @@ class KernelLayout:
     _scale_fragment_shape_scale_slot: gl.constexpr
     _scale_fragment_shape_slot: gl.constexpr
     _scale_hbm_offset_layout: gl.constexpr
+    _scale_lds_layout: gl.constexpr
     _scale_lds_view_layout_scale_slot: gl.constexpr
     _scale_fragment_layout_scale_slot: gl.constexpr
     _scale_fragment_layout: gl.constexpr
@@ -453,6 +451,7 @@ class KernelLayout:
     quant_staging_rows: gl.constexpr
     #: Whether the fused-quant staging alternates two per-slot LDS banks.
     quant_staging_rotates: gl.constexpr
+    quant_staging_layout: gl.constexpr
     # -- resources --
     lds_bytes: gl.constexpr
 
@@ -540,7 +539,7 @@ class KernelLayout:
         num_lds_slots_non_k = (num_m_slots, num_n_slots)
         payload_block_k_storage = tuple(BK // fc.pack_divisor(idx) for idx in ops)
         scale_block_k_storage = BK // MX_GROUP
-        payload_fragment_shape_slot = (
+        payload_shape_slot = (
             [SLOT_M, payload_block_k_storage[0]],
             [payload_block_k_storage[1], SLOT_N],
         )
@@ -554,14 +553,12 @@ class KernelLayout:
         # its own efficient padded layout and fully coalesced direct-to-LDS copy.
         # Slicing one tile-wide buffer would give the copy a strided view of a permuted
         # layout. With one K slot per stage, a slot is read whole into one fragment, so
-        # it is allocated in the fragment's shape.
-        payload_lds_shape_slot = payload_fragment_shape_slot
+        # its LDS allocation and its fragment share one shape.
         scale_lds_shape_slot = tuple(
             [nonk, scale_block_k_storage] for nonk in (SLOT_M, SLOT_N)
         )
-        payload_lds_shape_tile = tuple(
-            [tc.num_buffers(idx) * num_lds_slots_non_k[idx]]
-            + payload_lds_shape_slot[idx]
+        payload_shape_tile = tuple(
+            [tc.num_buffers(idx) * num_lds_slots_non_k[idx]] + payload_shape_slot[idx]
             for idx in ops
         )
         # 128 bits per lane, in storage elements: 8 for bf16, 16 for fp8 and fp4 (uint8).
@@ -603,8 +600,8 @@ class KernelLayout:
         # warp can have two -- hence a gate rather than an assert.
         payload_byte_unit_lds_ok = []
         for idx in ops:
-            rows = payload_lds_shape_slot[idx][idx]
-            k_storage = payload_lds_shape_slot[idx][1 - idx]
+            rows = payload_shape_slot[idx][idx]
+            k_storage = payload_shape_slot[idx][1 - idx]
             unit_k = LDS_UNIT_K_BYTES * 8 // storage_bits[idx]
             payload_byte_unit_lds_ok.append(
                 is_16x16x128
@@ -642,7 +639,7 @@ class KernelLayout:
         # BLOCK_K that keeps the scale on LDS.
         component_via_lds = []
         for idx in ops:
-            payload, scale = payload_lds_shape_slot[idx], scale_lds_shape_slot[idx]
+            payload, scale = payload_shape_slot[idx], scale_lds_shape_slot[idx]
             component_via_lds.append(
                 (
                     bool(tc.allow_component_via_lds((idx, False)))
@@ -700,7 +697,7 @@ class KernelLayout:
             for idx in ops:
                 if not payload_via_lds[idx]:
                     continue
-                shape = payload_lds_shape_slot[idx]
+                shape = payload_shape_slot[idx]
                 if payload_byte_unit_lds_ok[idx]:
                     layout = byte_unit_lds_layout(
                         shape,
@@ -826,14 +823,13 @@ class KernelLayout:
 
         # -- scale layouts --------------------------------------------------------
         # Identity (K-contiguous) staging tile for raw and shuffled scales and both
-        # operands alike. For raw E8M0 scales the three LDS goals are not
-        # simultaneously satisfiable: with `get_mfma_scale_layout` each lane wants
-        # K-scale elements strided by 2 or 4, so the read is `ds_read_u8` regardless,
-        # and the identity tile keeps the *write* side (direct-to-LDS) coalesced, which
-        # is the side that matters. A shuffled scale slot is a flat run in HBM byte
-        # order; its fragment order returns on the read. The fused-quant staging
-        # buffer uses the same layout.
-        identity_lds_layout = gl.SwizzledSharedLayout(
+        # operands alike, so it is stored once. For raw E8M0 scales the three LDS goals
+        # are not simultaneously satisfiable: with `get_mfma_scale_layout` each lane
+        # wants K-scale elements strided by 2 or 4, so the read is `ds_read_u8`
+        # regardless, and the identity tile keeps the *write* side (direct-to-LDS)
+        # coalesced, which is the side that matters. A shuffled scale slot is a flat run
+        # in HBM byte order; its fragment order returns on the read.
+        scale_lds_layout = gl.SwizzledSharedLayout(
             vec=1, per_phase=1, max_phase=1, order=[1, 0]
         )
         scale_fragment_layout = [None, None]
@@ -1082,6 +1078,9 @@ class KernelLayout:
             )
         epilogue_gamma_shape = [epilogue_threads]
         epilogue_bias_shape = [BN]
+        quant_staging_layout = gl.SwizzledSharedLayout(
+            vec=1, per_phase=1, max_phase=1, order=[1, 0]
+        )
         quant_staging_rows = BM if gu_split else SLOT_M
         quant_staging_rotates = fc.output_quant.value is not None and not gu_split
 
@@ -1094,7 +1093,7 @@ class KernelLayout:
             for idx in ops:
                 if payload_via_lds[idx]:
                     # Ring depth x slots x one slot, in storage elements.
-                    tile = payload_lds_shape_tile[idx]
+                    tile = payload_shape_tile[idx]
                     lds_bytes += tile[0] * tile[1] * tile[2] * (storage_bits[idx] // 8)
                 if scale_via_lds[idx]:
                     tile = scale_lds_shape_tile[idx]
@@ -1115,7 +1114,6 @@ class KernelLayout:
         self.num_prefetch_k_slots = gl.constexpr(num_prefetch_k_slots)
         self.num_m_slots = gl.constexpr(num_m_slots)
         self.num_n_slots = gl.constexpr(num_n_slots)
-        self.identity_lds_layout = gl.constexpr(identity_lds_layout)
 
         # operand placement
         self._component_via_lds = gl.constexpr(component_via_lds)
@@ -1124,8 +1122,8 @@ class KernelLayout:
         self._payload_block_k_storage = gl.constexpr(payload_block_k_storage)
         self._payload_hbm_step = gl.constexpr(payload_hbm_step)
         self._payload_byte_unit_lds_ok = gl.constexpr(payload_byte_unit_lds_ok)
-        self._payload_lds_shape_tile = gl.constexpr(payload_lds_shape_tile)
-        self._payload_fragment_shape_slot = gl.constexpr(payload_fragment_shape_slot)
+        self._payload_shape_tile = gl.constexpr(payload_shape_tile)
+        self._payload_shape_slot = gl.constexpr(payload_shape_slot)
         self._payload_hbm_offset_layout = gl.constexpr(payload_hbm_offset_layout)
         self._payload_lds_layout = gl.constexpr(payload_lds_layout)
         self._payload_fragment_layout = gl.constexpr(payload_fragment_layout)
@@ -1150,6 +1148,7 @@ class KernelLayout:
         )
         self._scale_fragment_shape_slot = gl.constexpr(scale_fragment_shape_slot)
         self._scale_hbm_offset_layout = gl.constexpr(scale_hbm_offset_layout)
+        self._scale_lds_layout = gl.constexpr(scale_lds_layout)
         self._scale_lds_view_layout_scale_slot = gl.constexpr(
             scale_lds_view_layout_scale_slot
         )
@@ -1181,6 +1180,7 @@ class KernelLayout:
         )
         self.quant_staging_rows = gl.constexpr(quant_staging_rows)
         self.quant_staging_rotates = gl.constexpr(quant_staging_rotates)
+        self.quant_staging_layout = gl.constexpr(quant_staging_layout)
 
         # resources
         self.lds_bytes = gl.constexpr(lds_bytes)
@@ -1223,7 +1223,7 @@ class KernelLayout:
         """
         if is_scale:
             return list(self._scale_fragment_shape_slot.value[idx])
-        return list(self._payload_fragment_shape_slot.value[idx])
+        return list(self._payload_shape_slot.value[idx])
 
     @gluon.constexpr_function
     def lds_shape_slot(self, idx, is_scale):
@@ -1234,7 +1234,7 @@ class KernelLayout:
         """
         if is_scale:
             return list(self._scale_lds_shape_slot.value[idx])
-        return list(self._payload_fragment_shape_slot.value[idx])
+        return list(self._payload_shape_slot.value[idx])
 
     @gluon.constexpr_function
     def lds_shape_tile(self, idx, is_scale):
@@ -1244,7 +1244,7 @@ class KernelLayout:
         """
         if is_scale:
             return list(self._scale_lds_shape_tile.value[idx])
-        return list(self._payload_lds_shape_tile.value[idx])
+        return list(self._payload_shape_tile.value[idx])
 
     @gluon.constexpr_function
     def payload_hbm_step(self, idx):
@@ -1287,11 +1287,11 @@ class KernelLayout:
     def lds_layout(self, idx, is_scale):
         """Shared layout of a component staged through LDS.
 
-        Padded for a payload; :attr:`identity_lds_layout` for a scale, a K-contiguous
-        tile shared by both operands.
+        Padded for a payload; for a scale, one identity (K-contiguous) tile shared by
+        both operands.
         """
         if is_scale:
-            return self.identity_lds_layout.value
+            return self._scale_lds_layout.value
         return self._payload_lds_layout.value[idx]
 
     @gluon.constexpr_function
