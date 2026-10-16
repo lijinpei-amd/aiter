@@ -104,7 +104,7 @@ class _ScheduleConfig:
     def scale_read_k_slots(self, idx):
         return self.scale_slot_ratio_k(idx)
 
-    def scale_cache_fragments(self, idx):
+    def scale_fragments_per_buffer(self, idx):
         return self.num_lds_slots_non_k(idx) * self.scale_read_k_slots(idx)
 
     def commit_per_op(self):

@@ -259,11 +259,11 @@ def _rotate(queue, SHIFT: gl.constexpr):
 def _rotate_buffers(buffers, sched, layout, PHASE: gl.constexpr = 0):
     mk: gl.constexpr = layout.num_k_slots
     if require_constexpr(sched.selects_at_phase(_A_SCALE, PHASE + 1)):
-        a_scale = _rotate(buffers[2], layout.scale_cache_fragments(0))
+        a_scale = _rotate(buffers[2], layout.scale_fragments_per_buffer(0))
     else:
         a_scale = buffers[2]
     if require_constexpr(sched.selects_at_phase(_B_SCALE, PHASE + 1)):
-        b_scale = _rotate(buffers[3], layout.scale_cache_fragments(1))
+        b_scale = _rotate(buffers[3], layout.scale_fragments_per_buffer(1))
     else:
         b_scale = buffers[3]
     return (
@@ -304,7 +304,7 @@ def _init_buffers(pc):
             )
     if require_constexpr(sched.present(_A_SCALE) and sched.in_reg(_A_SCALE)):
         for _ in gl.static_range(
-            tc.num_buffers(0, True) * layout.scale_cache_fragments(0)
+            tc.num_buffers(0, True) * layout.scale_fragments_per_buffer(0)
         ):
             a_scale += (
                 gl.zeros(
@@ -315,7 +315,7 @@ def _init_buffers(pc):
             )
     if require_constexpr(sched.present(_B_SCALE) and sched.in_reg(_B_SCALE)):
         for _ in gl.static_range(
-            tc.num_buffers(1, True) * layout.scale_cache_fragments(1)
+            tc.num_buffers(1, True) * layout.scale_fragments_per_buffer(1)
         ):
             b_scale += (
                 gl.zeros(
@@ -424,7 +424,7 @@ def _fill_slot(
                 a_scale,
                 fragments,
                 sched.register_index(STEP, _A_SCALE, True)
-                * layout.scale_cache_fragments(0)
+                * layout.scale_fragments_per_buffer(0)
                 + ops[1] * layout.scale_read_k_slots(0),
             )
     if require_constexpr(ops[2] is not None):
@@ -482,7 +482,7 @@ def _fill_slot(
                 b_scale,
                 fragments,
                 sched.register_index(STEP, _B_SCALE, True)
-                * layout.scale_cache_fragments(1)
+                * layout.scale_fragments_per_buffer(1)
                 + ops[3] * layout.scale_read_k_slots(1),
             )
     if require_constexpr(
@@ -593,7 +593,7 @@ def _read_scale(
     else:
         offset: gl.constexpr = sched.register_index(
             STEP, component
-        ) * layout.scale_cache_fragments(
+        ) * layout.scale_fragments_per_buffer(
             operand
         ) + non_k_slot * layout.scale_read_k_slots(
             operand

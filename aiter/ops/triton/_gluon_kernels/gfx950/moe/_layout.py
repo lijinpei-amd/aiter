@@ -398,7 +398,8 @@ class KernelLayout:
     _scale_slot_ratio_k: gl.constexpr
     _scale_slot_ratio_non_k: gl.constexpr
     _scale_num_slots: gl.constexpr
-    _scale_cache_fragments: gl.constexpr
+    _scale_read_k_slots: gl.constexpr
+    _scale_fragments_per_buffer: gl.constexpr
     _scale_packed_ok: gl.constexpr
     _scale_packed_sel: gl.constexpr
     #: Whether either live MFMA scale operand uses packed dword storage.
@@ -790,7 +791,7 @@ class KernelLayout:
             for idx in ops
         )
         scale_read_k_slots = tuple(num_k_slots * ratio for ratio in scale_slot_ratio_k)
-        scale_cache_fragments = tuple(
+        scale_fragments_per_buffer = tuple(
             num_lds_slots_non_k[idx] * scale_read_k_slots[idx] for idx in ops
         )
         # A shuffled scale slot is staged in HBM byte order, not fragment order, because
@@ -1140,7 +1141,8 @@ class KernelLayout:
         self._scale_slot_ratio_k = gl.constexpr(scale_slot_ratio_k)
         self._scale_slot_ratio_non_k = gl.constexpr(scale_slot_ratio_non_k)
         self._scale_num_slots = gl.constexpr(scale_num_slots)
-        self._scale_cache_fragments = gl.constexpr(scale_cache_fragments)
+        self._scale_read_k_slots = gl.constexpr(scale_read_k_slots)
+        self._scale_fragments_per_buffer = gl.constexpr(scale_fragments_per_buffer)
         self._scale_packed_ok = gl.constexpr(scale_packed_ok)
         self._scale_packed_sel = gl.constexpr(scale_packed_sel)
         self.any_scale_packed = gl.constexpr(any_scale_packed)
@@ -1342,11 +1344,15 @@ class KernelLayout:
     @gluon.constexpr_function
     def scale_read_k_slots(self, idx):
         """K slots one scale slot covers: one per K slot of each step it spans."""
-        return self.num_k_slots.value * self._scale_slot_ratio_k.value[idx]
+        return self._scale_read_k_slots.value[idx]
 
     @gluon.constexpr_function
-    def scale_cache_fragments(self, idx):
-        return self._scale_cache_fragments.value[idx]
+    def scale_fragments_per_buffer(self, idx):
+        """Scale fragments one register-ring buffer holds.
+
+        One per non-K slot and per K slot of each step a scale slot spans.
+        """
+        return self._scale_fragments_per_buffer.value[idx]
 
     @gluon.constexpr_function
     def scale_lds_shape_scale_slot(self, idx):
