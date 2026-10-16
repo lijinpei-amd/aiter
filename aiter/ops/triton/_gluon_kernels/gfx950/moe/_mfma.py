@@ -33,8 +33,8 @@ def _dot(
 ):
     """The one matrix instruction, dispatched on the operand pair."""
     kind: gl.constexpr = func_cfg.dot_kind()
-    a_sel: gl.constexpr = layout.mfma_scale_selector(0, K_PHASE)
-    b_sel: gl.constexpr = layout.mfma_scale_selector(1, K_PHASE)
+    a_sel: gl.constexpr = layout.scale_packed_sel(0, K_PHASE)
+    b_sel: gl.constexpr = layout.scale_packed_sel(1, K_PHASE)
     any_packed: gl.constexpr = layout.has_mfma_packed_scale
     if require_constexpr(kind == _DK_MFMA_SCALED and any_packed):
         if require_constexpr(not func_cfg.has_scale(0)):

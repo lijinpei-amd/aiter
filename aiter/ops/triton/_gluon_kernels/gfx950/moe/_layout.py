@@ -1369,13 +1369,11 @@ class KernelLayout:
 
     @gluon.constexpr_function
     def scale_packed_sel(self, idx, k_phase=0):
-        """Byte selectors in MFMA order, for one K128 half or the full K256 word."""
-        return self._scale_packed_sel.value[idx][k_phase]
+        """Byte selectors in MFMA order, for one K128 half or the full K256 word.
 
-    @gluon.constexpr_function
-    def mfma_scale_selector(self, idx, k_phase=0):
-        """Packed-scale selector for the live MFMA path, or ``None``."""
-        return self.scale_packed_sel(idx, k_phase)
+        ``None`` unless :meth:`scale_packed_ok`.
+        """
+        return self._scale_packed_sel.value[idx][k_phase]
 
     # -- scale layouts ------------------------------------------------------------
 
