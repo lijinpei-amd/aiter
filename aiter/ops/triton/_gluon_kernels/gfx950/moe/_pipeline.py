@@ -306,42 +306,24 @@ def _init_buffers(pc):
         for _ in gl.static_range(
             tc.num_buffers(0, True) * layout.scale_cache_fragments(0)
         ):
-            if require_constexpr(layout.mfma_scale_selector(0) is not None):
-                a_scale += (
-                    gl.zeros(
-                        layout.packed_scale_fragment_shape_slot(0),
-                        gl.int32,
-                        layout.packed_scale_fragment_layout_slot(0),
-                    ),
-                )
-            else:
-                a_scale += (
-                    gl.zeros(
-                        layout.fragment_shape_slot(0, True),
-                        gl.uint8,
-                        layout.dot_operand_fragment_layout(0, True),
-                    ),
-                )
+            a_scale += (
+                gl.zeros(
+                    layout.fragment_shape_slot(0, True),
+                    layout.scale_fragment_dtype(0),
+                    layout.dot_operand_fragment_layout(0, True),
+                ),
+            )
     if require_constexpr(sched.present(_B_SCALE) and sched.in_reg(_B_SCALE)):
         for _ in gl.static_range(
             tc.num_buffers(1, True) * layout.scale_cache_fragments(1)
         ):
-            if require_constexpr(layout.mfma_scale_selector(1) is not None):
-                b_scale += (
-                    gl.zeros(
-                        layout.packed_scale_fragment_shape_slot(1),
-                        gl.int32,
-                        layout.packed_scale_fragment_layout_slot(1),
-                    ),
-                )
-            else:
-                b_scale += (
-                    gl.zeros(
-                        layout.fragment_shape_slot(1, True),
-                        gl.uint8,
-                        layout.dot_operand_fragment_layout(1, True),
-                    ),
-                )
+            b_scale += (
+                gl.zeros(
+                    layout.fragment_shape_slot(1, True),
+                    layout.scale_fragment_dtype(1),
+                    layout.dot_operand_fragment_layout(1, True),
+                ),
+            )
     return a, b, a_scale, b_scale
 
 
@@ -377,16 +359,12 @@ def _fill_slot(
         * (pc.func_cfg.operand_elem_ty(1).primitive_bitwidth // 8)
     )
     as_soff: gl.constexpr = (
-        sched.scale_soff_steps(_A_SCALE, offset_step)
-        * pc.s_step
-        * pc.a_scale_stride_k
+        sched.scale_soff_steps(_A_SCALE, offset_step) * pc.s_step * pc.a_scale_stride_k
         if offset_step and pc.func_cfg.has_scale(0)
         else 0
     )
     bs_soff: gl.constexpr = (
-        sched.scale_soff_steps(_B_SCALE, offset_step)
-        * pc.s_step
-        * pc.b_scale_stride_k
+        sched.scale_soff_steps(_B_SCALE, offset_step) * pc.s_step * pc.b_scale_stride_k
         if offset_step and pc.func_cfg.has_scale(1)
         else 0
     )
@@ -617,7 +595,9 @@ def _read_scale(
             STEP, component
         ) * layout.scale_cache_fragments(
             operand
-        ) + non_k_slot * layout.scale_read_k_slots(operand)
+        ) + non_k_slot * layout.scale_read_k_slots(
+            operand
+        )
         fragments = ()
         for k in gl.static_range(
             layout.scale_ratio_non_k_slot(operand) * layout.scale_read_k_slots(operand)
