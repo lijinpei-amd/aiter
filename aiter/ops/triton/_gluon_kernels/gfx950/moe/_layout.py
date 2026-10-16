@@ -377,6 +377,9 @@ class KernelLayout:
     num_m_slots: gl.constexpr
     #: N slots per tile. Operand B and the accumulator split by this.
     num_n_slots: gl.constexpr
+    #: Unswizzled row-major 2-D shared layout: the scale staging tile and the
+    #: fused-quant staging buffer.
+    identity_lds_layout: gl.constexpr
     # -- operand placement --
     _component_via_lds: gl.constexpr
     # -- operand payload --
@@ -430,7 +433,6 @@ class KernelLayout:
     _scale_fragment_shape_slot: gl.constexpr
     _scale_hbm_offset_layout: gl.constexpr
     _dot_operand_scale_buffer_load_lds_layout: gl.constexpr
-    _dot_operand_scale_lds_layout: gl.constexpr
     _scale_lds_view_layout_scale_slot: gl.constexpr
     _scale_fragment_layout_scale_slot: gl.constexpr
     _dot_operand_scale_fragment_layout: gl.constexpr
@@ -457,7 +459,6 @@ class KernelLayout:
     quant_staging_rows: gl.constexpr
     #: Whether the fused-quant staging alternates two per-slot LDS banks.
     quant_staging_rotates: gl.constexpr
-    quant_staging_layout: gl.constexpr
     # -- resources --
     lds_bytes: gl.constexpr
 
@@ -827,13 +828,14 @@ class KernelLayout:
 
         # -- scale layouts --------------------------------------------------------
         # Identity (K-contiguous) staging tile for raw and shuffled scales and both
-        # operands alike, so it is stored once. For raw E8M0 scales the three LDS goals
-        # are not simultaneously satisfiable: with `get_mfma_scale_layout` each lane
-        # wants K-scale elements strided by 2 or 4, so the read is `ds_read_u8`
-        # regardless, and the identity tile keeps the *write* side (direct-to-LDS)
-        # coalesced, which is the side that matters. A shuffled scale slot is a flat run
-        # in HBM byte order; its fragment order returns on the read.
-        scale_lds_layout = gl.SwizzledSharedLayout(
+        # operands alike. For raw E8M0 scales the three LDS goals are not
+        # simultaneously satisfiable: with `get_mfma_scale_layout` each lane wants
+        # K-scale elements strided by 2 or 4, so the read is `ds_read_u8` regardless,
+        # and the identity tile keeps the *write* side (direct-to-LDS) coalesced, which
+        # is the side that matters. A shuffled scale slot is a flat run in HBM byte
+        # order; its fragment order returns on the read. The fused-quant staging
+        # buffer uses the same layout.
+        identity_lds_layout = gl.SwizzledSharedLayout(
             vec=1, per_phase=1, max_phase=1, order=[1, 0]
         )
         dot_operand_scale_fragment_layout = [None, None]
@@ -1084,9 +1086,6 @@ class KernelLayout:
             )
         epilogue_gamma_shape = [epilogue_threads]
         epilogue_bias_shape = [BN]
-        quant_staging_layout = gl.SwizzledSharedLayout(
-            vec=1, per_phase=1, max_phase=1, order=[1, 0]
-        )
         quant_staging_rows = BM if gu_split else SLOT_M
         quant_staging_rotates = fc.output_quant.value is not None and not gu_split
 
@@ -1120,6 +1119,7 @@ class KernelLayout:
         self.num_prefetch_k_slots = gl.constexpr(num_prefetch_k_slots)
         self.num_m_slots = gl.constexpr(num_m_slots)
         self.num_n_slots = gl.constexpr(num_n_slots)
+        self.identity_lds_layout = gl.constexpr(identity_lds_layout)
 
         # operand placement
         self._component_via_lds = gl.constexpr(component_via_lds)
@@ -1163,7 +1163,6 @@ class KernelLayout:
         self._dot_operand_scale_buffer_load_lds_layout = gl.constexpr(
             dot_operand_scale_buffer_load_lds_layout
         )
-        self._dot_operand_scale_lds_layout = gl.constexpr(scale_lds_layout)
         self._scale_lds_view_layout_scale_slot = gl.constexpr(
             scale_lds_view_layout_scale_slot
         )
@@ -1198,7 +1197,6 @@ class KernelLayout:
         )
         self.quant_staging_rows = gl.constexpr(quant_staging_rows)
         self.quant_staging_rotates = gl.constexpr(quant_staging_rotates)
-        self.quant_staging_layout = gl.constexpr(quant_staging_layout)
 
         # resources
         self.lds_bytes = gl.constexpr(lds_bytes)
@@ -1320,11 +1318,11 @@ class KernelLayout:
     def dot_operand_lds_layout(self, idx, is_scale):
         """Shared layout of a component staged through LDS.
 
-        Padded for a payload; for a scale, one identity (K-contiguous) tile shared by
-        both operands.
+        Padded for a payload; :attr:`identity_lds_layout` for a scale, a K-contiguous
+        tile shared by both operands.
         """
         if is_scale:
-            return self._dot_operand_scale_lds_layout.value
+            return self.identity_lds_layout.value
         return self._dot_operand_lds_layout.value[idx]
 
     @gluon.constexpr_function
