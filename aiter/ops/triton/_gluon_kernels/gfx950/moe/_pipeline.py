@@ -309,9 +309,9 @@ def _init_buffers(pc):
             if require_constexpr(layout.mfma_scale_selector(0) is not None):
                 a_scale += (
                     gl.zeros(
-                        layout.packed_scale_shape(0),
+                        layout.packed_scale_fragment_shape_slot(0),
                         gl.int32,
-                        layout.packed_scale_frag_layout1(0),
+                        layout.packed_scale_fragment_layout_slot(0),
                     ),
                 )
             else:
@@ -329,9 +329,9 @@ def _init_buffers(pc):
             if require_constexpr(layout.mfma_scale_selector(1) is not None):
                 b_scale += (
                     gl.zeros(
-                        layout.packed_scale_shape(1),
+                        layout.packed_scale_fragment_shape_slot(1),
                         gl.int32,
-                        layout.packed_scale_frag_layout1(1),
+                        layout.packed_scale_fragment_layout_slot(1),
                     ),
                 )
             else:

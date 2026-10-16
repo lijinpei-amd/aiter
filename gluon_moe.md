@@ -195,7 +195,7 @@ non-obvious one:
 - **Scales**: `(E, N, K/32)` uint8, strides carried explicitly. If `scale_swizzle == CDNA4_SCALE`
   the physical layout is the preshuffled one from `aiter/ops/triton/utils/shuffle.py:196-198`, which
   is not contiguous in the naive sense. Its effective scale K extent is at least
-  `max(256, BLOCK_K)` and must be divisible by `BLOCK_K`; a wider scale tile is retained across the
+  `max(256, BLOCK_K)` and must be divisible by `BLOCK_K`; a wider scale slot is retained across the
   corresponding number of payload K steps.
 - **Per-expert re-basing is mandatory.** Buffer ops carry a 32-bit offset (2 GB window); V4-Pro's
   stacked gemm1 weight is ~8.5 GB. Re-base `ptr` per expert on the host (any single expert is 22 MB

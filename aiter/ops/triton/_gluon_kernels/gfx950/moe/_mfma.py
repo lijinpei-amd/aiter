@@ -57,7 +57,7 @@ def _dot(
                     layout.fragment_shape_slot(1, True),
                 ),
             )
-        # At least one scale tile arrived as pre-packed dwords; the other, if any,
+        # At least one scale fragment arrived as pre-packed dwords; the other, if any,
         # takes the ordinary path through the same instruction.
         out = gl.amd.cdna4.mfma_scaled_packed(
             a=a,

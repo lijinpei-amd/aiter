@@ -770,7 +770,7 @@ def get_gluon_config_uncached(
     # Which axis to give up first when the tile does not fit.
     #
     # With microscaled operands, keep the payload K tile wide when possible. The
-    # shuffled scale tile independently defaults to max(256, BLOCK_K), so a narrower
+    # shuffled scale slot independently defaults to max(256, BLOCK_K), so a narrower
     # payload stage retains and reuses a coalesced wider scale load. Narrow N first and
     # accept the loss of arithmetic intensity before shortening that payload stream.
     #

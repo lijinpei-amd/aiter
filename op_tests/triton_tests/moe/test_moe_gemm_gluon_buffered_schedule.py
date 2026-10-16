@@ -56,7 +56,7 @@ class _Config(_ScheduleConfig):
         unroll_epilogue=True,
         soff=False,
         scale_steps=None,
-        scale_tiles=(1, 1),
+        scale_non_k_slots=(1, 1),
         compiler_pipeline=False,
     ):
         super().__init__(*shape, scheme, middle)
@@ -70,7 +70,7 @@ class _Config(_ScheduleConfig):
         self.ALLOW_B_VIA_LDS = not (register_mask & 1)
         self.packed = packed
         self.scale_steps = scale_steps or ((2, 2) if packed else (1, 1))
-        self.scale_tiles = scale_tiles
+        self.scale_non_k_slots = scale_non_k_slots
         self.compiler_pipeline = compiler_pipeline
         self.read_mask = read_mask
         self.K_UNROLL = unroll
@@ -116,7 +116,7 @@ class _Config(_ScheduleConfig):
         return self.scale_steps[operand] if self.has_scale(operand) else 1
 
     def scale_ratio_non_k_slot(self, operand):
-        return self.scale_tiles[operand]
+        return self.scale_non_k_slots[operand]
 
     def scale_read_k_slots(self, operand):
         return self.num_k_slots * self.scale_ratio_k_step(operand)
@@ -643,7 +643,7 @@ def test_unroll_epilogue_selects_remainder_loop(
         (
             (3, 2, 3, 2),
             0,
-            {"packed": True, "scale_steps": (4, 4), "scale_tiles": (2, 2)},
+            {"packed": True, "scale_steps": (4, 4), "scale_non_k_slots": (2, 2)},
         ),
         (
             (2, 2, 2, 2),
@@ -651,7 +651,7 @@ def test_unroll_epilogue_selects_remainder_loop(
             {
                 "packed": True,
                 "scale_steps": (8, 8),
-                "scale_tiles": (2, 2),
+                "scale_non_k_slots": (2, 2),
                 "soff": True,
             },
         ),
@@ -661,7 +661,7 @@ def test_unroll_epilogue_selects_remainder_loop(
             {
                 "packed": True,
                 "scale_steps": (1, 4),
-                "scale_tiles": (1, 2),
+                "scale_non_k_slots": (1, 2),
                 "middle": True,
             },
         ),
@@ -671,7 +671,7 @@ def test_unroll_epilogue_selects_remainder_loop(
             {
                 "packed": True,
                 "scale_steps": (4, 1),
-                "scale_tiles": (2, 1),
+                "scale_non_k_slots": (2, 1),
                 "shape": (4, 2),
             },
         ),

@@ -550,7 +550,7 @@ def sched_cases():
             },
         ),
         # A scale slot narrower than the payload slot, staged in registers instead of
-        # LDS: no scale tiles, but the LDS footprint still exists.
+        # LDS: no scale slot count, but the LDS footprint still exists.
         (
             "ascale-narrow-reg",
             DQ.MXFP4,
@@ -733,7 +733,7 @@ def scale_layout_test_cases():
                 SLOT_N=slot_n,
                 warps_per_cta=warps,
             )
-    # test_wide_packed_scale_frag_layout2_matches_producer
+    # test_wide_packed_scale_fragment_layout_scale_slot_matches_producer
     for sk in (256, 512, 1024):
         add(
             f"wide-sk{sk}",
