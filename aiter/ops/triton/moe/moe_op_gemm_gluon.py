@@ -1030,28 +1030,56 @@ def _default_launch_config(
         and dq_a == dq_b == DtypeQuant.BF16
         and block_m in (64, 128)
         and N % 256 == 0
-        and K % 64 == 0
+        and K % (64 if block_m == 128 else 128) == 0
     ):
         # Same defect for BF16, and worse: the automatic tile is BLOCK_N 64 with the
         # warps split (4, 2), so N is exactly one warp granularity wide and no
-        # slot split exists at all. The tuned tile is four times wider in N with
-        # a shallow K stage. Measured: T=1024 680.2 vs 723.7 us for the automatic
-        # geometry, T=4096 2193.5 vs 2252.7 us, T=256 436.0 vs 513.2 us
-        # (bench_out/gluon_larget_a4bf16_20260921, gluon_bm64_cg_20260921).
+        # slot split exists at all. The 16x16x32 MFMA beats the 32x32x16 one at both
+        # block sizes. Block_m 64 halves BLOCK_N and doubles BLOCK_K; block_m 128
+        # keeps BLOCK_N 256 and gives each of four N warps the whole M extent,
+        # eight M tiles by two N tiles. Screened against the 32x32x16 tile that
+        # was here (2026-10-17, H7168-I2048-E33-k8, 768 MiB flush per launch):
+        # T=256 392 vs 428 us, T=1024 662 vs 706 us, T=4096 2049 vs 2228 us.
         c = dict(
             c,
-            BLOCK_N=256,
-            BLOCK_K=64,
-            SLOT_M=block_m // 2,
-            SLOT_N=128,
-            mfma_instr_shape=(32, 32, 16),
-            warps_per_cta=(2, 4) if block_m == 128 else (1, 4),
+            BLOCK_N=256 if block_m == 128 else 128,
+            BLOCK_K=64 if block_m == 128 else 128,
+            SLOT_M=block_m if block_m == 128 else 32,
+            SLOT_N=128 if block_m == 128 else 64,
+            mfma_instr_shape=(16, 16, 32),
+            warps_per_cta=(1, 4),
+            tiles_per_warp=(8, 2) if block_m == 128 else (1, 1),
+            NUM_LDS_BUFFER=3,
+            K_UNROLL=3,
+            VGPR_PREFETCH_K=64 if block_m == 128 else 128,
+            WAVES_PER_EU=1,
+            WAIT_COMMIT_SCHEME=int(WaitCommitScheme.PER_STAGE_WHOLE),
+        )
+    if (
+        apply_swiglu
+        and dq_a == dq_b == DtypeQuant.BF16
+        and block_m in (16, 32)
+        and not small_grid
+        and N % 256 == 0
+        and K % 128 == 0
+    ):
+        # The automatic tile has one N slot (SLOT_N == BLOCK_N == 128), so a
+        # gate/up-split caller cannot run it. Two 64-column slots split it at the
+        # same speed as the tuned BLOCK_M 32 tile the benchmark pinned, and the
+        # automatic .cg weight hint is what that pin lacked: T=16 357 vs 463 us,
+        # T=64 366 vs 463 us at block_m 16, against the pin (screened as above).
+        c = dict(
+            c,
+            BLOCK_N=128,
+            BLOCK_K=128,
+            SLOT_M=block_m,
+            SLOT_N=64,
+            mfma_instr_shape=(16, 16, 32),
+            warps_per_cta=(1, 4),
             tiles_per_warp=(1, 1),
             NUM_LDS_BUFFER=3,
             K_UNROLL=3,
-            VGPR_PREFETCH_K=64,
-            WAVES_PER_EU=1,
-            WAIT_COMMIT_SCHEME=int(WaitCommitScheme.PER_STAGE_WHOLE),
+            VGPR_PREFETCH_K=128,
         )
     return c
 

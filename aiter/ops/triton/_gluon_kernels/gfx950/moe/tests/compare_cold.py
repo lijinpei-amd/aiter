@@ -47,6 +47,8 @@ print("|---|---:|---:|---:|---:|---:|---:|---:|")
 wtl, dg, df = [0, 0, 0], [], []
 for p in ("a4w4", "a8w4", "a8w8", "a16w16"):
     for t in (16, 64, 256, 1024, 4096):
+        if not all((p, t, s) in run for run in (a, b) for s in ("gluon", "flydsl")):
+            continue  # a --precisions/--tokens subset run
         g0, g1, f0, f1 = (
             a[p, t, "gluon"],
             b[p, t, "gluon"],

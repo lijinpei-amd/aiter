@@ -310,6 +310,14 @@ faster in 14 cells, tied in 1 (a8w4 T=4096 at 0.997; ties are within ±0.5%) and
 | a16w16 | 1024 | 683.1 | 698.5 | 1072.5 | 1100.3 | 0.637 |
 | a16w16 | 4096 | 2227.2 | 2285.7 | 3468.2 | 3502.6 | 0.642 |
 
+The a16w16 rows predate the 2026-10-17 bf16 ladder retune, which also repinned
+`gluon_a16w16` in `cases.json`. Against them, a run of the retuned tree shows the
+retune, not a regression. Same GPU and protocol, before against after
+(`cold_a16_before` / `cold_a16_after2`): Gluon 459.7 / 463.7 / 433.4 / 684.2 /
+2230.6 → 356.3 / 365.7 / 400.3 / 644.5 / 2067.7 µs at T=16 / 64 / 256 / 1024 / 4096,
+net of the FlyDSL control −22.2 / −21.1 / −6.1 / −6.1 / −7.4%, and faster than FlyDSL
+in all five cells.
+
 ## Vendored dependencies
 
 Copied, not moved; the originals are untouched. Edits are limited to paths
