@@ -402,12 +402,11 @@ class KernelLayout:
             rows = payload_shape_slot[idx][idx]
             k_storage = payload_shape_slot[idx][1 - idx]
             unit_k = LDS_UNIT_K_BYTES * 8 // storage_bits[idx]
-            if payload_preshuffled[idx]:
-                read_fits = k_width_for[idx] * storage_bits[idx] == LDS_LANE_BYTES * 8
-            else:
-                read_fits = (
-                    is_16x16x128 and storage_bits[idx] == 8 and tiles_per_warp[idx] >= 2
-                )
+            read_fits = k_width_for[idx] * storage_bits[idx] == LDS_LANE_BYTES * 8
+            if not payload_preshuffled[idx]:
+                read_fits = read_fits and list(instr[:2]) == [16, 16]
+                if storage_bits[idx] == 8:
+                    read_fits = read_fits and tiles_per_warp[idx] >= 2
             payload_byte_unit_lds_ok.append(
                 bool(read_fits)
                 and rows % lds_unit_rows[idx] == 0

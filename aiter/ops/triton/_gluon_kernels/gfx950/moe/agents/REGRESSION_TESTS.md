@@ -113,7 +113,8 @@ Notes:
   rename (both times names changed, values did not), and when `KernelLayout` began
   asserting its tile geometry (the 14 unsound cases now record the assert) (T0's `sched_baseline.txt` was
   re-recorded by the `Schedule` refactor, which changed the dump to one block per
-  emitted step; the other gate references are from `1d3431e50`). T0b differs by
+  emitted step; T2d's `asm_baseline.txt` by the bf16 byte-unit LDS gate, which
+  moved only a16w16 t16/t64; the other gate references are from `1d3431e50`). T0b differs by
   design when a
   change renames, adds or removes a `KernelLayout` field, or adds a sched-dump case
   (`layout_fields.py` imports that case list, so T0 differs too). Check that the diff

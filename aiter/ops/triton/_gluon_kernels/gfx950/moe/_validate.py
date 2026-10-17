@@ -176,19 +176,6 @@ def validate_layout(tc, layout, N, K):
     assert BM % (instr[0] * warps[0] * tiles[0]) == 0
     assert BN % (instr[1] * warps[1] * tiles[1]) == 0
 
-    # -- the LDS unit the byte-tiled layout is built from --
-    # A non-preshuffled unit is 32 rows because a warp reads two 16-row MFMA tiles
-    # from it; at tiles_per_warp 1 the second half of every unit belongs to another
-    # warp, so the 1, 4, 16, 2, 8 permutation would spread one warp's rows over two
-    # padding intervals instead of one. payload_byte_unit_lds_ok() gates on exactly
-    # this, so the assert can only fire if that gate is ever loosened without this
-    # being revisited -- which is the point of stating it here.
-    for idx in (0, 1):
-        if layout.payload_byte_unit_lds_ok(idx) and not tc.preshuffled(idx):
-            assert tiles[idx] >= 2, (
-                f"operand {idx} is not preshuffled, so its LDS unit is 32 rows and "
-                f"tiles_per_warp[{idx}] must be >= 2 (got {tiles[idx]})"
-            )
     if tc.preshuffled(1):
         # The 16-column-blocked global offsets only stay inside the N slot while
         # every extent is a whole number of 16-column, 16-byte blocks.

@@ -13,8 +13,8 @@ a8w8    t64    md5=a0ff21dfccc3 instrs=1779
 a8w8    t256   md5=b2a831a53d8f instrs=2879
 a8w8    t1024  md5=d2b0702a2f63 instrs=4006
 a8w8    t4096  md5=d2b0702a2f63 instrs=4006
-a16w16  t16    md5=fedbdac73fe4 instrs=1434
-a16w16  t64    md5=fedbdac73fe4 instrs=1434
+a16w16  t16    md5=f9f8f82d26fc instrs=1446
+a16w16  t64    md5=f9f8f82d26fc instrs=1446
 a16w16  t256   md5=d16a16c0082c instrs=1806
 a16w16  t1024  md5=f991e8cbfc5b instrs=1605
 a16w16  t4096  md5=f991e8cbfc5b instrs=1605
