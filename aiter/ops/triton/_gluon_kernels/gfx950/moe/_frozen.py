@@ -1864,19 +1864,26 @@ def _blocked_b_hbm_offsets_frozen(
     n0,
     n_slot: gl.constexpr,
     stored_k,
+    run: gl.constexpr,
 ):
-    """Byte offsets for a B tile in the 16-column-blocked HBM layout.
+    """Element offsets for a B tile in the 16-column-blocked HBM layout.
 
-    ``utils/shuffle.py::shuffle_weight(w, (16, 16))`` maps logical ``(n, k)``
-    to ``(n//16)*(stored_k*16) + (k//16)*256 + (n%16)*16 + k%16``. Keeping
-    this physical-layout transform beside the layout that consumes it prevents
-    the HBM and LDS permutations from drifting apart.
+    ``aiter/ops/shuffle.py::shuffle_weight(w, (16, 16))`` maps logical ``(n, k)``
+    to ``(n//16)*(stored_k*16) + (k//run)*(16*run) + (n%16)*run + k%run``, with
+    ``run`` the elements in 16 bytes. Keeping this physical-layout transform beside
+    the layout that consumes it prevents the HBM and LDS permutations from drifting
+    apart.
     """
     kk = gl.arange(0, payload_block_k_storage, layout=gl.SliceLayout(1, layout))[
         :, None
     ]
     nn = (n0 + gl.arange(0, n_slot, layout=gl.SliceLayout(0, layout)))[None, :]
-    return (nn // 16) * (stored_k * 16) + (kk // 16) * 256 + (nn % 16) * 16 + kk % 16
+    return (
+        (nn // 16) * (stored_k * 16)
+        + (kk // run) * (16 * run)
+        + (nn % 16) * run
+        + kk % run
+    )
 
 
 @gluon.jit
@@ -1988,6 +1995,7 @@ def _b_payload_hbm_offsets_frozen(b, pid_n, N, K, func_cfg, tuning_cfg, layout):
     PAYLOAD_BLOCK_K_STORAGE: gl.constexpr = layout.payload_block_k_storage(1)
     layout_b_slot: gl.constexpr = layout.payload_hbm_offset_layout(1)
     K_STORAGE: gl.constexpr = K // _pack_divisor_frozen(func_cfg, 1)
+    RUN: gl.constexpr = 128 // _operand_elem_ty_frozen(func_cfg, 1).primitive_bitwidth
     b_hbm_offsets_block = ()
     for n_slot_idx in gl.static_range(NUM_N_SLOTS_PER_BLOCK):
         if require_constexpr(tuning_cfg.B_PRESHUFFLED):
@@ -1998,6 +2006,7 @@ def _b_payload_hbm_offsets_frozen(b, pid_n, N, K, func_cfg, tuning_cfg, layout):
                     _n_start_frozen(pid_n, n_slot_idx, N, func_cfg, tuning_cfg),
                     N_SLOT,
                     K_STORAGE,
+                    RUN,
                 ),
             )
         else:

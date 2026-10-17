@@ -228,9 +228,10 @@ class TuningSpec(NamedTuple):
     #: static, so unlike the A-side shuffle this costs nothing at run time.
     B_SCALE_SHUFFLED: bool = False
     #: read operand B from a 16-column-blocked weight tensor -- aiter's
-    #: utils/shuffle.py::shuffle_weight(w, (16, 16)). The LDS tile takes the matching
-    #: permutation, which drops the staging unit from 32 rows to 16 and removes its
-    #: padding. Changes the operand contract, so the caller supplies the permuted tensor.
+    #: aiter/ops/shuffle.py::shuffle_weight(w, (16, 16)), 16 x 16 B tiles for every
+    #: dtype. The LDS tile takes the matching permutation, which drops the staging
+    #: unit from 32 rows to 16 and removes its padding. Changes the operand contract,
+    #: so the caller supplies the permuted tensor.
     B_PRESHUFFLED: bool = False
     #: use the hardware reciprocal in the fused SwiGLU instead of an IEEE divide,
     #: as the FlyDSL port does. ~1 ulp, well inside the bf16 the result is stored as.

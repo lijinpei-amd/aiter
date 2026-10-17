@@ -101,12 +101,18 @@ def _blocked_b_hbm_offsets(
     n0,
     n_slot: gl.constexpr,
     k_storage,
+    run: gl.constexpr,
 ):
     kk = gl.arange(0, payload_block_k_storage, layout=gl.SliceLayout(1, layout))[
         :, None
     ]
     nn = (n0 + gl.arange(0, n_slot, layout=gl.SliceLayout(0, layout)))[None, :]
-    return (nn // 16) * (k_storage * 16) + (kk // 16) * 256 + (nn % 16) * 16 + kk % 16
+    return (
+        (nn // 16) * (k_storage * 16)
+        + (kk // run) * (16 * run)
+        + (nn % 16) * run
+        + kk % run
+    )
 
 
 @gluon.jit
@@ -356,7 +362,7 @@ class KernelLayout:
         payload_block_k_storage = tuple(BK // fc.pack_divisor(idx) for idx in ops)
         payload_preshuffled = tuple(tc.preshuffled(idx) for idx in ops)
         payload_hbm_step = tuple(
-            step // 16 * 256 if pre else step
+            step * 16 if pre else step
             for step, pre in zip(payload_block_k_storage, payload_preshuffled)
         )
         payload_shape_slot = (
@@ -381,23 +387,6 @@ class KernelLayout:
             for idx in ops
         )
         is_16x16x128 = list(instr) == [16, 16, 128]
-        lds_unit_rows = tuple(16 if pre else 32 for pre in payload_preshuffled)
-        payload_byte_unit_lds_ok = []
-        for idx in ops:
-            rows = payload_shape_slot[idx][idx]
-            k_storage = payload_shape_slot[idx][1 - idx]
-            unit_k = LDS_UNIT_K_BYTES * 8 // storage_bits[idx]
-            payload_byte_unit_lds_ok.append(
-                is_16x16x128
-                and storage_bits[idx] == 8
-                and bool(payload_preshuffled[idx] or tiles_per_warp[idx] >= 2)
-                and rows % lds_unit_rows[idx] == 0
-                and k_storage % unit_k == 0
-            )
-        payload_byte_unit_lds_ok = tuple(payload_byte_unit_lds_ok)
-        payload_a_sorted_shuffled_ok = (
-            is_16x16x128 and BM % 32 == 0 and SLOT_M % 32 == 0
-        )
         k_width_override = tc.k_width.value
         k_width_for = tuple(
             (
@@ -406,6 +395,27 @@ class KernelLayout:
                 else k_width_override
             )
             for idx in ops
+        )
+        lds_unit_rows = tuple(16 if pre else 32 for pre in payload_preshuffled)
+        payload_byte_unit_lds_ok = []
+        for idx in ops:
+            rows = payload_shape_slot[idx][idx]
+            k_storage = payload_shape_slot[idx][1 - idx]
+            unit_k = LDS_UNIT_K_BYTES * 8 // storage_bits[idx]
+            if payload_preshuffled[idx]:
+                read_fits = k_width_for[idx] * storage_bits[idx] == LDS_LANE_BYTES * 8
+            else:
+                read_fits = (
+                    is_16x16x128 and storage_bits[idx] == 8 and tiles_per_warp[idx] >= 2
+                )
+            payload_byte_unit_lds_ok.append(
+                bool(read_fits)
+                and rows % lds_unit_rows[idx] == 0
+                and k_storage % unit_k == 0
+            )
+        payload_byte_unit_lds_ok = tuple(payload_byte_unit_lds_ok)
+        payload_a_sorted_shuffled_ok = (
+            is_16x16x128 and BM % 32 == 0 and SLOT_M % 32 == 0
         )
         payload_fragment_layout = tuple(
             gl.DotOperandLayout(
@@ -1058,6 +1068,7 @@ class KernelLayout:
         PAYLOAD_BLOCK_K_STORAGE: gl.constexpr = self.payload_block_k_storage(1)
         layout_b_slot: gl.constexpr = self.hbm_offset_layout(1, False)
         K_STORAGE: gl.constexpr = K // func_cfg.pack_divisor(1)
+        RUN: gl.constexpr = 128 // func_cfg.operand_elem_ty(1).primitive_bitwidth
         b_hbm_offsets_tile = ()
         for n_slot_idx in gl.static_range(NUM_N_SLOTS):
             if require_constexpr(tuning_cfg.B_PRESHUFFLED):
@@ -1068,6 +1079,7 @@ class KernelLayout:
                         self.n_start(pid_n, n_slot_idx, N),
                         N_SLOT,
                         K_STORAGE,
+                        RUN,
                     ),
                 )
             else:
