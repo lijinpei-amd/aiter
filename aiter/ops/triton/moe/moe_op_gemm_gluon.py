@@ -1524,13 +1524,13 @@ def _preshuffled_b(w, cfg, N, K, dq_b):
 
     Byte ``(n, k)`` of an expert moves to
         ``(n//16)*(KB*16) + (k//16)*256 + (n%16)*16 + k%16``
-    where ``KB = K // pack_divisor`` is the stored K extent, so a wave's 64 lanes --
-    lane L wanting bytes ``[16L, 16L+16)`` of a 16-column, 128-byte tile -- cover one
+    where ``KB`` is the stored K extent in bytes, so a wave's 64 lanes -- lane L
+    wanting bytes ``[16L, 16L+16)`` of four 16-column, 16-byte tiles -- cover one
     contiguous 1024 B run. Read through the operand-B fragment layout, the plain
     ``(E, KB, N)`` tensor instead puts consecutive lanes ``stride(-2)`` apart: same L2
-    and HBM traffic, 2.8x the L1 accesses, 42% slower. This is the same permute
-    ``utils/shuffle.py::shuffle_weight(w, (16, 16))`` applies, and the same one FlyDSL's
-    port requires of its caller.
+    and HBM traffic, 2.8x the L1 accesses, 42% slower. The tile is 16 bytes wide for
+    every dtype, so this is the permute ``aiter/ops/shuffle.py::shuffle_weight(w,
+    (16, 16))`` applies, and the one FlyDSL's port requires of its caller.
 
     ``byte_unit_lds_layout`` gives the shared tile the matching permutation, so the
     direct-to-LDS copy stays one linear run and the unit drops from 32 rows to 16 and
@@ -1540,7 +1540,7 @@ def _preshuffled_b(w, cfg, N, K, dq_b):
         return None
     if int(cfg["BLOCK_K"]) % 32 != 0 or N % 16 != 0 or K % 32 != 0:
         return None
-    KB = K // dq_pack_divisor(dq_b)
+    KB = K // dq_pack_divisor(dq_b) * w.element_size()
     if KB % 16 != 0:
         return None
     hit = getattr(w, _B_PRESHUFFLE_ATTR, None)
@@ -1548,14 +1548,16 @@ def _preshuffled_b(w, cfg, N, K, dq_b):
         return hit
 
     E = w.shape[0]
-    # (E, KB, N) -> (E, N, KB) -> blocked (E, N/16, KB/16, 16, 16) -> flat
+    # (E, K, N) -> (E, N, KB bytes) -> blocked (E, N/16, KB/16, 16, 16) -> flat
     out = (
         w.transpose(-1, -2)
         .contiguous()
+        .view(torch.uint8)
         .reshape(E, N // 16, 16, KB // 16, 16)
         .permute(0, 1, 3, 2, 4)
         .reshape(E, N // 16 * KB * 16)
         .contiguous()
+        .view(w.dtype)
     )
     try:
         setattr(w, _B_PRESHUFFLE_ATTR, out)

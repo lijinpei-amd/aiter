@@ -193,13 +193,14 @@ def validate_layout(tc, layout, N, K):
         # The 16-column-blocked global offsets only stay inside the N slot while
         # every extent is a whole number of 16-column, 16-byte blocks.
         pk_b = BK // fc.pack_divisor(1)
+        pk_b_bytes = pk_b * fc.operand_elem_ty(1).primitive_bitwidth // 8
         assert BN % 16 == 0 and tc.SLOT_N.value % 16 == 0, (
             f"B_PRESHUFFLED needs BLOCK_N ({BN}) and SLOT_N "
             f"({tc.SLOT_N.value}) to be multiples of the 16-column block"
         )
-        assert pk_b % 16 == 0, (
-            f"B_PRESHUFFLED needs BLOCK_K/pack ({pk_b}) to be a multiple of the "
-            "16-byte block"
+        assert pk_b_bytes % 16 == 0, (
+            f"B_PRESHUFFLED needs BLOCK_K/pack ({pk_b} elements, {pk_b_bytes} B) "
+            "to be a multiple of the 16-byte block"
         )
 
     # -- scale swizzle --

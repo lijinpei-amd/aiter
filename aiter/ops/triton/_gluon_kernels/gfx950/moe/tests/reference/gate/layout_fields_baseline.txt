@@ -9301,7 +9301,7 @@
   _component_via_lds = ((True, True), (False, True))
   _payload_block_k_storage = (256, 256)
   _payload_hbm_step = (256, 4096)
-  _payload_byte_unit_lds_ok = (False, False)
+  _payload_byte_unit_lds_ok = (False, True)
   payload_a_sorted_shuffled_ok = True
   _payload_shape_tile = ([6, 64, 256], [4, 256, 128])
   _payload_shape_slot = ([64, 256], [256, 128])
@@ -9345,7 +9345,7 @@
   quant_staging_rotates = False
   quant_staging_layout = SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0], cga_layout=[])
   lds_bytes = 196608
-  #mangle_sha256 = 6b80633a5f6adb7b84c0bf1ce13cb275294b6382a09a6157eb019202b9be600e
+  #mangle_sha256 = 81c30d853316782d80b18f80afff74a95ec84e4980c72dee94dd9acec1af2c66
 == test/config/epilogue_nop
   cfg KernelTuningConfig(func_cfg=KernelFuncConfig(token_dtype_quant=cx(2), expert_dtype_quant=cx(2), token_online_quant=cx(2), expert_online_quant=cx(2), mma_acc_dtype=cx(dtype:triton.language.float32), activation=cx(ActivationSpec(kind=0, alpha=1.0, limit=None, add_residual=False)), output_quant=cx(2), has_bias=cx(True), has_gammas=cx(False), has_gather=cx(True), has_x_static_scale=cx(False), weight_gu_hbm_layout=cx(1), epilogue=cx(2)), BLOCK_M=cx(128), BLOCK_N=cx(256), BLOCK_K=cx(256), K_UNROLL=cx(3), SLOT_M=cx(64), SLOT_N=cx(128), NUM_LDS_BUFFER=cx(3), mfma_instr_shape=cx([16, 16, 128]), warps_per_cta=cx([2, 2]), tiles_per_warp=cx([2, 2]), k_width=cx(None), transposed=cx(True), WAVES_PER_EU=cx(0), TILE_SCHED=cx(2), GROUP_M=cx(4), NUM_XCDS=cx(8), token_cache_modifier=cx(''), token_scale_cache_modifier=cx(''), expert_cache_modifier=cx('.cg'), expert_scale_cache_modifier=cx('.cg'), result_cache_modifier=cx(''), result_scale_cache_modifier=cx(''), WARP_PIPELINE=cx(0), VGPR_PREFETCH_K=cx(256), A_SCALE_SORTED_SHUFFLED=cx(False), B_SCALE_SHUFFLED=cx(False), B_PRESHUFFLED=cx(False), ACT_FAST_RCP=cx(True), WAIT_COMMIT_SCHEME=cx(1), DS_READ_A_PAYLOAD_IN_MFMA=cx(False), DS_READ_A_SCALE_IN_MFMA=cx(False), DS_READ_B_PAYLOAD_IN_MFMA=cx(False), DS_READ_B_SCALE_IN_MFMA=cx(False), SCHED_MODE=cx(0), FROZEN_STEP=cx(False), SOFF_UNROLL=cx(False), SCALE_FILL_MID=cx(False), ALLOW_B_VIA_LDS=cx(True), ALLOW_B_SCALE_VIA_LDS=cx(True), ALLOW_A_SCALE_VIA_LDS=cx(True), A_NUM_BUFFER=cx(0), B_NUM_BUFFER=cx(0), A_SCALE_NUM_BUFFER=cx(0), B_SCALE_NUM_BUFFER=cx(0), SCALE_SLOT_M=cx(0), SCALE_SLOT_N=cx(0), SCALE_SLOT_K=cx(0), UNROLL_EPILOGUE=cx(True))
   _BLOCK_N = 256
