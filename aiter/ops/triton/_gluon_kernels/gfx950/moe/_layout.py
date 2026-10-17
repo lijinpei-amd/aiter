@@ -68,19 +68,19 @@ def byte_unit_lds_layout(shape, nk_dim, storage_bits, unit_rows, preshuffled):
     kd = 1 - nk_dim
     els = lambda nbytes: nbytes * 8 // storage_bits
 
-    U = els(LDS_UNIT_K_BYTES)
-    V = els(LDS_LANE_BYTES)
     rows, k_storage = shape[nk_dim], shape[kd]
 
     K = lambda vs: _pow2_bases(kd, rank, vs)
     NK = lambda vs: _pow2_bases(nk_dim, rank, vs)
 
     if preshuffled:
-        bases = K(_ramp(1, V)) + NK(_ramp(1, unit_rows)) + K(_ramp(V, U))
+        V = els(LDS_LANE_BYTES)
+        bases = K(_ramp(1, V)) + NK(_ramp(1, unit_rows)) + K(_ramp(V, k_storage))
     else:
         assert unit_rows == 32, "the 1, 4, 16, 2, 8 permutation is a 32-row order"
-        bases = K(_ramp(1, U)) + NK([1, 4, 16, 2, 8])
-    bases = bases + K(_ramp(U, k_storage)) + NK(_ramp(unit_rows, rows))
+        U = els(LDS_UNIT_K_BYTES)
+        bases = K(_ramp(1, U)) + NK([1, 4, 16, 2, 8]) + K(_ramp(U, k_storage))
+    bases = bases + NK(_ramp(unit_rows, rows))
 
     if preshuffled:
         pairs = [[1 << (rows * k_storage).bit_length(), 16]]
@@ -397,11 +397,14 @@ class KernelLayout:
             for idx in ops
         )
         lds_unit_rows = tuple(16 if pre else 32 for pre in payload_preshuffled)
+        lds_unit_k_bytes = tuple(
+            LDS_LANE_BYTES if pre else LDS_UNIT_K_BYTES for pre in payload_preshuffled
+        )
         payload_byte_unit_lds_ok = []
         for idx in ops:
             rows = payload_shape_slot[idx][idx]
             k_storage = payload_shape_slot[idx][1 - idx]
-            unit_k = LDS_UNIT_K_BYTES * 8 // storage_bits[idx]
+            unit_k = lds_unit_k_bytes[idx] * 8 // storage_bits[idx]
             read_fits = k_width_for[idx] * storage_bits[idx] == LDS_LANE_BYTES * 8
             if not payload_preshuffled[idx]:
                 read_fits = read_fits and list(instr[:2]) == [16, 16]

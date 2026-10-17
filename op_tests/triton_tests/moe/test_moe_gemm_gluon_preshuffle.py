@@ -45,17 +45,22 @@ def test_host_preshuffle_matches_shuffle_weight(dtype):
 
 
 @pytest.mark.parametrize(
-    "dtype, instr",
+    "dtype, instr, block_k",
     [
-        ("mxfp4", (16, 16, 128)),
-        ("mxfp8", (16, 16, 128)),
-        ("bf16", (32, 32, 16)),
-        ("bf16", (16, 16, 32)),
+        ("mxfp4", (16, 16, 128), None),
+        ("mxfp8", (16, 16, 128), None),
+        ("bf16", (32, 32, 16), None),
+        ("bf16", (16, 16, 32), None),
+        # 64 B of K, narrower than the 128 B unit of a non-preshuffled payload.
+        ("bf16", (32, 32, 16), 32),
+        ("bf16", (16, 16, 32), 32),
     ],
 )
-def test_preshuffled_b_lds_keeps_hbm_order(dtype, instr):
+def test_preshuffled_b_lds_keeps_hbm_order(dtype, instr, block_k):
     storage, quant, _ = _STORAGE[dtype]
     config = dict(_register_config(dtype), B_PRESHUFFLED=True, mfma_instr_shape=instr)
+    if block_k is not None:
+        config["BLOCK_K"] = block_k
     layout = KernelLayout(host._probe_tuning_config(config, quant, quant))
     assert maybe_unwrap(layout.payload_byte_unit_lds_ok(1))
     shape = [int(x) for x in maybe_unwrap(layout.lds_shape_slot(1, False))]
