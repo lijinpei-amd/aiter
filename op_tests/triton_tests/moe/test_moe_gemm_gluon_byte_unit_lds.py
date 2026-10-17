@@ -90,6 +90,18 @@ def test_production_payloads_read_conflict_free(dtype, block_m, expected):
         assert _worst_read(addresses, rows, k_bytes, 16) == 1, (dtype, block_m, idx)
 
 
+@pytest.mark.parametrize(
+    "k_bytes, width", [(32, 32), (64, 16), (64, 32), (128, 16), (128, 32)]
+)
+def test_preshuffled_reads_conflict_free_below_128_bytes(k_bytes, width):
+    # A preshuffled slot keeps the 16 x 16 B HBM order at any K extent, so one narrower
+    # than the 128 B non-preshuffled unit reads like the wider ones.
+    shape = [k_bytes // 2, 64]
+    lds = byte_unit_lds_layout(shape, 1, 16, 16, True)
+    addresses = _byte_addresses(lds, shape, 0, 2)
+    assert _worst_read(addresses, 64, k_bytes, width) == 1
+
+
 def test_32_wide_reads_are_excluded():
     # The 32-row unit is 2-way for a 32-wide MFMA (lane rows 20-23 share banks with
     # rows 0-3), which is why a non-preshuffled operand needs a 16-wide one.
