@@ -287,17 +287,8 @@ class KernelLayout:
         instr = tc.mfma_instr_shape.value
         warps = tc.warps_per_cta.value
         tiles_per_warp = tc.tiles_per_warp.value
-        is_16x16x128 = list(instr) == [16, 16, 128]
-        gu_split = fc.weight_gu_hbm_layout.value == WeightGuHbmLayout.SPLIT
-        num_warps = warps[0] * warps[1]
-        threads = num_warps * WARP_SIZE
-        storage_dtype = tuple(fc.operand_elem_ty(idx) for idx in ops)
-        storage_bits = tuple(ty.primitive_bitwidth for ty in storage_dtype)
-        has_scale = tuple(fc.has_scale(idx) for idx in ops)
-        scale_preshuffled = tuple(tc.preshuffled(idx, True) for idx in ops)
-        payload_preshuffled = tuple(tc.preshuffled(idx) for idx in ops)
 
-        slot_nonk = (SLOT_M, SLOT_N)
+        scale_preshuffled = tuple(tc.preshuffled(idx, True) for idx in ops)
         scale_stage_k = max(256, BK)
         scale_slot_nonk = (
             (tc.SCALE_SLOT_M.value or SLOT_M) if scale_preshuffled[0] else SLOT_M,
@@ -308,6 +299,7 @@ class KernelLayout:
             for idx in ops
         )
 
+        slot_nonk = (SLOT_M, SLOT_N)
         assert (
             BK % instr[2] == 0
         ), f"BLOCK_K {BK} must be a multiple of MFMA K {instr[2]}"
@@ -340,43 +332,55 @@ class KernelLayout:
             assert (
                 sk & (sk - 1) == 0 and sk % BK == 0
             ), "SCALE_SLOT_K must be a power of two and a multiple of BLOCK_K"
+        assert (
+            tc.transposed.value
+        ), "transposed=True is pinned, see the module docstring"
 
+        num_warps = warps[0] * warps[1]
         num_k_slots = 1
         num_prefetch_k_slots = 1 if tc.VGPR_PREFETCH_K.value else 0
         num_m_slots = BM // SLOT_M
         num_n_slots = BN // SLOT_N
-        num_lds_slots_non_k = (num_m_slots, num_n_slots)
-        payload_block_k_storage = tuple(BK // fc.pack_divisor(idx) for idx in ops)
-        scale_block_k_storage = BK // MX_GROUP
-        payload_shape_slot = (
-            [SLOT_M, payload_block_k_storage[0]],
-            [payload_block_k_storage[1], SLOT_N],
-        )
-        scale_fragment_shape_slot = tuple(
-            [nonk, scale_block_k_storage] for nonk in (SLOT_M, SLOT_N)
-        )
+
+        threads = num_warps * WARP_SIZE
+        acc_vgprs_per_lane = BM * BN // threads
         accumulator_fragment_shape_slot = [SLOT_M, SLOT_N]
-        scale_lds_shape_slot = tuple(
-            [nonk, scale_block_k_storage] for nonk in (SLOT_M, SLOT_N)
+        dot_result_fragment_layout = gl.amd.AMDMFMALayout(
+            version=4,
+            instr_shape=instr,
+            transposed=True,
+            warps_per_cta=warps,
+            tiles_per_warp=tiles_per_warp,
         )
-        payload_shape_tile = tuple(
-            [tc.num_buffers(idx) * num_lds_slots_non_k[idx]] + payload_shape_slot[idx]
-            for idx in ops
-        )
-        payload_copy_contiguity = tuple(128 // bits for bits in storage_bits)
-        k_width_override = tc.k_width.value
-        k_width_for = tuple(
-            (
-                payload_copy_contiguity[idx]
-                if k_width_override is None
-                else k_width_override
-            )
-            for idx in ops
-        )
+
+        payload_block_k_storage = tuple(BK // fc.pack_divisor(idx) for idx in ops)
+        payload_preshuffled = tuple(tc.preshuffled(idx) for idx in ops)
         payload_hbm_step = tuple(
             step // 16 * 256 if pre else step
             for step, pre in zip(payload_block_k_storage, payload_preshuffled)
         )
+        payload_shape_slot = (
+            [SLOT_M, payload_block_k_storage[0]],
+            [payload_block_k_storage[1], SLOT_N],
+        )
+        num_lds_slots_non_k = (num_m_slots, num_n_slots)
+        payload_shape_tile = tuple(
+            [tc.num_buffers(idx) * num_lds_slots_non_k[idx]] + payload_shape_slot[idx]
+            for idx in ops
+        )
+
+        storage_dtype = tuple(fc.operand_elem_ty(idx) for idx in ops)
+        storage_bits = tuple(ty.primitive_bitwidth for ty in storage_dtype)
+        payload_copy_contiguity = tuple(128 // bits for bits in storage_bits)
+        payload_via_lds = tuple(
+            bool(tc.allow_component_via_lds((idx, False)))
+            and (
+                payload_shape_slot[idx][0] * payload_shape_slot[idx][1]
+                >= WARP_SIZE * payload_copy_contiguity[idx] * num_warps
+            )
+            for idx in ops
+        )
+        is_16x16x128 = list(instr) == [16, 16, 128]
         lds_unit_rows = tuple(16 if pre else 32 for pre in payload_preshuffled)
         payload_byte_unit_lds_ok = []
         for idx in ops:
@@ -391,49 +395,17 @@ class KernelLayout:
                 and k_storage % unit_k == 0
             )
         payload_byte_unit_lds_ok = tuple(payload_byte_unit_lds_ok)
-
         payload_a_sorted_shuffled_ok = (
             is_16x16x128 and BM % 32 == 0 and SLOT_M % 32 == 0
         )
-
-        component_via_lds = []
-        for idx in ops:
-            payload, scale = payload_shape_slot[idx], scale_lds_shape_slot[idx]
-            component_via_lds.append(
-                (
-                    bool(tc.allow_component_via_lds((idx, False)))
-                    and (
-                        payload[0] * payload[1]
-                        >= WARP_SIZE * payload_copy_contiguity[idx] * num_warps
-                    ),
-                    bool(tc.allow_component_via_lds((idx, True)))
-                    and (
-                        bool(scale_preshuffled[idx])
-                        or (
-                            scale[0] * scale[1] >= WARP_SIZE * 4
-                            and scale[1] % 4 == 0
-                            and scale[1] >= 8
-                        )
-                    ),
-                )
+        k_width_override = tc.k_width.value
+        k_width_for = tuple(
+            (
+                payload_copy_contiguity[idx]
+                if k_width_override is None
+                else k_width_override
             )
-        component_via_lds = tuple(component_via_lds)
-        payload_via_lds = tuple(placement[0] for placement in component_via_lds)
-        scale_via_lds = tuple(
-            has_scale[idx] and component_via_lds[idx][1] for idx in ops
-        )
-
-        payload_lds_layout = [None, None]
-        dot_operand_buffer_load_lds_layout = [None, None]
-        assert (
-            tc.transposed.value
-        ), "transposed=True is pinned, see the module docstring"
-        dot_result_fragment_layout = gl.amd.AMDMFMALayout(
-            version=4,
-            instr_shape=instr,
-            transposed=True,
-            warps_per_cta=warps,
-            tiles_per_warp=tiles_per_warp,
+            for idx in ops
         )
         payload_fragment_layout = tuple(
             gl.DotOperandLayout(
@@ -443,6 +415,8 @@ class KernelLayout:
             )
             for idx in ops
         )
+        payload_lds_layout = [None, None]
+        dot_operand_buffer_load_lds_layout = [None, None]
         for idx in ops:
             if not payload_via_lds[idx]:
                 continue
@@ -477,6 +451,8 @@ class KernelLayout:
                 WARP_SIZE,
                 shape,
             )
+        payload_lds_layout = tuple(payload_lds_layout)
+        dot_operand_buffer_load_lds_layout = tuple(dot_operand_buffer_load_lds_layout)
         payload_hbm_offset_layout = tuple(
             (
                 dot_operand_buffer_load_lds_layout[idx]
@@ -485,9 +461,8 @@ class KernelLayout:
             )
             for idx in ops
         )
-        payload_lds_layout = tuple(payload_lds_layout)
-        dot_operand_buffer_load_lds_layout = tuple(dot_operand_buffer_load_lds_layout)
 
+        scale_block_k_storage = BK // MX_GROUP
         scale_slot_ratio_k = tuple(k // BK for k in scale_slot_k)
         scale_slot_ratio_non_k = tuple(
             scale_slot_nonk[idx] // slot_nonk[idx] for idx in ops
@@ -502,6 +477,9 @@ class KernelLayout:
         scale_lds_shape_scale_slot = tuple(
             [scale_slot_nonk[idx] // 32, scale_slot_k[idx]] for idx in ops
         )
+        scale_lds_shape_slot = tuple(
+            [nonk, scale_block_k_storage] for nonk in (SLOT_M, SLOT_N)
+        )
         scale_shape_tile = []
         for idx in ops:
             if scale_preshuffled[idx]:
@@ -515,12 +493,37 @@ class KernelLayout:
                     + scale_lds_shape_slot[idx]
                 )
         scale_shape_tile = tuple(scale_shape_tile)
-        scale_fragment_shape_scale_slot = tuple(
-            [scale_slot_nonk[idx], scale_slot_k[idx] // MX_GROUP] for idx in ops
-        )
 
+        component_via_lds = []
+        for idx in ops:
+            scale = scale_lds_shape_slot[idx]
+            component_via_lds.append(
+                (
+                    payload_via_lds[idx],
+                    bool(tc.allow_component_via_lds((idx, True)))
+                    and (
+                        bool(scale_preshuffled[idx])
+                        or (
+                            scale[0] * scale[1] >= WARP_SIZE * 4
+                            and scale[1] % 4 == 0
+                            and scale[1] >= 8
+                        )
+                    ),
+                )
+            )
+        component_via_lds = tuple(component_via_lds)
+        has_scale = tuple(fc.has_scale(idx) for idx in ops)
+        scale_via_lds = tuple(
+            has_scale[idx] and component_via_lds[idx][1] for idx in ops
+        )
         scale_lds_layout = gl.SwizzledSharedLayout(
             vec=1, per_phase=1, max_phase=1, order=[1, 0]
+        )
+        scale_fragment_shape_slot = tuple(
+            [nonk, scale_block_k_storage] for nonk in (SLOT_M, SLOT_N)
+        )
+        scale_fragment_shape_scale_slot = tuple(
+            [scale_slot_nonk[idx], scale_slot_k[idx] // MX_GROUP] for idx in ops
         )
         scale_fragment_layout = [None, None]
         scale_fragment_layout_scale_slot = [None, None]
@@ -721,6 +724,8 @@ class KernelLayout:
         epilogue_input_lds_layout = gl.SwizzledSharedLayout(
             vec=1, per_phase=1, max_phase=1, order=[0]
         )
+        epilogue_gamma_shape = [epilogue_threads]
+        epilogue_bias_shape = [BN]
         epilogue_gamma_buffer_load_lds_layout = None
         epilogue_bias_buffer_load_lds_layout = None
         if epilogue_inputs_via_lds:
@@ -730,13 +735,12 @@ class KernelLayout:
             epilogue_bias_buffer_load_lds_layout = gl.BlockedLayout(
                 [epilogue_bias_per_thread], [WARP_SIZE], [num_warps], [0]
             )
-        epilogue_gamma_shape = [epilogue_threads]
-        epilogue_bias_shape = [BN]
+        gu_split = fc.weight_gu_hbm_layout.value == WeightGuHbmLayout.SPLIT
+        quant_staging_rows = BM if gu_split else SLOT_M
+        quant_staging_rotates = fc.output_quant.value is not None and not gu_split
         quant_staging_layout = gl.SwizzledSharedLayout(
             vec=1, per_phase=1, max_phase=1, order=[1, 0]
         )
-        quant_staging_rows = BM if gu_split else SLOT_M
-        quant_staging_rotates = fc.output_quant.value is not None and not gu_split
 
         lds_bytes = 0
         for idx in ops:
@@ -746,7 +750,6 @@ class KernelLayout:
             if scale_via_lds[idx]:
                 tile = scale_shape_tile[idx]
                 lds_bytes += tile[0] * tile[1] * tile[2]
-        acc_vgprs_per_lane = BM * BN // threads
 
         self._BLOCK_N = gl.constexpr(BN)
         self._BLOCK_K = gl.constexpr(BK)
