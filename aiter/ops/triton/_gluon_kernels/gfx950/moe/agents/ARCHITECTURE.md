@@ -13,6 +13,7 @@ Each python file is a component, and inter files, the import dependency should b
     * the LDS budget constants (`LDS_CAP_BYTES`, `LDS_EPILOGUE_RESERVE_BYTES`, `LDS_USABLE_BYTES`), read by `_validate.py` and the host wrapper.
     * slot-traversal indexing: `_slot_index`, a slot's position in the N-outer, M-inner traversal, which is also the index of its accumulator in the carried tuple. Shared by `_schedule.py`, `_pipeline.py`, `_epilogue.py` and `moe_gemm.py`.
 * `_quant.py`: quant/dequant related helpers
+* `_packed_scale.py`: packed scales for the CDNA4 scaled MFMA, written as the `gl.amd.cdna4` helpers they stand in for (the Triton tree stays untouched): the i32 layout of a shuffled scale in whole 32-row by K256 units (`packed_scale_shape`, `packed_scale_layout`, `packed_scale_lds_view_layout`), and the byte selectors `mfma_scaled_packed` takes with the shape its verifier checks (`packed_scale_sel`, `packed_scale_dot_shape`, `packed_scale_dot_layout`). It imports only `_lang.py`, and only `_layout.py` imports it.
 * `_config.py`:
     * `KernelFuncConfig` describes what the kernel does, e.g. gemm1/gemm2, various dtype, epilogue.
     * `KernelTuningConfig` is the input tunning knob, it describes, e.g. various tiling size, whether lds is allowed for async load (`ALLOW_*_VIA_LDS`, read through `allow_component_via_lds`), buffer depth for pipelining.
