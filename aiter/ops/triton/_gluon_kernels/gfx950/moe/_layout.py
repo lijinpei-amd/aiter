@@ -288,13 +288,22 @@ class KernelLayout:
         tiles_per_warp = tc.tiles_per_warp.value
 
         scale_preshuffled = tuple(tc.preshuffled(idx, True) for idx in ops)
-        scale_stage_k = max(256, BK)
+        # The block a scale stores contiguously, which a scale slot holds whole. A
+        # shuffled scale's is a 32-row stripe by K256, one 256 B tile in CDNA4
+        # MX-scale order; an unshuffled scale is row-major, so its is one row by
+        # any K.
+        scale_stripe_nonk = tuple(32 if scale_preshuffled[idx] else 1 for idx in ops)
+        scale_stripe_k = tuple(256 if scale_preshuffled[idx] else 1 for idx in ops)
+        scale_stage_k = tuple(max(k, BK) for k in scale_stripe_k)
         scale_slot_nonk = (
             (tc.SCALE_SLOT_M.value or SLOT_M) if scale_preshuffled[0] else SLOT_M,
             (tc.SCALE_SLOT_N.value or SLOT_N) if scale_preshuffled[1] else SLOT_N,
         )
+        # Only a shuffled scale takes SCALE_SLOT_K; the default is one step, widened
+        # to whole stripes.
         scale_slot_k = tuple(
-            (tc.SCALE_SLOT_K.value or scale_stage_k) if scale_preshuffled[idx] else BK
+            (tc.SCALE_SLOT_K.value if scale_preshuffled[idx] else 0)
+            or scale_stage_k[idx]
             for idx in ops
         )
 
@@ -323,10 +332,10 @@ class KernelLayout:
                 f"SLOT_{axis}"
             )
             assert (
-                nonk % 32 == 0
+                nonk % scale_stripe_nonk[idx] == 0
             ), f"SCALE_SLOT_{axis} must contain whole 32-row stripes"
             assert (
-                sk >= scale_stage_k
+                sk >= scale_stage_k[idx]
             ), "SCALE_SLOT_K must be at least 256 and at least BLOCK_K"
             assert (
                 sk & (sk - 1) == 0 and sk % BK == 0
@@ -471,14 +480,13 @@ class KernelLayout:
         scale_slot_shape_logical = tuple(
             [scale_slot_nonk[idx], scale_slot_k[idx] // MX_GROUP] for idx in ops
         )
-        # A shuffled scale is stored as its 32-row stripes in HBM byte order, an
-        # unshuffled one in its logical shape.
+        # Storage is one row per stripe, so an unshuffled scale is stored in its
+        # logical shape.
         scale_slot_shape_storage = tuple(
-            (
-                [scale_slot_nonk[idx] // 32, scale_slot_k[idx]]
-                if scale_preshuffled[idx]
-                else scale_slot_shape_logical[idx]
-            )
+            [
+                scale_slot_nonk[idx] // scale_stripe_nonk[idx],
+                scale_stripe_nonk[idx] * scale_slot_k[idx] // MX_GROUP,
+            ]
             for idx in ops
         )
         scale_shape_tile = tuple(
@@ -570,7 +578,7 @@ class KernelLayout:
             ):
                 sel = tuple(
                     packed_scale_sel(
-                        frag, slot_nonk[idx], BK, k_phase * BK % scale_stage_k
+                        frag, slot_nonk[idx], BK, k_phase * BK % scale_stage_k[idx]
                     )
                     for k_phase in (0, 1)
                 )
