@@ -532,24 +532,28 @@ def test_streaming_expert_payload_respects_explicit_config(explicit):
 
 
 @pytest.mark.parametrize(
-    "dq_b,block_m,K,block_k,expected",
+    "dq_b,block_m,K,stream,block_k,shuffled,expected",
     [
-        # An MXFP8 B scale row of 4 bytes copied through LDS: the one exception.
-        (DtypeQuant.MXFP8, 16, 1024, 128, ".cg"),
-        (DtypeQuant.MXFP8, 128, 2880, 128, ".cg"),
-        # BLOCK_K 256, where the hint measured slower at T=16/64.
-        (DtypeQuant.MXFP8, 32, 7168, 256, ""),
+        # Shuffled MXFP8 B scales, the T>=256 tiles: T=256 streams B, T>=1024 does
+        # not.
+        (DtypeQuant.MXFP8, 64, 7168, True, 256, True, ".cg"),
+        (DtypeQuant.MXFP8, 128, 7168, False, 128, True, ".cg"),
+        # An unshuffled MXFP8 B scale row of 4 bytes copied through LDS.
+        (DtypeQuant.MXFP8, 16, 1024, False, 128, False, ".cg"),
+        (DtypeQuant.MXFP8, 128, 2880, False, 128, False, ".cg"),
+        # Unshuffled at BLOCK_K 256, where the hint measured slower at T=16/64.
+        (DtypeQuant.MXFP8, 32, 7168, False, 256, False, ""),
         # MXFP4 weights take the hint at every BLOCK_K.
-        (DtypeQuant.MXFP4, 16, 1024, 128, ".cg"),
+        (DtypeQuant.MXFP4, 16, 1024, False, 128, False, ".cg"),
     ],
 )
-def test_mxfp8_weight_scale_hint_only_for_four_byte_lds_rows(
-    dq_b, block_m, K, block_k, expected
+def test_mxfp8_weight_scale_hint_cases(
+    dq_b, block_m, K, stream, block_k, shuffled, expected
 ):
     config = host._default_launch_config(
-        block_m, 4096, K, DtypeQuant.MXFP8, dq_b, False, True
+        block_m, 4096, K, DtypeQuant.MXFP8, dq_b, False, True, stream
     )
-    assert (config["BLOCK_K"], config["B_SCALE_SHUFFLED"]) == (block_k, False)
+    assert (config["BLOCK_K"], config["B_SCALE_SHUFFLED"]) == (block_k, shuffled)
     assert config["expert_scale_cache_modifier"] == expected
 
 

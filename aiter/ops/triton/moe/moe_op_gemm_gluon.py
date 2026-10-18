@@ -722,8 +722,9 @@ def get_gluon_config_uncached(
             # genuinely mixed there: +3.1%/+3.2% at T=16/64 against -10.7% at T=256.
             # bench_out/gluon_scale_hint_20260923. Re-measured 2026-10-18 on the
             # current pins: +2.2% +2.4% -11.1% -2.5% -0.3% (T=16..4096),
-            # bench_out/gluon_moe_regression/harness/cold_a8w8{nocg,cg}. The one
-            # MXFP8 exception, BLOCK_K 128, is applied in _default_launch_config.
+            # bench_out/gluon_moe_regression/harness/cold_a8w8{nocg,cg}. The two
+            # MXFP8 exceptions -- shuffled scales (the T>=256 tiles) and BLOCK_K 128
+            # through LDS -- are applied in _default_launch_config.
             "expert_scale_cache_modifier": _env_cache_modifier(
                 "EXPERT_SCALE_CACHE_MODIFIER",
                 ".cg" if dq_b == DtypeQuant.MXFP4 else "",
@@ -1111,25 +1112,38 @@ def _default_launch_config(
             K_UNROLL=3,
             VGPR_PREFETCH_K=128,
         )
-    if (
-        dq_b == DtypeQuant.MXFP8
-        and not c["B_SCALE_SHUFFLED"]
-        and c["BLOCK_K"] == 128
-        and _probe_b_scale_via_lds(_cfg_key(c), dq_a, dq_b)
+    if dq_b == DtypeQuant.MXFP8 and (
+        c["B_SCALE_SHUFFLED"]
+        or (
+            c["BLOCK_K"] == 128
+            and _probe_b_scale_via_lds(_cfg_key(c), dq_a, dq_b)
+        )
     ):
-        # The one MXFP8 weight-scale exception to get_gluon_config's empty hint. At
-        # BLOCK_K 128 an unshuffled scale row is 4 bytes, and its LDS copy has every
-        # warp fetch the same rows (all but one warp's writes are discarded). Without
-        # `.cg` those fetches allocate in L1, and L1 stalls on L2 rose 50%. Measured
-        # on H7168-I2048-E33-k8 with a8w8 pinned to BLOCK_K 128, cold, us:
+        # The MXFP8 weight-scale exceptions to get_gluon_config's empty hint.
+        #
+        # Shuffled scales: the overrides above shuffle them only for the T>=256
+        # tiles, and the measured split follows that line. Every cell that gains
+        # reads CDNA4_SCALE scales; both cells that lose read unshuffled scales at
+        # BLOCK_K 256. Cold, current a8w8 pins on H7168-I2048-E33-k8, `.cg` vs none:
+        #
+        #   T=256 -11.1%   T=1024 -2.5%   T=4096 -0.3%   (T=16 +2.2%, T=64 +2.4%)
+        #
+        # Those overrides only shuffle when N and K are multiples of 256, where
+        # _shuffled_b_scales always succeeds, so the launch never drops the shuffle
+        # and keeps the hint.
+        #
+        # BLOCK_K 128 through LDS: an unshuffled scale row is 4 bytes, and its LDS
+        # copy has every warp fetch the same rows (all but one warp's writes are
+        # discarded). Without `.cg` those fetches allocate in L1, and L1 stalls on L2
+        # rose 50%. a8w8 pinned to BLOCK_K 128, cold, us:
         #
         #          register   LDS     LDS + .cg
         #   T=16   272.1      277.8   269.4
         #   T=64   304.0      298.6   298.0
         #
-        # Kept to this case: at BLOCK_K 256 the hint loses at T=16/64 (see above),
-        # and a register B scale with `.cg` was 2.7% slower at T=16.
-        # bench_out/gluon_moe_regression/harness/cold_{bk128reg,bk128lds,a8w8ldscg}.
+        # A register B scale with `.cg` was 2.7% slower at T=16, so it gets no hint.
+        # bench_out/gluon_moe_regression/harness/cold_{a8w8nocg,a8w8cg,bk128reg,
+        # bk128lds,a8w8ldscg}.
         c = dict(
             c,
             expert_scale_cache_modifier=_env_cache_modifier(
