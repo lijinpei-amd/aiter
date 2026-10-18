@@ -259,11 +259,11 @@ def _rotate(queue, SHIFT: gl.constexpr):
 def _rotate_buffers(buffers, sched, layout, PHASE: gl.constexpr = 0):
     mk: gl.constexpr = layout.num_k_slots
     if require_constexpr(sched.selects_at_phase(_A_SCALE, PHASE + 1)):
-        a_scale = _rotate(buffers[2], layout.scale_fragments_per_buffer(0))
+        a_scale = _rotate(buffers[2], layout.num_m_slots * mk * sched.ratio_k(_A_SCALE))
     else:
         a_scale = buffers[2]
     if require_constexpr(sched.selects_at_phase(_B_SCALE, PHASE + 1)):
-        b_scale = _rotate(buffers[3], layout.scale_fragments_per_buffer(1))
+        b_scale = _rotate(buffers[3], layout.num_n_slots * mk * sched.ratio_k(_B_SCALE))
     else:
         b_scale = buffers[3]
     return (
@@ -304,7 +304,10 @@ def _init_buffers(pc):
             )
     if require_constexpr(sched.present(_A_SCALE) and sched.in_reg(_A_SCALE)):
         for _ in gl.static_range(
-            tc.num_buffers(0, True) * layout.scale_fragments_per_buffer(0)
+            tc.num_buffers(0, True)
+            * layout.num_m_slots
+            * layout.num_k_slots
+            * sched.ratio_k(_A_SCALE)
         ):
             a_scale += (
                 gl.zeros(
@@ -315,7 +318,10 @@ def _init_buffers(pc):
             )
     if require_constexpr(sched.present(_B_SCALE) and sched.in_reg(_B_SCALE)):
         for _ in gl.static_range(
-            tc.num_buffers(1, True) * layout.scale_fragments_per_buffer(1)
+            tc.num_buffers(1, True)
+            * layout.num_n_slots
+            * layout.num_k_slots
+            * sched.ratio_k(_B_SCALE)
         ):
             b_scale += (
                 gl.zeros(
@@ -423,9 +429,9 @@ def _fill_slot(
             a_scale = _replace_fragments(
                 a_scale,
                 fragments,
-                sched.register_index(STEP, _A_SCALE, True)
-                * layout.scale_fragments_per_buffer(0)
-                + ops[1] * layout.scale_read_k_slots(0),
+                (sched.register_index(STEP, _A_SCALE, True) * nm + ops[1])
+                * mk
+                * sched.ratio_k(_A_SCALE),
             )
     if require_constexpr(ops[2] is not None):
         if require_constexpr(sched.in_reg(_B_PAYLOAD)):
@@ -481,9 +487,9 @@ def _fill_slot(
             b_scale = _replace_fragments(
                 b_scale,
                 fragments,
-                sched.register_index(STEP, _B_SCALE, True)
-                * layout.scale_fragments_per_buffer(1)
-                + ops[3] * layout.scale_read_k_slots(1),
+                (sched.register_index(STEP, _B_SCALE, True) * nn + ops[3])
+                * mk
+                * sched.ratio_k(_B_SCALE),
             )
     if require_constexpr(
         sched.commit_per_slot
@@ -591,17 +597,14 @@ def _read_scale(
             non_k_slot,
         )
     else:
-        offset: gl.constexpr = sched.register_index(
-            STEP, component
-        ) * layout.scale_fragments_per_buffer(
-            operand
-        ) + non_k_slot * layout.scale_read_k_slots(
-            operand
-        )
+        buffer: gl.constexpr = sched.register_index(STEP, component)
+        non_k_slots: gl.constexpr = layout.num_lds_slots_non_k(operand)
+        k_fragments: gl.constexpr = layout.num_k_slots * sched.ratio_k(component)
+        offset: gl.constexpr = (buffer * non_k_slots + non_k_slot) * k_fragments
+        slot_nonk: gl.constexpr = layout.slot_nonk(operand)
+        ratio: gl.constexpr = layout.scale_slot_nonk(operand) // slot_nonk
         fragments = ()
-        for k in gl.static_range(
-            layout.scale_slot_ratio_non_k(operand) * layout.scale_read_k_slots(operand)
-        ):
+        for k in gl.static_range(ratio * k_fragments):
             fragments += (buffers[operand + 2][offset + k],)
     return fragments
 
@@ -653,15 +656,14 @@ def _take_operand_pairs(
     non_k_slot: gl.constexpr,
     PHASE: gl.constexpr,
 ):
+    ratio_k: gl.constexpr = layout.scale_slot_k(operand) // tc.BLOCK_K
     out = ()
     for k in gl.static_range(layout.num_k_slots):
         if require_constexpr(tc.func_cfg.has_scale(operand)):
             out += (
                 payload[non_k_slot * layout.num_k_slots + k],
                 scale[
-                    non_k_slot * layout.scale_read_k_slots(operand)
-                    + PHASE % layout.scale_slot_ratio_k(operand) * layout.num_k_slots
-                    + k
+                    (non_k_slot * ratio_k + PHASE % ratio_k) * layout.num_k_slots + k
                 ],
             )
         else:

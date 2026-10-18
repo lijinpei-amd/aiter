@@ -172,9 +172,10 @@ def test_packed_words_and_selectors_match_producer(
     # address. The read views a whole scale slot, which by default is this one
     # fragment, as [stripe, dword]; the fragment is its row-major reshape to the
     # dot's shape.
-    view_shape = layout.scale_fragment_shape_scale_slot(operand)
+    storage = layout.scale_slot_shape_storage(operand)
+    view_shape = [storage[0], storage[1] // 4]
     assert view_shape[0] * view_shape[1] == word_shape[0] * word_shape[1]
-    read_bases = layout.scale_lds_view_layout_scale_slot(operand).offset_bases
+    read_bases = layout.scale_slot_lds_view_layout_storage(operand).offset_bases
     physical_word = {
         tuple(_coordinate(read_bases, offset)): offset
         for offset in range(len(producer) // 4)
@@ -216,7 +217,7 @@ def test_packed_words_and_selectors_match_producer(
 
 @pytest.mark.parametrize("scale_k", [256, 512, 1024])
 @pytest.mark.parametrize("operand", [0, 1], ids=["A", "B"])
-def test_wide_packed_scale_fragment_layout_scale_slot_matches_producer(
+def test_wide_packed_scale_slot_fragment_layout_storage_matches_producer(
     scale_k, operand
 ):
     tc = _config(
@@ -239,14 +240,14 @@ def test_wide_packed_scale_fragment_layout_scale_slot_matches_producer(
         for half_row in range(2)
     ]
     assert layout.scale_packed_ok(operand)
-    word_bases = layout.scale_lds_view_layout_scale_slot(operand).offset_bases
+    word_bases = layout.scale_slot_lds_view_layout_storage(operand).offset_bases
     physical_word = {
         tuple(_coordinate(word_bases, offset)): offset
         for offset in range(len(producer) // 4)
     }
     assert len(physical_word) == len(producer) // 4
     byte_layout = _byte_fragment_layout(layout, operand, [nonk, scale_k // 32])
-    word_layout = layout.scale_fragment_layout_scale_slot(operand)
+    word_layout = layout.scale_slot_fragment_layout_storage(operand)
     registers = [list(basis) for basis in byte_layout.reg_bases]
     nonk_bit, k_bit = registers.index([16, 0]), registers.index([0, 4])
     retained = [bit for bit in range(len(registers)) if bit not in (nonk_bit, k_bit)]
@@ -390,6 +391,14 @@ class _CopyRecorder:
         self.depths = {
             component: tc.num_buffers(*component) for component in COMPONENTS
         }
+        self.ratios = {
+            (operand, is_scale): (
+                layout.scale_slot_k(operand) // maybe_unwrap(tc.BLOCK_K)
+                if is_scale
+                else 1
+            )
+            for operand, is_scale in COMPONENTS
+        }
         self.b_step = b_step
         self.addresses = defaultdict(list)
         self.reads = defaultdict(list)
@@ -400,7 +409,7 @@ class _CopyRecorder:
         assert offsets == tile
         operand, is_scale = component
         history = self.addresses[component, tile]
-        ratio = self.layout.scale_slot_ratio_k(operand) if is_scale else 1
+        ratio = self.ratios[component]
         stage = len(history) * ratio
         expected = (
             (stage // 2) * 256
@@ -441,11 +450,13 @@ class _CopyRecorder:
         component = (operand, SCALE)
         value = self._record(component, buffer, tile, pointer, offsets, soffset)
         if not VIA_LDS:
-            return (value,) * self.layout.scale_read_k_slots(operand)
+            return (value,) * self._k_fragments(component)
+
+    def _k_fragments(self, component):
+        return maybe_unwrap(self.layout.num_k_slots) * self.ratios[component]
 
     def _read(self, component, tile, slot):
-        operand, is_scale = component
-        ratio = self.layout.scale_slot_ratio_k(operand) if is_scale else 1
+        ratio = self.ratios[component]
         stage = len(self.reads[component, tile]) * ratio
         assert slot == stage // ratio % self.depths[component]
         self.reads[component, tile].append(stage)
@@ -470,7 +481,7 @@ class _CopyRecorder:
 
     def ds_read_scale(self, operand, slot, tile):
         value = self._read((operand, SCALE), tile, slot)
-        return (value,) * self.layout.scale_read_k_slots(operand)
+        return (value,) * self._k_fragments((operand, SCALE))
 
     def commit_buffer_load(self):
         pass

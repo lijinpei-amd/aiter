@@ -83,29 +83,20 @@ class _ScheduleConfig:
     def preshuffled(self, idx, is_scale=False):
         return is_scale and idx == 0 and self.a_scale_ratio > 1
 
-    def scale_slot_ratio_non_k(self, idx):
-        return self.a_scale_ratio if idx == 0 else 1
+    def slot_nonk(self, idx):
+        return 32
 
-    def scale_num_slots(self, idx):
-        return self.num_lds_slots_non_k(idx) // self.scale_slot_ratio_non_k(idx)
+    def scale_slot_nonk(self, idx):
+        return self.slot_nonk(idx) * (self.a_scale_ratio if idx == 0 else 1)
 
     def scale_slot_k(self, idx):
         return 256
-
-    def scale_slot_ratio_k(self, idx):
-        return 1
 
     def buffer_live_span(self, idx, scale=False):
         return self.num_buffers(idx, scale)
 
     def num_buffers(self, idx, scale=False):
         return 3
-
-    def scale_read_k_slots(self, idx):
-        return self.scale_slot_ratio_k(idx)
-
-    def scale_fragments_per_buffer(self, idx):
-        return self.num_lds_slots_non_k(idx) * self.scale_read_k_slots(idx)
 
     def commit_per_op(self):
         return self.WAIT_COMMIT_SCHEME == WaitCommitScheme.PER_OP

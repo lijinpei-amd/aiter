@@ -1227,14 +1227,18 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
         operand, is_scale = component
         depths[component] = _plain(tc.num_buffers(operand, is_scale))
         ratios[component] = (
-            _plain(layout.scale_slot_ratio_k(operand)) if is_scale else 1
+            _plain(layout.scale_slot_k(operand)) // _plain(tc.BLOCK_K)
+            if is_scale
+            else 1
         )
         via_lds[component] = _plain(layout.component_via_lds(component))
         live_span = (depths[component] - 1) * ratios[component] + 1
         fill_spans[component] = live_span - int(not via_lds[component])
         producer_phases[component] = (1 - fill_spans[component]) % ratios[component]
     non_k_ratios = {
-        operand: _plain(layout.scale_slot_ratio_non_k(operand)) for operand in (A, B)
+        operand: _plain(layout.scale_slot_nonk(operand))
+        // _plain(layout.slot_nonk(operand))
+        for operand in (A, B)
     }
     payload_slots = {
         (component, tile): slot
