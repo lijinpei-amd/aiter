@@ -357,6 +357,18 @@ def _probe_lds_bytes_uncached(cfg: dict, dq_a, dq_b) -> int:
     return _cval(KernelLayout(tc).lds_bytes)
 
 
+@cache
+def _probe_b_scale_via_lds(cfg_items: tuple, dq_a, dq_b) -> bool:
+    """Whether the layout copies the B scale through LDS, asked of the aggregate for the
+    same reason as ``_probe_lds_bytes``. A geometry KernelLayout rejects answers False;
+    validate() reports it."""
+    try:
+        tc = _probe_tuning_config(dict(cfg_items), dq_a, dq_b)
+        return bool(_cval(KernelLayout(tc).component_via_lds((1, True))))
+    except AssertionError:
+        return False
+
+
 def _probe_tuning_config(cfg: dict, dq_a, dq_b):
     """Build the shape-independent configuration used by capability checks."""
     from triton.experimental.gluon import language as gl
@@ -708,7 +720,10 @@ def get_gluon_config_uncached(
             # -0.04%..+0.40% across the same sweep, which is that harness's floor and
             # the null control for it. MXFP8 weights are left alone because they are
             # genuinely mixed there: +3.1%/+3.2% at T=16/64 against -10.7% at T=256.
-            # bench_out/gluon_scale_hint_20260923.
+            # bench_out/gluon_scale_hint_20260923. Re-measured 2026-10-18 on the
+            # current pins: +2.2% +2.4% -11.1% -2.5% -0.3% (T=16..4096),
+            # bench_out/gluon_moe_regression/harness/cold_a8w8{nocg,cg}. The one
+            # MXFP8 exception, BLOCK_K 128, is applied in _default_launch_config.
             "expert_scale_cache_modifier": _env_cache_modifier(
                 "EXPERT_SCALE_CACHE_MODIFIER",
                 ".cg" if dq_b == DtypeQuant.MXFP4 else "",
@@ -1095,6 +1110,31 @@ def _default_launch_config(
             NUM_LDS_BUFFER=3,
             K_UNROLL=3,
             VGPR_PREFETCH_K=128,
+        )
+    if (
+        dq_b == DtypeQuant.MXFP8
+        and not c["B_SCALE_SHUFFLED"]
+        and c["BLOCK_K"] == 128
+        and _probe_b_scale_via_lds(_cfg_key(c), dq_a, dq_b)
+    ):
+        # The one MXFP8 weight-scale exception to get_gluon_config's empty hint. At
+        # BLOCK_K 128 an unshuffled scale row is 4 bytes, and its LDS copy has every
+        # warp fetch the same rows (all but one warp's writes are discarded). Without
+        # `.cg` those fetches allocate in L1, and L1 stalls on L2 rose 50%. Measured
+        # on H7168-I2048-E33-k8 with a8w8 pinned to BLOCK_K 128, cold, us:
+        #
+        #          register   LDS     LDS + .cg
+        #   T=16   272.1      277.8   269.4
+        #   T=64   304.0      298.6   298.0
+        #
+        # Kept to this case: at BLOCK_K 256 the hint loses at T=16/64 (see above),
+        # and a register B scale with `.cg` was 2.7% slower at T=16.
+        # bench_out/gluon_moe_regression/harness/cold_{bk128reg,bk128lds,a8w8ldscg}.
+        c = dict(
+            c,
+            expert_scale_cache_modifier=_env_cache_modifier(
+                "EXPERT_SCALE_CACHE_MODIFIER", ".cg", "EXPERT_SCALE_MOD"
+            ),
         )
     return c
 
