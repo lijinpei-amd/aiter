@@ -266,10 +266,11 @@ class TuningSpec(NamedTuple):
     A_SCALE_NUM_BUFFER: int = 0
     B_SCALE_NUM_BUFFER: int = 0
     #: Scale slot extents (agents/CONCEPTS.md): the shuffled-scale load extents,
-    #: independent of the payload slot. Zero follows the payload slot extent, with K
-    #: at least 256 logical elements (eight stored scale bytes). A configured K extent
-    #: must be a power-of-two multiple of BLOCK_K that divides total K, so one
-    #: physical scale load covers complete payload K steps.
+    #: independent of the payload slot. K counts scale columns, one E8M0 byte per
+    #: MX group of 32 payload K. Zero follows the payload slot extent, with K at least
+    #: 8 scale columns (payload K256). A configured K extent must be a power-of-two
+    #: multiple of BLOCK_K / 32 that divides total K / 32, so one physical scale load
+    #: covers complete payload K steps.
     #: These fields are ignored for operands whose scales are not shuffled.
     SCALE_SLOT_M: int = 0
     SCALE_SLOT_N: int = 0

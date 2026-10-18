@@ -50,10 +50,12 @@ def _buffer_load_to_lds(
 
 
 @gluon.jit
-def _scale_fragments(scale, cfg, layout, operand: gl.constexpr):
+def _scale_fragments(scale, layout, operand: gl.constexpr):
     """Split one shuffled scale load in registers, retaining whole packed words."""
     sk: gl.constexpr = layout.scale_slot_k(operand)
-    bk: gl.constexpr = cfg.BLOCK_K
+    bk: gl.constexpr = layout.scale_block_k
+    # A step's whole units, 8 scale columns (K256) each.
+    stage_k: gl.constexpr = max(8, bk)
     ratio: gl.constexpr = layout.scale_slot_nonk(operand) // layout.slot_nonk(operand)
     packed: gl.constexpr = layout.scale_packed_ok(operand)
     fragments = ()
@@ -64,15 +66,15 @@ def _scale_fragments(scale, cfg, layout, operand: gl.constexpr):
                 # unit per 64 dwords. A slot's units are whole register and warp
                 # steps, so the slice never unpacks a dword or moves it across lanes;
                 # the reshape to the dot's shape moves nothing.
-                if require_constexpr(ratio == 1 and sk == max(256, bk)):
+                if require_constexpr(ratio == 1 and sk == stage_k):
                     fragment = gl.reshape(
                         scale, layout.fragment_shape_slot(operand, True)
                     )
                 else:
                     words = gl.amd.slice(
                         scale,
-                        [layout.slot_nonk(operand) // 32, max(256, bk) // 4],
-                        [n * layout.slot_nonk(operand) // 32, k * bk // 256 * 64],
+                        [layout.slot_nonk(operand) // 32, 32 * stage_k // 4],
+                        [n * layout.slot_nonk(operand) // 32, k * bk // 8 * 64],
                     )
                     fragment = gl.convert_layout(
                         gl.reshape(words, layout.fragment_shape_slot(operand, True)),
@@ -82,7 +84,7 @@ def _scale_fragments(scale, cfg, layout, operand: gl.constexpr):
                 fragment = gl.amd.slice(
                     scale,
                     layout.fragment_shape_slot(operand, True),
-                    [n * layout.slot_nonk(operand), k * bk // 32],
+                    [n * layout.slot_nonk(operand), k * bk],
                 )
             fragments += (fragment,)
     return fragments
@@ -292,7 +294,7 @@ class LDSManager:
                         ),
                         layout.scale_slot_fragment_layout(operand),
                     )
-                fragments = _scale_fragments(scale, cfg, layout, operand)
+                fragments = _scale_fragments(scale, layout, operand)
             else:
                 scale = gl.amd.cdna4.buffer_load(
                     ptr=hbm_ptr, offsets=hbm_offs, cache=cache, soffset=SOFF
@@ -326,7 +328,7 @@ class LDSManager:
                 ),
                 layout.scale_slot_fragment_layout(operand),
             )
-            fragments = _scale_fragments(scale, cfg, layout, operand)
+            fragments = _scale_fragments(scale, layout, operand)
         else:
             fragments = (
                 _ds_read(
@@ -364,7 +366,6 @@ class LDSManager:
 
         An absent or disabled component returns None.
         """
-        cfg: gl.constexpr = self.tuning_cfg
         layout: gl.constexpr = self.layout
         if require_constexpr(operand == 0):
             payload_lds_ptr = self.a_payload_lds_ptr
@@ -391,7 +392,7 @@ class LDSManager:
             fragments = self.ds_read_scale(
                 operand, SCALE_READ_IDX, non_k_slot // ratio * ratio
             )
-            ratio_k: gl.constexpr = layout.scale_slot_k(operand) // cfg.BLOCK_K
+            ratio_k: gl.constexpr = layout.scale_slot_k(operand) // layout.scale_block_k
             scale_val = fragments[
                 (non_k_slot % ratio) * layout.num_k_slots * ratio_k + k_slot
             ]

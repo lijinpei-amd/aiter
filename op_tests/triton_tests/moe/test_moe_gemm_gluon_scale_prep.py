@@ -147,10 +147,10 @@ def test_incompatible_k128_geometry_refuses_scale_preparation(field, value):
 @pytest.mark.parametrize(
     "block_k,scale_k,expected",
     [
-        (256, 512, True),
+        (256, 16, True),
         (512, 0, True),
-        (512, 256, False),
-        (256, 384, False),
+        (512, 8, False),
+        (256, 12, False),
     ],
 )
 def test_scale_shuffle_requires_valid_scale_k(block_k, scale_k, expected):

@@ -115,10 +115,10 @@ def cases():
     # 2. the SCALE_FILL_MID policy toggle (inert outside 2x2 -- proves it)
     out.append(_case("tuned-mxfp4-fillmid0", DQ.MXFP4, DQ.MXFP4, SCALE_FILL_MID=False))
     # 3. scale K-step ratio R > 1 (one scale load covers several payload stages)
-    out.append(_case("mxfp4-bk128-sk256-R2", DQ.MXFP4, DQ.MXFP4, BLOCK_K=128,
-                     VGPR_PREFETCH_K=128, SCALE_SLOT_K=256, K_UNROLL=1))
-    out.append(_case("mxfp4-bk128-sk512-R4", DQ.MXFP4, DQ.MXFP4, BLOCK_K=128,
-                     VGPR_PREFETCH_K=128, SCALE_SLOT_K=512, K_UNROLL=1))
+    out.append(_case("mxfp4-bk128-sk8-R2", DQ.MXFP4, DQ.MXFP4, BLOCK_K=128,
+                     VGPR_PREFETCH_K=128, SCALE_SLOT_K=8, K_UNROLL=1))
+    out.append(_case("mxfp4-bk128-sk16-R4", DQ.MXFP4, DQ.MXFP4, BLOCK_K=128,
+                     VGPR_PREFETCH_K=128, SCALE_SLOT_K=16, K_UNROLL=1))
     # 4. direct-register placement, per component and at the D=2 same-step boundary
     out.append(_case("breg", DQ.MXFP4, DQ.MXFP4, ALLOW_B_VIA_LDS=False,
                      B_PRESHUFFLED=True))

@@ -734,7 +734,7 @@ def scale_layout_test_cases():
                 warps_per_cta=warps,
             )
     # test_wide_packed_scale_slot_fragment_layout_matches_producer
-    for sk in (256, 512, 1024):
+    for sk in (8, 16, 32):
         add(
             f"wide-sk{sk}",
             BLOCK_N=256,
@@ -767,7 +767,7 @@ def scale_layout_test_cases():
             B_SCALE_SHUFFLED=sb,
             SCALE_SLOT_M=128,
             SCALE_SLOT_N=128,
-            SCALE_SLOT_K=512,
+            SCALE_SLOT_K=16,
         )
     # test_shuffled_scale_k_defaults_to_at_least_k256
     for bk in (128, 256, 512):
@@ -787,12 +787,12 @@ def scale_layout_test_cases():
         ("SCALE_SLOT_M", 256),
         ("SCALE_SLOT_N", 32),
         ("SCALE_SLOT_N", 256),
-        ("SCALE_SLOT_K", 128),
-        ("SCALE_SLOT_K", 384),
+        ("SCALE_SLOT_K", 4),
+        ("SCALE_SLOT_K", 12),
     ):
         add(f"invalid-{field}-{value}", **{field: value})
     # test_shuffled_scale_k_cannot_be_narrower_than_payload_k
-    add("sk-narrower-than-bk", BLOCK_K=512, SCALE_SLOT_K=256, VGPR_PREFETCH_K=512)
+    add("sk-narrower-than-bk", BLOCK_K=512, SCALE_SLOT_K=8, VGPR_PREFETCH_K=512)
     return out
 
 
@@ -871,10 +871,10 @@ def register_test_cases():
     # test_scale_and_payload_k_load_units_are_independent
     for dtype in ("mxfp4", "mxfp8"):
         for bk, sk, sh in (
-            (256, 256, (False, False)),
-            (256, 512, (True, False)),
-            (512, 512, (True, True)),
-            (512, 1024, (False, True)),
+            (256, 8, (False, False)),
+            (256, 16, (True, False)),
+            (512, 16, (True, True)),
+            (512, 32, (False, True)),
         ):
             add(
                 f"kunits-{dtype}-bk{bk}-sk{sk}-sh{int(sh[0])}{int(sh[1])}",

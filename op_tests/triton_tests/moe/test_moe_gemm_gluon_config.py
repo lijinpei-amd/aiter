@@ -162,7 +162,7 @@ def test_a_scale_row_stride_preserves_sub_16_byte_alignment(kernel):
         ("B_SCALE_NUM_BUFFER", 6),
         ("SCALE_SLOT_M", 128),
         ("SCALE_SLOT_N", 256),
-        ("SCALE_SLOT_K", 512),
+        ("SCALE_SLOT_K", 16),
     ],
 )
 def test_launch_specs_match_kernel_config_field_order(
@@ -293,10 +293,12 @@ def test_cache_modifier_environment_names(
 def test_legacy_slot_config_names(config, legacy, renamed, field):
     config.pop(field, None)
     config[legacy] = 96
+    # The legacy scale K counted payload K; its new name counts scale columns.
+    expected = 96 // host._LEGACY_SLOT_DIVISORS.get(field, 1)
     # A raw launch config is renamed before the host reads any slot key from it.
     canonical = host._canonical_slot_keys(config)
-    assert canonical[renamed] == 96 and legacy not in canonical
-    assert getattr(_tuning_spec(config), field) == 96
+    assert canonical[renamed] == expected and legacy not in canonical
+    assert getattr(_tuning_spec(config), field) == expected
 
     config[field] = 128
     with pytest.raises(ValueError, match="disagree"):
@@ -309,7 +311,8 @@ def test_legacy_slot_environment_names(monkeypatch, canonical):
     legacy = host._LEGACY_SLOT_KEYS[canonical]
     monkeypatch.delenv(prefix + canonical, raising=False)
     monkeypatch.setenv(prefix + legacy, "64")
-    assert host._env_slot_int(canonical, 0) == 64
+    expected = 64 // host._LEGACY_SLOT_DIVISORS.get(canonical, 1)
+    assert host._env_slot_int(canonical, 0) == expected
     monkeypatch.setenv(prefix + canonical, "128")
     assert host._env_slot_int(canonical, 0) == 128
 
@@ -322,7 +325,8 @@ def test_legacy_scale_slot_environment_reaches_the_config(monkeypatch):
     config = host.get_gluon_config_uncached(
         128, 4096, 7168, DtypeQuant.MXFP4, DtypeQuant.MXFP4
     )
-    assert config["SCALE_SLOT_K"] == 512
+    # The legacy name counted payload K; SCALE_SLOT_K counts scale columns.
+    assert config["SCALE_SLOT_K"] == 16
     assert "SCALE_MINI_BLOCK_K" not in config
 
 
@@ -1227,7 +1231,7 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
         operand, is_scale = component
         depths[component] = _plain(tc.num_buffers(operand, is_scale))
         ratios[component] = (
-            _plain(layout.scale_slot_k(operand)) // _plain(tc.BLOCK_K)
+            _plain(layout.scale_slot_k(operand)) // _plain(layout.scale_block_k)
             if is_scale
             else 1
         )

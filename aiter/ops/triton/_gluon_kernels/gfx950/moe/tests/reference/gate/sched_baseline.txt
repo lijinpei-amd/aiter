@@ -3562,7 +3562,7 @@
     B_SCL reg=0/2 lds=1/0
   soff A_SCL [0, 1, 2]
   soff B_SCL [0, 1, 2]
-== mxfp4-bk128-sk256-R2
+== mxfp4-bk128-sk8-R2
   geom NM=2 NN=2 slots=4 mk=1 num_k=56 scheme=1
   sizing depth=5 unroll=6 peeled=1 ring=6 regperiod=1 async=2 hasreg=False
   regions static_remainder=True static_drain=False epilogue_groups=0 epilogue_wait=None
@@ -3766,7 +3766,7 @@
     B_SCL reg=0/2 lds=None/None
   soff A_SCL [0, 0, 2, 2, 4, 4]
   soff B_SCL [0, 0, 2, 2, 4, 4]
-== mxfp4-bk128-sk512-R4
+== mxfp4-bk128-sk16-R4
   geom NM=2 NN=2 slots=4 mk=1 num_k=56 scheme=1
   sizing depth=9 unroll=12 peeled=1 ring=12 regperiod=1 async=4 hasreg=False
   regions static_remainder=True static_drain=False epilogue_groups=0 epilogue_wait=None

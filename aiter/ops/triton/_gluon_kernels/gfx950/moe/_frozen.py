@@ -786,7 +786,8 @@ def _calc_scale_mini_block_k_frozen(tc, idx):
     """Scale load K extent in logical payload elements, not E8M0 bytes."""
     if not _scale_shuffled_frozen(tc, idx):
         return _v(tc.BLOCK_K)
-    return _v(tc.SCALE_SLOT_K) or max(256, _v(tc.BLOCK_K))
+    # SCALE_SLOT_K counts scale columns, one per MX group.
+    return _v(tc.SCALE_SLOT_K) * MX_GROUP_INT or max(256, _v(tc.BLOCK_K))
 
 
 @gluon.constexpr_function
