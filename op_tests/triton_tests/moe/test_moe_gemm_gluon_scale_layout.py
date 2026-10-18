@@ -161,7 +161,7 @@ def test_packed_words_and_selectors_match_producer(
     byte_layout = _byte_fragment_layout(
         layout,
         operand,
-        [layout.slot_nonk(operand), maybe_unwrap(layout.scale_block_k_storage)],
+        [layout.slot_nonk(operand), maybe_unwrap(layout.scale_block_k)],
     )
     word_layout = layout.fragment_layout(operand, True)
     word_shape = layout.fragment_shape_slot(operand, True)
@@ -214,7 +214,7 @@ def test_packed_words_and_selectors_match_producer(
             )
 
 
-@pytest.mark.parametrize("scale_k", [256, 512, 1024])
+@pytest.mark.parametrize("scale_k", [8, 16, 32])
 @pytest.mark.parametrize("operand", [0, 1], ids=["A", "B"])
 def test_wide_packed_scale_slot_fragment_layout_matches_producer(
     scale_k, operand
@@ -232,7 +232,7 @@ def test_wide_packed_scale_slot_fragment_layout_matches_producer(
     producer = [
         (stripe * 32 + row + half_row * 16, ku * 8 + group + half_k * 4)
         for stripe in range(nonk // 32)
-        for ku in range(scale_k // 256)
+        for ku in range(scale_k // 8)
         for group in range(4)
         for row in range(16)
         for half_k in range(2)
@@ -245,7 +245,7 @@ def test_wide_packed_scale_slot_fragment_layout_matches_producer(
         for offset in range(len(producer) // 4)
     }
     assert len(physical_word) == len(producer) // 4
-    byte_layout = _byte_fragment_layout(layout, operand, [nonk, scale_k // 32])
+    byte_layout = _byte_fragment_layout(layout, operand, [nonk, scale_k])
     word_layout = layout.scale_slot_fragment_layout(operand)
     registers = [list(basis) for basis in byte_layout.reg_bases]
     nonk_bit, k_bit = registers.index([16, 0]), registers.index([0, 4])
@@ -392,7 +392,7 @@ class _CopyRecorder:
         }
         self.ratios = {
             (operand, is_scale): (
-                layout.scale_slot_k(operand) // maybe_unwrap(tc.BLOCK_K)
+                layout.scale_slot_k(operand) // maybe_unwrap(layout.scale_block_k)
                 if is_scale
                 else 1
             )

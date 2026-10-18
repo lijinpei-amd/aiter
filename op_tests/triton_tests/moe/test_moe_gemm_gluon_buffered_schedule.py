@@ -118,13 +118,17 @@ class _Config(_ScheduleConfig):
     def scale_slot_nonk(self, operand):
         return self.slot_nonk(operand) * self.scale_non_k_slots[operand]
 
+    @property
+    def scale_block_k(self):
+        return self.BLOCK_K // 32
+
     def scale_slot_k(self, operand):
         steps = self.scale_steps[operand] if self.has_scale(operand) else 1
-        return self.BLOCK_K * steps
+        return self.scale_block_k * steps
 
     def ratio_k(self, operand):
-        """Steps one scale slot spans, ``scale_slot_k / BLOCK_K``."""
-        return self.scale_slot_k(operand) // self.BLOCK_K
+        """Steps one scale slot spans, ``scale_slot_k / scale_block_k``."""
+        return self.scale_slot_k(operand) // self.scale_block_k
 
     def ratio_non_k(self, operand):
         """Non-K slots one scale slot spans, ``scale_slot_nonk / slot_nonk``."""

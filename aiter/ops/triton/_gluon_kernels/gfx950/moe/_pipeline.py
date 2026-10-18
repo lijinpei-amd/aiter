@@ -656,7 +656,7 @@ def _take_operand_pairs(
     non_k_slot: gl.constexpr,
     PHASE: gl.constexpr,
 ):
-    ratio_k: gl.constexpr = layout.scale_slot_k(operand) // tc.BLOCK_K
+    ratio_k: gl.constexpr = layout.scale_slot_k(operand) // layout.scale_block_k
     out = ()
     for k in gl.static_range(layout.num_k_slots):
         if require_constexpr(tc.func_cfg.has_scale(operand)):

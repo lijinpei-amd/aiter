@@ -89,8 +89,12 @@ class _ScheduleConfig:
     def scale_slot_nonk(self, idx):
         return self.slot_nonk(idx) * (self.a_scale_ratio if idx == 0 else 1)
 
+    @property
+    def scale_block_k(self):
+        return self.BLOCK_K // 32
+
     def scale_slot_k(self, idx):
-        return 256
+        return 8
 
     def buffer_live_span(self, idx, scale=False):
         return self.num_buffers(idx, scale)

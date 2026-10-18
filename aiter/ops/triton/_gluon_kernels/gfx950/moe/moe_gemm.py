@@ -239,7 +239,7 @@ def _moe_gemm_body(
     # per-fill pointer bumps (K is the contiguous axis of every operand)
     a_step: gl.constexpr = layout.payload_hbm_step(0)
     b_step: gl.constexpr = layout.payload_hbm_step(1)
-    s_step: gl.constexpr = layout.scale_block_k_storage
+    s_step: gl.constexpr = layout.scale_block_k
 
     hbm_ptrs = _PipelinePointers(
         a.ptr,

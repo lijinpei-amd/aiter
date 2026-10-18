@@ -425,10 +425,10 @@ def test_k128_register_scale_phase(register_case):
 @pytest.mark.parametrize(
     "block_k,scale_k,shuffled",
     [
-        (256, 256, (False, False)),
-        (256, 512, (True, False)),
-        (512, 512, (True, True)),
-        (512, 1024, (False, True)),
+        (256, 8, (False, False)),
+        (256, 16, (True, False)),
+        (512, 16, (True, True)),
+        (512, 32, (False, True)),
     ],
     ids=["raw-k256", "a-scale512", "both-scale512", "b-scale1024"],
 )

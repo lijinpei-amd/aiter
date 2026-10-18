@@ -127,7 +127,7 @@ def _shuffled_scale_register_offsets(
     layout: gl.constexpr,
     nonk0,
     nonk: gl.constexpr,
-    scale_block_k_storage: gl.constexpr,
+    scale_slot_k: gl.constexpr,
     K,
     packed: gl.constexpr = False,
     split_extent: gl.constexpr = 0,
@@ -136,9 +136,9 @@ def _shuffled_scale_register_offsets(
     if require_constexpr(packed):
         # packed_scale_shape: one row per 32-row stripe, its dwords in HBM order.
         stripe = gl.arange(0, nonk // 32, layout=gl.SliceLayout(1, layout))[:, None]
-        dword = gl.arange(
-            0, scale_block_k_storage * 8, layout=gl.SliceLayout(0, layout)
-        )[None, :]
+        dword = gl.arange(0, scale_slot_k * 8, layout=gl.SliceLayout(0, layout))[
+            None, :
+        ]
         row = stripe * 32
         if require_constexpr(split_extent):
             row = row // split_extent * split_stride + row % split_extent
@@ -148,9 +148,7 @@ def _shuffled_scale_register_offsets(
         if require_constexpr(split_extent):
             nn = nn // split_extent * split_stride + nn % split_extent
         nn += nonk0
-        kk = gl.arange(0, scale_block_k_storage, layout=gl.SliceLayout(0, layout))[
-            None, :
-        ]
+        kk = gl.arange(0, scale_slot_k, layout=gl.SliceLayout(0, layout))[None, :]
         offsets = (
             (nn // 32) * K
             + (kk // 8) * 256
@@ -168,12 +166,12 @@ def _shuffled_scale_stage_offsets(
     nonk0,
     stripes: gl.constexpr,
     K,
-    scale_slot_k: gl.constexpr = 256,
+    stripe_bytes: gl.constexpr,
     split_extent: gl.constexpr = 0,
     split_stride=0,
 ):
     stripe = gl.arange(0, stripes, layout=gl.SliceLayout(1, layout))[:, None]
-    byte = gl.arange(0, scale_slot_k, layout=gl.SliceLayout(0, layout))[None, :]
+    byte = gl.arange(0, stripe_bytes, layout=gl.SliceLayout(0, layout))[None, :]
     if require_constexpr(not split_extent):
         return (nonk0 // 32 + stripe) * K + byte
     row = stripe * 32
@@ -241,7 +239,7 @@ class KernelLayout:
     _payload_hbm_offset_layout: gl.constexpr
     _payload_lds_layout: gl.constexpr
     _payload_fragment_layout: gl.constexpr
-    scale_block_k_storage: gl.constexpr
+    scale_block_k: gl.constexpr
     _scale_slot_nonk: gl.constexpr
     _scale_slot_k: gl.constexpr
     _scale_packed_ok: gl.constexpr
@@ -286,13 +284,15 @@ class KernelLayout:
         tiles_per_warp = tc.tiles_per_warp.value
 
         scale_preshuffled = tuple(tc.preshuffled(idx, True) for idx in ops)
+        # A scale K counts scale columns, one E8M0 byte per MX group of payload K.
+        scale_block_k = BK // MX_GROUP
         # The unit a scale stores contiguously, which a scale slot holds whole. A
-        # shuffled scale's is 32 rows by K256, one 256 B tile in CDNA4 MX-scale
-        # order (_packed_scale.UNIT_NONK x UNIT_K); an unshuffled scale is
+        # shuffled scale's is 32 rows by 8 columns (K256), one 256 B tile in CDNA4
+        # MX-scale order (_packed_scale.UNIT_NONK x UNIT_K); an unshuffled scale is
         # row-major, so its is one row by any K.
         scale_unit_nonk = tuple(32 if scale_preshuffled[idx] else 1 for idx in ops)
-        scale_unit_k = tuple(256 if scale_preshuffled[idx] else 1 for idx in ops)
-        scale_stage_k = tuple(max(k, BK) for k in scale_unit_k)
+        scale_unit_k = tuple(8 if scale_preshuffled[idx] else 1 for idx in ops)
+        scale_stage_k = tuple(max(k, scale_block_k) for k in scale_unit_k)
         scale_slot_nonk = (
             (tc.SCALE_SLOT_M.value or SLOT_M) if scale_preshuffled[0] else SLOT_M,
             (tc.SCALE_SLOT_N.value or SLOT_N) if scale_preshuffled[1] else SLOT_N,
@@ -334,10 +334,10 @@ class KernelLayout:
             ), f"SCALE_SLOT_{axis} must contain whole 32-row stripes"
             assert (
                 sk >= scale_stage_k[idx]
-            ), "SCALE_SLOT_K must be at least 256 and at least BLOCK_K"
+            ), "SCALE_SLOT_K must be at least 8 (K256) and at least BLOCK_K / 32"
             assert (
-                sk & (sk - 1) == 0 and sk % BK == 0
-            ), "SCALE_SLOT_K must be a power of two and a multiple of BLOCK_K"
+                sk & (sk - 1) == 0 and sk % scale_block_k == 0
+            ), "SCALE_SLOT_K must be a power of two and a multiple of BLOCK_K / 32"
         assert (
             tc.transposed.value
         ), "transposed=True is pinned, see the module docstring"
@@ -474,16 +474,15 @@ class KernelLayout:
             for idx in ops
         )
 
-        scale_block_k_storage = BK // MX_GROUP
         scale_slot_shape_logical = tuple(
-            [scale_slot_nonk[idx], scale_slot_k[idx] // MX_GROUP] for idx in ops
+            [scale_slot_nonk[idx], scale_slot_k[idx]] for idx in ops
         )
         # Storage is one row per scale_unit_nonk rows (a 32-row stripe when
         # shuffled), so an unshuffled scale is stored in its logical shape.
         scale_slot_shape_storage = tuple(
             [
                 scale_slot_nonk[idx] // scale_unit_nonk[idx],
-                scale_unit_nonk[idx] * scale_slot_k[idx] // MX_GROUP,
+                scale_unit_nonk[idx] * scale_slot_k[idx],
             ]
             for idx in ops
         )
@@ -517,9 +516,7 @@ class KernelLayout:
         scale_lds_layout = gl.SwizzledSharedLayout(
             vec=1, per_phase=1, max_phase=1, order=[1, 0]
         )
-        scale_fragment_shape_slot = [
-            [nonk, scale_block_k_storage] for nonk in (SLOT_M, SLOT_N)
-        ]
+        scale_fragment_shape_slot = [[nonk, scale_block_k] for nonk in (SLOT_M, SLOT_N)]
         scale_fragment_layout_slot = [None, None]
         scale_slot_fragment_layout = [None, None]
         dot_operand_scale_buffer_load_lds_layout = [None, None]
@@ -535,9 +532,7 @@ class KernelLayout:
                 frag, scale_slot_shape_logical[idx], MX_GROUP
             )
             if scale_via_lds[idx]:
-                lanes_k = (
-                    WARP_SIZE if scale_preshuffled[idx] else scale_block_k_storage // 4
-                )
+                lanes_k = WARP_SIZE if scale_preshuffled[idx] else scale_block_k // 4
                 dot_operand_scale_buffer_load_lds_layout[idx] = gl.BlockedLayout(
                     size_per_thread=[1, 4],
                     threads_per_warp=[WARP_SIZE // lanes_k, lanes_k],
@@ -549,7 +544,7 @@ class KernelLayout:
                 offset_bases=[[16, 0], [0, 4]]
                 + _pow2_bases(0, 2, [1, 2, 4, 8])
                 + _pow2_bases(1, 2, [1, 2])
-                + _pow2_bases(1, 2, _ramp(8, k // MX_GROUP))
+                + _pow2_bases(1, 2, _ramp(8, k))
                 + _pow2_bases(0, 2, _ramp(32, nonk))
             )
         dot_operand_scale_buffer_load_lds_layout = tuple(
@@ -571,7 +566,10 @@ class KernelLayout:
             ):
                 sel = tuple(
                     packed_scale_sel(
-                        frag, slot_nonk[idx], BK, k_phase * BK % scale_stage_k[idx]
+                        frag,
+                        slot_nonk[idx],
+                        scale_block_k,
+                        k_phase * scale_block_k % scale_stage_k[idx],
                     )
                     for k_phase in (0, 1)
                 )
@@ -591,10 +589,10 @@ class KernelLayout:
             frag = payload_fragment_layout[idx]
             nonk, k = scale_slot_nonk[idx], scale_slot_k[idx]
             scale_fragment_shape_slot[idx] = packed_scale_dot_shape(
-                slot_nonk[idx], BK, sel
+                slot_nonk[idx], scale_block_k, sel
             )
             scale_fragment_layout_slot[idx] = packed_scale_dot_layout(
-                frag, slot_nonk[idx], BK, sel
+                frag, slot_nonk[idx], scale_block_k, sel
             )
             scale_slot_fragment_layout[idx] = packed_scale_layout(frag, nonk, k)
             scale_slot_lds_view_layout[idx] = packed_scale_lds_view_layout(nonk, k)
@@ -688,7 +686,7 @@ class KernelLayout:
         self._payload_lds_layout = gl.constexpr(payload_lds_layout)
         self._payload_fragment_layout = gl.constexpr(payload_fragment_layout)
 
-        self.scale_block_k_storage = gl.constexpr(scale_block_k_storage)
+        self.scale_block_k = gl.constexpr(scale_block_k)
         self._scale_slot_nonk = gl.constexpr(scale_slot_nonk)
         self._scale_slot_k = gl.constexpr(scale_slot_k)
         self._scale_packed_ok = gl.constexpr(scale_packed_ok)
@@ -987,7 +985,7 @@ class KernelLayout:
         M_TILE: gl.constexpr = tuning_cfg.BLOCK_M
         M_SLOT: gl.constexpr = tuning_cfg.SLOT_M
         NUM_M_SLOTS: gl.constexpr = self.num_m_slots
-        SCALE_BLOCK_K_STORAGE: gl.constexpr = self.scale_block_k_storage
+        SCALE_BLOCK_K: gl.constexpr = self.scale_block_k
         layout_a_scale_slot: gl.constexpr = self.hbm_offset_layout(0, True)
         SCALE_M: gl.constexpr = self.scale_slot_nonk(0)
         SCALE_K: gl.constexpr = self.scale_slot_k(0)
@@ -1003,7 +1001,7 @@ class KernelLayout:
                         layout_a_scale_slot,
                         pid_m * M_TILE + (m_slot_idx // SCALE_RATIO) * SCALE_M,
                         SCALE_M,
-                        SCALE_K // 32,
+                        SCALE_K,
                         K,
                         self.scale_packed_ok(0),
                     ),
@@ -1023,7 +1021,7 @@ class KernelLayout:
                         pid_m * M_TILE + (m_slot_idx // SCALE_RATIO) * SCALE_M,
                         SCALE_FILL_SHAPE[0],
                         K,
-                        SCALE_K,
+                        SCALE_FILL_SHAPE[1],
                     ),
                 )
         else:
@@ -1044,7 +1042,7 @@ class KernelLayout:
                     rows_a_scale_slot[:, None] * a.scale_stride_m
                     + gl.arange(
                         0,
-                        SCALE_BLOCK_K_STORAGE,
+                        SCALE_BLOCK_K,
                         layout=gl.SliceLayout(0, layout_a_scale_slot),
                     )[None, :]
                     * a.scale_stride_k,
@@ -1058,7 +1056,7 @@ class KernelLayout:
 
         N_SLOT: gl.constexpr = tuning_cfg.SLOT_N
         NUM_N_SLOTS: gl.constexpr = self.num_n_slots
-        SCALE_BLOCK_K_STORAGE: gl.constexpr = self.scale_block_k_storage
+        SCALE_BLOCK_K: gl.constexpr = self.scale_block_k
         layout_b_scale_slot: gl.constexpr = self.hbm_offset_layout(1, True)
         SCALE_N: gl.constexpr = self.scale_slot_nonk(1)
         SCALE_K: gl.constexpr = self.scale_slot_k(1)
@@ -1079,7 +1077,7 @@ class KernelLayout:
                         layout_b_scale_slot,
                         self.n_start(pid_n, n_slot_idx // SCALE_RATIO * SCALE_RATIO, N),
                         SCALE_N,
-                        SCALE_K // 32,
+                        SCALE_K,
                         K,
                         self.scale_packed_ok(1),
                         SPLIT_EXTENT,
@@ -1096,7 +1094,7 @@ class KernelLayout:
                         self.n_start(pid_n, n_slot_idx // SCALE_RATIO * SCALE_RATIO, N),
                         SCALE_FILL_SHAPE[0],
                         K,
-                        SCALE_K,
+                        SCALE_FILL_SHAPE[1],
                         SPLIT_EXTENT,
                         N // 2,
                     ),
@@ -1116,7 +1114,7 @@ class KernelLayout:
                     * b.scale_stride_n
                     + gl.arange(
                         0,
-                        SCALE_BLOCK_K_STORAGE,
+                        SCALE_BLOCK_K,
                         layout=gl.SliceLayout(0, layout_b_scale_slot),
                     )[None, :]
                     * b.scale_stride_k,

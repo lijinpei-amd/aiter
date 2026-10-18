@@ -4,20 +4,21 @@
 """Packed scales: the i32 layout of a shuffled E8M0 scale and its MFMA byte selectors.
 
 A shuffled scale (``agents/CONCEPTS.md``, CDNA4 MX-scale order) is a run of *units*,
-each 32 non-K rows by 256 payload K. A unit is 64 dwords, and dword ``l`` is what MFMA
+each 32 non-K rows by 8 scale columns (payload K256). Every K here counts scale
+columns, one E8M0 byte per MX group. A unit is 64 dwords, and dword ``l`` is what MFMA
 lane ``l`` supplies: row ``l % 16`` and scale column ``l // 16`` of one K128 step. Its
 four bytes are the two 16-row halves by the two K128 steps, byte
 ``2 * kstep + rowhalf``.
 
-Viewed as i32, a ``nonk x k`` scale is ``[nonk // 32, k // 4]``: one row per 32-row
-stripe, the stripe's units back to back along it, which is the HBM and LDS byte order
-itself. :func:`packed_scale_layout` lays the dwords out so that lane ``l`` holds dword
+Viewed as i32, a ``nonk x k`` scale is ``[nonk // 32, 32 * k // 4]``: one row per
+32-row stripe, the stripe's units back to back along it, which is the HBM and LDS byte
+order itself. :func:`packed_scale_layout` lays the dwords out so that lane ``l`` holds dword
 ``l`` of every unit it touches and the register and warp bases step whole units.
 
 ``gl.amd.cdna4.mfma_scaled_packed`` hands those dwords to the matrix instruction
 untouched. Its lowering issues instruction ``i = non_k * num_rep_k + k`` with byte
 ``sel[i % len(sel)]`` of the scale tensor's register ``i // len(sel)``, and checks the
-scale's shape as ``[nonk, k // 32 // len(sel)]``. :func:`packed_scale_sel` derives
+scale's shape as ``[nonk, k // len(sel)]``. :func:`packed_scale_sel` derives
 ``sel`` from the layouts, and :func:`packed_scale_dot_layout` gives the dot's view of
 the same registers in the shape the instruction checks.
 
@@ -41,16 +42,14 @@ __all__ = [
 
 #: Non-K rows of one unit.
 UNIT_NONK = 32
-#: Payload K of one unit.
-UNIT_K = 256
-#: Scale columns of one unit.
-_UNIT_COLS = UNIT_K // MX_GROUP
+#: Scale columns of one unit: payload K256.
+UNIT_K = 8
 
 
 @gluon.constexpr_function
 def _byte(row, col):
     """Byte of scale ``(row, col)`` within its dword."""
-    return 2 * (col % _UNIT_COLS // 4) + row % UNIT_NONK // 16
+    return 2 * (col % UNIT_K // 4) + row % UNIT_NONK // 16
 
 
 @gluon.constexpr_function
@@ -62,7 +61,7 @@ def _dword(row, col):
 @gluon.constexpr_function
 def _word(row, col):
     """Packed coordinate ``[stripe, dword]`` of the dword holding scale ``(row, col)``."""
-    return [row // UNIT_NONK, col // _UNIT_COLS * 64 + _dword(row, col)]
+    return [row // UNIT_NONK, col // UNIT_K * 64 + _dword(row, col)]
 
 
 @gluon.constexpr_function
@@ -79,19 +78,19 @@ def _span(bases, index):
 def _unit_basis(basis):
     """A u8 basis that steps whole units, as a packed basis; ``None`` otherwise."""
     row, col = basis
-    if row % UNIT_NONK or col % _UNIT_COLS:
+    if row % UNIT_NONK or col % UNIT_K:
         return None
-    return [row // UNIT_NONK, col // _UNIT_COLS * 64]
+    return [row // UNIT_NONK, col // UNIT_K * 64]
 
 
 @gluon.constexpr_function
 def packed_scale_shape(nonk, k):
-    """The i32 shape of a ``nonk x k`` shuffled scale, ``k`` in payload elements."""
+    """The i32 shape of a ``nonk x k`` shuffled scale."""
     assert nonk % UNIT_NONK == 0 and k % UNIT_K == 0, (
         f"a packed scale holds whole {UNIT_NONK} x {UNIT_K} units, "
         f"got {nonk} x {k}"
     )
-    return [nonk // UNIT_NONK, k // 4]
+    return [nonk // UNIT_NONK, UNIT_NONK * k // 4]
 
 
 @gluon.constexpr_function
@@ -105,18 +104,16 @@ def packed_scale_layout(dot_operand_layout, nonk, k):
     whole units. ``None`` when the u8 layout breaks any of that, e.g. when a warp basis
     is ``[16, 0]``, which puts a dword's row halves in different warps.
     """
-    u8 = gl.amd.cdna4.get_mfma_scale_layout(
-        dot_operand_layout, [nonk, k // MX_GROUP], MX_GROUP
-    )
+    u8 = gl.amd.cdna4.get_mfma_scale_layout(dot_operand_layout, [nonk, k], MX_GROUP)
     lane_bases = []
     for row, col in u8.lane_bases:
-        if row >= UNIT_NONK or col >= _UNIT_COLS or _byte(row, col):
+        if row >= UNIT_NONK or col >= UNIT_K or _byte(row, col):
             return None
         lane_bases.append([0, _dword(row, col)])
     reg_bases, folded = [], []
     for basis in u8.reg_bases:
         row, col = basis
-        if row < UNIT_NONK and col < _UNIT_COLS and not _dword(row, col):
+        if row < UNIT_NONK and col < UNIT_K and not _dword(row, col):
             folded.append(_byte(row, col))
             continue
         packed = _unit_basis(basis)
@@ -154,7 +151,7 @@ def packed_scale_sel(dot_operand_layout, nonk, k, k_offset=0):
     """Byte selectors for one ``nonk x k`` dot, or ``None`` if none exist.
 
     The dot reads the whole units that hold it, in :func:`packed_scale_layout`, and
-    sits ``k_offset`` payload K into them: a K128 dot uses half of every dword, and
+    sits ``k_offset`` scale columns into them: a K128 dot uses half of every dword, and
     ``k_offset`` says which half. Instruction ``i`` reads scale register ``i`` of the
     u8 layout, so it needs byte ``_byte`` of the packed register holding ``_word``.
     The lowering reads register ``i // len(sel)``, so the instructions one register
@@ -167,18 +164,15 @@ def packed_scale_sel(dot_operand_layout, nonk, k, k_offset=0):
     packed = packed_scale_layout(dot_operand_layout, nonk, unit_k)
     if packed is None:
         return None
-    u8 = gl.amd.cdna4.get_mfma_scale_layout(
-        dot_operand_layout, [nonk, k // MX_GROUP], MX_GROUP
-    )
+    u8 = gl.amd.cdna4.get_mfma_scale_layout(dot_operand_layout, [nonk, k], MX_GROUP)
     held = {}
     for reg in range(1 << len(packed.reg_bases)):
         held[tuple(_span(packed.reg_bases, reg))] = reg
-    col0 = k_offset // MX_GROUP
     regs, sel = [], []
     for i in range(1 << len(u8.reg_bases)):
         row, col = _span(u8.reg_bases, i)
-        regs.append(held[tuple(_word(row, col + col0))])
-        sel.append(_byte(row, col + col0))
+        regs.append(held[tuple(_word(row, col + k_offset))])
+        sel.append(_byte(row, col + k_offset))
     period = regs.count(0)
     for i in range(len(regs)):
         if regs[i] != i // period or sel[i] != sel[i % period]:
@@ -189,7 +183,7 @@ def packed_scale_sel(dot_operand_layout, nonk, k, k_offset=0):
 @gluon.constexpr_function
 def packed_scale_dot_shape(nonk, k, sel):
     """The shape ``mfma_scaled_packed`` checks a ``nonk x k`` dot's packed scale in."""
-    return [nonk, k // MX_GROUP // len(sel)]
+    return [nonk, k // len(sel)]
 
 
 @gluon.constexpr_function

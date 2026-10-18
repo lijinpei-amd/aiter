@@ -114,6 +114,9 @@ _LEGACY_SLOT_KEYS = {
     "SCALE_SLOT_N": "SCALE_MINI_BLOCK_N",
     "SCALE_SLOT_K": "SCALE_MINI_BLOCK_K",
 }
+#: Slot keys whose legacy name counted another unit: SCALE_MINI_BLOCK_K counted payload
+#: K, SCALE_SLOT_K counts scale columns, one per MX group. A legacy value is divided.
+_LEGACY_SLOT_DIVISORS = {"SCALE_SLOT_K": MX_GROUP_SIZE}
 _DS_READ_FIELDS = (
     ("DS_READ_A_PAYLOAD_IN_MFMA", DSReadOperand.A),
     ("DS_READ_A_SCALE_IN_MFMA", DSReadOperand.A_SCALE),
@@ -193,10 +196,20 @@ def _env_int(name: str, default: int) -> int:
     return default if v is None else int(v)
 
 
+def _from_legacy_slot(name: str, value: int) -> int:
+    """A value given under ``name``'s legacy key, in the unit ``name`` counts."""
+    divisor = _LEGACY_SLOT_DIVISORS.get(name.upper(), 1)
+    if value % divisor:
+        legacy = _LEGACY_SLOT_KEYS[name.upper()]
+        raise ValueError(f"legacy {legacy} {value} is not a multiple of {divisor}")
+    return value // divisor
+
+
 def _env_slot_int(name: str, default: int) -> int:
     """A slot extent from the environment, under its name or its legacy name."""
     prefix = "AITER_TRITON_MOE_GLUON_"
-    legacy = _env_int(prefix + _LEGACY_SLOT_KEYS[name], default)
+    legacy = _env_int(prefix + _LEGACY_SLOT_KEYS[name], None)
+    legacy = default if legacy is None else _from_legacy_slot(name, legacy)
     return _env_int(prefix + name, legacy)
 
 
@@ -204,6 +217,7 @@ def _canonical_slot_keys(c: dict) -> dict:
     """``c`` with its legacy slot keys renamed, upper- or lowercase.
 
     Lowercase is accepted for the scale slots only, as it was before the rename. A
+    legacy value is converted to its new name's unit (``_LEGACY_SLOT_DIVISORS``). A
     legacy key that disagrees with its new name is rejected.
     """
     renames = list(_LEGACY_SLOT_KEYS.items()) + [
@@ -211,7 +225,7 @@ def _canonical_slot_keys(c: dict) -> dict:
     ]
     for name, legacy in renames:
         if legacy in c:
-            value = c[legacy]
+            value = _from_legacy_slot(name, c[legacy])
             if name in c and c[name] != value:
                 raise ValueError(f"{name} and legacy {legacy} disagree")
             c = {k: v for k, v in c.items() if k != legacy}
@@ -610,8 +624,8 @@ def get_gluon_config_uncached(
             "SLOT_M": out_slot_m,
             "SLOT_N": out_slot_n,
             # Zero inherits the corresponding payload M/N extent. Shuffled scale K
-            # defaults to max(256, BLOCK_K); an override must be at least that wide
-            # and an integer multiple of BLOCK_K.
+            # counts scale columns and defaults to max(8, BLOCK_K / 32); an override
+            # must be at least that wide and an integer multiple of BLOCK_K / 32.
             **{key: _env_slot_int(key, 0) for key in _SCALE_SLOT_KEYS},
             "NUM_LDS_BUFFER": n_buf,
             # Zero inherits NUM_LDS_BUFFER in the common component pipeline.
@@ -770,9 +784,10 @@ def get_gluon_config_uncached(
     # Which axis to give up first when the tile does not fit.
     #
     # With microscaled operands, keep the payload K tile wide when possible. The
-    # shuffled scale slot independently defaults to max(256, BLOCK_K), so a narrower
-    # payload stage retains and reuses a coalesced wider scale load. Narrow N first and
-    # accept the loss of arithmetic intensity before shortening that payload stream.
+    # shuffled scale slot independently defaults to max(256, BLOCK_K) payload K, so a
+    # narrower payload stage retains and reuses a coalesced wider scale load. Narrow N
+    # first and accept the loss of arithmetic intensity before shortening that payload
+    # stream.
     #
     # With no scales at all (bf16 x bf16) that argument does not exist, and narrowing N
     # is pure loss -- it was picking BLOCK_N=64 where BLOCK_N=128 with a shorter K fits
@@ -1446,18 +1461,20 @@ def _scale_shuffle_supported(cfg, operand):
         configured_scale_k = cfg["scale_slot_k"]
     if not configured_scale_k:
         configured_scale_k = _env_slot_int("SCALE_SLOT_K", 0)
-    scale_k = int(configured_scale_k) or max(256, block_k)
+    # Scale K counts scale columns, one per MX group; a K256 unit is 8 of them.
+    scale_block_k = block_k // MX_GROUP_SIZE
+    scale_k = int(configured_scale_k) or max(8, scale_block_k)
     if (
         tuple(cfg["mfma_instr_shape"]) != (16, 16, 128)
         or block_k < 128
         or block_k % 128 != 0
-        or scale_k < max(256, block_k)
-        or scale_k % block_k != 0
+        or scale_k < max(8, scale_block_k)
+        or scale_k % scale_block_k != 0
         or (scale_k & (scale_k - 1)) != 0
     ):
         return False
     if cfg.get("FROZEN_STEP", False):
-        return block_k == scale_k == 256
+        return block_k == 256 and scale_k == scale_block_k
     if block_k == 128:
         # Preserve the K128 stage's dword-load eligibility: both non-K bytes
         # belong to this wave while the component pipeline retains the next half.
@@ -1781,11 +1798,12 @@ def moe_gemm_gluon(
     ``scale_slot_m``, ``scale_slot_n`` and ``scale_slot_k``
     (also accepted in uppercase, and under the legacy ``scale_mini_block_*`` names)
     set the scale slots, the shuffled-scale load extents, independently of the
-    payload slots. K counts logical payload elements; its scale storage
-    extent is K / 32. Zero inherits the payload M/N extent, while shuffled scale
-    K defaults to ``max(256, BLOCK_K)``. An explicit scale K must be a power-of-two
-    multiple of ``BLOCK_K``, at least that wide, and divide total K. Unshuffled
-    scales ignore these settings.
+    payload slots. K counts scale columns, one E8M0 byte per MX group of 32
+    payload K (the legacy ``scale_mini_block_k`` counted payload K and is divided by
+    32). Zero inherits the payload M/N extent, while shuffled scale K defaults to
+    ``max(8, BLOCK_K / 32)``. An explicit scale K must be a power-of-two multiple of
+    ``BLOCK_K / 32``, at least that wide, and divide total K / 32. Unshuffled scales
+    ignore these settings.
 
     ``y_scales`` non-None selects the fused MXFP4 output quant: ``y`` then holds the
     E2M1 payload (``N // ARN // 2`` uint8 columns) and ``y_scales`` the E8M0 exponents,

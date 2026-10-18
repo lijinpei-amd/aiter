@@ -217,11 +217,11 @@ def test_public_mxfp8_gemm1_restores_only_unavailable_raw_scale(
 @pytest.mark.parametrize(
     "scale_shape,shuffled,registers,depths,split,soff",
     [
-        ((128, 256, 256), (True, True), False, (3, 3, 3, 3), True, False),
-        ((128, 256, 512), (True, True), False, (2, 3, 2, 3), False, True),
-        ((128, 256, 1024), (True, True), True, (2, 2, 2, 2), True, True),
-        ((128, 256, 512), (True, False), False, (3, 2, 3, 2), True, True),
-        ((128, 256, 512), (False, True), True, (3, 2, 2, 3), False, False),
+        ((128, 256, 8), (True, True), False, (3, 3, 3, 3), True, False),
+        ((128, 256, 16), (True, True), False, (2, 3, 2, 3), False, True),
+        ((128, 256, 32), (True, True), True, (2, 2, 2, 2), True, True),
+        ((128, 256, 16), (True, False), False, (3, 2, 3, 2), True, True),
+        ((128, 256, 16), (False, True), True, (3, 2, 2, 3), False, False),
         ((1, 1, 1), (False, False), False, (3, 3, 3, 3), True, False),
     ],
     ids=["mn", "mnk", "register-k1024", "a-only", "b-only", "raw-ignores"],
