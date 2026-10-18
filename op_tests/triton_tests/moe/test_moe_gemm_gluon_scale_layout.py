@@ -172,10 +172,9 @@ def test_packed_words_and_selectors_match_producer(
     # address. The read views a whole scale slot, which by default is this one
     # fragment, as [stripe, dword]; the fragment is its row-major reshape to the
     # dot's shape.
-    storage = layout.scale_slot_shape_storage(operand)
-    view_shape = [storage[0], storage[1] // 4]
+    view_shape = layout.scale_slot_shape_fragment(operand)
     assert view_shape[0] * view_shape[1] == word_shape[0] * word_shape[1]
-    read_bases = layout.scale_slot_lds_view_layout_storage(operand).offset_bases
+    read_bases = layout.scale_slot_lds_view_layout(operand).offset_bases
     physical_word = {
         tuple(_coordinate(read_bases, offset)): offset
         for offset in range(len(producer) // 4)
@@ -217,7 +216,7 @@ def test_packed_words_and_selectors_match_producer(
 
 @pytest.mark.parametrize("scale_k", [256, 512, 1024])
 @pytest.mark.parametrize("operand", [0, 1], ids=["A", "B"])
-def test_wide_packed_scale_slot_fragment_layout_storage_matches_producer(
+def test_wide_packed_scale_slot_fragment_layout_matches_producer(
     scale_k, operand
 ):
     tc = _config(
@@ -240,14 +239,14 @@ def test_wide_packed_scale_slot_fragment_layout_storage_matches_producer(
         for half_row in range(2)
     ]
     assert layout.scale_packed_ok(operand)
-    word_bases = layout.scale_slot_lds_view_layout_storage(operand).offset_bases
+    word_bases = layout.scale_slot_lds_view_layout(operand).offset_bases
     physical_word = {
         tuple(_coordinate(word_bases, offset)): offset
         for offset in range(len(producer) // 4)
     }
     assert len(physical_word) == len(producer) // 4
     byte_layout = _byte_fragment_layout(layout, operand, [nonk, scale_k // 32])
-    word_layout = layout.scale_slot_fragment_layout_storage(operand)
+    word_layout = layout.scale_slot_fragment_layout(operand)
     registers = [list(basis) for basis in byte_layout.reg_bases]
     nonk_bit, k_bit = registers.index([16, 0]), registers.index([0, 4])
     retained = [bit for bit in range(len(registers)) if bit not in (nonk_bit, k_bit)]
