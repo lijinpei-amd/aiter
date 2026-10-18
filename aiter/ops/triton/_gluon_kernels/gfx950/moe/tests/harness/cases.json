@@ -952,7 +952,7 @@
           "WARP_PIPELINE": 0,
           "WAVES_PER_EU": 1,
           "expert_cache_modifier": ".cg",
-          "expert_scale_cache_modifier": "",
+          "expert_scale_cache_modifier": ".cg",
           "k_width": null,
           "mfma_instr_shape": [
             16,
@@ -1015,7 +1015,7 @@
           "WARP_PIPELINE": 0,
           "WAVES_PER_EU": 0,
           "expert_cache_modifier": ".cg",
-          "expert_scale_cache_modifier": "",
+          "expert_scale_cache_modifier": ".cg",
           "k_width": null,
           "mfma_instr_shape": [
             16,
@@ -1078,7 +1078,7 @@
           "WARP_PIPELINE": 0,
           "WAVES_PER_EU": 0,
           "expert_cache_modifier": ".cg",
-          "expert_scale_cache_modifier": "",
+          "expert_scale_cache_modifier": ".cg",
           "k_width": null,
           "mfma_instr_shape": [
             16,
