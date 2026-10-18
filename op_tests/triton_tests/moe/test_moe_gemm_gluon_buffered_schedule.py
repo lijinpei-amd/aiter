@@ -88,7 +88,7 @@ class _Config(_ScheduleConfig):
 
     def buffer_live_span(self, operand, scale=False):
         return (self.num_buffers(operand, scale) - 1) * (
-            self.scale_slot_ratio_k(operand) if scale else 1
+            self.ratio_k(operand) if scale else 1
         ) + 1
 
     def active_components(self):
@@ -112,17 +112,24 @@ class _Config(_ScheduleConfig):
 
     num_k_slots = num_prefetch_k_slots = 1
 
-    def scale_slot_ratio_k(self, operand):
-        return self.scale_steps[operand] if self.has_scale(operand) else 1
+    def slot_nonk(self, operand):
+        return (self.SLOT_M, self.SLOT_N)[operand]
 
-    def scale_slot_ratio_non_k(self, operand):
-        return self.scale_non_k_slots[operand]
+    def scale_slot_nonk(self, operand):
+        return self.slot_nonk(operand) * self.scale_non_k_slots[operand]
 
-    def scale_read_k_slots(self, operand):
-        return self.num_k_slots * self.scale_slot_ratio_k(operand)
+    def scale_slot_k(self, operand):
+        steps = self.scale_steps[operand] if self.has_scale(operand) else 1
+        return self.BLOCK_K * steps
 
-    def scale_fragments_per_buffer(self, operand):
-        return self.num_lds_slots_non_k(operand) * self.scale_read_k_slots(operand)
+    def ratio_k(self, operand):
+        """Steps one scale slot spans, ``scale_slot_k / BLOCK_K``."""
+        return self.scale_slot_k(operand) // self.BLOCK_K
+
+    def ratio_non_k(self, operand):
+        """Non-K slots one scale slot spans, ``scale_slot_nonk / slot_nonk``."""
+        return self.scale_slot_nonk(operand) // self.slot_nonk(operand)
+
 
     def operand_elem_ty(self, operand):
         return SimpleNamespace(primitive_bitwidth=8)
@@ -194,8 +201,8 @@ class _Machine:
         tc = self.tc
         operand, is_scale = component
         tile = pointer
-        ratio = tc.scale_slot_ratio_k(operand) if is_scale else 1
-        nonk = tc.scale_slot_ratio_non_k(operand) if is_scale else 1
+        ratio = tc.ratio_k(operand) if is_scale else 1
+        nonk = tc.ratio_non_k(operand) if is_scale else 1
         mk = tc.num_k_slots
         assert 0 <= tile < self.num_k, "HBM load exceeded the K strip"
         live_span = (tc.depths[component] - 1) * ratio + 1
@@ -286,8 +293,8 @@ class _Machine:
                     component
                 ):
                     if component[1] and (
-                        self.current_read % tc.scale_slot_ratio_k(operand)
-                        or mini % tc.scale_slot_ratio_non_k(operand)
+                        self.current_read % tc.ratio_k(operand)
+                        or mini % tc.ratio_non_k(operand)
                     ):
                         continue
                     required.add((component, mini, self.current_read))
@@ -382,8 +389,8 @@ class _Machine:
                         (
                             scale.component,
                             scale.mini
-                            - scale.mini % tc.scale_slot_ratio_non_k(operand),
-                            accumulator - accumulator % tc.scale_slot_ratio_k(operand),
+                            - scale.mini % tc.ratio_non_k(operand),
+                            accumulator - accumulator % tc.ratio_k(operand),
                         )
                     )
         token = a[0].mini, b[0].mini, accumulator
@@ -466,7 +473,7 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         operand = args[5]
         component = (operand, SCALE)
         if tc.component_in_reg(component):
-            ratio = tc.scale_slot_ratio_k(operand)
+            ratio = tc.ratio_k(operand)
             machine.events.append(
                 (
                     machine.current_read,
@@ -506,11 +513,9 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
                 (None,)
                 * (
                     tc.depths[component]
-                    * (
-                        tc.scale_fragments_per_buffer(component[0])
-                        if component[1]
-                        else (tc.nm if component[0] == A else tc.nn) * tc.num_k_slots
-                    )
+                    * (tc.nm if component[0] == A else tc.nn)
+                    * tc.num_k_slots
+                    * (tc.ratio_k(component[0]) if component[1] else 1)
                 )
                 if component in tc.active_components()
                 and not tc.component_via_lds(component)
@@ -572,12 +577,12 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         for mini in range(
             0,
             tc.nm if component[0] == A else tc.nn,
-            tc.scale_slot_ratio_non_k(component[0]) if component[1] else 1,
+            tc.ratio_non_k(component[0]) if component[1] else 1,
         )
         for tile in range(
             0,
             num_k,
-            tc.scale_slot_ratio_k(component[0]) if component[1] else 1,
+            tc.ratio_k(component[0]) if component[1] else 1,
         )
     }
     assert machine.loads == expected
@@ -1067,7 +1072,7 @@ def test_every_payload_tile_is_filled_exactly_once(nm, nn, middle):
             for non_k_slot in (schedule.owned(slot)[COMPONENTS.index(component)],)
             if non_k_slot is not None
         ]
-        ratio = tc.scale_slot_ratio_non_k(component[0]) if component[1] else 1
+        ratio = tc.ratio_non_k(component[0]) if component[1] else 1
         expected = [t for t in range(non_k_slots) if t % ratio == 0]
         assert sorted(owners) == expected, (component, owners, expected)
 

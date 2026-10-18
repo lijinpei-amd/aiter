@@ -60,8 +60,6 @@ def test_scale_slots_only_change_the_shuffled_operand(shuffled):
             128 if shuffled[operand] else 64
         )
         assert layout.scale_slot_k(operand) == (512 if shuffled[operand] else 128)
-        assert layout.scale_slot_ratio_k(operand) == (4 if shuffled[operand] else 1)
-        assert layout.scale_slot_ratio_non_k(operand) == (2 if shuffled[operand] else 1)
     assert validate(tc, 4096, 7168)
 
 
@@ -175,7 +173,6 @@ def test_scale_k_step_ratio_sets_buffer_span_and_unroll(
     ratio = scale_k // block_k
     for operand, depth in enumerate((2, 3)):
         assert schedule.live_span((operand, True)) == (depth - 1) * ratio + 1
-        assert layout.scale_slot_ratio_k(operand) == ratio
-        assert layout.scale_read_k_slots(operand) == ratio
+        assert layout.scale_slot_k(operand) == scale_k
     period = math.lcm(3, 2 * ratio, 3 * ratio)
     assert maybe_unwrap(schedule.unroll) == period

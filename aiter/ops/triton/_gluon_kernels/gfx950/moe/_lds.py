@@ -54,18 +54,17 @@ def _scale_fragments(scale, cfg, layout, operand: gl.constexpr):
     """Split one shuffled scale load in registers, retaining whole packed words."""
     sk: gl.constexpr = layout.scale_slot_k(operand)
     bk: gl.constexpr = cfg.BLOCK_K
+    ratio: gl.constexpr = layout.scale_slot_nonk(operand) // layout.slot_nonk(operand)
     packed: gl.constexpr = layout.scale_packed_ok(operand)
     fragments = ()
-    for n in gl.static_range(layout.scale_slot_ratio_non_k(operand)):
+    for n in gl.static_range(ratio):
         for k in gl.static_range(sk // bk):
             if require_constexpr(packed):
-                # The scale slot is [stripe, dword] (packed_scale_shape), a unit per 64
-                # dwords. A slot's units are whole register and warp steps, so the
-                # slice never unpacks a dword or moves it across lanes; the reshape to
-                # the dot's shape moves nothing.
-                if require_constexpr(
-                    layout.scale_slot_ratio_non_k(operand) == 1 and sk == max(256, bk)
-                ):
+                # The scale slot is in storage order as i32, [stripe, dword], a
+                # unit per 64 dwords. A slot's units are whole register and warp
+                # steps, so the slice never unpacks a dword or moves it across lanes;
+                # the reshape to the dot's shape moves nothing.
+                if require_constexpr(ratio == 1 and sk == max(256, bk)):
                     fragment = gl.reshape(
                         scale, layout.fragment_shape_slot(operand, True)
                     )
@@ -249,7 +248,8 @@ class LDSManager:
             if operand == 0
             else cfg.expert_scale_cache_modifier
         )
-        ratio: gl.constexpr = layout.scale_slot_ratio_non_k(operand)
+        slot_nonk: gl.constexpr = layout.slot_nonk(operand)
+        ratio: gl.constexpr = layout.scale_slot_nonk(operand) // slot_nonk
         if require_constexpr(VIA_LDS):
             if require_constexpr(
                 self.func_cfg.has_scale(operand)
@@ -262,7 +262,7 @@ class LDSManager:
                     lds_ptr = self.b_scale_lds_ptr
                 _buffer_load_to_lds(
                     lds_ptr.index(
-                        BUFFER_LOAD_IDX * layout.scale_num_slots(operand)
+                        BUFFER_LOAD_IDX * (layout.num_lds_slots_non_k(operand) // ratio)
                         + non_k_slot // ratio
                     ),
                     hbm_ptr,
@@ -290,7 +290,7 @@ class LDSManager:
                             contiguity=4,
                             soffset=SOFF,
                         ),
-                        layout.scale_fragment_layout_scale_slot(operand),
+                        layout.scale_slot_fragment_layout_logical(operand),
                     )
                 fragments = _scale_fragments(scale, cfg, layout, operand)
             else:
@@ -312,24 +312,39 @@ class LDSManager:
         else:
             lds_ptr = self.b_scale_lds_ptr
         if require_constexpr(cfg.preshuffled(operand, True)):
+            slot_nonk: gl.constexpr = layout.slot_nonk(operand)
+            ratio: gl.constexpr = layout.scale_slot_nonk(operand) // slot_nonk
             scale_ptr = lds_ptr.index(
-                SCALE_READ_IDX * layout.scale_num_slots(operand)
-                + non_k_slot // layout.scale_slot_ratio_non_k(operand)
+                SCALE_READ_IDX * (layout.num_lds_slots_non_k(operand) // ratio)
+                + non_k_slot // ratio
             )
-            scale = _ds_read(
-                scale_ptr.reinterpret(
-                    layout.scale_fragment_dtype(operand),
-                    layout.scale_fragment_shape_scale_slot(operand),
-                    layout.scale_lds_view_layout_scale_slot(operand),
-                ),
-                layout.scale_fragment_layout_scale_slot(operand),
-            )
+            if require_constexpr(layout.scale_packed_ok(operand)):
+                # Storage order as i32: four bytes of a stripe per element.
+                storage: gl.constexpr = layout.scale_slot_shape_storage(operand)
+                scale = _ds_read(
+                    scale_ptr.reinterpret(
+                        gl.int32,
+                        [storage[0], storage[1] // 4],
+                        layout.scale_slot_lds_view_layout_storage(operand),
+                    ),
+                    layout.scale_slot_fragment_layout_storage(operand),
+                )
+            else:
+                scale = _ds_read(
+                    scale_ptr.reinterpret(
+                        gl.uint8,
+                        layout.scale_slot_shape_logical(operand),
+                        layout.scale_slot_lds_view_layout_logical(operand),
+                    ),
+                    layout.scale_slot_fragment_layout_logical(operand),
+                )
             fragments = _scale_fragments(scale, cfg, layout, operand)
         else:
             fragments = (
                 _ds_read(
                     lds_ptr.index(
-                        SCALE_READ_IDX * layout.scale_num_slots(operand) + non_k_slot
+                        SCALE_READ_IDX * layout.num_lds_slots_non_k(operand)
+                        + non_k_slot
                     ),
                     layout.fragment_layout(operand, True),
                 ),
@@ -361,6 +376,7 @@ class LDSManager:
 
         An absent or disabled component returns None.
         """
+        cfg: gl.constexpr = self.tuning_cfg
         layout: gl.constexpr = self.layout
         if require_constexpr(operand == 0):
             payload_lds_ptr = self.a_payload_lds_ptr
@@ -382,12 +398,14 @@ class LDSManager:
                 layout.component_via_lds((operand, True)),
                 "ds_read_frag only reads LDS-staged scales",
             )
-            ratio: gl.constexpr = layout.scale_slot_ratio_non_k(operand)
+            slot_nonk: gl.constexpr = layout.slot_nonk(operand)
+            ratio: gl.constexpr = layout.scale_slot_nonk(operand) // slot_nonk
             fragments = self.ds_read_scale(
                 operand, SCALE_READ_IDX, non_k_slot // ratio * ratio
             )
+            ratio_k: gl.constexpr = layout.scale_slot_k(operand) // cfg.BLOCK_K
             scale_val = fragments[
-                (non_k_slot % ratio) * layout.scale_read_k_slots(operand) + k_slot
+                (non_k_slot % ratio) * layout.num_k_slots * ratio_k + k_slot
             ]
         else:
             scale_val: gl.constexpr = None
