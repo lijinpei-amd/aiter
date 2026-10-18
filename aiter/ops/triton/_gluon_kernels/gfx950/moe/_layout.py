@@ -505,7 +505,6 @@ class KernelLayout:
                         or (
                             scale[0] * scale[1] >= WARP_SIZE * 4
                             and scale[1] % 4 == 0
-                            and scale[1] >= 8
                         )
                     ),
                 )
