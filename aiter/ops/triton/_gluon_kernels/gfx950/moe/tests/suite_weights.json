@@ -110,7 +110,7 @@
     "test_moe_gemm_gluon_scale_layout.py::test_invalid_packed_k128_configs_are_rejected": [0.0, 0.0, 0.0],
     "test_moe_gemm_gluon_scale_layout.py::test_packed_words_and_selectors_match_producer": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
     "test_moe_gemm_gluon_scale_layout.py::test_pipeline_phases_and_packed_scale_addresses": [0.2, 1.3, 3.5, 0.8, 1.3, 3.5, 0.2, 3.5, 3.5, 0.2, 1.2, 3.4, 0.8, 1.3, 3.6, 0.2, 3.5, 3.4, 0.1, 1.3, 4.6, 0.8, 1.6, 4.6, 0.2, 4.6, 4.8, 0.2, 1.6, 4.6, 0.8, 1.5, 4.5, 0.2, 4.4, 4.5, 0.2, 1.3, 2.9, 0.6, 1.0, 3.0, 0.1, 2.9, 2.9, 0.2, 1.0, 3.1, 0.7, 1.0, 3.1, 0.2, 3.0, 3.1, 0.1, 1.3, 4.0, 0.6, 1.3, 4.0, 0.1, 4.0, 4.0, 0.2, 1.4, 4.2, 0.7, 1.4, 4.2, 0.2, 4.2, 4.2],
-    "test_moe_gemm_gluon_scale_layout.py::test_wide_packed_scale_slot_fragment_layout_storage_matches_producer": [0.0, 0.1, 0.1, 0.0, 0.0, 0.1],
+    "test_moe_gemm_gluon_scale_layout.py::test_wide_packed_scale_slot_fragment_layout_matches_producer": [0.0, 0.1, 0.1, 0.0, 0.0, 0.1],
     "test_moe_gemm_gluon_scale_slots.py::test_frozen_shuffled_scales_reject_k_wider_than_256": [0.0],
     "test_moe_gemm_gluon_scale_slots.py::test_invalid_shuffled_scale_slots_are_rejected": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
     "test_moe_gemm_gluon_scale_slots.py::test_invalid_unused_scale_slots_are_ignored": [0.0],

@@ -290,7 +290,7 @@ class LDSManager:
                             contiguity=4,
                             soffset=SOFF,
                         ),
-                        layout.scale_slot_fragment_layout_logical(operand),
+                        layout.scale_slot_fragment_layout(operand),
                     )
                 fragments = _scale_fragments(scale, cfg, layout, operand)
             else:
@@ -318,26 +318,14 @@ class LDSManager:
                 SCALE_READ_IDX * (layout.num_lds_slots_non_k(operand) // ratio)
                 + non_k_slot // ratio
             )
-            if require_constexpr(layout.scale_packed_ok(operand)):
-                # Storage order as i32: four bytes of a stripe per element.
-                storage: gl.constexpr = layout.scale_slot_shape_storage(operand)
-                scale = _ds_read(
-                    scale_ptr.reinterpret(
-                        gl.int32,
-                        [storage[0], storage[1] // 4],
-                        layout.scale_slot_lds_view_layout_storage(operand),
-                    ),
-                    layout.scale_slot_fragment_layout_storage(operand),
-                )
-            else:
-                scale = _ds_read(
-                    scale_ptr.reinterpret(
-                        gl.uint8,
-                        layout.scale_slot_shape_logical(operand),
-                        layout.scale_slot_lds_view_layout_logical(operand),
-                    ),
-                    layout.scale_slot_fragment_layout_logical(operand),
-                )
+            scale = _ds_read(
+                scale_ptr.reinterpret(
+                    layout.scale_fragment_dtype(operand),
+                    layout.scale_slot_shape_fragment(operand),
+                    layout.scale_slot_lds_view_layout(operand),
+                ),
+                layout.scale_slot_fragment_layout(operand),
+            )
             fragments = _scale_fragments(scale, cfg, layout, operand)
         else:
             fragments = (

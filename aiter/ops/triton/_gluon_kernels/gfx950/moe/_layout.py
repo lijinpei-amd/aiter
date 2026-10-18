@@ -253,10 +253,8 @@ class KernelLayout:
     _scale_fragment_shape_slot: gl.constexpr
     _scale_hbm_offset_layout: gl.constexpr
     _scale_lds_layout: gl.constexpr
-    _scale_slot_lds_view_layout_storage: gl.constexpr
-    _scale_slot_lds_view_layout_logical: gl.constexpr
-    _scale_slot_fragment_layout_storage: gl.constexpr
-    _scale_slot_fragment_layout_logical: gl.constexpr
+    _scale_slot_lds_view_layout: gl.constexpr
+    _scale_slot_fragment_layout: gl.constexpr
     _scale_fragment_layout_slot: gl.constexpr
     acc_vgprs_per_lane: gl.constexpr
     accumulator_fragment_shape_slot: gl.constexpr
@@ -524,9 +522,9 @@ class KernelLayout:
             [nonk, scale_block_k_storage] for nonk in (SLOT_M, SLOT_N)
         ]
         scale_fragment_layout_slot = [None, None]
-        scale_slot_fragment_layout_logical = [None, None]
+        scale_slot_fragment_layout = [None, None]
         dot_operand_scale_buffer_load_lds_layout = [None, None]
-        scale_slot_lds_view_layout_logical = [None, None]
+        scale_slot_lds_view_layout = [None, None]
         for idx in ops:
             if not has_scale[idx]:
                 continue
@@ -534,10 +532,8 @@ class KernelLayout:
             scale_fragment_layout_slot[idx] = gl.amd.cdna4.get_mfma_scale_layout(
                 frag, scale_fragment_shape_slot[idx], MX_GROUP
             )
-            scale_slot_fragment_layout_logical[idx] = (
-                gl.amd.cdna4.get_mfma_scale_layout(
-                    frag, scale_slot_shape_logical[idx], MX_GROUP
-                )
+            scale_slot_fragment_layout[idx] = gl.amd.cdna4.get_mfma_scale_layout(
+                frag, scale_slot_shape_logical[idx], MX_GROUP
             )
             if scale_via_lds[idx]:
                 lanes_k = (
@@ -550,18 +546,16 @@ class KernelLayout:
                     order=[1, 0],
                 )
             nonk, k = scale_slot_nonk[idx], scale_slot_k[idx]
-            scale_slot_lds_view_layout_logical[idx] = gl.SharedLinearLayout(
+            scale_slot_lds_view_layout[idx] = gl.SharedLinearLayout(
                 offset_bases=[[16, 0], [0, 4]]
                 + _pow2_bases(0, 2, [1, 2, 4, 8])
                 + _pow2_bases(1, 2, [1, 2])
                 + _pow2_bases(1, 2, _ramp(8, k // MX_GROUP))
                 + _pow2_bases(0, 2, _ramp(32, nonk))
             )
-        scale_slot_fragment_layout_logical = tuple(scale_slot_fragment_layout_logical)
         dot_operand_scale_buffer_load_lds_layout = tuple(
             dot_operand_scale_buffer_load_lds_layout
         )
-        scale_slot_lds_view_layout_logical = tuple(scale_slot_lds_view_layout_logical)
 
         # Packed scales (_packed_scale.py): a shuffled scale held as whole i32 units
         # and handed to the MFMA with byte selectors. A slot packs when its scale slot
@@ -591,8 +585,6 @@ class KernelLayout:
         # A packed scale slot is read and held in its storage order, as i32: its
         # storage shape with every four bytes of a row one element. Its slot
         # fragments stay i32.
-        scale_slot_fragment_layout_storage = [None, None]
-        scale_slot_lds_view_layout_storage = [None, None]
         for idx in ops:
             sel = scale_packed_sel[idx][0]
             if sel is None:
@@ -605,16 +597,12 @@ class KernelLayout:
             scale_fragment_layout_slot[idx] = packed_scale_dot_layout(
                 frag, slot_nonk[idx], BK, sel
             )
-            scale_slot_fragment_layout_storage[idx] = packed_scale_layout(
-                frag, nonk, k
-            )
-            scale_slot_lds_view_layout_storage[idx] = packed_scale_lds_view_layout(
-                nonk, k
-            )
+            scale_slot_fragment_layout[idx] = packed_scale_layout(frag, nonk, k)
+            scale_slot_lds_view_layout[idx] = packed_scale_lds_view_layout(nonk, k)
         scale_fragment_shape_slot = tuple(scale_fragment_shape_slot)
         scale_fragment_layout_slot = tuple(scale_fragment_layout_slot)
-        scale_slot_fragment_layout_storage = tuple(scale_slot_fragment_layout_storage)
-        scale_slot_lds_view_layout_storage = tuple(scale_slot_lds_view_layout_storage)
+        scale_slot_fragment_layout = tuple(scale_slot_fragment_layout)
+        scale_slot_lds_view_layout = tuple(scale_slot_lds_view_layout)
 
         scale_hbm_offset_layout = [None, None]
         for idx in ops:
@@ -625,9 +613,9 @@ class KernelLayout:
             elif not scale_preshuffled[idx]:
                 layout = scale_fragment_layout_slot[idx]
             elif scale_packed_ok[idx]:
-                layout = scale_slot_fragment_layout_storage[idx]
+                layout = scale_slot_fragment_layout[idx]
             else:
-                frag = scale_slot_fragment_layout_logical[idx]
+                frag = scale_slot_fragment_layout[idx]
                 lead = [[16, 0], [0, 4]]
                 rest = [list(b) for b in frag.reg_bases if list(b) not in lead]
                 layout = gl.DistributedLinearLayout(
@@ -713,18 +701,8 @@ class KernelLayout:
         self._scale_fragment_shape_slot = gl.constexpr(scale_fragment_shape_slot)
         self._scale_hbm_offset_layout = gl.constexpr(scale_hbm_offset_layout)
         self._scale_lds_layout = gl.constexpr(scale_lds_layout)
-        self._scale_slot_lds_view_layout_storage = gl.constexpr(
-            scale_slot_lds_view_layout_storage
-        )
-        self._scale_slot_lds_view_layout_logical = gl.constexpr(
-            scale_slot_lds_view_layout_logical
-        )
-        self._scale_slot_fragment_layout_storage = gl.constexpr(
-            scale_slot_fragment_layout_storage
-        )
-        self._scale_slot_fragment_layout_logical = gl.constexpr(
-            scale_slot_fragment_layout_logical
-        )
+        self._scale_slot_lds_view_layout = gl.constexpr(scale_slot_lds_view_layout)
+        self._scale_slot_fragment_layout = gl.constexpr(scale_slot_fragment_layout)
         self._scale_fragment_layout_slot = gl.constexpr(scale_fragment_layout_slot)
 
         self.acc_vgprs_per_lane = gl.constexpr(acc_vgprs_per_lane)
@@ -859,20 +837,17 @@ class KernelLayout:
         return self._scale_packed_sel.value[idx][k_phase]
 
     @gluon.constexpr_function
-    def scale_slot_lds_view_layout_storage(self, idx):
-        return self._scale_slot_lds_view_layout_storage.value[idx]
+    def scale_slot_shape_fragment(self, idx):
+        """Shape of a scale slot as read and held: logical u8, or storage i32."""
+        return list(self._scale_slot_fragment_layout.value[idx].shape)
 
     @gluon.constexpr_function
-    def scale_slot_lds_view_layout_logical(self, idx):
-        return self._scale_slot_lds_view_layout_logical.value[idx]
+    def scale_slot_lds_view_layout(self, idx):
+        return self._scale_slot_lds_view_layout.value[idx]
 
     @gluon.constexpr_function
-    def scale_slot_fragment_layout_storage(self, idx):
-        return self._scale_slot_fragment_layout_storage.value[idx]
-
-    @gluon.constexpr_function
-    def scale_slot_fragment_layout_logical(self, idx):
-        return self._scale_slot_fragment_layout_logical.value[idx]
+    def scale_slot_fragment_layout(self, idx):
+        return self._scale_slot_fragment_layout.value[idx]
 
     @gluon.constexpr_function
     def result_store_layout(self, extent_m, extent_n, storage_bits):
