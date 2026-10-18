@@ -52,7 +52,6 @@ def _buffer_load_to_lds(
 @gluon.jit
 def _scale_fragments(scale, cfg, layout, operand: gl.constexpr):
     """Split one shuffled scale load in registers, retaining whole packed words."""
-    nonk: gl.constexpr = layout.scale_slot_nonk(operand)
     sk: gl.constexpr = layout.scale_slot_k(operand)
     bk: gl.constexpr = cfg.BLOCK_K
     packed: gl.constexpr = layout.scale_packed_ok(operand)
@@ -60,18 +59,21 @@ def _scale_fragments(scale, cfg, layout, operand: gl.constexpr):
     for n in gl.static_range(layout.scale_slot_ratio_non_k(operand)):
         for k in gl.static_range(sk // bk):
             if require_constexpr(packed):
+                # The scale slot is [stripe, dword] (packed_scale_shape), a unit per 64
+                # dwords. A slot's units are whole register and warp steps, so the
+                # slice never unpacks a dword or moves it across lanes; the reshape to
+                # the dot's shape moves nothing.
                 if require_constexpr(
                     layout.scale_slot_ratio_non_k(operand) == 1 and sk == max(256, bk)
                 ):
-                    fragment = scale
+                    fragment = gl.reshape(
+                        scale, layout.fragment_shape_slot(operand, True)
+                    )
                 else:
-                    # Physical order is stripe, K256 group, lane dword. Splitting
-                    # these axes never unpacks a dword or moves it across lanes.
-                    words = gl.reshape(scale, [nonk // 32, sk // 256, 64])
                     words = gl.amd.slice(
-                        words,
-                        [layout.slot_nonk(operand) // 32, max(256, bk) // 256, 64],
-                        [n * layout.slot_nonk(operand) // 32, k * bk // 256, 0],
+                        scale,
+                        [layout.slot_nonk(operand) // 32, max(256, bk) // 4],
+                        [n * layout.slot_nonk(operand) // 32, k * bk // 256 * 64],
                     )
                     fragment = gl.convert_layout(
                         gl.reshape(words, layout.fragment_shape_slot(operand, True)),

@@ -169,9 +169,11 @@ def test_packed_words_and_selectors_match_producer(
     assert word_shape[0] * word_shape[1] * 4 == len(producer)
 
     # Invert the actual LDS view layout to find each fragment word's physical
-    # address, rather than reusing production's _scale_dword_delta formula. The read
-    # views a whole scale slot, which by default is this one fragment.
-    assert layout.scale_fragment_shape_scale_slot(operand) == word_shape
+    # address. The read views a whole scale slot, which by default is this one
+    # fragment, as [stripe, dword]; the fragment is its row-major reshape to the
+    # dot's shape.
+    view_shape = layout.scale_fragment_shape_scale_slot(operand)
+    assert view_shape[0] * view_shape[1] == word_shape[0] * word_shape[1]
     read_bases = layout.scale_lds_view_layout_scale_slot(operand).offset_bases
     physical_word = {
         tuple(_coordinate(read_bases, offset)): offset
@@ -194,8 +196,10 @@ def test_packed_words_and_selectors_match_producer(
             word_coord = _thread_coordinate(
                 word_layout, reg // len(selectors), lane, warp
             )
+            flat = word_coord[0] * word_shape[1] + word_coord[1]
+            view_coord = (flat // view_shape[1], flat % view_shape[1])
             byte_offset = (
-                physical_word[word_coord] * 4 + selectors[reg % len(selectors)]
+                physical_word[view_coord] * 4 + selectors[reg % len(selectors)]
             )
             expected_group = group + (4 * phase if block_k == 128 else 0)
             assert producer[byte_offset] == (row, expected_group), (

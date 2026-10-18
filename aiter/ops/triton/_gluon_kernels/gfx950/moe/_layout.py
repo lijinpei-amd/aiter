@@ -7,6 +7,14 @@ from triton.experimental.gluon import language as gl
 from triton.language.core import _aggregate as aggregate
 
 from ._lang import MX_GROUP, WARP_SIZE, require_constexpr, strip_annotate
+from ._packed_scale import (
+    packed_scale_dot_layout,
+    packed_scale_dot_shape,
+    packed_scale_layout,
+    packed_scale_lds_view_layout,
+    packed_scale_sel,
+    packed_scale_shape,
+)
 from ._types import WeightGuHbmLayout
 
 __all__ = ["KernelLayout"]
@@ -127,15 +135,15 @@ def _shuffled_scale_register_offsets(
     split_stride=0,
 ):
     if require_constexpr(packed):
-        rr = gl.arange(0, nonk, layout=gl.SliceLayout(1, layout))[:, None]
-        width: gl.constexpr = scale_block_k_storage // 4
-        cc = gl.arange(0, width, layout=gl.SliceLayout(0, layout))[None, :]
-        word = rr * width + cc
-        stripe_dwords: gl.constexpr = scale_block_k_storage * 8
-        row = (word // stripe_dwords) * 32
+        # packed_scale_shape: one row per 32-row stripe, its dwords in HBM order.
+        stripe = gl.arange(0, nonk // 32, layout=gl.SliceLayout(1, layout))[:, None]
+        dword = gl.arange(
+            0, scale_block_k_storage * 8, layout=gl.SliceLayout(0, layout)
+        )[None, :]
+        row = stripe * 32
         if require_constexpr(split_extent):
             row = row // split_extent * split_stride + row % split_extent
-        offsets = ((nonk0 + row) // 32) * K + (word % stripe_dwords) * 4
+        offsets = ((nonk0 + row) // 32) * K + dword * 4
     else:
         nn = gl.arange(0, nonk, layout=gl.SliceLayout(1, layout))[:, None]
         if require_constexpr(split_extent):
@@ -209,16 +217,6 @@ def _n_reduction_slot(func_cfg):
     if func_cfg.weight_gu_hbm_layout.value == WeightGuHbmLayout.SPLIT:
         return 1
     return func_cfg.activation_reduction_n()
-
-
-@gluon.constexpr_function
-def _scale_dword_delta(delta, k=256):
-    b = [int(x) for x in delta]
-    if b == [0, 0]:
-        return [0, 0]
-    width = k // 128
-    d = (b[0] // 32) * (k // 4) + (b[1] // 8) * 64 + (b[1] % 4) * 16 + (b[0] % 16)
-    return [d // width, d % width]
 
 
 @aggregate
@@ -576,88 +574,55 @@ class KernelLayout:
         )
         scale_lds_view_layout_scale_slot = tuple(scale_lds_view_layout_scale_slot)
 
-        scale_packed_ok = [False, False]
+        # Packed scales (_packed_scale.py): a shuffled scale held as whole i32 units
+        # and handed to the MFMA with byte selectors. A slot packs when its scale slot
+        # has a packed layout and every K phase of the slot has a selector list.
+        scale_packed_sel = []
         for idx in ops:
-            if scale_preshuffled[idx] and BK in (128, 256):
-                regs = [list(b) for b in scale_fragment_layout[idx].reg_bases]
-                if BK == 128:
-                    scale_packed_ok[idx] = len(regs) >= 1 and regs[0] == [16, 0]
-                else:
-                    scale_packed_ok[idx] = (
-                        len(regs) >= 2 and regs[0] == [0, 4] and regs[1] == [16, 0]
+            frag = payload_fragment_layout[idx]
+            sel = (None, None)
+            if (
+                scale_preshuffled[idx]
+                and slot_nonk[idx] % 32 == 0
+                and packed_scale_layout(frag, scale_slot_nonk[idx], scale_slot_k[idx])
+                is not None
+            ):
+                sel = tuple(
+                    packed_scale_sel(
+                        frag, slot_nonk[idx], BK, k_phase * BK % scale_stage_k
                     )
-        scale_packed_ok = tuple(scale_packed_ok)
-        scale_packed_sel = tuple(
-            tuple(
-                (
-                    ([2 * k_phase, 2 * k_phase + 1] if BK == 128 else [0, 2, 1, 3])
-                    if scale_packed_ok[idx]
-                    else None
+                    for k_phase in (0, 1)
                 )
-                for k_phase in (0, 1)
-            )
-            for idx in ops
-        )
+                if None in sel:
+                    sel = (None, None)
+            scale_packed_sel.append(sel)
+        scale_packed_sel = tuple(scale_packed_sel)
+        scale_packed_ok = tuple(sel[0] is not None for sel in scale_packed_sel)
         any_scale_packed = scale_packed_ok[0] or scale_packed_ok[1]
-        packed_scale_fragment_shape_slot = tuple(
-            [nonk, scale_stage_k // 128] for nonk in slot_nonk
-        )
-        packed_scale_fragment_shape_scale_slot = tuple(
-            [scale_slot_nonk[idx], scale_slot_k[idx] // 128] for idx in ops
-        )
+        packed_scale_fragment_shape_slot = [None, None]
         packed_scale_fragment_layout_slot = [None, None]
-        packed_scale_lds_view_layout_scale_slot = [None, None]
+        packed_scale_fragment_shape_scale_slot = [None, None]
         packed_scale_fragment_layout_scale_slot = [None, None]
+        packed_scale_lds_view_layout_scale_slot = [None, None]
         for idx in ops:
-            if not has_scale[idx]:
+            sel = scale_packed_sel[idx][0]
+            if sel is None:
                 continue
-            frag = gl.amd.cdna4.get_mfma_scale_layout(
-                payload_fragment_layout[idx],
-                [slot_nonk[idx], scale_stage_k // MX_GROUP],
-                MX_GROUP,
+            frag = payload_fragment_layout[idx]
+            nonk, k = scale_slot_nonk[idx], scale_slot_k[idx]
+            packed_scale_fragment_shape_slot[idx] = packed_scale_dot_shape(
+                slot_nonk[idx], BK, sel
             )
-            packed_scale_fragment_layout_slot[idx] = gl.DistributedLinearLayout(
-                reg_bases=[
-                    _scale_dword_delta(b, scale_stage_k) for b in frag.reg_bases[2:]
-                ],
-                lane_bases=[
-                    _scale_dword_delta(b, scale_stage_k) for b in frag.lane_bases
-                ],
-                warp_bases=[
-                    _scale_dword_delta(b, scale_stage_k) for b in frag.warp_bases
-                ],
-                block_bases=[],
-                shape=packed_scale_fragment_shape_slot[idx],
+            packed_scale_fragment_layout_slot[idx] = packed_scale_dot_layout(
+                frag, slot_nonk[idx], BK, sel
             )
-            packed_scale_lds_view_layout_scale_slot[idx] = gl.SharedLinearLayout(
-                offset_bases=[
-                    _scale_dword_delta(b, scale_slot_k[idx])
-                    for b in list(scale_lds_view_layout_scale_slot[idx].offset_bases)[
-                        2:
-                    ]
-                ]
+            packed_scale_fragment_shape_scale_slot[idx] = packed_scale_shape(nonk, k)
+            packed_scale_fragment_layout_scale_slot[idx] = packed_scale_layout(
+                frag, nonk, k
             )
-            frag = scale_fragment_layout_scale_slot[idx]
-            k = scale_slot_k[idx]
-            within_dword = ([0, 4], [16, 0])
-            packed_scale_fragment_layout_scale_slot[idx] = gl.DistributedLinearLayout(
-                reg_bases=[
-                    _scale_dword_delta(b, k)
-                    for b in frag.reg_bases
-                    if list(b) not in within_dword
-                ],
-                lane_bases=[_scale_dword_delta(b, k) for b in frag.lane_bases],
-                warp_bases=[_scale_dword_delta(b, k) for b in frag.warp_bases],
-                block_bases=[],
-                shape=packed_scale_fragment_shape_scale_slot[idx],
+            packed_scale_lds_view_layout_scale_slot[idx] = (
+                packed_scale_lds_view_layout(nonk, k)
             )
-        packed_scale_fragment_layout_slot = tuple(packed_scale_fragment_layout_slot)
-        packed_scale_lds_view_layout_scale_slot = tuple(
-            packed_scale_lds_view_layout_scale_slot
-        )
-        packed_scale_fragment_layout_scale_slot = tuple(
-            packed_scale_fragment_layout_scale_slot
-        )
 
         scale_hbm_offset_layout = [None, None]
         for idx in ops:
