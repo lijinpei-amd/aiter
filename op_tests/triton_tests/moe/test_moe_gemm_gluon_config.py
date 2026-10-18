@@ -532,6 +532,47 @@ def test_streaming_expert_payload_respects_explicit_config(explicit):
 
 
 @pytest.mark.parametrize(
+    "dq_b,block_m,K,block_k,expected",
+    [
+        # An MXFP8 B scale row of 4 bytes copied through LDS: the one exception.
+        (DtypeQuant.MXFP8, 16, 1024, 128, ".cg"),
+        (DtypeQuant.MXFP8, 128, 2880, 128, ".cg"),
+        # BLOCK_K 256, where the hint measured slower at T=16/64.
+        (DtypeQuant.MXFP8, 32, 7168, 256, ""),
+        # MXFP4 weights take the hint at every BLOCK_K.
+        (DtypeQuant.MXFP4, 16, 1024, 128, ".cg"),
+    ],
+)
+def test_mxfp8_weight_scale_hint_only_for_four_byte_lds_rows(
+    dq_b, block_m, K, block_k, expected
+):
+    config = host._default_launch_config(
+        block_m, 4096, K, DtypeQuant.MXFP8, dq_b, False, True
+    )
+    assert (config["BLOCK_K"], config["B_SCALE_SHUFFLED"]) == (block_k, False)
+    assert config["expert_scale_cache_modifier"] == expected
+
+
+@pytest.mark.parametrize(
+    "env,expected",
+    [
+        # A register B scale does not take the hint.
+        ({"ALLOW_B_SCALE_VIA_LDS": "0"}, ""),
+        ({"EXPERT_SCALE_CACHE_MODIFIER": ""}, ""),
+        ({"EXPERT_SCALE_MOD": ".ca"}, ".ca"),
+    ],
+)
+def test_mxfp8_weight_scale_hint_respects_environment(monkeypatch, env, expected):
+    for name, value in env.items():
+        monkeypatch.setenv("AITER_TRITON_MOE_GLUON_" + name, value)
+    config = host._default_launch_config(
+        16, 4096, 1024, DtypeQuant.MXFP8, DtypeQuant.MXFP8, False, True
+    )
+    assert config["BLOCK_K"] == 128
+    assert config["expert_scale_cache_modifier"] == expected
+
+
+@pytest.mark.parametrize(
     "scheme,groups,stage_head",
     [
         (WaitCommitScheme.PER_OP, 8, False),

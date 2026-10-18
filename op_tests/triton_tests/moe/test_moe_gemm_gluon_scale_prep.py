@@ -84,12 +84,18 @@ def test_mxfp8_gemm1_default_uses_paired_k128_scales(split):
     {"K": 1408},
 ])
 def test_other_launches_keep_the_existing_tuning_ladder(overrides):
-    cfg = _spec(**overrides)[4]
-    expected = host.get_gluon_config(
+    cfg = dict(_spec(**overrides)[4])
+    expected = dict(host.get_gluon_config(
         overrides.get("block_m", 128), overrides.get("N", 512),
         overrides.get("K", 2560), overrides.get("dq_a", DtypeQuant.MXFP8),
         overrides.get("dq_b", DtypeQuant.MXFP8), False,
-    )
+    ))
+    if overrides == {"K": 1408}:
+        # The ladder picks BLOCK_K 128 here, and an MXFP8 B scale row of 4 bytes
+        # copied through LDS takes the `.cg` hint on top of the ladder (see
+        # test_mxfp8_weight_scale_hint_only_for_four_byte_lds_rows).
+        assert cfg.pop("expert_scale_cache_modifier") == ".cg"
+        assert expected.pop("expert_scale_cache_modifier") == ""
     assert cfg == expected
 
 
