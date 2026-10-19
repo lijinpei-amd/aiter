@@ -3026,7 +3026,7 @@
     B_SCL reg=0/2 lds=1/0
   soff A_SCL [0, 1, 2]
   soff B_SCL [0, 1, 2]
-== tuned-mxfp4-PER_SLOT
+== tuned-mxfp4-PER_PANEL
   geom NM=2 NN=2 slots=4 mk=1 num_k=28 scheme=2
   sizing depth=3 unroll=3 peeled=1 ring=3 regperiod=1 async=1 hasreg=False
   regions static_remainder=True static_drain=True epilogue_groups=0 epilogue_wait=None

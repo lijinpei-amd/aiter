@@ -451,8 +451,8 @@ class KernelTuningConfig:
         return self.WAIT_COMMIT_SCHEME.value == int(WaitCommitScheme.PER_OP)
 
     @gluon.constexpr_function
-    def commit_per_slot(self):
-        return self.WAIT_COMMIT_SCHEME.value == int(WaitCommitScheme.PER_SLOT)
+    def commit_per_panel(self):
+        return self.WAIT_COMMIT_SCHEME.value == int(WaitCommitScheme.PER_PANEL)
 
     @gluon.constexpr_function
     def commit_per_stage(self):

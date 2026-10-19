@@ -31,7 +31,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     SCALE,
     A,
     WaitCommitScheme,
-    _slot_index,
+    _panel_index,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import validate
 from op_tests.triton_tests.moe.test_moe_gemm_gluon_scale_layout import _HostView
@@ -56,7 +56,7 @@ class _Config(_ScheduleConfig):
         unroll_epilogue=True,
         soff=False,
         scale_steps=None,
-        scale_non_k_slots=(1, 1),
+        slots_per_scale_slot=(1, 1),
         compiler_pipeline=False,
     ):
         super().__init__(*shape, scheme, middle)
@@ -70,7 +70,7 @@ class _Config(_ScheduleConfig):
         self.ALLOW_B_VIA_LDS = not (register_mask & 1)
         self.packed = packed
         self.scale_steps = scale_steps or ((2, 2) if packed else (1, 1))
-        self.scale_non_k_slots = scale_non_k_slots
+        self.slots_per_scale_slot = slots_per_scale_slot
         self.compiler_pipeline = compiler_pipeline
         self.read_mask = read_mask
         self.K_UNROLL = unroll
@@ -116,7 +116,7 @@ class _Config(_ScheduleConfig):
         return (self.SLOT_M, self.SLOT_N)[operand]
 
     def scale_slot_nonk(self, operand):
-        return self.slot_nonk(operand) * self.scale_non_k_slots[operand]
+        return self.slot_nonk(operand) * self.slots_per_scale_slot[operand]
 
     @property
     def scale_block_k(self):
@@ -131,7 +131,7 @@ class _Config(_ScheduleConfig):
         return self.scale_slot_k(operand) // self.scale_block_k
 
     def ratio_non_k(self, operand):
-        """Non-K slots one scale slot spans, ``scale_slot_nonk / slot_nonk``."""
+        """Slots one scale slot spans, ``scale_slot_nonk / slot_nonk``."""
         return self.scale_slot_nonk(operand) // self.slot_nonk(operand)
 
 
@@ -156,7 +156,7 @@ class _Config(_ScheduleConfig):
     dot_result_fragment_layout = None
 
     @property
-    def accumulator_fragment_shape_slot(self):
+    def accumulator_fragment_shape_panel(self):
         return [self.SLOT_M, self.SLOT_N]
 
 
@@ -271,7 +271,7 @@ class _Machine:
         while len(self.outstanding) > count:
             self.completed.update(self.outstanding.pop(0))
 
-    def required(self, slot):
+    def required(self, panel):
         tc = self.tc
         if (tc.nm, tc.nn) == (2, 2):
             payloads = [
@@ -289,7 +289,7 @@ class _Machine:
                     payloads.append((B_PAYLOAD, tile))
         required = set()
         for pos, (payload_component, mini) in enumerate(payloads):
-            if slot is not None and slot != pos:
+            if panel is not None and panel != pos:
                 continue
             operand, _ = payload_component
             for component in ((operand, PAYLOAD), (operand, SCALE)):
@@ -304,17 +304,17 @@ class _Machine:
                     required.add((component, mini, self.current_read))
         return required
 
-    def check_wait(self, slot):
+    def check_wait(self, panel):
         """The wait before this read point retires exactly the copies it reads.
 
-        Checked when the slot first reads, against the FIFO as it stood when the wait
+        Checked when the panel first reads, against the FIFO as it stood when the wait
         issued: the immediate must leave the newest required group retired and every
-        newer one in flight. A per-tile scheme waits once, before slot zero, for the
-        whole step (``slot=None``).
+        newer one in flight. A per-tile scheme waits once, before panel zero, for the
+        whole step (``panel=None``).
         """
-        required = self.required(slot)
+        required = self.required(panel)
         if required:
-            assert self.wait is not None, (self.current_read, slot, "no wait")
+            assert self.wait is not None, (self.current_read, panel, "no wait")
             actual, committed = self.wait
             youngest = max(
                 i
@@ -323,13 +323,13 @@ class _Machine:
             )
             assert actual == committed - youngest - 1, (
                 self.current_read,
-                slot,
+                panel,
                 actual,
                 youngest,
                 self.committed[:committed],
             )
         else:
-            assert self.wait is None, (self.current_read, slot, self.wait)
+            assert self.wait is None, (self.current_read, panel, self.wait)
         self.wait = None
 
     def read(self, component, ring, mini, k):
@@ -425,15 +425,15 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         a_scale_stride_k=1,
         b_scale_stride_k=1,
     )
-    step_fn, buffer_load_fn = pipeline._step.fn, pipeline._buffer_load_slot.fn
-    ds_read_slot_fn = pipeline._ds_read_slot.fn
+    step_fn, buffer_load_fn = pipeline._step.fn, pipeline._buffer_load_panel.fn
+    ds_read_panel_fn = pipeline._ds_read_panel.fn
     ds_read_payload_fn = pipeline._ds_read_payload.fn
     ds_read_scale_fn = pipeline._ds_read_scale.fn
 
     # Positional layouts: _step(pc, ptrs, buffers, regs, step, STEP),
-    # _buffer_load_slot(pc, ptrs, buffers, step, STEP, mi, ni),
-    # _ds_read_slot(pc, buffers, step, STEP, mi, ni, MFMA),
-    # _ds_read_payload/_ds_read_scale(pc, buffers, step, STEP, non-K slot, operand).
+    # _buffer_load_panel(pc, ptrs, buffers, step, STEP, mi, ni),
+    # _ds_read_panel(pc, buffers, step, STEP, mi, ni, MFMA),
+    # _ds_read_payload/_ds_read_scale(pc, buffers, step, STEP, slot, operand).
     def step(*args, **kwargs):
         assert machine.wait is None, "a wait guarded no read"
         machine.current_read = args[4]
@@ -448,14 +448,14 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         machine.current_drain = schedule.is_drain(args[4])
         return buffer_load_fn(*args, **kwargs)
 
-    def ds_read_slot(*args, **kwargs):
-        if not args[6]:  # the slot's first read, right after its wait
-            slot = _slot_index(args[4], args[5], tc.nm, tc.nn)
+    def ds_read_panel(*args, **kwargs):
+        if not args[6]:  # the panel's first read, right after its wait
+            panel = _panel_index(args[4], args[5], tc.nm, tc.nn)
             if not per_tile:
-                machine.check_wait(slot)
-            elif slot == 0:
+                machine.check_wait(panel)
+            elif panel == 0:
                 machine.check_wait(None)
-        return ds_read_slot_fn(*args, **kwargs)
+        return ds_read_panel_fn(*args, **kwargs)
 
     def ds_read_payload(*args, **kwargs):
         component = (args[5], PAYLOAD)
@@ -537,7 +537,7 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
             "_advance",
             "_ds_read_payload",
             "_ds_read_scale",
-            "_ds_read_slot",
+            "_ds_read_panel",
             "_step_live",
             "_take_reg_pairs",
             "_take_operand_pairs",
@@ -547,8 +547,8 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         patch.setattr(pipeline, "_PipelineRegFragments", _fragments)
         patch.setattr(pipeline, "_PipelinePointers", _pointers)
         patch.setattr(pipeline, "_step", step)
-        patch.setattr(pipeline, "_buffer_load_slot", buffer_load)
-        patch.setattr(pipeline, "_ds_read_slot", ds_read_slot)
+        patch.setattr(pipeline, "_buffer_load_panel", buffer_load)
+        patch.setattr(pipeline, "_ds_read_panel", ds_read_panel)
         patch.setattr(pipeline, "_ds_read_payload", ds_read_payload)
         patch.setattr(pipeline, "_ds_read_scale", ds_read_scale)
         patch.setattr(pipeline, "_init_buffers", init_buffers)
@@ -648,7 +648,7 @@ def test_unroll_epilogue_selects_remainder_loop(
         (
             (3, 2, 3, 2),
             0,
-            {"packed": True, "scale_steps": (4, 4), "scale_non_k_slots": (2, 2)},
+            {"packed": True, "scale_steps": (4, 4), "slots_per_scale_slot": (2, 2)},
         ),
         (
             (2, 2, 2, 2),
@@ -656,7 +656,7 @@ def test_unroll_epilogue_selects_remainder_loop(
             {
                 "packed": True,
                 "scale_steps": (8, 8),
-                "scale_non_k_slots": (2, 2),
+                "slots_per_scale_slot": (2, 2),
                 "soff": True,
             },
         ),
@@ -666,7 +666,7 @@ def test_unroll_epilogue_selects_remainder_loop(
             {
                 "packed": True,
                 "scale_steps": (1, 4),
-                "scale_non_k_slots": (1, 2),
+                "slots_per_scale_slot": (1, 2),
                 "middle": True,
             },
         ),
@@ -676,7 +676,7 @@ def test_unroll_epilogue_selects_remainder_loop(
             {
                 "packed": True,
                 "scale_steps": (4, 1),
-                "scale_non_k_slots": (2, 1),
+                "slots_per_scale_slot": (2, 1),
                 "shape": (4, 2),
             },
         ),
@@ -963,9 +963,9 @@ def _straight_line_waits(schedule, tc, last):
     prologue and warm-up steps as emitted, then one step per K tile with the loop
     body's commit pattern for that K phase -- which is what every step after the
     warm-up issues. Returns ``{step: tile wait}`` for a per-tile scheme, else
-    ``{step: per-slot waits}``.
+    ``{step: per-panel waits}``.
     """
-    slots = tc.nm * tc.nn
+    panels = tc.nm * tc.nn
     per_tile = tc.commit_per_stage()
     depth, peeled, unroll = (
         maybe_unwrap(schedule.depth),
@@ -974,15 +974,15 @@ def _straight_line_waits(schedule, tc, last):
     )
     committed, waits = [], {}
 
-    def required(step, slot):
+    def required(step, panel):
         return {
             (
                 step - schedule.load_to_mfma_distance(c) + 1,
                 c,
-                schedule.ds_read_panel(slot, c),
+                schedule.ds_read_slot(panel, c),
             )
             for c in COMPONENTS
-            if schedule.ds_read_panel(slot, c) is not None
+            if schedule.ds_read_slot(panel, c) is not None
             and tc.component_via_lds(c)
             and schedule.ds_reads_at_phase(c, step)
         }
@@ -1002,13 +1002,13 @@ def _straight_line_waits(schedule, tc, last):
             index = schedule.loop_step((step - peeled - 1) % unroll)
         if step >= 0 and per_tile:
             waits[step] = immediate(
-                set().union(*(required(step, slot) for slot in range(slots)))
+                set().union(*(required(step, panel) for panel in range(panels)))
             )
         vector = []
-        for slot in range(slots):
+        for panel in range(panels):
             if step >= 0 and not per_tile:
-                vector.append(immediate(required(step, slot)))
-            for group in schedule.commits(index, slot):
+                vector.append(immediate(required(step, panel)))
+            for group in schedule.commits(index, panel):
                 committed.append(tuple((step, c, t) for c, t in group))
         if step >= 0 and not per_tile:
             waits[step] = tuple(vector)
@@ -1046,7 +1046,7 @@ def test_peeled_wait_prefix_is_minimal(scheme, register_mask, extra):
     def emitted(index):
         if tc.commit_per_stage():
             return schedule.wait(index)
-        return tuple(schedule.wait(index, slot) for slot in range(tc.nm * tc.nn))
+        return tuple(schedule.wait(index, panel) for panel in range(tc.nm * tc.nn))
 
     differs = [x for x in range(depth * 2) if waits[x + 1] != steady(x + 1)]
     assert peeled == max(1, (max(differs) + 1) if differs else 0)
@@ -1061,43 +1061,43 @@ def test_peeled_wait_prefix_is_minimal(scheme, register_mask, extra):
 @pytest.mark.parametrize("nm", [1, 2, 3, 4])
 @pytest.mark.parametrize("middle", [False, True])
 def test_every_payload_tile_is_filled_exactly_once(nm, nn, middle):
-    """Copy ownership must be a total, injective map from non-K slots to slots.
+    """Copy ownership must be a total, injective map from slots to panels.
 
-    A step needs `NM + NN` payload copies and has `NM * NN` slots. While a slot
-    could copy only one non-K slot, that held only for `NM, NN >= 2`; below it a copy
-    was assigned a slot index that does not exist and was silently never issued, so
+    A step needs `NM + NN` payload copies and has `NM * NN` panels. While a panel
+    could copy only one slot, that held only for `NM, NN >= 2`; below it a copy
+    was assigned a panel index that does not exist and was silently never issued, so
     the kernel read whichever stale value the ring still held.
     """
     tc = _Config(WaitCommitScheme.PER_OP, (3, 3, 3, 3), 0, shape=(nm, nn),
                  middle=middle)
     schedule = Schedule(tc, tc, tc.BLOCK_K)
     assert maybe_unwrap(
-        schedule.buffer_load_slots_valid
+        schedule.buffer_load_panels_valid
     ), "ownership is not a valid mapping"
     for component in COMPONENTS:
-        non_k_slots = nm if component[0] == A else nn
-        loaded_non_k_slots = [
-            non_k_slot
-            for slot in range(nm * nn)
-            for non_k_slot in (
-                schedule.buffer_load_panels(slot)[COMPONENTS.index(component)],
+        num_slots = nm if component[0] == A else nn
+        loaded_slots = [
+            slot
+            for panel in range(nm * nn)
+            for slot in (
+                schedule.buffer_load_slots(panel)[COMPONENTS.index(component)],
             )
-            if non_k_slot is not None
+            if slot is not None
         ]
         ratio = tc.ratio_non_k(component[0]) if component[1] else 1
-        expected = [t for t in range(non_k_slots) if t % ratio == 0]
-        assert sorted(loaded_non_k_slots) == expected, (
+        expected = [t for t in range(num_slots) if t % ratio == 0]
+        assert sorted(loaded_slots) == expected, (
             component,
-            loaded_non_k_slots,
+            loaded_slots,
             expected,
         )
 
 
 @pytest.mark.parametrize("shape", [(2, 2), (2, 3), (3, 2), (2, 4), (4, 2)])
-def test_scale_fill_mid_moves_only_the_scale_buffer_load_slots(shape):
+def test_scale_fill_mid_moves_only_the_scale_buffer_load_panels(shape):
     """`SCALE_FILL_MID` is a copy-ownership knob and nothing else.
 
-    It must not disturb payload ownership, the DS-read slots, or the configured
+    It must not disturb payload ownership, the DS-read panels, or the configured
     DS-read region. It is also inert outside the guarded 2x2 split, which is easy to
     forget when reading a config that sets it on a rectangular tile.
     """
@@ -1107,23 +1107,23 @@ def test_scale_fill_mid_moves_only_the_scale_buffer_load_slots(shape):
     on_schedule = Schedule(on, on, on.BLOCK_K)
     nm, nn = shape
     for component in (A_PAYLOAD, B_PAYLOAD):
-        non_k_slots = range(nm if component[0] == A else nn)
-        assert [off_schedule.buffer_load_slot(component, t) for t in non_k_slots] == [
-            on_schedule.buffer_load_slot(component, t) for t in non_k_slots
+        slots = range(nm if component[0] == A else nn)
+        assert [off_schedule.buffer_load_panel(component, t) for t in slots] == [
+            on_schedule.buffer_load_panel(component, t) for t in slots
         ], component
     for component in COMPONENTS:
-        non_k_slots = range(nm if component[0] == A else nn)
-        assert [off_schedule.ds_read_slot(component, t) for t in non_k_slots] == [
-            on_schedule.ds_read_slot(component, t) for t in non_k_slots
+        slots = range(nm if component[0] == A else nn)
+        assert [off_schedule.ds_read_panel(component, t) for t in slots] == [
+            on_schedule.ds_read_panel(component, t) for t in slots
         ], component
         assert off.ds_read_in_mfma(*component) == on.ds_read_in_mfma(*component)
 
-    scale_off = [off_schedule.buffer_load_slot(A_SCALE, t) for t in range(nm)]
-    scale_on = [on_schedule.buffer_load_slot(A_SCALE, t) for t in range(nm)]
-    b_off = [off_schedule.buffer_load_slot(B_SCALE, t) for t in range(nn)]
-    b_on = [on_schedule.buffer_load_slot(B_SCALE, t) for t in range(nn)]
+    scale_off = [off_schedule.buffer_load_panel(A_SCALE, t) for t in range(nm)]
+    scale_on = [on_schedule.buffer_load_panel(A_SCALE, t) for t in range(nm)]
+    b_off = [off_schedule.buffer_load_panel(B_SCALE, t) for t in range(nn)]
+    b_on = [on_schedule.buffer_load_panel(B_SCALE, t) for t in range(nn)]
     if shape == (2, 2):
-        # The guarded case: A scale already owns the middle slots, so only B moves.
+        # The guarded case: A scale already owns the middle panels, so only B moves.
         assert scale_off == scale_on == [1, 2]
         assert b_off == [0, 3] and b_on == [1, 2]
     else:
@@ -1136,7 +1136,7 @@ def test_epilogue_groups_stop_adding_slack_after_a_drain_producer():
     K = (tc.minimum_num_k() + 3) * tc.BLOCK_K
     two, none = Schedule(tc, tc, K, 2), Schedule(tc, tc, K, 0)
     first, second = two.drain_step(0, 0), two.drain_step(0, 1)
-    # B's first N slot is DS-read in slot zero. Its depth-two producer moves past
+    # B's first N slot is DS-read in panel zero. Its depth-two producer moves past
     # the epilogue commit at drain iteration one; globally adding slack is unsafe.
     assert two.wait(first, 0) == none.wait(first, 0) + 2
     assert two.wait(second, 0) == none.wait(second, 0)

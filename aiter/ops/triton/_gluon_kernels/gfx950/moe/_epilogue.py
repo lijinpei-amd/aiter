@@ -19,7 +19,7 @@ from ._lang import MX_GROUP_CE as MX_GROUP
 from ._lang import optional as _opt
 from ._lang import require_constexpr
 from ._quant import mxfp4_quant_gluon
-from ._types import DtypeQuant, WeightGuHbmLayout, _slot_index
+from ._types import DtypeQuant, WeightGuHbmLayout, _panel_index
 
 _DQ_MXFP4: gl.constexpr = gl.constexpr(int(DtypeQuant.MXFP4))
 _WEIGHT_GU_SPLIT: gl.constexpr = gl.constexpr(int(WeightGuHbmLayout.SPLIT))
@@ -217,7 +217,7 @@ def _epi_stage_flush(
     tuning_cfg,
     layout,
 ):
-    """Read one staged MXFP4 slot back out of LDS and store it.
+    """Read one staged MXFP4 panel back out of LDS and store it.
 
     The second half of :func:`_epilogue_one_tile`'s staged store, split out so
     ``rotating epilogue`` can run it one iteration behind the write that produced it.
@@ -341,10 +341,10 @@ def _epilogue_one_tile(
     STAGE_ROW: gl.constexpr = 0,
     GATE_PRE: gl.constexpr = False,
 ):
-    """bias -> activation -> gammas -> output_quant -> store, for ONE slot.
+    """bias -> activation -> gammas -> output_quant -> store, for ONE panel.
 
     Lifted verbatim out of :func:`_epilogue_store` so the fused drain step can call it
-    per slot the moment that slot's last MFMA retires. ``sub`` is the finished
+    per panel the moment that panel's last MFMA retires. ``sub`` is the finished
     accumulator for tile ``(mi, ni)``.
 
     Under ``WeightGuHbmLayout.SPLIT`` a "tile" is a *pair*: ``sub`` is the gate side
@@ -518,7 +518,7 @@ def _epilogue_one_tile(
             SL: gl.constexpr = layout.result_store_layout(SLOT_M, S_COLS, 8)
             # if/elif/else, not early returns: a `return` from inside a nested
             # `if require_constexpr(...)` here does NOT stop the trace, so the code
-            # below it still ran and stored the slot to the *unsliced* buffer --
+            # below it still ran and stored the panel to the *unsliced* buffer --
             # which only surfaced as a shape mismatch because the split buffer is
             # block-height. Keep exactly one store path reachable per configuration.
             if require_constexpr(func_cfg.weight_gu_hbm_layout == _WEIGHT_GU_SPLIT):
@@ -608,13 +608,13 @@ def _epilogue_store(
     layout,
     GATE_PRE: gl.constexpr = False,
 ):
-    """bias -> activation -> gammas -> output_quant -> store, per (M, N) slot.
+    """bias -> activation -> gammas -> output_quant -> store, per panel.
 
     The order is fixed and matches ``_triton_kernels/moe/moe_op_gemm_a4w4.py``; the
     clamp and the multiply happen in fp32 before any cast. ``acc`` arrives already split
-    into one tensor per slot -- the K pipeline accumulates that way -- so the
+    into one tensor per panel -- the K pipeline accumulates that way -- so the
     epilogue walks the same tiling and consumes them one at a time, which lets the
-    compiler kill each slot's accumulator before the next slot's epilogue.
+    compiler kill each panel's accumulator before the next panel's epilogue.
     """
     SLOT_M: gl.constexpr = tuning_cfg.SLOT_M
     OUT_SLOT_N: gl.constexpr = layout.output_n_slot
@@ -639,14 +639,14 @@ def _epilogue_store(
     # Staging for the MXFP4 payload store, bouncing it through LDS so the global store
     # vectorises -- worth ~16 us on the 4-wave a4w4 gemm1, see _epilogue_one_tile.
     #
-    # ONE slot's worth, reused across the walk: NM*NN buffers would cost NM*NN
+    # ONE panel's worth, reused across the walk: NM*NN buffers would cost NM*NN
     # times the LDS for no gain, since the tiles are stored one after another anyway.
     # Allocated here so it dominates every use; the pipeline's buffers are dead by this
     # point, so Triton's liveness-based shared allocator overlays this on top of them
     # and the kernel's LDS footprint does not grow at all.
     QSH: gl.constexpr = layout.quant_staging_layout
     ROT: gl.constexpr = layout.quant_staging_rotates
-    # Split stages the whole block, not one slot: NM slots into one buffer, flushed
+    # Split stages the whole block, not one panel: NM panels into one buffer, flushed
     # once at the end of the walk. Costs NM x the LDS (still a few KB, overlaid on the
     # dead pipeline buffers) and buys NM-1 barrier pairs and one wide store instead of
     # NM narrow ones.
@@ -682,7 +682,7 @@ def _epilogue_store(
         # one store flushes the lot.
         for mi in gl.static_range(NM):
             _epilogue_one_tile(
-                acc[_slot_index(mi, 0, NM, NN)],
+                acc[_panel_index(mi, 0, NM, NN)],
                 mi,
                 0,
                 bias_tiles,
@@ -705,7 +705,7 @@ def _epilogue_store(
                 layout,
                 qp_lds_ptr,
                 qs_lds_ptr,
-                lin=acc[_slot_index(mi, 1, NM, NN)],
+                lin=acc[_panel_index(mi, 1, NM, NN)],
                 STAGE_ROW=mi * SLOT_M,
                 GATE_PRE=GATE_PRE,
             )
@@ -735,7 +735,7 @@ def _epilogue_store(
                     block_id, pid_n, M_e, func_cfg, tuning_cfg, layout,
                 )
             _epilogue_one_tile(
-                acc[_slot_index(k // NN, k % NN, NM, NN)],
+                acc[_panel_index(k // NN, k % NN, NM, NN)],
                 k // NN, k % NN,
                 bias_tiles, gamma_tiles, gamma_lds_ptr, bias_hbm_ptr, gammas_hbm_ptr,
                 y_hbm_ptr, y_stride_m, y_stride_n, ys_hbm_ptr, ys_stride_m, ys_stride_n,
@@ -757,11 +757,11 @@ def _epilogue_store(
     else:
         for mi in gl.static_range(NM):
             for ni in gl.static_range(NN):
-                # acc is stored in slot-traversal order, which _slot_index defines; the
-                # store loop is free to walk the grid however it likes as long as it
-                # indexes through the same map.
+                # acc is stored in panel-traversal order, which _panel_index defines;
+                # the store loop is free to walk the grid however it likes as long as
+                # it indexes through the same map.
                 _epilogue_one_tile(
-                    acc[_slot_index(mi, ni, NM, NN)],
+                    acc[_panel_index(mi, ni, NM, NN)],
                     mi,
                     ni,
                     bias_tiles,
