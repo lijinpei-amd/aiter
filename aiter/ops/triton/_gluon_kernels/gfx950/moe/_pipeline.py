@@ -545,8 +545,7 @@ def _ds_read_scale(
             component
         )
         offset: gl.constexpr = (buffer * non_k_slots + non_k_slot) * k_fragments
-        slot_nonk: gl.constexpr = layout.slot_nonk(operand)
-        ratio: gl.constexpr = layout.scale_slot_nonk(operand) // slot_nonk
+        ratio: gl.constexpr = layout.scale_steps_per_buffer[operand][0]
         fragments = ()
         for k in gl.static_range(ratio * k_fragments):
             fragments += (buffers[operand + 2][offset + k],)
@@ -604,7 +603,7 @@ def _take_operand_pairs(
     non_k_slot: gl.constexpr,
     PHASE: gl.constexpr,
 ):
-    ratio_k: gl.constexpr = layout.scale_slot_k(operand) // layout.scale_block_k
+    ratio_k: gl.constexpr = layout.scale_steps_per_buffer[operand][1]
     out = ()
     for k in gl.static_range(layout.num_k_slots):
         if require_constexpr(tc.func_cfg.has_scale(operand)):

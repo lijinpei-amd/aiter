@@ -56,11 +56,12 @@ def _scale_fragments(scale, layout, operand: gl.constexpr):
     bk: gl.constexpr = layout.scale_block_k
     # A step's whole units, 8 scale columns (K256) each.
     stage_k: gl.constexpr = max(8, bk)
-    ratio: gl.constexpr = layout.scale_slot_nonk(operand) // layout.slot_nonk(operand)
+    ratio: gl.constexpr = layout.scale_steps_per_buffer[operand][0]
+    ratio_k: gl.constexpr = layout.scale_steps_per_buffer[operand][1]
     packed: gl.constexpr = layout.scale_packed_ok(operand)
     fragments = ()
     for n in gl.static_range(ratio):
-        for k in gl.static_range(sk // bk):
+        for k in gl.static_range(ratio_k):
             if require_constexpr(packed):
                 # The scale slot is in storage order as i32, [stripe, dword], a
                 # unit per 64 dwords. A slot's units are whole register and warp
@@ -250,8 +251,7 @@ class LDSManager:
             if operand == 0
             else cfg.expert_scale_cache_modifier
         )
-        slot_nonk: gl.constexpr = layout.slot_nonk(operand)
-        ratio: gl.constexpr = layout.scale_slot_nonk(operand) // slot_nonk
+        ratio: gl.constexpr = layout.scale_steps_per_buffer[operand][0]
         if require_constexpr(VIA_LDS):
             if require_constexpr(
                 self.func_cfg.has_scale(operand)
@@ -314,8 +314,7 @@ class LDSManager:
         else:
             lds_ptr = self.b_scale_lds_ptr
         if require_constexpr(cfg.preshuffled(operand, True)):
-            slot_nonk: gl.constexpr = layout.slot_nonk(operand)
-            ratio: gl.constexpr = layout.scale_slot_nonk(operand) // slot_nonk
+            ratio: gl.constexpr = layout.scale_steps_per_buffer[operand][0]
             scale_ptr = lds_ptr.index(
                 SCALE_READ_IDX * (layout.num_lds_slots_non_k(operand) // ratio)
                 + non_k_slot // ratio
@@ -387,12 +386,11 @@ class LDSManager:
                 layout.component_via_lds((operand, True)),
                 "ds_read_frag only reads LDS-staged scales",
             )
-            slot_nonk: gl.constexpr = layout.slot_nonk(operand)
-            ratio: gl.constexpr = layout.scale_slot_nonk(operand) // slot_nonk
+            ratio: gl.constexpr = layout.scale_steps_per_buffer[operand][0]
             fragments = self.ds_read_scale(
                 operand, SCALE_READ_IDX, non_k_slot // ratio * ratio
             )
-            ratio_k: gl.constexpr = layout.scale_slot_k(operand) // layout.scale_block_k
+            ratio_k: gl.constexpr = layout.scale_steps_per_buffer[operand][1]
             scale_val = fragments[
                 (non_k_slot % ratio) * layout.num_k_slots * ratio_k + k_slot
             ]

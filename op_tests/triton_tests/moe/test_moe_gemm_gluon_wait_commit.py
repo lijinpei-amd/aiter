@@ -96,6 +96,16 @@ class _ScheduleConfig:
     def scale_slot_k(self, idx):
         return 8
 
+    @property
+    def scale_steps_per_buffer(self):
+        return tuple(
+            (
+                self.scale_slot_nonk(idx) // self.slot_nonk(idx),
+                self.scale_slot_k(idx) // self.scale_block_k,
+            )
+            for idx in (0, 1)
+        )
+
     def buffer_live_span(self, idx, scale=False):
         return self.num_buffers(idx, scale)
 

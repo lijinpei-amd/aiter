@@ -58,11 +58,18 @@ def _first_non_k_slot(mapping, slot, ratio):
 
 
 @gluon.constexpr_function
+def _steps_per_buffer(scale_steps_per_buffer, component, axis):
+    return scale_steps_per_buffer[component[0]][axis] if component[1] else 1
+
+
+@gluon.constexpr_function
 def _step_plan(m, layout, kind, stage, phase):
-    component_present, load_to_mfma_distance, steps_per_buffer = (
+    component_present, load_to_mfma_distance = (
         m["component_present"],
         m["load_to_mfma_distance"],
-        m["steps_per_buffer"],
+    )
+    steps_per_buffer = tuple(
+        _steps_per_buffer(m["scale_steps_per_buffer"], c, 1) for c in COMPONENTS
     )
     if kind == _StepKind.DRAIN:
         active = tuple(
@@ -169,7 +176,7 @@ class Schedule:
 
     _component_present: gl.constexpr
     _num_buffers: gl.constexpr
-    _steps_per_buffer: gl.constexpr
+    _scale_steps_per_buffer: gl.constexpr
     _load_to_mfma_distance: gl.constexpr
     _buffer_load_slots: gl.constexpr
     _ds_read_slots: gl.constexpr
@@ -211,16 +218,10 @@ class Schedule:
             not is_scale or bool(fc.has_scale(op)) for op, is_scale in COMPONENTS
         )
         num_buffers = tuple(tc.num_buffers(op, is_scale) for op, is_scale in COMPONENTS)
-        steps_per_buffer = tuple(
-            layout.scale_slot_k(op) // _v(layout.scale_block_k) if is_scale else 1
-            for op, is_scale in COMPONENTS
-        )
-        ratio_non_k = tuple(
-            layout.scale_slot_nonk(op) // layout.slot_nonk(op) if is_scale else 1
-            for op, is_scale in COMPONENTS
-        )
+        scale_steps_per_buffer = _v(layout.scale_steps_per_buffer)
         live_span = tuple(
-            (d - 1) * r + 1 for d, r in zip(num_buffers, steps_per_buffer)
+            (d - 1) * _steps_per_buffer(scale_steps_per_buffer, c, 1) + 1
+            for d, c in zip(num_buffers, COMPONENTS)
         )
         load_to_mfma_distance = tuple(
             s if layout.component_via_lds(c) else s - 1
@@ -230,16 +231,13 @@ class Schedule:
         depth, ring_period, register_period, async_period = 0, 1, 1, 1
         for ci, c in enumerate(COMPONENTS):
             if component_present[ci]:
+                ratio = _steps_per_buffer(scale_steps_per_buffer, c, 1)
                 depth = max(depth, live_span[ci])
-                ring_period = math.lcm(
-                    ring_period, num_buffers[ci] * steps_per_buffer[ci]
-                )
+                ring_period = math.lcm(ring_period, num_buffers[ci] * ratio)
                 if layout.component_via_lds(c):
-                    async_period = math.lcm(async_period, steps_per_buffer[ci])
+                    async_period = math.lcm(async_period, ratio)
                 else:
-                    register_period = math.lcm(
-                        register_period, num_buffers[ci] * steps_per_buffer[ci]
-                    )
+                    register_period = math.lcm(register_period, num_buffers[ci] * ratio)
         k_unroll = _v(tc.K_UNROLL)
         assert k_unroll >= 1, "K_UNROLL must be at least 1"
         unroll = math.lcm(k_unroll, ring_period)
@@ -259,7 +257,11 @@ class Schedule:
         owned = tuple(
             tuple(
                 (
-                    _first_non_k_slot(buffer_load_slots[ci], slot, ratio_non_k[ci])
+                    _first_non_k_slot(
+                        buffer_load_slots[ci],
+                        slot,
+                        _steps_per_buffer(scale_steps_per_buffer, COMPONENTS[ci], 0),
+                    )
                     if component_present[ci]
                     else None
                 )
@@ -298,7 +300,11 @@ class Schedule:
         ds_read_non_k_slots = tuple(
             tuple(
                 (
-                    _first_non_k_slot(ds_read_slots[ci], slot, ratio_non_k[ci])
+                    _first_non_k_slot(
+                        ds_read_slots[ci],
+                        slot,
+                        _steps_per_buffer(scale_steps_per_buffer, COMPONENTS[ci], 0),
+                    )
                     if component_present[ci]
                     else None
                 )
@@ -327,7 +333,7 @@ class Schedule:
             )
         model = {
             "component_present": component_present,
-            "steps_per_buffer": steps_per_buffer,
+            "scale_steps_per_buffer": scale_steps_per_buffer,
             "load_to_mfma_distance": load_to_mfma_distance,
             "depth": depth,
             "owned": owned,
@@ -353,7 +359,7 @@ class Schedule:
 
         self._component_present = gl.constexpr(component_present)
         self._num_buffers = gl.constexpr(num_buffers)
-        self._steps_per_buffer = gl.constexpr(steps_per_buffer)
+        self._scale_steps_per_buffer = gl.constexpr(scale_steps_per_buffer)
         self._load_to_mfma_distance = gl.constexpr(load_to_mfma_distance)
         self._buffer_load_slots = gl.constexpr(buffer_load_slots)
         self._ds_read_slots = gl.constexpr(tuple(ds_read_slots))
@@ -559,10 +565,9 @@ class Schedule:
 
     @gluon.constexpr_function
     def ds_reads_at_phase(self, component, phase):
-        ci = _ci(component)
         return (
-            self._component_present.value[ci]
-            and phase % self._steps_per_buffer.value[ci] == 0
+            self.component_present(component)
+            and phase % self.steps_per_buffer(component) == 0
         )
 
     @gluon.constexpr_function
@@ -591,7 +596,7 @@ class Schedule:
 
     @gluon.constexpr_function
     def steps_per_buffer(self, component):
-        return self._steps_per_buffer.value[_ci(component)]
+        return _steps_per_buffer(self._scale_steps_per_buffer.value, component, 1)
 
     @gluon.constexpr_function
     def live_span(self, component):
