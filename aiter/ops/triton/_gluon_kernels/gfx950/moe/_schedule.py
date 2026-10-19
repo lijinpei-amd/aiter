@@ -189,7 +189,6 @@ class Schedule:
     peeled: gl.constexpr
     ring_period: gl.constexpr
     register_period: gl.constexpr
-    async_period: gl.constexpr
     buffer_load_slots_valid: gl.constexpr
     commit_per_copy: gl.constexpr
     commit_per_slot: gl.constexpr
@@ -372,7 +371,6 @@ class Schedule:
         self.peeled = gl.constexpr(peeled)
         self.ring_period = gl.constexpr(ring_period)
         self.register_period = gl.constexpr(register_period)
-        self.async_period = gl.constexpr(async_period)
         self.buffer_load_slots_valid = gl.constexpr(buffer_load_slots_valid)
         self.commit_per_copy = gl.constexpr(commit[0])
         self.commit_per_slot = gl.constexpr(commit[1])
@@ -482,14 +480,6 @@ class Schedule:
         )
 
     @gluon.constexpr_function
-    def scheduled(self):
-        return self._steps.value is not None
-
-    @gluon.constexpr_function
-    def num_steps(self):
-        return len(self._steps.value)
-
-    @gluon.constexpr_function
     def prologue_step(self, r):
         depth = self.depth.value
         assert 1 - depth <= r < 0, f"no prologue step {r}"
@@ -521,7 +511,7 @@ class Schedule:
         depth = self.depth.value
         phases = self.ring_period.value if self.static_drain.value else 1
         assert 0 <= p < phases and 0 <= j < depth - 1, f"no drain step {p, j}"
-        return self.num_steps() - (phases - p) * (depth - 1) + j
+        return len(self._steps.value) - (phases - p) * (depth - 1) + j
 
     @gluon.constexpr_function
     def phase(self, step):
@@ -534,10 +524,6 @@ class Schedule:
     @gluon.constexpr_function
     def in_loop(self, step):
         return self._steps.value[step][4]
-
-    @gluon.constexpr_function
-    def static_phase(self, step):
-        return self._steps.value[step][5]
 
     @gluon.constexpr_function
     def dot(self, step):
@@ -599,17 +585,8 @@ class Schedule:
         return _steps_per_buffer(self._scale_steps_per_buffer.value, component, 1)
 
     @gluon.constexpr_function
-    def live_span(self, component):
-        return (self.num_buffers(component) - 1) * self.steps_per_buffer(component) + 1
-
-    @gluon.constexpr_function
     def load_to_mfma_distance(self, component):
         return self._load_to_mfma_distance.value[_ci(component)]
-
-    @gluon.constexpr_function
-    def producer_phase(self, component):
-        ratio = self.steps_per_buffer(component)
-        return (1 - self.load_to_mfma_distance(component)) % ratio
 
     @gluon.constexpr_function
     def buffer_load_slot(self, component, non_k_slot):
@@ -652,7 +629,7 @@ class Schedule:
         if not self.component_present(component):
             return 0
         depth, ratio = self.num_buffers(component), self.steps_per_buffer(component)
-        if not (self.in_loop(step) or self.static_phase(step)):
+        if not (self.in_loop(step) or self._steps.value[step][5]):
             return None
         if self.unroll.value % (depth * ratio) != 0:
             return None
@@ -667,7 +644,7 @@ class Schedule:
     def scale_soff_steps(self, component, offset_step):
         ratio = self.steps_per_buffer(component)
         start = self.peeled.value + 1
-        producer_phase = self.producer_phase(component)
+        producer_phase = (1 - self.load_to_mfma_distance(component)) % ratio
         first_producer = (start - producer_phase + ratio - 1) // ratio
         producer = (start + offset_step - producer_phase) // ratio
         return (producer - first_producer) * ratio

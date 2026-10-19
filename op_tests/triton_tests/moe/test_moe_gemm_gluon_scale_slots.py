@@ -173,7 +173,9 @@ def test_scale_k_step_ratio_sets_buffer_span_and_unroll(
     schedule = Schedule(tc, layout, block_k)
     ratio = scale_k // (block_k // 32)
     for operand, depth in enumerate((2, 3)):
-        assert schedule.live_span((operand, True)) == (depth - 1) * ratio + 1
+        live_span = (depth - 1) * ratio + 1
+        distance = live_span - 1 if register_scales else live_span
+        assert schedule.load_to_mfma_distance((operand, True)) == distance
         assert layout.scale_slot_k(operand) == scale_k
     period = math.lcm(3, 2 * ratio, 3 * ratio)
     assert maybe_unwrap(schedule.unroll) == period

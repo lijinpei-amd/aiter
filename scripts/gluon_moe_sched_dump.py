@@ -24,6 +24,7 @@ covers exactly the steps `_pipeline.py` expands.
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 
@@ -143,21 +144,32 @@ def cases():
 
 
 def _steps(schedule):
-    """Every emitted step, labelled the way `_pipeline.py` expands it."""
+    """Every emitted step, labelled the way `_pipeline.py` expands it.
+
+    Each entry is `(label, step, static_phase)`; only an unrolled remainder or drain
+    has a static phase outside the loop.
+    """
     depth, unroll = maybe_unwrap(schedule.depth), maybe_unwrap(schedule.unroll)
-    out = [(f"prologue r={r}", schedule.prologue_step(r)) for r in range(1 - depth, 0)]
-    out.append(("warmup", schedule.warmup_step()))
+    out = [
+        (f"prologue r={r}", schedule.prologue_step(r), False)
+        for r in range(1 - depth, 0)
+    ]
+    out.append(("warmup", schedule.warmup_step(), False))
     out += [
-        (f"peeled x={x}", schedule.peeled_step(x))
+        (f"peeled x={x}", schedule.peeled_step(x), False)
         for x in range(maybe_unwrap(schedule.peeled))
     ]
-    out += [(f"loop u={u}", schedule.loop_step(u)) for u in range(unroll)]
-    count = unroll - 1 if maybe_unwrap(schedule.static_remainder) else 1
-    out += [(f"remainder u={u}", schedule.remainder_step(u)) for u in range(count)]
+    out += [(f"loop u={u}", schedule.loop_step(u), False) for u in range(unroll)]
+    static_remainder = maybe_unwrap(schedule.static_remainder)
+    count = unroll - 1 if static_remainder else 1
+    out += [
+        (f"remainder u={u}", schedule.remainder_step(u), static_remainder)
+        for u in range(count)
+    ]
     static_drain = maybe_unwrap(schedule.static_drain)
     phases = maybe_unwrap(schedule.ring_period) if static_drain else 1
     out += [
-        (f"drain p={p} j={j}", schedule.drain_step(p, j))
+        (f"drain p={p} j={j}", schedule.drain_step(p, j), static_drain)
         for p in range(phases)
         for j in range(depth - 1)
     ]
@@ -178,6 +190,9 @@ def dump_case(name, cfg, dq_a, dq_b, K, out):
     nm, nn = maybe_unwrap(layout.num_m_slots), maybe_unwrap(layout.num_n_slots)
     slots = nm * nn
     present = [c for c in COMPONENTS if schedule.component_present(c)]
+    async_period = math.lcm(
+        *(schedule.steps_per_buffer(c) for c in present if layout.component_via_lds(c))
+    )
 
     out(f"== {name}")
     out(f"  geom NM={nm} NN={nn} slots={slots} mk={maybe_unwrap(layout.num_k_slots)} "
@@ -187,7 +202,7 @@ def dump_case(name, cfg, dq_a, dq_b, K, out):
         f"peeled={maybe_unwrap(schedule.peeled)} "
         f"ring={maybe_unwrap(schedule.ring_period)} "
         f"regperiod={maybe_unwrap(schedule.register_period)} "
-        f"async={maybe_unwrap(schedule.async_period)} "
+        f"async={async_period} "
         f"hasreg={any(schedule.component_present(c) and layout.component_in_reg(c) for c in COMPONENTS)}")
     out(f"  regions static_remainder={maybe_unwrap(schedule.static_remainder)} "
         f"static_drain={maybe_unwrap(schedule.static_drain)} "
@@ -203,9 +218,10 @@ def dump_case(name, cfg, dq_a, dq_b, K, out):
             out(f"  {CNAME[c]} absent")
             continue
         non_k_slots = nm if c[0] == 0 else nn
-        out(f"  {CNAME[c]} D={schedule.num_buffers(c)} R={schedule.steps_per_buffer(c)} "
-            f"L={schedule.live_span(c)} F={schedule.load_to_mfma_distance(c)} "
-            f"via_lds={bool(layout.component_via_lds(c))} pphase={schedule.producer_phase(c)} "
+        D, R = schedule.num_buffers(c), schedule.steps_per_buffer(c)
+        F = schedule.load_to_mfma_distance(c)
+        out(f"  {CNAME[c]} D={D} R={R} L={(D - 1) * R + 1} F={F} "
+            f"via_lds={bool(layout.component_via_lds(c))} pphase={(1 - F) % R} "
             f"nonk_ratio={layout.scale_slot_nonk(c[0]) // layout.slot_nonk(c[0])} "
             f"buffer_load_slots={tuple(schedule.buffer_load_slot(c, t) for t in range(non_k_slots))} "
             f"ds_read_slots={tuple(schedule.ds_read_slot(c, t) for t in range(non_k_slots))} "
@@ -220,10 +236,10 @@ def dump_case(name, cfg, dq_a, dq_b, K, out):
                 f"ds_read_non_k_slots={ds_read}")
 
     # every emitted step: what it copies, commits and waits on, and its ring indices
-    for label, step in _steps(schedule):
+    for label, step, static_phase in _steps(schedule):
         out(f"  step {step} {label}: phase={schedule.phase(step)} "
             f"ki={schedule.ki(step)} in_loop={schedule.in_loop(step)} "
-            f"static_phase={schedule.static_phase(step)} dot={schedule.dot(step)} "
+            f"static_phase={static_phase} dot={schedule.dot(step)} "
             f"soff={schedule.soff_unroll(step)}")
         act = tuple(int(schedule.active(step, c)) for c in COMPONENTS)
         loads = tuple(int(schedule.loads(step, c)) for c in COMPONENTS)
