@@ -2882,7 +2882,7 @@
   regions static_remainder=True static_drain=True epilogue_groups=0 epilogue_wait=None
   commit per_copy=True per_slot=False per_tile=False tile_after_mfma=False
   A_PAY D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, 2) ds_read_slots=(1, 2) ds_read_in_mfma=(False, False)
-  A_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, 2) ds_read_slots=(1, 2) ds_read_in_mfma=(False, False)
+  A_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, None) ds_read_slots=(1, None) ds_read_in_mfma=(False, False)
   B_PAY D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=1 buffer_load_slots=(0, 3) ds_read_slots=(0, 3) ds_read_in_mfma=(False, False)
   B_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=1 buffer_load_slots=(1, 2) ds_read_slots=(0, 3) ds_read_in_mfma=(False, False)
   slot0(mi=0,ni=0) owned=(None, None, 0, None) ds_read_non_k_slots=(None, None, 0, 0)
@@ -3032,7 +3032,7 @@
   regions static_remainder=True static_drain=True epilogue_groups=0 epilogue_wait=None
   commit per_copy=False per_slot=True per_tile=False tile_after_mfma=False
   A_PAY D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, 2) ds_read_slots=(1, 2) ds_read_in_mfma=(False, False)
-  A_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, 2) ds_read_slots=(1, 2) ds_read_in_mfma=(False, False)
+  A_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, None) ds_read_slots=(1, None) ds_read_in_mfma=(False, False)
   B_PAY D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=1 buffer_load_slots=(0, 3) ds_read_slots=(0, 3) ds_read_in_mfma=(False, False)
   B_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=1 buffer_load_slots=(1, 2) ds_read_slots=(0, 3) ds_read_in_mfma=(False, False)
   slot0(mi=0,ni=0) owned=(None, None, 0, None) ds_read_non_k_slots=(None, None, 0, 0)
@@ -3182,7 +3182,7 @@
   regions static_remainder=True static_drain=True epilogue_groups=0 epilogue_wait=None
   commit per_copy=False per_slot=False per_tile=True tile_after_mfma=True
   A_PAY D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, 2) ds_read_slots=(1, 2) ds_read_in_mfma=(False, False)
-  A_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, 2) ds_read_slots=(1, 2) ds_read_in_mfma=(False, False)
+  A_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, None) ds_read_slots=(1, None) ds_read_in_mfma=(False, False)
   B_PAY D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=1 buffer_load_slots=(0, 3) ds_read_slots=(0, 3) ds_read_in_mfma=(False, False)
   B_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=1 buffer_load_slots=(1, 2) ds_read_slots=(0, 3) ds_read_in_mfma=(False, False)
   slot0(mi=0,ni=0) owned=(None, None, 0, None) ds_read_non_k_slots=(None, None, 0, 0)
@@ -3332,7 +3332,7 @@
   regions static_remainder=True static_drain=True epilogue_groups=0 epilogue_wait=None
   commit per_copy=False per_slot=False per_tile=True tile_after_mfma=False
   A_PAY D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, 2) ds_read_slots=(1, 2) ds_read_in_mfma=(False, False)
-  A_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, 2) ds_read_slots=(1, 2) ds_read_in_mfma=(False, False)
+  A_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, None) ds_read_slots=(1, None) ds_read_in_mfma=(False, False)
   B_PAY D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=1 buffer_load_slots=(0, 3) ds_read_slots=(0, 3) ds_read_in_mfma=(False, False)
   B_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=1 buffer_load_slots=(1, 2) ds_read_slots=(0, 3) ds_read_in_mfma=(False, False)
   slot0(mi=0,ni=0) owned=(None, None, 0, None) ds_read_non_k_slots=(None, None, 0, 0)
@@ -3482,7 +3482,7 @@
   regions static_remainder=True static_drain=True epilogue_groups=0 epilogue_wait=None
   commit per_copy=True per_slot=False per_tile=False tile_after_mfma=False
   A_PAY D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, 2) ds_read_slots=(1, 2) ds_read_in_mfma=(False, False)
-  A_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, 2) ds_read_slots=(1, 2) ds_read_in_mfma=(False, False)
+  A_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, None) ds_read_slots=(1, None) ds_read_in_mfma=(False, False)
   B_PAY D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=1 buffer_load_slots=(0, 3) ds_read_slots=(0, 3) ds_read_in_mfma=(False, False)
   B_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=1 buffer_load_slots=(0, 3) ds_read_slots=(0, 3) ds_read_in_mfma=(False, False)
   slot0(mi=0,ni=0) owned=(None, None, 0, 0) ds_read_non_k_slots=(None, None, 0, 0)
@@ -3632,7 +3632,7 @@
   regions static_remainder=True static_drain=False epilogue_groups=0 epilogue_wait=None
   commit per_copy=True per_slot=False per_tile=False tile_after_mfma=False
   A_PAY D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, 2) ds_read_slots=(1, 2) ds_read_in_mfma=(False, False)
-  A_SCL D=3 R=2 L=5 F=5 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, 2) ds_read_slots=(1, 2) ds_read_in_mfma=(False, False)
+  A_SCL D=3 R=2 L=5 F=5 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, None) ds_read_slots=(1, None) ds_read_in_mfma=(False, False)
   B_PAY D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=1 buffer_load_slots=(0, 3) ds_read_slots=(0, 3) ds_read_in_mfma=(False, False)
   B_SCL D=3 R=2 L=5 F=5 via_lds=True pphase=0 nonk_ratio=1 buffer_load_slots=(1, 2) ds_read_slots=(0, 3) ds_read_in_mfma=(False, False)
   slot0(mi=0,ni=0) owned=(None, None, 0, None) ds_read_non_k_slots=(None, None, 0, 0)
@@ -3836,7 +3836,7 @@
   regions static_remainder=True static_drain=False epilogue_groups=0 epilogue_wait=None
   commit per_copy=True per_slot=False per_tile=False tile_after_mfma=False
   A_PAY D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, 2) ds_read_slots=(1, 2) ds_read_in_mfma=(False, False)
-  A_SCL D=3 R=4 L=9 F=9 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, 2) ds_read_slots=(1, 2) ds_read_in_mfma=(False, False)
+  A_SCL D=3 R=4 L=9 F=9 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, None) ds_read_slots=(1, None) ds_read_in_mfma=(False, False)
   B_PAY D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=1 buffer_load_slots=(0, 3) ds_read_slots=(0, 3) ds_read_in_mfma=(False, False)
   B_SCL D=3 R=4 L=9 F=9 via_lds=True pphase=0 nonk_ratio=1 buffer_load_slots=(1, 2) ds_read_slots=(0, 3) ds_read_in_mfma=(False, False)
   slot0(mi=0,ni=0) owned=(None, None, 0, None) ds_read_non_k_slots=(None, None, 0, 0)
@@ -4220,7 +4220,7 @@
   regions static_remainder=True static_drain=False epilogue_groups=0 epilogue_wait=None
   commit per_copy=True per_slot=False per_tile=False tile_after_mfma=False
   A_PAY D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, 2) ds_read_slots=(1, 2) ds_read_in_mfma=(False, False)
-  A_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, 2) ds_read_slots=(1, 2) ds_read_in_mfma=(False, False)
+  A_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, None) ds_read_slots=(1, None) ds_read_in_mfma=(False, False)
   B_PAY D=3 R=1 L=3 F=2 via_lds=False pphase=0 nonk_ratio=1 buffer_load_slots=(0, 3) ds_read_slots=(0, 3) ds_read_in_mfma=(False, False)
   B_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=1 buffer_load_slots=(1, 2) ds_read_slots=(0, 3) ds_read_in_mfma=(False, False)
   slot0(mi=0,ni=0) owned=(None, None, 0, None) ds_read_non_k_slots=(None, None, 0, 0)
@@ -4334,7 +4334,7 @@
   regions static_remainder=True static_drain=False epilogue_groups=0 epilogue_wait=None
   commit per_copy=True per_slot=False per_tile=False tile_after_mfma=False
   A_PAY D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, 2) ds_read_slots=(1, 2) ds_read_in_mfma=(False, False)
-  A_SCL D=3 R=1 L=3 F=2 via_lds=False pphase=0 nonk_ratio=2 buffer_load_slots=(1, 2) ds_read_slots=(1, 2) ds_read_in_mfma=(False, False)
+  A_SCL D=3 R=1 L=3 F=2 via_lds=False pphase=0 nonk_ratio=2 buffer_load_slots=(1, None) ds_read_slots=(1, None) ds_read_in_mfma=(False, False)
   B_PAY D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=1 buffer_load_slots=(0, 3) ds_read_slots=(0, 3) ds_read_in_mfma=(False, False)
   B_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=1 buffer_load_slots=(1, 2) ds_read_slots=(0, 3) ds_read_in_mfma=(False, False)
   slot0(mi=0,ni=0) owned=(None, None, 0, None) ds_read_non_k_slots=(None, None, 0, 0)
@@ -4448,7 +4448,7 @@
   regions static_remainder=True static_drain=False epilogue_groups=0 epilogue_wait=None
   commit per_copy=True per_slot=False per_tile=False tile_after_mfma=False
   A_PAY D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, 2) ds_read_slots=(1, 2) ds_read_in_mfma=(False, False)
-  A_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, 2) ds_read_slots=(1, 2) ds_read_in_mfma=(False, False)
+  A_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, None) ds_read_slots=(1, None) ds_read_in_mfma=(False, False)
   B_PAY D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=1 buffer_load_slots=(0, 3) ds_read_slots=(0, 3) ds_read_in_mfma=(False, False)
   B_SCL D=3 R=1 L=3 F=2 via_lds=False pphase=0 nonk_ratio=1 buffer_load_slots=(1, 2) ds_read_slots=(0, 3) ds_read_in_mfma=(False, False)
   slot0(mi=0,ni=0) owned=(None, None, 0, None) ds_read_non_k_slots=(None, None, 0, 0)
@@ -4562,7 +4562,7 @@
   regions static_remainder=True static_drain=False epilogue_groups=0 epilogue_wait=None
   commit per_copy=True per_slot=False per_tile=False tile_after_mfma=False
   A_PAY D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, 2) ds_read_slots=(1, 2) ds_read_in_mfma=(False, False)
-  A_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, 2) ds_read_slots=(1, 2) ds_read_in_mfma=(False, False)
+  A_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, None) ds_read_slots=(1, None) ds_read_in_mfma=(False, False)
   B_PAY D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=1 buffer_load_slots=(0, 3) ds_read_slots=(0, 3) ds_read_in_mfma=(False, False)
   B_SCL D=2 R=1 L=2 F=1 via_lds=False pphase=0 nonk_ratio=1 buffer_load_slots=(1, 2) ds_read_slots=(1, 3) ds_read_in_mfma=(True, False)
   slot0(mi=0,ni=0) owned=(None, None, 0, None) ds_read_non_k_slots=(None, None, 0, None)
@@ -4730,7 +4730,7 @@
   regions static_remainder=True static_drain=False epilogue_groups=0 epilogue_wait=None
   commit per_copy=True per_slot=False per_tile=False tile_after_mfma=False
   A_PAY D=2 R=1 L=2 F=2 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, 2) ds_read_slots=(1, 2) ds_read_in_mfma=(False, False)
-  A_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, 2) ds_read_slots=(1, 2) ds_read_in_mfma=(False, False)
+  A_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, None) ds_read_slots=(1, None) ds_read_in_mfma=(False, False)
   B_PAY D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=1 buffer_load_slots=(0, 3) ds_read_slots=(0, 3) ds_read_in_mfma=(False, False)
   B_SCL D=2 R=1 L=2 F=2 via_lds=True pphase=0 nonk_ratio=1 buffer_load_slots=(1, 2) ds_read_slots=(0, 3) ds_read_in_mfma=(False, False)
   slot0(mi=0,ni=0) owned=(None, None, 0, None) ds_read_non_k_slots=(None, None, 0, 0)
@@ -4898,7 +4898,7 @@
   regions static_remainder=True static_drain=True epilogue_groups=0 epilogue_wait=None
   commit per_copy=True per_slot=False per_tile=False tile_after_mfma=False
   A_PAY D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=4 buffer_load_slots=(0, 2, 4, 5) ds_read_slots=(0, 2, 4, 5) ds_read_in_mfma=(False, False, False, False)
-  A_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=4 buffer_load_slots=(0, 2, 4, 5) ds_read_slots=(0, 2, 4, 5) ds_read_in_mfma=(False, False, False, False)
+  A_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=4 buffer_load_slots=(0, None, None, None) ds_read_slots=(0, None, None, None) ds_read_in_mfma=(False, False, False, False)
   B_PAY D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=1 buffer_load_slots=(1, 3) ds_read_slots=(1, 3) ds_read_in_mfma=(False, False)
   B_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=1 buffer_load_slots=(1, 3) ds_read_slots=(1, 3) ds_read_in_mfma=(False, False)
   slot0(mi=0,ni=0) owned=(0, 0, None, None) ds_read_non_k_slots=(0, 0, None, None)
@@ -5052,7 +5052,7 @@
   regions static_remainder=True static_drain=True epilogue_groups=0 epilogue_wait=None
   commit per_copy=True per_slot=False per_tile=False tile_after_mfma=False
   A_PAY D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, 2) ds_read_slots=(1, 2) ds_read_in_mfma=(True, True)
-  A_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, 2) ds_read_slots=(1, 2) ds_read_in_mfma=(True, True)
+  A_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, None) ds_read_slots=(1, None) ds_read_in_mfma=(True, True)
   B_PAY D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=1 buffer_load_slots=(0, 3) ds_read_slots=(0, 3) ds_read_in_mfma=(True, True)
   B_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=1 buffer_load_slots=(1, 2) ds_read_slots=(0, 3) ds_read_in_mfma=(True, True)
   slot0(mi=0,ni=0) owned=(None, None, 0, None) ds_read_non_k_slots=(None, None, 0, 0)
@@ -5202,7 +5202,7 @@
   regions static_remainder=True static_drain=True epilogue_groups=0 epilogue_wait=None
   commit per_copy=True per_slot=False per_tile=False tile_after_mfma=False
   A_PAY D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, 2) ds_read_slots=(1, 2) ds_read_in_mfma=(False, False)
-  A_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, 2) ds_read_slots=(1, 2) ds_read_in_mfma=(False, False)
+  A_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=2 buffer_load_slots=(1, None) ds_read_slots=(1, None) ds_read_in_mfma=(False, False)
   B_PAY D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=1 buffer_load_slots=(0, 3) ds_read_slots=(0, 3) ds_read_in_mfma=(False, False)
   B_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=1 buffer_load_slots=(1, 2) ds_read_slots=(0, 3) ds_read_in_mfma=(False, False)
   slot0(mi=0,ni=0) owned=(None, None, 0, None) ds_read_non_k_slots=(None, None, 0, 0)
