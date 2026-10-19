@@ -58,7 +58,7 @@ def _first_non_k_slot(mapping, slot, ratio):
 
 
 @gluon.constexpr_function
-def _step_plan(m, kind, stage, phase):
+def _step_plan(m, layout, kind, stage, phase):
     component_present, load_to_mfma_distance, steps_per_buffer = (
         m["component_present"],
         m["load_to_mfma_distance"],
@@ -86,7 +86,9 @@ def _step_plan(m, kind, stage, phase):
     commits, whole = [], ()
     for slot, copies in enumerate(issued):
         ops = tuple(
-            (ci, t) for ci, t in enumerate(copies) if t is not None and m["via_lds"][ci]
+            (ci, t)
+            for ci, t in enumerate(copies)
+            if t is not None and layout.component_via_lds(COMPONENTS[ci])
         )
         if per_copy:
             groups = tuple((op,) for op in ops)
@@ -106,7 +108,9 @@ def _step_plan(m, kind, stage, phase):
             tuple(
                 (ci, t)
                 for ci, t in enumerate(non_k_slots)
-                if t is not None and m["via_lds"][ci] and ds_reads[ci]
+                if t is not None
+                and layout.component_via_lds(COMPONENTS[ci])
+                and ds_reads[ci]
             )
             for non_k_slots in m["ds_read_non_k_slots"]
         )
@@ -206,7 +210,6 @@ class Schedule:
         component_present = tuple(
             not is_scale or bool(fc.has_scale(op)) for op, is_scale in COMPONENTS
         )
-        via_lds = tuple(bool(layout.component_via_lds(c)) for c in COMPONENTS)
         num_buffers = tuple(tc.num_buffers(op, is_scale) for op, is_scale in COMPONENTS)
         steps_per_buffer = tuple(
             layout.scale_slot_k(op) // _v(layout.scale_block_k) if is_scale else 1
@@ -220,17 +223,18 @@ class Schedule:
             (d - 1) * r + 1 for d, r in zip(num_buffers, steps_per_buffer)
         )
         load_to_mfma_distance = tuple(
-            s if lds else s - 1 for s, lds in zip(live_span, via_lds)
+            s if layout.component_via_lds(c) else s - 1
+            for s, c in zip(live_span, COMPONENTS)
         )
 
         depth, ring_period, register_period, async_period = 0, 1, 1, 1
-        for ci in range(len(COMPONENTS)):
+        for ci, c in enumerate(COMPONENTS):
             if component_present[ci]:
                 depth = max(depth, live_span[ci])
                 ring_period = math.lcm(
                     ring_period, num_buffers[ci] * steps_per_buffer[ci]
                 )
-                if via_lds[ci]:
+                if layout.component_via_lds(c):
                     async_period = math.lcm(async_period, steps_per_buffer[ci])
                 else:
                     register_period = math.lcm(
@@ -269,7 +273,10 @@ class Schedule:
             ds_reads, in_mfma = [], []
             for t in range(len(payload_slots)):
                 ds_read = payload_slots[t]
-                same_step = not via_lds[ci] and load_to_mfma_distance[ci] == 1
+                same_step = (
+                    layout.component_in_reg((op, is_scale))
+                    and load_to_mfma_distance[ci] == 1
+                )
                 if (
                     same_step
                     and buffer_load_slots_valid
@@ -320,7 +327,6 @@ class Schedule:
             )
         model = {
             "component_present": component_present,
-            "via_lds": via_lds,
             "steps_per_buffer": steps_per_buffer,
             "load_to_mfma_distance": load_to_mfma_distance,
             "depth": depth,
@@ -333,12 +339,12 @@ class Schedule:
         if buffer_load_slots_valid:
             settled = 3 * depth + async_period
             warm = [
-                (None, r) + _step_plan(model, _StepKind.PROLOGUE, r, r)[3:]
+                (None, r) + _step_plan(model, layout, _StepKind.PROLOGUE, r, r)[3:]
                 for r in range(1 - depth, 0)
             ]
             for s in range(settled + 1):
                 kind = _StepKind.PEELED if s else _StepKind.WARMUP
-                warm.append((s, s) + _step_plan(model, kind, s, s)[3:])
+                warm.append((s, s) + _step_plan(model, layout, kind, s, s)[3:])
             waits = _replay([warm], load_to_mfma_distance, commit[2], slots)
             for s in range(1, depth - 1):
                 steady = s + async_period * -(-(2 * depth - s) // async_period)
@@ -415,7 +421,7 @@ class Schedule:
             for p in range(drain_phases)
             for j in range(depth - 1)
         ]
-        plans = [_step_plan(model, s[0], s[1], s[2]) for s in steps]
+        plans = [_step_plan(model, layout, s[0], s[1], s[2]) for s in steps]
 
         warmup = depth - 1
         loop = warmup + 1 + peeled
