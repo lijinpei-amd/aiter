@@ -263,8 +263,8 @@ def validate_pipeline(tc, layout, K, schedule=None):
     validate_buffer_counts(tc)
     if schedule is None:
         schedule = Schedule(tc, layout, K)
-    # Copy ownership maps each component's non-K slots onto slots, so every mapped
-    # slot has to exist and no component may copy two of its own non-K slots in one
+    # Copy ownership maps each component's panels onto slots, so every mapped
+    # slot has to exist and no component may copy two of its own panels in one
     # slot -- a slot carries one optional copy per component. Different components
     # sharing a slot is fine, which is what lets a single-slot step copy both
     # operands.

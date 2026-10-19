@@ -70,7 +70,7 @@ class _ScheduleConfig:
     def num_n_slots(self):
         return self.nn
 
-    def num_lds_slots_non_k(self, idx):
+    def num_panels(self, idx):
         return (self.nm, self.nn)[idx]
 
     def component_via_lds(self, component):
@@ -416,7 +416,9 @@ def test_emitted_groups_and_waits_retire_required_copies(
                 or tc.component_via_lds(component)
             )
             else None
-            for component, non_k_slot in zip(COMPONENTS, schedule.owned(slot))
+            for component, non_k_slot in zip(
+                COMPONENTS, schedule.buffer_load_panels(slot)
+            )
         )
         assert nominal == tuple(
             dict(operations).get(component) for component in COMPONENTS

@@ -109,8 +109,8 @@ def _slot_index(
     This one number is the slot's place in three orderings at once -- the visitation
     order of the slot loop, the index of its accumulator in the carried tuple, and
     (under the even schedule) the position of its fill in
-    ``_schedule._buffer_load_order``. They have to agree, which is why they all come
-    from here.
+    ``_schedule._payload_buffer_load_order``. They have to agree, which is why they all
+    come from here.
 
     Down the M axis first, so with two slots on each axis the four slots are visited
     ``(0,0), (1,0), (0,1), (1,1)`` -- the region order of the reference kernel in
@@ -197,7 +197,7 @@ class TuningSpec(NamedTuple):
     BLOCK_N: int
     BLOCK_K: int
     #: Requested unroll factor. The effective factor is its LCM with every active
-    #: LDS/register ring period and shuffled-scale K cadence.
+    #: LDS/register buffer period and shuffled-scale K cadence.
     K_UNROLL: int
     SLOT_M: int
     SLOT_N: int

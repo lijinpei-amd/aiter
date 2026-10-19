@@ -167,7 +167,7 @@ def _steps(schedule):
         for u in range(count)
     ]
     static_drain = maybe_unwrap(schedule.static_drain)
-    phases = maybe_unwrap(schedule.ring_period) if static_drain else 1
+    phases = maybe_unwrap(schedule.buffer_period) if static_drain else 1
     out += [
         (f"drain p={p} j={j}", schedule.drain_step(p, j), static_drain)
         for p in range(phases)
@@ -200,8 +200,8 @@ def dump_case(name, cfg, dq_a, dq_b, K, out):
     out(f"  sizing depth={maybe_unwrap(schedule.depth)} "
         f"unroll={maybe_unwrap(schedule.unroll)} "
         f"peeled={maybe_unwrap(schedule.peeled)} "
-        f"ring={maybe_unwrap(schedule.ring_period)} "
-        f"regperiod={maybe_unwrap(schedule.register_period)} "
+        f"ring={maybe_unwrap(schedule.buffer_period)} "
+        f"regperiod={maybe_unwrap(schedule.reg_buffer_period)} "
         f"async={async_period} "
         f"hasreg={any(schedule.component_present(c) and layout.component_in_reg(c) for c in COMPONENTS)}")
     out(f"  regions static_remainder={maybe_unwrap(schedule.static_remainder)} "
@@ -231,8 +231,8 @@ def dump_case(name, cfg, dq_a, dq_b, K, out):
     for ni in range(nn):
         for mi in range(nm):
             s = _slot_index(mi, ni, nm, nn)
-            ds_read = tuple(schedule.ds_read_non_k_slot(s, c) for c in COMPONENTS)
-            out(f"  slot{s}(mi={mi},ni={ni}) owned={schedule.owned(s)} "
+            ds_read = tuple(schedule.ds_read_panel(s, c) for c in COMPONENTS)
+            out(f"  slot{s}(mi={mi},ni={ni}) owned={schedule.buffer_load_panels(s)} "
                 f"ds_read_non_k_slots={ds_read}")
 
     # every emitted step: what it copies, commits and waits on, and its ring indices

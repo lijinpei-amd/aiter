@@ -979,10 +979,10 @@ def _straight_line_waits(schedule, tc, last):
             (
                 step - schedule.load_to_mfma_distance(c) + 1,
                 c,
-                schedule.ds_read_non_k_slot(slot, c),
+                schedule.ds_read_panel(slot, c),
             )
             for c in COMPONENTS
-            if schedule.ds_read_non_k_slot(slot, c) is not None
+            if schedule.ds_read_panel(slot, c) is not None
             and tc.component_via_lds(c)
             and schedule.ds_reads_at_phase(c, step)
         }
@@ -1076,15 +1076,21 @@ def test_every_payload_tile_is_filled_exactly_once(nm, nn, middle):
     ), "ownership is not a valid mapping"
     for component in COMPONENTS:
         non_k_slots = nm if component[0] == A else nn
-        owners = [
+        loaded_non_k_slots = [
             non_k_slot
             for slot in range(nm * nn)
-            for non_k_slot in (schedule.owned(slot)[COMPONENTS.index(component)],)
+            for non_k_slot in (
+                schedule.buffer_load_panels(slot)[COMPONENTS.index(component)],
+            )
             if non_k_slot is not None
         ]
         ratio = tc.ratio_non_k(component[0]) if component[1] else 1
         expected = [t for t in range(non_k_slots) if t % ratio == 0]
-        assert sorted(owners) == expected, (component, owners, expected)
+        assert sorted(loaded_non_k_slots) == expected, (
+            component,
+            loaded_non_k_slots,
+            expected,
+        )
 
 
 @pytest.mark.parametrize("shape", [(2, 2), (2, 3), (3, 2), (2, 4), (4, 2)])
@@ -1171,7 +1177,7 @@ def test_absent_scale_ring_indices_ignore_invalid_unused_depths(scale_depths):
     assert validate(tc, 512, 960)
     schedule = Schedule(tc, KernelLayout(tc), 960)
     assert maybe_unwrap(schedule.depth) == 2
-    assert maybe_unwrap(schedule.register_period) == 1
+    assert maybe_unwrap(schedule.reg_buffer_period) == 1
     for component in (A_SCALE, B_SCALE):
         for step in (schedule.warmup_step(), schedule.loop_step(1)):
             for buffer_load in (False, True):

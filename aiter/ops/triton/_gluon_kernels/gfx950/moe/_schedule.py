@@ -26,7 +26,7 @@ class _StepKind(IntEnum):
 
 
 @gluon.constexpr_function
-def _buffer_load_order(nm, nn):
+def _payload_buffer_load_order(nm, nn):
     if nm == 2 and nn == 2:
         return [(0, 0), (1, 0), (1, 1), (0, 1)]
     out = []
@@ -41,23 +41,23 @@ def _buffer_load_order(nm, nn):
 @gluon.constexpr_function
 def _payload_buffer_load_slots(nm, nn):
     if nm > 1 and nn > 1:
-        order = _buffer_load_order(nm, nn)
+        order = _payload_buffer_load_order(nm, nn)
         return (
-            tuple(order.index((1, t)) for t in range(nm)),
-            tuple(order.index((0, t)) for t in range(nn)),
+            tuple(order.index((1, panel)) for panel in range(nm)),
+            tuple(order.index((0, panel)) for panel in range(nn)),
         )
     return tuple(range(nm)), tuple(range(nn))
 
 
 @gluon.constexpr_function
 def _by_slot_index(slot_index_of, keys, num_slots):
-    non_k_slot_of = {}
-    for (component_index, non_k_slot), slot_index in slot_index_of.items():
-        if (component_index, non_k_slot) in keys:
-            non_k_slot_of.setdefault((slot_index, component_index), non_k_slot)
+    panel_of = {}
+    for (component_index, panel), slot_index in slot_index_of.items():
+        if (component_index, panel) in keys:
+            panel_of.setdefault((slot_index, component_index), panel)
     return tuple(
         tuple(
-            non_k_slot_of.get((slot_index, component_index))
+            panel_of.get((slot_index, component_index))
             for component_index in range(len(COMPONENTS))
         )
         for slot_index in range(num_slots)
@@ -65,10 +65,10 @@ def _by_slot_index(slot_index_of, keys, num_slots):
 
 
 @gluon.constexpr_function
-def _slot_index_of(by_slot_index, component, non_k_slot):
+def _slot_index_of(by_slot_index, component, panel):
     component_index = _component_index(component)
-    for slot_index, non_k_slots in enumerate(by_slot_index):
-        if non_k_slots[component_index] == non_k_slot:
+    for slot_index, panels in enumerate(by_slot_index):
+        if panels[component_index] == panel:
             return slot_index
     return None
 
@@ -102,16 +102,20 @@ def _step_plan(m, layout, kind, stage, phase):
         for a, r, f in zip(active, steps_per_buffer, load_to_mfma_distance)
     )
     issued = tuple(
-        tuple(t if t is not None and load else None for t, load in zip(owned, loads))
-        for owned in m["owned"]
+        tuple(
+            panel if panel is not None and load else None
+            for panel, load in zip(panels, loads)
+        )
+        for panels in m["buffer_load_panels"]
     )
     per_copy, per_slot = m["commit"][0], m["commit"][1]
     commits, whole = [], ()
     for slot_index, copies in enumerate(issued):
         ops = tuple(
-            (component_index, t)
-            for component_index, t in enumerate(copies)
-            if t is not None and layout.component_via_lds(COMPONENTS[component_index])
+            (component_index, panel)
+            for component_index, panel in enumerate(copies)
+            if panel is not None
+            and layout.component_via_lds(COMPONENTS[component_index])
         )
         if per_copy:
             groups = tuple((op,) for op in ops)
@@ -129,13 +133,13 @@ def _step_plan(m, layout, kind, stage, phase):
         )
         demand = tuple(
             tuple(
-                (component_index, t)
-                for component_index, t in enumerate(non_k_slots)
-                if t is not None
+                (component_index, panel)
+                for component_index, panel in enumerate(panels)
+                if panel is not None
                 and layout.component_via_lds(COMPONENTS[component_index])
                 and ds_reads[component_index]
             )
-            for non_k_slots in m["ds_read_non_k_slots"]
+            for panels in m["ds_read_panels"]
         )
     return active, loads, tuple(commits), demand
 
@@ -146,11 +150,11 @@ def _replay(orders, load_to_mfma_distance, per_tile, num_slots):
         if not need:
             return None
         latest = -1
-        for component_index, t in need:
+        for component_index, panel in need:
             copy = (
                 step - load_to_mfma_distance[component_index] + 1,
                 component_index,
-                t,
+                panel,
             )
             assert (
                 copy in position
@@ -180,8 +184,8 @@ def _replay(orders, load_to_mfma_distance, per_tile, num_slots):
                     )
                     slot_waits[slot_index] = _smaller(slot_waits[slot_index], now)
                 for group in groups:
-                    for component_index, t in group:
-                        copy = (step, component_index, t)
+                    for component_index, panel in group:
+                        copy = (step, component_index, panel)
                         assert copy not in position, f"copy {copy} committed twice"
                         position[copy] = count
                     count += 1
@@ -199,14 +203,14 @@ class Schedule:
     _scale_steps_per_buffer: gl.constexpr
     _load_to_mfma_distance: gl.constexpr
     _ds_read_in_mfma: gl.constexpr
-    _owned: gl.constexpr
-    _ds_read_non_k_slots: gl.constexpr
+    _buffer_load_panels: gl.constexpr
+    _ds_read_panels: gl.constexpr
     num_k: gl.constexpr
     depth: gl.constexpr
     unroll: gl.constexpr
     peeled: gl.constexpr
-    ring_period: gl.constexpr
-    register_period: gl.constexpr
+    buffer_period: gl.constexpr
+    reg_buffer_period: gl.constexpr
     buffer_load_slots_valid: gl.constexpr
     commit_per_copy: gl.constexpr
     commit_per_slot: gl.constexpr
@@ -235,58 +239,63 @@ class Schedule:
         )
         num_buffers = tuple(tc.num_buffers(op, is_scale) for op, is_scale in COMPONENTS)
         scale_steps_per_buffer = _v(layout.scale_steps_per_buffer)
-        live_span = tuple(
+        buffer_live_span = tuple(
             (d - 1) * _steps_per_buffer(scale_steps_per_buffer, c, 1) + 1
             for d, c in zip(num_buffers, COMPONENTS)
         )
         load_to_mfma_distance = tuple(
             s if layout.component_via_lds(c) else s - 1
-            for s, c in zip(live_span, COMPONENTS)
+            for s, c in zip(buffer_live_span, COMPONENTS)
         )
 
-        depth, ring_period, register_period, async_period = 0, 1, 1, 1
+        depth, buffer_period, reg_buffer_period, async_period = 0, 1, 1, 1
         for component_index, c in enumerate(COMPONENTS):
             if component_present[component_index]:
                 ratio = _steps_per_buffer(scale_steps_per_buffer, c, 1)
-                depth = max(depth, live_span[component_index])
-                ring_period = math.lcm(
-                    ring_period, num_buffers[component_index] * ratio
+                depth = max(depth, buffer_live_span[component_index])
+                buffer_period = math.lcm(
+                    buffer_period, num_buffers[component_index] * ratio
                 )
                 if layout.component_via_lds(c):
                     async_period = math.lcm(async_period, ratio)
                 else:
-                    register_period = math.lcm(
-                        register_period, num_buffers[component_index] * ratio
+                    reg_buffer_period = math.lcm(
+                        reg_buffer_period, num_buffers[component_index] * ratio
                     )
         k_unroll = _v(tc.K_UNROLL)
         assert k_unroll >= 1, "K_UNROLL must be at least 1"
-        unroll = math.lcm(k_unroll, ring_period)
+        unroll = math.lcm(k_unroll, buffer_period)
 
         a_slots, b_slots = _payload_buffer_load_slots(nm, nn)
         fill_mid = bool(_v(tc.SCALE_FILL_MID)) and nm == 2 and nn == 2
-        non_k_slots = {
-            (component_index, t)
+        a_scale_slots, b_scale_slots = (
+            ((1, 2), (1, 2)) if fill_mid else (a_slots, b_slots)
+        )
+        panels = {
+            (component_index, panel)
             for component_index, (op, _) in enumerate(COMPONENTS)
-            for t in range(nm if op == A else nn)
+            for panel in range(nm if op == A else nn)
         }
         non_k_ratio = tuple(
             _steps_per_buffer(scale_steps_per_buffer, c, 0) for c in COMPONENTS
         )
-        first_non_k_slots = {
-            (component_index, t)
-            for component_index, t in non_k_slots
+        first_panels = {
+            (component_index, panel)
+            for component_index, panel in panels
             if component_present[component_index]
-            and t % non_k_ratio[component_index] == 0
+            and panel % non_k_ratio[component_index] == 0
         }
         buffer_load_slot = {
-            (component_index, t): slot_index
+            (component_index, panel): slot_index
             for component_index, (op, is_scale) in enumerate(COMPONENTS)
-            for t, slot_index in enumerate(
-                (1, 2) if is_scale and fill_mid else (a_slots if op == A else b_slots)
+            for panel, slot_index in enumerate(
+                (a_scale_slots if op == A else b_scale_slots)
+                if is_scale
+                else (a_slots if op == A else b_slots)
             )
         }
         buffer_load_slots_valid = (
-            set(buffer_load_slot) == non_k_slots
+            set(buffer_load_slot) == panels
             and all(
                 0 <= slot_index < num_slots for slot_index in buffer_load_slot.values()
             )
@@ -295,13 +304,13 @@ class Schedule:
             )
             == len(buffer_load_slot)
         )
-        owned = _by_slot_index(buffer_load_slot, first_non_k_slots, num_slots)
+        buffer_load_panels = _by_slot_index(buffer_load_slot, first_panels, num_slots)
         ds_read_slot, ds_read_in_mfma = {}, {}
         for component_index, (op, is_scale) in enumerate(COMPONENTS):
             payload_slots = a_slots if op == A else b_slots
-            for t in range(len(payload_slots)):
-                key = (component_index, t)
-                ds_read = payload_slots[t]
+            for panel in range(len(payload_slots)):
+                key = (component_index, panel)
+                ds_read = payload_slots[panel]
                 same_step = (
                     layout.component_in_reg((op, is_scale))
                     and load_to_mfma_distance[component_index] == 1
@@ -325,10 +334,10 @@ class Schedule:
                         ds_read == buffer_load and ds_read_in_mfma[key]
                     ), (
                         f"component {(op, is_scale)} is in registers at F == 1, so "
-                        f"its DS read of non-K slot {t} (slot {ds_read}) must follow "
+                        f"its DS read of panel {panel} (slot {ds_read}) must follow "
                         f"the same step's buffer load (slot {buffer_load})"
                     )
-        ds_read_non_k_slots = _by_slot_index(ds_read_slot, first_non_k_slots, num_slots)
+        ds_read_panels = _by_slot_index(ds_read_slot, first_panels, num_slots)
 
         commit = (
             bool(tc.commit_per_op()),
@@ -338,9 +347,9 @@ class Schedule:
         )
         static_remainder = bool(_v(tc.UNROLL_EPILOGUE))
         static_drain = (
-            ring_period <= 3
-            and unroll % ring_period == 0
-            and register_period == 1
+            buffer_period <= 3
+            and unroll % buffer_period == 0
+            and reg_buffer_period == 1
             and _v(fc.output_quant) is None
         )
         if epilogue_groups is None:
@@ -353,8 +362,8 @@ class Schedule:
             "scale_steps_per_buffer": scale_steps_per_buffer,
             "load_to_mfma_distance": load_to_mfma_distance,
             "depth": depth,
-            "owned": owned,
-            "ds_read_non_k_slots": ds_read_non_k_slots,
+            "buffer_load_panels": buffer_load_panels,
+            "ds_read_panels": ds_read_panels,
             "commit": commit,
         }
 
@@ -381,20 +390,20 @@ class Schedule:
         self._ds_read_in_mfma = gl.constexpr(
             tuple(
                 tuple(
-                    ds_read_in_mfma[(component_index, t)]
-                    for t in range(nm if op == A else nn)
+                    ds_read_in_mfma[(component_index, panel)]
+                    for panel in range(nm if op == A else nn)
                 )
                 for component_index, (op, _) in enumerate(COMPONENTS)
             )
         )
-        self._owned = gl.constexpr(owned)
-        self._ds_read_non_k_slots = gl.constexpr(ds_read_non_k_slots)
+        self._buffer_load_panels = gl.constexpr(buffer_load_panels)
+        self._ds_read_panels = gl.constexpr(ds_read_panels)
         self.num_k = gl.constexpr(num_k)
         self.depth = gl.constexpr(depth)
         self.unroll = gl.constexpr(unroll)
         self.peeled = gl.constexpr(peeled)
-        self.ring_period = gl.constexpr(ring_period)
-        self.register_period = gl.constexpr(register_period)
+        self.buffer_period = gl.constexpr(buffer_period)
+        self.reg_buffer_period = gl.constexpr(reg_buffer_period)
         self.buffer_load_slots_valid = gl.constexpr(buffer_load_slots_valid)
         self.commit_per_copy = gl.constexpr(commit[0])
         self.commit_per_slot = gl.constexpr(commit[1])
@@ -414,7 +423,7 @@ class Schedule:
             self._waits = gl.constexpr(None)
             return
 
-        drain_phases = ring_period if static_drain else 1
+        drain_phases = buffer_period if static_drain else 1
         steps = [
             (int(_StepKind.PROLOGUE), r, r, 0, False, False, False)
             for r in range(1 - depth, 0)
@@ -474,7 +483,7 @@ class Schedule:
                 for u in range(count)
             ]
 
-        phase = main % ring_period if static_drain else 0
+        phase = main % buffer_period if static_drain else 0
         executed = head + tail(rem)
         executed.append((None, None, (((),) * epilogue_groups,), ()))
         executed += [
@@ -531,7 +540,7 @@ class Schedule:
     @gluon.constexpr_function
     def drain_step(self, p, j):
         depth = self.depth.value
-        phases = self.ring_period.value if self.static_drain.value else 1
+        phases = self.buffer_period.value if self.static_drain.value else 1
         assert 0 <= p < phases and 0 <= j < depth - 1, f"no drain step {p, j}"
         return len(self._steps.value) - (phases - p) * (depth - 1) + j
 
@@ -566,9 +575,9 @@ class Schedule:
     @gluon.constexpr_function
     def issued(self, step, slot_index):
         return tuple(
-            non_k_slot if load else None
-            for non_k_slot, load in zip(
-                self._owned.value[slot_index], self._loads.value[step]
+            panel if load else None
+            for panel, load in zip(
+                self._buffer_load_panels.value[slot_index], self._loads.value[step]
             )
         )
 
@@ -586,7 +595,9 @@ class Schedule:
     @gluon.constexpr_function
     def commits(self, step, slot_index):
         return tuple(
-            tuple((COMPONENTS[component_index], t) for component_index, t in group)
+            tuple(
+                (COMPONENTS[component_index], panel) for component_index, panel in group
+            )
             for group in self._commits.value[step][slot_index]
         )
 
@@ -616,24 +627,24 @@ class Schedule:
         return self._load_to_mfma_distance.value[_component_index(component)]
 
     @gluon.constexpr_function
-    def buffer_load_slot(self, component, non_k_slot):
-        return _slot_index_of(self._owned.value, component, non_k_slot)
+    def buffer_load_slot(self, component, panel):
+        return _slot_index_of(self._buffer_load_panels.value, component, panel)
 
     @gluon.constexpr_function
-    def ds_read_slot(self, component, non_k_slot):
-        return _slot_index_of(self._ds_read_non_k_slots.value, component, non_k_slot)
+    def ds_read_slot(self, component, panel):
+        return _slot_index_of(self._ds_read_panels.value, component, panel)
 
     @gluon.constexpr_function
-    def ds_read_in_mfma(self, component, non_k_slot):
-        return self._ds_read_in_mfma.value[_component_index(component)][non_k_slot]
+    def ds_read_in_mfma(self, component, panel):
+        return self._ds_read_in_mfma.value[_component_index(component)][panel]
 
     @gluon.constexpr_function
-    def owned(self, slot_index):
-        return self._owned.value[slot_index]
+    def buffer_load_panels(self, slot_index):
+        return self._buffer_load_panels.value[slot_index]
 
     @gluon.constexpr_function
-    def ds_read_non_k_slot(self, slot_index, component):
-        return self._ds_read_non_k_slots.value[slot_index][_component_index(component)]
+    def ds_read_panel(self, slot_index, component):
+        return self._ds_read_panels.value[slot_index][_component_index(component)]
 
     @gluon.constexpr_function
     def register_index(self, step, component, buffer_load=False):

@@ -44,7 +44,7 @@ mismatch before preparing scales or launching the GEMM.
 | `ALLOW_A_SCALE_VIA_LDS`, `ALLOW_B_SCALE_VIA_LDS` | Allow the selected scale component to be staged through LDS; `False` loads it directly into registers. Both options are independent of each other and of `ALLOW_B_VIA_LDS`; neither requires preshuffled B payload. Defaults to `True`. |
 | `A_NUM_BUFFER`, `B_NUM_BUFFER` | Number of pipeline buffers for each payload component. Omitted or zero values inherit `NUM_LDS_BUFFER`; each resolved active depth must be at least 2. |
 | `A_SCALE_NUM_BUFFER`, `B_SCALE_NUM_BUFFER` | Number of buffers for each active scale component, independent of the payload counts and at least 2 after inheritance. Absent scales do not participate in validation or scheduling. `A_SCALE_NUMB_BUFFER` is accepted as a dictionary/environment alias for `A_SCALE_NUM_BUFFER`. |
-| `K_UNROLL` | Requested main-loop unroll, at least 1. The effective unroll is the least common multiple of this request and every active payload/scale ring period. |
+| `K_UNROLL` | Requested main-loop unroll, at least 1. The effective unroll is the least common multiple of this request and every active payload/scale buffer period. |
 
 The same component driver runs whether depths are inherited or explicit. Every
 active LDS or register payload ring contributes its resolved buffer depth. A scale
@@ -222,7 +222,7 @@ issues each component's next ring fill when its K-Step phase is due.
 
 After the peeled iterations, the driver executes complete statically unrolled
 bodies up to the runtime bound. Short bodies use statically expanded guarded
-remainder steps. When `UNROLL > 6` and the active register period exceeds one,
+remainder steps. When `UNROLL > 6` and the active register buffer period exceeds one,
 a runtime remainder loop avoids register spills caused by the long chain of
 guarded tuple updates. Register rings keep distinct SSA slots through a whole unrolled body;
 the finite prologue, remainder and drain rotate their logical queues. Packed

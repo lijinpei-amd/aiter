@@ -167,7 +167,7 @@ def _index(
             sched.load_to_mfma_distance(component) - 1 if BUFFER_LOAD else 0
         )
         k_tile = (step + advance) // ratio
-        if require_constexpr(sched.register_period == 1):
+        if require_constexpr(sched.reg_buffer_period == 1):
             gl.assume(k_tile >= 0)
         out = k_tile % depth
     return out
@@ -489,7 +489,7 @@ def _ds_read_payload(
     buffers,
     step,
     STEP: gl.constexpr,
-    non_k_slot: gl.constexpr,
+    panel: gl.constexpr,
     operand: gl.constexpr,
 ):
     layout: gl.constexpr = pc.layout
@@ -501,7 +501,7 @@ def _ds_read_payload(
         payload, _ = pc.lds_ptrs.ds_read_frag(
             operand,
             _index(sched, step, STEP, component, False),
-            non_k_slot,
+            panel,
             k,
             READ_PAYLOAD=not reg_payload,
             READ_SCALE=False,
@@ -511,7 +511,7 @@ def _ds_read_payload(
                 (
                     sched.register_index(STEP, component)
                     * (layout.num_m_slots if operand == 0 else layout.num_n_slots)
-                    + non_k_slot
+                    + panel
                 )
                 * layout.num_k_slots
                 + k
@@ -526,7 +526,7 @@ def _ds_read_scale(
     buffers,
     step,
     STEP: gl.constexpr,
-    non_k_slot: gl.constexpr,
+    panel: gl.constexpr,
     operand: gl.constexpr,
 ):
     layout: gl.constexpr = pc.layout
@@ -536,15 +536,15 @@ def _ds_read_scale(
         fragments = pc.lds_ptrs.ds_read_scale(
             operand,
             _index(sched, step, STEP, component, False),
-            non_k_slot,
+            panel,
         )
     else:
         buffer: gl.constexpr = sched.register_index(STEP, component)
-        non_k_slots: gl.constexpr = layout.num_lds_slots_non_k(operand)
+        num_panels: gl.constexpr = layout.num_panels(operand)
         k_fragments: gl.constexpr = layout.num_k_slots * sched.steps_per_buffer(
             component
         )
-        offset: gl.constexpr = (buffer * non_k_slots + non_k_slot) * k_fragments
+        offset: gl.constexpr = (buffer * num_panels + panel) * k_fragments
         ratio: gl.constexpr = layout.scale_steps_per_buffer[operand][0]
         fragments = ()
         for k in gl.static_range(ratio * k_fragments):
@@ -567,10 +567,10 @@ def _ds_read_slot(
     slot_index: gl.constexpr = _slot_index(
         mi, ni, layout.num_m_slots, layout.num_n_slots
     )
-    at: gl.constexpr = sched.ds_read_non_k_slot(slot_index, _A_PAYLOAD)
-    ast: gl.constexpr = sched.ds_read_non_k_slot(slot_index, _A_SCALE)
-    bt: gl.constexpr = sched.ds_read_non_k_slot(slot_index, _B_PAYLOAD)
-    bst: gl.constexpr = sched.ds_read_non_k_slot(slot_index, _B_SCALE)
+    at: gl.constexpr = sched.ds_read_panel(slot_index, _A_PAYLOAD)
+    ast: gl.constexpr = sched.ds_read_panel(slot_index, _A_SCALE)
+    bt: gl.constexpr = sched.ds_read_panel(slot_index, _B_PAYLOAD)
+    bst: gl.constexpr = sched.ds_read_panel(slot_index, _B_SCALE)
     a, b, a_scale, b_scale = (), (), (), ()
     if require_constexpr(
         at is not None and sched.ds_read_in_mfma(_A_PAYLOAD, at) == MFMA
@@ -602,7 +602,7 @@ def _take_operand_pairs(
     tc,
     layout,
     operand: gl.constexpr,
-    non_k_slot: gl.constexpr,
+    panel: gl.constexpr,
     PHASE: gl.constexpr,
 ):
     ratio_k: gl.constexpr = layout.scale_steps_per_buffer[operand][1]
@@ -610,15 +610,13 @@ def _take_operand_pairs(
     for k in gl.static_range(layout.num_k_slots):
         if require_constexpr(tc.func_cfg.has_scale(operand)):
             out += (
-                payload[non_k_slot * layout.num_k_slots + k],
-                scale[
-                    (non_k_slot * ratio_k + PHASE % ratio_k) * layout.num_k_slots + k
-                ],
+                payload[panel * layout.num_k_slots + k],
+                scale[(panel * ratio_k + PHASE % ratio_k) * layout.num_k_slots + k],
             )
         else:
             out += (
-                payload[non_k_slot * layout.num_k_slots + k],
-                scale[non_k_slot * layout.num_k_slots + k],
+                payload[panel * layout.num_k_slots + k],
+                scale[panel * layout.num_k_slots + k],
             )
     return out
 
@@ -815,8 +813,8 @@ def _drain_buffered_pipeline(pc, ptrs, buffers, regs, NUM_K):
     sched: gl.constexpr = pc.schedule
     main = NUM_K - sched.depth
     if require_constexpr(sched.static_drain):
-        phase = main % sched.ring_period
-        for p in gl.static_range(sched.ring_period):
+        phase = main % sched.buffer_period
+        for p in gl.static_range(sched.buffer_period):
             if phase == p:
                 for j in gl.static_range(sched.depth - 1):
                     ptrs, buffers, regs = _step(
