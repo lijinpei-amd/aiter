@@ -210,8 +210,8 @@ class _Machine:
         mk = tc.num_k_slots
         assert 0 <= tile < self.num_k, "HBM load exceeded the K strip"
         live_span = (tc.depths[component] - 1) * ratio + 1
-        fill_span = live_span - int(tc.component_in_reg(component))
-        lead = fill_span - 1
+        load_to_mfma_distance = live_span - int(tc.component_in_reg(component))
+        lead = load_to_mfma_distance - 1
         assert tile == self.current_read + lead
         assert tile % ratio == 0 and mini % nonk == 0
         token = component, mini, tile
@@ -425,13 +425,13 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         a_scale_stride_k=1,
         b_scale_stride_k=1,
     )
-    step_fn, fill_fn = pipeline._step.fn, pipeline._fill_slot.fn
+    step_fn, buffer_load_fn = pipeline._step.fn, pipeline._buffer_load_slot.fn
     ds_read_slot_fn = pipeline._ds_read_slot.fn
     ds_read_payload_fn = pipeline._ds_read_payload.fn
     ds_read_scale_fn = pipeline._ds_read_scale.fn
 
     # Positional layouts: _step(pc, ptrs, buffers, regs, step, STEP),
-    # _fill_slot(pc, ptrs, buffers, step, STEP, mi, ni),
+    # _buffer_load_slot(pc, ptrs, buffers, step, STEP, mi, ni),
     # _ds_read_slot(pc, buffers, step, STEP, mi, ni, MFMA),
     # _ds_read_payload/_ds_read_scale(pc, buffers, step, STEP, non-K slot, operand).
     def step(*args, **kwargs):
@@ -442,11 +442,11 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         machine.steps.append((args[4], machine.current_in_loop))
         return step_fn(*args, **kwargs)
 
-    def fill(*args, **kwargs):
+    def buffer_load(*args, **kwargs):
         machine.current_read = args[3]
         machine.current_in_loop = schedule.in_loop(args[4])
         machine.current_drain = schedule.is_drain(args[4])
-        return fill_fn(*args, **kwargs)
+        return buffer_load_fn(*args, **kwargs)
 
     def ds_read_slot(*args, **kwargs):
         if not args[6]:  # the slot's first read, right after its wait
@@ -547,7 +547,7 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         patch.setattr(pipeline, "_PipelineRegFragments", _fragments)
         patch.setattr(pipeline, "_PipelinePointers", _pointers)
         patch.setattr(pipeline, "_step", step)
-        patch.setattr(pipeline, "_fill_slot", fill)
+        patch.setattr(pipeline, "_buffer_load_slot", buffer_load)
         patch.setattr(pipeline, "_ds_read_slot", ds_read_slot)
         patch.setattr(pipeline, "_ds_read_payload", ds_read_payload)
         patch.setattr(pipeline, "_ds_read_scale", ds_read_scale)
@@ -976,7 +976,11 @@ def _straight_line_waits(schedule, tc, last):
 
     def required(step, slot):
         return {
-            (step - schedule.fill_span(c) + 1, c, schedule.ds_read_non_k_slot(slot, c))
+            (
+                step - schedule.load_to_mfma_distance(c) + 1,
+                c,
+                schedule.ds_read_non_k_slot(slot, c),
+            )
             for c in COMPONENTS
             if schedule.ds_read_non_k_slot(slot, c) is not None
             and tc.component_via_lds(c)
@@ -1067,7 +1071,9 @@ def test_every_payload_tile_is_filled_exactly_once(nm, nn, middle):
     tc = _Config(WaitCommitScheme.PER_OP, (3, 3, 3, 3), 0, shape=(nm, nn),
                  middle=middle)
     schedule = Schedule(tc, tc, tc.BLOCK_K)
-    assert maybe_unwrap(schedule.fill_slots_valid), "ownership is not a valid mapping"
+    assert maybe_unwrap(
+        schedule.buffer_load_slots_valid
+    ), "ownership is not a valid mapping"
     for component in COMPONENTS:
         non_k_slots = nm if component[0] == A else nn
         owners = [
@@ -1082,7 +1088,7 @@ def test_every_payload_tile_is_filled_exactly_once(nm, nn, middle):
 
 
 @pytest.mark.parametrize("shape", [(2, 2), (2, 3), (3, 2), (2, 4), (4, 2)])
-def test_scale_fill_mid_moves_only_the_scale_fill_slots(shape):
+def test_scale_fill_mid_moves_only_the_scale_buffer_load_slots(shape):
     """`SCALE_FILL_MID` is a copy-ownership knob and nothing else.
 
     It must not disturb payload ownership, the DS-read slots, or the configured
@@ -1096,8 +1102,8 @@ def test_scale_fill_mid_moves_only_the_scale_fill_slots(shape):
     nm, nn = shape
     for component in (A_PAYLOAD, B_PAYLOAD):
         non_k_slots = range(nm if component[0] == A else nn)
-        assert [off_schedule.fill_slot(component, t) for t in non_k_slots] == [
-            on_schedule.fill_slot(component, t) for t in non_k_slots
+        assert [off_schedule.buffer_load_slot(component, t) for t in non_k_slots] == [
+            on_schedule.buffer_load_slot(component, t) for t in non_k_slots
         ], component
     for component in COMPONENTS:
         non_k_slots = range(nm if component[0] == A else nn)
@@ -1106,10 +1112,10 @@ def test_scale_fill_mid_moves_only_the_scale_fill_slots(shape):
         ], component
         assert off.ds_read_in_mfma(*component) == on.ds_read_in_mfma(*component)
 
-    scale_off = [off_schedule.fill_slot(A_SCALE, t) for t in range(nm)]
-    scale_on = [on_schedule.fill_slot(A_SCALE, t) for t in range(nm)]
-    b_off = [off_schedule.fill_slot(B_SCALE, t) for t in range(nn)]
-    b_on = [on_schedule.fill_slot(B_SCALE, t) for t in range(nn)]
+    scale_off = [off_schedule.buffer_load_slot(A_SCALE, t) for t in range(nm)]
+    scale_on = [on_schedule.buffer_load_slot(A_SCALE, t) for t in range(nm)]
+    b_off = [off_schedule.buffer_load_slot(B_SCALE, t) for t in range(nn)]
+    b_on = [on_schedule.buffer_load_slot(B_SCALE, t) for t in range(nn)]
     if shape == (2, 2):
         # The guarded case: A scale already owns the middle slots, so only B moves.
         assert scale_off == scale_on == [1, 2]
@@ -1168,5 +1174,6 @@ def test_absent_scale_ring_indices_ignore_invalid_unused_depths(scale_depths):
     assert maybe_unwrap(schedule.register_period) == 1
     for component in (A_SCALE, B_SCALE):
         for step in (schedule.warmup_step(), schedule.loop_step(1)):
-            for fill in (False, True):
-                assert pipeline._index.fn(schedule, 7, step, component, fill) == 0
+            for buffer_load in (False, True):
+                index = pipeline._index.fn(schedule, 7, step, component, buffer_load)
+                assert index == 0

@@ -547,7 +547,7 @@ def _run_scalar_pipeline(monkeypatch, tc, layout, stages, fused):
             "_rotate",
             "_rotate_buffers",
             "_init_buffers",
-            "_fill_slot",
+            "_buffer_load_slot",
             "_advance",
             "_ds_read_payload",
             "_ds_read_scale",

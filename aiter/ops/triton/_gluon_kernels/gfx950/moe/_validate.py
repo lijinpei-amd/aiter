@@ -268,8 +268,8 @@ def validate_pipeline(tc, layout, K, schedule=None):
     # slot -- a slot carries one optional copy per component. Different components
     # sharing a slot is fine, which is what lets a single-slot step copy both
     # operands.
-    assert schedule.fill_slots_valid.value, (
-        f"fill ownership is not a valid mapping for num_m_slots "
+    assert schedule.buffer_load_slots_valid.value, (
+        f"buffer-load ownership is not a valid mapping for num_m_slots "
         f"{layout.num_m_slots.value} x num_n_slots {layout.num_n_slots.value} "
         f"(SLOT_M {tc.SLOT_M.value} vs BLOCK_M {tc.BLOCK_M.value}, "
         f"SLOT_N {tc.SLOT_N.value} vs BLOCK_N {tc.BLOCK_N.value})"
