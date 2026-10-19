@@ -430,7 +430,7 @@ class _CopyRecorder:
                 assert (
                     stage - self.depths[component] * ratio
                     in self.reads[component, tile]
-                ), ("LDS slot overwritten before its read", key, stage)
+                ), ("LDS buffer overwritten before its read", key, stage)
             self.lds[key] = value
         return value
 
@@ -454,12 +454,12 @@ class _CopyRecorder:
     def _k_fragments(self, component):
         return maybe_unwrap(self.layout.num_k_slots) * self.ratios[component]
 
-    def _read(self, component, tile, slot):
+    def _read(self, component, tile, buffer):
         ratio = self.ratios[component]
         stage = len(self.reads[component, tile]) * ratio
-        assert slot == stage // ratio % self.depths[component]
+        assert buffer == stage // ratio % self.depths[component]
         self.reads[component, tile].append(stage)
-        return self.lds[component, tile, slot]
+        return self.lds[component, tile, buffer]
 
     def ds_read_frag(
         self,
@@ -478,8 +478,8 @@ class _CopyRecorder:
         )
         return payload, scale
 
-    def ds_read_scale(self, operand, slot, tile):
-        value = self._read((operand, SCALE), tile, slot)
+    def ds_read_scale(self, operand, buffer, tile):
+        value = self._read((operand, SCALE), tile, buffer)
         return (value,) * self._k_fragments((operand, SCALE))
 
     def commit_buffer_load(self):
@@ -547,11 +547,11 @@ def _run_scalar_pipeline(monkeypatch, tc, layout, stages, fused):
             "_rotate",
             "_rotate_buffers",
             "_init_buffers",
-            "_buffer_load_slot",
+            "_buffer_load_panel",
             "_advance",
             "_ds_read_payload",
             "_ds_read_scale",
-            "_ds_read_slot",
+            "_ds_read_panel",
             "_step",
             "_step_live",
             "_take_reg_pairs",
