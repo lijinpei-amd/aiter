@@ -304,6 +304,15 @@ class Schedule:
                         and ds_read == buffer_load_slots[component_index][t]
                     )
                 )
+                if same_step and buffer_load_slots_valid:
+                    buffer_load = buffer_load_slots[component_index][t]
+                    assert ds_read > buffer_load or (
+                        ds_read == buffer_load and in_mfma[t]
+                    ), (
+                        f"component {(op, is_scale)} is in registers at F == 1, so "
+                        f"its DS read of non-K slot {t} (slot {ds_read}) must follow "
+                        f"the same step's buffer load (slot {buffer_load})"
+                    )
             ds_read_slots.append(tuple(ds_reads))
             ds_read_in_mfma.append(tuple(in_mfma))
         ds_read_non_k_slots = tuple(
