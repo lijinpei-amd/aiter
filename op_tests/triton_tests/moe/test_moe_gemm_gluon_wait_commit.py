@@ -466,7 +466,7 @@ def test_register_only_slots_need_no_cooperative_fence(scheme, monkeypatch):
     )
     monkeypatch.setattr(pipeline.gl, "barrier", lambda: barriers.append(True))
     monkeypatch.setattr(pipeline.gl, "static_range", range)
-    monkeypatch.setattr(pipeline, "_read_slot", lambda *args: ((), (), (), ()))
+    monkeypatch.setattr(pipeline, "_ds_read_slot", lambda *args: ((), (), (), ()))
     monkeypatch.setattr(
         pipeline, "_fill_slot", lambda pc, ptrs, buffers, *args, **kwargs: buffers
     )
@@ -559,7 +559,7 @@ def test_pipeline_stage_commit_boundaries(
     monkeypatch.setattr(pipeline.gl, "static_range", range)
     monkeypatch.setattr(pipeline.gl.amd.cdna4, "sched_barrier", lambda mask: None)
     monkeypatch.setattr(pipeline, "_fill_slot", buffer_load)
-    monkeypatch.setattr(pipeline, "_read_slot", lambda *args: ((), (), (), ()))
+    monkeypatch.setattr(pipeline, "_ds_read_slot", lambda *args: ((), (), (), ()))
     monkeypatch.setattr(pipeline, "_take_operand_pairs", lambda *args: ())
     monkeypatch.setattr(pipeline, "_PipelineRegFragments", lambda *args: args)
     monkeypatch.setattr(pipeline, "_rotate_buffers", lambda buffers, *args: buffers)

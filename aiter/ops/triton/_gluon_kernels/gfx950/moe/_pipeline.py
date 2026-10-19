@@ -3,16 +3,16 @@
 
 """One payload/scale pipeline for shared and independent buffer depths.
 
-A step named ``r`` selects the K tile ``r`` and accumulates K tile ``r - 1``.
+A step named ``r`` DS-reads the K tile ``r`` and accumulates K tile ``r - 1``.
 Each component has baseline live span ``L = (D - 1) * R + 1`` payload steps.
-An LDS producer is selected after ``F = L`` steps; a direct-register producer
-skips the DS-read stage and is selected after ``F = L - 1`` steps.  Register
+An LDS producer is DS-read ``F = L`` steps after it is issued, counting both
+ends; a direct-register producer issues no ``ds_read``, so ``F = L - 1``.  Register
 rings keep fixed SSA slots throughout each complete unrolled body; only the
 finite prologue, remainder, and drain rotate the logical queues.
 
 The expansion follows ``pc.schedule``, the build's :class:`~._schedule.Schedule`:
 it says which steps exist, and each emitted step is passed its index there as
-``STEP``, from which every per-step decision -- its K phase, copies, selections,
+``STEP``, from which every per-step decision -- its K phase, copies, DS reads,
 commits and waits -- is read.
 """
 
@@ -258,11 +258,11 @@ def _rotate(queue, SHIFT: gl.constexpr):
 @gluon.jit
 def _rotate_buffers(buffers, sched, layout, PHASE: gl.constexpr = 0):
     mk: gl.constexpr = layout.num_k_slots
-    if require_constexpr(sched.selects_at_phase(_A_SCALE, PHASE + 1)):
+    if require_constexpr(sched.ds_reads_at_phase(_A_SCALE, PHASE + 1)):
         a_scale = _rotate(buffers[2], layout.num_m_slots * mk * sched.ratio_k(_A_SCALE))
     else:
         a_scale = buffers[2]
-    if require_constexpr(sched.selects_at_phase(_B_SCALE, PHASE + 1)):
+    if require_constexpr(sched.ds_reads_at_phase(_B_SCALE, PHASE + 1)):
         b_scale = _rotate(buffers[3], layout.num_n_slots * mk * sched.ratio_k(_B_SCALE))
     else:
         b_scale = buffers[3]
@@ -540,7 +540,7 @@ def _advance(pc, ptrs, STEP: gl.constexpr):
 
 
 @gluon.jit
-def _read_payload(
+def _ds_read_payload(
     pc,
     buffers,
     step,
@@ -578,7 +578,7 @@ def _read_payload(
 
 
 @gluon.jit
-def _read_scale(
+def _ds_read_scale(
     pc,
     buffers,
     step,
@@ -610,7 +610,7 @@ def _read_scale(
 
 
 @gluon.jit
-def _read_slot(
+def _ds_read_slot(
     pc,
     buffers,
     step,
@@ -622,27 +622,31 @@ def _read_slot(
     layout: gl.constexpr = pc.layout
     sched: gl.constexpr = pc.schedule
     slot: gl.constexpr = _slot_index(mi, ni, layout.num_m_slots, layout.num_n_slots)
-    at: gl.constexpr = sched.selected(slot, _A_PAYLOAD)
-    ast: gl.constexpr = sched.selected(slot, _A_SCALE)
-    bt: gl.constexpr = sched.selected(slot, _B_PAYLOAD)
-    bst: gl.constexpr = sched.selected(slot, _B_SCALE)
+    at: gl.constexpr = sched.ds_read_non_k_slot(slot, _A_PAYLOAD)
+    ast: gl.constexpr = sched.ds_read_non_k_slot(slot, _A_SCALE)
+    bt: gl.constexpr = sched.ds_read_non_k_slot(slot, _B_PAYLOAD)
+    bst: gl.constexpr = sched.ds_read_non_k_slot(slot, _B_SCALE)
     a, b, a_scale, b_scale = (), (), (), ()
-    if require_constexpr(at is not None and sched.read_in_mfma(_A_PAYLOAD, at) == MFMA):
-        a = _read_payload(pc, buffers, step, STEP, at, 0)
+    if require_constexpr(
+        at is not None and sched.ds_read_in_mfma(_A_PAYLOAD, at) == MFMA
+    ):
+        a = _ds_read_payload(pc, buffers, step, STEP, at, 0)
     if require_constexpr(
         ast is not None
-        and sched.selects(STEP, _A_SCALE)
-        and sched.read_in_mfma(_A_SCALE, ast) == MFMA
+        and sched.ds_reads(STEP, _A_SCALE)
+        and sched.ds_read_in_mfma(_A_SCALE, ast) == MFMA
     ):
-        a_scale = _read_scale(pc, buffers, step, STEP, ast, 0)
-    if require_constexpr(bt is not None and sched.read_in_mfma(_B_PAYLOAD, bt) == MFMA):
-        b = _read_payload(pc, buffers, step, STEP, bt, 1)
+        a_scale = _ds_read_scale(pc, buffers, step, STEP, ast, 0)
+    if require_constexpr(
+        bt is not None and sched.ds_read_in_mfma(_B_PAYLOAD, bt) == MFMA
+    ):
+        b = _ds_read_payload(pc, buffers, step, STEP, bt, 1)
     if require_constexpr(
         bst is not None
-        and sched.selects(STEP, _B_SCALE)
-        and sched.read_in_mfma(_B_SCALE, bst) == MFMA
+        and sched.ds_reads(STEP, _B_SCALE)
+        and sched.ds_read_in_mfma(_B_SCALE, bst) == MFMA
     ):
-        b_scale = _read_scale(pc, buffers, step, STEP, bst, 1)
+        b_scale = _ds_read_scale(pc, buffers, step, STEP, bst, 1)
     return a, b, a_scale, b_scale
 
 
@@ -676,9 +680,9 @@ def _take_operand_pairs(
 
 @gluon.jit
 def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
-    """Advance payloads and independently phased scale producers/selections.
+    """Advance payloads and independently phased scale producers/DS reads.
 
-    ``step`` is the K tile the step selects, a runtime value inside the loops;
+    ``step`` is the K tile the step DS-reads, a runtime value inside the loops;
     ``STEP`` is the step's index in ``pc.schedule``.
     """
     tc: gl.constexpr = pc.tuning_cfg
@@ -693,8 +697,8 @@ def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
     nn: gl.constexpr = layout.num_n_slots
     mk: gl.constexpr = layout.num_k_slots
     a, b, acc = (), (), ()
-    a_scale = () if sched.selects(STEP, _A_SCALE) else regs.a_scale
-    b_scale = () if sched.selects(STEP, _B_SCALE) else regs.b_scale
+    a_scale = () if sched.ds_reads(STEP, _A_SCALE) else regs.a_scale
+    b_scale = () if sched.ds_reads(STEP, _B_SCALE) else regs.b_scale
     tile_wait: gl.constexpr = sched.wait(STEP)
     if require_constexpr(tile_wait is not None):
         pc.lds_ptrs.wait_buffer_load_groups(tile_wait)
@@ -711,7 +715,7 @@ def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
             if require_constexpr(not DOT and mi == 0 and ni == 0):
                 gl.amd.cdna4.sched_barrier(0)
             with region("mem"):
-                am, bm, asm, bsm = _read_slot(pc, buffers, step, STEP, mi, ni, False)
+                am, bm, asm, bsm = _ds_read_slot(pc, buffers, step, STEP, mi, ni, False)
                 buffers = _fill_slot(
                     pc, ptrs, buffers, step, STEP, mi, ni, MARK_TILE=False
                 )
@@ -743,7 +747,7 @@ def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
                     DOT,
                     (PHASE - 1) * tc.BLOCK_K // 128 % 2,
                 )
-                af, bf, asf, bsf = _read_slot(pc, buffers, step, STEP, mi, ni, True)
+                af, bf, asf, bsf = _ds_read_slot(pc, buffers, step, STEP, mi, ni, True)
                 if require_constexpr(mi == nm - 1 and ni == nn - 1):
                     ptrs = _advance(pc, ptrs, STEP)
             if require_constexpr(

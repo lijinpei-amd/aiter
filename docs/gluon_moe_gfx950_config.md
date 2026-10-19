@@ -72,7 +72,7 @@ Let `PIPELINE_DEPTH` be the largest baseline inclusive live span `L`, measured i
 payload K steps, among present components. For ring depth `D` and K-Step ratio `R`
 (`R=1` for payloads), `L = (D - 1) * R + 1`. An LDS-backed component has actual
 fill span `F=L`; every direct-register component has `F=L-1`. `PIPELINE_DEPTH`
-remains `max(L)`, while prologue/drain activity and producer-to-selection timing use
+remains `max(L)`, while prologue/drain activity and producer-to-DS-read timing use
 `F`.
 `PEELED` is the number of initial main iterations needed before invariant
 steady-state waits. The first MFMA is always peeled, so `PEELED >= 1`; staggered
@@ -118,12 +118,12 @@ wait before each slot's LDS reads. Wait counts follow each component's producer
 and the actual committed groups, including empty slot/stage groups during the
 prologue and drain. Direct-register loads own no LDS async-copy groups. Their
 register dependencies provide VMEM completion before use. A direct scale producer
-uses residue `(1-F) % R`, while selection remains on residue zero; this shifts its
+uses residue `(1-F) % R`, while its DS read remains on residue zero; this shifts its
 load one payload step later than the corresponding LDS producer without changing
 the scale block consumed by MFMA.
 
 Payload and scale placement are independent. Missing components emit no reads;
-components loaded directly into registers follow the same region selection.
+components loaded directly into registers follow the same DS-read region.
 For example, after obtaining a normal supported tuning dictionary:
 
 ```python
@@ -205,9 +205,9 @@ HBM pointer. B register loads occupy the same logical fill slot as B LDS copies.
 Scale register loads also use their configured fill slots, including
 `SCALE_FILL_MID`.
 
-Selection of a direct-register ring entry occurs `F-1` steps after its producer and
-MFMA consumes it on the following step. At the minimum `D=2`, `R=1` case, production
-and selection share a step; the producer is emitted first even when the configured
+The DS read of a direct-register ring entry occurs `F-1` steps after its producer,
+and the MFMA consumes it on the following step. At the minimum `D=2`, `R=1` case, production
+and DS read share a step; the producer is emitted first even when the configured
 read region would otherwise precede its fill slot.
 
 The prologue has `PIPELINE_DEPTH - 1` fill-only stages. A component with actual
@@ -249,7 +249,7 @@ The K loop carries two aggregates plus the component register rings:
 `_PipelineConst.lds_ptrs` holds the `LDSManager` descriptors, named
 `a_payload_lds_ptr`, `a_scale_lds_ptr`, `b_payload_lds_ptr`, and `b_scale_lds_ptr`.
 LDS tile `t` occupies slot `t % NB` for that component. `_fill_slot` issues
-copies and commits, `_read_slot` supplies the next register fragments, and
+copies and commits, `_ds_read_slot` supplies the next register fragments, and
 `_advance` moves only pointers whose streams actually filled. With
 `SOFF_UNROLL`, the last step advances by the complete body's fill count.
 Cooperative LDS barriers and read-result dependencies protect buffer reuse.

@@ -9,7 +9,7 @@ holds the results in its fields. ``_pipeline.py`` expands the loop from it alone
 * how many prologue, warm-up, peeled, loop, remainder and drain steps there are, and
   each step's K phase, unroll position and region;
 * in each step and slot, which non-K slot of each component is copied and which is
-  selected, and whether the selection reads in the memory or the MFMA region;
+  DS-read, and whether the DS read sits in the memory or the MFMA region;
 * where the async commits go, and the immediate of every async wait.
 
 The public surface is :class:`Schedule`: its constructor, methods and fields.
@@ -23,9 +23,9 @@ split along its operand's non-K axis only -- A by M slot, B by N slot -- and tha
 per-operand index is a copy's *non-K slot*.
 
 Each component has a ring of ``D`` buffers and a scale K-step ratio ``R`` (1 for a
-payload), so a value lives ``L = (D - 1) * R + 1`` steps. An LDS producer is selected
-``F = L`` steps after it is issued; a direct-register producer skips the DS read and
-is selected after ``F = L - 1``.
+payload), so a value lives ``L = (D - 1) * R + 1`` steps. An LDS producer is DS-read
+``F = L`` steps after it is issued, counting both ends; a direct-register producer
+issues no ``ds_read``, which saves a step: ``F = L - 1``.
 
 Waits are computed in two passes. The first builds the commit plan: for every emitted
 step, the commit groups each slot closes, as sets of ``(component, non-K slot)``
@@ -48,8 +48,8 @@ __all__ = ["Schedule"]
 
 # Step kinds, in program order. A step is one emitted `_step` call, or for the
 # prologue one fill-only expansion.
-_PROLOGUE = 0  # fills only, before anything is selected
-_WARMUP = 1  # step 0: selects the first K tile, issues no MFMA
+_PROLOGUE = 0  # fills only, before anything is DS-read
+_WARMUP = 1  # step 0: DS-reads the first K tile, issues no MFMA
 _PEELED = 2  # straight-line main steps whose waits differ from the loop body's
 _LOOP = 3  # the runtime loop body
 _REMAINDER = 4  # the main steps a whole number of loop bodies leaves over
@@ -102,7 +102,7 @@ def _first_non_k_slot(mapping, slot, ratio):
     """First non-K slot ``mapping`` places in ``slot``, or ``None``.
 
     Only every ``ratio``-th non-K slot counts: a scale shared across non-K slots is
-    copied and selected once, at its first non-K slot.
+    copied and DS-read once, at its first non-K slot.
     """
     for t, mapped in enumerate(mapping):
         if mapped == slot and t % ratio == 0:
@@ -112,12 +112,12 @@ def _first_non_k_slot(mapping, slot, ratio):
 
 @gluon.constexpr_function
 def _step_plan(m, kind, stage, phase):
-    """What one step copies, commits and selects, as the async FIFO sees it.
+    """What one step copies, commits and DS-reads, as the async FIFO sees it.
 
     ``stage`` places the step for the staggered start and stop: an absolute step
     before the loop (``None`` inside it, where every component fills), the zero-based
     iteration in the drain. ``phase`` is its K step, which decides the scale copies
-    and selections. Returns ``(active, loads, issued, commits, demand)``:
+    and DS reads. Returns ``(active, loads, issued, commits, demand)``:
 
     * ``active`` -- whether each component fills here at all. Prologue filling starts
       at ``1 - F(c)``, so a component with a shorter fill span starts later. The
@@ -128,7 +128,7 @@ def _step_plan(m, kind, stage, phase):
       included.
     * ``commits`` -- per slot, the groups it closes, of LDS copies only. Per-slot and
       per-tile schemes commit even an empty group: it still occupies a FIFO position.
-    * ``demand`` -- per slot, the LDS copies its selections read. Register components
+    * ``demand`` -- per slot, the LDS copies its DS reads need. Register components
       have no commit group; the compiler tracks their loads itself.
     """
     present, fill_span, ratio_k = m["present"], m["fill_span"], m["ratio_k"]
@@ -163,14 +163,14 @@ def _step_plan(m, kind, stage, phase):
     if kind == _PROLOGUE:
         demand = ()
     else:
-        selects = tuple(p and phase % r == 0 for p, r in zip(present, ratio_k))
+        ds_reads = tuple(p and phase % r == 0 for p, r in zip(present, ratio_k))
         demand = tuple(
             tuple(
                 (ci, t)
-                for ci, t in enumerate(selected)
-                if t is not None and m["via_lds"][ci] and selects[ci]
+                for ci, t in enumerate(non_k_slots)
+                if t is not None and m["via_lds"][ci] and ds_reads[ci]
             )
-            for selected in m["selected"]
+            for non_k_slots in m["ds_read_non_k_slots"]
         )
     return active, loads, issued, tuple(commits), demand
 
@@ -185,7 +185,7 @@ def _immediate(position, count, step, need, fill_span):
         copy = (step - fill_span[ci] + 1, ci, t)
         assert (
             copy in position
-        ), f"copy {copy} is selected at step {step} but was never committed before it"
+        ), f"copy {copy} is DS-read at step {step} but was never committed before it"
         latest = max(latest, position[copy])
     return count - latest - 1
 
@@ -208,8 +208,8 @@ def _replay(orders, fill_span, per_tile, slots):
     every execution, so each key keeps its smallest.
 
     A copy is ``(step, component, non-K slot)``: the same copy repeats every ring
-    period, so the component and slot alone would match another step's value. A
-    selection at step ``s`` reads the copy issued at ``s - F(c) + 1``.
+    period, so the component and slot alone would match another step's value. A DS
+    read at step ``s`` reads the copy issued at ``s - F(c) + 1``.
 
     ``wait_group(n)`` blocks until at most ``n`` groups are outstanding. With ``j`` the
     newest group holding a required copy, ``count - j - 1`` retires through ``j`` and
@@ -261,7 +261,7 @@ class Schedule:
     Every emitted step has an index, ``step``. The steps, in program order:
 
     * ``prologue_step(r)``, ``r`` in ``[1 - depth, 0)``: fills only.
-    * ``warmup_step()``: K step 0, selects without an MFMA.
+    * ``warmup_step()``: K step 0, DS-reads without an MFMA.
     * ``peeled_step(x)``, ``x`` in ``[0, peeled)``: K step ``x + 1``.
     * ``loop_step(u)``, ``u`` in ``[0, unroll)``: the runtime loop body.
     * ``remainder_step(u)``: the steps a whole number of loop bodies leaves over --
@@ -282,11 +282,11 @@ class Schedule:
     _ratio_k: gl.constexpr
     _fill_span: gl.constexpr
     _fill_slots: gl.constexpr
-    _read_slots: gl.constexpr
-    _read_in_mfma: gl.constexpr
+    _ds_read_slots: gl.constexpr
+    _ds_read_in_mfma: gl.constexpr
     # -- per slot ----------------------------------------------------------------------
     _owned: gl.constexpr
-    _selected: gl.constexpr
+    _ds_read_non_k_slots: gl.constexpr
     # -- sizing ------------------------------------------------------------------------
     #: K tiles in the strip: K // BLOCK_K.
     num_k: gl.constexpr
@@ -388,7 +388,7 @@ class Schedule:
         # sits at a fixed ring phase and register tuples get static indices.
         unroll = math.lcm(k_unroll, ring_period)
 
-        # -- copy ownership and selection ----------------------------------------------
+        # -- copy ownership and DS reads -----------------------------------------------
         # SCALE_FILL_MID is consumed here and nowhere else, and only on the 2x2 split:
         # on any other geometry it is inert.
         a_slots, b_slots = _payload_fill_slots(nm, nn)
@@ -417,32 +417,33 @@ class Schedule:
             )
             for slot in range(slots)
         )
-        # A component is selected where its operand's payload is copied, except that
-        # a register producer with F = 1 is selected in the step it is issued, so its
-        # selection cannot precede its copy.
-        read_slots, read_in_mfma = [], []
+        # A component is DS-read where its operand's payload is copied. A register
+        # component issues no DS read; its entry is where its value is taken out of
+        # the register ring. With F = 1 that is the ring position this step's fill
+        # overwrites, so the read cannot precede its copy.
+        ds_read_slots, ds_read_in_mfma = [], []
         for ci, (op, is_scale) in enumerate(COMPONENTS):
             payload_slots = a_slots if op == A else b_slots
-            reads, in_mfma = [], []
+            ds_reads, in_mfma = [], []
             for t in range(len(payload_slots)):
-                read = payload_slots[t]
+                ds_read = payload_slots[t]
                 same_step = not via_lds[ci] and fill_span[ci] == 1
-                if same_step and fill_slots_valid and fill_slots[ci][t] > read:
-                    read = fill_slots[ci][t]
-                reads.append(read)
-                # A same-step register selection in its own fill slot has to read in
-                # the MFMA region, after the fill.
+                if same_step and fill_slots_valid and fill_slots[ci][t] > ds_read:
+                    ds_read = fill_slots[ci][t]
+                ds_reads.append(ds_read)
+                # A same-step register read in its own fill slot has to sit in the
+                # MFMA region, after the fill.
                 configured = bool(tc.ds_read_in_mfma(op, is_scale))
                 in_mfma.append(
                     configured
-                    or (same_step and fill_slots_valid and read == fill_slots[ci][t])
+                    or (same_step and fill_slots_valid and ds_read == fill_slots[ci][t])
                 )
-            read_slots.append(tuple(reads))
-            read_in_mfma.append(tuple(in_mfma))
-        selected = tuple(
+            ds_read_slots.append(tuple(ds_reads))
+            ds_read_in_mfma.append(tuple(in_mfma))
+        ds_read_non_k_slots = tuple(
             tuple(
                 (
-                    _first_non_k_slot(read_slots[ci], slot, ratio_non_k[ci])
+                    _first_non_k_slot(ds_read_slots[ci], slot, ratio_non_k[ci])
                     if present[ci]
                     else None
                 )
@@ -480,13 +481,13 @@ class Schedule:
             "fill_span": fill_span,
             "depth": depth,
             "owned": owned,
-            "selected": selected,
+            "ds_read_non_k_slots": ds_read_non_k_slots,
             "commit": commit,
         }
 
         # -- peeling -------------------------------------------------------------------
         # The loop body has one wait immediate per slot for all its executions, so it
-        # takes the smallest. Before the read at step depth - 1, some selections read
+        # takes the smallest. Before the read at step depth - 1, some DS reads need
         # copies issued while shallower components had not started filling, which
         # can need a smaller immediate than the loop does. Peel those steps instead
         # of letting them tighten every loop iteration. The first main step is always
@@ -514,10 +515,10 @@ class Schedule:
         self._ratio_k = gl.constexpr(ratio_k)
         self._fill_span = gl.constexpr(fill_span)
         self._fill_slots = gl.constexpr(fill_slots)
-        self._read_slots = gl.constexpr(tuple(read_slots))
-        self._read_in_mfma = gl.constexpr(tuple(read_in_mfma))
+        self._ds_read_slots = gl.constexpr(tuple(ds_read_slots))
+        self._ds_read_in_mfma = gl.constexpr(tuple(ds_read_in_mfma))
         self._owned = gl.constexpr(owned)
-        self._selected = gl.constexpr(selected)
+        self._ds_read_non_k_slots = gl.constexpr(ds_read_non_k_slots)
         self.num_k = gl.constexpr(num_k)
         self.depth = gl.constexpr(depth)
         self.unroll = gl.constexpr(unroll)
@@ -736,12 +737,12 @@ class Schedule:
         return self._issued.value[step][slot]
 
     @gluon.constexpr_function
-    def selects(self, step, component):
-        """Whether the step selects a new value of the component."""
-        return self.selects_at_phase(component, self.phase(step))
+    def ds_reads(self, step, component):
+        """Whether the step DS-reads a new value of the component."""
+        return self.ds_reads_at_phase(component, self.phase(step))
 
     @gluon.constexpr_function
-    def selects_at_phase(self, component, phase):
+    def ds_reads_at_phase(self, component, phase):
         ci = _ci(component)
         return self._present.value[ci] and phase % self._ratio_k.value[ci] == 0
 
@@ -816,7 +817,7 @@ class Schedule:
 
     @gluon.constexpr_function
     def fill_span(self, component):
-        """Inclusive producer-to-selection span ``F``: ``L``, ``L - 1`` in registers."""
+        """Inclusive producer-to-DS-read span ``F``: ``L``, ``L - 1`` in registers."""
         return self._fill_span.value[_ci(component)]
 
     @gluon.constexpr_function
@@ -831,14 +832,18 @@ class Schedule:
         return self._fill_slots.value[_ci(component)][non_k_slot]
 
     @gluon.constexpr_function
-    def read_slot(self, component, non_k_slot):
-        """Slot that selects one non-K slot of the component."""
-        return self._read_slots.value[_ci(component)][non_k_slot]
+    def ds_read_slot(self, component, non_k_slot):
+        """Slot that DS-reads one non-K slot of the component.
+
+        A register component issues no DS read: there it is the slot that takes the
+        value out of the register ring, which with ``F = 1`` must follow its fill.
+        """
+        return self._ds_read_slots.value[_ci(component)][non_k_slot]
 
     @gluon.constexpr_function
-    def read_in_mfma(self, component, non_k_slot):
-        """Whether the selection reads in the MFMA region rather than the memory one."""
-        return self._read_in_mfma.value[_ci(component)][non_k_slot]
+    def ds_read_in_mfma(self, component, non_k_slot):
+        """Whether the DS read sits in the MFMA region rather than the memory one."""
+        return self._ds_read_in_mfma.value[_ci(component)][non_k_slot]
 
     @gluon.constexpr_function
     def owned(self, slot):
@@ -846,19 +851,19 @@ class Schedule:
         return self._owned.value[slot]
 
     @gluon.constexpr_function
-    def selected(self, slot, component):
-        """Non-K slot of the component selected in this slot, or ``None``."""
-        return self._selected.value[slot][_ci(component)]
+    def ds_read_non_k_slot(self, slot, component):
+        """Non-K slot of the component DS-read in this slot, or ``None``."""
+        return self._ds_read_non_k_slots.value[slot][_ci(component)]
 
     # -- ring indices ------------------------------------------------------------------
 
     @gluon.constexpr_function
     def register_index(self, step, component, fill=False):
-        """Static register-ring index of the step's selection, or with ``fill`` copy.
+        """Static register-ring index of the step's DS read, or with ``fill`` copy.
 
         In the loop it is measured from the loop's first step, so the same body
         position always names the same register; a finite region rotates its tuples
-        after each step, so there logical index zero is the value selected at its
+        after each step, so there logical index zero is the value DS-read at its
         own phase.
         """
         if not self.present(component):
