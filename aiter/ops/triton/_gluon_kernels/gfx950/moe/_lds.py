@@ -37,7 +37,7 @@ def _buffer_load_to_lds(
     cache: gl.constexpr,
     SOFF: gl.constexpr = 0,
 ):
-    """Copy one non-K slot of a component directly from global memory to LDS.
+    """Copy one panel of a component directly from global memory to LDS.
 
     ``SOFF`` is a byte offset from ``hbm_ptr`` that is uniform across the block. It rides in
     the buffer op's ``soffset`` (SGPR) field, so unlike folding it into ``hbm_offs`` it
@@ -127,10 +127,10 @@ class LDSManager:
     def alloc(func_cfg, tuning_cfg, layout):
         """Static factory -- invoked as ``LDSManager.alloc(...)``, no ``self``.
 
-        The leading axis runs over pipeline buffer *and* non-K slot
+        The leading axis runs over pipeline buffer *and* panel
         (``num_m_slots`` for A, ``num_n_slots`` for B), flattened as
-        ``buffer_idx * n_slots + non_k_slot``: a shared allocation takes a layout of its
-        own rank, so two separate leading axes are not expressible. Each non-K slot is a
+        ``buffer_idx * num_panels + panel``: a shared allocation takes a layout of its
+        own rank, so two separate leading axes are not expressible. Each panel is a
         real allocation rather than a slice of one big tile so that each one keeps the
         padded layout ``compute_efficient_padded_shared_layout`` picked *for its own
         shape* -- that is what makes the per-slot direct-to-LDS copy as coalesced and as
@@ -192,12 +192,12 @@ class LDSManager:
         operand: gl.constexpr,
         VIA_LDS: gl.constexpr,
         BUFFER_LOAD_IDX,
-        non_k_slot: gl.constexpr,
+        panel: gl.constexpr,
         hbm_ptr,
         hbm_offs,
         SOFF: gl.constexpr = 0,
     ):
-        """Load one non-K slot of the A (0) or B (1) payload into LDS or registers.
+        """Load one panel of the A (0) or B (1) payload into LDS or registers.
 
         The register path returns the complete BLOCK_K stage as one fragment; its
         offsets must already use the operand fragment layout. The caller owns
@@ -217,9 +217,7 @@ class LDSManager:
             else:
                 lds_ptr = self.b_payload_lds_ptr
             _buffer_load_to_lds(
-                lds_ptr.index(
-                    BUFFER_LOAD_IDX * layout.num_lds_slots_non_k(operand) + non_k_slot
-                ),
+                lds_ptr.index(BUFFER_LOAD_IDX * layout.num_panels(operand) + panel),
                 hbm_ptr,
                 hbm_offs,
                 cache,
@@ -237,13 +235,13 @@ class LDSManager:
         operand: gl.constexpr,
         VIA_LDS: gl.constexpr,
         BUFFER_LOAD_IDX,
-        non_k_slot: gl.constexpr,
+        panel: gl.constexpr,
         hbm_ptr,
         hbm_offs,
         SOFF: gl.constexpr = 0,
         K_PHASE=0,
     ):
-        """Load one non-K slot of a scale, covering one or more whole K steps."""
+        """Load one panel of a scale, covering one or more whole K steps."""
         cfg: gl.constexpr = self.tuning_cfg
         layout: gl.constexpr = self.layout
         cache: gl.constexpr = (
@@ -256,7 +254,7 @@ class LDSManager:
             if require_constexpr(
                 self.func_cfg.has_scale(operand)
                 and layout.component_via_lds((operand, True))
-                and non_k_slot % ratio == 0
+                and panel % ratio == 0
             ):
                 if require_constexpr(operand == 0):
                     lds_ptr = self.a_scale_lds_ptr
@@ -264,8 +262,8 @@ class LDSManager:
                     lds_ptr = self.b_scale_lds_ptr
                 _buffer_load_to_lds(
                     lds_ptr.index(
-                        BUFFER_LOAD_IDX * (layout.num_lds_slots_non_k(operand) // ratio)
-                        + non_k_slot // ratio
+                        BUFFER_LOAD_IDX * (layout.num_panels(operand) // ratio)
+                        + panel // ratio
                     ),
                     hbm_ptr,
                     hbm_offs,
@@ -303,9 +301,7 @@ class LDSManager:
             return fragments
 
     @gluon.jit
-    def ds_read_scale(
-        self, operand: gl.constexpr, SCALE_READ_IDX, non_k_slot: gl.constexpr
-    ):
+    def ds_read_scale(self, operand: gl.constexpr, SCALE_READ_IDX, panel: gl.constexpr):
         """Read each scale slot once and retain all of its consumer fragments."""
         cfg: gl.constexpr = self.tuning_cfg
         layout: gl.constexpr = self.layout
@@ -316,8 +312,7 @@ class LDSManager:
         if require_constexpr(cfg.preshuffled(operand, True)):
             ratio: gl.constexpr = layout.scale_steps_per_buffer[operand][0]
             scale_ptr = lds_ptr.index(
-                SCALE_READ_IDX * (layout.num_lds_slots_non_k(operand) // ratio)
-                + non_k_slot // ratio
+                SCALE_READ_IDX * (layout.num_panels(operand) // ratio) + panel // ratio
             )
             scale = _ds_read(
                 scale_ptr.reinterpret(
@@ -331,10 +326,7 @@ class LDSManager:
         else:
             fragments = (
                 _ds_read(
-                    lds_ptr.index(
-                        SCALE_READ_IDX * layout.num_lds_slots_non_k(operand)
-                        + non_k_slot
-                    ),
+                    lds_ptr.index(SCALE_READ_IDX * layout.num_panels(operand) + panel),
                     layout.fragment_layout(operand, True),
                 ),
             )
@@ -355,13 +347,13 @@ class LDSManager:
         self,
         operand: gl.constexpr,
         DS_READ_IDX,
-        non_k_slot: gl.constexpr,
+        panel: gl.constexpr,
         k_slot: gl.constexpr,
         READ_PAYLOAD: gl.constexpr = True,
         READ_SCALE: gl.constexpr = True,
         SCALE_READ_IDX=None,
     ):
-        """Read K slot ``k_slot`` of one non-K slot of A (0) or B (1) from LDS.
+        """Read K slot ``k_slot`` of one panel of A (0) or B (1) from LDS.
 
         An absent or disabled component returns None.
         """
@@ -376,9 +368,7 @@ class LDSManager:
             payload: gl.constexpr = None
         else:
             payload = _ds_read(
-                payload_lds_ptr.index(
-                    DS_READ_IDX * layout.num_lds_slots_non_k(operand) + non_k_slot
-                ),
+                payload_lds_ptr.index(DS_READ_IDX * layout.num_panels(operand) + panel),
                 layout.fragment_layout(operand, False),
             )
         if require_constexpr(READ_SCALE and self.func_cfg.has_scale(operand)):
@@ -388,11 +378,11 @@ class LDSManager:
             )
             ratio: gl.constexpr = layout.scale_steps_per_buffer[operand][0]
             fragments = self.ds_read_scale(
-                operand, SCALE_READ_IDX, non_k_slot // ratio * ratio
+                operand, SCALE_READ_IDX, panel // ratio * ratio
             )
             ratio_k: gl.constexpr = layout.scale_steps_per_buffer[operand][1]
             scale_val = fragments[
-                (non_k_slot % ratio) * layout.num_k_slots * ratio_k + k_slot
+                (panel % ratio) * layout.num_k_slots * ratio_k + k_slot
             ]
         else:
             scale_val: gl.constexpr = None

@@ -908,7 +908,7 @@ def test_all_component_buffer_counts_determine_lcm_unroll(
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     layout = KernelLayout(tc)
     schedule = _schedule(tc, layout)
-    assert maybe_unwrap(schedule.register_period) == period
+    assert maybe_unwrap(schedule.reg_buffer_period) == period
     assert maybe_unwrap(schedule.unroll) == expected
     resolved = [count or config["NUM_LDS_BUFFER"] for count in counts]
     assert [
@@ -969,7 +969,7 @@ def test_small_payload_tiles_use_register_rings(config):
     assert not _plain(layout.component_via_lds(B_PAYLOAD))
     assert config["ALLOW_B_VIA_LDS"]
     assert not config["B_PRESHUFFLED"]
-    assert maybe_unwrap(_schedule(tc, layout).register_period) == 6
+    assert maybe_unwrap(_schedule(tc, layout).reg_buffer_period) == 6
     assert _plain(maybe_unwrap(layout.lds_bytes)) == 0
     assert _plain(_validate(tc, 64, 512))
 
@@ -1012,9 +1012,9 @@ def test_absent_scales_do_not_participate_in_depth_unroll_or_validation(
     for slot in range(
         maybe_unwrap(layout.num_m_slots) * maybe_unwrap(layout.num_n_slots)
     ):
-        owned = schedule.owned(slot)
-        assert owned[COMPONENTS.index(A_SCALE)] is None
-        assert owned[COMPONENTS.index(B_SCALE)] is None
+        non_k_slots = schedule.buffer_load_panels(slot)
+        assert non_k_slots[COMPONENTS.index(A_SCALE)] is None
+        assert non_k_slots[COMPONENTS.index(B_SCALE)] is None
     assert maybe_unwrap(schedule.depth) == 4
     assert maybe_unwrap(schedule.unroll) == 12
     assert _plain(host._validate_selected_pipeline(tc, layout, 7168))
@@ -1293,7 +1293,7 @@ def _executed_step(schedule, num_k, k_step):
         return schedule.peeled_step(k_step - 1)
     if k_step > main:
         static_drain = maybe_unwrap(schedule.static_drain)
-        phase = main % maybe_unwrap(schedule.ring_period) if static_drain else 0
+        phase = main % maybe_unwrap(schedule.buffer_period) if static_drain else 0
         return schedule.drain_step(phase, k_step - main - 1)
     loop_end = peeled + (main - peeled) // unroll * unroll
     if k_step <= loop_end:
@@ -1389,7 +1389,7 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
         assert all(existing[0] != component for existing in ds_read_slots[ds_read_slot])
         ds_read_slots[ds_read_slot].append(copy)
     for slot, expected in enumerate(buffer_load_slots):
-        actual = schedule.owned(slot)
+        actual = schedule.buffer_load_panels(slot)
         assert (
             tuple(
                 (component, tile)

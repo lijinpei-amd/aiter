@@ -374,9 +374,9 @@ class KernelLayout:
             [SLOT_M, payload_block_k_storage[0]],
             [payload_block_k_storage[1], SLOT_N],
         )
-        num_lds_slots_non_k = (num_m_slots, num_n_slots)
+        num_panels = (num_m_slots, num_n_slots)
         payload_shape_tile = tuple(
-            [tc.num_buffers(idx) * num_lds_slots_non_k[idx]] + payload_shape_slot[idx]
+            [tc.num_buffers(idx) * num_panels[idx]] + payload_shape_slot[idx]
             for idx in ops
         )
 
@@ -746,7 +746,7 @@ class KernelLayout:
         return K // BK
 
     @gluon.constexpr_function
-    def num_lds_slots_non_k(self, idx):
+    def num_panels(self, idx):
         return (self.num_m_slots.value, self.num_n_slots.value)[idx]
 
     @gluon.constexpr_function
