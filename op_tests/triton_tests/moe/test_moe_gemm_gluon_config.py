@@ -434,6 +434,32 @@ def test_t256_mxfp8_gemm1_uses_validated_streaming_geometry():
     )
 
 
+def test_small_t_mxfp8_gemm1_fits_two_ctas_per_cu():
+    config = host._default_launch_config(
+        32, 4096, 7168, DtypeQuant.MXFP8, DtypeQuant.MXFP8, False, True
+    )
+    expected = {
+        "BLOCK_M": 32,
+        "BLOCK_N": 64,
+        "BLOCK_K": 256,
+        "SLOT_M": 32,
+        "SLOT_N": 32,
+        "warps_per_cta": (2, 2),
+        "tiles_per_warp": (1, 1),
+        "B_SCALE_SHUFFLED": True,
+        "expert_cache_modifier": ".cg",
+        "expert_scale_cache_modifier": ".cg",
+    }
+    assert {name: config[name] for name in expected} == expected
+    tuning = host._probe_tuning_config(config, DtypeQuant.MXFP8, DtypeQuant.MXFP8)
+    assert host._cval(validate(tuning, 4096, 7168))
+    # The point of the tile: half the LDS budget, so two CTAs share a CU.
+    assert (
+        host._probe_lds_bytes(config, DtypeQuant.MXFP8, DtypeQuant.MXFP8)
+        <= host.LDS_USABLE_BYTES // 2
+    )
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -474,7 +500,7 @@ def test_t256_mxfp8_gemm1_geometry_override_is_narrow(overrides):
         # override, so it does not fall back to the bare ladder. What matters here is
         # that it is not wearing the T=256 geometry.
         assert selected != baseline
-        assert (selected["BLOCK_K"], selected["SLOT_M"]) != (256, 32)
+        assert (selected["BLOCK_N"], selected["SLOT_N"]) != (128, 64)
         assert selected["BLOCK_M"] == 32
     elif overrides == {"dq_b": DtypeQuant.MXFP4}:
         # MXFP4 weights at block_m 64 also carry their own measured override now. The
@@ -541,8 +567,10 @@ def test_streaming_expert_payload_respects_explicit_config(explicit):
         # An unshuffled MXFP8 B scale row of 4 bytes copied through LDS.
         (DtypeQuant.MXFP8, 16, 1024, False, 128, False, ".cg"),
         (DtypeQuant.MXFP8, 128, 2880, False, 128, False, ".cg"),
-        # Unshuffled at BLOCK_K 256, where the hint measured slower at T=16/64.
-        (DtypeQuant.MXFP8, 32, 7168, False, 256, False, ""),
+        # The T<=64 tile shuffles them too.
+        (DtypeQuant.MXFP8, 32, 7168, False, 256, True, ".cg"),
+        # Unshuffled at BLOCK_K 256, where the hint measured slower.
+        (DtypeQuant.MXFP8, 64, 7168, False, 256, False, ""),
         # MXFP4 weights take the hint at every BLOCK_K.
         (DtypeQuant.MXFP4, 16, 1024, False, 128, False, ".cg"),
     ],

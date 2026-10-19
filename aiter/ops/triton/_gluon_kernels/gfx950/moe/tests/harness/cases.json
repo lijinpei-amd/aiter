@@ -795,13 +795,13 @@
           "A_SCALE_SORTED_SHUFFLED": false,
           "BLOCK_K": 256,
           "BLOCK_M": 32,
-          "BLOCK_N": 128,
+          "BLOCK_N": 64,
           "ALLOW_B_VIA_LDS": true,
           "B_NUM_BUFFER": 0,
           "B_PRESHUFFLED": false,
           "ALLOW_B_SCALE_VIA_LDS": true,
           "B_SCALE_NUM_BUFFER": 0,
-          "B_SCALE_SHUFFLED": false,
+          "B_SCALE_SHUFFLED": true,
           "DS_READ_A_PAYLOAD_IN_MFMA": false,
           "DS_READ_A_SCALE_IN_MFMA": false,
           "DS_READ_B_PAYLOAD_IN_MFMA": false,
@@ -809,8 +809,8 @@
           "FROZEN_STEP": false,
           "GROUP_M": 4,
           "K_UNROLL": 3,
-          "SLOT_M": 16,
-          "SLOT_N": 64,
+          "SLOT_M": 32,
+          "SLOT_N": 32,
           "NUM_LDS_BUFFER": 3,
           "NUM_XCDS": 8,
           "SCALE_FILL_MID": false,
@@ -826,7 +826,7 @@
           "WARP_PIPELINE": 0,
           "WAVES_PER_EU": 0,
           "expert_cache_modifier": ".cg",
-          "expert_scale_cache_modifier": "",
+          "expert_scale_cache_modifier": ".cg",
           "k_width": null,
           "mfma_instr_shape": [
             16,
@@ -843,8 +843,8 @@
           "token_scale_cache_modifier": "",
           "transposed": true,
           "warps_per_cta": [
-            1,
-            4
+            2,
+            2
           ]
         },
         "env": {}
@@ -858,13 +858,13 @@
           "A_SCALE_SORTED_SHUFFLED": false,
           "BLOCK_K": 256,
           "BLOCK_M": 32,
-          "BLOCK_N": 128,
+          "BLOCK_N": 64,
           "ALLOW_B_VIA_LDS": true,
           "B_NUM_BUFFER": 0,
           "B_PRESHUFFLED": false,
           "ALLOW_B_SCALE_VIA_LDS": true,
           "B_SCALE_NUM_BUFFER": 0,
-          "B_SCALE_SHUFFLED": false,
+          "B_SCALE_SHUFFLED": true,
           "DS_READ_A_PAYLOAD_IN_MFMA": false,
           "DS_READ_A_SCALE_IN_MFMA": false,
           "DS_READ_B_PAYLOAD_IN_MFMA": false,
@@ -872,8 +872,8 @@
           "FROZEN_STEP": false,
           "GROUP_M": 4,
           "K_UNROLL": 3,
-          "SLOT_M": 16,
-          "SLOT_N": 64,
+          "SLOT_M": 32,
+          "SLOT_N": 32,
           "NUM_LDS_BUFFER": 3,
           "NUM_XCDS": 8,
           "SCALE_FILL_MID": false,
@@ -889,7 +889,7 @@
           "WARP_PIPELINE": 0,
           "WAVES_PER_EU": 0,
           "expert_cache_modifier": ".cg",
-          "expert_scale_cache_modifier": "",
+          "expert_scale_cache_modifier": ".cg",
           "k_width": null,
           "mfma_instr_shape": [
             16,
@@ -906,8 +906,8 @@
           "token_scale_cache_modifier": "",
           "transposed": true,
           "warps_per_cta": [
-            1,
-            4
+            2,
+            2
           ]
         },
         "env": {}

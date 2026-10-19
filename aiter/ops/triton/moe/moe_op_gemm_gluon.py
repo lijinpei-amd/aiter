@@ -945,6 +945,29 @@ def _default_launch_config(
             K_UNROLL=3,
             VGPR_PREFETCH_K=512 if dq_b == DtypeQuant.MXFP4 else 256,
         )
+        if dq_b == DtypeQuant.MXFP8:
+            # a8w8 at BLOCK_N 128 needs 126 KB of LDS and 296 registers, so one CTA
+            # (four waves) holds a CU; FlyDSL keeps two there. BLOCK_N 64 halves the
+            # ring to 76 KB and fits two. Shuffled B scales make each scale fetch a
+            # contiguous 256 B run, which lets them take the `.cg` hint below; the
+            # unshuffled 8-byte rows lost with it. In-process cold A/B against
+            # FlyDSL, each arm the mean of four weight placements, us:
+            #
+            #                                T=16    T=64
+            #   BLOCK_N 128 (was)           224.8   233.6
+            #   + shuffled B scale, .cg     200.2   203.6
+            #   + BLOCK_N 64                181.1   183.8
+            #   FlyDSL                      211.0   217.8
+            #
+            # bench_out/gluon_moe_regression/a8small/ab/var4_{16,64}.
+            c = dict(
+                c,
+                BLOCK_N=64,
+                SLOT_M=32,
+                SLOT_N=32,
+                warps_per_cta=(2, 2),
+                B_SCALE_SHUFFLED=True,
+            )
     if (
         apply_swiglu
         and dq_a == dq_b == DtypeQuant.MXFP8
@@ -1121,12 +1144,14 @@ def _default_launch_config(
     ):
         # The MXFP8 weight-scale exceptions to get_gluon_config's empty hint.
         #
-        # Shuffled scales: the overrides above shuffle them only for the T>=256
-        # tiles, and the measured split follows that line. Every cell that gains
-        # reads CDNA4_SCALE scales; both cells that lose read unshuffled scales at
-        # BLOCK_K 256. Cold, current a8w8 pins on H7168-I2048-E33-k8, `.cg` vs none:
+        # Shuffled scales: every cell that gains reads CDNA4_SCALE scales; both
+        # cells that lose read unshuffled scales at BLOCK_K 256. Cold a8w8 pins on
+        # H7168-I2048-E33-k8, `.cg` vs none:
         #
         #   T=256 -11.1%   T=1024 -2.5%   T=4096 -0.3%   (T=16 +2.2%, T=64 +2.4%)
+        #
+        # T=16/64 were the unshuffled ones; their block_m 32 tile now shuffles too,
+        # and with the hint gains (see that override).
         #
         # Those overrides only shuffle when N and K are multiples of 256, where
         # _shuffled_b_scales always succeeds, so the launch never drops the shuffle
