@@ -979,7 +979,7 @@ def _straight_line_waits(schedule, tc, last):
             (step - schedule.fill_span(c) + 1, c, schedule.ds_read_non_k_slot(slot, c))
             for c in COMPONENTS
             if schedule.ds_read_non_k_slot(slot, c) is not None
-            and schedule.via_lds(c)
+            and tc.component_via_lds(c)
             and schedule.ds_reads_at_phase(c, step)
         }
 

@@ -217,7 +217,7 @@ def _init_buffers(pc):
     layout: gl.constexpr = pc.layout
     sched: gl.constexpr = pc.schedule
     a, b, a_scale, b_scale = (), (), (), ()
-    if require_constexpr(sched.in_reg(_A_PAYLOAD)):
+    if require_constexpr(layout.component_in_reg(_A_PAYLOAD)):
         for _ in gl.static_range(
             tc.num_buffers(0) * layout.num_m_slots * layout.num_k_slots
         ):
@@ -228,7 +228,7 @@ def _init_buffers(pc):
                     layout.fragment_layout(0, False),
                 ),
             )
-    if require_constexpr(sched.in_reg(_B_PAYLOAD)):
+    if require_constexpr(layout.component_in_reg(_B_PAYLOAD)):
         for _ in gl.static_range(
             tc.num_buffers(1) * layout.num_n_slots * layout.num_k_slots
         ):
@@ -239,7 +239,7 @@ def _init_buffers(pc):
                     layout.fragment_layout(1, False),
                 ),
             )
-    if require_constexpr(sched.present(_A_SCALE) and sched.in_reg(_A_SCALE)):
+    if require_constexpr(sched.present(_A_SCALE) and layout.component_in_reg(_A_SCALE)):
         for _ in gl.static_range(
             tc.num_buffers(0, True)
             * layout.num_m_slots
@@ -253,7 +253,7 @@ def _init_buffers(pc):
                     layout.fragment_layout(0, True),
                 ),
             )
-    if require_constexpr(sched.present(_B_SCALE) and sched.in_reg(_B_SCALE)):
+    if require_constexpr(sched.present(_B_SCALE) and layout.component_in_reg(_B_SCALE)):
         for _ in gl.static_range(
             tc.num_buffers(1, True)
             * layout.num_n_slots
@@ -310,7 +310,7 @@ def _fill_slot(
     )
     a, b, a_scale, b_scale = buffers
     if require_constexpr(ops[0] is not None):
-        if require_constexpr(sched.via_lds(_A_PAYLOAD)):
+        if require_constexpr(layout.component_via_lds(_A_PAYLOAD)):
             pc.lds_ptrs.buffer_load_payload(
                 0,
                 True,
@@ -338,7 +338,7 @@ def _fill_slot(
                 (sched.register_index(STEP, _A_PAYLOAD, True) * nm + ops[0]) * mk,
             )
     if require_constexpr(ops[1] is not None):
-        if require_constexpr(sched.via_lds(_A_SCALE)):
+        if require_constexpr(layout.component_via_lds(_A_SCALE)):
             pc.lds_ptrs.buffer_load_scale(
                 0,
                 True,
@@ -368,7 +368,7 @@ def _fill_slot(
                 * sched.ratio_k(_A_SCALE),
             )
     if require_constexpr(ops[2] is not None):
-        if require_constexpr(sched.in_reg(_B_PAYLOAD)):
+        if require_constexpr(layout.component_in_reg(_B_PAYLOAD)):
             fragments = pc.lds_ptrs.buffer_load_payload(
                 1,
                 False,
@@ -396,7 +396,7 @@ def _fill_slot(
             if require_constexpr(sched.commit_per_copy):
                 pc.lds_ptrs.commit_buffer_load()
     if require_constexpr(ops[3] is not None):
-        if require_constexpr(sched.via_lds(_B_SCALE)):
+        if require_constexpr(layout.component_via_lds(_B_SCALE)):
             pc.lds_ptrs.buffer_load_scale(
                 1,
                 True,
@@ -485,7 +485,7 @@ def _ds_read_payload(
     layout: gl.constexpr = pc.layout
     sched: gl.constexpr = pc.schedule
     component: gl.constexpr = (operand, False)
-    reg_payload: gl.constexpr = sched.in_reg(component)
+    reg_payload: gl.constexpr = layout.component_in_reg(component)
     frags = ()
     for k in gl.static_range(layout.num_k_slots):
         payload, _ = pc.lds_ptrs.ds_read_frag(
@@ -522,7 +522,7 @@ def _ds_read_scale(
     layout: gl.constexpr = pc.layout
     sched: gl.constexpr = pc.schedule
     component: gl.constexpr = (operand, True)
-    if require_constexpr(sched.via_lds(component)):
+    if require_constexpr(layout.component_via_lds(component)):
         fragments = pc.lds_ptrs.ds_read_scale(
             operand,
             _index(sched, step, STEP, component, False),
@@ -690,7 +690,13 @@ def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
             a_scale += asm + asf
             b_scale += bsm + bsf
             acc += (value,)
-    if require_constexpr(IN_LOOP and sched.has_register_component() and not warp):
+    has_register_component: gl.constexpr = (
+        layout.component_in_reg(_A_PAYLOAD)
+        or layout.component_in_reg(_B_PAYLOAD)
+        or (sched.present(_A_SCALE) and layout.component_in_reg(_A_SCALE))
+        or (sched.present(_B_SCALE) and layout.component_in_reg(_B_SCALE))
+    )
+    if require_constexpr(IN_LOOP and has_register_component and not warp):
         gl.amd.cdna4.sched_barrier(0)
     if require_constexpr(not IN_LOOP):
         buffers = _rotate_buffers(buffers, sched, layout, PHASE)

@@ -188,7 +188,7 @@ def dump_case(name, cfg, dq_a, dq_b, K, out):
         f"ring={maybe_unwrap(schedule.ring_period)} "
         f"regperiod={maybe_unwrap(schedule.register_period)} "
         f"async={maybe_unwrap(schedule.async_period)} "
-        f"hasreg={schedule.has_register_component()}")
+        f"hasreg={any(schedule.present(c) and layout.component_in_reg(c) for c in COMPONENTS)}")
     out(f"  regions static_remainder={maybe_unwrap(schedule.static_remainder)} "
         f"static_drain={maybe_unwrap(schedule.static_drain)} "
         f"epilogue_groups={maybe_unwrap(schedule.epilogue_groups)} "
@@ -205,7 +205,7 @@ def dump_case(name, cfg, dq_a, dq_b, K, out):
         non_k_slots = nm if c[0] == 0 else nn
         out(f"  {CNAME[c]} D={schedule.ring_depth(c)} R={schedule.ratio_k(c)} "
             f"L={schedule.live_span(c)} F={schedule.fill_span(c)} "
-            f"via_lds={schedule.via_lds(c)} pphase={schedule.producer_phase(c)} "
+            f"via_lds={bool(layout.component_via_lds(c))} pphase={schedule.producer_phase(c)} "
             f"nonk_ratio={layout.scale_slot_nonk(c[0]) // layout.slot_nonk(c[0])} "
             f"fill_slots={tuple(schedule.fill_slot(c, t) for t in range(non_k_slots))} "
             f"ds_read_slots={tuple(schedule.ds_read_slot(c, t) for t in range(non_k_slots))} "
