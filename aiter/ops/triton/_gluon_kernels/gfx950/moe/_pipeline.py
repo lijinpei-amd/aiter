@@ -564,11 +564,13 @@ def _ds_read_slot(
 ):
     layout: gl.constexpr = pc.layout
     sched: gl.constexpr = pc.schedule
-    slot: gl.constexpr = _slot_index(mi, ni, layout.num_m_slots, layout.num_n_slots)
-    at: gl.constexpr = sched.ds_read_non_k_slot(slot, _A_PAYLOAD)
-    ast: gl.constexpr = sched.ds_read_non_k_slot(slot, _A_SCALE)
-    bt: gl.constexpr = sched.ds_read_non_k_slot(slot, _B_PAYLOAD)
-    bst: gl.constexpr = sched.ds_read_non_k_slot(slot, _B_SCALE)
+    slot_index: gl.constexpr = _slot_index(
+        mi, ni, layout.num_m_slots, layout.num_n_slots
+    )
+    at: gl.constexpr = sched.ds_read_non_k_slot(slot_index, _A_PAYLOAD)
+    ast: gl.constexpr = sched.ds_read_non_k_slot(slot_index, _A_SCALE)
+    bt: gl.constexpr = sched.ds_read_non_k_slot(slot_index, _B_PAYLOAD)
+    bst: gl.constexpr = sched.ds_read_non_k_slot(slot_index, _B_SCALE)
     a, b, a_scale, b_scale = (), (), (), ()
     if require_constexpr(
         at is not None and sched.ds_read_in_mfma(_A_PAYLOAD, at) == MFMA
