@@ -242,6 +242,7 @@ class KernelLayout:
     scale_block_k: gl.constexpr
     _scale_slot_nonk: gl.constexpr
     _scale_slot_k: gl.constexpr
+    scale_steps_per_buffer: gl.constexpr
     _scale_packed_ok: gl.constexpr
     _scale_packed_sel: gl.constexpr
     any_scale_packed: gl.constexpr
@@ -341,6 +342,10 @@ class KernelLayout:
         assert (
             tc.transposed.value
         ), "transposed=True is pinned, see the module docstring"
+        scale_steps_per_buffer = tuple(
+            (scale_slot_nonk[idx] // slot_nonk[idx], scale_slot_k[idx] // scale_block_k)
+            for idx in ops
+        )
 
         num_warps = warps[0] * warps[1]
         num_k_slots = 1
@@ -689,6 +694,7 @@ class KernelLayout:
         self.scale_block_k = gl.constexpr(scale_block_k)
         self._scale_slot_nonk = gl.constexpr(scale_slot_nonk)
         self._scale_slot_k = gl.constexpr(scale_slot_k)
+        self.scale_steps_per_buffer = gl.constexpr(scale_steps_per_buffer)
         self._scale_packed_ok = gl.constexpr(scale_packed_ok)
         self._scale_packed_sel = gl.constexpr(scale_packed_sel)
         self.any_scale_packed = gl.constexpr(any_scale_packed)
