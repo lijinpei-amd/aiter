@@ -917,57 +917,49 @@ def _default_launch_config(
         # of that stream it keeps in flight -- not by MFMA and not by the HBM roof
         # (3.9 TB/s is about half of peak here).
         #
-        # Two things buy the bandwidth back, measured cold against a paired FlyDSL
-        # control (bench_out/a8_smallt_20260920, 4 rounds x 100 samples):
+        # The first round, measured cold against a paired FlyDSL control
+        # (bench_out/a8_smallt_20260920, 4 rounds x 100 samples):
         #
         #   a8w4 T16  200.4 -> 132.8 us   a8w4 T64  206.5 -> 138.8 us
         #   a8w8 T16  280.1 -> 232.9 us   a8w8 T64  287.6 -> 242.1 us
         #
-        # FlyDSL on the same shapes is 132.1/133.6 and 241.5/242.5, so this is parity
-        # rather than a partial recovery. The `.cg` hint on the expert stream is most
-        # of it and comes from the block_m <= 32 rule above; what is set here is the
-        # geometry that hint needs -- and, decisively, SLOT_M/N at the warp
-        # granularity rather than the whole tile. Leaving them at the tile gives one
-        # slot per axis, which gate/up split refuses outright, so these shapes fell
-        # back to the Triton kernel and none of the tuning above ever ran.
+        # FlyDSL on the same shapes was 132.1/133.6 and 241.5/242.5. The `.cg` hint on
+        # the expert stream is most of it and comes from the block_m <= 32 rule above.
+        # SLOT_M/N at the warp granularity rather than the whole tile matter too: one
+        # slot per axis is refused by gate/up split outright.
+        #
+        # The tile itself is set by occupancy. The old BLOCK_N 128 tile held one CTA
+        # (four waves) per CU: 126 KB of LDS and 296 registers for a8w8, 155 KB and
+        # 336 for a8w4 at BLOCK_K 512. FlyDSL keeps two or more. BLOCK_N 64 at
+        # BLOCK_K 256 fits two a8w8 CTAs (76 KB, 188 registers) and three a8w4 ones
+        # (51 KB, 140 registers). Shuffled B scales make each scale fetch a contiguous
+        # 256 B run that streams under `.cg`; the unshuffled MXFP8 rows lost with it.
+        # In-process cold A/B against FlyDSL, each arm the mean of four weight
+        # placements, us:
+        #
+        #                                      a8w8 T=16  T=64   a8w4 T=16  T=64
+        #   BLOCK_N 128 (was)                  224.8  233.6      140.4  144.6
+        #   + shuffled B scale (.cg on both)   200.2  203.6      127.9  126.2
+        #   + BLOCK_N 64, BLOCK_K 256          181.1  183.8       99.2  104.8
+        #   FlyDSL                             211.0  217.8      130.9  125.1
+        #
+        # A deeper ring loses: two a8w4 stages at BLOCK_K 512 (164 us), four at
+        # BLOCK_K 256 (396 registers, one CTA). BLOCK_K 128 cannot read shuffled
+        # scales. bench_out/gluon_moe_regression/a8small/ab/{var4,w4v1,w4v2}_{16,64}.
         c = dict(
             c,
-            BLOCK_N=128,
-            # a8w4 halves the weight bytes per K step, so it can afford twice the K
-            # depth inside the same LDS budget; a8w8 cannot.
-            BLOCK_K=512 if dq_b == DtypeQuant.MXFP4 else 256,
-            SLOT_M=16,
-            SLOT_N=64,
+            BLOCK_N=64,
+            BLOCK_K=256,
+            SLOT_M=32,
+            SLOT_N=32,
             mfma_instr_shape=(16, 16, 128),
-            warps_per_cta=(1, 4),
+            warps_per_cta=(2, 2),
             tiles_per_warp=(1, 1),
             NUM_LDS_BUFFER=3,
             K_UNROLL=3,
-            VGPR_PREFETCH_K=512 if dq_b == DtypeQuant.MXFP4 else 256,
+            VGPR_PREFETCH_K=256,
+            B_SCALE_SHUFFLED=True,
         )
-        if dq_b == DtypeQuant.MXFP8:
-            # a8w8 at BLOCK_N 128 needs 126 KB of LDS and 296 registers, so one CTA
-            # (four waves) holds a CU; FlyDSL keeps two there. BLOCK_N 64 halves the
-            # ring to 76 KB and fits two. Shuffled B scales make each scale fetch a
-            # contiguous 256 B run, which lets them take the `.cg` hint below; the
-            # unshuffled 8-byte rows lost with it. In-process cold A/B against
-            # FlyDSL, each arm the mean of four weight placements, us:
-            #
-            #                                T=16    T=64
-            #   BLOCK_N 128 (was)           224.8   233.6
-            #   + shuffled B scale, .cg     200.2   203.6
-            #   + BLOCK_N 64                181.1   183.8
-            #   FlyDSL                      211.0   217.8
-            #
-            # bench_out/gluon_moe_regression/a8small/ab/var4_{16,64}.
-            c = dict(
-                c,
-                BLOCK_N=64,
-                SLOT_M=32,
-                SLOT_N=32,
-                warps_per_cta=(2, 2),
-                B_SCALE_SHUFFLED=True,
-            )
     if (
         apply_swiglu
         and dq_a == dq_b == DtypeQuant.MXFP8

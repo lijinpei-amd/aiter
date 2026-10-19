@@ -434,9 +434,12 @@ def test_t256_mxfp8_gemm1_uses_validated_streaming_geometry():
     )
 
 
-def test_small_t_mxfp8_gemm1_fits_two_ctas_per_cu():
+@pytest.mark.parametrize(
+    "dq_b,ctas_per_cu", [(DtypeQuant.MXFP8, 2), (DtypeQuant.MXFP4, 3)]
+)
+def test_small_t_mxfp8_gemm1_fits_several_ctas_per_cu(dq_b, ctas_per_cu):
     config = host._default_launch_config(
-        32, 4096, 7168, DtypeQuant.MXFP8, DtypeQuant.MXFP8, False, True
+        32, 4096, 7168, DtypeQuant.MXFP8, dq_b, False, True
     )
     expected = {
         "BLOCK_M": 32,
@@ -451,12 +454,12 @@ def test_small_t_mxfp8_gemm1_fits_two_ctas_per_cu():
         "expert_scale_cache_modifier": ".cg",
     }
     assert {name: config[name] for name in expected} == expected
-    tuning = host._probe_tuning_config(config, DtypeQuant.MXFP8, DtypeQuant.MXFP8)
+    tuning = host._probe_tuning_config(config, DtypeQuant.MXFP8, dq_b)
     assert host._cval(validate(tuning, 4096, 7168))
-    # The point of the tile: half the LDS budget, so two CTAs share a CU.
+    # The point of the tile: several CTAs share a CU's LDS.
     assert (
-        host._probe_lds_bytes(config, DtypeQuant.MXFP8, DtypeQuant.MXFP8)
-        <= host.LDS_USABLE_BYTES // 2
+        host._probe_lds_bytes(config, DtypeQuant.MXFP8, dq_b)
+        <= host.LDS_USABLE_BYTES // ctas_per_cu
     )
 
 

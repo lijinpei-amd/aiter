@@ -266,111 +266,111 @@
   lds_bytes = 156672
   #mangle_sha256 = b97cde66814f2116b52c812c2d1557c2c5c80b66fc916a65905237d1958cf722
 == sched/prod-a8w4-t16
-  cfg KernelTuningConfig(func_cfg=KernelFuncConfig(token_dtype_quant=cx(3), expert_dtype_quant=cx(2), token_online_quant=cx(3), expert_online_quant=cx(2), mma_acc_dtype=cx(dtype:triton.language.float32), activation=cx(None), output_quant=cx(None), has_bias=cx(False), has_gammas=cx(False), has_gather=cx(False), has_x_static_scale=cx(False), weight_gu_hbm_layout=cx(0), epilogue=cx(0)), BLOCK_M=cx(32), BLOCK_N=cx(128), BLOCK_K=cx(512), K_UNROLL=cx(3), SLOT_M=cx(16), SLOT_N=cx(64), NUM_LDS_BUFFER=cx(3), mfma_instr_shape=cx([16, 16, 128]), warps_per_cta=cx([1, 4]), tiles_per_warp=cx([1, 1]), k_width=cx(None), transposed=cx(True), WAVES_PER_EU=cx(0), TILE_SCHED=cx(2), GROUP_M=cx(4), NUM_XCDS=cx(8), token_cache_modifier=cx(''), token_scale_cache_modifier=cx(''), expert_cache_modifier=cx('.cg'), expert_scale_cache_modifier=cx('.cg'), result_cache_modifier=cx(''), result_scale_cache_modifier=cx(''), WARP_PIPELINE=cx(0), VGPR_PREFETCH_K=cx(512), A_SCALE_SORTED_SHUFFLED=cx(False), B_SCALE_SHUFFLED=cx(False), B_PRESHUFFLED=cx(False), ACT_FAST_RCP=cx(True), WAIT_COMMIT_SCHEME=cx(1), DS_READ_A_PAYLOAD_IN_MFMA=cx(False), DS_READ_A_SCALE_IN_MFMA=cx(False), DS_READ_B_PAYLOAD_IN_MFMA=cx(False), DS_READ_B_SCALE_IN_MFMA=cx(False), SCHED_MODE=cx(0), FROZEN_STEP=cx(False), SOFF_UNROLL=cx(False), SCALE_FILL_MID=cx(False), ALLOW_B_VIA_LDS=cx(True), ALLOW_B_SCALE_VIA_LDS=cx(True), ALLOW_A_SCALE_VIA_LDS=cx(True), A_NUM_BUFFER=cx(0), B_NUM_BUFFER=cx(0), A_SCALE_NUM_BUFFER=cx(0), B_SCALE_NUM_BUFFER=cx(0), SCALE_SLOT_M=cx(0), SCALE_SLOT_N=cx(0), SCALE_SLOT_K=cx(0), UNROLL_EPILOGUE=cx(True))
-  _BLOCK_N = 128
-  _BLOCK_K = 512
+  cfg KernelTuningConfig(func_cfg=KernelFuncConfig(token_dtype_quant=cx(3), expert_dtype_quant=cx(2), token_online_quant=cx(3), expert_online_quant=cx(2), mma_acc_dtype=cx(dtype:triton.language.float32), activation=cx(None), output_quant=cx(None), has_bias=cx(False), has_gammas=cx(False), has_gather=cx(False), has_x_static_scale=cx(False), weight_gu_hbm_layout=cx(0), epilogue=cx(0)), BLOCK_M=cx(32), BLOCK_N=cx(64), BLOCK_K=cx(256), K_UNROLL=cx(3), SLOT_M=cx(32), SLOT_N=cx(32), NUM_LDS_BUFFER=cx(3), mfma_instr_shape=cx([16, 16, 128]), warps_per_cta=cx([2, 2]), tiles_per_warp=cx([1, 1]), k_width=cx(None), transposed=cx(True), WAVES_PER_EU=cx(0), TILE_SCHED=cx(2), GROUP_M=cx(4), NUM_XCDS=cx(8), token_cache_modifier=cx(''), token_scale_cache_modifier=cx(''), expert_cache_modifier=cx('.cg'), expert_scale_cache_modifier=cx('.cg'), result_cache_modifier=cx(''), result_scale_cache_modifier=cx(''), WARP_PIPELINE=cx(0), VGPR_PREFETCH_K=cx(256), A_SCALE_SORTED_SHUFFLED=cx(False), B_SCALE_SHUFFLED=cx(True), B_PRESHUFFLED=cx(False), ACT_FAST_RCP=cx(True), WAIT_COMMIT_SCHEME=cx(1), DS_READ_A_PAYLOAD_IN_MFMA=cx(False), DS_READ_A_SCALE_IN_MFMA=cx(False), DS_READ_B_PAYLOAD_IN_MFMA=cx(False), DS_READ_B_SCALE_IN_MFMA=cx(False), SCHED_MODE=cx(0), FROZEN_STEP=cx(False), SOFF_UNROLL=cx(False), SCALE_FILL_MID=cx(False), ALLOW_B_VIA_LDS=cx(True), ALLOW_B_SCALE_VIA_LDS=cx(True), ALLOW_A_SCALE_VIA_LDS=cx(True), A_NUM_BUFFER=cx(0), B_NUM_BUFFER=cx(0), A_SCALE_NUM_BUFFER=cx(0), B_SCALE_NUM_BUFFER=cx(0), SCALE_SLOT_M=cx(0), SCALE_SLOT_N=cx(0), SCALE_SLOT_K=cx(0), UNROLL_EPILOGUE=cx(True))
+  _BLOCK_N = 64
+  _BLOCK_K = 256
   _mfma_instr_shape = [16, 16, 128]
   _weight_gu_hbm_layout = 0
   num_warps = 4
   num_k_slots = 1
   num_prefetch_k_slots = 1
-  num_m_slots = 2
+  num_m_slots = 1
   num_n_slots = 2
   _component_via_lds = ((True, True), (True, True))
-  _payload_block_k_storage = (512, 256)
-  _payload_hbm_step = (512, 256)
+  _payload_block_k_storage = (256, 128)
+  _payload_hbm_step = (256, 128)
   _payload_byte_unit_lds_ok = (False, False)
-  payload_a_sorted_shuffled_ok = False
-  _payload_shape_tile = ([6, 16, 512], [6, 256, 64])
-  _payload_shape_slot = ([16, 512], [256, 64])
-  _payload_hbm_offset_layout = (DistributedLinearLayout(reg_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [4, 0]], lane_bases=[[0, 16], [0, 32], [0, 64], [0, 128], [0, 256], [8, 0]], warp_bases=[[1, 0], [2, 0]], block_bases=[], shape=[16, 512]), DistributedLinearLayout(reg_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 4], [0, 8]], lane_bases=[[16, 0], [32, 0], [64, 0], [128, 0], [0, 16], [0, 32]], warp_bases=[[0, 1], [0, 2]], block_bases=[], shape=[256, 64]))
-  _payload_lds_layout = (PaddedSharedLayout(interval_padding_pairs=[(1024, 32)], offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [0, 256], [8, 0], [1, 0], [2, 0], [4, 0]], cga_layout=[], shape=[16, 512]), PaddedSharedLayout(interval_padding_pairs=[(1024, 32)], offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [128, 0], [0, 16], [0, 32], [0, 1], [0, 2], [0, 4], [0, 8]], cga_layout=[], shape=[256, 64]))
-  _payload_fragment_layout = (DotOperandLayout(operand_index=0, parent=AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True, warps_per_cta=[1, 4], element_bitwidth=32, tiles_per_warp=[1, 1], cga_layout=[]), k_width=16), DotOperandLayout(operand_index=1, parent=AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True, warps_per_cta=[1, 4], element_bitwidth=32, tiles_per_warp=[1, 1], cga_layout=[]), k_width=16))
-  scale_block_k = 16
-  _scale_slot_nonk = (16, 64)
-  _scale_slot_k = (16, 16)
+  payload_a_sorted_shuffled_ok = True
+  _payload_shape_tile = ([3, 32, 256], [6, 128, 32])
+  _payload_shape_slot = ([32, 256], [128, 32])
+  _payload_hbm_offset_layout = (DistributedLinearLayout(reg_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [4, 0]], lane_bases=[[0, 16], [0, 32], [0, 64], [0, 128], [8, 0], [16, 0]], warp_bases=[[1, 0], [2, 0]], block_bases=[], shape=[32, 256]), DistributedLinearLayout(reg_bases=[[1, 0], [2, 0], [4, 0], [8, 0]], lane_bases=[[16, 0], [32, 0], [64, 0], [0, 4], [0, 8], [0, 16]], warp_bases=[[0, 1], [0, 2]], block_bases=[], shape=[128, 32]))
+  _payload_lds_layout = (PaddedSharedLayout(interval_padding_pairs=[(1024, 32)], offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [8, 0], [16, 0], [1, 0], [2, 0], [4, 0]], cga_layout=[], shape=[32, 256]), PaddedSharedLayout(interval_padding_pairs=[(1024, 32)], offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [0, 4], [0, 8], [0, 16], [0, 1], [0, 2]], cga_layout=[], shape=[128, 32]))
+  _payload_fragment_layout = (DotOperandLayout(operand_index=0, parent=AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True, warps_per_cta=[2, 2], element_bitwidth=32, tiles_per_warp=[1, 1], cga_layout=[]), k_width=16), DotOperandLayout(operand_index=1, parent=AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True, warps_per_cta=[2, 2], element_bitwidth=32, tiles_per_warp=[1, 1], cga_layout=[]), k_width=16))
+  scale_block_k = 8
+  _scale_slot_nonk = (32, 32)
+  _scale_slot_k = (8, 8)
   _scale_packed_ok = (False, False)
   _scale_packed_sel = ((None, None), (None, None))
   any_scale_packed = False
-  _scale_shape_tile = ([6, 16, 16], [6, 64, 16])
-  _scale_slot_shape_storage = ([16, 16], [64, 16])
-  _scale_slot_shape_logical = ([16, 16], [64, 16])
-  _scale_fragment_shape_slot = ([16, 16], [64, 16])
-  _scale_hbm_offset_layout = (BlockedLayout(size_per_thread=[1, 4], threads_per_warp=[16, 4], warps_per_cta=[4, 1], order=[1, 0], cga_layout=[]), BlockedLayout(size_per_thread=[1, 4], threads_per_warp=[16, 4], warps_per_cta=[4, 1], order=[1, 0], cga_layout=[]))
+  _scale_shape_tile = ([3, 32, 8], [6, 1, 256])
+  _scale_slot_shape_storage = ([32, 8], [1, 256])
+  _scale_slot_shape_logical = ([32, 8], [32, 8])
+  _scale_fragment_shape_slot = ([32, 8], [32, 8])
+  _scale_hbm_offset_layout = (BlockedLayout(size_per_thread=[1, 4], threads_per_warp=[32, 2], warps_per_cta=[4, 1], order=[1, 0], cga_layout=[]), BlockedLayout(size_per_thread=[1, 4], threads_per_warp=[1, 64], warps_per_cta=[4, 1], order=[1, 0], cga_layout=[]))
   _scale_lds_layout = SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0], cga_layout=[])
-  _scale_slot_lds_view_layout = (SharedLinearLayout(offset_bases=[[16, 0], [0, 4], [1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2], [0, 8]], block_bases=[], alignment=16), SharedLinearLayout(offset_bases=[[16, 0], [0, 4], [1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2], [0, 8], [32, 0]], block_bases=[], alignment=16))
-  _scale_slot_fragment_layout = (DistributedLinearLayout(reg_bases=[[0, 4], [0, 8]], lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp_bases=[[0, 0], [0, 0]], block_bases=[], shape=[16, 16]), DistributedLinearLayout(reg_bases=[[0, 4], [0, 8]], lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp_bases=[[16, 0], [32, 0]], block_bases=[], shape=[64, 16]))
-  _scale_fragment_layout_slot = (DistributedLinearLayout(reg_bases=[[0, 4], [0, 8]], lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp_bases=[[0, 0], [0, 0]], block_bases=[], shape=[16, 16]), DistributedLinearLayout(reg_bases=[[0, 4], [0, 8]], lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp_bases=[[16, 0], [32, 0]], block_bases=[], shape=[64, 16]))
-  acc_vgprs_per_lane = 16
-  accumulator_fragment_shape_slot = [16, 64]
-  dot_result_fragment_layout = AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True, warps_per_cta=[1, 4], element_bitwidth=32, tiles_per_warp=[1, 1], cga_layout=[])
-  output_n_slot = 64
-  output_block_n = 128
+  _scale_slot_lds_view_layout = (SharedLinearLayout(offset_bases=[[16, 0], [0, 4], [1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], block_bases=[], alignment=16), SharedLinearLayout(offset_bases=[[16, 0], [0, 4], [1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], block_bases=[], alignment=16))
+  _scale_slot_fragment_layout = (DistributedLinearLayout(reg_bases=[[0, 4]], lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp_bases=[[0, 0], [16, 0]], block_bases=[], shape=[32, 8]), DistributedLinearLayout(reg_bases=[[0, 4]], lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp_bases=[[16, 0], [0, 0]], block_bases=[], shape=[32, 8]))
+  _scale_fragment_layout_slot = (DistributedLinearLayout(reg_bases=[[0, 4]], lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp_bases=[[0, 0], [16, 0]], block_bases=[], shape=[32, 8]), DistributedLinearLayout(reg_bases=[[0, 4]], lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp_bases=[[16, 0], [0, 0]], block_bases=[], shape=[32, 8]))
+  acc_vgprs_per_lane = 8
+  accumulator_fragment_shape_slot = [32, 32]
+  dot_result_fragment_layout = AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True, warps_per_cta=[2, 2], element_bitwidth=32, tiles_per_warp=[1, 1], cga_layout=[])
+  output_n_slot = 32
+  output_block_n = 64
   epilogue_threads = 256
   epilogue_inputs_via_lds = False
   epilogue_input_lds_layout = SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[0], cga_layout=[])
   epilogue_gamma_shape = [256]
   epilogue_gamma_buffer_load_lds_layout = None
-  epilogue_bias_shape = [128]
+  epilogue_bias_shape = [64]
   epilogue_bias_buffer_load_lds_layout = None
-  quant_staging_rows = 16
+  quant_staging_rows = 32
   quant_staging_rotates = False
   quant_staging_layout = SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0], cga_layout=[])
-  lds_bytes = 155136
-  #mangle_sha256 = 62b2e8796a811368926a97acebad3d6b651d6d63b11809c36019014265092259
+  lds_bytes = 51456
+  #mangle_sha256 = ef2f5b798032fb8efe9bd1231f878945faa8e78b1cb3df0e855b055fc106ea89
 == sched/prod-a8w4-t64
-  cfg KernelTuningConfig(func_cfg=KernelFuncConfig(token_dtype_quant=cx(3), expert_dtype_quant=cx(2), token_online_quant=cx(3), expert_online_quant=cx(2), mma_acc_dtype=cx(dtype:triton.language.float32), activation=cx(None), output_quant=cx(None), has_bias=cx(False), has_gammas=cx(False), has_gather=cx(False), has_x_static_scale=cx(False), weight_gu_hbm_layout=cx(0), epilogue=cx(0)), BLOCK_M=cx(32), BLOCK_N=cx(128), BLOCK_K=cx(512), K_UNROLL=cx(3), SLOT_M=cx(16), SLOT_N=cx(64), NUM_LDS_BUFFER=cx(3), mfma_instr_shape=cx([16, 16, 128]), warps_per_cta=cx([1, 4]), tiles_per_warp=cx([1, 1]), k_width=cx(None), transposed=cx(True), WAVES_PER_EU=cx(0), TILE_SCHED=cx(2), GROUP_M=cx(4), NUM_XCDS=cx(8), token_cache_modifier=cx(''), token_scale_cache_modifier=cx(''), expert_cache_modifier=cx('.cg'), expert_scale_cache_modifier=cx('.cg'), result_cache_modifier=cx(''), result_scale_cache_modifier=cx(''), WARP_PIPELINE=cx(0), VGPR_PREFETCH_K=cx(512), A_SCALE_SORTED_SHUFFLED=cx(False), B_SCALE_SHUFFLED=cx(False), B_PRESHUFFLED=cx(False), ACT_FAST_RCP=cx(True), WAIT_COMMIT_SCHEME=cx(1), DS_READ_A_PAYLOAD_IN_MFMA=cx(False), DS_READ_A_SCALE_IN_MFMA=cx(False), DS_READ_B_PAYLOAD_IN_MFMA=cx(False), DS_READ_B_SCALE_IN_MFMA=cx(False), SCHED_MODE=cx(0), FROZEN_STEP=cx(False), SOFF_UNROLL=cx(False), SCALE_FILL_MID=cx(False), ALLOW_B_VIA_LDS=cx(True), ALLOW_B_SCALE_VIA_LDS=cx(True), ALLOW_A_SCALE_VIA_LDS=cx(True), A_NUM_BUFFER=cx(0), B_NUM_BUFFER=cx(0), A_SCALE_NUM_BUFFER=cx(0), B_SCALE_NUM_BUFFER=cx(0), SCALE_SLOT_M=cx(0), SCALE_SLOT_N=cx(0), SCALE_SLOT_K=cx(0), UNROLL_EPILOGUE=cx(True))
-  _BLOCK_N = 128
-  _BLOCK_K = 512
+  cfg KernelTuningConfig(func_cfg=KernelFuncConfig(token_dtype_quant=cx(3), expert_dtype_quant=cx(2), token_online_quant=cx(3), expert_online_quant=cx(2), mma_acc_dtype=cx(dtype:triton.language.float32), activation=cx(None), output_quant=cx(None), has_bias=cx(False), has_gammas=cx(False), has_gather=cx(False), has_x_static_scale=cx(False), weight_gu_hbm_layout=cx(0), epilogue=cx(0)), BLOCK_M=cx(32), BLOCK_N=cx(64), BLOCK_K=cx(256), K_UNROLL=cx(3), SLOT_M=cx(32), SLOT_N=cx(32), NUM_LDS_BUFFER=cx(3), mfma_instr_shape=cx([16, 16, 128]), warps_per_cta=cx([2, 2]), tiles_per_warp=cx([1, 1]), k_width=cx(None), transposed=cx(True), WAVES_PER_EU=cx(0), TILE_SCHED=cx(2), GROUP_M=cx(4), NUM_XCDS=cx(8), token_cache_modifier=cx(''), token_scale_cache_modifier=cx(''), expert_cache_modifier=cx('.cg'), expert_scale_cache_modifier=cx('.cg'), result_cache_modifier=cx(''), result_scale_cache_modifier=cx(''), WARP_PIPELINE=cx(0), VGPR_PREFETCH_K=cx(256), A_SCALE_SORTED_SHUFFLED=cx(False), B_SCALE_SHUFFLED=cx(True), B_PRESHUFFLED=cx(False), ACT_FAST_RCP=cx(True), WAIT_COMMIT_SCHEME=cx(1), DS_READ_A_PAYLOAD_IN_MFMA=cx(False), DS_READ_A_SCALE_IN_MFMA=cx(False), DS_READ_B_PAYLOAD_IN_MFMA=cx(False), DS_READ_B_SCALE_IN_MFMA=cx(False), SCHED_MODE=cx(0), FROZEN_STEP=cx(False), SOFF_UNROLL=cx(False), SCALE_FILL_MID=cx(False), ALLOW_B_VIA_LDS=cx(True), ALLOW_B_SCALE_VIA_LDS=cx(True), ALLOW_A_SCALE_VIA_LDS=cx(True), A_NUM_BUFFER=cx(0), B_NUM_BUFFER=cx(0), A_SCALE_NUM_BUFFER=cx(0), B_SCALE_NUM_BUFFER=cx(0), SCALE_SLOT_M=cx(0), SCALE_SLOT_N=cx(0), SCALE_SLOT_K=cx(0), UNROLL_EPILOGUE=cx(True))
+  _BLOCK_N = 64
+  _BLOCK_K = 256
   _mfma_instr_shape = [16, 16, 128]
   _weight_gu_hbm_layout = 0
   num_warps = 4
   num_k_slots = 1
   num_prefetch_k_slots = 1
-  num_m_slots = 2
+  num_m_slots = 1
   num_n_slots = 2
   _component_via_lds = ((True, True), (True, True))
-  _payload_block_k_storage = (512, 256)
-  _payload_hbm_step = (512, 256)
+  _payload_block_k_storage = (256, 128)
+  _payload_hbm_step = (256, 128)
   _payload_byte_unit_lds_ok = (False, False)
-  payload_a_sorted_shuffled_ok = False
-  _payload_shape_tile = ([6, 16, 512], [6, 256, 64])
-  _payload_shape_slot = ([16, 512], [256, 64])
-  _payload_hbm_offset_layout = (DistributedLinearLayout(reg_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [4, 0]], lane_bases=[[0, 16], [0, 32], [0, 64], [0, 128], [0, 256], [8, 0]], warp_bases=[[1, 0], [2, 0]], block_bases=[], shape=[16, 512]), DistributedLinearLayout(reg_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 4], [0, 8]], lane_bases=[[16, 0], [32, 0], [64, 0], [128, 0], [0, 16], [0, 32]], warp_bases=[[0, 1], [0, 2]], block_bases=[], shape=[256, 64]))
-  _payload_lds_layout = (PaddedSharedLayout(interval_padding_pairs=[(1024, 32)], offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [0, 256], [8, 0], [1, 0], [2, 0], [4, 0]], cga_layout=[], shape=[16, 512]), PaddedSharedLayout(interval_padding_pairs=[(1024, 32)], offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [128, 0], [0, 16], [0, 32], [0, 1], [0, 2], [0, 4], [0, 8]], cga_layout=[], shape=[256, 64]))
-  _payload_fragment_layout = (DotOperandLayout(operand_index=0, parent=AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True, warps_per_cta=[1, 4], element_bitwidth=32, tiles_per_warp=[1, 1], cga_layout=[]), k_width=16), DotOperandLayout(operand_index=1, parent=AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True, warps_per_cta=[1, 4], element_bitwidth=32, tiles_per_warp=[1, 1], cga_layout=[]), k_width=16))
-  scale_block_k = 16
-  _scale_slot_nonk = (16, 64)
-  _scale_slot_k = (16, 16)
+  payload_a_sorted_shuffled_ok = True
+  _payload_shape_tile = ([3, 32, 256], [6, 128, 32])
+  _payload_shape_slot = ([32, 256], [128, 32])
+  _payload_hbm_offset_layout = (DistributedLinearLayout(reg_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [4, 0]], lane_bases=[[0, 16], [0, 32], [0, 64], [0, 128], [8, 0], [16, 0]], warp_bases=[[1, 0], [2, 0]], block_bases=[], shape=[32, 256]), DistributedLinearLayout(reg_bases=[[1, 0], [2, 0], [4, 0], [8, 0]], lane_bases=[[16, 0], [32, 0], [64, 0], [0, 4], [0, 8], [0, 16]], warp_bases=[[0, 1], [0, 2]], block_bases=[], shape=[128, 32]))
+  _payload_lds_layout = (PaddedSharedLayout(interval_padding_pairs=[(1024, 32)], offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [8, 0], [16, 0], [1, 0], [2, 0], [4, 0]], cga_layout=[], shape=[32, 256]), PaddedSharedLayout(interval_padding_pairs=[(1024, 32)], offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [0, 4], [0, 8], [0, 16], [0, 1], [0, 2]], cga_layout=[], shape=[128, 32]))
+  _payload_fragment_layout = (DotOperandLayout(operand_index=0, parent=AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True, warps_per_cta=[2, 2], element_bitwidth=32, tiles_per_warp=[1, 1], cga_layout=[]), k_width=16), DotOperandLayout(operand_index=1, parent=AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True, warps_per_cta=[2, 2], element_bitwidth=32, tiles_per_warp=[1, 1], cga_layout=[]), k_width=16))
+  scale_block_k = 8
+  _scale_slot_nonk = (32, 32)
+  _scale_slot_k = (8, 8)
   _scale_packed_ok = (False, False)
   _scale_packed_sel = ((None, None), (None, None))
   any_scale_packed = False
-  _scale_shape_tile = ([6, 16, 16], [6, 64, 16])
-  _scale_slot_shape_storage = ([16, 16], [64, 16])
-  _scale_slot_shape_logical = ([16, 16], [64, 16])
-  _scale_fragment_shape_slot = ([16, 16], [64, 16])
-  _scale_hbm_offset_layout = (BlockedLayout(size_per_thread=[1, 4], threads_per_warp=[16, 4], warps_per_cta=[4, 1], order=[1, 0], cga_layout=[]), BlockedLayout(size_per_thread=[1, 4], threads_per_warp=[16, 4], warps_per_cta=[4, 1], order=[1, 0], cga_layout=[]))
+  _scale_shape_tile = ([3, 32, 8], [6, 1, 256])
+  _scale_slot_shape_storage = ([32, 8], [1, 256])
+  _scale_slot_shape_logical = ([32, 8], [32, 8])
+  _scale_fragment_shape_slot = ([32, 8], [32, 8])
+  _scale_hbm_offset_layout = (BlockedLayout(size_per_thread=[1, 4], threads_per_warp=[32, 2], warps_per_cta=[4, 1], order=[1, 0], cga_layout=[]), BlockedLayout(size_per_thread=[1, 4], threads_per_warp=[1, 64], warps_per_cta=[4, 1], order=[1, 0], cga_layout=[]))
   _scale_lds_layout = SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0], cga_layout=[])
-  _scale_slot_lds_view_layout = (SharedLinearLayout(offset_bases=[[16, 0], [0, 4], [1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2], [0, 8]], block_bases=[], alignment=16), SharedLinearLayout(offset_bases=[[16, 0], [0, 4], [1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2], [0, 8], [32, 0]], block_bases=[], alignment=16))
-  _scale_slot_fragment_layout = (DistributedLinearLayout(reg_bases=[[0, 4], [0, 8]], lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp_bases=[[0, 0], [0, 0]], block_bases=[], shape=[16, 16]), DistributedLinearLayout(reg_bases=[[0, 4], [0, 8]], lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp_bases=[[16, 0], [32, 0]], block_bases=[], shape=[64, 16]))
-  _scale_fragment_layout_slot = (DistributedLinearLayout(reg_bases=[[0, 4], [0, 8]], lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp_bases=[[0, 0], [0, 0]], block_bases=[], shape=[16, 16]), DistributedLinearLayout(reg_bases=[[0, 4], [0, 8]], lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp_bases=[[16, 0], [32, 0]], block_bases=[], shape=[64, 16]))
-  acc_vgprs_per_lane = 16
-  accumulator_fragment_shape_slot = [16, 64]
-  dot_result_fragment_layout = AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True, warps_per_cta=[1, 4], element_bitwidth=32, tiles_per_warp=[1, 1], cga_layout=[])
-  output_n_slot = 64
-  output_block_n = 128
+  _scale_slot_lds_view_layout = (SharedLinearLayout(offset_bases=[[16, 0], [0, 4], [1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], block_bases=[], alignment=16), SharedLinearLayout(offset_bases=[[16, 0], [0, 4], [1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], block_bases=[], alignment=16))
+  _scale_slot_fragment_layout = (DistributedLinearLayout(reg_bases=[[0, 4]], lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp_bases=[[0, 0], [16, 0]], block_bases=[], shape=[32, 8]), DistributedLinearLayout(reg_bases=[[0, 4]], lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp_bases=[[16, 0], [0, 0]], block_bases=[], shape=[32, 8]))
+  _scale_fragment_layout_slot = (DistributedLinearLayout(reg_bases=[[0, 4]], lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp_bases=[[0, 0], [16, 0]], block_bases=[], shape=[32, 8]), DistributedLinearLayout(reg_bases=[[0, 4]], lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp_bases=[[16, 0], [0, 0]], block_bases=[], shape=[32, 8]))
+  acc_vgprs_per_lane = 8
+  accumulator_fragment_shape_slot = [32, 32]
+  dot_result_fragment_layout = AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True, warps_per_cta=[2, 2], element_bitwidth=32, tiles_per_warp=[1, 1], cga_layout=[])
+  output_n_slot = 32
+  output_block_n = 64
   epilogue_threads = 256
   epilogue_inputs_via_lds = False
   epilogue_input_lds_layout = SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[0], cga_layout=[])
   epilogue_gamma_shape = [256]
   epilogue_gamma_buffer_load_lds_layout = None
-  epilogue_bias_shape = [128]
+  epilogue_bias_shape = [64]
   epilogue_bias_buffer_load_lds_layout = None
-  quant_staging_rows = 16
+  quant_staging_rows = 32
   quant_staging_rotates = False
   quant_staging_layout = SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0], cga_layout=[])
-  lds_bytes = 155136
-  #mangle_sha256 = 62b2e8796a811368926a97acebad3d6b651d6d63b11809c36019014265092259
+  lds_bytes = 51456
+  #mangle_sha256 = ef2f5b798032fb8efe9bd1231f878945faa8e78b1cb3df0e855b055fc106ea89
 == sched/prod-a8w4-t256
   cfg KernelTuningConfig(func_cfg=KernelFuncConfig(token_dtype_quant=cx(3), expert_dtype_quant=cx(2), token_online_quant=cx(3), expert_online_quant=cx(2), mma_acc_dtype=cx(dtype:triton.language.float32), activation=cx(None), output_quant=cx(None), has_bias=cx(False), has_gammas=cx(False), has_gather=cx(False), has_x_static_scale=cx(False), weight_gu_hbm_layout=cx(0), epilogue=cx(0)), BLOCK_M=cx(64), BLOCK_N=cx(256), BLOCK_K=cx(256), K_UNROLL=cx(3), SLOT_M=cx(32), SLOT_N=cx(128), NUM_LDS_BUFFER=cx(3), mfma_instr_shape=cx([16, 16, 128]), warps_per_cta=cx([1, 4]), tiles_per_warp=cx([2, 2]), k_width=cx(None), transposed=cx(True), WAVES_PER_EU=cx(1), TILE_SCHED=cx(2), GROUP_M=cx(4), NUM_XCDS=cx(8), token_cache_modifier=cx(''), token_scale_cache_modifier=cx(''), expert_cache_modifier=cx('.cg'), expert_scale_cache_modifier=cx('.cg'), result_cache_modifier=cx(''), result_scale_cache_modifier=cx(''), WARP_PIPELINE=cx(0), VGPR_PREFETCH_K=cx(256), A_SCALE_SORTED_SHUFFLED=cx(True), B_SCALE_SHUFFLED=cx(True), B_PRESHUFFLED=cx(False), ACT_FAST_RCP=cx(True), WAIT_COMMIT_SCHEME=cx(3), DS_READ_A_PAYLOAD_IN_MFMA=cx(False), DS_READ_A_SCALE_IN_MFMA=cx(False), DS_READ_B_PAYLOAD_IN_MFMA=cx(False), DS_READ_B_SCALE_IN_MFMA=cx(False), SCHED_MODE=cx(0), FROZEN_STEP=cx(False), SOFF_UNROLL=cx(False), SCALE_FILL_MID=cx(False), ALLOW_B_VIA_LDS=cx(True), ALLOW_B_SCALE_VIA_LDS=cx(True), ALLOW_A_SCALE_VIA_LDS=cx(True), A_NUM_BUFFER=cx(0), B_NUM_BUFFER=cx(0), A_SCALE_NUM_BUFFER=cx(0), B_SCALE_NUM_BUFFER=cx(0), SCALE_SLOT_M=cx(0), SCALE_SLOT_N=cx(0), SCALE_SLOT_K=cx(0), UNROLL_EPILOGUE=cx(True))
   _BLOCK_N = 256
@@ -3470,111 +3470,111 @@
   lds_bytes = 129792
   #mangle_sha256 = ff648f6f9872c08998e28a8d2f7a159bb1e499e935b7aa05856d739f81d4d260
 == prod/g1-a8w4-t128-bm32-split/raw
-  cfg KernelTuningConfig(func_cfg=KernelFuncConfig(token_dtype_quant=cx(3), expert_dtype_quant=cx(2), token_online_quant=cx(3), expert_online_quant=cx(2), mma_acc_dtype=cx(dtype:triton.language.float32), activation=cx(ActivationSpec(kind=0, alpha=1.0, limit=None, add_residual=False)), output_quant=cx(None), has_bias=cx(False), has_gammas=cx(False), has_gather=cx(True), has_x_static_scale=cx(False), weight_gu_hbm_layout=cx(1), epilogue=cx(0)), BLOCK_M=cx(32), BLOCK_N=cx(128), BLOCK_K=cx(512), K_UNROLL=cx(3), SLOT_M=cx(16), SLOT_N=cx(64), NUM_LDS_BUFFER=cx(3), mfma_instr_shape=cx([16, 16, 128]), warps_per_cta=cx([1, 4]), tiles_per_warp=cx([1, 1]), k_width=cx(None), transposed=cx(True), WAVES_PER_EU=cx(0), TILE_SCHED=cx(2), GROUP_M=cx(4), NUM_XCDS=cx(8), token_cache_modifier=cx(''), token_scale_cache_modifier=cx(''), expert_cache_modifier=cx('.cg'), expert_scale_cache_modifier=cx('.cg'), result_cache_modifier=cx(''), result_scale_cache_modifier=cx(''), WARP_PIPELINE=cx(0), VGPR_PREFETCH_K=cx(512), A_SCALE_SORTED_SHUFFLED=cx(False), B_SCALE_SHUFFLED=cx(False), B_PRESHUFFLED=cx(False), ACT_FAST_RCP=cx(True), WAIT_COMMIT_SCHEME=cx(1), DS_READ_A_PAYLOAD_IN_MFMA=cx(False), DS_READ_A_SCALE_IN_MFMA=cx(False), DS_READ_B_PAYLOAD_IN_MFMA=cx(False), DS_READ_B_SCALE_IN_MFMA=cx(False), SCHED_MODE=cx(0), FROZEN_STEP=cx(False), SOFF_UNROLL=cx(False), SCALE_FILL_MID=cx(False), ALLOW_B_VIA_LDS=cx(True), ALLOW_B_SCALE_VIA_LDS=cx(True), ALLOW_A_SCALE_VIA_LDS=cx(True), A_NUM_BUFFER=cx(0), B_NUM_BUFFER=cx(0), A_SCALE_NUM_BUFFER=cx(0), B_SCALE_NUM_BUFFER=cx(0), SCALE_SLOT_M=cx(0), SCALE_SLOT_N=cx(0), SCALE_SLOT_K=cx(0), UNROLL_EPILOGUE=cx(True))
-  _BLOCK_N = 128
-  _BLOCK_K = 512
+  cfg KernelTuningConfig(func_cfg=KernelFuncConfig(token_dtype_quant=cx(3), expert_dtype_quant=cx(2), token_online_quant=cx(3), expert_online_quant=cx(2), mma_acc_dtype=cx(dtype:triton.language.float32), activation=cx(ActivationSpec(kind=0, alpha=1.0, limit=None, add_residual=False)), output_quant=cx(None), has_bias=cx(False), has_gammas=cx(False), has_gather=cx(True), has_x_static_scale=cx(False), weight_gu_hbm_layout=cx(1), epilogue=cx(0)), BLOCK_M=cx(32), BLOCK_N=cx(64), BLOCK_K=cx(256), K_UNROLL=cx(3), SLOT_M=cx(32), SLOT_N=cx(32), NUM_LDS_BUFFER=cx(3), mfma_instr_shape=cx([16, 16, 128]), warps_per_cta=cx([2, 2]), tiles_per_warp=cx([1, 1]), k_width=cx(None), transposed=cx(True), WAVES_PER_EU=cx(0), TILE_SCHED=cx(2), GROUP_M=cx(4), NUM_XCDS=cx(8), token_cache_modifier=cx(''), token_scale_cache_modifier=cx(''), expert_cache_modifier=cx('.cg'), expert_scale_cache_modifier=cx('.cg'), result_cache_modifier=cx(''), result_scale_cache_modifier=cx(''), WARP_PIPELINE=cx(0), VGPR_PREFETCH_K=cx(256), A_SCALE_SORTED_SHUFFLED=cx(False), B_SCALE_SHUFFLED=cx(True), B_PRESHUFFLED=cx(False), ACT_FAST_RCP=cx(True), WAIT_COMMIT_SCHEME=cx(1), DS_READ_A_PAYLOAD_IN_MFMA=cx(False), DS_READ_A_SCALE_IN_MFMA=cx(False), DS_READ_B_PAYLOAD_IN_MFMA=cx(False), DS_READ_B_SCALE_IN_MFMA=cx(False), SCHED_MODE=cx(0), FROZEN_STEP=cx(False), SOFF_UNROLL=cx(False), SCALE_FILL_MID=cx(False), ALLOW_B_VIA_LDS=cx(True), ALLOW_B_SCALE_VIA_LDS=cx(True), ALLOW_A_SCALE_VIA_LDS=cx(True), A_NUM_BUFFER=cx(0), B_NUM_BUFFER=cx(0), A_SCALE_NUM_BUFFER=cx(0), B_SCALE_NUM_BUFFER=cx(0), SCALE_SLOT_M=cx(0), SCALE_SLOT_N=cx(0), SCALE_SLOT_K=cx(0), UNROLL_EPILOGUE=cx(True))
+  _BLOCK_N = 64
+  _BLOCK_K = 256
   _mfma_instr_shape = [16, 16, 128]
   _weight_gu_hbm_layout = 1
   num_warps = 4
   num_k_slots = 1
   num_prefetch_k_slots = 1
-  num_m_slots = 2
+  num_m_slots = 1
   num_n_slots = 2
   _component_via_lds = ((True, True), (True, True))
-  _payload_block_k_storage = (512, 256)
-  _payload_hbm_step = (512, 256)
+  _payload_block_k_storage = (256, 128)
+  _payload_hbm_step = (256, 128)
   _payload_byte_unit_lds_ok = (False, False)
-  payload_a_sorted_shuffled_ok = False
-  _payload_shape_tile = ([6, 16, 512], [6, 256, 64])
-  _payload_shape_slot = ([16, 512], [256, 64])
-  _payload_hbm_offset_layout = (DistributedLinearLayout(reg_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [4, 0]], lane_bases=[[0, 16], [0, 32], [0, 64], [0, 128], [0, 256], [8, 0]], warp_bases=[[1, 0], [2, 0]], block_bases=[], shape=[16, 512]), DistributedLinearLayout(reg_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 4], [0, 8]], lane_bases=[[16, 0], [32, 0], [64, 0], [128, 0], [0, 16], [0, 32]], warp_bases=[[0, 1], [0, 2]], block_bases=[], shape=[256, 64]))
-  _payload_lds_layout = (PaddedSharedLayout(interval_padding_pairs=[(1024, 32)], offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [0, 256], [8, 0], [1, 0], [2, 0], [4, 0]], cga_layout=[], shape=[16, 512]), PaddedSharedLayout(interval_padding_pairs=[(1024, 32)], offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [128, 0], [0, 16], [0, 32], [0, 1], [0, 2], [0, 4], [0, 8]], cga_layout=[], shape=[256, 64]))
-  _payload_fragment_layout = (DotOperandLayout(operand_index=0, parent=AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True, warps_per_cta=[1, 4], element_bitwidth=32, tiles_per_warp=[1, 1], cga_layout=[]), k_width=16), DotOperandLayout(operand_index=1, parent=AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True, warps_per_cta=[1, 4], element_bitwidth=32, tiles_per_warp=[1, 1], cga_layout=[]), k_width=16))
-  scale_block_k = 16
-  _scale_slot_nonk = (16, 64)
-  _scale_slot_k = (16, 16)
+  payload_a_sorted_shuffled_ok = True
+  _payload_shape_tile = ([3, 32, 256], [6, 128, 32])
+  _payload_shape_slot = ([32, 256], [128, 32])
+  _payload_hbm_offset_layout = (DistributedLinearLayout(reg_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [4, 0]], lane_bases=[[0, 16], [0, 32], [0, 64], [0, 128], [8, 0], [16, 0]], warp_bases=[[1, 0], [2, 0]], block_bases=[], shape=[32, 256]), DistributedLinearLayout(reg_bases=[[1, 0], [2, 0], [4, 0], [8, 0]], lane_bases=[[16, 0], [32, 0], [64, 0], [0, 4], [0, 8], [0, 16]], warp_bases=[[0, 1], [0, 2]], block_bases=[], shape=[128, 32]))
+  _payload_lds_layout = (PaddedSharedLayout(interval_padding_pairs=[(1024, 32)], offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [8, 0], [16, 0], [1, 0], [2, 0], [4, 0]], cga_layout=[], shape=[32, 256]), PaddedSharedLayout(interval_padding_pairs=[(1024, 32)], offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [0, 4], [0, 8], [0, 16], [0, 1], [0, 2]], cga_layout=[], shape=[128, 32]))
+  _payload_fragment_layout = (DotOperandLayout(operand_index=0, parent=AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True, warps_per_cta=[2, 2], element_bitwidth=32, tiles_per_warp=[1, 1], cga_layout=[]), k_width=16), DotOperandLayout(operand_index=1, parent=AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True, warps_per_cta=[2, 2], element_bitwidth=32, tiles_per_warp=[1, 1], cga_layout=[]), k_width=16))
+  scale_block_k = 8
+  _scale_slot_nonk = (32, 32)
+  _scale_slot_k = (8, 8)
   _scale_packed_ok = (False, False)
   _scale_packed_sel = ((None, None), (None, None))
   any_scale_packed = False
-  _scale_shape_tile = ([6, 16, 16], [6, 64, 16])
-  _scale_slot_shape_storage = ([16, 16], [64, 16])
-  _scale_slot_shape_logical = ([16, 16], [64, 16])
-  _scale_fragment_shape_slot = ([16, 16], [64, 16])
-  _scale_hbm_offset_layout = (BlockedLayout(size_per_thread=[1, 4], threads_per_warp=[16, 4], warps_per_cta=[4, 1], order=[1, 0], cga_layout=[]), BlockedLayout(size_per_thread=[1, 4], threads_per_warp=[16, 4], warps_per_cta=[4, 1], order=[1, 0], cga_layout=[]))
+  _scale_shape_tile = ([3, 32, 8], [6, 1, 256])
+  _scale_slot_shape_storage = ([32, 8], [1, 256])
+  _scale_slot_shape_logical = ([32, 8], [32, 8])
+  _scale_fragment_shape_slot = ([32, 8], [32, 8])
+  _scale_hbm_offset_layout = (BlockedLayout(size_per_thread=[1, 4], threads_per_warp=[32, 2], warps_per_cta=[4, 1], order=[1, 0], cga_layout=[]), BlockedLayout(size_per_thread=[1, 4], threads_per_warp=[1, 64], warps_per_cta=[4, 1], order=[1, 0], cga_layout=[]))
   _scale_lds_layout = SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0], cga_layout=[])
-  _scale_slot_lds_view_layout = (SharedLinearLayout(offset_bases=[[16, 0], [0, 4], [1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2], [0, 8]], block_bases=[], alignment=16), SharedLinearLayout(offset_bases=[[16, 0], [0, 4], [1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2], [0, 8], [32, 0]], block_bases=[], alignment=16))
-  _scale_slot_fragment_layout = (DistributedLinearLayout(reg_bases=[[0, 4], [0, 8]], lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp_bases=[[0, 0], [0, 0]], block_bases=[], shape=[16, 16]), DistributedLinearLayout(reg_bases=[[0, 4], [0, 8]], lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp_bases=[[16, 0], [32, 0]], block_bases=[], shape=[64, 16]))
-  _scale_fragment_layout_slot = (DistributedLinearLayout(reg_bases=[[0, 4], [0, 8]], lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp_bases=[[0, 0], [0, 0]], block_bases=[], shape=[16, 16]), DistributedLinearLayout(reg_bases=[[0, 4], [0, 8]], lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp_bases=[[16, 0], [32, 0]], block_bases=[], shape=[64, 16]))
-  acc_vgprs_per_lane = 16
-  accumulator_fragment_shape_slot = [16, 64]
-  dot_result_fragment_layout = AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True, warps_per_cta=[1, 4], element_bitwidth=32, tiles_per_warp=[1, 1], cga_layout=[])
-  output_n_slot = 64
-  output_block_n = 64
+  _scale_slot_lds_view_layout = (SharedLinearLayout(offset_bases=[[16, 0], [0, 4], [1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], block_bases=[], alignment=16), SharedLinearLayout(offset_bases=[[16, 0], [0, 4], [1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], block_bases=[], alignment=16))
+  _scale_slot_fragment_layout = (DistributedLinearLayout(reg_bases=[[0, 4]], lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp_bases=[[0, 0], [16, 0]], block_bases=[], shape=[32, 8]), DistributedLinearLayout(reg_bases=[[0, 4]], lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp_bases=[[16, 0], [0, 0]], block_bases=[], shape=[32, 8]))
+  _scale_fragment_layout_slot = (DistributedLinearLayout(reg_bases=[[0, 4]], lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp_bases=[[0, 0], [16, 0]], block_bases=[], shape=[32, 8]), DistributedLinearLayout(reg_bases=[[0, 4]], lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp_bases=[[16, 0], [0, 0]], block_bases=[], shape=[32, 8]))
+  acc_vgprs_per_lane = 8
+  accumulator_fragment_shape_slot = [32, 32]
+  dot_result_fragment_layout = AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True, warps_per_cta=[2, 2], element_bitwidth=32, tiles_per_warp=[1, 1], cga_layout=[])
+  output_n_slot = 32
+  output_block_n = 32
   epilogue_threads = 256
   epilogue_inputs_via_lds = False
   epilogue_input_lds_layout = SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[0], cga_layout=[])
   epilogue_gamma_shape = [256]
   epilogue_gamma_buffer_load_lds_layout = None
-  epilogue_bias_shape = [128]
+  epilogue_bias_shape = [64]
   epilogue_bias_buffer_load_lds_layout = None
   quant_staging_rows = 32
   quant_staging_rotates = False
   quant_staging_layout = SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0], cga_layout=[])
-  lds_bytes = 155136
-  #mangle_sha256 = 59f1b8583a0ef9a3aeab87ed4604819b2afe9cd132910002d3d3d5e112be12af
+  lds_bytes = 51456
+  #mangle_sha256 = 2793b9c469b88a5db919affe4bd0a57b86400619f34db0983dba97799888fc12
 == prod/g1-a8w4-t128-bm32-ilv/raw
-  cfg KernelTuningConfig(func_cfg=KernelFuncConfig(token_dtype_quant=cx(3), expert_dtype_quant=cx(2), token_online_quant=cx(3), expert_online_quant=cx(2), mma_acc_dtype=cx(dtype:triton.language.float32), activation=cx(ActivationSpec(kind=0, alpha=1.0, limit=None, add_residual=False)), output_quant=cx(None), has_bias=cx(False), has_gammas=cx(False), has_gather=cx(True), has_x_static_scale=cx(False), weight_gu_hbm_layout=cx(0), epilogue=cx(0)), BLOCK_M=cx(32), BLOCK_N=cx(128), BLOCK_K=cx(512), K_UNROLL=cx(3), SLOT_M=cx(16), SLOT_N=cx(64), NUM_LDS_BUFFER=cx(3), mfma_instr_shape=cx([16, 16, 128]), warps_per_cta=cx([1, 4]), tiles_per_warp=cx([1, 1]), k_width=cx(None), transposed=cx(True), WAVES_PER_EU=cx(0), TILE_SCHED=cx(2), GROUP_M=cx(4), NUM_XCDS=cx(8), token_cache_modifier=cx(''), token_scale_cache_modifier=cx(''), expert_cache_modifier=cx('.cg'), expert_scale_cache_modifier=cx('.cg'), result_cache_modifier=cx(''), result_scale_cache_modifier=cx(''), WARP_PIPELINE=cx(0), VGPR_PREFETCH_K=cx(512), A_SCALE_SORTED_SHUFFLED=cx(False), B_SCALE_SHUFFLED=cx(False), B_PRESHUFFLED=cx(False), ACT_FAST_RCP=cx(True), WAIT_COMMIT_SCHEME=cx(1), DS_READ_A_PAYLOAD_IN_MFMA=cx(False), DS_READ_A_SCALE_IN_MFMA=cx(False), DS_READ_B_PAYLOAD_IN_MFMA=cx(False), DS_READ_B_SCALE_IN_MFMA=cx(False), SCHED_MODE=cx(0), FROZEN_STEP=cx(False), SOFF_UNROLL=cx(False), SCALE_FILL_MID=cx(False), ALLOW_B_VIA_LDS=cx(True), ALLOW_B_SCALE_VIA_LDS=cx(True), ALLOW_A_SCALE_VIA_LDS=cx(True), A_NUM_BUFFER=cx(0), B_NUM_BUFFER=cx(0), A_SCALE_NUM_BUFFER=cx(0), B_SCALE_NUM_BUFFER=cx(0), SCALE_SLOT_M=cx(0), SCALE_SLOT_N=cx(0), SCALE_SLOT_K=cx(0), UNROLL_EPILOGUE=cx(True))
-  _BLOCK_N = 128
-  _BLOCK_K = 512
+  cfg KernelTuningConfig(func_cfg=KernelFuncConfig(token_dtype_quant=cx(3), expert_dtype_quant=cx(2), token_online_quant=cx(3), expert_online_quant=cx(2), mma_acc_dtype=cx(dtype:triton.language.float32), activation=cx(ActivationSpec(kind=0, alpha=1.0, limit=None, add_residual=False)), output_quant=cx(None), has_bias=cx(False), has_gammas=cx(False), has_gather=cx(True), has_x_static_scale=cx(False), weight_gu_hbm_layout=cx(0), epilogue=cx(0)), BLOCK_M=cx(32), BLOCK_N=cx(64), BLOCK_K=cx(256), K_UNROLL=cx(3), SLOT_M=cx(32), SLOT_N=cx(32), NUM_LDS_BUFFER=cx(3), mfma_instr_shape=cx([16, 16, 128]), warps_per_cta=cx([2, 2]), tiles_per_warp=cx([1, 1]), k_width=cx(None), transposed=cx(True), WAVES_PER_EU=cx(0), TILE_SCHED=cx(2), GROUP_M=cx(4), NUM_XCDS=cx(8), token_cache_modifier=cx(''), token_scale_cache_modifier=cx(''), expert_cache_modifier=cx('.cg'), expert_scale_cache_modifier=cx('.cg'), result_cache_modifier=cx(''), result_scale_cache_modifier=cx(''), WARP_PIPELINE=cx(0), VGPR_PREFETCH_K=cx(256), A_SCALE_SORTED_SHUFFLED=cx(False), B_SCALE_SHUFFLED=cx(True), B_PRESHUFFLED=cx(False), ACT_FAST_RCP=cx(True), WAIT_COMMIT_SCHEME=cx(1), DS_READ_A_PAYLOAD_IN_MFMA=cx(False), DS_READ_A_SCALE_IN_MFMA=cx(False), DS_READ_B_PAYLOAD_IN_MFMA=cx(False), DS_READ_B_SCALE_IN_MFMA=cx(False), SCHED_MODE=cx(0), FROZEN_STEP=cx(False), SOFF_UNROLL=cx(False), SCALE_FILL_MID=cx(False), ALLOW_B_VIA_LDS=cx(True), ALLOW_B_SCALE_VIA_LDS=cx(True), ALLOW_A_SCALE_VIA_LDS=cx(True), A_NUM_BUFFER=cx(0), B_NUM_BUFFER=cx(0), A_SCALE_NUM_BUFFER=cx(0), B_SCALE_NUM_BUFFER=cx(0), SCALE_SLOT_M=cx(0), SCALE_SLOT_N=cx(0), SCALE_SLOT_K=cx(0), UNROLL_EPILOGUE=cx(True))
+  _BLOCK_N = 64
+  _BLOCK_K = 256
   _mfma_instr_shape = [16, 16, 128]
   _weight_gu_hbm_layout = 0
   num_warps = 4
   num_k_slots = 1
   num_prefetch_k_slots = 1
-  num_m_slots = 2
+  num_m_slots = 1
   num_n_slots = 2
   _component_via_lds = ((True, True), (True, True))
-  _payload_block_k_storage = (512, 256)
-  _payload_hbm_step = (512, 256)
+  _payload_block_k_storage = (256, 128)
+  _payload_hbm_step = (256, 128)
   _payload_byte_unit_lds_ok = (False, False)
-  payload_a_sorted_shuffled_ok = False
-  _payload_shape_tile = ([6, 16, 512], [6, 256, 64])
-  _payload_shape_slot = ([16, 512], [256, 64])
-  _payload_hbm_offset_layout = (DistributedLinearLayout(reg_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [4, 0]], lane_bases=[[0, 16], [0, 32], [0, 64], [0, 128], [0, 256], [8, 0]], warp_bases=[[1, 0], [2, 0]], block_bases=[], shape=[16, 512]), DistributedLinearLayout(reg_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 4], [0, 8]], lane_bases=[[16, 0], [32, 0], [64, 0], [128, 0], [0, 16], [0, 32]], warp_bases=[[0, 1], [0, 2]], block_bases=[], shape=[256, 64]))
-  _payload_lds_layout = (PaddedSharedLayout(interval_padding_pairs=[(1024, 32)], offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [0, 256], [8, 0], [1, 0], [2, 0], [4, 0]], cga_layout=[], shape=[16, 512]), PaddedSharedLayout(interval_padding_pairs=[(1024, 32)], offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [128, 0], [0, 16], [0, 32], [0, 1], [0, 2], [0, 4], [0, 8]], cga_layout=[], shape=[256, 64]))
-  _payload_fragment_layout = (DotOperandLayout(operand_index=0, parent=AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True, warps_per_cta=[1, 4], element_bitwidth=32, tiles_per_warp=[1, 1], cga_layout=[]), k_width=16), DotOperandLayout(operand_index=1, parent=AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True, warps_per_cta=[1, 4], element_bitwidth=32, tiles_per_warp=[1, 1], cga_layout=[]), k_width=16))
-  scale_block_k = 16
-  _scale_slot_nonk = (16, 64)
-  _scale_slot_k = (16, 16)
+  payload_a_sorted_shuffled_ok = True
+  _payload_shape_tile = ([3, 32, 256], [6, 128, 32])
+  _payload_shape_slot = ([32, 256], [128, 32])
+  _payload_hbm_offset_layout = (DistributedLinearLayout(reg_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [4, 0]], lane_bases=[[0, 16], [0, 32], [0, 64], [0, 128], [8, 0], [16, 0]], warp_bases=[[1, 0], [2, 0]], block_bases=[], shape=[32, 256]), DistributedLinearLayout(reg_bases=[[1, 0], [2, 0], [4, 0], [8, 0]], lane_bases=[[16, 0], [32, 0], [64, 0], [0, 4], [0, 8], [0, 16]], warp_bases=[[0, 1], [0, 2]], block_bases=[], shape=[128, 32]))
+  _payload_lds_layout = (PaddedSharedLayout(interval_padding_pairs=[(1024, 32)], offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [8, 0], [16, 0], [1, 0], [2, 0], [4, 0]], cga_layout=[], shape=[32, 256]), PaddedSharedLayout(interval_padding_pairs=[(1024, 32)], offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [0, 4], [0, 8], [0, 16], [0, 1], [0, 2]], cga_layout=[], shape=[128, 32]))
+  _payload_fragment_layout = (DotOperandLayout(operand_index=0, parent=AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True, warps_per_cta=[2, 2], element_bitwidth=32, tiles_per_warp=[1, 1], cga_layout=[]), k_width=16), DotOperandLayout(operand_index=1, parent=AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True, warps_per_cta=[2, 2], element_bitwidth=32, tiles_per_warp=[1, 1], cga_layout=[]), k_width=16))
+  scale_block_k = 8
+  _scale_slot_nonk = (32, 32)
+  _scale_slot_k = (8, 8)
   _scale_packed_ok = (False, False)
   _scale_packed_sel = ((None, None), (None, None))
   any_scale_packed = False
-  _scale_shape_tile = ([6, 16, 16], [6, 64, 16])
-  _scale_slot_shape_storage = ([16, 16], [64, 16])
-  _scale_slot_shape_logical = ([16, 16], [64, 16])
-  _scale_fragment_shape_slot = ([16, 16], [64, 16])
-  _scale_hbm_offset_layout = (BlockedLayout(size_per_thread=[1, 4], threads_per_warp=[16, 4], warps_per_cta=[4, 1], order=[1, 0], cga_layout=[]), BlockedLayout(size_per_thread=[1, 4], threads_per_warp=[16, 4], warps_per_cta=[4, 1], order=[1, 0], cga_layout=[]))
+  _scale_shape_tile = ([3, 32, 8], [6, 1, 256])
+  _scale_slot_shape_storage = ([32, 8], [1, 256])
+  _scale_slot_shape_logical = ([32, 8], [32, 8])
+  _scale_fragment_shape_slot = ([32, 8], [32, 8])
+  _scale_hbm_offset_layout = (BlockedLayout(size_per_thread=[1, 4], threads_per_warp=[32, 2], warps_per_cta=[4, 1], order=[1, 0], cga_layout=[]), BlockedLayout(size_per_thread=[1, 4], threads_per_warp=[1, 64], warps_per_cta=[4, 1], order=[1, 0], cga_layout=[]))
   _scale_lds_layout = SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0], cga_layout=[])
-  _scale_slot_lds_view_layout = (SharedLinearLayout(offset_bases=[[16, 0], [0, 4], [1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2], [0, 8]], block_bases=[], alignment=16), SharedLinearLayout(offset_bases=[[16, 0], [0, 4], [1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2], [0, 8], [32, 0]], block_bases=[], alignment=16))
-  _scale_slot_fragment_layout = (DistributedLinearLayout(reg_bases=[[0, 4], [0, 8]], lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp_bases=[[0, 0], [0, 0]], block_bases=[], shape=[16, 16]), DistributedLinearLayout(reg_bases=[[0, 4], [0, 8]], lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp_bases=[[16, 0], [32, 0]], block_bases=[], shape=[64, 16]))
-  _scale_fragment_layout_slot = (DistributedLinearLayout(reg_bases=[[0, 4], [0, 8]], lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp_bases=[[0, 0], [0, 0]], block_bases=[], shape=[16, 16]), DistributedLinearLayout(reg_bases=[[0, 4], [0, 8]], lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp_bases=[[16, 0], [32, 0]], block_bases=[], shape=[64, 16]))
-  acc_vgprs_per_lane = 16
-  accumulator_fragment_shape_slot = [16, 64]
-  dot_result_fragment_layout = AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True, warps_per_cta=[1, 4], element_bitwidth=32, tiles_per_warp=[1, 1], cga_layout=[])
-  output_n_slot = 32
-  output_block_n = 64
+  _scale_slot_lds_view_layout = (SharedLinearLayout(offset_bases=[[16, 0], [0, 4], [1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], block_bases=[], alignment=16), SharedLinearLayout(offset_bases=[[16, 0], [0, 4], [1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], block_bases=[], alignment=16))
+  _scale_slot_fragment_layout = (DistributedLinearLayout(reg_bases=[[0, 4]], lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp_bases=[[0, 0], [16, 0]], block_bases=[], shape=[32, 8]), DistributedLinearLayout(reg_bases=[[0, 4]], lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp_bases=[[16, 0], [0, 0]], block_bases=[], shape=[32, 8]))
+  _scale_fragment_layout_slot = (DistributedLinearLayout(reg_bases=[[0, 4]], lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp_bases=[[0, 0], [16, 0]], block_bases=[], shape=[32, 8]), DistributedLinearLayout(reg_bases=[[0, 4]], lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]], warp_bases=[[16, 0], [0, 0]], block_bases=[], shape=[32, 8]))
+  acc_vgprs_per_lane = 8
+  accumulator_fragment_shape_slot = [32, 32]
+  dot_result_fragment_layout = AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True, warps_per_cta=[2, 2], element_bitwidth=32, tiles_per_warp=[1, 1], cga_layout=[])
+  output_n_slot = 16
+  output_block_n = 32
   epilogue_threads = 256
   epilogue_inputs_via_lds = False
   epilogue_input_lds_layout = SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[0], cga_layout=[])
   epilogue_gamma_shape = [256]
   epilogue_gamma_buffer_load_lds_layout = None
-  epilogue_bias_shape = [128]
+  epilogue_bias_shape = [64]
   epilogue_bias_buffer_load_lds_layout = None
-  quant_staging_rows = 16
+  quant_staging_rows = 32
   quant_staging_rotates = False
   quant_staging_layout = SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0], cga_layout=[])
-  lds_bytes = 155136
-  #mangle_sha256 = ade5fbb2d8688735e4ae2a19af20cd831d97e165034a9d46774697664ed47f5c
+  lds_bytes = 51456
+  #mangle_sha256 = e7fe8faa37e037196690f3dce45cdd966c816a320ac44dd11f6d17c6b2edaf8b
 == prod/g1-a8w4-t256-bm64-split/raw
   cfg KernelTuningConfig(func_cfg=KernelFuncConfig(token_dtype_quant=cx(3), expert_dtype_quant=cx(2), token_online_quant=cx(3), expert_online_quant=cx(2), mma_acc_dtype=cx(dtype:triton.language.float32), activation=cx(ActivationSpec(kind=0, alpha=1.0, limit=None, add_residual=False)), output_quant=cx(None), has_bias=cx(False), has_gammas=cx(False), has_gather=cx(True), has_x_static_scale=cx(False), weight_gu_hbm_layout=cx(1), epilogue=cx(0)), BLOCK_M=cx(64), BLOCK_N=cx(256), BLOCK_K=cx(256), K_UNROLL=cx(3), SLOT_M=cx(32), SLOT_N=cx(128), NUM_LDS_BUFFER=cx(3), mfma_instr_shape=cx([16, 16, 128]), warps_per_cta=cx([1, 4]), tiles_per_warp=cx([2, 2]), k_width=cx(None), transposed=cx(True), WAVES_PER_EU=cx(1), TILE_SCHED=cx(2), GROUP_M=cx(4), NUM_XCDS=cx(8), token_cache_modifier=cx(''), token_scale_cache_modifier=cx(''), expert_cache_modifier=cx('.cg'), expert_scale_cache_modifier=cx('.cg'), result_cache_modifier=cx(''), result_scale_cache_modifier=cx(''), WARP_PIPELINE=cx(0), VGPR_PREFETCH_K=cx(256), A_SCALE_SORTED_SHUFFLED=cx(True), B_SCALE_SHUFFLED=cx(True), B_PRESHUFFLED=cx(False), ACT_FAST_RCP=cx(True), WAIT_COMMIT_SCHEME=cx(3), DS_READ_A_PAYLOAD_IN_MFMA=cx(False), DS_READ_A_SCALE_IN_MFMA=cx(False), DS_READ_B_PAYLOAD_IN_MFMA=cx(False), DS_READ_B_SCALE_IN_MFMA=cx(False), SCHED_MODE=cx(0), FROZEN_STEP=cx(False), SOFF_UNROLL=cx(False), SCALE_FILL_MID=cx(False), ALLOW_B_VIA_LDS=cx(True), ALLOW_B_SCALE_VIA_LDS=cx(True), ALLOW_A_SCALE_VIA_LDS=cx(True), A_NUM_BUFFER=cx(0), B_NUM_BUFFER=cx(0), A_SCALE_NUM_BUFFER=cx(0), B_SCALE_NUM_BUFFER=cx(0), SCALE_SLOT_M=cx(0), SCALE_SLOT_N=cx(0), SCALE_SLOT_K=cx(0), UNROLL_EPILOGUE=cx(True))
   _BLOCK_N = 256
