@@ -1,20 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""One payload/scale pipeline for shared and independent buffer depths.
-
-A step named ``r`` DS-reads the K tile ``r`` and accumulates K tile ``r - 1``.
-Each component has baseline live span ``L = (D - 1) * R + 1`` payload steps.
-An LDS producer is DS-read ``F = L`` steps after it is issued, counting both
-ends; a direct-register producer issues no ``ds_read``, so ``F = L - 1``.  Register
-rings keep fixed SSA slots throughout each complete unrolled body; only the
-finite prologue, remainder, and drain rotate the logical queues.
-
-The expansion follows ``pc.schedule``, the build's :class:`~._schedule.Schedule`:
-it says which steps exist, and each emitted step is passed its index there as
-``STEP``, from which every per-step decision -- its K phase, copies, DS reads,
-commits and waits -- is read.
-"""
 
 import triton.language as tl
 from triton.experimental import gluon
@@ -44,7 +30,6 @@ _SG_VMEM: gl.constexpr = gl.constexpr(16)
 
 @gluon.jit
 def _sched_hint(MODE: gl.constexpr):
-    """Scheduling recipe for one K stage, emitted at the top of its region."""
     if require_constexpr(MODE == 1):
         gl.amd.cdna4.iglp_opt(0)
     elif require_constexpr(MODE == 2):
@@ -64,26 +49,6 @@ def _sched_hint(MODE: gl.constexpr):
 @aggregate
 @strip_annotate
 class _PipelineConst:
-    """Loop-invariant data for a K-pipeline step.
-
-    Hoisted once before the loop: LDS buffers, HBM offset grids, and per-step pointer
-    increments. Only :class:`_PipelinePointers` and :class:`_PipelineRegFragments`
-    cross the back edge.
-
-    Every offset grid is a *tuple*, one entry per non-K slot: ``num_m_slots`` for the A
-    side, ``num_n_slots`` for the B side. Each entry is laid out for its own slot's
-    copy layout, which is what keeps every per-slot direct-to-LDS copy as wide and
-    as coalesced as the whole-tile copy it replaces.
-
-    ``a_scale_hbm_offs``/``b_scale_hbm_offs`` serve both direct-to-LDS and register
-    loads. Both walk K by advancing their scalar base pointer in
-    :class:`_PipelinePointers` instead of the offset grid, so the offset grid is
-    computed once and never moves.
-
-    The two ``*_scale_stride_k`` are lifted out of the operand tuples rather than kept as
-    ``a``/``b``: the non-quantised operand types have no such field at all, so it can only
-    be read behind the ``has_scale`` predicate that the caller already evaluates.
-    """
 
     lds_ptrs: LDSManager
     a_hbm_offs: tl.tuple | tuple
@@ -123,8 +88,6 @@ class _PipelineConst:
         self.b_hbm_offs = b_hbm_offs
         self.a_scale_hbm_offs = _opt(a_scale_hbm_offs)
         self.b_scale_hbm_offs = _opt(b_scale_hbm_offs)
-        # re-wrapped: the frontend unwraps a constexpr argument before a
-        # constexpr_function sees it, so these arrive as plain ints
         self.a_scale_stride_k = gl.constexpr(a_scale_stride_k)
         self.b_scale_stride_k = gl.constexpr(b_scale_stride_k)
         self.a_step = gl.constexpr(a_step)
@@ -139,25 +102,12 @@ class _PipelineConst:
 @aggregate
 @strip_annotate
 class _PipelinePointers:
-    """HBM addresses carried between K stages, independent of register fragments.
-
-    Every address here is in HBM -- the LDS side of the pipeline is entirely inside
-    ``_PipelineConst.lds_ptrs``. Each operand has one scale pointer: its scale loads
-    either stage through LDS or go straight to registers. The unified queues
-    advance each stream at its fill point, so their pointers can address different
-    K stages. The explicit frozen step retains its original pointer advances.
-    """
 
     a_hbm_ptr: gl.tensor
     b_hbm_ptr: gl.tensor
     a_scale_hbm_ptr: gl.tensor | gl.constexpr
     b_scale_hbm_ptr: gl.tensor | gl.constexpr
 
-    # constexpr_function, not @gluon.jit: Triton's aggregate metaclass calls __init__
-    # itself from outside kernel scope, which a JITFunction refuses, and a bare Python
-    # function trips its "Unsupported function referenced" member walk. Every argument
-    # is already a Triton value (or a constexpr None for an absent scale) built by the
-    # caller inside the kernel, so there is nothing to trace here anyway.
     @gluon.constexpr_function
     def __init__(
         self,
@@ -168,8 +118,6 @@ class _PipelinePointers:
     ):
         self.a_hbm_ptr = a_hbm_ptr
         self.b_hbm_ptr = b_hbm_ptr
-        # _opt, not a bare assign: an operand with no scale arrives as raw Python None
-        # (a8w8, bf16), which the field annotation rejects -- it has to be constexpr.
         self.a_scale_hbm_ptr = _opt(a_scale_hbm_ptr)
         self.b_scale_hbm_ptr = _opt(b_scale_hbm_ptr)
 
@@ -177,11 +125,6 @@ class _PipelinePointers:
 @aggregate
 @strip_annotate
 class _PipelineRegFragments:
-    """Prefetched A/B payloads and scales, plus one accumulator per (ni, mi) slot.
-
-    Operand tuples are ordered by non-K slot, then whole-stage K fragment. An unscaled
-    operand aliases its payload in the scale tuple; _maybe_block_dot ignores that slot.
-    """
 
     a_payload: tl.tuple | tuple
     a_scale: tl.tuple | tuple
@@ -214,21 +157,15 @@ def _index(
     component: gl.constexpr,
     FILL: gl.constexpr,
 ):
-    """LDS ring index the step reads (with ``FILL``, writes) for a component."""
     static: gl.constexpr = sched.static_lds_index(STEP, component, FILL)
     if require_constexpr(static is not None):
         out = static
     else:
         depth: gl.constexpr = sched.ring_depth(component)
         ratio: gl.constexpr = sched.ratio_k(component)
-        # fill_span, not live_span: they differ only for a direct-register
-        # component, and FILL is only ever set from the LDS branches where the
-        # two agree. Spelling it this way means the ring index stays right if a
-        # register component is ever routed through here.
         advance: gl.constexpr = sched.fill_span(component) - 1 if FILL else 0
         k_tile = (step + advance) // ratio
         if require_constexpr(sched.register_period == 1):
-            # Avoid signed ring arithmetic without disturbing live register queues.
             gl.assume(k_tile >= 0)
         out = k_tile % depth
     return out
@@ -348,9 +285,6 @@ def _fill_slot(
     sched: gl.constexpr = pc.schedule
     nm: gl.constexpr = layout.num_m_slots
     nn: gl.constexpr = layout.num_n_slots
-    # One query for what this slot issues this step. The four branches below
-    # stay separate because they perform different JIT-visible pointer and
-    # tuple operations, but they no longer each restate the gate.
     ops: gl.constexpr = sched.issued(STEP, _slot_index(mi, ni, nm, nn))
     mk: gl.constexpr = layout.num_k_slots
     offset_step: gl.constexpr = sched.ki(STEP) if sched.soff_unroll(STEP) else 0
@@ -548,7 +482,6 @@ def _ds_read_payload(
     non_k_slot: gl.constexpr,
     operand: gl.constexpr,
 ):
-    """Read one non-K slot of an operand's payload, from LDS or its register ring."""
     layout: gl.constexpr = pc.layout
     sched: gl.constexpr = pc.schedule
     component: gl.constexpr = (operand, False)
@@ -586,7 +519,6 @@ def _ds_read_scale(
     non_k_slot: gl.constexpr,
     operand: gl.constexpr,
 ):
-    """Read all fragments shared by one non-K slot of a scale and its R K steps."""
     layout: gl.constexpr = pc.layout
     sched: gl.constexpr = pc.schedule
     component: gl.constexpr = (operand, True)
@@ -680,11 +612,6 @@ def _take_operand_pairs(
 
 @gluon.jit
 def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
-    """Advance payloads and independently phased scale producers/DS reads.
-
-    ``step`` is the K tile the step DS-reads, a runtime value inside the loops;
-    ``STEP`` is the step's index in ``pc.schedule``.
-    """
     tc: gl.constexpr = pc.tuning_cfg
     layout: gl.constexpr = pc.layout
     sched: gl.constexpr = pc.schedule
@@ -763,9 +690,6 @@ def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
             a_scale += asm + asf
             b_scale += bsm + bsf
             acc += (value,)
-    # The compiler warp pipeline supplies the cross-stage ordering itself and
-    # rejects explicit barriers in its staged loop. Non-warp loops need this
-    # boundary for every kind of direct-register producer, not only B payloads.
     if require_constexpr(IN_LOOP and sched.has_register_component() and not warp):
         gl.amd.cdna4.sched_barrier(0)
     if require_constexpr(not IN_LOOP):
@@ -782,7 +706,6 @@ _step = _step_live
 
 @gluon.jit
 def _run_buffered_pipeline(pc, ptrs, NUM_K):
-    """Run the prologue and MAIN iterations; leave the drain to overlap the epilogue."""
     tc: gl.constexpr = pc.tuning_cfg
     layout: gl.constexpr = pc.layout
     sched: gl.constexpr = pc.schedule
@@ -802,8 +725,6 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
     remaining = main - peeled
     unroll_end = remaining // unroll * unroll
     buffers = _init_buffers(pc)
-    # The relative prologue stage starts at 1 - PIPELINE_DEPTH; each component
-    # begins filling when that stage reaches 1 - its own fill span.
     for r in gl.static_range(1 - depth, 0):
         for ni in gl.static_range(layout.num_n_slots):
             for mi in gl.static_range(layout.num_m_slots):
@@ -845,7 +766,6 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
                 sched.loop_step(u),
             )
     if require_constexpr(sched.static_remainder):
-        # Static expansion keeps short remainders and their LDS indices constant.
         for u in gl.static_range(unroll - 1):
             if unroll_end + u < remaining:
                 ptrs, buffers, regs = _step(
@@ -857,8 +777,6 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
                     sched.remainder_step(u),
                 )
     else:
-        # A single runtime remainder loop avoids the register pressure of a chain
-        # of guarded tuple updates. The ring rotates only in this remainder loop.
         for u in tl.range(0, remaining - unroll_end):
             ptrs, buffers, regs = _step(
                 pc,
@@ -873,12 +791,6 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
 
 @gluon.jit
 def _drain_buffered_pipeline(pc, ptrs, buffers, regs, NUM_K):
-    # Precondition: NUM_K == layout.num_k_tiles(K). The drain's region selection
-    # uses the runtime NUM_K while its absolute scale phase comes from the
-    # schedule's constexpr num_k, so the two must name the same strip. Every
-    # production launch passes K // BLOCK_K for NUM_K, which satisfies it. It matters
-    # only for a scale K-step ratio above one or BLOCK_K == 128, where the phase
-    # selects which scale block or which half of a packed word the MFMA consumes.
     tc: gl.constexpr = pc.tuning_cfg
     layout: gl.constexpr = pc.layout
     sched: gl.constexpr = pc.schedule
