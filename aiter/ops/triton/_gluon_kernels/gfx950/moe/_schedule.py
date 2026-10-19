@@ -50,9 +50,9 @@ def _payload_buffer_load_slots(nm, nn):
 
 
 @gluon.constexpr_function
-def _first_non_k_slot(mapping, slot, ratio):
+def _first_non_k_slot(mapping, slot_index, ratio):
     for t, mapped in enumerate(mapping):
-        if mapped == slot and t % ratio == 0:
+        if mapped == slot_index and t % ratio == 0:
             return t
     return None
 
@@ -91,11 +91,11 @@ def _step_plan(m, layout, kind, stage, phase):
     )
     per_copy, per_slot = m["commit"][0], m["commit"][1]
     commits, whole = [], ()
-    for slot, copies in enumerate(issued):
+    for slot_index, copies in enumerate(issued):
         ops = tuple(
-            (ci, t)
-            for ci, t in enumerate(copies)
-            if t is not None and layout.component_via_lds(COMPONENTS[ci])
+            (component_index, t)
+            for component_index, t in enumerate(copies)
+            if t is not None and layout.component_via_lds(COMPONENTS[component_index])
         )
         if per_copy:
             groups = tuple((op,) for op in ops)
@@ -103,7 +103,7 @@ def _step_plan(m, layout, kind, stage, phase):
             groups = (ops,)
         else:
             whole += ops
-            groups = (whole,) if slot == len(issued) - 1 else ()
+            groups = (whole,) if slot_index == len(issued) - 1 else ()
         commits.append(groups)
     if kind == _StepKind.PROLOGUE:
         demand = ()
@@ -113,11 +113,11 @@ def _step_plan(m, layout, kind, stage, phase):
         )
         demand = tuple(
             tuple(
-                (ci, t)
-                for ci, t in enumerate(non_k_slots)
+                (component_index, t)
+                for component_index, t in enumerate(non_k_slots)
                 if t is not None
-                and layout.component_via_lds(COMPONENTS[ci])
-                and ds_reads[ci]
+                and layout.component_via_lds(COMPONENTS[component_index])
+                and ds_reads[component_index]
             )
             for non_k_slots in m["ds_read_non_k_slots"]
         )
@@ -125,13 +125,17 @@ def _step_plan(m, layout, kind, stage, phase):
 
 
 @gluon.constexpr_function
-def _replay(orders, load_to_mfma_distance, per_tile, slots):
+def _replay(orders, load_to_mfma_distance, per_tile, num_slots):
     def _immediate(position, count, step, need, load_to_mfma_distance):
         if not need:
             return None
         latest = -1
-        for ci, t in need:
-            copy = (step - load_to_mfma_distance[ci] + 1, ci, t)
+        for component_index, t in need:
+            copy = (
+                step - load_to_mfma_distance[component_index] + 1,
+                component_index,
+                t,
+            )
             assert (
                 copy in position
             ), f"copy {copy} is DS-read at step {step} but was never committed before it"
@@ -147,21 +151,21 @@ def _replay(orders, load_to_mfma_distance, per_tile, slots):
         for key, step, commits, demand in order:
             measure = key is not None and bool(demand)
             if measure:
-                tile, slot_waits = out.get(key, (None, (None,) * slots))
+                tile, slot_waits = out.get(key, (None, (None,) * num_slots))
                 slot_waits = list(slot_waits)
                 if per_tile:
                     need = tuple(copy for copies in demand for copy in copies)
                     now = _immediate(position, count, step, need, load_to_mfma_distance)
                     tile = _smaller(tile, now)
-            for slot, groups in enumerate(commits):
+            for slot_index, groups in enumerate(commits):
                 if measure and not per_tile:
                     now = _immediate(
-                        position, count, step, demand[slot], load_to_mfma_distance
+                        position, count, step, demand[slot_index], load_to_mfma_distance
                     )
-                    slot_waits[slot] = _smaller(slot_waits[slot], now)
+                    slot_waits[slot_index] = _smaller(slot_waits[slot_index], now)
                 for group in groups:
-                    for ci, t in group:
-                        copy = (step, ci, t)
+                    for component_index, t in group:
+                        copy = (step, component_index, t)
                         assert copy not in position, f"copy {copy} committed twice"
                         position[copy] = count
                     count += 1
@@ -210,7 +214,7 @@ class Schedule:
         tc = tuning_cfg
         fc = tc.func_cfg
         nm, nn = _v(layout.num_m_slots), _v(layout.num_n_slots)
-        slots = nm * nn
+        num_slots = nm * nn
         num_k = layout.num_k_tiles(K)
 
         component_present = tuple(
@@ -228,15 +232,19 @@ class Schedule:
         )
 
         depth, ring_period, register_period, async_period = 0, 1, 1, 1
-        for ci, c in enumerate(COMPONENTS):
-            if component_present[ci]:
+        for component_index, c in enumerate(COMPONENTS):
+            if component_present[component_index]:
                 ratio = _steps_per_buffer(scale_steps_per_buffer, c, 1)
-                depth = max(depth, live_span[ci])
-                ring_period = math.lcm(ring_period, num_buffers[ci] * ratio)
+                depth = max(depth, live_span[component_index])
+                ring_period = math.lcm(
+                    ring_period, num_buffers[component_index] * ratio
+                )
                 if layout.component_via_lds(c):
                     async_period = math.lcm(async_period, ratio)
                 else:
-                    register_period = math.lcm(register_period, num_buffers[ci] * ratio)
+                    register_period = math.lcm(
+                        register_period, num_buffers[component_index] * ratio
+                    )
         k_unroll = _v(tc.K_UNROLL)
         assert k_unroll >= 1, "K_UNROLL must be at least 1"
         unroll = math.lcm(k_unroll, ring_period)
@@ -249,7 +257,7 @@ class Schedule:
         )
         buffer_load_slots_valid = all(
             len(mapping) == (nm if op == A else nn)
-            and all(0 <= slot < slots for slot in mapping)
+            and all(0 <= slot_index < num_slots for slot_index in mapping)
             and len(set(mapping)) == len(mapping)
             for (op, _), mapping in zip(COMPONENTS, buffer_load_slots)
         )
@@ -257,33 +265,35 @@ class Schedule:
             tuple(
                 (
                     _first_non_k_slot(
-                        buffer_load_slots[ci],
-                        slot,
-                        _steps_per_buffer(scale_steps_per_buffer, COMPONENTS[ci], 0),
+                        buffer_load_slots[component_index],
+                        slot_index,
+                        _steps_per_buffer(
+                            scale_steps_per_buffer, COMPONENTS[component_index], 0
+                        ),
                     )
-                    if component_present[ci]
+                    if component_present[component_index]
                     else None
                 )
-                for ci in range(len(COMPONENTS))
+                for component_index in range(len(COMPONENTS))
             )
-            for slot in range(slots)
+            for slot_index in range(num_slots)
         )
         ds_read_slots, ds_read_in_mfma = [], []
-        for ci, (op, is_scale) in enumerate(COMPONENTS):
+        for component_index, (op, is_scale) in enumerate(COMPONENTS):
             payload_slots = a_slots if op == A else b_slots
             ds_reads, in_mfma = [], []
             for t in range(len(payload_slots)):
                 ds_read = payload_slots[t]
                 same_step = (
                     layout.component_in_reg((op, is_scale))
-                    and load_to_mfma_distance[ci] == 1
+                    and load_to_mfma_distance[component_index] == 1
                 )
                 if (
                     same_step
                     and buffer_load_slots_valid
-                    and buffer_load_slots[ci][t] > ds_read
+                    and buffer_load_slots[component_index][t] > ds_read
                 ):
-                    ds_read = buffer_load_slots[ci][t]
+                    ds_read = buffer_load_slots[component_index][t]
                 ds_reads.append(ds_read)
                 configured = bool(tc.ds_read_in_mfma(op, is_scale))
                 in_mfma.append(
@@ -291,7 +301,7 @@ class Schedule:
                     or (
                         same_step
                         and buffer_load_slots_valid
-                        and ds_read == buffer_load_slots[ci][t]
+                        and ds_read == buffer_load_slots[component_index][t]
                     )
                 )
             ds_read_slots.append(tuple(ds_reads))
@@ -300,16 +310,18 @@ class Schedule:
             tuple(
                 (
                     _first_non_k_slot(
-                        ds_read_slots[ci],
-                        slot,
-                        _steps_per_buffer(scale_steps_per_buffer, COMPONENTS[ci], 0),
+                        ds_read_slots[component_index],
+                        slot_index,
+                        _steps_per_buffer(
+                            scale_steps_per_buffer, COMPONENTS[component_index], 0
+                        ),
                     )
-                    if component_present[ci]
+                    if component_present[component_index]
                     else None
                 )
-                for ci in range(len(COMPONENTS))
+                for component_index in range(len(COMPONENTS))
             )
-            for slot in range(slots)
+            for slot_index in range(num_slots)
         )
 
         commit = (
@@ -350,7 +362,7 @@ class Schedule:
             for s in range(settled + 1):
                 kind = _StepKind.PEELED if s else _StepKind.WARMUP
                 warm.append((s, s) + _step_plan(model, layout, kind, s, s)[3:])
-            waits = _replay([warm], load_to_mfma_distance, commit[2], slots)
+            waits = _replay([warm], load_to_mfma_distance, commit[2], num_slots)
             for s in range(1, depth - 1):
                 steady = s + async_period * -(-(2 * depth - s) // async_period)
                 if waits.get(s) != waits.get(steady):
@@ -462,13 +474,13 @@ class Schedule:
         longest = unroll - 1 if static_remainder else 1
         if rem < longest:
             orders.append(head + tail(longest))
-        waits = _replay(orders, load_to_mfma_distance, commit[2], slots)
+        waits = _replay(orders, load_to_mfma_distance, commit[2], num_slots)
         for p in range(drain_phases):
             for j in range(depth - 1):
                 executed_copy = drain + phase * (depth - 1) + j
                 if executed_copy in waits:
                     waits[drain + p * (depth - 1) + j] = waits[executed_copy]
-        idle = (None, (None,) * slots)
+        idle = (None, (None,) * num_slots)
 
         self._steps = gl.constexpr(tuple(steps))
         self._active = gl.constexpr(tuple(plan[0] for plan in plans))
@@ -535,15 +547,15 @@ class Schedule:
 
     @gluon.constexpr_function
     def active(self, step, component):
-        return self._active.value[step][_ci(component)]
+        return self._active.value[step][_component_index(component)]
 
     @gluon.constexpr_function
     def loads(self, step, component):
-        return self._loads.value[step][_ci(component)]
+        return self._loads.value[step][_component_index(component)]
 
     @gluon.constexpr_function
-    def issued(self, step, slot):
-        return self._issued.value[step][slot]
+    def issued(self, step, slot_index):
+        return self._issued.value[step][slot_index]
 
     @gluon.constexpr_function
     def ds_reads(self, step, component):
@@ -557,16 +569,16 @@ class Schedule:
         )
 
     @gluon.constexpr_function
-    def commits(self, step, slot):
+    def commits(self, step, slot_index):
         return tuple(
-            tuple((COMPONENTS[ci], t) for ci, t in group)
-            for group in self._commits.value[step][slot]
+            tuple((COMPONENTS[component_index], t) for component_index, t in group)
+            for group in self._commits.value[step][slot_index]
         )
 
     @gluon.constexpr_function
-    def wait(self, step, slot=None):
+    def wait(self, step, slot_index=None):
         tile, slot_waits = self._waits.value[step]
-        return tile if slot is None else slot_waits[slot]
+        return tile if slot_index is None else slot_waits[slot_index]
 
     @gluon.constexpr_function
     def epilogue_wait(self):
@@ -574,11 +586,11 @@ class Schedule:
 
     @gluon.constexpr_function
     def component_present(self, component):
-        return self._component_present.value[_ci(component)]
+        return self._component_present.value[_component_index(component)]
 
     @gluon.constexpr_function
     def num_buffers(self, component):
-        return self._num_buffers.value[_ci(component)]
+        return self._num_buffers.value[_component_index(component)]
 
     @gluon.constexpr_function
     def steps_per_buffer(self, component):
@@ -586,27 +598,27 @@ class Schedule:
 
     @gluon.constexpr_function
     def load_to_mfma_distance(self, component):
-        return self._load_to_mfma_distance.value[_ci(component)]
+        return self._load_to_mfma_distance.value[_component_index(component)]
 
     @gluon.constexpr_function
     def buffer_load_slot(self, component, non_k_slot):
-        return self._buffer_load_slots.value[_ci(component)][non_k_slot]
+        return self._buffer_load_slots.value[_component_index(component)][non_k_slot]
 
     @gluon.constexpr_function
     def ds_read_slot(self, component, non_k_slot):
-        return self._ds_read_slots.value[_ci(component)][non_k_slot]
+        return self._ds_read_slots.value[_component_index(component)][non_k_slot]
 
     @gluon.constexpr_function
     def ds_read_in_mfma(self, component, non_k_slot):
-        return self._ds_read_in_mfma.value[_ci(component)][non_k_slot]
+        return self._ds_read_in_mfma.value[_component_index(component)][non_k_slot]
 
     @gluon.constexpr_function
-    def owned(self, slot):
-        return self._owned.value[slot]
+    def owned(self, slot_index):
+        return self._owned.value[slot_index]
 
     @gluon.constexpr_function
-    def ds_read_non_k_slot(self, slot, component):
-        return self._ds_read_non_k_slots.value[slot][_ci(component)]
+    def ds_read_non_k_slot(self, slot_index, component):
+        return self._ds_read_non_k_slots.value[slot_index][_component_index(component)]
 
     @gluon.constexpr_function
     def register_index(self, step, component, buffer_load=False):
@@ -651,9 +663,9 @@ class Schedule:
 
 
 @gluon.constexpr_function
-def _ci(component):
+def _component_index(component):
     key = (component[0], bool(component[1]))
-    for ci, candidate in enumerate(COMPONENTS):
+    for component_index, candidate in enumerate(COMPONENTS):
         if candidate == key:
-            return ci
+            return component_index
     raise AssertionError(f"{key} is not a component")
