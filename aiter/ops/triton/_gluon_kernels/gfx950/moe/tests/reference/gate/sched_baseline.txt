@@ -1201,7 +1201,7 @@
   sizing depth=3 unroll=3 peeled=1 ring=3 regperiod=3 async=1 hasreg=True
   regions static_remainder=True static_drain=False epilogue_groups=0 epilogue_wait=None
   commit per_copy=False per_slot=False per_tile=True tile_after_mfma=True
-  A_PAY D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=1 fill_slots=(1, 2) read_slots=(1, 2) in_mfma=(False, False)
+  A_PAY D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=1 fill_slots=(1, 2) read_slots=(1, 2) in_mfma=(True, True)
   A_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=1 fill_slots=(1, 2) read_slots=(1, 2) in_mfma=(False, False)
   B_PAY D=3 R=1 L=3 F=2 via_lds=False pphase=0 nonk_ratio=1 fill_slots=(0, 3) read_slots=(0, 3) in_mfma=(False, False)
   B_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=1 fill_slots=(0, 3) read_slots=(0, 3) in_mfma=(False, False)
@@ -1315,7 +1315,7 @@
   sizing depth=3 unroll=3 peeled=1 ring=3 regperiod=3 async=1 hasreg=True
   regions static_remainder=True static_drain=False epilogue_groups=0 epilogue_wait=None
   commit per_copy=False per_slot=False per_tile=True tile_after_mfma=True
-  A_PAY D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=1 fill_slots=(1, 2) read_slots=(1, 2) in_mfma=(False, False)
+  A_PAY D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=1 fill_slots=(1, 2) read_slots=(1, 2) in_mfma=(True, True)
   A_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=1 fill_slots=(1, 2) read_slots=(1, 2) in_mfma=(False, False)
   B_PAY D=3 R=1 L=3 F=2 via_lds=False pphase=0 nonk_ratio=1 fill_slots=(0, 3) read_slots=(0, 3) in_mfma=(False, False)
   B_SCL D=3 R=1 L=3 F=3 via_lds=True pphase=0 nonk_ratio=1 fill_slots=(0, 3) read_slots=(0, 3) in_mfma=(False, False)

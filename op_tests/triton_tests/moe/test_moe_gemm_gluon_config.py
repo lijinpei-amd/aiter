@@ -19,6 +19,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._entry import (
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._frozen import _validate_frozen
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import (
+    SchedMode,
     constexpr_fields,
     maybe_unwrap,
 )
@@ -461,6 +462,33 @@ def test_small_t_mxfp8_gemm1_fits_several_ctas_per_cu(dq_b, ctas_per_cu):
         host._probe_lds_bytes(config, DtypeQuant.MXFP8, dq_b)
         <= host.LDS_USABLE_BYTES // ctas_per_cu
     )
+
+
+@pytest.mark.parametrize(
+    "env,sched_mode", [(None, SchedMode.MFMA_8), ("0", SchedMode.NONE)]
+)
+def test_large_t_mxfp8_mxfp4_gemm1_interleaves_mfma_with_memory(
+    monkeypatch, env, sched_mode
+):
+    # The environment still wins over the measured default.
+    if env is not None:
+        monkeypatch.setenv("AITER_TRITON_MOE_GLUON_SCHED_MODE", env)
+    config = host._default_launch_config(
+        128, 4096, 7168, DtypeQuant.MXFP8, DtypeQuant.MXFP4, False, True
+    )
+    expected = {
+        "BLOCK_N": 256,
+        "warps_per_cta": (1, 4),
+        "ALLOW_B_VIA_LDS": False,
+        "SCHED_MODE": int(sched_mode),
+        "DS_READ_A_PAYLOAD_IN_MFMA": True,
+        "GROUP_M": 4,
+    }
+    assert {name: config[name] for name in expected} == expected
+    tuning = host._probe_tuning_config(config, DtypeQuant.MXFP8, DtypeQuant.MXFP4)
+    assert host._cval(validate(tuning, 4096, 7168))
+    layout = KernelLayout(tuning)
+    assert host._cval(host._validate_selected_pipeline(tuning, layout, 7168))
 
 
 @pytest.mark.parametrize(
