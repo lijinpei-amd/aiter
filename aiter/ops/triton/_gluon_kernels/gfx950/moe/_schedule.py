@@ -3,6 +3,7 @@
 
 
 import math
+from enum import IntEnum
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
@@ -10,16 +11,18 @@ from triton.language.core import _aggregate as aggregate
 
 from ._lang import maybe_unwrap as _v
 from ._lang import strip_annotate
-from ._types import COMPONENTS, A, _slot_index
+from ._types import COMPONENTS, A
 
 __all__ = ["Schedule"]
 
-_PROLOGUE = 0
-_WARMUP = 1
-_PEELED = 2
-_LOOP = 3
-_REMAINDER = 4
-_DRAIN = 5
+
+class _StepKind(IntEnum):
+    PROLOGUE = 0
+    WARMUP = 1
+    PEELED = 2
+    LOOP = 3
+    REMAINDER = 4
+    DRAIN = 5
 
 
 @gluon.constexpr_function
@@ -43,10 +46,7 @@ def _payload_fill_slots(nm, nn):
             tuple(order.index((1, t)) for t in range(nm)),
             tuple(order.index((0, t)) for t in range(nn)),
         )
-    return (
-        tuple(_slot_index(t, 0, nm, nn) for t in range(nm)),
-        tuple(_slot_index(0, t, nm, nn) for t in range(nn)),
-    )
+    return tuple(range(nm)), tuple(range(nn))
 
 
 @gluon.constexpr_function
@@ -60,7 +60,7 @@ def _first_non_k_slot(mapping, slot, ratio):
 @gluon.constexpr_function
 def _step_plan(m, kind, stage, phase):
     present, fill_span, ratio_k = m["present"], m["fill_span"], m["ratio_k"]
-    if kind == _DRAIN:
+    if kind == _StepKind.DRAIN:
         active = tuple(p and stage < m["depth"] - f for p, f in zip(present, fill_span))
     else:
         active = tuple(
@@ -88,7 +88,7 @@ def _step_plan(m, kind, stage, phase):
             whole += ops
             groups = (whole,) if slot == len(issued) - 1 else ()
         commits.append(groups)
-    if kind == _PROLOGUE:
+    if kind == _StepKind.PROLOGUE:
         demand = ()
     else:
         ds_reads = tuple(p and phase % r == 0 for p, r in zip(present, ratio_k))
@@ -104,26 +104,22 @@ def _step_plan(m, kind, stage, phase):
 
 
 @gluon.constexpr_function
-def _immediate(position, count, step, need, fill_span):
-    if not need:
-        return None
-    latest = -1
-    for ci, t in need:
-        copy = (step - fill_span[ci] + 1, ci, t)
-        assert (
-            copy in position
-        ), f"copy {copy} is DS-read at step {step} but was never committed before it"
-        latest = max(latest, position[copy])
-    return count - latest - 1
-
-
-@gluon.constexpr_function
-def _smaller(a, b):
-    return b if a is None else a if b is None else min(a, b)
-
-
-@gluon.constexpr_function
 def _replay(orders, fill_span, per_tile, slots):
+    def _immediate(position, count, step, need, fill_span):
+        if not need:
+            return None
+        latest = -1
+        for ci, t in need:
+            copy = (step - fill_span[ci] + 1, ci, t)
+            assert (
+                copy in position
+            ), f"copy {copy} is DS-read at step {step} but was never committed before it"
+            latest = max(latest, position[copy])
+        return count - latest - 1
+
+    def _smaller(a, b):
+        return b if a is None else a if b is None else min(a, b)
+
     out = {}
     for order in orders:
         position, count = {}, 0
@@ -156,7 +152,6 @@ def _replay(orders, fill_span, per_tile, slots):
 class Schedule:
 
     _present: gl.constexpr
-    _via_lds: gl.constexpr
     _ring_depth: gl.constexpr
     _ratio_k: gl.constexpr
     _fill_span: gl.constexpr
@@ -312,13 +307,12 @@ class Schedule:
         if fill_slots_valid:
             settled = 3 * depth + async_period
             warm = [
-                (None, r) + _step_plan(model, _PROLOGUE, r, r)[3:]
+                (None, r) + _step_plan(model, _StepKind.PROLOGUE, r, r)[3:]
                 for r in range(1 - depth, 0)
             ]
-            warm += [
-                (s, s) + _step_plan(model, _PEELED if s else _WARMUP, s, s)[3:]
-                for s in range(settled + 1)
-            ]
+            for s in range(settled + 1):
+                kind = _StepKind.PEELED if s else _StepKind.WARMUP
+                warm.append((s, s) + _step_plan(model, kind, s, s)[3:])
             waits = _replay([warm], fill_span, commit[2], slots)
             for s in range(1, depth - 1):
                 steady = s + async_period * -(-(2 * depth - s) // async_period)
@@ -326,7 +320,6 @@ class Schedule:
                     peeled = s
 
         self._present = gl.constexpr(present)
-        self._via_lds = gl.constexpr(via_lds)
         self._ring_depth = gl.constexpr(ring_depth)
         self._ratio_k = gl.constexpr(ratio_k)
         self._fill_span = gl.constexpr(fill_span)
@@ -363,22 +356,29 @@ class Schedule:
             return
 
         drain_phases = ring_period if static_drain else 1
-        steps = [(_PROLOGUE, r, r, 0, False, False, False) for r in range(1 - depth, 0)]
-        steps.append((_WARMUP, 0, 0, 0, False, False, False))
-        steps += [(_PEELED, x + 1, x + 1, 0, False, False, True) for x in range(peeled)]
+        steps = [
+            (int(_StepKind.PROLOGUE), r, r, 0, False, False, False)
+            for r in range(1 - depth, 0)
+        ]
+        steps.append((int(_StepKind.WARMUP), 0, 0, 0, False, False, False))
         steps += [
-            (_LOOP, None, peeled + u + 1, u, True, False, True) for u in range(unroll)
+            (int(_StepKind.PEELED), x + 1, x + 1, 0, False, False, True)
+            for x in range(peeled)
+        ]
+        steps += [
+            (int(_StepKind.LOOP), None, peeled + u + 1, u, True, False, True)
+            for u in range(unroll)
         ]
         if static_remainder:
             steps += [
-                (_REMAINDER, None, peeled + u + 1, u, False, True, True)
+                (int(_StepKind.REMAINDER), None, peeled + u + 1, u, False, True, True)
                 for u in range(unroll - 1)
             ]
         else:
-            steps.append((_REMAINDER, None, 0, 0, False, False, True))
+            steps.append((int(_StepKind.REMAINDER), None, 0, 0, False, False, True))
         steps += [
             (
-                _DRAIN,
+                int(_StepKind.DRAIN),
                 j,
                 num_k - depth + j + 1,
                 p + j - peeled if static_drain else 0,
@@ -507,7 +507,7 @@ class Schedule:
 
     @gluon.constexpr_function
     def is_drain(self, step):
-        return self._steps.value[step][0] == _DRAIN
+        return self._steps.value[step][0] == _StepKind.DRAIN
 
     @gluon.constexpr_function
     def active(self, step, component):
@@ -549,20 +549,6 @@ class Schedule:
     @gluon.constexpr_function
     def present(self, component):
         return self._present.value[_ci(component)]
-
-    @gluon.constexpr_function
-    def via_lds(self, component):
-        return self._via_lds.value[_ci(component)]
-
-    @gluon.constexpr_function
-    def in_reg(self, component):
-        return not self.via_lds(component)
-
-    @gluon.constexpr_function
-    def has_register_component(self):
-        return any(
-            p and not lds for p, lds in zip(self._present.value, self._via_lds.value)
-        )
 
     @gluon.constexpr_function
     def ring_depth(self, component):

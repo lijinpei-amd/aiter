@@ -403,7 +403,7 @@ def test_emitted_groups_and_waits_retire_required_copies(
             if (
                 not component[1]
                 or non_k_slot is None
-                or schedule.via_lds(component)
+                or tc.component_via_lds(component)
             )
             else None
             for component, non_k_slot in zip(COMPONENTS, schedule.owned(slot))
