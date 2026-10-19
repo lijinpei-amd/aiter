@@ -1013,6 +1013,22 @@ def _default_launch_config(
         # Splitting the slot to 64x128 also gives this shape two N slots, so unlike
         # every other block_m 64/128 cell it does not fall off the Gluon path for a
         # gate/up-split caller.
+        #
+        # One CTA of four waves holds the CU (480 registers), so the MFMAs and the
+        # memory work only overlap within a wave. The MFMA_8 interleave hint and A's
+        # LDS reads placed in the MFMA region buy it back. In-process cold A/B,
+        # each arm 3 rounds x 25 steady-state dispatches on four weight placements,
+        # us:
+        #
+        #                           T=1024   T=4096
+        #   neither (was)            270.6    976.9
+        #   SCHED_MODE MFMA_8        252.6    916.1
+        #   + A reads in MFMA        251.7    906.5
+        #   FlyDSL                   279.6    982.6
+        #
+        # GROUP_M 8 on top reaches 883.9 at T=4096 but costs T=1024 (258.9), and the
+        # ladder cannot tell them apart. The IGLP modes spill, and per-op commits
+        # lose 12%. bench_out/gluon_moe_regression/a8small/ab/w4m2_{1024,4096}.
         c = dict(
             c,
             BLOCK_N=256,
@@ -1027,6 +1043,10 @@ def _default_launch_config(
             VGPR_PREFETCH_K=256,
             WAVES_PER_EU=1,
             WAIT_COMMIT_SCHEME=int(WaitCommitScheme.PER_STAGE_WHOLE),
+            SCHED_MODE=_env_int(
+                "AITER_TRITON_MOE_GLUON_SCHED_MODE", int(SchedMode.MFMA_8)
+            ),
+            DS_READ_A_PAYLOAD_IN_MFMA=True,
             A_SCALE_SORTED_SHUFFLED=True,
             B_SCALE_SHUFFLED=True,
             B_PRESHUFFLED=True,
