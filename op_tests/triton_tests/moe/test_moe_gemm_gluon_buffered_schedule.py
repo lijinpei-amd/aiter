@@ -4,7 +4,7 @@
 """Execute the unified schedule on CPU with symbolic HBM/LDS/register values.
 
 Only hardware operations and Gluon aggregates are replaced.  The actual driver,
-fill guards, pointer advances, register tuple updates, read selection and waits
+fill guards, pointer advances, register tuple updates, DS reads and waits
 run as Python, so the oracle observes their issue history rather than reproducing
 the pipeline implementation.
 """
@@ -426,14 +426,14 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         b_scale_stride_k=1,
     )
     step_fn, fill_fn = pipeline._step.fn, pipeline._fill_slot.fn
-    read_slot_fn = pipeline._read_slot.fn
-    read_payload_fn = pipeline._read_payload.fn
-    read_scale_fn = pipeline._read_scale.fn
+    ds_read_slot_fn = pipeline._ds_read_slot.fn
+    ds_read_payload_fn = pipeline._ds_read_payload.fn
+    ds_read_scale_fn = pipeline._ds_read_scale.fn
 
     # Positional layouts: _step(pc, ptrs, buffers, regs, step, STEP),
-    # _fill_slot(pc, ptrs, buffers, step, STEP, mi, ni), _read_slot(pc, buffers, step,
-    # STEP, mi, ni, MFMA), _read_payload/_read_scale(pc, buffers, step, STEP,
-    # non-K slot, operand).
+    # _fill_slot(pc, ptrs, buffers, step, STEP, mi, ni),
+    # _ds_read_slot(pc, buffers, step, STEP, mi, ni, MFMA),
+    # _ds_read_payload/_ds_read_scale(pc, buffers, step, STEP, non-K slot, operand).
     def step(*args, **kwargs):
         assert machine.wait is None, "a wait guarded no read"
         machine.current_read = args[4]
@@ -448,16 +448,16 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         machine.current_drain = schedule.is_drain(args[4])
         return fill_fn(*args, **kwargs)
 
-    def read_slot(*args, **kwargs):
+    def ds_read_slot(*args, **kwargs):
         if not args[6]:  # the slot's first read, right after its wait
             slot = _slot_index(args[4], args[5], tc.nm, tc.nn)
             if not per_tile:
                 machine.check_wait(slot)
             elif slot == 0:
                 machine.check_wait(None)
-        return read_slot_fn(*args, **kwargs)
+        return ds_read_slot_fn(*args, **kwargs)
 
-    def read_payload(*args, **kwargs):
+    def ds_read_payload(*args, **kwargs):
         component = (args[5], PAYLOAD)
         if tc.component_in_reg(component):
             machine.events.append(
@@ -465,15 +465,15 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
                     machine.current_read,
                     machine.current_in_loop,
                     machine.current_drain,
-                    "select",
+                    "ds_read",
                     component,
                     machine.current_read,
                     args[4],
                 )
             )
-        return read_payload_fn(*args, **kwargs)
+        return ds_read_payload_fn(*args, **kwargs)
 
-    def read_scale(*args, **kwargs):
+    def ds_read_scale(*args, **kwargs):
         operand = args[5]
         component = (operand, SCALE)
         if tc.component_in_reg(component):
@@ -483,13 +483,13 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
                     machine.current_read,
                     machine.current_in_loop,
                     machine.current_drain,
-                    "select",
+                    "ds_read",
                     component,
                     machine.current_read - machine.current_read % ratio,
                     args[4],
                 )
             )
-        return read_scale_fn(*args, **kwargs)
+        return ds_read_scale_fn(*args, **kwargs)
 
     def check_assumption(value):
         assert value
@@ -535,9 +535,9 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
             "_rotate",
             "_rotate_buffers",
             "_advance",
-            "_read_payload",
-            "_read_scale",
-            "_read_slot",
+            "_ds_read_payload",
+            "_ds_read_scale",
+            "_ds_read_slot",
             "_step_live",
             "_take_reg_pairs",
             "_take_operand_pairs",
@@ -548,9 +548,9 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         patch.setattr(pipeline, "_PipelinePointers", _pointers)
         patch.setattr(pipeline, "_step", step)
         patch.setattr(pipeline, "_fill_slot", fill)
-        patch.setattr(pipeline, "_read_slot", read_slot)
-        patch.setattr(pipeline, "_read_payload", read_payload)
-        patch.setattr(pipeline, "_read_scale", read_scale)
+        patch.setattr(pipeline, "_ds_read_slot", ds_read_slot)
+        patch.setattr(pipeline, "_ds_read_payload", ds_read_payload)
+        patch.setattr(pipeline, "_ds_read_scale", ds_read_scale)
         patch.setattr(pipeline, "_init_buffers", init_buffers)
         patch.setattr(pipeline, "_maybe_block_dot", machine.dot)
         patch.setattr(
@@ -727,7 +727,7 @@ def _assert_direct_b_stage_barriers(machine):
     ],
     ids=["a-payload", "a-scale", "b-payload", "b-scale"],
 )
-def test_depth_two_direct_component_selects_after_same_step_fill(
+def test_depth_two_direct_component_ds_reads_after_same_step_fill(
     component, register_mask, monkeypatch
 ):
     depths = [3, 3, 3, 3]
@@ -741,22 +741,22 @@ def test_depth_two_direct_component_selects_after_same_step_fill(
     num_k = tc.minimum_num_k() + 1
     machine = _execute(tc, num_k, monkeypatch)
 
-    selections = [
+    ds_reads = [
         (pos, event)
         for pos, event in enumerate(machine.events)
-        if event[3] == "select" and event[4] == component
+        if event[3] == "ds_read" and event[4] == component
     ]
-    assert selections
-    for select_pos, selection in selections:
-        event_read, _, _, _, _, tile, mini = selection
+    assert ds_reads
+    for ds_read_pos, ds_read in ds_reads:
+        event_read, _, _, _, _, tile, mini = ds_read
         matching_loads = [
             pos
-            for pos, event in enumerate(machine.events[:select_pos])
+            for pos, event in enumerate(machine.events[:ds_read_pos])
             if event[0] == event_read
             and event[3] == "load"
             and event[4:] == (component, tile, mini)
         ]
-        assert matching_loads, "F=1 direct selection must follow its same-step fill"
+        assert matching_loads, "F=1 direct DS read must follow its same-step fill"
 
 
 @pytest.mark.parametrize("read_mask", [0, 8], ids=["configured-mem", "configured-mfma"])
@@ -779,14 +779,14 @@ def test_middle_direct_b_scale_defers_tile_zero_and_preserves_order(
             for pos, event in enumerate(machine.events)
             if event[0] == event_read and event[4] == B_SCALE
         ]
-        selections = [(pos, event) for pos, event in events if event[3] == "select"]
-        assert [event[6] for _, event in selections] == [0, 1]
+        ds_reads = [(pos, event) for pos, event in events if event[3] == "ds_read"]
+        assert [event[6] for _, event in ds_reads] == [0, 1]
         tile_zero_load = next(
             pos
             for pos, event in events
             if event[3] == "load" and event[5:] == (event_read, 0)
         )
-        assert tile_zero_load < selections[0][0]
+        assert tile_zero_load < ds_reads[0][0]
 
 
 @pytest.mark.parametrize("component,register_mask", [(A_SCALE, 2), (B_SCALE, 4)])
@@ -959,7 +959,7 @@ def test_compiler_pipeline_owns_register_stage_ordering(monkeypatch):
 def _straight_line_waits(schedule, tc, last):
     """Wait immediates of K steps ``0..last`` as if every one were emitted in a line.
 
-    An independent FIFO over the schedule's public commit plan and selections: the
+    An independent FIFO over the schedule's public commit plan and DS reads: the
     prologue and warm-up steps as emitted, then one step per K tile with the loop
     body's commit pattern for that K phase -- which is what every step after the
     warm-up issues. Returns ``{step: tile wait}`` for a per-tile scheme, else
@@ -976,11 +976,11 @@ def _straight_line_waits(schedule, tc, last):
 
     def required(step, slot):
         return {
-            (step - schedule.fill_span(c) + 1, c, schedule.selected(slot, c))
+            (step - schedule.fill_span(c) + 1, c, schedule.ds_read_non_k_slot(slot, c))
             for c in COMPONENTS
-            if schedule.selected(slot, c) is not None
+            if schedule.ds_read_non_k_slot(slot, c) is not None
             and schedule.via_lds(c)
-            and schedule.selects_at_phase(c, step)
+            and schedule.ds_reads_at_phase(c, step)
         }
 
     def immediate(need):
@@ -1085,7 +1085,7 @@ def test_every_payload_tile_is_filled_exactly_once(nm, nn, middle):
 def test_scale_fill_mid_moves_only_the_scale_fill_slots(shape):
     """`SCALE_FILL_MID` is a copy-ownership knob and nothing else.
 
-    It must not disturb payload ownership, the selection slots, or the configured
+    It must not disturb payload ownership, the DS-read slots, or the configured
     DS-read region. It is also inert outside the guarded 2x2 split, which is easy to
     forget when reading a config that sets it on a rectangular tile.
     """
@@ -1101,8 +1101,8 @@ def test_scale_fill_mid_moves_only_the_scale_fill_slots(shape):
         ], component
     for component in COMPONENTS:
         non_k_slots = range(nm if component[0] == A else nn)
-        assert [off_schedule.read_slot(component, t) for t in non_k_slots] == [
-            on_schedule.read_slot(component, t) for t in non_k_slots
+        assert [off_schedule.ds_read_slot(component, t) for t in non_k_slots] == [
+            on_schedule.ds_read_slot(component, t) for t in non_k_slots
         ], component
         assert off.ds_read_in_mfma(*component) == on.ds_read_in_mfma(*component)
 
@@ -1124,7 +1124,7 @@ def test_epilogue_groups_stop_adding_slack_after_a_drain_producer():
     K = (tc.minimum_num_k() + 3) * tc.BLOCK_K
     two, none = Schedule(tc, tc, K, 2), Schedule(tc, tc, K, 0)
     first, second = two.drain_step(0, 0), two.drain_step(0, 1)
-    # B's first N slot is selected in slot zero. Its depth-two producer moves past
+    # B's first N slot is DS-read in slot zero. Its depth-two producer moves past
     # the epilogue commit at drain iteration one; globally adding slack is unsafe.
     assert two.wait(first, 0) == none.wait(first, 0) + 2
     assert two.wait(second, 0) == none.wait(second, 0)

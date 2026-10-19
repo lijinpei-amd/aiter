@@ -774,7 +774,7 @@ def get_gluon_config_uncached(
             # cases set it -- which is why those benchmarked ~3% faster than the ladder.
             "ACT_FAST_RCP": bool(_env_int("AITER_TRITON_MOE_GLUON_ACT_FAST_RCP", 1)),
             # PER_OP (1) commits each async copy; PER_SLOT (2) commits each slot.
-            # Both wait before each read slot. PER_STAGE (3) commits the whole K
+            # Both wait before each DS-read slot. PER_STAGE (3) commits the whole K
             # stage and waits once at the read stage's head. Counts and copy ownership
             # come from the same schedule; see WaitCommitScheme.
             "WAIT_COMMIT_SCHEME": _env_int(

@@ -208,16 +208,16 @@ def dump_case(name, cfg, dq_a, dq_b, K, out):
             f"via_lds={schedule.via_lds(c)} pphase={schedule.producer_phase(c)} "
             f"nonk_ratio={layout.scale_slot_nonk(c[0]) // layout.slot_nonk(c[0])} "
             f"fill_slots={tuple(schedule.fill_slot(c, t) for t in range(non_k_slots))} "
-            f"read_slots={tuple(schedule.read_slot(c, t) for t in range(non_k_slots))} "
-            f"in_mfma={tuple(schedule.read_in_mfma(c, t) for t in range(non_k_slots))}")
+            f"ds_read_slots={tuple(schedule.ds_read_slot(c, t) for t in range(non_k_slots))} "
+            f"ds_read_in_mfma={tuple(schedule.ds_read_in_mfma(c, t) for t in range(non_k_slots))}")
 
-    # ownership and selection, per slot
+    # ownership and DS reads, per slot
     for ni in range(nn):
         for mi in range(nm):
             s = _slot_index(mi, ni, nm, nn)
-            selected = tuple(schedule.selected(s, c) for c in COMPONENTS)
+            ds_read = tuple(schedule.ds_read_non_k_slot(s, c) for c in COMPONENTS)
             out(f"  slot{s}(mi={mi},ni={ni}) owned={schedule.owned(s)} "
-                f"selected={selected}")
+                f"ds_read_non_k_slots={ds_read}")
 
     # every emitted step: what it copies, commits and waits on, and its ring indices
     for label, step in _steps(schedule):
@@ -227,8 +227,8 @@ def dump_case(name, cfg, dq_a, dq_b, K, out):
             f"soff={schedule.soff_unroll(step)}")
         act = tuple(int(schedule.active(step, c)) for c in COMPONENTS)
         loads = tuple(int(schedule.loads(step, c)) for c in COMPONENTS)
-        sel = tuple(int(schedule.selects(step, c)) for c in COMPONENTS)
-        out(f"    active={act} loads={loads} selects={sel}")
+        ds_reads = tuple(int(schedule.ds_reads(step, c)) for c in COMPONENTS)
+        out(f"    active={act} loads={loads} ds_reads={ds_reads}")
         out(f"    issued={tuple(schedule.issued(step, s) for s in range(slots))}")
         commits = tuple(
             tuple(tuple((CNAME[c], t) for c, t in g) for g in schedule.commits(step, s))

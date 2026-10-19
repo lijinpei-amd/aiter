@@ -24,7 +24,7 @@ Each python file is a component, and inter files, the import dependency should b
     * Everything else in it is internal derivation detail. Nothing outside `_layout.py` imports any other name from it or reaches into its module attributes: not the kernel modules, the host wrapper, `scripts/`, `op_tests/` or `tests/`. `_frozen.py` keeps its own private copies.
 * `_schedule.py`: the pipelined loop's schedule. Its only public surface is `Schedule`: its constructor, methods and fields, the same rule as `KernelLayout`'s. `Schedule(tuning_cfg, layout, K)` evaluates the whole schedule of one build in its constructor and holds the results in its fields, and `_pipeline.py` expands the loop from it alone:
     * how many prologue, warm-up, peeled, loop, remainder and drain steps there are, and each step's K phase, unroll position and region; every emitted step has an index into these tables;
-    * per step and slot, which non-K slot of each component is copied and which is selected, and the ring indices of both;
+    * per step and slot, which non-K slot of each component is copied and which is DS-read, and the ring indices of both;
     * the commit plan: the commit groups each slot of each step closes, and the granularity the emitter commits at;
     * the wait plan: the immediate of every async wait, read off a replay of the commit plan in execution order for this K. It also counts the epilogue's commit groups, which sit in the same FIFO.
     * It is built once, in `moe_gemm.py`, and carried in `_PipelineConst`. Nothing outside `_schedule.py` imports any other name from it.

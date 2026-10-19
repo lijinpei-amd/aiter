@@ -1307,7 +1307,7 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
     """Compare the commit and wait plans with a complete chronological simulation.
 
     The oracle records absolute K tiles and group sequence numbers, and does not use
-    the schedule's replay. It verifies direct-register selection against the
+    the schedule's replay. It verifies direct-register DS reads against the
     independent producer history; the buffered-pipeline oracle separately checks
     exact ring-bank contents and overwrite safety.
     """
@@ -1376,15 +1376,15 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
     fill_slot_for = {
         copy: slot for slot, copies in enumerate(fill_slots) for copy in copies
     }
-    read_slots = [[] for _ in range(nslots)]
+    ds_read_slots = [[] for _ in range(nslots)]
     for copy, fill_slot in fill_slot_for.items():
         component, tile = copy
         nominal = payload_slots[((component[0], False), tile)]
-        read_slot = nominal
+        ds_read_slot = nominal
         if not via_lds[component] and fill_spans[component] == 1:
-            read_slot = max(read_slot, fill_slot)
-        assert all(existing[0] != component for existing in read_slots[read_slot])
-        read_slots[read_slot].append(copy)
+            ds_read_slot = max(ds_read_slot, fill_slot)
+        assert all(existing[0] != component for existing in ds_read_slots[ds_read_slot])
+        ds_read_slots[ds_read_slot].append(copy)
     for slot, expected in enumerate(fill_slots):
         actual = schedule.owned(slot)
         assert (
@@ -1411,8 +1411,8 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
     def required_copies(stage, slot):
         need = []
         slots = range(nslots) if slot is None else (slot,)
-        for read_slot in slots:
-            for component, tile in read_slots[read_slot]:
+        for ds_read_slot in slots:
+            for component, tile in ds_read_slots[ds_read_slot]:
                 if stage % ratios[component] == 0:
                     need.append(
                         (stage - fill_spans[component] + 1, component, tile)
@@ -1489,9 +1489,9 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
                     group_for_copy[token] = len(committed)
                 committed.append(group)
 
-        def read_slot(slot, after_fill, read_stage=stage):
-            for component, tile in read_slots[slot]:
-                if read_stage % ratios[component]:
+        def ds_read_slot(slot, after_fill, ds_read_stage=stage):
+            for component, tile in ds_read_slots[slot]:
+                if ds_read_stage % ratios[component]:
                     continue
                 same_slot_fill = (
                     not via_lds[component]
@@ -1500,12 +1500,12 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
                 )
                 if same_slot_fill != after_fill:
                     continue
-                token = (read_stage - fill_spans[component] + 1, component, tile)
+                token = (ds_read_stage - fill_spans[component] + 1, component, tile)
                 if via_lds[component]:
-                    ring = read_stage // ratios[component] % depths[component]
-                    assert lds[component, tile, ring] == read_stage
+                    ring = ds_read_stage // ratios[component] % depths[component]
+                    assert lds[component, tile, ring] == ds_read_stage
                 else:
-                    assert token in issued, "register selected before its producer"
+                    assert token in issued, "register DS-read before its producer"
                 consumed.add(token)
 
         if stage < 0:
@@ -1517,9 +1517,9 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
             for slot in range(nslots):
                 if not per_stage:
                     check_wait(stage, slot)
-                read_slot(slot, False)
+                ds_read_slot(slot, False)
                 fill_slot(slot)
-                read_slot(slot, True)
+                ds_read_slot(slot, True)
         if stage == main:
             committed.extend(() for _ in range(epilogue_groups))
     expected_loads = {
