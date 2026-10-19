@@ -70,10 +70,10 @@ separately gate scale components with the operand format's `has_scale` predicate
 
 Let `PIPELINE_DEPTH` be the largest baseline inclusive live span `L`, measured in
 payload K steps, among present components. For ring depth `D` and K-Step ratio `R`
-(`R=1` for payloads), `L = (D - 1) * R + 1`. An LDS-backed component has actual
-fill span `F=L`; every direct-register component has `F=L-1`. `PIPELINE_DEPTH`
-remains `max(L)`, while prologue/drain activity and producer-to-DS-read timing use
-`F`.
+(`R=1` for payloads), `L = (D - 1) * R + 1`. An LDS-backed component has
+load-to-MFMA distance `F=L`; every direct-register component has `F=L-1`.
+`PIPELINE_DEPTH` remains `max(L)`, while prologue/drain activity and
+producer-to-DS-read timing use `F`.
 `PEELED` is the number of initial main iterations needed before invariant
 steady-state waits. The first MFMA is always peeled, so `PEELED >= 1`; staggered
 warmup may require more. The host and device use the same issue-history helper
@@ -201,19 +201,21 @@ machine-code hashes and resource metadata for all three dtypes.
 
 The driver takes invariant data in `_PipelineConst`. Each active stream has its
 own physical ring depth `D`, K-Step ratio `R`, LDS ring or register queue, and
-HBM pointer. B register loads occupy the same logical fill slot as B LDS copies.
-Scale register loads also use their configured fill slots, including
-`SCALE_FILL_MID`.
+HBM pointer. B register loads occupy the same logical buffer-load slot as B LDS
+copies. Scale register loads also use their configured buffer-load slots,
+including `SCALE_FILL_MID`.
 
-The DS read of a direct-register ring entry occurs `F-1` steps after its producer,
-and the MFMA consumes it on the following step. At the minimum `D=2`, `R=1` case, production
-and DS read share a step; the producer is emitted first even when the configured
-read region would otherwise precede its fill slot.
+The DS read of a direct-register ring entry occurs `F-1` steps after its
+producer, and the MFMA consumes it on the following step. At the minimum `D=2`,
+`R=1` case, production and DS read share a step; the producer is emitted first
+even when the configured read region would otherwise precede its buffer-load
+slot.
 
-The prologue has `PIPELINE_DEPTH - 1` fill-only stages. A component with actual
-fill span `F = _fill_span(component)` begins after `PIPELINE_DEPTH - F` leading
-stages and fills only at the stages selected by `R`. A seed stage then reads
-payload step 0 and performs the phase-due fills, without an MFMA. Each logical
+The prologue has `PIPELINE_DEPTH - 1` fill-only stages. A component with
+load-to-MFMA distance `F = Schedule.load_to_mfma_distance(component)` begins
+after `PIPELINE_DEPTH - F` leading stages and fills only at the stages selected
+by `R`. A seed stage then reads payload step 0 and performs the phase-due fills,
+without an MFMA. Each logical
 main iteration accumulates the current payload step, reads the next one, and
 issues each component's next ring fill when its K-Step phase is due.
 `MAIN = NUM_K - PIPELINE_DEPTH` remains a runtime value.
@@ -229,8 +231,8 @@ Ring and packed-scale phases continue across every phase boundary.
 
 The pipeline drain has `PIPELINE_DEPTH` MFMAs. Drain iteration `j` continues a
 component's fill only while
-`j < PIPELINE_DEPTH - _fill_span(component)`, so each stream covers exactly
-`NUM_K` payload steps. The first `PIPELINE_DEPTH - 1` drain iterations still
+`j < PIPELINE_DEPTH - Schedule.load_to_mfma_distance(component)`, so each stream
+covers exactly `NUM_K` payload steps. The first `PIPELINE_DEPTH - 1` drain iterations still
 read the next operands; the separate final MFMA consumes the prefetched operands
 without another read or fill. Eligible output epilogues fuse with that last
 MFMA; other paths execute it once before the output epilogue. Epilogue input
@@ -248,7 +250,7 @@ The K loop carries two aggregates plus the component register rings:
 
 `_PipelineConst.lds_ptrs` holds the `LDSManager` descriptors, named
 `a_payload_lds_ptr`, `a_scale_lds_ptr`, `b_payload_lds_ptr`, and `b_scale_lds_ptr`.
-LDS tile `t` occupies slot `t % NB` for that component. `_fill_slot` issues
+LDS tile `t` occupies slot `t % NB` for that component. `_buffer_load_slot` issues
 copies and commits, `_ds_read_slot` supplies the next register fragments, and
 `_advance` moves only pointers whose streams actually filled. With
 `SOFF_UNROLL`, the last step advances by the complete body's fill count.

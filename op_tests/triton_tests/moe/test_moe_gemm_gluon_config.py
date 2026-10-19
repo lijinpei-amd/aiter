@@ -1330,7 +1330,8 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
             if tile < nn:
                 payloads.append((B_PAYLOAD, tile))
     has_scale = {operand: _plain(tc.func_cfg.has_scale(operand)) for operand in (A, B)}
-    depths, ratios, via_lds, fill_spans, producer_phases = {}, {}, {}, {}, {}
+    depths, ratios, via_lds, producer_phases = {}, {}, {}, {}
+    load_to_mfma_distances = {}
     for component in COMPONENTS:
         operand, is_scale = component
         depths[component] = _plain(tc.num_buffers(operand, is_scale))
@@ -1341,8 +1342,10 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
         )
         via_lds[component] = _plain(layout.component_via_lds(component))
         live_span = (depths[component] - 1) * ratios[component] + 1
-        fill_spans[component] = live_span - int(not via_lds[component])
-        producer_phases[component] = (1 - fill_spans[component]) % ratios[component]
+        load_to_mfma_distances[component] = live_span - int(not via_lds[component])
+        producer_phases[component] = (
+            1 - load_to_mfma_distances[component]
+        ) % ratios[component]
     non_k_ratios = {
         operand: _plain(layout.scale_slot_nonk(operand))
         // _plain(layout.slot_nonk(operand))
@@ -1352,40 +1355,40 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
         (component, tile): slot
         for slot, (component, tile) in enumerate(payloads)
     }
-    fill_slots = [[] for _ in range(nslots)]
+    buffer_load_slots = [[] for _ in range(nslots)]
     for slot, (component, tile) in enumerate(payloads):
         operand, is_scale = component
         assert not is_scale
-        fill_slots[slot].append((component, tile))
+        buffer_load_slots[slot].append((component, tile))
         if not has_scale[operand] or tile % non_k_ratios[operand]:
             continue
         scale_slot = (
             tile + 1 if (nm, nn) == (2, 2) and _plain(tc.SCALE_FILL_MID) else slot
         )
-        fill_slots[scale_slot].append(((operand, SCALE), tile))
+        buffer_load_slots[scale_slot].append(((operand, SCALE), tile))
     component_rank = {
         A_PAYLOAD: 0,
         A_SCALE: 1,
         B_PAYLOAD: 2,
         B_SCALE: 3,
     }
-    fill_slots = [
+    buffer_load_slots = [
         tuple(sorted(ops, key=lambda copy: component_rank[copy[0]]))
-        for ops in fill_slots
+        for ops in buffer_load_slots
     ]
-    fill_slot_for = {
-        copy: slot for slot, copies in enumerate(fill_slots) for copy in copies
+    buffer_load_slot_for = {
+        copy: slot for slot, copies in enumerate(buffer_load_slots) for copy in copies
     }
     ds_read_slots = [[] for _ in range(nslots)]
-    for copy, fill_slot in fill_slot_for.items():
+    for copy, buffer_load_slot in buffer_load_slot_for.items():
         component, tile = copy
         nominal = payload_slots[((component[0], False), tile)]
         ds_read_slot = nominal
-        if not via_lds[component] and fill_spans[component] == 1:
-            ds_read_slot = max(ds_read_slot, fill_slot)
+        if not via_lds[component] and load_to_mfma_distances[component] == 1:
+            ds_read_slot = max(ds_read_slot, buffer_load_slot)
         assert all(existing[0] != component for existing in ds_read_slots[ds_read_slot])
         ds_read_slots[ds_read_slot].append(copy)
-    for slot, expected in enumerate(fill_slots):
+    for slot, expected in enumerate(buffer_load_slots):
         actual = schedule.owned(slot)
         assert (
             tuple(
@@ -1415,7 +1418,7 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
             for component, tile in ds_read_slots[ds_read_slot]:
                 if stage % ratios[component] == 0:
                     need.append(
-                        (stage - fill_spans[component] + 1, component, tile)
+                        (stage - load_to_mfma_distances[component] + 1, component, tile)
                     )
         return need
 
@@ -1440,9 +1443,9 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
                 (stage, component, tile)
                 for component, tile in ops
                 if stage % ratios[component] == producer_phases[component]
-                and 0 <= stage + fill_spans[component] - 1 < num_k
+                and 0 <= stage + load_to_mfma_distances[component] - 1 < num_k
             )
-            for ops in fill_slots
+            for ops in buffer_load_slots
         ]
         for slot, copies in enumerate(stage_copies):
             asynchronous = tuple(token for token in copies if via_lds[token[1]])
@@ -1468,7 +1471,7 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
                 producer, component, tile = token
                 # The ring slot is named by the step that consumes the value, so
                 # it has to be derived from the producer, not carried in the token.
-                target = producer + fill_spans[component] - 1
+                target = producer + load_to_mfma_distances[component] - 1
                 assert token not in issued, "a K tile was loaded twice"
                 issued.add(token)
                 if via_lds[component]:
@@ -1479,7 +1482,7 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
                         # have been read; name it by its producer, as `consumed`
                         # does, not by the step that consumed it.
                         assert (
-                            lds[key] - fill_spans[component] + 1,
+                            lds[key] - load_to_mfma_distances[component] + 1,
                             component,
                             tile,
                         ) in consumed
@@ -1495,12 +1498,16 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
                     continue
                 same_slot_fill = (
                     not via_lds[component]
-                    and fill_spans[component] == 1
-                    and fill_slot_for[component, tile] == slot
+                    and load_to_mfma_distances[component] == 1
+                    and buffer_load_slot_for[component, tile] == slot
                 )
                 if same_slot_fill != after_fill:
                     continue
-                token = (ds_read_stage - fill_spans[component] + 1, component, tile)
+                token = (
+                    ds_read_stage - load_to_mfma_distances[component] + 1,
+                    component,
+                    tile,
+                )
                 if via_lds[component]:
                     ring = ds_read_stage // ratios[component] % depths[component]
                     assert lds[component, tile, ring] == ds_read_stage
@@ -1523,8 +1530,8 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
         if stage == main:
             committed.extend(() for _ in range(epilogue_groups))
     expected_loads = {
-        (target - fill_spans[component] + 1, component, tile)
-        for ops in fill_slots
+        (target - load_to_mfma_distances[component] + 1, component, tile)
+        for ops in buffer_load_slots
         for component, tile in ops
         for target in range(0, num_k, ratios[component])
     }

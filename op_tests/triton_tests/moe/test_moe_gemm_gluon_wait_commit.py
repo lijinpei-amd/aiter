@@ -337,7 +337,7 @@ def _trace_emitter(tc, monkeypatch, defer_stage_commit=False):
         patch.setattr(buffered.gl, "assume", check_assumption)
         for slot in range(tc.nm * tc.nn):
             sink.slot = slot
-            buffers = buffered._fill_slot.fn(
+            buffers = buffered._buffer_load_slot.fn(
                 pc,
                 pointers,
                 buffers,
@@ -468,7 +468,9 @@ def test_register_only_slots_need_no_cooperative_fence(scheme, monkeypatch):
     monkeypatch.setattr(pipeline.gl, "static_range", range)
     monkeypatch.setattr(pipeline, "_ds_read_slot", lambda *args: ((), (), (), ()))
     monkeypatch.setattr(
-        pipeline, "_fill_slot", lambda pc, ptrs, buffers, *args, **kwargs: buffers
+        pipeline,
+        "_buffer_load_slot",
+        lambda pc, ptrs, buffers, *args, **kwargs: buffers,
     )
     monkeypatch.setattr(pipeline, "_advance", lambda pc, ptrs, *args: ptrs)
     monkeypatch.setattr(pipeline, "_rotate_buffers", lambda buffers, *args: buffers)
@@ -558,7 +560,7 @@ def test_pipeline_stage_commit_boundaries(
     monkeypatch.setattr(pipeline, "pick_stage", pick_stage)
     monkeypatch.setattr(pipeline.gl, "static_range", range)
     monkeypatch.setattr(pipeline.gl.amd.cdna4, "sched_barrier", lambda mask: None)
-    monkeypatch.setattr(pipeline, "_fill_slot", buffer_load)
+    monkeypatch.setattr(pipeline, "_buffer_load_slot", buffer_load)
     monkeypatch.setattr(pipeline, "_ds_read_slot", lambda *args: ((), (), (), ()))
     monkeypatch.setattr(pipeline, "_take_operand_pairs", lambda *args: ())
     monkeypatch.setattr(pipeline, "_PipelineRegFragments", lambda *args: args)

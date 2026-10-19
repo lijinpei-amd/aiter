@@ -177,7 +177,7 @@ def dump_case(name, cfg, dq_a, dq_b, K, out):
 
     nm, nn = maybe_unwrap(layout.num_m_slots), maybe_unwrap(layout.num_n_slots)
     slots = nm * nn
-    present = [c for c in COMPONENTS if schedule.present(c)]
+    present = [c for c in COMPONENTS if schedule.component_present(c)]
 
     out(f"== {name}")
     out(f"  geom NM={nm} NN={nn} slots={slots} mk={maybe_unwrap(layout.num_k_slots)} "
@@ -188,7 +188,7 @@ def dump_case(name, cfg, dq_a, dq_b, K, out):
         f"ring={maybe_unwrap(schedule.ring_period)} "
         f"regperiod={maybe_unwrap(schedule.register_period)} "
         f"async={maybe_unwrap(schedule.async_period)} "
-        f"hasreg={any(schedule.present(c) and layout.component_in_reg(c) for c in COMPONENTS)}")
+        f"hasreg={any(schedule.component_present(c) and layout.component_in_reg(c) for c in COMPONENTS)}")
     out(f"  regions static_remainder={maybe_unwrap(schedule.static_remainder)} "
         f"static_drain={maybe_unwrap(schedule.static_drain)} "
         f"epilogue_groups={maybe_unwrap(schedule.epilogue_groups)} "
@@ -199,15 +199,15 @@ def dump_case(name, cfg, dq_a, dq_b, K, out):
         f"tile_after_mfma={maybe_unwrap(schedule.tile_commit_after_mfma)}")
 
     for c in COMPONENTS:
-        if not schedule.present(c):
+        if not schedule.component_present(c):
             out(f"  {CNAME[c]} absent")
             continue
         non_k_slots = nm if c[0] == 0 else nn
-        out(f"  {CNAME[c]} D={schedule.ring_depth(c)} R={schedule.ratio_k(c)} "
-            f"L={schedule.live_span(c)} F={schedule.fill_span(c)} "
+        out(f"  {CNAME[c]} D={schedule.num_buffers(c)} R={schedule.steps_per_buffer(c)} "
+            f"L={schedule.live_span(c)} F={schedule.load_to_mfma_distance(c)} "
             f"via_lds={bool(layout.component_via_lds(c))} pphase={schedule.producer_phase(c)} "
             f"nonk_ratio={layout.scale_slot_nonk(c[0]) // layout.slot_nonk(c[0])} "
-            f"fill_slots={tuple(schedule.fill_slot(c, t) for t in range(non_k_slots))} "
+            f"buffer_load_slots={tuple(schedule.buffer_load_slot(c, t) for t in range(non_k_slots))} "
             f"ds_read_slots={tuple(schedule.ds_read_slot(c, t) for t in range(non_k_slots))} "
             f"ds_read_in_mfma={tuple(schedule.ds_read_in_mfma(c, t) for t in range(non_k_slots))}")
 

@@ -155,15 +155,17 @@ def _index(
     step,
     STEP: gl.constexpr,
     component: gl.constexpr,
-    FILL: gl.constexpr,
+    BUFFER_LOAD: gl.constexpr,
 ):
-    static: gl.constexpr = sched.static_lds_index(STEP, component, FILL)
+    static: gl.constexpr = sched.static_lds_index(STEP, component, BUFFER_LOAD)
     if require_constexpr(static is not None):
         out = static
     else:
-        depth: gl.constexpr = sched.ring_depth(component)
-        ratio: gl.constexpr = sched.ratio_k(component)
-        advance: gl.constexpr = sched.fill_span(component) - 1 if FILL else 0
+        depth: gl.constexpr = sched.num_buffers(component)
+        ratio: gl.constexpr = sched.steps_per_buffer(component)
+        advance: gl.constexpr = (
+            sched.load_to_mfma_distance(component) - 1 if BUFFER_LOAD else 0
+        )
         k_tile = (step + advance) // ratio
         if require_constexpr(sched.register_period == 1):
             gl.assume(k_tile >= 0)
@@ -196,11 +198,15 @@ def _rotate(queue, SHIFT: gl.constexpr):
 def _rotate_buffers(buffers, sched, layout, PHASE: gl.constexpr = 0):
     mk: gl.constexpr = layout.num_k_slots
     if require_constexpr(sched.ds_reads_at_phase(_A_SCALE, PHASE + 1)):
-        a_scale = _rotate(buffers[2], layout.num_m_slots * mk * sched.ratio_k(_A_SCALE))
+        a_scale = _rotate(
+            buffers[2], layout.num_m_slots * mk * sched.steps_per_buffer(_A_SCALE)
+        )
     else:
         a_scale = buffers[2]
     if require_constexpr(sched.ds_reads_at_phase(_B_SCALE, PHASE + 1)):
-        b_scale = _rotate(buffers[3], layout.num_n_slots * mk * sched.ratio_k(_B_SCALE))
+        b_scale = _rotate(
+            buffers[3], layout.num_n_slots * mk * sched.steps_per_buffer(_B_SCALE)
+        )
     else:
         b_scale = buffers[3]
     return (
@@ -239,12 +245,14 @@ def _init_buffers(pc):
                     layout.fragment_layout(1, False),
                 ),
             )
-    if require_constexpr(sched.present(_A_SCALE) and layout.component_in_reg(_A_SCALE)):
+    if require_constexpr(
+        sched.component_present(_A_SCALE) and layout.component_in_reg(_A_SCALE)
+    ):
         for _ in gl.static_range(
             tc.num_buffers(0, True)
             * layout.num_m_slots
             * layout.num_k_slots
-            * sched.ratio_k(_A_SCALE)
+            * sched.steps_per_buffer(_A_SCALE)
         ):
             a_scale += (
                 gl.zeros(
@@ -253,12 +261,14 @@ def _init_buffers(pc):
                     layout.fragment_layout(0, True),
                 ),
             )
-    if require_constexpr(sched.present(_B_SCALE) and layout.component_in_reg(_B_SCALE)):
+    if require_constexpr(
+        sched.component_present(_B_SCALE) and layout.component_in_reg(_B_SCALE)
+    ):
         for _ in gl.static_range(
             tc.num_buffers(1, True)
             * layout.num_n_slots
             * layout.num_k_slots
-            * sched.ratio_k(_B_SCALE)
+            * sched.steps_per_buffer(_B_SCALE)
         ):
             b_scale += (
                 gl.zeros(
@@ -271,7 +281,7 @@ def _init_buffers(pc):
 
 
 @gluon.jit
-def _fill_slot(
+def _buffer_load_slot(
     pc,
     ptrs,
     buffers,
@@ -365,7 +375,7 @@ def _fill_slot(
                 fragments,
                 (sched.register_index(STEP, _A_SCALE, True) * nm + ops[1])
                 * mk
-                * sched.ratio_k(_A_SCALE),
+                * sched.steps_per_buffer(_A_SCALE),
             )
     if require_constexpr(ops[2] is not None):
         if require_constexpr(layout.component_in_reg(_B_PAYLOAD)):
@@ -423,7 +433,7 @@ def _fill_slot(
                 fragments,
                 (sched.register_index(STEP, _B_SCALE, True) * nn + ops[3])
                 * mk
-                * sched.ratio_k(_B_SCALE),
+                * sched.steps_per_buffer(_B_SCALE),
             )
     if require_constexpr(
         sched.commit_per_slot
@@ -458,7 +468,7 @@ def _advance(pc, ptrs, STEP: gl.constexpr):
             sched.active(STEP, _A_SCALE) and (soff or sched.loads(STEP, _A_SCALE))
         ):
             a_scale += (
-                (steps if soff else sched.ratio_k(_A_SCALE))
+                (steps if soff else sched.steps_per_buffer(_A_SCALE))
                 * pc.s_step
                 * pc.a_scale_stride_k
             )
@@ -466,7 +476,7 @@ def _advance(pc, ptrs, STEP: gl.constexpr):
             sched.active(STEP, _B_SCALE) and (soff or sched.loads(STEP, _B_SCALE))
         ):
             b_scale += (
-                (steps if soff else sched.ratio_k(_B_SCALE))
+                (steps if soff else sched.steps_per_buffer(_B_SCALE))
                 * pc.s_step
                 * pc.b_scale_stride_k
             )
@@ -531,7 +541,9 @@ def _ds_read_scale(
     else:
         buffer: gl.constexpr = sched.register_index(STEP, component)
         non_k_slots: gl.constexpr = layout.num_lds_slots_non_k(operand)
-        k_fragments: gl.constexpr = layout.num_k_slots * sched.ratio_k(component)
+        k_fragments: gl.constexpr = layout.num_k_slots * sched.steps_per_buffer(
+            component
+        )
         offset: gl.constexpr = (buffer * non_k_slots + non_k_slot) * k_fragments
         slot_nonk: gl.constexpr = layout.slot_nonk(operand)
         ratio: gl.constexpr = layout.scale_slot_nonk(operand) // slot_nonk
@@ -643,7 +655,7 @@ def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
                 gl.amd.cdna4.sched_barrier(0)
             with region("mem"):
                 am, bm, asm, bsm = _ds_read_slot(pc, buffers, step, STEP, mi, ni, False)
-                buffers = _fill_slot(
+                buffers = _buffer_load_slot(
                     pc, ptrs, buffers, step, STEP, mi, ni, MARK_TILE=False
                 )
                 if require_constexpr(
@@ -693,8 +705,8 @@ def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
     has_register_component: gl.constexpr = (
         layout.component_in_reg(_A_PAYLOAD)
         or layout.component_in_reg(_B_PAYLOAD)
-        or (sched.present(_A_SCALE) and layout.component_in_reg(_A_SCALE))
-        or (sched.present(_B_SCALE) and layout.component_in_reg(_B_SCALE))
+        or (sched.component_present(_A_SCALE) and layout.component_in_reg(_A_SCALE))
+        or (sched.component_present(_B_SCALE) and layout.component_in_reg(_B_SCALE))
     )
     if require_constexpr(IN_LOOP and has_register_component and not warp):
         gl.amd.cdna4.sched_barrier(0)
@@ -734,7 +746,7 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
     for r in gl.static_range(1 - depth, 0):
         for ni in gl.static_range(layout.num_n_slots):
             for mi in gl.static_range(layout.num_m_slots):
-                buffers = _fill_slot(
+                buffers = _buffer_load_slot(
                     pc,
                     ptrs,
                     buffers,
