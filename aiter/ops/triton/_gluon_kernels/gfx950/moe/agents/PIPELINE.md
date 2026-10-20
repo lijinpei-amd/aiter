@@ -79,47 +79,10 @@ for x in -depth .. num_k - 1:
     step(x)
 ```
 
-Three transformations turn this loop into the emitted program.
+Unrolling and then peeling turn this loop into the emitted program. The step kinds are
+the parts they leave.
 
-**1. Split by kind.** Every condition in `step` depends on `x` alone, and each stays
-fixed over one of five ranges of `x`. Split at those bounds, each part knows at compile
-time what its steps issue:
-
-```
-for x in -depth .. -2:                         # prologue: buffer_load only
-    step(x)
-step(-1)                                       # warm-up: buffer_load and ds_read
-for x in 0 .. main - 1:                        # main: all three, every component
-    step(x)
-for j in 0 .. depth - 2:                       # drain: ds_read and mfma; buffer_load only
-    step(main + j)                             #   by components with j < depth - F(c)
-step(num_k - 1)                                # final MFMA: mfma only
-```
-
-The ranges, given `1 <= F(c) <= depth`:
-
-| kind | steps `x` | count | `buffer_load` | `ds_read` | MFMA |
-|---|---|---|---|---|---|
-| prologue | `-depth .. -2` | `depth - 1` | components with `x >= -F` | - | - |
-| warm-up | `-1` | 1 | all | yes | - |
-| main | `0 .. main - 1` | `main = num_k - depth` | all | yes | yes |
-| drain | `main .. num_k - 2` | `depth - 1` | components with `x < num_k - F` | yes | yes |
-| final MFMA | `num_k - 1` | 1 | - | - | yes |
-
-- The prologue starts at the first copy: tile 0, by a component with `F = depth`, at
-  step `-depth`.
-- Main ends at that component's last copy, of tile `num_k - 1`, at step `main - 1`. A
-  component with a smaller `F` keeps copying through drain step `depth - F - 1`.
-- Prologue and drain both have `depth - 1` steps, the lead of an `F = depth` copy over
-  its `ds_read`. In all, `num_k + depth` steps, the last one the final MFMA.
-- `depth` is the largest `L`, not the largest `F`: if the deepest ring is in registers
-  and no component reaches `F = depth`, prologue step `-depth` copies nothing.
-
-Only main has a runtime trip count. The other parts have at most `depth - 1` steps and
-are emitted straight-line. The drain's steps `main + j` still depend on the runtime
-`num_k`; see Drain below.
-
-**2. Unroll main.** A main step still depends on `x` through its rings:
+**1. Unroll.** `step(x)` depends on `x` through its rings:
 
 - the LDS buffer it copies into and DS-reads from, `((x + F) // R) % D`;
 - the register buffer it copies into and its MFMA reads, a tuple index that must be
@@ -128,46 +91,94 @@ are emitted straight-line. The drain's steps `main + j` still depend on the runt
   tile of the value its MFMA takes, `x % R`.
 
 All of these repeat every `buffer_period = lcm(D * R)` steps over the present
-components. Unrolled by `unroll = lcm(K_UNROLL, buffer_period)`, they depend on `u` alone
-and fold to constants, which also gives immediate LDS offsets:
+components. The unroll factor is the smallest multiple of `buffer_period` that is also a
+multiple of the `K_UNROLL` knob: `unroll = lcm(K_UNROLL, buffer_period)`. Body step `u`
+runs at `x = -depth + i * unroll + u`, congruent to `-depth + u` modulo every ring
+period, so its rings fold to constants, which also gives immediate LDS offsets. The trip
+count depends on the runtime `num_k`, so a remainder runs the steps that do not fill a
+body:
 
 ```
-iters, rem = main // unroll, main % unroll
+n = num_k + depth
+iters, rem = n // unroll, n % unroll
 for i in 0 .. iters - 1:                       # a runtime loop
     for u in 0 .. unroll - 1:                  # unrolled: rings depend on u only
-        step(i * unroll + u)
+        step(-depth + i * unroll + u)
 for u in 0 .. rem - 1:                         # remainder
-    step(iters * unroll + u)
+    step(-depth + iters * unroll + u)
 ```
 
-`main` depends on the runtime `num_k`, so the remainder runs the `rem` steps that do not
-fill a loop body.
+The guards in `step` still test `x`, which now depends on the runtime `i`.
 
-**3. Peel the first main steps.** Two things set them apart:
+**2. Peel.** Peeling moves steps off the front and the back of the loop, as straight-line
+code, until every guard holds in every iteration. Given `1 <= F(c) <= depth`:
+
+- Front: the MFMA's `x >= 0` and each copy's `x + F(c) >= 0` hold from step 0 on. The
+  first copy, tile 0 by a component with `F = depth`, is at step `-depth`: `depth` steps,
+  `-depth .. -1`.
+- Back: every copy's `x + F(c) < num_k` holds through step `main - 1`, where
+  `main = num_k - depth`, the last copy of a component with `F = depth`. The DS read's
+  `x + 1 < num_k` holds through step `num_k - 2`. So `depth` steps, `main .. num_k - 1`.
+
+Two more reasons peel the first main steps, `peeled >= 1` of them:
 
 - Step 0's MFMA accumulates into zeros. Out of the loop, the compiler sees the zero
   accumulator.
 - Under `PER_OP`, an early step can need a smaller wait immediate than later iterations
-  of its loop step (see Peeling). A loop step takes the smallest immediate over its
-  iterations, so in the loop it would tighten the wait of every iteration.
+  of its loop step. `PER_OP` commits one group per copy, and before every component has
+  started copying, fewer groups separate a copy from its DS read. The other schemes
+  commit a fixed number of groups per pane or step, so their immediates repeat from the
+  warm-up on. A loop step takes the smallest immediate over its iterations, so in the
+  loop it would tighten the wait of every iteration.
 
-So `peeled >= 1` main steps run straight-line before the loop:
+`peeled` is one past the last step in `[0, depth - 3]` whose wait immediates differ from
+its steady twin's, and at least 1 (the rule is under Peeling). In all, `depth + peeled`
+steps come off the front and `depth` off the back. The loop keeps steps
+`peeled .. main - 1`, unrolled as in 1:
 
 ```
-for x in 0 .. peeled - 1:                      # peeled: straight-line
+for x in -depth .. peeled - 1:                 # front: straight-line
     step(x)
 iters, rem = (main - peeled) // unroll, (main - peeled) % unroll
-for i in 0 .. iters - 1:
+for i in 0 .. iters - 1:                       # no guards; rings depend on u only
     for u in 0 .. unroll - 1:
         step(peeled + i * unroll + u)
-for u in 0 .. rem - 1:
+for u in 0 .. rem - 1:                         # remainder
     step(peeled + iters * unroll + u)
+for x in main .. num_k - 1:                    # back: straight-line
+    step(x)
 ```
 
-All together, with the `Schedule` accessor that indexes each part:
+A front step has a compile-time `x`, so its guards and rings fold. A back step `main + j`
+still depends on the runtime `num_k`, but its guards do not: `x + F < num_k` is
+`j < depth - F`, and the others hold. Its rings depend on `main % buffer_period`; see
+Drain below.
+
+**3. Step kinds.** The DS read's guards split the front and the back once more: only
+step `-1` has `x + 1 >= 0` in the front, and only step `num_k - 1` fails `x + 1 < num_k`
+in the back. Each kind is a range of steps that issues a fixed set of instructions:
+
+| kind | steps `x` | count | `buffer_load` | `ds_read` | MFMA |
+|---|---|---|---|---|---|
+| prologue | `-depth .. -2` | `depth - 1` | components with `x >= -F` | - | - |
+| warm-up | `-1` | 1 | all | yes | - |
+| peeled | `0 .. peeled - 1` | `peeled` | all | yes | yes |
+| loop | `peeled .. peeled + iters * unroll - 1` | `iters * unroll` | all | yes | yes |
+| remainder | `peeled + iters * unroll .. main - 1` | `rem` | all | yes | yes |
+| drain | `main .. num_k - 2` | `depth - 1` | components with `x < num_k - F` | yes | yes |
+| final MFMA | `num_k - 1` | 1 | - | - | yes |
+
+- The warm-up copies for every component, since `x + F >= 0` at `F >= 1`, and DS-reads
+  K tile 0.
+- Prologue and drain both have `depth - 1` steps, the lead of an `F = depth` copy over
+  its `ds_read`. In all, `num_k + depth` steps, the last one the final MFMA.
+- `depth` is the largest `L`, not the largest `F`: if the deepest ring is in registers
+  and no component reaches `F = depth`, prologue step `-depth` copies nothing.
+
+All together, with the `Schedule` accessor that indexes each kind:
 
 ```
-for x in -depth .. -2:                         # prologue: prologue_step(x)    
+for x in -depth .. -2:                         # prologue: prologue_step(x)
     step(x)
 step(-1)                                       # warm-up: warmup_step()
 for x in 0 .. peeled - 1:                      # peeled: peeled_step(x)
