@@ -394,7 +394,7 @@ class _CopyRecorder:
             )
             for component in COMPONENTS
         }
-        self.ratios = {
+        self.rs = {
             component: (
                 layout.scale_slot_k(component.operand_index.value)
                 // maybe_unwrap(layout.scale_block_k)
@@ -413,8 +413,8 @@ class _CopyRecorder:
         assert offsets == tile
         operand, is_scale = component.operand_index.value, component.is_scale.value
         history = self.addresses[component, tile]
-        ratio = self.ratios[component]
-        stage = len(history) * ratio
+        r = self.rs[component]
+        stage = len(history) * r
         expected = (
             (stage // 2) * 256
             if is_scale
@@ -429,12 +429,11 @@ class _CopyRecorder:
         else:
             value = _Payload(stage, operand, tile)
         if buffer is not None:
-            assert buffer == stage // ratio % self.depths[component]
+            assert buffer == stage // r % self.depths[component]
             key = component, tile, buffer
             if key in self.lds:
                 assert (
-                    stage - self.depths[component] * ratio
-                    in self.reads[component, tile]
+                    stage - self.depths[component] * r in self.reads[component, tile]
                 ), ("LDS buffer overwritten before its read", key, stage)
             self.lds[key] = value
         return value
@@ -457,12 +456,12 @@ class _CopyRecorder:
             return (value,) * self._k_fragments(component)
 
     def _k_fragments(self, component):
-        return maybe_unwrap(self.layout.num_k_slots) * self.ratios[component]
+        return maybe_unwrap(self.layout.num_k_slots) * self.rs[component]
 
     def _read(self, component, tile, buffer):
-        ratio = self.ratios[component]
-        stage = len(self.reads[component, tile]) * ratio
-        assert buffer == stage // ratio % self.depths[component]
+        r = self.rs[component]
+        stage = len(self.reads[component, tile]) * r
+        assert buffer == stage // r % self.depths[component]
         self.reads[component, tile].append(stage)
         return self.lds[component, tile, buffer]
 

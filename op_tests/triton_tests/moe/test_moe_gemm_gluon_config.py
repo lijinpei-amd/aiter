@@ -1332,23 +1332,23 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
             if tile < nn:
                 payloads.append((B_PAYLOAD, tile))
     has_scale = {operand: _plain(tc.func_cfg.has_scale(operand)) for operand in (A, B)}
-    depths, ratios, via_lds, producer_phases = {}, {}, {}, {}
+    depths, rs, via_lds, producer_phases = {}, {}, {}, {}
     load_to_mfma_distances = {}
     for component in COMPONENTS:
         operand, is_scale = component.operand_index.value, component.is_scale.value
         depths[component] = _plain(tc.num_buffers(operand, is_scale))
-        ratios[component] = (
+        rs[component] = (
             _plain(layout.scale_slot_k(operand)) // _plain(layout.scale_block_k)
             if is_scale
             else 1
         )
         via_lds[component] = _plain(layout.component_via_lds(component))
-        live_span = (depths[component] - 1) * ratios[component] + 1
+        live_span = (depths[component] - 1) * rs[component] + 1
         load_to_mfma_distances[component] = live_span - int(not via_lds[component])
         producer_phases[component] = (
             1 - load_to_mfma_distances[component]
-        ) % ratios[component]
-    non_k_ratios = {
+        ) % rs[component]
+    qs = {
         operand: _plain(layout.scale_slot_nonk(operand))
         // _plain(layout.slot_nonk(operand))
         for operand in (A, B)
@@ -1362,7 +1362,7 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
         operand = component.operand_index.value
         assert not component.is_scale.value
         buffer_load_panes[pane].append((component, tile))
-        if not has_scale[operand] or tile % non_k_ratios[operand]:
+        if not has_scale[operand] or tile % qs[operand]:
             continue
         scale_slot = (
             tile + 1 if (nm, nn) == (2, 2) and _plain(tc.SCALE_FILL_MID) else pane
@@ -1418,7 +1418,7 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
         panes = range(npanes) if pane is None else (pane,)
         for ds_read_pane in panes:
             for component, tile in ds_read_panes[ds_read_pane]:
-                if stage % ratios[component] == 0:
+                if stage % rs[component] == 0:
                     need.append(
                         (stage - load_to_mfma_distances[component] + 1, component, tile)
                     )
@@ -1444,7 +1444,7 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
             tuple(
                 (stage, component, tile)
                 for component, tile in ops
-                if stage % ratios[component] == producer_phases[component]
+                if stage % rs[component] == producer_phases[component]
                 and 0 <= stage + load_to_mfma_distances[component] - 1 < num_k
             )
             for ops in buffer_load_panes
@@ -1477,7 +1477,7 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
                 assert token not in issued, "a K tile was loaded twice"
                 issued.add(token)
                 if via_lds[component]:
-                    ring = target // ratios[component] % depths[component]
+                    ring = target // rs[component] % depths[component]
                     key = component, tile, ring
                     if key in lds:
                         # The previous occupant of this ring buffer must already
@@ -1496,7 +1496,7 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
 
         def ds_read_pane(pane, after_fill, ds_read_stage=stage):
             for component, tile in ds_read_panes[pane]:
-                if ds_read_stage % ratios[component]:
+                if ds_read_stage % rs[component]:
                     continue
                 same_pane_fill = (
                     not via_lds[component]
@@ -1511,7 +1511,7 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
                     tile,
                 )
                 if via_lds[component]:
-                    ring = ds_read_stage // ratios[component] % depths[component]
+                    ring = ds_read_stage // rs[component] % depths[component]
                     assert lds[component, tile, ring] == ds_read_stage
                 else:
                     assert token in issued, "register DS-read before its producer"
@@ -1535,7 +1535,7 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
         (target - load_to_mfma_distances[component] + 1, component, tile)
         for ops in buffer_load_panes
         for component, tile in ops
-        for target in range(0, num_k, ratios[component])
+        for target in range(0, num_k, rs[component])
     }
     assert issued == expected_loads
     assert consumed == expected_loads

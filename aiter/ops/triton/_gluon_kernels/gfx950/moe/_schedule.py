@@ -73,17 +73,24 @@ def _pane_index_of(by_pane_index, comp_slot):
 
 
 @gluon.constexpr_function
-def _steps_per_buffer(scale_steps_per_buffer, component, axis):
+def _scale_q(scale_slot_span, component):
     if not component.is_scale.value:
         return 1
-    return scale_steps_per_buffer[component.operand_index.value][axis]
+    return scale_slot_span[component.operand_index.value][0]
+
+
+@gluon.constexpr_function
+def _scale_r(scale_slot_span, component):
+    if not component.is_scale.value:
+        return 1
+    return scale_slot_span[component.operand_index.value][1]
 
 
 @gluon.constexpr_function
 def _step_plan(
     layout,
     component_present,
-    scale_steps_per_buffer,
+    scale_slot_span,
     load_to_mfma_distance,
     depth,
     buffer_load_slots,
@@ -93,9 +100,7 @@ def _step_plan(
     stage,
     phase,
 ):
-    steps_per_buffer = tuple(
-        _steps_per_buffer(scale_steps_per_buffer, c, 1) for c in COMPONENTS
-    )
+    steps_per_buffer = tuple(_scale_r(scale_slot_span, c) for c in COMPONENTS)
     if kind == _StepKind.DRAIN:
         active = tuple(
             p and stage < depth - f
@@ -213,7 +218,7 @@ class Schedule:
 
     _component_present: gl.constexpr
     _num_buffers: gl.constexpr
-    _scale_steps_per_buffer: gl.constexpr
+    _scale_slot_span: gl.constexpr
     _load_to_mfma_distance: gl.constexpr
     _ds_read_in_mfma: gl.constexpr
     _buffer_load_slots: gl.constexpr
@@ -254,9 +259,9 @@ class Schedule:
         num_buffers = tuple(
             tc.num_buffers(c.operand_index.value, c.is_scale.value) for c in COMPONENTS
         )
-        scale_steps_per_buffer = _v(layout.scale_steps_per_buffer)
+        scale_slot_span = _v(layout.scale_slot_span)
         buffer_live_span = tuple(
-            (d - 1) * _steps_per_buffer(scale_steps_per_buffer, c, 1) + 1
+            (d - 1) * _scale_r(scale_slot_span, c) + 1
             for d, c in zip(num_buffers, COMPONENTS)
         )
         load_to_mfma_distance = tuple(
@@ -267,16 +272,16 @@ class Schedule:
         depth, buffer_period, reg_buffer_period, async_period = 0, 1, 1, 1
         for component_index, c in enumerate(COMPONENTS):
             if component_present[component_index]:
-                ratio = _steps_per_buffer(scale_steps_per_buffer, c, 1)
+                r = _scale_r(scale_slot_span, c)
                 depth = max(depth, buffer_live_span[component_index])
                 buffer_period = math.lcm(
-                    buffer_period, num_buffers[component_index] * ratio
+                    buffer_period, num_buffers[component_index] * r
                 )
                 if layout.component_via_lds(c):
-                    async_period = math.lcm(async_period, ratio)
+                    async_period = math.lcm(async_period, r)
                 else:
                     reg_buffer_period = math.lcm(
-                        reg_buffer_period, num_buffers[component_index] * ratio
+                        reg_buffer_period, num_buffers[component_index] * r
                     )
         k_unroll = _v(tc.K_UNROLL)
         assert k_unroll >= 1, "K_UNROLL must be at least 1"
@@ -288,14 +293,12 @@ class Schedule:
             for c in COMPONENTS
             for slot in range(nm if c.operand_index.value == A else nn)
         }
-        non_k_ratio = tuple(
-            _steps_per_buffer(scale_steps_per_buffer, c, 0) for c in COMPONENTS
-        )
         first_slots = {
             comp_slot
             for comp_slot in slots
             if component_present[comp_slot.component.index()]
-            and comp_slot.index.value % non_k_ratio[comp_slot.component.index()] == 0
+            and comp_slot.index.value % _scale_q(scale_slot_span, comp_slot.component)
+            == 0
         }
         # The pane index that issues each component slot's buffer load.
         buffer_load_pane = {
@@ -379,7 +382,7 @@ class Schedule:
             return _step_plan(
                 layout,
                 component_present,
-                scale_steps_per_buffer,
+                scale_slot_span,
                 load_to_mfma_distance,
                 depth,
                 buffer_load_slots,
@@ -408,7 +411,7 @@ class Schedule:
 
         self._component_present = gl.constexpr(component_present)
         self._num_buffers = gl.constexpr(num_buffers)
-        self._scale_steps_per_buffer = gl.constexpr(scale_steps_per_buffer)
+        self._scale_slot_span = gl.constexpr(scale_slot_span)
         self._load_to_mfma_distance = gl.constexpr(load_to_mfma_distance)
         self._ds_read_in_mfma = gl.constexpr(
             tuple(
@@ -644,7 +647,7 @@ class Schedule:
 
     @gluon.constexpr_function
     def steps_per_buffer(self, component):
-        return _steps_per_buffer(self._scale_steps_per_buffer.value, component, 1)
+        return _scale_r(self._scale_slot_span.value, component)
 
     @gluon.constexpr_function
     def load_to_mfma_distance(self, component):
@@ -675,7 +678,7 @@ class Schedule:
     def register_index(self, step, component, buffer_load=False):
         if not self.component_present(component):
             return 0
-        ratio = self.steps_per_buffer(component)
+        r = self.steps_per_buffer(component)
         if self.in_loop(step):
             origin = self.peeled.value + 1
             current = origin + self.ki(step)
@@ -685,19 +688,19 @@ class Schedule:
         target = current + (
             self.load_to_mfma_distance(component) - 1 if buffer_load else 0
         )
-        return (target // ratio - origin // ratio) % self.num_buffers(component)
+        return (target // r - origin // r) % self.num_buffers(component)
 
     @gluon.constexpr_function
     def static_lds_index(self, step, component, buffer_load):
         if not self.component_present(component):
             return 0
-        depth, ratio = self.num_buffers(component), self.steps_per_buffer(component)
+        depth, r = self.num_buffers(component), self.steps_per_buffer(component)
         if not (self.in_loop(step) or self._steps.value[step][5]):
             return None
-        if self.unroll.value % (depth * ratio) != 0:
+        if self.unroll.value % (depth * r) != 0:
             return None
         advance = self.load_to_mfma_distance(component) - 1 if buffer_load else 0
-        return ((self.peeled.value + self.ki(step) + 1 + advance) // ratio) % depth
+        return ((self.peeled.value + self.ki(step) + 1 + advance) // r) % depth
 
     @gluon.constexpr_function
     def soff_unroll(self, step):
@@ -705,9 +708,9 @@ class Schedule:
 
     @gluon.constexpr_function
     def scale_soff_steps(self, component, offset_step):
-        ratio = self.steps_per_buffer(component)
+        r = self.steps_per_buffer(component)
         start = self.peeled.value + 1
-        producer_phase = (1 - self.load_to_mfma_distance(component)) % ratio
-        first_producer = (start - producer_phase + ratio - 1) // ratio
-        producer = (start + offset_step - producer_phase) // ratio
-        return (producer - first_producer) * ratio
+        producer_phase = (1 - self.load_to_mfma_distance(component)) % r
+        first_producer = (start - producer_phase + r - 1) // r
+        producer = (start + offset_step - producer_phase) // r
+        return (producer - first_producer) * r

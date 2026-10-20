@@ -90,7 +90,7 @@ class _Config(_ScheduleConfig):
 
     def buffer_live_span(self, operand, scale=False):
         return (self.num_buffers(operand, scale) - 1) * (
-            self.ratio_k(operand) if scale else 1
+            self.scale_r(operand) if scale else 1
         ) + 1
 
     def active_components(self):
@@ -129,12 +129,12 @@ class _Config(_ScheduleConfig):
         steps = self.scale_steps[operand] if self.has_scale(operand) else 1
         return self.scale_block_k * steps
 
-    def ratio_k(self, operand):
-        """Steps one scale slot spans, ``scale_slot_k / scale_block_k``."""
+    def scale_r(self, operand):
+        """``R``, the steps one scale slot spans: ``scale_slot_k / scale_block_k``."""
         return self.scale_slot_k(operand) // self.scale_block_k
 
-    def ratio_non_k(self, operand):
-        """Slots one scale slot spans, ``scale_slot_nonk / slot_nonk``."""
+    def scale_q(self, operand):
+        """``Q``, the slots one scale slot spans: ``scale_slot_nonk / slot_nonk``."""
         return self.scale_slot_nonk(operand) // self.slot_nonk(operand)
 
 
@@ -208,15 +208,15 @@ class _Machine:
         tc = self.tc
         operand, is_scale = component.operand_index.value, component.is_scale.value
         tile = pointer
-        ratio = tc.ratio_k(operand) if is_scale else 1
-        nonk = tc.ratio_non_k(operand) if is_scale else 1
+        r = tc.scale_r(operand) if is_scale else 1
+        q = tc.scale_q(operand) if is_scale else 1
         mk = tc.num_k_slots
         assert 0 <= tile < self.num_k, "HBM load exceeded the K strip"
-        live_span = (tc.depths[component] - 1) * ratio + 1
+        live_span = (tc.depths[component] - 1) * r + 1
         load_to_mfma_distance = live_span - int(tc.component_in_reg(component))
         lead = load_to_mfma_distance - 1
         assert tile == self.current_read + lead
-        assert tile % ratio == 0 and mini % nonk == 0
+        assert tile % r == 0 and mini % q == 0
         token = component, mini, tile
         assert token not in self.loads, "HBM tile loaded more than once"
         self.loads.add(token)
@@ -233,8 +233,8 @@ class _Machine:
         )
         fragments = tuple(
             _Fragment(component, tile + k // mk, mini + mn, k % mk)
-            for mn in range(nonk)
-            for k in range(mk * ratio)
+            for mn in range(q)
+            for k in range(mk * r)
         )
         if tc.component_via_lds(component):
             key = component, mini, ring
@@ -245,7 +245,7 @@ class _Machine:
                     mini,
                     old,
                 ) in self.reads, "LDS overwritten before its DS read"
-            assert ring == tile // ratio % tc.depths[component]
+            assert ring == tile // r % tc.depths[component]
             self.lds[key] = tile, fragments
             self.pending.append(token)
         return fragments
@@ -300,8 +300,8 @@ class _Machine:
                     component
                 ):
                     if component.is_scale.value and (
-                        self.current_read % tc.ratio_k(operand)
-                        or mini % tc.ratio_non_k(operand)
+                        self.current_read % tc.scale_r(operand)
+                        or mini % tc.scale_q(operand)
                     ):
                         continue
                     required.add((component, mini, self.current_read))
@@ -401,8 +401,8 @@ class _Machine:
                         (
                             scale.component,
                             scale.mini
-                            - scale.mini % tc.ratio_non_k(operand),
-                            accumulator - accumulator % tc.ratio_k(operand),
+                            - scale.mini % tc.scale_q(operand),
+                            accumulator - accumulator % tc.scale_r(operand),
                         )
                     )
         token = a[0].mini, b[0].mini, accumulator
@@ -485,7 +485,7 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         operand = args[5]
         component = Component(operand, SCALE)
         if tc.component_in_reg(component):
-            ratio = tc.ratio_k(operand)
+            r = tc.scale_r(operand)
             machine.events.append(
                 (
                     machine.current_read,
@@ -493,7 +493,7 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
                     machine.current_drain,
                     "ds_read",
                     component,
-                    machine.current_read - machine.current_read % ratio,
+                    machine.current_read - machine.current_read % r,
                     args[4],
                 )
             )
@@ -528,7 +528,7 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
                     * (tc.nm if component.operand_index.value == A else tc.nn)
                     * tc.num_k_slots
                     * (
-                        tc.ratio_k(component.operand_index.value)
+                        tc.scale_r(component.operand_index.value)
                         if component.is_scale.value
                         else 1
                     )
@@ -594,7 +594,7 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
             0,
             tc.nm if component.operand_index.value == A else tc.nn,
             (
-                tc.ratio_non_k(component.operand_index.value)
+                tc.scale_q(component.operand_index.value)
                 if component.is_scale.value
                 else 1
             ),
@@ -602,7 +602,7 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         for tile in range(
             0,
             num_k,
-            tc.ratio_k(component.operand_index.value) if component.is_scale.value else 1,
+            tc.scale_r(component.operand_index.value) if component.is_scale.value else 1,
         )
     }
     assert machine.loads == expected
@@ -806,9 +806,9 @@ def test_middle_direct_b_scale_defers_tile_zero_and_preserves_order(
 
 
 @pytest.mark.parametrize("component,register_mask", [(A_SCALE, 2), (B_SCALE, 4)])
-@pytest.mark.parametrize("ratio", [2, 4])
+@pytest.mark.parametrize("r", [2, 4])
 def test_direct_scale_producer_phase_and_soffset_stream_match(
-    component, register_mask, ratio, monkeypatch
+    component, register_mask, r, monkeypatch
 ):
     machines = []
     for soff in (False, True):
@@ -817,12 +817,12 @@ def test_direct_scale_producer_phase_and_soffset_stream_match(
             (2, 2, 2, 2),
             register_mask,
             packed=True,
-            scale_steps=(ratio, ratio),
+            scale_steps=(r, r),
             unroll=2,
             soff=soff,
         )
         minimum = tc.minimum_num_k()
-        num_k = math.ceil(minimum / ratio) * ratio
+        num_k = math.ceil(minimum / r) * r
         machines.append(_execute(tc, num_k, monkeypatch))
 
     load_streams = []
@@ -833,7 +833,7 @@ def test_direct_scale_producer_phase_and_soffset_stream_match(
             if op == "load" and loaded == component
         ]
         assert loads
-        assert {event_read % ratio for event_read, *_ in loads} == {1 % ratio}
+        assert {event_read % r for event_read, *_ in loads} == {1 % r}
         load_streams.append(loads)
     assert load_streams[0] == load_streams[1]
 
@@ -1103,8 +1103,8 @@ def test_every_payload_tile_is_filled_exactly_once(nm, nn, middle):
             )
             if slot is not None
         ]
-        ratio = tc.ratio_non_k(operand) if component.is_scale.value else 1
-        expected = [t for t in range(num_slots) if t % ratio == 0]
+        q = tc.scale_q(operand) if component.is_scale.value else 1
+        expected = [t for t in range(num_slots) if t % q == 0]
         assert sorted(loaded_slots) == expected, (
             component,
             loaded_slots,

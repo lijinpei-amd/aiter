@@ -51,18 +51,18 @@ def _scale_fragments(scale, layout, operand: gl.constexpr):
     bk: gl.constexpr = layout.scale_block_k
     # A step's whole units, 8 scale columns (K256) each.
     stage_k: gl.constexpr = max(8, bk)
-    ratio: gl.constexpr = layout.scale_steps_per_buffer[operand][0]
-    ratio_k: gl.constexpr = layout.scale_steps_per_buffer[operand][1]
+    q: gl.constexpr = layout.scale_slot_span[operand][0]
+    r: gl.constexpr = layout.scale_slot_span[operand][1]
     packed: gl.constexpr = layout.scale_packed_ok(operand)
     fragments = ()
-    for n in gl.static_range(ratio):
-        for k in gl.static_range(ratio_k):
+    for n in gl.static_range(q):
+        for k in gl.static_range(r):
             if require_constexpr(packed):
                 # The scale slot is in storage order as i32, [stripe, dword], a
                 # unit per 64 dwords. A slot's units are whole register and warp
                 # steps, so the slice never unpacks a dword or moves it across lanes;
                 # the reshape to the dot's shape moves nothing.
-                if require_constexpr(ratio == 1 and sk == stage_k):
+                if require_constexpr(q == 1 and sk == stage_k):
                     fragment = gl.reshape(
                         scale, layout.fragment_shape_slot(operand, True)
                     )
@@ -244,12 +244,12 @@ class LDSManager:
             if operand == 0
             else cfg.expert_scale_cache_modifier
         )
-        ratio: gl.constexpr = layout.scale_steps_per_buffer[operand][0]
+        q: gl.constexpr = layout.scale_slot_span[operand][0]
         if require_constexpr(VIA_LDS):
             if require_constexpr(
                 self.func_cfg.has_scale(operand)
                 and layout.component_via_lds(Component(operand, True))
-                and slot % ratio == 0
+                and slot % q == 0
             ):
                 if require_constexpr(operand == 0):
                     lds_ptr = self.a_scale_lds_ptr
@@ -257,8 +257,7 @@ class LDSManager:
                     lds_ptr = self.b_scale_lds_ptr
                 _buffer_load_to_lds(
                     lds_ptr.index(
-                        BUFFER_LOAD_IDX * (layout.num_slots(operand) // ratio)
-                        + slot // ratio
+                        BUFFER_LOAD_IDX * (layout.num_slots(operand) // q) + slot // q
                     ),
                     hbm_ptr,
                     hbm_offs,
@@ -305,9 +304,9 @@ class LDSManager:
         else:
             lds_ptr = self.b_scale_lds_ptr
         if require_constexpr(cfg.preshuffled(operand, True)):
-            ratio: gl.constexpr = layout.scale_steps_per_buffer[operand][0]
+            q: gl.constexpr = layout.scale_slot_span[operand][0]
             scale_ptr = lds_ptr.index(
-                SCALE_READ_IDX * (layout.num_slots(operand) // ratio) + slot // ratio
+                SCALE_READ_IDX * (layout.num_slots(operand) // q) + slot // q
             )
             scale = _ds_read(
                 scale_ptr.reinterpret(
@@ -371,14 +370,10 @@ class LDSManager:
                 layout.component_via_lds(Component(operand, True)),
                 "ds_read_frag only reads LDS-staged scales",
             )
-            ratio: gl.constexpr = layout.scale_steps_per_buffer[operand][0]
-            fragments = self.ds_read_scale(
-                operand, SCALE_READ_IDX, slot // ratio * ratio
-            )
-            ratio_k: gl.constexpr = layout.scale_steps_per_buffer[operand][1]
-            scale_val = fragments[
-                (slot % ratio) * layout.num_k_slots * ratio_k + k_slot
-            ]
+            q: gl.constexpr = layout.scale_slot_span[operand][0]
+            fragments = self.ds_read_scale(operand, SCALE_READ_IDX, slot // q * q)
+            r: gl.constexpr = layout.scale_slot_span[operand][1]
+            scale_val = fragments[(slot % q) * layout.num_k_slots * r + k_slot]
         else:
             scale_val: gl.constexpr = None
         return payload, scale_val

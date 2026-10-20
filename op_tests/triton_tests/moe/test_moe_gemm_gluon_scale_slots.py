@@ -171,11 +171,11 @@ def test_scale_k_step_ratio_sets_buffer_span_and_unroll(
     )
     layout = KernelLayout(tc)
     schedule = Schedule(tc, layout, block_k)
-    ratio = scale_k // (block_k // 32)
+    r = scale_k // (block_k // 32)
     for operand, depth in enumerate((2, 3)):
-        live_span = (depth - 1) * ratio + 1
+        live_span = (depth - 1) * r + 1
         distance = live_span - 1 if register_scales else live_span
         assert schedule.load_to_mfma_distance(Component(operand, True)) == distance
         assert layout.scale_slot_k(operand) == scale_k
-    period = math.lcm(3, 2 * ratio, 3 * ratio)
+    period = math.lcm(3, 2 * r, 3 * r)
     assert maybe_unwrap(schedule.unroll) == period

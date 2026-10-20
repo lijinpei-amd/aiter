@@ -44,7 +44,7 @@ class _ScheduleConfig:
     scales: tuple = (True, True)
     scale_async: tuple = (True, True)
     payload_async: tuple = (True, True)
-    a_scale_ratio: int = 1
+    a_scale_q: int = 1
     SOFF_UNROLL: bool = False
     K_UNROLL: int = 1
     UNROLL_EPILOGUE: bool = True
@@ -83,13 +83,13 @@ class _ScheduleConfig:
         return not self.component_via_lds(component)
 
     def preshuffled(self, idx, is_scale=False):
-        return is_scale and idx == 0 and self.a_scale_ratio > 1
+        return is_scale and idx == 0 and self.a_scale_q > 1
 
     def slot_nonk(self, idx):
         return 32
 
     def scale_slot_nonk(self, idx):
-        return self.slot_nonk(idx) * (self.a_scale_ratio if idx == 0 else 1)
+        return self.slot_nonk(idx) * (self.a_scale_q if idx == 0 else 1)
 
     @property
     def scale_block_k(self):
@@ -99,7 +99,7 @@ class _ScheduleConfig:
         return 8
 
     @property
-    def scale_steps_per_buffer(self):
+    def scale_slot_span(self):
         return tuple(
             (
                 self.scale_slot_nonk(idx) // self.slot_nonk(idx),
@@ -157,9 +157,9 @@ def _config(shape, scheme, middle, traffic):
     elif traffic == "direct-scales":
         tc.scale_async = (False, False)
     elif traffic == "shared-a-pair":
-        tc.a_scale_ratio = 2
+        tc.a_scale_q = 2
     elif traffic == "shared-a-whole":
-        tc.a_scale_ratio = tc.nm
+        tc.a_scale_q = tc.nm
     elif traffic == "a-register-payload":
         tc.scales = (False, False)
         tc.payload_async = (False, True)
@@ -199,7 +199,7 @@ def _reference_panes(tc):
             tc.has_scale(operand) and tc.component_via_lds(scale_component)
         ):
             continue
-        owner = tile - tile % tc.a_scale_ratio if operand == A else tile
+        owner = tile - tile % tc.a_scale_q if operand == A else tile
         if tile == owner:
             reads[pane].add(CompSlot(scale_component, owner))
             scale_slot = (
@@ -238,12 +238,12 @@ class _Descriptor:
     def __init__(self, component, tc):
         self.component = component
         operand = component.operand_index.value
-        self.ratio = tc.a_scale_ratio if component == A_SCALE else 1
-        self.tiles = (tc.nm if operand == A else tc.nn) // self.ratio
+        self.q = tc.a_scale_q if component == A_SCALE else 1
+        self.tiles = (tc.nm if operand == A else tc.nn) // self.q
 
     def index(self, index):
         stage, tile = divmod(maybe_unwrap(index), self.tiles)
-        return stage, self.component, tile * self.ratio
+        return stage, self.component, tile * self.q
 
 
 class _LDSRecorder:
