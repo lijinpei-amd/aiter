@@ -166,11 +166,11 @@ def _index(
         out = static
     else:
         depth: gl.constexpr = sched.num_buffers(component)
-        ratio: gl.constexpr = sched.steps_per_buffer(component)
+        r: gl.constexpr = sched.steps_per_buffer(component)
         advance: gl.constexpr = (
             sched.load_to_mfma_distance(component) - 1 if BUFFER_LOAD else 0
         )
-        k_tile = (step + advance) // ratio
+        k_tile = (step + advance) // r
         if require_constexpr(sched.reg_buffer_period == 1):
             gl.assume(k_tile >= 0)
         out = k_tile % depth
@@ -549,9 +549,9 @@ def _ds_read_scale(
             component
         )
         offset: gl.constexpr = (buffer * num_slots + slot) * k_fragments
-        ratio: gl.constexpr = layout.scale_steps_per_buffer[operand][0]
+        q: gl.constexpr = layout.scale_slot_span[operand][0]
         fragments = ()
-        for k in gl.static_range(ratio * k_fragments):
+        for k in gl.static_range(q * k_fragments):
             fragments += (buffers[operand + 2][offset + k],)
     return fragments
 
@@ -607,13 +607,13 @@ def _take_operand_pairs(
     slot: gl.constexpr,
     PHASE: gl.constexpr,
 ):
-    ratio_k: gl.constexpr = layout.scale_steps_per_buffer[operand][1]
+    r: gl.constexpr = layout.scale_slot_span[operand][1]
     out = ()
     for k in gl.static_range(layout.num_k_slots):
         if require_constexpr(tc.func_cfg.has_scale(operand)):
             out += (
                 payload[slot * layout.num_k_slots + k],
-                scale[(slot * ratio_k + PHASE % ratio_k) * layout.num_k_slots + k],
+                scale[(slot * r + PHASE % r) * layout.num_k_slots + k],
             )
         else:
             out += (

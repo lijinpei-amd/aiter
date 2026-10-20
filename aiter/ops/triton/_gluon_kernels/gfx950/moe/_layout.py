@@ -242,7 +242,7 @@ class KernelLayout:
     scale_block_k: gl.constexpr
     _scale_slot_nonk: gl.constexpr
     _scale_slot_k: gl.constexpr
-    scale_steps_per_buffer: gl.constexpr
+    scale_slot_span: gl.constexpr
     _scale_packed_ok: gl.constexpr
     _scale_packed_sel: gl.constexpr
     any_scale_packed: gl.constexpr
@@ -342,7 +342,7 @@ class KernelLayout:
         assert (
             tc.transposed.value
         ), "transposed=True is pinned, see the module docstring"
-        scale_steps_per_buffer = tuple(
+        scale_slot_span = tuple(
             (scale_slot_nonk[idx] // slot_nonk[idx], scale_slot_k[idx] // scale_block_k)
             for idx in ops
         )
@@ -694,7 +694,7 @@ class KernelLayout:
         self.scale_block_k = gl.constexpr(scale_block_k)
         self._scale_slot_nonk = gl.constexpr(scale_slot_nonk)
         self._scale_slot_k = gl.constexpr(scale_slot_k)
-        self.scale_steps_per_buffer = gl.constexpr(scale_steps_per_buffer)
+        self.scale_slot_span = gl.constexpr(scale_slot_span)
         self._scale_packed_ok = gl.constexpr(scale_packed_ok)
         self._scale_packed_sel = gl.constexpr(scale_packed_sel)
         self.any_scale_packed = gl.constexpr(any_scale_packed)
@@ -994,7 +994,7 @@ class KernelLayout:
         layout_a_scale_slot: gl.constexpr = self.hbm_offset_layout(0, True)
         SCALE_M: gl.constexpr = self.scale_slot_nonk(0)
         SCALE_K: gl.constexpr = self.scale_slot_k(0)
-        SCALE_RATIO: gl.constexpr = SCALE_M // M_SLOT
+        q: gl.constexpr = SCALE_M // M_SLOT
 
         if require_constexpr(
             tuning_cfg.preshuffled(0, True) and self.component_in_reg(Component(0, True))
@@ -1004,7 +1004,7 @@ class KernelLayout:
                 a_scale_hbm_offsets_tile = a_scale_hbm_offsets_tile + (
                     _shuffled_scale_register_offsets(
                         layout_a_scale_slot,
-                        pid_m * M_TILE + (m_slot_idx // SCALE_RATIO) * SCALE_M,
+                        pid_m * M_TILE + (m_slot_idx // q) * SCALE_M,
                         SCALE_M,
                         SCALE_K,
                         K,
@@ -1023,7 +1023,7 @@ class KernelLayout:
                 a_scale_hbm_offsets_tile = a_scale_hbm_offsets_tile + (
                     _shuffled_scale_stage_offsets(
                         layout_a_scale_slot,
-                        pid_m * M_TILE + (m_slot_idx // SCALE_RATIO) * SCALE_M,
+                        pid_m * M_TILE + (m_slot_idx // q) * SCALE_M,
                         SCALE_FILL_SHAPE[0],
                         K,
                         SCALE_FILL_SHAPE[1],
@@ -1065,11 +1065,9 @@ class KernelLayout:
         layout_b_scale_slot: gl.constexpr = self.hbm_offset_layout(1, True)
         SCALE_N: gl.constexpr = self.scale_slot_nonk(1)
         SCALE_K: gl.constexpr = self.scale_slot_k(1)
-        SCALE_RATIO: gl.constexpr = SCALE_N // N_SLOT
+        q: gl.constexpr = SCALE_N // N_SLOT
         SPLIT_EXTENT: gl.constexpr = (
-            N_SLOT
-            if func_cfg.weight_gu_hbm_layout == _WEIGHT_GU_SPLIT and SCALE_RATIO > 1
-            else 0
+            N_SLOT if func_cfg.weight_gu_hbm_layout == _WEIGHT_GU_SPLIT and q > 1 else 0
         )
 
         if require_constexpr(
@@ -1080,7 +1078,7 @@ class KernelLayout:
                 b_scale_hbm_offsets_tile = b_scale_hbm_offsets_tile + (
                     _shuffled_scale_register_offsets(
                         layout_b_scale_slot,
-                        self.n_start(pid_n, n_slot_idx // SCALE_RATIO * SCALE_RATIO, N),
+                        self.n_start(pid_n, n_slot_idx // q * q, N),
                         SCALE_N,
                         SCALE_K,
                         K,
@@ -1096,7 +1094,7 @@ class KernelLayout:
                 b_scale_hbm_offsets_tile = b_scale_hbm_offsets_tile + (
                     _shuffled_scale_stage_offsets(
                         layout_b_scale_slot,
-                        self.n_start(pid_n, n_slot_idx // SCALE_RATIO * SCALE_RATIO, N),
+                        self.n_start(pid_n, n_slot_idx // q * q, N),
                         SCALE_FILL_SHAPE[0],
                         K,
                         SCALE_FILL_SHAPE[1],
