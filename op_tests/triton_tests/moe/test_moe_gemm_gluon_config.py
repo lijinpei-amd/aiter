@@ -1287,21 +1287,21 @@ def _executed_step(schedule, num_k, k_step):
         maybe_unwrap(schedule.unroll),
     )
     main = num_k - depth
-    if k_step < 0:
+    if k_step < -1:
         return schedule.prologue_step(k_step)
-    if k_step == 0:
+    if k_step == -1:
         return schedule.warmup_step()
-    if k_step <= peeled:
-        return schedule.peeled_step(k_step - 1)
-    if k_step > main:
+    if k_step < peeled:
+        return schedule.peeled_step(k_step)
+    if k_step >= main:
         static_drain = maybe_unwrap(schedule.static_drain)
         phase = main % maybe_unwrap(schedule.buffer_period) if static_drain else 0
-        return schedule.drain_step(phase, k_step - main - 1)
+        return schedule.drain_step(phase, k_step - main)
     loop_end = peeled + (main - peeled) // unroll * unroll
-    if k_step <= loop_end:
-        return schedule.loop_step((k_step - peeled - 1) % unroll)
+    if k_step < loop_end:
+        return schedule.loop_step((k_step - peeled) % unroll)
     if maybe_unwrap(schedule.static_remainder):
-        return schedule.remainder_step(k_step - loop_end - 1)
+        return schedule.remainder_step(k_step - loop_end)
     return schedule.remainder_step(0)
 
 
@@ -1345,9 +1345,7 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
         via_lds[component] = _plain(layout.component_via_lds(component))
         live_span = (depths[component] - 1) * rs[component] + 1
         load_to_mfma_distances[component] = live_span - int(not via_lds[component])
-        producer_phases[component] = (
-            1 - load_to_mfma_distances[component]
-        ) % rs[component]
+        producer_phases[component] = -load_to_mfma_distances[component] % rs[component]
     qs = {
         operand: _plain(layout.scale_slot_nonk(operand))
         // _plain(layout.slot_nonk(operand))
@@ -1414,13 +1412,14 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
     )
 
     def required_copies(stage, pane):
+        # Step `stage` DS-reads K tile `stage + 1`, copied F steps before its MFMAs.
         need = []
         panes = range(npanes) if pane is None else (pane,)
         for ds_read_pane in panes:
             for component, tile in ds_read_panes[ds_read_pane]:
-                if stage % rs[component] == 0:
+                if (stage + 1) % rs[component] == 0:
                     need.append(
-                        (stage - load_to_mfma_distances[component] + 1, component, tile)
+                        (stage + 1 - load_to_mfma_distances[component], component, tile)
                     )
         return need
 
@@ -1438,17 +1437,16 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
         assert schedule.wait(_executed_step(schedule, num_k, stage), pane) == expected
 
     def mfma_reads_registers(stage):
-        # The MFMAs of `stage` read K tile `stage - 1`; a register value is consumed
-        # by the MFMA of its first tile.
-        read = stage - 1
+        # The MFMAs of `stage` read K tile `stage`; a register value is consumed by
+        # the MFMA of its first tile.
         for component, tile in register_copies:
-            if read % rs[component]:
+            if stage % rs[component]:
                 continue
-            token = (read - load_to_mfma_distances[component] + 1, component, tile)
+            token = (stage - load_to_mfma_distances[component], component, tile)
             assert token in issued, "register MFMA operand read before its producer"
             consumed.add(token)
 
-    for stage in range(1 - depth, num_k):
+    for stage in range(-depth, num_k - 1):
         pending_stage = []
         expected_groups = []
         stage_copies = [
@@ -1456,7 +1454,7 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
                 (stage, component, tile)
                 for component, tile in ops
                 if stage % rs[component] == producer_phases[component]
-                and 0 <= stage + load_to_mfma_distances[component] - 1 < num_k
+                and 0 <= stage + load_to_mfma_distances[component] < num_k
             )
             for ops in buffer_load_panes
         ]
@@ -1482,9 +1480,9 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
         ):
             for token in copies_by_pane[pane]:
                 producer, component, tile = token
-                # The ring buffer is named by the step that consumes the value, so
-                # it has to be derived from the producer, not carried in the token.
-                target = producer + load_to_mfma_distances[component] - 1
+                # The ring buffer is named by the K tile the copy carries, so it has
+                # to be derived from the producer, not carried in the token.
+                target = producer + load_to_mfma_distances[component]
                 assert token not in issued, "a K tile was loaded twice"
                 issued.add(token)
                 if via_lds[component]:
@@ -1495,7 +1493,7 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
                         # have been read; name it by its producer, as `consumed`
                         # does, not by the step that consumed it.
                         assert (
-                            lds[key] - load_to_mfma_distances[component] + 1,
+                            lds[key] - load_to_mfma_distances[component],
                             component,
                             tile,
                         ) in consumed
@@ -1505,25 +1503,25 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
                     group_for_copy[token] = len(committed)
                 committed.append(group)
 
-        def ds_read_pane(pane, ds_read_stage=stage):
+        def ds_read_pane(pane, ds_read_tile=stage + 1):
             for component, tile in ds_read_panes[pane]:
-                if ds_read_stage % rs[component]:
+                if ds_read_tile % rs[component]:
                     continue
                 token = (
-                    ds_read_stage - load_to_mfma_distances[component] + 1,
+                    ds_read_tile - load_to_mfma_distances[component],
                     component,
                     tile,
                 )
-                ring = ds_read_stage // rs[component] % depths[component]
-                assert lds[component, tile, ring] == ds_read_stage
+                ring = ds_read_tile // rs[component] % depths[component]
+                assert lds[component, tile, ring] == ds_read_tile
                 consumed.add(token)
 
-        if stage < 0:
+        if stage < -1:
             for pane in range(npanes):
                 fill_pane(pane)
-        if stage >= 1:
-            mfma_reads_registers(stage)
         if stage >= 0:
+            mfma_reads_registers(stage)
+        if stage >= -1:
             if per_stage:
                 check_wait(stage, None)
             for pane in range(npanes):
@@ -1531,11 +1529,11 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
                     check_wait(stage, pane)
                 ds_read_pane(pane)
                 fill_pane(pane)
-        if stage == main:
+        if stage == main - 1:
             committed.extend(() for _ in range(epilogue_groups))
-    mfma_reads_registers(num_k)
+    mfma_reads_registers(num_k - 1)
     expected_loads = {
-        (target - load_to_mfma_distances[component] + 1, component, tile)
+        (target - load_to_mfma_distances[component], component, tile)
         for ops in buffer_load_panes
         for component, tile in ops
         for target in range(0, num_k, rs[component])

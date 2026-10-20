@@ -108,11 +108,11 @@ def _step_plan(
         )
     else:
         active = tuple(
-            p and (stage is None or stage + f - 1 >= 0)
+            p and (stage is None or stage + f >= 0)
             for p, f in zip(component_present, load_to_mfma_distance)
         )
     loads = tuple(
-        a and phase % r == (1 - f) % r
+        a and (phase + f) % r == 0
         for a, r, f in zip(active, steps_per_buffer, load_to_mfma_distance)
     )
     issued = tuple(
@@ -143,7 +143,8 @@ def _step_plan(
         demand = ()
     else:
         ds_reads = tuple(
-            p and phase % r == 0 for p, r in zip(component_present, steps_per_buffer)
+            p and (phase + 1) % r == 0
+            for p, r in zip(component_present, steps_per_buffer)
         )
         demand = tuple(
             tuple(
@@ -165,8 +166,9 @@ def _replay(orders, load_to_mfma_distance, per_tile, num_panes):
             return None
         latest = -1
         for component_index, slot in need:
+            # Step `step` DS-reads K tile `step + 1`, copied F steps before its MFMAs.
             copy = (
-                step - load_to_mfma_distance[component_index] + 1,
+                step + 1 - load_to_mfma_distance[component_index],
                 component_index,
                 slot,
             )
@@ -378,17 +380,17 @@ class Schedule:
         if buffer_load_panes_valid:
             settled = 3 * depth + async_period
             warm = [
-                (None, r) + step_plan(_StepKind.PROLOGUE, r, r)[2:]
-                for r in range(1 - depth, 0)
+                (None, x) + step_plan(_StepKind.PROLOGUE, x, x)[2:]
+                for x in range(-depth, -1)
             ]
-            for s in range(settled + 1):
-                kind = _StepKind.PEELED if s else _StepKind.WARMUP
-                warm.append((s, s) + step_plan(kind, s, s)[2:])
+            for x in range(-1, settled):
+                kind = _StepKind.PEELED if x >= 0 else _StepKind.WARMUP
+                warm.append((x, x) + step_plan(kind, x, x)[2:])
             waits = _replay([warm], load_to_mfma_distance, commit[2], num_panes)
-            for s in range(1, depth - 1):
-                steady = s + async_period * -(-(2 * depth - s) // async_period)
-                if waits.get(s) != waits.get(steady):
-                    peeled = s
+            for x in range(depth - 2):
+                steady = x + async_period * -(-(2 * depth - 1 - x) // async_period)
+                if waits.get(x) != waits.get(steady):
+                    peeled = x + 1
 
         self._component_present = gl.constexpr(component_present)
         self._num_buffers = gl.constexpr(num_buffers)
@@ -429,21 +431,20 @@ class Schedule:
 
         drain_phases = buffer_period if static_drain else 1
         steps = [
-            (int(_StepKind.PROLOGUE), r, r, 0, False, False, False)
-            for r in range(1 - depth, 0)
+            (int(_StepKind.PROLOGUE), x, x, 0, False, False, False)
+            for x in range(-depth, -1)
         ]
-        steps.append((int(_StepKind.WARMUP), 0, 0, 0, False, False, False))
+        steps.append((int(_StepKind.WARMUP), -1, -1, 0, False, False, False))
         steps += [
-            (int(_StepKind.PEELED), x + 1, x + 1, 0, False, False, True)
-            for x in range(peeled)
+            (int(_StepKind.PEELED), x, x, 0, False, False, True) for x in range(peeled)
         ]
         steps += [
-            (int(_StepKind.LOOP), None, peeled + u + 1, u, True, False, True)
+            (int(_StepKind.LOOP), None, peeled + u, u, True, False, True)
             for u in range(unroll)
         ]
         if static_remainder:
             steps += [
-                (int(_StepKind.REMAINDER), None, peeled + u + 1, u, False, True, True)
+                (int(_StepKind.REMAINDER), None, peeled + u, u, False, True, True)
                 for u in range(unroll - 1)
             ]
         else:
@@ -452,7 +453,7 @@ class Schedule:
             (
                 int(_StepKind.DRAIN),
                 j,
-                num_k - depth + j + 1,
+                num_k - depth + j,
                 p + j - peeled if static_drain else 0,
                 False,
                 static_drain,
@@ -475,7 +476,7 @@ class Schedule:
 
         head = [entry(i, steps[i][1]) for i in range(warmup + 1 + peeled)]
         head += [
-            entry(loop + u, peeled + it * unroll + u + 1)
+            entry(loop + u, peeled + it * unroll + u)
             for it in range(iters)
             for u in range(unroll)
         ]
@@ -483,7 +484,7 @@ class Schedule:
 
         def tail(count):
             return [
-                entry(remainder + (u if static_remainder else 0), base + u + 1)
+                entry(remainder + (u if static_remainder else 0), base + u)
                 for u in range(count)
             ]
 
@@ -491,8 +492,7 @@ class Schedule:
         executed = head + tail(rem)
         executed.append((None, None, (((),) * epilogue_groups,), ()))
         executed += [
-            entry(drain + phase * (depth - 1) + j, main + j + 1)
-            for j in range(depth - 1)
+            entry(drain + phase * (depth - 1) + j, main + j) for j in range(depth - 1)
         ]
         orders = [executed]
         longest = unroll - 1 if static_remainder else 1
@@ -515,10 +515,10 @@ class Schedule:
         )
 
     @gluon.constexpr_function
-    def prologue_step(self, r):
+    def prologue_step(self, x):
         depth = self.depth.value
-        assert 1 - depth <= r < 0, f"no prologue step {r}"
-        return r + depth - 1
+        assert -depth <= x < -1, f"no prologue step {x}"
+        return x + depth
 
     @gluon.constexpr_function
     def warmup_step(self):
@@ -591,9 +591,10 @@ class Schedule:
 
     @gluon.constexpr_function
     def ds_reads_at_phase(self, component, phase):
+        # Step `phase` DS-reads K tile `phase + 1`; a new value starts every R tiles.
         return (
             self.component_present(component)
-            and phase % self.steps_per_buffer(component) == 0
+            and (phase + 1) % self.steps_per_buffer(component) == 0
         )
 
     @gluon.constexpr_function
@@ -654,27 +655,29 @@ class Schedule:
     @gluon.constexpr_function
     def register_index(self, step, component, buffer_load=False):
         # The register buffer this step's buffer load fills, or the one its MFMA reads.
+        # Buffer 0 holds the value of K tile `origin`: the tile this step DS-reads,
+        # which `_rotate_buffers` keeps there, or in the loop the tile its first step
+        # DS-reads.
         if not self.component_present(component):
             return 0
         r = self.steps_per_buffer(component)
         if self.in_loop(step):
+            current = self.peeled.value + self.ki(step)
             origin = self.peeled.value + 1
-            current = origin + self.ki(step)
         else:
-            origin = self.phase(step)
-            current = origin
-        target = current + (
-            self.load_to_mfma_distance(component) - 1 if buffer_load else -1
-        )
+            current = self.phase(step)
+            origin = current + 1
+        target = current + (self.load_to_mfma_distance(component) if buffer_load else 0)
         return (target // r - origin // r) % self.num_buffers(component)
 
     @gluon.constexpr_function
     def final_register_index(self, component):
-        # The register buffer the final MFMA, after the last drain step, reads.
+        # The register buffer the final MFMA, step `num_k - 1` after the last drain
+        # step, reads.
         if not self.component_present(component):
             return 0
-        r, num_k = self.steps_per_buffer(component), self.num_k.value
-        return ((num_k - 1) // r - num_k // r) % self.num_buffers(component)
+        r, last = self.steps_per_buffer(component), self.num_k.value - 1
+        return (last // r - (last + 1) // r) % self.num_buffers(component)
 
     @gluon.constexpr_function
     def static_lds_index(self, step, component, buffer_load):
@@ -685,8 +688,8 @@ class Schedule:
             return None
         if self.unroll.value % (depth * r) != 0:
             return None
-        advance = self.load_to_mfma_distance(component) - 1 if buffer_load else 0
-        return ((self.peeled.value + self.ki(step) + 1 + advance) // r) % depth
+        advance = self.load_to_mfma_distance(component) if buffer_load else 1
+        return ((self.peeled.value + self.ki(step) + advance) // r) % depth
 
     @gluon.constexpr_function
     def soff_unroll(self, step):
@@ -695,8 +698,8 @@ class Schedule:
     @gluon.constexpr_function
     def scale_soff_steps(self, component, offset_step):
         r = self.steps_per_buffer(component)
-        start = self.peeled.value + 1
-        producer_phase = (1 - self.load_to_mfma_distance(component)) % r
+        start = self.peeled.value
+        producer_phase = (-self.load_to_mfma_distance(component)) % r
         first_producer = (start - producer_phase + r - 1) // r
         producer = (start + offset_step - producer_phase) // r
         return (producer - first_producer) * r
