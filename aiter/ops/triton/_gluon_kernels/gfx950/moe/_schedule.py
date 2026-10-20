@@ -83,17 +83,25 @@ def _steps_per_buffer(scale_steps_per_buffer, component, axis):
 
 
 @gluon.constexpr_function
-def _step_plan(m, layout, kind, stage, phase):
-    component_present, load_to_mfma_distance = (
-        m["component_present"],
-        m["load_to_mfma_distance"],
-    )
+def _step_plan(
+    layout,
+    component_present,
+    scale_steps_per_buffer,
+    load_to_mfma_distance,
+    depth,
+    buffer_load_slots,
+    ds_read_slots,
+    commit,
+    kind,
+    stage,
+    phase,
+):
     steps_per_buffer = tuple(
-        _steps_per_buffer(m["scale_steps_per_buffer"], c, 1) for c in COMPONENTS
+        _steps_per_buffer(scale_steps_per_buffer, c, 1) for c in COMPONENTS
     )
     if kind == _StepKind.DRAIN:
         active = tuple(
-            p and stage < m["depth"] - f
+            p and stage < depth - f
             for p, f in zip(component_present, load_to_mfma_distance)
         )
     else:
@@ -110,9 +118,9 @@ def _step_plan(m, layout, kind, stage, phase):
             slot if slot is not None and load else None
             for slot, load in zip(slots, loads)
         )
-        for slots in m["buffer_load_slots"]
+        for slots in buffer_load_slots
     )
-    per_copy, per_pane = m["commit"][0], m["commit"][1]
+    per_copy, per_pane = commit[0], commit[1]
     commits, whole = [], ()
     for pane_index, copies in enumerate(issued):
         ops = tuple(
@@ -143,7 +151,7 @@ def _step_plan(m, layout, kind, stage, phase):
                 and layout.component_via_lds(COMPONENTS[component_index])
                 and ds_reads[component_index]
             )
-            for slots in m["ds_read_slots"]
+            for slots in ds_read_slots
         )
     return active, loads, tuple(commits), demand
 
@@ -371,26 +379,32 @@ class Schedule:
                 bool(_v(layout.epilogue_inputs_via_lds))
                 and bool(_v(fc.has_gammas) or _v(fc.has_bias))
             )
-        model = {
-            "component_present": component_present,
-            "scale_steps_per_buffer": scale_steps_per_buffer,
-            "load_to_mfma_distance": load_to_mfma_distance,
-            "depth": depth,
-            "buffer_load_slots": buffer_load_slots,
-            "ds_read_slots": ds_read_slots,
-            "commit": commit,
-        }
+
+        def step_plan(kind, stage, phase):
+            return _step_plan(
+                layout,
+                component_present,
+                scale_steps_per_buffer,
+                load_to_mfma_distance,
+                depth,
+                buffer_load_slots,
+                ds_read_slots,
+                commit,
+                kind,
+                stage,
+                phase,
+            )
 
         peeled = 1
         if buffer_load_panes_valid:
             settled = 3 * depth + async_period
             warm = [
-                (None, r) + _step_plan(model, layout, _StepKind.PROLOGUE, r, r)[2:]
+                (None, r) + step_plan(_StepKind.PROLOGUE, r, r)[2:]
                 for r in range(1 - depth, 0)
             ]
             for s in range(settled + 1):
                 kind = _StepKind.PEELED if s else _StepKind.WARMUP
-                warm.append((s, s) + _step_plan(model, layout, kind, s, s)[2:])
+                warm.append((s, s) + step_plan(kind, s, s)[2:])
             waits = _replay([warm], load_to_mfma_distance, commit[2], num_panes)
             for s in range(1, depth - 1):
                 steady = s + async_period * -(-(2 * depth - s) // async_period)
@@ -471,7 +485,7 @@ class Schedule:
             for p in range(drain_phases)
             for j in range(depth - 1)
         ]
-        plans = [_step_plan(model, layout, s[0], s[1], s[2]) for s in steps]
+        plans = [step_plan(s[0], s[1], s[2]) for s in steps]
 
         warmup = depth - 1
         loop = warmup + 1 + peeled
