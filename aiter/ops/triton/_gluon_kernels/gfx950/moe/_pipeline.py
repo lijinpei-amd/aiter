@@ -490,7 +490,6 @@ def _advance(pc, ptrs, STEP: gl.constexpr):
 @gluon.jit
 def _ds_read_payload(
     pc,
-    buffers,
     step,
     STEP: gl.constexpr,
     slot: gl.constexpr,
@@ -499,7 +498,6 @@ def _ds_read_payload(
     layout: gl.constexpr = pc.layout
     sched: gl.constexpr = pc.schedule
     component: gl.constexpr = Component(operand, False)
-    reg_payload: gl.constexpr = layout.component_in_reg(component)
     frags = ()
     for k in gl.static_range(layout.num_k_slots):
         payload, _ = pc.lds_ptrs.ds_read_frag(
@@ -507,19 +505,9 @@ def _ds_read_payload(
             _index(sched, step, STEP, component, False),
             slot,
             k,
-            READ_PAYLOAD=not reg_payload,
+            READ_PAYLOAD=True,
             READ_SCALE=False,
         )
-        if require_constexpr(reg_payload):
-            payload = buffers[operand][
-                (
-                    sched.register_index(STEP, component)
-                    * (layout.num_m_slots if operand == 0 else layout.num_n_slots)
-                    + slot
-                )
-                * layout.num_k_slots
-                + k
-            ]
         frags += (payload,)
     return frags
 
@@ -527,39 +515,23 @@ def _ds_read_payload(
 @gluon.jit
 def _ds_read_scale(
     pc,
-    buffers,
     step,
     STEP: gl.constexpr,
     slot: gl.constexpr,
     operand: gl.constexpr,
 ):
-    layout: gl.constexpr = pc.layout
     sched: gl.constexpr = pc.schedule
     component: gl.constexpr = Component(operand, True)
-    if require_constexpr(layout.component_via_lds(component)):
-        fragments = pc.lds_ptrs.ds_read_scale(
-            operand,
-            _index(sched, step, STEP, component, False),
-            slot,
-        )
-    else:
-        buffer: gl.constexpr = sched.register_index(STEP, component)
-        num_slots: gl.constexpr = layout.num_slots(operand)
-        k_fragments: gl.constexpr = layout.num_k_slots * sched.steps_per_buffer(
-            component
-        )
-        offset: gl.constexpr = (buffer * num_slots + slot) * k_fragments
-        q: gl.constexpr = layout.scale_slot_span[operand][0]
-        fragments = ()
-        for k in gl.static_range(q * k_fragments):
-            fragments += (buffers[operand + 2][offset + k],)
-    return fragments
+    return pc.lds_ptrs.ds_read_scale(
+        operand,
+        _index(sched, step, STEP, component, False),
+        slot,
+    )
 
 
 @gluon.jit
 def _ds_read_pane(
     pc,
-    buffers,
     step,
     STEP: gl.constexpr,
     mi: gl.constexpr,
@@ -577,23 +549,23 @@ def _ds_read_pane(
     if require_constexpr(
         at is not None and sched.ds_read_in_mfma(CompSlot(A_PAYLOAD, at)) == MFMA
     ):
-        a = _ds_read_payload(pc, buffers, step, STEP, at, 0)
+        a = _ds_read_payload(pc, step, STEP, at, 0)
     if require_constexpr(
         ast is not None
         and sched.ds_reads(STEP, A_SCALE)
         and sched.ds_read_in_mfma(CompSlot(A_SCALE, ast)) == MFMA
     ):
-        a_scale = _ds_read_scale(pc, buffers, step, STEP, ast, 0)
+        a_scale = _ds_read_scale(pc, step, STEP, ast, 0)
     if require_constexpr(
         bt is not None and sched.ds_read_in_mfma(CompSlot(B_PAYLOAD, bt)) == MFMA
     ):
-        b = _ds_read_payload(pc, buffers, step, STEP, bt, 1)
+        b = _ds_read_payload(pc, step, STEP, bt, 1)
     if require_constexpr(
         bst is not None
         and sched.ds_reads(STEP, B_SCALE)
         and sched.ds_read_in_mfma(CompSlot(B_SCALE, bst)) == MFMA
     ):
-        b_scale = _ds_read_scale(pc, buffers, step, STEP, bst, 1)
+        b_scale = _ds_read_scale(pc, step, STEP, bst, 1)
     return a, b, a_scale, b_scale
 
 
@@ -601,25 +573,41 @@ def _ds_read_pane(
 def _take_operand_pairs(
     payload,
     scale,
+    buffers,
     tc,
     layout,
     operand: gl.constexpr,
     slot: gl.constexpr,
     PHASE: gl.constexpr,
+    PAYLOAD_BUFFER: gl.constexpr,
+    SCALE_BUFFER: gl.constexpr,
 ):
+    # An LDS component's fragments come from its DS reads, `payload` / `scale`; a
+    # register component's straight from its ring, buffer PAYLOAD_BUFFER /
+    # SCALE_BUFFER of `buffers`.
+    mk: gl.constexpr = layout.num_k_slots
+    num_slots: gl.constexpr = layout.num_slots(operand)
     r: gl.constexpr = layout.scale_slot_span[operand][1]
+    has_scale: gl.constexpr = tc.func_cfg.has_scale(operand)
+    payload_in_reg: gl.constexpr = layout.component_in_reg(Component(operand, False))
+    scale_in_reg: gl.constexpr = has_scale and layout.component_in_reg(
+        Component(operand, True)
+    )
     out = ()
-    for k in gl.static_range(layout.num_k_slots):
-        if require_constexpr(tc.func_cfg.has_scale(operand)):
-            out += (
-                payload[slot * layout.num_k_slots + k],
-                scale[(slot * r + PHASE % r) * layout.num_k_slots + k],
-            )
+    for k in gl.static_range(mk):
+        if require_constexpr(payload_in_reg):
+            p = buffers[operand][(PAYLOAD_BUFFER * num_slots + slot) * mk + k]
         else:
-            out += (
-                payload[slot * layout.num_k_slots + k],
-                scale[slot * layout.num_k_slots + k],
-            )
+            p = payload[slot * mk + k]
+        if require_constexpr(not has_scale):
+            s = p
+        elif require_constexpr(scale_in_reg):
+            s = buffers[operand + 2][
+                ((SCALE_BUFFER * num_slots + slot) * r + PHASE % r) * mk + k
+            ]
+        else:
+            s = scale[(slot * r + PHASE % r) * mk + k]
+        out += (p, s)
     return out
 
 
@@ -639,6 +627,11 @@ def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
     a, b, acc = (), (), ()
     a_scale = () if sched.ds_reads(STEP, A_SCALE) else regs.a_scale
     b_scale = () if sched.ds_reads(STEP, B_SCALE) else regs.b_scale
+    # The register buffers this step's MFMAs read, for components in registers.
+    a_buffer: gl.constexpr = sched.register_index(STEP, A_PAYLOAD)
+    a_scale_buffer: gl.constexpr = sched.register_index(STEP, A_SCALE)
+    b_buffer: gl.constexpr = sched.register_index(STEP, B_PAYLOAD)
+    b_scale_buffer: gl.constexpr = sched.register_index(STEP, B_SCALE)
     tile_wait: gl.constexpr = sched.wait(STEP)
     if require_constexpr(tile_wait is not None):
         pc.lds_ptrs.wait_buffer_load_groups(tile_wait)
@@ -655,7 +648,7 @@ def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
             if require_constexpr(not DOT and mi == 0 and ni == 0):
                 gl.amd.cdna4.sched_barrier(0)
             with region("mem"):
-                am, bm, asm, bsm = _ds_read_pane(pc, buffers, step, STEP, mi, ni, False)
+                am, bm, asm, bsm = _ds_read_pane(pc, step, STEP, mi, ni, False)
                 buffers = _buffer_load_pane(
                     pc, ptrs, buffers, step, STEP, mi, ni, MARK_TILE=False
                 )
@@ -669,10 +662,28 @@ def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
             with region("mfma"):
                 if require_constexpr(DOT):
                     dot_a = _take_operand_pairs(
-                        regs.a_payload, regs.a_scale, tc, layout, 0, mi, PHASE - 1
+                        regs.a_payload,
+                        regs.a_scale,
+                        buffers,
+                        tc,
+                        layout,
+                        0,
+                        mi,
+                        PHASE - 1,
+                        a_buffer,
+                        a_scale_buffer,
                     )
                     dot_b = _take_operand_pairs(
-                        regs.b_payload, regs.b_scale, tc, layout, 1, ni, PHASE - 1
+                        regs.b_payload,
+                        regs.b_scale,
+                        buffers,
+                        tc,
+                        layout,
+                        1,
+                        ni,
+                        PHASE - 1,
+                        b_buffer,
+                        b_scale_buffer,
                     )
                 else:
                     dot_a, dot_b = (), ()
@@ -687,7 +698,7 @@ def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
                     DOT,
                     (PHASE - 1) * tc.BLOCK_K // 128 % 2,
                 )
-                af, bf, asf, bsf = _ds_read_pane(pc, buffers, step, STEP, mi, ni, True)
+                af, bf, asf, bsf = _ds_read_pane(pc, step, STEP, mi, ni, True)
                 if require_constexpr(mi == nm - 1 and ni == nn - 1):
                     ptrs = _advance(pc, ptrs, STEP)
             if require_constexpr(
@@ -837,22 +848,45 @@ def _drain_buffered_pipeline(pc, ptrs, buffers, regs, NUM_K):
                 main + j + 1,
                 sched.drain_step(0, j),
             )
-    a_scale, b_scale = (), ()
+    # The final MFMA's operands, one (payload, scale) pair per K slot of each slot.
+    a_buffer: gl.constexpr = sched.final_register_index(A_PAYLOAD)
+    a_scale_buffer: gl.constexpr = sched.final_register_index(A_SCALE)
+    b_buffer: gl.constexpr = sched.final_register_index(B_PAYLOAD)
+    b_scale_buffer: gl.constexpr = sched.final_register_index(B_SCALE)
+    a_payload, a_scale, b_payload, b_scale = (), (), (), ()
     for mi in gl.static_range(layout.num_m_slots):
         pairs = _take_operand_pairs(
-            regs.a_payload, regs.a_scale, tc, layout, 0, mi, sched.num_k - 1
+            regs.a_payload,
+            regs.a_scale,
+            buffers,
+            tc,
+            layout,
+            0,
+            mi,
+            sched.num_k - 1,
+            a_buffer,
+            a_scale_buffer,
         )
         for k in gl.static_range(layout.num_k_slots):
+            a_payload += (pairs[2 * k],)
             a_scale += (pairs[2 * k + 1],)
     for ni in gl.static_range(layout.num_n_slots):
         pairs = _take_operand_pairs(
-            regs.b_payload, regs.b_scale, tc, layout, 1, ni, sched.num_k - 1
+            regs.b_payload,
+            regs.b_scale,
+            buffers,
+            tc,
+            layout,
+            1,
+            ni,
+            sched.num_k - 1,
+            b_buffer,
+            b_scale_buffer,
         )
         for k in gl.static_range(layout.num_k_slots):
+            b_payload += (pairs[2 * k],)
             b_scale += (pairs[2 * k + 1],)
-    return _PipelineRegFragments(
-        regs.a_payload, a_scale, regs.b_payload, b_scale, regs.acc
-    )
+    return _PipelineRegFragments(a_payload, a_scale, b_payload, b_scale, regs.acc)
 
 
 @gluon.jit

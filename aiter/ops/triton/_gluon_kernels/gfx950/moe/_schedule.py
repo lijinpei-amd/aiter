@@ -325,39 +325,20 @@ class Schedule:
         )
         # Per pane index, the slot of each component it buffer-loads, or None.
         buffer_load_slots = _by_pane_index(buffer_load_pane, first_slots, num_panes)
-        ds_read_pane, ds_read_in_mfma = {}, {}
-        for c in COMPONENTS:
-            op, is_scale = c.operand_index.value, c.is_scale.value
-            payload = A_PAYLOAD if op == A else B_PAYLOAD
-            for slot in range(nm if op == A else nn):
-                key = CompSlot(c, slot)
-                ds_read = buffer_load_pane[CompSlot(payload, slot)]
-                same_step = (
-                    layout.component_in_reg(c) and load_to_mfma_distance[c.index()] == 1
-                )
-                if (
-                    same_step
-                    and buffer_load_panes_valid
-                    and buffer_load_pane[key] > ds_read
-                ):
-                    ds_read = buffer_load_pane[key]
-                ds_read_pane[key] = ds_read
-                configured = bool(tc.ds_read_in_mfma(op, is_scale))
-                ds_read_in_mfma[key] = configured or (
-                    same_step
-                    and buffer_load_panes_valid
-                    and ds_read == buffer_load_pane[key]
-                )
-                if same_step and buffer_load_panes_valid:
-                    buffer_load = buffer_load_pane[key]
-                    assert ds_read > buffer_load or (
-                        ds_read == buffer_load and ds_read_in_mfma[key]
-                    ), (
-                        f"component {c} is in registers at F == 1, so "
-                        f"its DS read of slot {slot} (pane {ds_read}) must follow "
-                        f"the same step's buffer load (pane {buffer_load})"
-                    )
-        ds_read_slots = _by_pane_index(ds_read_pane, first_slots, num_panes)
+        # A slot is DS-read in the pane that buffer-loads its operand's payload slot.
+        # Only LDS components have a DS read: the MFMA reads a register ring itself.
+        ds_read_pane = {
+            CompSlot(c, slot): buffer_load_pane[
+                CompSlot(A_PAYLOAD if c.operand_index.value == A else B_PAYLOAD, slot)
+            ]
+            for c in COMPONENTS
+            for slot in range(nm if c.operand_index.value == A else nn)
+        }
+        ds_read_slots = _by_pane_index(
+            ds_read_pane,
+            {cs for cs in first_slots if layout.component_via_lds(cs.component)},
+            num_panes,
+        )
 
         commit = (
             bool(tc.commit_per_op()),
@@ -415,10 +396,7 @@ class Schedule:
         self._load_to_mfma_distance = gl.constexpr(load_to_mfma_distance)
         self._ds_read_in_mfma = gl.constexpr(
             tuple(
-                tuple(
-                    ds_read_in_mfma[CompSlot(c, slot)]
-                    for slot in range(nm if c.operand_index.value == A else nn)
-                )
+                bool(tc.ds_read_in_mfma(c.operand_index.value, c.is_scale.value))
                 for c in COMPONENTS
             )
         )
@@ -663,8 +641,7 @@ class Schedule:
 
     @gluon.constexpr_function
     def ds_read_in_mfma(self, comp_slot):
-        component_index = comp_slot.component.index()
-        return self._ds_read_in_mfma.value[component_index][comp_slot.index.value]
+        return self._ds_read_in_mfma.value[comp_slot.component.index()]
 
     @gluon.constexpr_function
     def buffer_load_slots(self, pane_index):
@@ -676,6 +653,7 @@ class Schedule:
 
     @gluon.constexpr_function
     def register_index(self, step, component, buffer_load=False):
+        # The register buffer this step's buffer load fills, or the one its MFMA reads.
         if not self.component_present(component):
             return 0
         r = self.steps_per_buffer(component)
@@ -686,9 +664,17 @@ class Schedule:
             origin = self.phase(step)
             current = origin
         target = current + (
-            self.load_to_mfma_distance(component) - 1 if buffer_load else 0
+            self.load_to_mfma_distance(component) - 1 if buffer_load else -1
         )
         return (target // r - origin // r) % self.num_buffers(component)
+
+    @gluon.constexpr_function
+    def final_register_index(self, component):
+        # The register buffer the final MFMA, after the last drain step, reads.
+        if not self.component_present(component):
+            return 0
+        r, num_k = self.steps_per_buffer(component), self.num_k.value
+        return ((num_k - 1) // r - num_k // r) % self.num_buffers(component)
 
     @gluon.constexpr_function
     def static_lds_index(self, step, component, buffer_load):

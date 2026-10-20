@@ -20,7 +20,7 @@ Two per-component distances, in steps, set every timing below:
   `F >= 1` in registers.
 
 Throughout, `s` is the step that issues a copy and `t` the step that issues its MFMAs, so
-`t = s + F`, and the DS read is at step `t - 1`.
+`t = s + F`, and an LDS component's DS read is at step `t - 1`.
 
 Both cases for a scale at `D = 3`, `R = 2` (so `L = 5`). One value covers two K tiles, and
 its MFMAs issue at steps `t` and `t + 1` either way. `x` marks an instruction, `=` a step
@@ -37,7 +37,6 @@ in which that row's storage holds the value:
 | **In registers, `F = L - 1 = 4`, `s = t - 4`** | | | | | | | | |
 | `buffer_load` the value -> registers | | x | | | | | | |
 | register buffer holds it | | = | = | = | = | = | = | |
-| DS read: pick the buffer | | | | | = | = | = | |
 | MFMA of its two K tiles, from the buffer | | | | | | x | x | |
 | `buffer_load` the value `D` later -> same buffer | | | | | | | | x |
 
@@ -52,16 +51,17 @@ has to come after the buffer's last reader, and the readers hold the buffer for 
 lengths. Through LDS the last reader is the `ds_read` at `t - 1`, so the buffer sits idle
 for `R - 1` steps (step `t` here). In registers every MFMA of the value reads the buffer,
 the last at `t + R - 1`, so the refill comes on the next step and the buffer never idles.
-Through LDS `s` is therefore a multiple of `R`; in registers `s % R == 1`. At `D = 2`,
-`R = 1` a register ring has `F = 1`: its DS read falls in its copy's own step and is placed
-after the copy (see DS read in CONCEPTS.md).
+Through LDS `s` is therefore a multiple of `R`; in registers `s % R == 1`. The copy in a
+step never fills the buffer that step's MFMAs read, since `F = (D - 1) * R` puts them
+`D - 1` buffers apart; at `D = 2`, `R = 1` (`F = 1`) a copy is read by the next step's
+MFMA.
 
 A copy issued at step `s` carries K tile `s + F - 1`. That tile is DS-read at step
 `t - 1 = s + F - 1`, and its MFMAs issue at step `t`. So every step DS-reads the K tile
-with its own number and issues the MFMAs of the tile before, from fragments the previous
-step DS-read: the whole `BLOCK_K`
-tile is carried in registers (`VGPR_PREFETCH_K == BLOCK_K`, asserted), and a step's MFMAs
-never wait on its own DS reads.
+with its own number and issues the MFMAs of the tile before: through LDS from fragments
+the previous step DS-read, in registers from the ring itself. The whole `BLOCK_K` tile is
+carried in registers (`VGPR_PREFETCH_K == BLOCK_K`, asserted), and a step's MFMAs never
+wait on its own DS reads.
 
 Depth 3, every component `F = 3`:
 
@@ -80,8 +80,8 @@ A component copies at step `s` only when both hold (`_step_plan`):
 - `loads`: its ring advances, `(s + F - 1) % R == 0`. A payload copies at every active
   step, a scale once every `R`.
 
-It DS-reads at step `t - 1` when `(t - 1) % R == 0`, so only at multiples of `R`
-(`Schedule.ds_reads`).
+An LDS component DS-reads at step `t - 1` when `(t - 1) % R == 0`, so only at multiples
+of `R` (`Schedule.ds_reads`).
 
 ## Steps
 
@@ -156,8 +156,8 @@ Resolved once in `Schedule.__init__`:
   maps to an existing pane, and no pane copies two slots of one component. Different
   components may share a pane.
 - **DS-read pane** (`ds_read_pane`): the pane that copies the same operand's payload slot,
-  in the region `DS_READ_*_IN_MFMA` picks. A register ring at `F == 1` moves later (see
-  DS read in CONCEPTS.md).
+  in the region `DS_READ_*_IN_MFMA` picks. Only LDS components have one; a register
+  component's MFMA reads its ring directly.
 - **Fragment order.** A step appends each pane's DS-read fragments in pane order
   (`a += am + af`), and `_take_operand_pairs` indexes them by slot, so a component's
   DS-read panes must increase with its slot. Every current ownership rule satisfies this,
@@ -166,7 +166,8 @@ Resolved once in `Schedule.__init__`:
 ## Ring indices
 
 A copy issued at step `s` fills buffer `((s + F - 1) // R) % D`, which is
-`((t - 1) // R) % D`, the buffer the DS read at step `t - 1` reads.
+`((t - 1) // R) % D`: the buffer the `ds_read` at step `t - 1` reads through LDS, and the
+one the MFMA at step `t` reads in registers.
 
 - **LDS ring** (`_index`): compile-time when `static_lds_index` has a value (loop, static
   remainder and static drain steps), which gives immediate LDS offsets. Otherwise the
@@ -174,8 +175,10 @@ A copy issued at step `s` fills buffer `((s + F - 1) // R) % D`, which is
   no signed fix-up.
 - **Register ring**: a tuple has no runtime index. Straight-line steps rotate it
   (`_rotate_buffers`) so index 0 is the current value. Loop steps never rotate; they index
-  from the loop's first step (`register_index`), which needs `unroll` to be a multiple of
-  `reg_buffer_period`.
+  from the loop's first step, which needs `unroll` to be a multiple of
+  `reg_buffer_period`. `register_index(step, component)` is the buffer a step's MFMAs
+  read and `register_index(step, component, True)` the one its copy fills;
+  `final_register_index` is the buffer the final MFMA reads.
 
 ## Commit plan
 
