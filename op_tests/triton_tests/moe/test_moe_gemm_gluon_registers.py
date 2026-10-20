@@ -251,7 +251,7 @@ def test_compiler_pipeline_with_register_ring_unroll(register_case, depth):
     _assert_register_case(register_case, config)
 
 
-@pytest.mark.parametrize("scheme", [1, 2, 4], ids=["per_op", "per_panel", "warp_stage"])
+@pytest.mark.parametrize("scheme", [1, 2, 4], ids=["per_op", "per_pane", "warp_stage"])
 @pytest.mark.parametrize("mask", [1, 6], ids=["b_register", "scale_registers"])
 def test_mixed_buffers_wait_commit(register_case, scheme, mask):
     config = _register_config(register_case.dtype)

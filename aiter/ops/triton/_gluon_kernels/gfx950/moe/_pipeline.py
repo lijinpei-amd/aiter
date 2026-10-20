@@ -24,7 +24,7 @@ from ._types import (
     B_SCALE,
     Component,
     CompSlot,
-    Panel,
+    Pane,
 )
 
 _SG_MFMA: gl.constexpr = gl.constexpr(8)
@@ -285,7 +285,7 @@ def _init_buffers(pc):
 
 
 @gluon.jit
-def _buffer_load_panel(
+def _buffer_load_pane(
     pc,
     ptrs,
     buffers,
@@ -299,7 +299,7 @@ def _buffer_load_panel(
     sched: gl.constexpr = pc.schedule
     nm: gl.constexpr = layout.num_m_slots
     nn: gl.constexpr = layout.num_n_slots
-    ops: gl.constexpr = sched.issued(STEP, Panel(mi, ni).linear_index(nm))
+    ops: gl.constexpr = sched.issued(STEP, Pane(mi, ni).linear_index(nm))
     mk: gl.constexpr = layout.num_k_slots
     offset_step: gl.constexpr = sched.ki(STEP) if sched.soff_unroll(STEP) else 0
     a_soff: gl.constexpr = (
@@ -440,7 +440,7 @@ def _buffer_load_panel(
                 * sched.steps_per_buffer(B_SCALE),
             )
     if require_constexpr(
-        sched.commit_per_panel
+        sched.commit_per_pane
         or (
             MARK_TILE
             and sched.commit_per_tile
@@ -557,7 +557,7 @@ def _ds_read_scale(
 
 
 @gluon.jit
-def _ds_read_panel(
+def _ds_read_pane(
     pc,
     buffers,
     step,
@@ -568,11 +568,11 @@ def _ds_read_panel(
 ):
     layout: gl.constexpr = pc.layout
     sched: gl.constexpr = pc.schedule
-    panel_index: gl.constexpr = Panel(mi, ni).linear_index(layout.num_m_slots)
-    at: gl.constexpr = sched.ds_read_slot(panel_index, A_PAYLOAD)
-    ast: gl.constexpr = sched.ds_read_slot(panel_index, A_SCALE)
-    bt: gl.constexpr = sched.ds_read_slot(panel_index, B_PAYLOAD)
-    bst: gl.constexpr = sched.ds_read_slot(panel_index, B_SCALE)
+    pane_index: gl.constexpr = Pane(mi, ni).linear_index(layout.num_m_slots)
+    at: gl.constexpr = sched.ds_read_slot(pane_index, A_PAYLOAD)
+    ast: gl.constexpr = sched.ds_read_slot(pane_index, A_SCALE)
+    bt: gl.constexpr = sched.ds_read_slot(pane_index, B_PAYLOAD)
+    bst: gl.constexpr = sched.ds_read_slot(pane_index, B_SCALE)
     a, b, a_scale, b_scale = (), (), (), ()
     if require_constexpr(
         at is not None and sched.ds_read_in_mfma(CompSlot(A_PAYLOAD, at)) == MFMA
@@ -647,18 +647,16 @@ def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
     for ni in gl.static_range(nn):
         for mi in gl.static_range(nm):
             if require_constexpr(
-                sched.wait(STEP, Panel(mi, ni).linear_index(nm)) is not None
+                sched.wait(STEP, Pane(mi, ni).linear_index(nm)) is not None
             ):
                 pc.lds_ptrs.wait_buffer_load_groups(
-                    sched.wait(STEP, Panel(mi, ni).linear_index(nm))
+                    sched.wait(STEP, Pane(mi, ni).linear_index(nm))
                 )
             if require_constexpr(not DOT and mi == 0 and ni == 0):
                 gl.amd.cdna4.sched_barrier(0)
             with region("mem"):
-                am, bm, asm, bsm = _ds_read_panel(
-                    pc, buffers, step, STEP, mi, ni, False
-                )
-                buffers = _buffer_load_panel(
+                am, bm, asm, bsm = _ds_read_pane(pc, buffers, step, STEP, mi, ni, False)
+                buffers = _buffer_load_pane(
                     pc, ptrs, buffers, step, STEP, mi, ni, MARK_TILE=False
                 )
                 if require_constexpr(
@@ -681,7 +679,7 @@ def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
                 value = _maybe_block_dot(
                     dot_a,
                     dot_b,
-                    regs.acc[Panel(mi, ni).linear_index(nm)],
+                    regs.acc[Pane(mi, ni).linear_index(nm)],
                     mk,
                     pc.func_cfg,
                     tc,
@@ -689,7 +687,7 @@ def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
                     DOT,
                     (PHASE - 1) * tc.BLOCK_K // 128 % 2,
                 )
-                af, bf, asf, bsf = _ds_read_panel(pc, buffers, step, STEP, mi, ni, True)
+                af, bf, asf, bsf = _ds_read_pane(pc, buffers, step, STEP, mi, ni, True)
                 if require_constexpr(mi == nm - 1 and ni == nn - 1):
                     ptrs = _advance(pc, ptrs, STEP)
             if require_constexpr(
@@ -749,7 +747,7 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
     for r in gl.static_range(1 - depth, 0):
         for ni in gl.static_range(layout.num_n_slots):
             for mi in gl.static_range(layout.num_m_slots):
-                buffers = _buffer_load_panel(
+                buffers = _buffer_load_pane(
                     pc,
                     ptrs,
                     buffers,
@@ -765,7 +763,7 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
         for mi in gl.static_range(layout.num_m_slots):
             acc += (
                 gl.zeros(
-                    layout.accumulator_fragment_shape_panel,
+                    layout.accumulator_fragment_shape_pane,
                     pc.func_cfg.mma_acc_dtype,
                     layout.dot_result_fragment_layout,
                 ),
@@ -878,7 +876,7 @@ def _last_mfma(pc, regs):
                         ni * layout.num_k_slots,
                         layout.num_k_slots,
                     ),
-                    regs.acc[Panel(mi, ni).linear_index(layout.num_m_slots)],
+                    regs.acc[Pane(mi, ni).linear_index(layout.num_m_slots)],
                     layout.num_k_slots,
                     pc.func_cfg,
                     tc,

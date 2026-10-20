@@ -42,7 +42,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (  # noqa: E402
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (  # noqa: E402
     COMPONENTS,
     CompSlot,
-    Panel,
+    Pane,
     WaitCommitScheme,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import (  # noqa: E402
@@ -189,14 +189,14 @@ def dump_case(name, cfg, dq_a, dq_b, K, out):
         return
 
     nm, nn = maybe_unwrap(layout.num_m_slots), maybe_unwrap(layout.num_n_slots)
-    panels = nm * nn
+    panes = nm * nn
     present = [c for c in COMPONENTS if schedule.component_present(c)]
     async_period = math.lcm(
         *(schedule.steps_per_buffer(c) for c in present if layout.component_via_lds(c))
     )
 
     out(f"== {name}")
-    out(f"  geom NM={nm} NN={nn} slots={panels} mk={maybe_unwrap(layout.num_k_slots)} "
+    out(f"  geom NM={nm} NN={nn} slots={panes} mk={maybe_unwrap(layout.num_k_slots)} "
         f"num_k={maybe_unwrap(schedule.num_k)} scheme={int(tc.WAIT_COMMIT_SCHEME)}")
     out(f"  sizing depth={maybe_unwrap(schedule.depth)} "
         f"unroll={maybe_unwrap(schedule.unroll)} "
@@ -210,7 +210,7 @@ def dump_case(name, cfg, dq_a, dq_b, K, out):
         f"epilogue_groups={maybe_unwrap(schedule.epilogue_groups)} "
         f"epilogue_wait={schedule.epilogue_wait()}")
     out(f"  commit per_copy={maybe_unwrap(schedule.commit_per_copy)} "
-        f"per_slot={maybe_unwrap(schedule.commit_per_panel)} "
+        f"per_slot={maybe_unwrap(schedule.commit_per_pane)} "
         f"per_tile={maybe_unwrap(schedule.commit_per_tile)} "
         f"tile_after_mfma={maybe_unwrap(schedule.tile_commit_after_mfma)}")
 
@@ -225,14 +225,14 @@ def dump_case(name, cfg, dq_a, dq_b, K, out):
         out(f"  {CNAME[c]} D={D} R={R} L={(D - 1) * R + 1} F={F} "
             f"via_lds={bool(layout.component_via_lds(c))} pphase={(1 - F) % R} "
             f"nonk_ratio={layout.scale_slot_nonk(op) // layout.slot_nonk(op)} "
-            f"buffer_load_slots={tuple(schedule.buffer_load_panel(CompSlot(c, t)) for t in range(num_slots))} "
-            f"ds_read_slots={tuple(schedule.ds_read_panel(CompSlot(c, t)) for t in range(num_slots))} "
+            f"buffer_load_slots={tuple(schedule.buffer_load_pane(CompSlot(c, t)) for t in range(num_slots))} "
+            f"ds_read_slots={tuple(schedule.ds_read_pane(CompSlot(c, t)) for t in range(num_slots))} "
             f"ds_read_in_mfma={tuple(schedule.ds_read_in_mfma(CompSlot(c, t)) for t in range(num_slots))}")
 
-    # ownership and DS reads, per panel
+    # ownership and DS reads, per pane
     for ni in range(nn):
         for mi in range(nm):
-            s = Panel(mi, ni).linear_index(nm)
+            s = Pane(mi, ni).linear_index(nm)
             ds_read = tuple(schedule.ds_read_slot(s, c) for c in COMPONENTS)
             out(f"  slot{s}(mi={mi},ni={ni}) owned={schedule.buffer_load_slots(s)} "
                 f"ds_read_non_k_slots={ds_read}")
@@ -247,17 +247,17 @@ def dump_case(name, cfg, dq_a, dq_b, K, out):
         loads = tuple(int(schedule.loads(step, c)) for c in COMPONENTS)
         ds_reads = tuple(int(schedule.ds_reads(step, c)) for c in COMPONENTS)
         out(f"    active={act} loads={loads} ds_reads={ds_reads}")
-        out(f"    issued={tuple(schedule.issued(step, s) for s in range(panels))}")
+        out(f"    issued={tuple(schedule.issued(step, s) for s in range(panes))}")
         commits = tuple(
             tuple(
                 tuple((CNAME[cs.component], cs.index.value) for cs in g)
                 for g in schedule.commits(step, s)
             )
-            for s in range(panels)
+            for s in range(panes)
         )
         out(f"    commits={commits}")
         out(f"    wait tile={schedule.wait(step)} "
-            f"slots={[schedule.wait(step, s) for s in range(panels)]}")
+            f"slots={[schedule.wait(step, s) for s in range(panes)]}")
         for c in present:
             out(f"    {CNAME[c]} reg={schedule.register_index(step, c)}/"
                 f"{schedule.register_index(step, c, True)} "

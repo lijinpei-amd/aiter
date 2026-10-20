@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Dtype / quant-scheme enums, the LDS budget, the component, slot and panel
+"""Dtype / quant-scheme enums, the LDS budget, the component, slot and pane
 aggregates and the host->device NamedTuples of the gfx950 Gluon MoE grouped GEMMs.
 """
 
@@ -55,7 +55,7 @@ __all__ = [
     "FuncSpec",
     "NonQuantExpertTensor",
     "NonQuantTokenTensor",
-    "Panel",
+    "Pane",
     "QuantExpertTensor",
     "QuantTokenTensor",
     "ResultTensor",
@@ -157,7 +157,7 @@ class CompSlot:
 
 @aggregate
 @strip_annotate
-class Panel:
+class Pane:
     """The ``SLOT_M x SLOT_N`` part of the tile that A's slot ``m_index`` and B's slot
     ``n_index`` multiply into."""
 
@@ -173,15 +173,15 @@ class Panel:
 
     @gluon.constexpr_function
     def linear_index(self, num_m_slots) -> int:
-        """The panel index, this panel's position in the N-outer, M-inner traversal.
+        """The pane index, this pane's position in the N-outer, M-inner traversal.
 
-        This one number is the panel's place in three orderings at once -- the
-        visitation order of the panel loop, the index of its accumulator in the
+        This one number is the pane's place in three orderings at once -- the
+        visitation order of the pane loop, the index of its accumulator in the
         carried tuple, and (under the even schedule) the position of its fill in
         ``_schedule._payload_buffer_load_order``. They have to agree, which is why
         they all come from here.
 
-        Down the M axis first, so with two slots on each axis the four panels are
+        Down the M axis first, so with two slots on each axis the four panes are
         visited ``(0,0), (1,0), (0,1), (1,1)`` -- the region order of the reference
         kernel in gfx950-gluon-tutorials .../a16w16/v8_sliceMN, whose four DOTs are
         ``(A_top, B_left), (A_bot, B_left), (A_top, B_right), (A_bot, B_right)``.
@@ -205,7 +205,7 @@ class Panel:
 
     @gluon.constexpr_function
     def __repr__(self):
-        return f"Panel({self.m_index.value}, {self.n_index.value})"
+        return f"Pane({self.m_index.value}, {self.n_index.value})"
 
 
 A_PAYLOAD = Component(A, PAYLOAD)
@@ -346,8 +346,8 @@ class TuningSpec(NamedTuple):
     #: :class:`WaitCommitScheme` -- how coarsely the global->LDS copies are committed,
     #: and hence how many groups a ``wait_group`` count has to walk past.
     WAIT_COMMIT_SCHEME: int = int(WaitCommitScheme.PER_OP)
-    #: DS-read each component in its panel's MFMA region rather than its memory
-    #: region. A register ring at F == 1 overrides it to the MFMA region in the panel
+    #: DS-read each component in its pane's MFMA region rather than its memory
+    #: region. A register ring at F == 1 overrides it to the MFMA region in the pane
     #: of its buffer load, since the DS read must follow that load.
     DS_READ_A_PAYLOAD_IN_MFMA: bool = False
     DS_READ_A_SCALE_IN_MFMA: bool = False
@@ -358,10 +358,10 @@ class TuningSpec(NamedTuple):
     FROZEN_STEP: bool = False
     #: Advance HBM pointers per unrolled body and address its steps through soffset.
     SOFF_UNROLL: bool = False
-    #: At a 2x2 slot split, fill scales in the two middle panels.
+    #: At a 2x2 slot split, fill scales in the two middle panes.
     SCALE_FILL_MID: bool = False
     #: Allow B's payload through LDS. False forces preshuffled B directly into
-    #: registers at its global-load panel. Either payload may also resolve to registers
+    #: registers at its global-load pane. Either payload may also resolve to registers
     #: automatically when its LDS copy is illegal.
     ALLOW_B_VIA_LDS: bool = True
     #: Allow each operand's scales through LDS, independently. False forces

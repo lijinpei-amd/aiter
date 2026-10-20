@@ -117,8 +117,8 @@ class _ScheduleConfig:
     def commit_per_op(self):
         return self.WAIT_COMMIT_SCHEME == WaitCommitScheme.PER_OP
 
-    def commit_per_panel(self):
-        return self.WAIT_COMMIT_SCHEME == WaitCommitScheme.PER_PANEL
+    def commit_per_pane(self):
+        return self.WAIT_COMMIT_SCHEME == WaitCommitScheme.PER_PANE
 
     def commit_per_stage(self):
         return self.WAIT_COMMIT_SCHEME in (
@@ -169,8 +169,8 @@ def _config(shape, scheme, middle, traffic):
     return tc
 
 
-def _reference_panels(tc):
-    # State the copy order independently of production's panel/group helpers.
+def _reference_panes(tc):
+    # State the copy order independently of production's pane/group helpers.
     if (tc.nm, tc.nn) == (2, 2):
         payloads = [
             CompSlot(B_PAYLOAD, 0),
@@ -187,13 +187,13 @@ def _reference_panels(tc):
                 payloads.append(CompSlot(B_PAYLOAD, tile))
     copies = [[] for _ in range(tc.nm * tc.nn)]
     reads = [set() for _ in copies]
-    for panel, payload in enumerate(payloads):
+    for pane, payload in enumerate(payloads):
         component, tile = payload.component, payload.index.value
         operand = component.operand_index.value
         assert not component.is_scale.value
-        copies[panel].append(payload)
+        copies[pane].append(payload)
         if tc.component_via_lds(component):
-            reads[panel].add(payload)
+            reads[pane].add(payload)
         scale_component = Component(operand, SCALE)
         if not (
             tc.has_scale(operand) and tc.component_via_lds(scale_component)
@@ -201,12 +201,12 @@ def _reference_panels(tc):
             continue
         owner = tile - tile % tc.a_scale_ratio if operand == A else tile
         if tile == owner:
-            reads[panel].add(CompSlot(scale_component, owner))
+            reads[pane].add(CompSlot(scale_component, owner))
             scale_slot = (
-                1 + tile if tc.SCALE_FILL_MID and (tc.nm, tc.nn) == (2, 2) else panel
+                1 + tile if tc.SCALE_FILL_MID and (tc.nm, tc.nn) == (2, 2) else pane
             )
             copies[scale_slot].append(CompSlot(scale_component, tile))
-    # Within a panel, components issue in A, A-scale, B, B-scale order.
+    # Within a pane, components issue in A, A-scale, B, B-scale order.
     component_rank = {
         A_PAYLOAD: 0,
         A_SCALE: 1,
@@ -214,8 +214,8 @@ def _reference_panels(tc):
         B_SCALE: 3,
     }
     ordered = [
-        tuple(sorted(panel, key=lambda copy: component_rank[copy.component]))
-        for panel in copies
+        tuple(sorted(pane, key=lambda copy: component_rank[copy.component]))
+        for pane in copies
     ]
     return ordered, reads
 
@@ -224,13 +224,13 @@ def _reference_groups(tc, copies):
     def is_async(copy):
         return tc.component_via_lds(copy.component)
 
-    asynchronous = [tuple(copy for copy in panel if is_async(copy)) for panel in copies]
+    asynchronous = [tuple(copy for copy in pane if is_async(copy)) for pane in copies]
     if tc.WAIT_COMMIT_SCHEME == WaitCommitScheme.PER_OP:
-        return tuple(tuple((copy,) for copy in panel) for panel in asynchronous)
-    if tc.WAIT_COMMIT_SCHEME == WaitCommitScheme.PER_PANEL:
-        return tuple((panel,) for panel in asynchronous)
+        return tuple(tuple((copy,) for copy in pane) for pane in asynchronous)
+    if tc.WAIT_COMMIT_SCHEME == WaitCommitScheme.PER_PANE:
+        return tuple((pane,) for pane in asynchronous)
     return ((),) * (len(copies) - 1) + (
-        (tuple(copy for panel in asynchronous for copy in panel),),
+        (tuple(copy for pane in asynchronous for copy in pane),),
     )
 
 
@@ -255,7 +255,7 @@ class _LDSRecorder:
         self.a_scale_lds_ptr = _Descriptor(A_SCALE, tc)
         self.b_payload_lds_ptr = _Descriptor(B_PAYLOAD, tc)
         self.b_scale_lds_ptr = _Descriptor(B_SCALE, tc)
-        self.panel = 0
+        self.pane = 0
         self.pending = []
         self.copies = [[] for _ in range(tc.nm * tc.nn)]
         self.groups = [[] for _ in self.copies]
@@ -267,7 +267,7 @@ class _LDSRecorder:
             )
         else:
             # A direct-register load is issued but owns no LDS async-copy group.
-            self.copies[self.panel].append(CompSlot(Component(operand, PAYLOAD), tile))
+            self.copies[self.pane].append(CompSlot(Component(operand, PAYLOAD), tile))
             return (0,)
 
     def buffer_load_scale(self, operand, VIA_LDS, *args, **kwargs):
@@ -282,11 +282,11 @@ class _LDSRecorder:
     def copy(self, descriptor, base, offsets, modifier, soffset):
         stage, component, tile = descriptor
         assert stage == 2, "The emitter must index the requested LDS stage."
-        self.copies[self.panel].append(CompSlot(component, tile))
+        self.copies[self.pane].append(CompSlot(component, tile))
         self.pending.append(CompSlot(component, tile))
 
     def commit_buffer_load(self):
-        self.groups[self.panel].append(tuple(self.pending))
+        self.groups[self.pane].append(tuple(self.pending))
         self.pending.clear()
 
 
@@ -294,7 +294,7 @@ def _steady_step(tc):
     """A schedule and its runtime-remainder step: steady state at K phase zero.
 
     Every component fills there and nothing is unrolled, so the step's copies are the
-    panel ownership itself, with dynamic ring indices.
+    pane ownership itself, with dynamic ring indices.
     """
     tc.UNROLL_EPILOGUE = False
     schedule = tc.make_schedule()
@@ -350,24 +350,24 @@ def _trace_emitter(tc, monkeypatch, defer_stage_commit=False):
         patch.setattr(buffered, "_replace_fragments", buffered._replace_fragments.fn)
         patch.setattr(buffered.gl, "static_range", range)
         patch.setattr(buffered.gl, "assume", check_assumption)
-        for panel in range(tc.nm * tc.nn):
-            sink.panel = panel
-            buffers = buffered._buffer_load_panel.fn(
+        for pane in range(tc.nm * tc.nn):
+            sink.pane = pane
+            buffers = buffered._buffer_load_pane.fn(
                 pc,
                 pointers,
                 buffers,
                 0,
                 step,
-                panel % tc.nm,
-                panel // tc.nm,
+                pane % tc.nm,
+                pane // tc.nm,
                 MARK_TILE=not defer_stage_commit,
             )
     if defer_stage_commit:
         assert not any(sink.groups)
         sink.commit_buffer_load()
     assert not sink.pending
-    return tuple(tuple(panel) for panel in sink.copies), tuple(
-        tuple(panel) for panel in sink.groups
+    return tuple(tuple(pane) for pane in sink.copies), tuple(
+        tuple(pane) for pane in sink.groups
     )
 
 
@@ -396,7 +396,7 @@ def test_emitted_groups_and_waits_retire_required_copies(
     shape, scheme, middle, traffic, monkeypatch
 ):
     tc = _config(shape, scheme, middle, traffic)
-    copies, reads = _reference_panels(tc)
+    copies, reads = _reference_panes(tc)
     expected = _reference_groups(tc, copies)
     emitted_copies, emitted_groups = _trace_emitter(tc, monkeypatch)
     assert emitted_copies == tuple(copies)
@@ -406,13 +406,12 @@ def test_emitted_groups_and_waits_retire_required_copies(
     # reference describes.
     schedule, step = _steady_step(tc)
     assert (
-        tuple(schedule.commits(step, panel) for panel in range(tc.nm * tc.nn))
-        == expected
+        tuple(schedule.commits(step, pane) for pane in range(tc.nm * tc.nn)) == expected
     )
-    for panel, operations in enumerate(copies):
+    for pane, operations in enumerate(copies):
         # Ownership keeps direct-register destinations because the schedule still
         # issues them; only scales are dropped from the async view, since a register
-        # scale has no commit group while a register payload still occupies its panel.
+        # scale has no commit group while a register payload still occupies its pane.
         nominal = tuple(
             slot
             if (
@@ -422,7 +421,7 @@ def test_emitted_groups_and_waits_retire_required_copies(
             )
             else None
             for component, slot in zip(
-                COMPONENTS, schedule.buffer_load_slots(panel)
+                COMPONENTS, schedule.buffer_load_slots(pane)
             )
         )
         slot_of = {copy.component: copy.index.value for copy in operations}
@@ -443,9 +442,9 @@ def test_emitted_groups_and_waits_retire_required_copies(
         WaitCommitScheme.PER_STAGE_WHOLE,
     ],
 )
-def test_stage_commit_can_close_after_the_panel_walk(scheme, monkeypatch):
+def test_stage_commit_can_close_after_the_pane_walk(scheme, monkeypatch):
     tc = _config((4, 2), scheme, False, "shared-a-pair")
-    copies, _ = _reference_panels(tc)
+    copies, _ = _reference_panes(tc)
     _, emitted = _trace_emitter(tc, monkeypatch, defer_stage_commit=True)
     assert emitted == _reference_groups(tc, copies)
 
@@ -453,7 +452,7 @@ def test_stage_commit_can_close_after_the_panel_walk(scheme, monkeypatch):
 @pytest.mark.parametrize(
     "scheme", list(WaitCommitScheme), ids=lambda scheme: scheme.name
 )
-def test_register_only_panels_need_no_cooperative_fence(scheme, monkeypatch):
+def test_register_only_panes_need_no_cooperative_fence(scheme, monkeypatch):
     from aiter.ops.triton._gluon_kernels.gfx950.moe import _pipeline as pipeline
 
     waits, barriers = [], []
@@ -482,10 +481,10 @@ def test_register_only_panels_need_no_cooperative_fence(scheme, monkeypatch):
     )
     monkeypatch.setattr(pipeline.gl, "barrier", lambda: barriers.append(True))
     monkeypatch.setattr(pipeline.gl, "static_range", range)
-    monkeypatch.setattr(pipeline, "_ds_read_panel", lambda *args: ((), (), (), ()))
+    monkeypatch.setattr(pipeline, "_ds_read_pane", lambda *args: ((), (), (), ()))
     monkeypatch.setattr(
         pipeline,
-        "_buffer_load_panel",
+        "_buffer_load_pane",
         lambda pc, ptrs, buffers, *args, **kwargs: buffers,
     )
     monkeypatch.setattr(pipeline, "_advance", lambda pc, ptrs, *args: ptrs)
@@ -576,8 +575,8 @@ def test_pipeline_stage_commit_boundaries(
     monkeypatch.setattr(pipeline, "pick_stage", pick_stage)
     monkeypatch.setattr(pipeline.gl, "static_range", range)
     monkeypatch.setattr(pipeline.gl.amd.cdna4, "sched_barrier", lambda mask: None)
-    monkeypatch.setattr(pipeline, "_buffer_load_panel", buffer_load)
-    monkeypatch.setattr(pipeline, "_ds_read_panel", lambda *args: ((), (), (), ()))
+    monkeypatch.setattr(pipeline, "_buffer_load_pane", buffer_load)
+    monkeypatch.setattr(pipeline, "_ds_read_pane", lambda *args: ((), (), (), ()))
     monkeypatch.setattr(pipeline, "_take_operand_pairs", lambda *args: ())
     monkeypatch.setattr(pipeline, "_PipelineRegFragments", lambda *args: args)
     monkeypatch.setattr(pipeline, "_rotate_buffers", lambda buffers, *args: buffers)
@@ -588,7 +587,7 @@ def test_pipeline_stage_commit_boundaries(
     pipeline._step_live.fn(pc, None, ((), (), (), ()), regs, 1, step)
     assert [event for event in events if event[0] == "wait"] == [("wait", wait)]
     assert events[0] == ("wait", wait)
-    # Stage/panel commit schemes retain empty groups during the drain. The FIFO
+    # Stage/pane commit schemes retain empty groups during the drain. The FIFO
     # accounting models those exact commits, including their region placement.
     assert events.count(("commit",)) == 1
     commit = events.index(("commit",))

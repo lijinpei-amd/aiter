@@ -32,7 +32,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     A,
     Component,
     CompSlot,
-    Panel,
+    Pane,
     WaitCommitScheme,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import validate
@@ -159,7 +159,7 @@ class _Config(_ScheduleConfig):
     dot_result_fragment_layout = None
 
     @property
-    def accumulator_fragment_shape_panel(self):
+    def accumulator_fragment_shape_pane(self):
         return [self.SLOT_M, self.SLOT_N]
 
 
@@ -274,7 +274,7 @@ class _Machine:
         while len(self.outstanding) > count:
             self.completed.update(self.outstanding.pop(0))
 
-    def required(self, panel):
+    def required(self, pane):
         tc = self.tc
         if (tc.nm, tc.nn) == (2, 2):
             payloads = [
@@ -292,7 +292,7 @@ class _Machine:
                     payloads.append(CompSlot(B_PAYLOAD, tile))
         required = set()
         for pos, payload in enumerate(payloads):
-            if panel is not None and panel != pos:
+            if pane is not None and pane != pos:
                 continue
             operand, mini = payload.component.operand_index.value, payload.index.value
             for component in (Component(operand, PAYLOAD), Component(operand, SCALE)):
@@ -307,17 +307,17 @@ class _Machine:
                     required.add((component, mini, self.current_read))
         return required
 
-    def check_wait(self, panel):
+    def check_wait(self, pane):
         """The wait before this read point retires exactly the copies it reads.
 
-        Checked when the panel first reads, against the FIFO as it stood when the wait
+        Checked when the pane first reads, against the FIFO as it stood when the wait
         issued: the immediate must leave the newest required group retired and every
-        newer one in flight. A per-tile scheme waits once, before panel zero, for the
-        whole step (``panel=None``).
+        newer one in flight. A per-tile scheme waits once, before pane zero, for the
+        whole step (``pane=None``).
         """
-        required = self.required(panel)
+        required = self.required(pane)
         if required:
-            assert self.wait is not None, (self.current_read, panel, "no wait")
+            assert self.wait is not None, (self.current_read, pane, "no wait")
             actual, committed = self.wait
             youngest = max(
                 i
@@ -326,13 +326,13 @@ class _Machine:
             )
             assert actual == committed - youngest - 1, (
                 self.current_read,
-                panel,
+                pane,
                 actual,
                 youngest,
                 self.committed[:committed],
             )
         else:
-            assert self.wait is None, (self.current_read, panel, self.wait)
+            assert self.wait is None, (self.current_read, pane, self.wait)
         self.wait = None
 
     def read(self, component, ring, mini, k):
@@ -433,14 +433,14 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         a_scale_stride_k=1,
         b_scale_stride_k=1,
     )
-    step_fn, buffer_load_fn = pipeline._step.fn, pipeline._buffer_load_panel.fn
-    ds_read_panel_fn = pipeline._ds_read_panel.fn
+    step_fn, buffer_load_fn = pipeline._step.fn, pipeline._buffer_load_pane.fn
+    ds_read_pane_fn = pipeline._ds_read_pane.fn
     ds_read_payload_fn = pipeline._ds_read_payload.fn
     ds_read_scale_fn = pipeline._ds_read_scale.fn
 
     # Positional layouts: _step(pc, ptrs, buffers, regs, step, STEP),
-    # _buffer_load_panel(pc, ptrs, buffers, step, STEP, mi, ni),
-    # _ds_read_panel(pc, buffers, step, STEP, mi, ni, MFMA),
+    # _buffer_load_pane(pc, ptrs, buffers, step, STEP, mi, ni),
+    # _ds_read_pane(pc, buffers, step, STEP, mi, ni, MFMA),
     # _ds_read_payload/_ds_read_scale(pc, buffers, step, STEP, slot, operand).
     def step(*args, **kwargs):
         assert machine.wait is None, "a wait guarded no read"
@@ -456,14 +456,14 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         machine.current_drain = schedule.is_drain(args[4])
         return buffer_load_fn(*args, **kwargs)
 
-    def ds_read_panel(*args, **kwargs):
-        if not args[6]:  # the panel's first read, right after its wait
-            panel = Panel(args[4], args[5]).linear_index(tc.nm)
+    def ds_read_pane(*args, **kwargs):
+        if not args[6]:  # the pane's first read, right after its wait
+            pane = Pane(args[4], args[5]).linear_index(tc.nm)
             if not per_tile:
-                machine.check_wait(panel)
-            elif panel == 0:
+                machine.check_wait(pane)
+            elif pane == 0:
                 machine.check_wait(None)
-        return ds_read_panel_fn(*args, **kwargs)
+        return ds_read_pane_fn(*args, **kwargs)
 
     def ds_read_payload(*args, **kwargs):
         component = Component(args[5], PAYLOAD)
@@ -549,7 +549,7 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
             "_advance",
             "_ds_read_payload",
             "_ds_read_scale",
-            "_ds_read_panel",
+            "_ds_read_pane",
             "_step_live",
             "_take_reg_pairs",
             "_take_operand_pairs",
@@ -559,8 +559,8 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         patch.setattr(pipeline, "_PipelineRegFragments", _fragments)
         patch.setattr(pipeline, "_PipelinePointers", _pointers)
         patch.setattr(pipeline, "_step", step)
-        patch.setattr(pipeline, "_buffer_load_panel", buffer_load)
-        patch.setattr(pipeline, "_ds_read_panel", ds_read_panel)
+        patch.setattr(pipeline, "_buffer_load_pane", buffer_load)
+        patch.setattr(pipeline, "_ds_read_pane", ds_read_pane)
         patch.setattr(pipeline, "_ds_read_payload", ds_read_payload)
         patch.setattr(pipeline, "_ds_read_scale", ds_read_scale)
         patch.setattr(pipeline, "_init_buffers", init_buffers)
@@ -979,9 +979,9 @@ def _straight_line_waits(schedule, tc, last):
     prologue and warm-up steps as emitted, then one step per K tile with the loop
     body's commit pattern for that K phase -- which is what every step after the
     warm-up issues. Returns ``{step: tile wait}`` for a per-tile scheme, else
-    ``{step: per-panel waits}``.
+    ``{step: per-pane waits}``.
     """
-    panels = tc.nm * tc.nn
+    panes = tc.nm * tc.nn
     per_tile = tc.commit_per_stage()
     depth, peeled, unroll = (
         maybe_unwrap(schedule.depth),
@@ -990,15 +990,15 @@ def _straight_line_waits(schedule, tc, last):
     )
     committed, waits = [], {}
 
-    def required(step, panel):
+    def required(step, pane):
         return {
             (
                 step - schedule.load_to_mfma_distance(c) + 1,
                 c,
-                schedule.ds_read_slot(panel, c),
+                schedule.ds_read_slot(pane, c),
             )
             for c in COMPONENTS
-            if schedule.ds_read_slot(panel, c) is not None
+            if schedule.ds_read_slot(pane, c) is not None
             and tc.component_via_lds(c)
             and schedule.ds_reads_at_phase(c, step)
         }
@@ -1018,13 +1018,13 @@ def _straight_line_waits(schedule, tc, last):
             index = schedule.loop_step((step - peeled - 1) % unroll)
         if step >= 0 and per_tile:
             waits[step] = immediate(
-                set().union(*(required(step, panel) for panel in range(panels)))
+                set().union(*(required(step, pane) for pane in range(panes)))
             )
         vector = []
-        for panel in range(panels):
+        for pane in range(panes):
             if step >= 0 and not per_tile:
-                vector.append(immediate(required(step, panel)))
-            for group in schedule.commits(index, panel):
+                vector.append(immediate(required(step, pane)))
+            for group in schedule.commits(index, pane):
                 committed.append(
                     tuple((step, cs.component, cs.index.value) for cs in group)
                 )
@@ -1064,7 +1064,7 @@ def test_peeled_wait_prefix_is_minimal(scheme, register_mask, extra):
     def emitted(index):
         if tc.commit_per_stage():
             return schedule.wait(index)
-        return tuple(schedule.wait(index, panel) for panel in range(tc.nm * tc.nn))
+        return tuple(schedule.wait(index, pane) for pane in range(tc.nm * tc.nn))
 
     differs = [x for x in range(depth * 2) if waits[x + 1] != steady(x + 1)]
     assert peeled == max(1, (max(differs) + 1) if differs else 0)
@@ -1079,27 +1079,27 @@ def test_peeled_wait_prefix_is_minimal(scheme, register_mask, extra):
 @pytest.mark.parametrize("nm", [1, 2, 3, 4])
 @pytest.mark.parametrize("middle", [False, True])
 def test_every_payload_tile_is_filled_exactly_once(nm, nn, middle):
-    """Copy ownership must be a total, injective map from slots to panels.
+    """Copy ownership must be a total, injective map from slots to panes.
 
-    A step needs `NM + NN` payload copies and has `NM * NN` panels. While a panel
+    A step needs `NM + NN` payload copies and has `NM * NN` panes. While a pane
     could copy only one slot, that held only for `NM, NN >= 2`; below it a copy
-    was assigned a panel index that does not exist and was silently never issued, so
+    was assigned a pane index that does not exist and was silently never issued, so
     the kernel read whichever stale value the ring still held.
     """
     tc = _Config(WaitCommitScheme.PER_OP, (3, 3, 3, 3), 0, shape=(nm, nn),
                  middle=middle)
     schedule = Schedule(tc, tc, tc.BLOCK_K)
     assert maybe_unwrap(
-        schedule.buffer_load_panels_valid
+        schedule.buffer_load_panes_valid
     ), "ownership is not a valid mapping"
     for component in COMPONENTS:
         operand = component.operand_index.value
         num_slots = nm if operand == A else nn
         loaded_slots = [
             slot
-            for panel in range(nm * nn)
+            for pane in range(nm * nn)
             for slot in (
-                schedule.buffer_load_slots(panel)[component.index()],
+                schedule.buffer_load_slots(pane)[component.index()],
             )
             if slot is not None
         ]
@@ -1113,10 +1113,10 @@ def test_every_payload_tile_is_filled_exactly_once(nm, nn, middle):
 
 
 @pytest.mark.parametrize("shape", [(2, 2), (2, 3), (3, 2), (2, 4), (4, 2)])
-def test_scale_fill_mid_moves_only_the_scale_buffer_load_panels(shape):
+def test_scale_fill_mid_moves_only_the_scale_buffer_load_panes(shape):
     """`SCALE_FILL_MID` is a copy-ownership knob and nothing else.
 
-    It must not disturb payload ownership, the DS-read panels, or the configured
+    It must not disturb payload ownership, the DS-read panes, or the configured
     DS-read region. It is also inert outside the guarded 2x2 split, which is easy to
     forget when reading a config that sets it on a rectangular tile.
     """
@@ -1128,28 +1128,26 @@ def test_scale_fill_mid_moves_only_the_scale_buffer_load_panels(shape):
     for component in (A_PAYLOAD, B_PAYLOAD):
         slots = range(nm if component.operand_index.value == A else nn)
         assert [
-            off_schedule.buffer_load_panel(CompSlot(component, t)) for t in slots
+            off_schedule.buffer_load_pane(CompSlot(component, t)) for t in slots
         ] == [
-            on_schedule.buffer_load_panel(CompSlot(component, t)) for t in slots
+            on_schedule.buffer_load_pane(CompSlot(component, t)) for t in slots
         ], component
     for component in COMPONENTS:
         operand, is_scale = component.operand_index.value, component.is_scale.value
         slots = range(nm if operand == A else nn)
-        assert [off_schedule.ds_read_panel(CompSlot(component, t)) for t in slots] == [
-            on_schedule.ds_read_panel(CompSlot(component, t)) for t in slots
+        assert [off_schedule.ds_read_pane(CompSlot(component, t)) for t in slots] == [
+            on_schedule.ds_read_pane(CompSlot(component, t)) for t in slots
         ], component
         assert off.ds_read_in_mfma(operand, is_scale) == on.ds_read_in_mfma(
             operand, is_scale
         )
 
-    scale_off = [
-        off_schedule.buffer_load_panel(CompSlot(A_SCALE, t)) for t in range(nm)
-    ]
-    scale_on = [on_schedule.buffer_load_panel(CompSlot(A_SCALE, t)) for t in range(nm)]
-    b_off = [off_schedule.buffer_load_panel(CompSlot(B_SCALE, t)) for t in range(nn)]
-    b_on = [on_schedule.buffer_load_panel(CompSlot(B_SCALE, t)) for t in range(nn)]
+    scale_off = [off_schedule.buffer_load_pane(CompSlot(A_SCALE, t)) for t in range(nm)]
+    scale_on = [on_schedule.buffer_load_pane(CompSlot(A_SCALE, t)) for t in range(nm)]
+    b_off = [off_schedule.buffer_load_pane(CompSlot(B_SCALE, t)) for t in range(nn)]
+    b_on = [on_schedule.buffer_load_pane(CompSlot(B_SCALE, t)) for t in range(nn)]
     if shape == (2, 2):
-        # The guarded case: A scale already owns the middle panels, so only B moves.
+        # The guarded case: A scale already owns the middle panes, so only B moves.
         assert scale_off == scale_on == [1, 2]
         assert b_off == [0, 3] and b_on == [1, 2]
     else:
@@ -1162,7 +1160,7 @@ def test_epilogue_groups_stop_adding_slack_after_a_drain_producer():
     K = (tc.minimum_num_k() + 3) * tc.BLOCK_K
     two, none = Schedule(tc, tc, K, 2), Schedule(tc, tc, K, 0)
     first, second = two.drain_step(0, 0), two.drain_step(0, 1)
-    # B's first N slot is DS-read in panel zero. Its depth-two producer moves past
+    # B's first N slot is DS-read in pane zero. Its depth-two producer moves past
     # the epilogue commit at drain iteration one; globally adding slack is unsafe.
     assert two.wait(first, 0) == none.wait(first, 0) + 2
     assert two.wait(second, 0) == none.wait(second, 0)

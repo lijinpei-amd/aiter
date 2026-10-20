@@ -84,7 +84,7 @@ from ._pipeline import (
     _take_reg_pairs,
 )
 from ._schedule import Schedule
-from ._types import Panel, TileSched, WeightGuHbmLayout
+from ._types import Pane, TileSched, WeightGuHbmLayout
 from ._validate import validate, validate_pipeline
 
 _TS_XCD_GROUP_M: gl.constexpr = gl.constexpr(int(TileSched.XCD_GROUP_M))
@@ -108,13 +108,13 @@ def _drain_last_fused(
     MFMAs whose operands are already in registers. The walk therefore needs only
     :func:`_maybe_block_dot` and the activation. The preconditions are asserted.
 
-    :meth:`Panel.linear_index` is N outer, so the visit order is
+    :meth:`Pane.linear_index` is N outer, so the visit order is
     ``(0,0), (1,0), (0,1), (1,1)`` and every gate-side accumulator is final before the
     first linear-side MFMA issues.
     The silu for M slot ``mi`` therefore lands *between* MFMA clusters and its
     exp2/rcp retire under them.
 
-    Returns the accumulator tuple with each ``ni == 0`` panel replaced by
+    Returns the accumulator tuple with each ``ni == 0`` pane replaced by
     ``silu(bias + acc)`` -- the same value :func:`_epilogue_one_tile` would have
     computed, which is why it takes ``GATE_PRE`` to skip recomputing it.
     """
@@ -128,10 +128,10 @@ def _drain_last_fused(
     acc = ()
     for ni in gl.static_range(NN):
         for mi in gl.static_range(NM):
-            panel_acc = _maybe_block_dot(
+            pane_acc = _maybe_block_dot(
                 _take_reg_pairs(regs.a_payload, regs.a_scale, mi * PF_FRAGS, PF_FRAGS),
                 _take_reg_pairs(regs.b_payload, regs.b_scale, ni * PF_FRAGS, PF_FRAGS),
-                regs.acc[Panel(mi, ni).linear_index(NM)],
+                regs.acc[Pane(mi, ni).linear_index(NM)],
                 PF_FRAGS,
                 func_cfg,
                 tc,
@@ -143,14 +143,14 @@ def _drain_last_fused(
                 # Gate side: everything up to and including the reciprocal, issued here
                 # so it overlaps the ni == 1 clusters still to come.
                 if require_constexpr(func_cfg.has_x_static_scale):
-                    panel_acc = panel_acc * x_static_scale
+                    pane_acc = pane_acc * x_static_scale
                 if require_constexpr(func_cfg.has_bias and func_cfg.epilogue < 2):
-                    panel_acc = panel_acc + bias_tiles[0][None, :]
+                    pane_acc = pane_acc + bias_tiles[0][None, :]
                 if require_constexpr(func_cfg.epilogue == 0):
-                    panel_acc = _swiglu_gate(
-                        panel_acc, act.alpha, act.limit, tc.ACT_FAST_RCP
+                    pane_acc = _swiglu_gate(
+                        pane_acc, act.alpha, act.limit, tc.ACT_FAST_RCP
                     )
-            acc = acc + (panel_acc,)
+            acc = acc + (pane_acc,)
     return acc
 
 
@@ -309,7 +309,7 @@ def _moe_gemm_body(
             _last_mfma(pc, regs),
         )
 
-    # Hoisted out of the panel loop: one scalar load, not one per tile.
+    # Hoisted out of the pane loop: one scalar load, not one per tile.
     if require_constexpr(func_cfg.has_x_static_scale):
         x_static_scale = gl.load(x_static_scale_hbm_ptr)
     else:

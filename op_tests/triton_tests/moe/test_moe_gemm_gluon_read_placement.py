@@ -248,8 +248,8 @@ def test_explicit_pipeline_controls(case, field, value):
 @pytest.mark.parametrize("scheme", list(WaitCommitScheme), ids=lambda scheme: scheme.name)
 @pytest.mark.parametrize("shape", [(4, 2), (2, 4)], ids=["4x2", "2x4"])
 def test_rectangular_read_schedule(case, pipeline, scheme, shape):
-    # A 4x2 walk reads only in panels 0..5. Panels 6 and 7 do not read, so delaying
-    # the non-relaxed read until the final panel would leave every actual read relaxed.
+    # A 4x2 walk reads only in panes 0..5. Panes 6 and 7 do not read, so delaying
+    # the non-relaxed read until the final pane would leave every actual read relaxed.
     config = _config(mask=15, pipeline=pipeline)
     config["WAIT_COMMIT_SCHEME"] = int(scheme)
     if shape == (4, 2):
@@ -257,7 +257,7 @@ def test_rectangular_read_schedule(case, pipeline, scheme, shape):
     else:
         config.update(SLOT_N=64, warps_per_cta=(2, 2))
     _assert_repeated_output(
-        case, config, f"{shape} panels, {scheme.name}, pipeline={pipeline.name}",
+        case, config, f"{shape} panes, {scheme.name}, pipeline={pipeline.name}",
         split=shape != (2, 4),
     )
 
