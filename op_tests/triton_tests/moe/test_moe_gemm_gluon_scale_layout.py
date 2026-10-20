@@ -32,6 +32,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     SCALE,
     ActivationSpec,
     ActKind,
+    Component,
     DtypeQuant,
     EpilogueMode,
 )
@@ -388,15 +389,19 @@ class _CopyRecorder:
         self.tc = tc
         self.layout = layout
         self.depths = {
-            component: tc.num_buffers(*component) for component in COMPONENTS
+            component: tc.num_buffers(
+                component.operand_index.value, component.is_scale.value
+            )
+            for component in COMPONENTS
         }
         self.ratios = {
-            (operand, is_scale): (
-                layout.scale_slot_k(operand) // maybe_unwrap(layout.scale_block_k)
-                if is_scale
+            component: (
+                layout.scale_slot_k(component.operand_index.value)
+                // maybe_unwrap(layout.scale_block_k)
+                if component.is_scale.value
                 else 1
             )
-            for operand, is_scale in COMPONENTS
+            for component in COMPONENTS
         }
         self.b_step = b_step
         self.addresses = defaultdict(list)
@@ -406,7 +411,7 @@ class _CopyRecorder:
 
     def _record(self, component, buffer, tile, pointer, offsets, soffset):
         assert offsets == tile
-        operand, is_scale = component
+        operand, is_scale = component.operand_index.value, component.is_scale.value
         history = self.addresses[component, tile]
         ratio = self.ratios[component]
         stage = len(history) * ratio
@@ -438,7 +443,7 @@ class _CopyRecorder:
         self, operand, VIA_LDS, buffer, tile, pointer, offsets, soffset
     ):
         value = self._record(
-            (operand, PAYLOAD), buffer, tile, pointer, offsets, soffset
+            Component(operand, PAYLOAD), buffer, tile, pointer, offsets, soffset
         )
         if not VIA_LDS:
             return (value,)
@@ -446,7 +451,7 @@ class _CopyRecorder:
     def buffer_load_scale(
         self, operand, VIA_LDS, buffer, tile, pointer, offsets, soffset
     ):
-        component = (operand, SCALE)
+        component = Component(operand, SCALE)
         value = self._record(component, buffer, tile, pointer, offsets, soffset)
         if not VIA_LDS:
             return (value,) * self._k_fragments(component)
@@ -472,15 +477,22 @@ class _CopyRecorder:
         SCALE_READ_IDX=None,
     ):
         assert k == 0
-        payload = self._read((operand, PAYLOAD), tile, buffer) if READ_PAYLOAD else None
+        payload = (
+            self._read(Component(operand, PAYLOAD), tile, buffer)
+            if READ_PAYLOAD
+            else None
+        )
         scale = (
-            self._read((operand, SCALE), tile, SCALE_READ_IDX) if READ_SCALE else None
+            self._read(Component(operand, SCALE), tile, SCALE_READ_IDX)
+            if READ_SCALE
+            else None
         )
         return payload, scale
 
     def ds_read_scale(self, operand, buffer, tile):
-        value = self._read((operand, SCALE), tile, buffer)
-        return (value,) * self._k_fragments((operand, SCALE))
+        component = Component(operand, SCALE)
+        value = self._read(component, tile, buffer)
+        return (value,) * self._k_fragments(component)
 
     def commit_buffer_load(self):
         pass
@@ -573,7 +585,7 @@ def _run_scalar_pipeline(monkeypatch, tc, layout, stages, fused):
     assert acc == (stages,) * 4
     assert set(sink.addresses) == set(product(COMPONENTS, range(2)))
     assert all(
-        len(history) == stages // (2 if component[1] else 1)
+        len(history) == stages // (2 if component.is_scale.value else 1)
         for (component, _tile), history in sink.addresses.items()
     )
     assert all(history == list(range(stages)) for history in sink.dot_tiles.values())

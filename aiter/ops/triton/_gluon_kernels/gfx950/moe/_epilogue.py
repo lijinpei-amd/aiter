@@ -19,7 +19,7 @@ from ._lang import MX_GROUP_CE as MX_GROUP
 from ._lang import optional as _opt
 from ._lang import require_constexpr
 from ._quant import mxfp4_quant_gluon
-from ._types import DtypeQuant, WeightGuHbmLayout, _panel_index
+from ._types import DtypeQuant, Panel, WeightGuHbmLayout
 
 _DQ_MXFP4: gl.constexpr = gl.constexpr(int(DtypeQuant.MXFP4))
 _WEIGHT_GU_SPLIT: gl.constexpr = gl.constexpr(int(WeightGuHbmLayout.SPLIT))
@@ -682,7 +682,7 @@ def _epilogue_store(
         # one store flushes the lot.
         for mi in gl.static_range(NM):
             _epilogue_one_tile(
-                acc[_panel_index(mi, 0, NM, NN)],
+                acc[Panel(mi, 0).linear_index(NM)],
                 mi,
                 0,
                 bias_tiles,
@@ -705,7 +705,7 @@ def _epilogue_store(
                 layout,
                 qp_lds_ptr,
                 qs_lds_ptr,
-                lin=acc[_panel_index(mi, 1, NM, NN)],
+                lin=acc[Panel(mi, 1).linear_index(NM)],
                 STAGE_ROW=mi * SLOT_M,
                 GATE_PRE=GATE_PRE,
             )
@@ -735,7 +735,7 @@ def _epilogue_store(
                     block_id, pid_n, M_e, func_cfg, tuning_cfg, layout,
                 )
             _epilogue_one_tile(
-                acc[_panel_index(k // NN, k % NN, NM, NN)],
+                acc[Panel(k // NN, k % NN).linear_index(NM)],
                 k // NN, k % NN,
                 bias_tiles, gamma_tiles, gamma_lds_ptr, bias_hbm_ptr, gammas_hbm_ptr,
                 y_hbm_ptr, y_stride_m, y_stride_n, ys_hbm_ptr, ys_stride_m, ys_stride_n,
@@ -757,11 +757,11 @@ def _epilogue_store(
     else:
         for mi in gl.static_range(NM):
             for ni in gl.static_range(NN):
-                # acc is stored in panel-traversal order, which _panel_index defines;
+                # acc is stored in panel-traversal order, which Panel.linear_index defines;
                 # the store loop is free to walk the grid however it likes as long as
                 # it indexes through the same map.
                 _epilogue_one_tile(
-                    acc[_panel_index(mi, ni, NM, NN)],
+                    acc[Panel(mi, ni).linear_index(NM)],
                     mi,
                     ni,
                     bias_tiles,

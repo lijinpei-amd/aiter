@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Dtype / quant-scheme enums, the LDS budget, panel-traversal indexing and the
-host->device NamedTuples of the gfx950 Gluon MoE grouped GEMMs.
+"""Dtype / quant-scheme enums, the LDS budget, the component, slot and panel
+aggregates and the host->device NamedTuples of the gfx950 Gluon MoE grouped GEMMs.
 """
 
 from enum import IntEnum, IntFlag
@@ -10,6 +10,7 @@ from typing import NamedTuple
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+from triton.language.core import _aggregate as aggregate
 
 from ._lang import (
     DotKind,
@@ -23,6 +24,7 @@ from ._lang import (
     dq_mx_format,
     dq_pack_divisor,
     dq_uses_mfma_scaled,
+    strip_annotate,
 )
 from ._lang import (
     const as _c,
@@ -44,6 +46,8 @@ __all__ = [
     "ActKind",
     "ActivationSpec",
     "B",
+    "CompSlot",
+    "Component",
     "DSReadOperand",
     "DotKind",
     "DtypeQuant",
@@ -51,6 +55,7 @@ __all__ = [
     "FuncSpec",
     "NonQuantExpertTensor",
     "NonQuantTokenTensor",
+    "Panel",
     "QuantExpertTensor",
     "QuantTokenTensor",
     "ResultTensor",
@@ -62,7 +67,6 @@ __all__ = [
     "WaitCommitScheme",
     "WarpPipeline",
     "WeightGuHbmLayout",
-    "_panel_index",
     "dq_has_scale",
     "dq_mx_format",
     "dq_pack_divisor",
@@ -75,14 +79,143 @@ B = 1
 PAYLOAD = False
 SCALE = True
 
-A_PAYLOAD = (A, PAYLOAD)
-A_SCALE = (A, SCALE)
-B_PAYLOAD = (B, PAYLOAD)
-B_SCALE = (B, SCALE)
-
 OPERANDS = (A, B)
-# Canonical component order. The live schedule also uses this as its copy issue
-# order, so changing it requires updating PER_OP wait-count expectations.
+
+
+@aggregate
+@strip_annotate
+class Component:
+    """One of an operand's payload and its scale. Equal by value, so it keys dicts
+    and sets."""
+
+    #: ``A`` or ``B``.
+    operand_index: gl.constexpr
+    #: ``SCALE`` for the operand's scale, ``PAYLOAD`` for its payload.
+    is_scale: gl.constexpr
+
+    @gluon.constexpr_function
+    def __init__(self, operand_index, is_scale):
+        assert operand_index in OPERANDS, f"operand {operand_index} is not A or B"
+        self.operand_index = gl.constexpr(operand_index)
+        self.is_scale = gl.constexpr(bool(is_scale))
+
+    @gluon.constexpr_function
+    def index(self) -> int:
+        """The component index, this component's position in ``COMPONENTS``."""
+        return 2 * self.operand_index.value + int(self.is_scale.value)
+
+    @gluon.constexpr_function
+    def __eq__(self, other):
+        return type(other) is type(self) and other.index() == self.index()
+
+    @gluon.constexpr_function
+    def __hash__(self):
+        return self.index()
+
+    @gluon.constexpr_function
+    def __repr__(self):
+        return f"Component({self.operand_index.value}, {self.is_scale.value})"
+
+    @gluon.constexpr_function
+    def __deepcopy__(self, memo):
+        # A kernel deep-copies the globals its constexpr functions read, COMPONENTS
+        # among them, to check them again at every launch. A component is immutable,
+        # and its constructor needs arguments the copy protocol does not pass.
+        return self
+
+
+@aggregate
+@strip_annotate
+class CompSlot:
+    """One slot of one component: what one copy fetches and one DS read takes."""
+
+    component: Component
+    #: The slot, in ``[0, num_slots(component.operand_index))``.
+    index: gl.constexpr
+
+    @gluon.constexpr_function
+    def __init__(self, component, index):
+        self.component = component
+        self.index = gl.constexpr(index)
+
+    @gluon.constexpr_function
+    def __eq__(self, other):
+        return (
+            type(other) is type(self)
+            and other.component == self.component
+            and other.index.value == self.index.value
+        )
+
+    @gluon.constexpr_function
+    def __hash__(self):
+        return hash((self.component.index(), self.index.value))
+
+    @gluon.constexpr_function
+    def __repr__(self):
+        return f"CompSlot({self.component!r}, {self.index.value})"
+
+
+@aggregate
+@strip_annotate
+class Panel:
+    """The ``SLOT_M x SLOT_N`` part of the tile that A's slot ``m_index`` and B's slot
+    ``n_index`` multiply into."""
+
+    #: A's slot, in ``[0, num_m_slots)``.
+    m_index: gl.constexpr
+    #: B's slot, in ``[0, num_n_slots)``.
+    n_index: gl.constexpr
+
+    @gluon.constexpr_function
+    def __init__(self, m_index, n_index):
+        self.m_index = gl.constexpr(m_index)
+        self.n_index = gl.constexpr(n_index)
+
+    @gluon.constexpr_function
+    def linear_index(self, num_m_slots) -> int:
+        """The panel index, this panel's position in the N-outer, M-inner traversal.
+
+        This one number is the panel's place in three orderings at once -- the
+        visitation order of the panel loop, the index of its accumulator in the
+        carried tuple, and (under the even schedule) the position of its fill in
+        ``_schedule._payload_buffer_load_order``. They have to agree, which is why
+        they all come from here.
+
+        Down the M axis first, so with two slots on each axis the four panels are
+        visited ``(0,0), (1,0), (0,1), (1,1)`` -- the region order of the reference
+        kernel in gfx950-gluon-tutorials .../a16w16/v8_sliceMN, whose four DOTs are
+        ``(A_top, B_left), (A_bot, B_left), (A_top, B_right), (A_bot, B_right)``.
+
+        With one slot on either axis this is the identity on the old row-major
+        order, so only a genuinely 2-D slot split sees any change.
+        """
+        return self.n_index.value * num_m_slots + self.m_index.value
+
+    @gluon.constexpr_function
+    def __eq__(self, other):
+        return (
+            type(other) is type(self)
+            and other.m_index.value == self.m_index.value
+            and other.n_index.value == self.n_index.value
+        )
+
+    @gluon.constexpr_function
+    def __hash__(self):
+        return hash((self.m_index.value, self.n_index.value))
+
+    @gluon.constexpr_function
+    def __repr__(self):
+        return f"Panel({self.m_index.value}, {self.n_index.value})"
+
+
+A_PAYLOAD = Component(A, PAYLOAD)
+A_SCALE = Component(A, SCALE)
+B_PAYLOAD = Component(B, PAYLOAD)
+B_SCALE = Component(B, SCALE)
+
+# Canonical component order, the one Component.index counts in. The live schedule
+# also uses it as its copy issue order, so changing it requires updating PER_OP
+# wait-count expectations.
 COMPONENTS = (A_PAYLOAD, A_SCALE, B_PAYLOAD, B_SCALE)
 
 #: gfx950 LDS capacity, mirrors utils/_triton/arch_info.py::_LDS_CAP_BYTES["gfx950"].
@@ -95,32 +228,6 @@ LDS_CAP_BYTES = 163840
 LDS_EPILOGUE_RESERVE_BYTES = 4096
 #: What the operand buffers may actually use.
 LDS_USABLE_BYTES = LDS_CAP_BYTES - LDS_EPILOGUE_RESERVE_BYTES
-
-
-@gluon.constexpr_function
-def _panel_index(
-    m_slot_idx,
-    n_slot_idx,
-    num_m_slots,
-    num_n_slots,
-):
-    """Position of one panel, an M/N slot pair, in the N-outer, M-inner traversal.
-
-    This one number is the panel's place in three orderings at once -- the visitation
-    order of the panel loop, the index of its accumulator in the carried tuple, and
-    (under the even schedule) the position of its fill in
-    ``_schedule._payload_buffer_load_order``. They have to agree, which is why they all
-    come from here.
-
-    Down the M axis first, so with two slots on each axis the four panels are visited
-    ``(0,0), (1,0), (0,1), (1,1)`` -- the region order of the reference kernel in
-    gfx950-gluon-tutorials .../a16w16/v8_sliceMN, whose four DOTs are
-    ``(A_top, B_left), (A_bot, B_left), (A_top, B_right), (A_bot, B_right)``.
-
-    With one slot on either axis this is the identity on the old row-major order, so
-    only a genuinely 2-D slot split sees any change.
-    """
-    return n_slot_idx * num_m_slots + m_slot_idx
 
 
 class ActKind(IntEnum):

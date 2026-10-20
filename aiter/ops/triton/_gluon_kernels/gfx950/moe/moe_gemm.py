@@ -84,7 +84,7 @@ from ._pipeline import (
     _take_reg_pairs,
 )
 from ._schedule import Schedule
-from ._types import TileSched, WeightGuHbmLayout, _panel_index
+from ._types import Panel, TileSched, WeightGuHbmLayout
 from ._validate import validate, validate_pipeline
 
 _TS_XCD_GROUP_M: gl.constexpr = gl.constexpr(int(TileSched.XCD_GROUP_M))
@@ -108,7 +108,7 @@ def _drain_last_fused(
     MFMAs whose operands are already in registers. The walk therefore needs only
     :func:`_maybe_block_dot` and the activation. The preconditions are asserted.
 
-    :func:`_panel_index` is N outer, so the visit order is
+    :meth:`Panel.linear_index` is N outer, so the visit order is
     ``(0,0), (1,0), (0,1), (1,1)`` and every gate-side accumulator is final before the
     first linear-side MFMA issues.
     The silu for M slot ``mi`` therefore lands *between* MFMA clusters and its
@@ -131,7 +131,7 @@ def _drain_last_fused(
             panel_acc = _maybe_block_dot(
                 _take_reg_pairs(regs.a_payload, regs.a_scale, mi * PF_FRAGS, PF_FRAGS),
                 _take_reg_pairs(regs.b_payload, regs.b_scale, ni * PF_FRAGS, PF_FRAGS),
-                regs.acc[_panel_index(mi, ni, NM, NN)],
+                regs.acc[Panel(mi, ni).linear_index(NM)],
                 PF_FRAGS,
                 func_cfg,
                 tc,

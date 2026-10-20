@@ -43,6 +43,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._frozen import (
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import KernelLayout
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
+    B_SCALE,
     LDS_USABLE_BYTES,
     ActivationSpec,
     ActKind,
@@ -364,7 +365,7 @@ def _probe_b_scale_via_lds(cfg_items: tuple, dq_a, dq_b) -> bool:
     validate() reports it."""
     try:
         tc = _probe_tuning_config(dict(cfg_items), dq_a, dq_b)
-        return bool(_cval(KernelLayout(tc).component_via_lds((1, True))))
+        return bool(_cval(KernelLayout(tc).component_via_lds(B_SCALE)))
     except AssertionError:
         return False
 

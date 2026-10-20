@@ -41,8 +41,9 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import (  # noqa: E402
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (  # noqa: E402
     COMPONENTS,
+    CompSlot,
+    Panel,
     WaitCommitScheme,
-    _panel_index,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import (  # noqa: E402
     validate,
@@ -217,20 +218,21 @@ def dump_case(name, cfg, dq_a, dq_b, K, out):
         if not schedule.component_present(c):
             out(f"  {CNAME[c]} absent")
             continue
-        num_slots = nm if c[0] == 0 else nn
+        op = c.operand_index.value
+        num_slots = nm if op == 0 else nn
         D, R = schedule.num_buffers(c), schedule.steps_per_buffer(c)
         F = schedule.load_to_mfma_distance(c)
         out(f"  {CNAME[c]} D={D} R={R} L={(D - 1) * R + 1} F={F} "
             f"via_lds={bool(layout.component_via_lds(c))} pphase={(1 - F) % R} "
-            f"nonk_ratio={layout.scale_slot_nonk(c[0]) // layout.slot_nonk(c[0])} "
-            f"buffer_load_slots={tuple(schedule.buffer_load_panel(c, t) for t in range(num_slots))} "
-            f"ds_read_slots={tuple(schedule.ds_read_panel(c, t) for t in range(num_slots))} "
-            f"ds_read_in_mfma={tuple(schedule.ds_read_in_mfma(c, t) for t in range(num_slots))}")
+            f"nonk_ratio={layout.scale_slot_nonk(op) // layout.slot_nonk(op)} "
+            f"buffer_load_slots={tuple(schedule.buffer_load_panel(CompSlot(c, t)) for t in range(num_slots))} "
+            f"ds_read_slots={tuple(schedule.ds_read_panel(CompSlot(c, t)) for t in range(num_slots))} "
+            f"ds_read_in_mfma={tuple(schedule.ds_read_in_mfma(CompSlot(c, t)) for t in range(num_slots))}")
 
     # ownership and DS reads, per panel
     for ni in range(nn):
         for mi in range(nm):
-            s = _panel_index(mi, ni, nm, nn)
+            s = Panel(mi, ni).linear_index(nm)
             ds_read = tuple(schedule.ds_read_slot(s, c) for c in COMPONENTS)
             out(f"  slot{s}(mi={mi},ni={ni}) owned={schedule.buffer_load_slots(s)} "
                 f"ds_read_non_k_slots={ds_read}")
@@ -247,7 +249,10 @@ def dump_case(name, cfg, dq_a, dq_b, K, out):
         out(f"    active={act} loads={loads} ds_reads={ds_reads}")
         out(f"    issued={tuple(schedule.issued(step, s) for s in range(panels))}")
         commits = tuple(
-            tuple(tuple((CNAME[c], t) for c, t in g) for g in schedule.commits(step, s))
+            tuple(
+                tuple((CNAME[cs.component], cs.index.value) for cs in g)
+                for g in schedule.commits(step, s)
+            )
             for s in range(panels)
         )
         out(f"    commits={commits}")
@@ -261,7 +266,7 @@ def dump_case(name, cfg, dq_a, dq_b, K, out):
 
     # the soffset stream
     for c in present:
-        if c[1]:
+        if c.is_scale.value:
             unroll = maybe_unwrap(schedule.unroll)
             soff = [schedule.scale_soff_steps(c, o) for o in range(unroll)]
             out(f"  soff {CNAME[c]} {soff}")

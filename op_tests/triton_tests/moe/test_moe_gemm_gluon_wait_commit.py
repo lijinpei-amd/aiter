@@ -23,6 +23,8 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     SCALE,
     A,
     B,
+    Component,
+    CompSlot,
     WaitCommitScheme,
 )
 
@@ -74,7 +76,7 @@ class _ScheduleConfig:
         return (self.nm, self.nn)[idx]
 
     def component_via_lds(self, component):
-        operand, is_scale = component
+        operand, is_scale = component.operand_index.value, component.is_scale.value
         return (self.scale_async if is_scale else self.payload_async)[operand]
 
     def component_in_reg(self, component):
@@ -171,38 +173,39 @@ def _reference_panels(tc):
     # State the copy order independently of production's panel/group helpers.
     if (tc.nm, tc.nn) == (2, 2):
         payloads = [
-            (B_PAYLOAD, 0),
-            (A_PAYLOAD, 0),
-            (A_PAYLOAD, 1),
-            (B_PAYLOAD, 1),
+            CompSlot(B_PAYLOAD, 0),
+            CompSlot(A_PAYLOAD, 0),
+            CompSlot(A_PAYLOAD, 1),
+            CompSlot(B_PAYLOAD, 1),
         ]
     else:
         payloads = []
         for tile in range(max(tc.nm, tc.nn)):
             if tile < tc.nm:
-                payloads.append((A_PAYLOAD, tile))
+                payloads.append(CompSlot(A_PAYLOAD, tile))
             if tile < tc.nn:
-                payloads.append((B_PAYLOAD, tile))
+                payloads.append(CompSlot(B_PAYLOAD, tile))
     copies = [[] for _ in range(tc.nm * tc.nn)]
     reads = [set() for _ in copies]
-    for panel, (component, tile) in enumerate(payloads):
-        operand, is_scale = component
-        assert not is_scale
-        copies[panel].append((component, tile))
+    for panel, payload in enumerate(payloads):
+        component, tile = payload.component, payload.index.value
+        operand = component.operand_index.value
+        assert not component.is_scale.value
+        copies[panel].append(payload)
         if tc.component_via_lds(component):
-            reads[panel].add((component, tile))
-        scale_component = (operand, SCALE)
+            reads[panel].add(payload)
+        scale_component = Component(operand, SCALE)
         if not (
             tc.has_scale(operand) and tc.component_via_lds(scale_component)
         ):
             continue
         owner = tile - tile % tc.a_scale_ratio if operand == A else tile
         if tile == owner:
-            reads[panel].add((scale_component, owner))
+            reads[panel].add(CompSlot(scale_component, owner))
             scale_slot = (
                 1 + tile if tc.SCALE_FILL_MID and (tc.nm, tc.nn) == (2, 2) else panel
             )
-            copies[scale_slot].append((scale_component, tile))
+            copies[scale_slot].append(CompSlot(scale_component, tile))
     # Within a panel, components issue in A, A-scale, B, B-scale order.
     component_rank = {
         A_PAYLOAD: 0,
@@ -210,14 +213,16 @@ def _reference_panels(tc):
         B_PAYLOAD: 2,
         B_SCALE: 3,
     }
-    ordered = [tuple(sorted(panel, key=lambda copy: component_rank[copy[0]])) for panel in copies]
+    ordered = [
+        tuple(sorted(panel, key=lambda copy: component_rank[copy.component]))
+        for panel in copies
+    ]
     return ordered, reads
 
 
 def _reference_groups(tc, copies):
     def is_async(copy):
-        component, _ = copy
-        return tc.component_via_lds(component)
+        return tc.component_via_lds(copy.component)
 
     asynchronous = [tuple(copy for copy in panel if is_async(copy)) for panel in copies]
     if tc.WAIT_COMMIT_SCHEME == WaitCommitScheme.PER_OP:
@@ -232,7 +237,7 @@ def _reference_groups(tc, copies):
 class _Descriptor:
     def __init__(self, component, tc):
         self.component = component
-        operand, _ = component
+        operand = component.operand_index.value
         self.ratio = tc.a_scale_ratio if component == A_SCALE else 1
         self.tiles = (tc.nm if operand == A else tc.nn) // self.ratio
 
@@ -262,7 +267,7 @@ class _LDSRecorder:
             )
         else:
             # A direct-register load is issued but owns no LDS async-copy group.
-            self.copies[self.panel].append(((operand, PAYLOAD), tile))
+            self.copies[self.panel].append(CompSlot(Component(operand, PAYLOAD), tile))
             return (0,)
 
     def buffer_load_scale(self, operand, VIA_LDS, *args, **kwargs):
@@ -277,8 +282,8 @@ class _LDSRecorder:
     def copy(self, descriptor, base, offsets, modifier, soffset):
         stage, component, tile = descriptor
         assert stage == 2, "The emitter must index the requested LDS stage."
-        self.copies[self.panel].append((component, tile))
-        self.pending.append((component, tile))
+        self.copies[self.panel].append(CompSlot(component, tile))
+        self.pending.append(CompSlot(component, tile))
 
     def commit_buffer_load(self):
         self.groups[self.panel].append(tuple(self.pending))
@@ -411,7 +416,7 @@ def test_emitted_groups_and_waits_retire_required_copies(
         nominal = tuple(
             slot
             if (
-                not component[1]
+                not component.is_scale.value
                 or slot is None
                 or tc.component_via_lds(component)
             )
@@ -420,9 +425,8 @@ def test_emitted_groups_and_waits_retire_required_copies(
                 COMPONENTS, schedule.buffer_load_slots(panel)
             )
         )
-        assert nominal == tuple(
-            dict(operations).get(component) for component in COMPONENTS
-        )
+        slot_of = {copy.component: copy.index.value for copy in operations}
+        assert nominal == tuple(slot_of.get(component) for component in COMPONENTS)
 
     # The wait plan is not re-derived here. It is covered end to end by two
     # independent FIFO oracles that model every pipeline region rather than a

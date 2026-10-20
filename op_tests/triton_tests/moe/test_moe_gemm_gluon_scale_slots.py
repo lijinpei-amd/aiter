@@ -11,7 +11,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._frozen import _validate_frozen
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import maybe_unwrap
 from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import KernelLayout
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import Schedule
-from aiter.ops.triton._gluon_kernels.gfx950.moe._types import DtypeQuant
+from aiter.ops.triton._gluon_kernels.gfx950.moe._types import Component, DtypeQuant
 from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import validate
 from aiter.ops.triton.moe import moe_op_gemm_gluon as host
 from op_tests.triton_tests.moe.test_moe_gemm_gluon_scale_layout import _config
@@ -175,7 +175,7 @@ def test_scale_k_step_ratio_sets_buffer_span_and_unroll(
     for operand, depth in enumerate((2, 3)):
         live_span = (depth - 1) * ratio + 1
         distance = live_span - 1 if register_scales else live_span
-        assert schedule.load_to_mfma_distance((operand, True)) == distance
+        assert schedule.load_to_mfma_distance(Component(operand, True)) == distance
         assert layout.scale_slot_k(operand) == scale_k
     period = math.lcm(3, 2 * ratio, 3 * ratio)
     assert maybe_unwrap(schedule.unroll) == period

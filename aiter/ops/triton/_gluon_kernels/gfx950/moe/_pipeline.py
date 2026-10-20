@@ -17,12 +17,16 @@ from ._layout import KernelLayout
 from ._lds import LDSManager
 from ._mfma import _maybe_block_dot
 from ._schedule import Schedule
-from ._types import A_PAYLOAD, A_SCALE, B_PAYLOAD, B_SCALE, _panel_index
+from ._types import (
+    A_PAYLOAD,
+    A_SCALE,
+    B_PAYLOAD,
+    B_SCALE,
+    Component,
+    CompSlot,
+    Panel,
+)
 
-_A_PAYLOAD: gl.constexpr = gl.constexpr(A_PAYLOAD)
-_A_SCALE: gl.constexpr = gl.constexpr(A_SCALE)
-_B_PAYLOAD: gl.constexpr = gl.constexpr(B_PAYLOAD)
-_B_SCALE: gl.constexpr = gl.constexpr(B_SCALE)
 _SG_MFMA: gl.constexpr = gl.constexpr(8)
 _SG_DS_READ: gl.constexpr = gl.constexpr(256)
 _SG_VMEM: gl.constexpr = gl.constexpr(16)
@@ -154,7 +158,7 @@ def _index(
     sched,
     step,
     STEP: gl.constexpr,
-    component: gl.constexpr,
+    component,
     BUFFER_LOAD: gl.constexpr,
 ):
     static: gl.constexpr = sched.static_lds_index(STEP, component, BUFFER_LOAD)
@@ -197,15 +201,15 @@ def _rotate(queue, SHIFT: gl.constexpr):
 @gluon.jit
 def _rotate_buffers(buffers, sched, layout, PHASE: gl.constexpr = 0):
     mk: gl.constexpr = layout.num_k_slots
-    if require_constexpr(sched.ds_reads_at_phase(_A_SCALE, PHASE + 1)):
+    if require_constexpr(sched.ds_reads_at_phase(A_SCALE, PHASE + 1)):
         a_scale = _rotate(
-            buffers[2], layout.num_m_slots * mk * sched.steps_per_buffer(_A_SCALE)
+            buffers[2], layout.num_m_slots * mk * sched.steps_per_buffer(A_SCALE)
         )
     else:
         a_scale = buffers[2]
-    if require_constexpr(sched.ds_reads_at_phase(_B_SCALE, PHASE + 1)):
+    if require_constexpr(sched.ds_reads_at_phase(B_SCALE, PHASE + 1)):
         b_scale = _rotate(
-            buffers[3], layout.num_n_slots * mk * sched.steps_per_buffer(_B_SCALE)
+            buffers[3], layout.num_n_slots * mk * sched.steps_per_buffer(B_SCALE)
         )
     else:
         b_scale = buffers[3]
@@ -223,7 +227,7 @@ def _init_buffers(pc):
     layout: gl.constexpr = pc.layout
     sched: gl.constexpr = pc.schedule
     a, b, a_scale, b_scale = (), (), (), ()
-    if require_constexpr(layout.component_in_reg(_A_PAYLOAD)):
+    if require_constexpr(layout.component_in_reg(A_PAYLOAD)):
         for _ in gl.static_range(
             tc.num_buffers(0) * layout.num_m_slots * layout.num_k_slots
         ):
@@ -234,7 +238,7 @@ def _init_buffers(pc):
                     layout.fragment_layout(0, False),
                 ),
             )
-    if require_constexpr(layout.component_in_reg(_B_PAYLOAD)):
+    if require_constexpr(layout.component_in_reg(B_PAYLOAD)):
         for _ in gl.static_range(
             tc.num_buffers(1) * layout.num_n_slots * layout.num_k_slots
         ):
@@ -246,13 +250,13 @@ def _init_buffers(pc):
                 ),
             )
     if require_constexpr(
-        sched.component_present(_A_SCALE) and layout.component_in_reg(_A_SCALE)
+        sched.component_present(A_SCALE) and layout.component_in_reg(A_SCALE)
     ):
         for _ in gl.static_range(
             tc.num_buffers(0, True)
             * layout.num_m_slots
             * layout.num_k_slots
-            * sched.steps_per_buffer(_A_SCALE)
+            * sched.steps_per_buffer(A_SCALE)
         ):
             a_scale += (
                 gl.zeros(
@@ -262,13 +266,13 @@ def _init_buffers(pc):
                 ),
             )
     if require_constexpr(
-        sched.component_present(_B_SCALE) and layout.component_in_reg(_B_SCALE)
+        sched.component_present(B_SCALE) and layout.component_in_reg(B_SCALE)
     ):
         for _ in gl.static_range(
             tc.num_buffers(1, True)
             * layout.num_n_slots
             * layout.num_k_slots
-            * sched.steps_per_buffer(_B_SCALE)
+            * sched.steps_per_buffer(B_SCALE)
         ):
             b_scale += (
                 gl.zeros(
@@ -295,7 +299,7 @@ def _buffer_load_panel(
     sched: gl.constexpr = pc.schedule
     nm: gl.constexpr = layout.num_m_slots
     nn: gl.constexpr = layout.num_n_slots
-    ops: gl.constexpr = sched.issued(STEP, _panel_index(mi, ni, nm, nn))
+    ops: gl.constexpr = sched.issued(STEP, Panel(mi, ni).linear_index(nm))
     mk: gl.constexpr = layout.num_k_slots
     offset_step: gl.constexpr = sched.ki(STEP) if sched.soff_unroll(STEP) else 0
     a_soff: gl.constexpr = (
@@ -309,22 +313,22 @@ def _buffer_load_panel(
         * (pc.func_cfg.operand_elem_ty(1).primitive_bitwidth // 8)
     )
     as_soff: gl.constexpr = (
-        sched.scale_soff_steps(_A_SCALE, offset_step) * pc.s_step * pc.a_scale_stride_k
+        sched.scale_soff_steps(A_SCALE, offset_step) * pc.s_step * pc.a_scale_stride_k
         if offset_step and pc.func_cfg.has_scale(0)
         else 0
     )
     bs_soff: gl.constexpr = (
-        sched.scale_soff_steps(_B_SCALE, offset_step) * pc.s_step * pc.b_scale_stride_k
+        sched.scale_soff_steps(B_SCALE, offset_step) * pc.s_step * pc.b_scale_stride_k
         if offset_step and pc.func_cfg.has_scale(1)
         else 0
     )
     a, b, a_scale, b_scale = buffers
     if require_constexpr(ops[0] is not None):
-        if require_constexpr(layout.component_via_lds(_A_PAYLOAD)):
+        if require_constexpr(layout.component_via_lds(A_PAYLOAD)):
             pc.lds_ptrs.buffer_load_payload(
                 0,
                 True,
-                _index(sched, step, STEP, _A_PAYLOAD, True),
+                _index(sched, step, STEP, A_PAYLOAD, True),
                 ops[0],
                 ptrs.a_hbm_ptr,
                 pc.a_hbm_offs[ops[0]],
@@ -345,14 +349,14 @@ def _buffer_load_panel(
             a = _replace_fragments(
                 a,
                 fragments,
-                (sched.register_index(STEP, _A_PAYLOAD, True) * nm + ops[0]) * mk,
+                (sched.register_index(STEP, A_PAYLOAD, True) * nm + ops[0]) * mk,
             )
     if require_constexpr(ops[1] is not None):
-        if require_constexpr(layout.component_via_lds(_A_SCALE)):
+        if require_constexpr(layout.component_via_lds(A_SCALE)):
             pc.lds_ptrs.buffer_load_scale(
                 0,
                 True,
-                _index(sched, step, STEP, _A_SCALE, True),
+                _index(sched, step, STEP, A_SCALE, True),
                 ops[1],
                 ptrs.a_scale_hbm_ptr,
                 pc.a_scale_hbm_offs[ops[1]],
@@ -373,12 +377,12 @@ def _buffer_load_panel(
             a_scale = _replace_fragments(
                 a_scale,
                 fragments,
-                (sched.register_index(STEP, _A_SCALE, True) * nm + ops[1])
+                (sched.register_index(STEP, A_SCALE, True) * nm + ops[1])
                 * mk
-                * sched.steps_per_buffer(_A_SCALE),
+                * sched.steps_per_buffer(A_SCALE),
             )
     if require_constexpr(ops[2] is not None):
-        if require_constexpr(layout.component_in_reg(_B_PAYLOAD)):
+        if require_constexpr(layout.component_in_reg(B_PAYLOAD)):
             fragments = pc.lds_ptrs.buffer_load_payload(
                 1,
                 False,
@@ -391,13 +395,13 @@ def _buffer_load_panel(
             b = _replace_fragments(
                 b,
                 fragments,
-                (sched.register_index(STEP, _B_PAYLOAD, True) * nn + ops[2]) * mk,
+                (sched.register_index(STEP, B_PAYLOAD, True) * nn + ops[2]) * mk,
             )
         else:
             pc.lds_ptrs.buffer_load_payload(
                 1,
                 True,
-                _index(sched, step, STEP, _B_PAYLOAD, True),
+                _index(sched, step, STEP, B_PAYLOAD, True),
                 ops[2],
                 ptrs.b_hbm_ptr,
                 pc.b_hbm_offs[ops[2]],
@@ -406,11 +410,11 @@ def _buffer_load_panel(
             if require_constexpr(sched.commit_per_copy):
                 pc.lds_ptrs.commit_buffer_load()
     if require_constexpr(ops[3] is not None):
-        if require_constexpr(layout.component_via_lds(_B_SCALE)):
+        if require_constexpr(layout.component_via_lds(B_SCALE)):
             pc.lds_ptrs.buffer_load_scale(
                 1,
                 True,
-                _index(sched, step, STEP, _B_SCALE, True),
+                _index(sched, step, STEP, B_SCALE, True),
                 ops[3],
                 ptrs.b_scale_hbm_ptr,
                 pc.b_scale_hbm_offs[ops[3]],
@@ -431,9 +435,9 @@ def _buffer_load_panel(
             b_scale = _replace_fragments(
                 b_scale,
                 fragments,
-                (sched.register_index(STEP, _B_SCALE, True) * nn + ops[3])
+                (sched.register_index(STEP, B_SCALE, True) * nn + ops[3])
                 * mk
-                * sched.steps_per_buffer(_B_SCALE),
+                * sched.steps_per_buffer(B_SCALE),
             )
     if require_constexpr(
         sched.commit_per_panel
@@ -460,23 +464,23 @@ def _advance(pc, ptrs, STEP: gl.constexpr):
     soff: gl.constexpr = sched.soff_unroll(STEP)
     steps: gl.constexpr = sched.unroll if soff else 1
     if require_constexpr(not soff or sched.ki(STEP) + 1 == sched.unroll):
-        if require_constexpr(sched.loads(STEP, _A_PAYLOAD)):
+        if require_constexpr(sched.loads(STEP, A_PAYLOAD)):
             a += steps * pc.a_step
-        if require_constexpr(sched.loads(STEP, _B_PAYLOAD)):
+        if require_constexpr(sched.loads(STEP, B_PAYLOAD)):
             b += steps * pc.b_step
         if require_constexpr(
-            sched.active(STEP, _A_SCALE) and (soff or sched.loads(STEP, _A_SCALE))
+            sched.active(STEP, A_SCALE) and (soff or sched.loads(STEP, A_SCALE))
         ):
             a_scale += (
-                (steps if soff else sched.steps_per_buffer(_A_SCALE))
+                (steps if soff else sched.steps_per_buffer(A_SCALE))
                 * pc.s_step
                 * pc.a_scale_stride_k
             )
         if require_constexpr(
-            sched.active(STEP, _B_SCALE) and (soff or sched.loads(STEP, _B_SCALE))
+            sched.active(STEP, B_SCALE) and (soff or sched.loads(STEP, B_SCALE))
         ):
             b_scale += (
-                (steps if soff else sched.steps_per_buffer(_B_SCALE))
+                (steps if soff else sched.steps_per_buffer(B_SCALE))
                 * pc.s_step
                 * pc.b_scale_stride_k
             )
@@ -494,7 +498,7 @@ def _ds_read_payload(
 ):
     layout: gl.constexpr = pc.layout
     sched: gl.constexpr = pc.schedule
-    component: gl.constexpr = (operand, False)
+    component: gl.constexpr = Component(operand, False)
     reg_payload: gl.constexpr = layout.component_in_reg(component)
     frags = ()
     for k in gl.static_range(layout.num_k_slots):
@@ -531,7 +535,7 @@ def _ds_read_scale(
 ):
     layout: gl.constexpr = pc.layout
     sched: gl.constexpr = pc.schedule
-    component: gl.constexpr = (operand, True)
+    component: gl.constexpr = Component(operand, True)
     if require_constexpr(layout.component_via_lds(component)):
         fragments = pc.lds_ptrs.ds_read_scale(
             operand,
@@ -564,32 +568,30 @@ def _ds_read_panel(
 ):
     layout: gl.constexpr = pc.layout
     sched: gl.constexpr = pc.schedule
-    panel_index: gl.constexpr = _panel_index(
-        mi, ni, layout.num_m_slots, layout.num_n_slots
-    )
-    at: gl.constexpr = sched.ds_read_slot(panel_index, _A_PAYLOAD)
-    ast: gl.constexpr = sched.ds_read_slot(panel_index, _A_SCALE)
-    bt: gl.constexpr = sched.ds_read_slot(panel_index, _B_PAYLOAD)
-    bst: gl.constexpr = sched.ds_read_slot(panel_index, _B_SCALE)
+    panel_index: gl.constexpr = Panel(mi, ni).linear_index(layout.num_m_slots)
+    at: gl.constexpr = sched.ds_read_slot(panel_index, A_PAYLOAD)
+    ast: gl.constexpr = sched.ds_read_slot(panel_index, A_SCALE)
+    bt: gl.constexpr = sched.ds_read_slot(panel_index, B_PAYLOAD)
+    bst: gl.constexpr = sched.ds_read_slot(panel_index, B_SCALE)
     a, b, a_scale, b_scale = (), (), (), ()
     if require_constexpr(
-        at is not None and sched.ds_read_in_mfma(_A_PAYLOAD, at) == MFMA
+        at is not None and sched.ds_read_in_mfma(CompSlot(A_PAYLOAD, at)) == MFMA
     ):
         a = _ds_read_payload(pc, buffers, step, STEP, at, 0)
     if require_constexpr(
         ast is not None
-        and sched.ds_reads(STEP, _A_SCALE)
-        and sched.ds_read_in_mfma(_A_SCALE, ast) == MFMA
+        and sched.ds_reads(STEP, A_SCALE)
+        and sched.ds_read_in_mfma(CompSlot(A_SCALE, ast)) == MFMA
     ):
         a_scale = _ds_read_scale(pc, buffers, step, STEP, ast, 0)
     if require_constexpr(
-        bt is not None and sched.ds_read_in_mfma(_B_PAYLOAD, bt) == MFMA
+        bt is not None and sched.ds_read_in_mfma(CompSlot(B_PAYLOAD, bt)) == MFMA
     ):
         b = _ds_read_payload(pc, buffers, step, STEP, bt, 1)
     if require_constexpr(
         bst is not None
-        and sched.ds_reads(STEP, _B_SCALE)
-        and sched.ds_read_in_mfma(_B_SCALE, bst) == MFMA
+        and sched.ds_reads(STEP, B_SCALE)
+        and sched.ds_read_in_mfma(CompSlot(B_SCALE, bst)) == MFMA
     ):
         b_scale = _ds_read_scale(pc, buffers, step, STEP, bst, 1)
     return a, b, a_scale, b_scale
@@ -635,8 +637,8 @@ def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
     nn: gl.constexpr = layout.num_n_slots
     mk: gl.constexpr = layout.num_k_slots
     a, b, acc = (), (), ()
-    a_scale = () if sched.ds_reads(STEP, _A_SCALE) else regs.a_scale
-    b_scale = () if sched.ds_reads(STEP, _B_SCALE) else regs.b_scale
+    a_scale = () if sched.ds_reads(STEP, A_SCALE) else regs.a_scale
+    b_scale = () if sched.ds_reads(STEP, B_SCALE) else regs.b_scale
     tile_wait: gl.constexpr = sched.wait(STEP)
     if require_constexpr(tile_wait is not None):
         pc.lds_ptrs.wait_buffer_load_groups(tile_wait)
@@ -645,10 +647,10 @@ def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
     for ni in gl.static_range(nn):
         for mi in gl.static_range(nm):
             if require_constexpr(
-                sched.wait(STEP, _panel_index(mi, ni, nm, nn)) is not None
+                sched.wait(STEP, Panel(mi, ni).linear_index(nm)) is not None
             ):
                 pc.lds_ptrs.wait_buffer_load_groups(
-                    sched.wait(STEP, _panel_index(mi, ni, nm, nn))
+                    sched.wait(STEP, Panel(mi, ni).linear_index(nm))
                 )
             if require_constexpr(not DOT and mi == 0 and ni == 0):
                 gl.amd.cdna4.sched_barrier(0)
@@ -679,7 +681,7 @@ def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
                 value = _maybe_block_dot(
                     dot_a,
                     dot_b,
-                    regs.acc[_panel_index(mi, ni, nm, nn)],
+                    regs.acc[Panel(mi, ni).linear_index(nm)],
                     mk,
                     pc.func_cfg,
                     tc,
@@ -704,10 +706,10 @@ def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
             b_scale += bsm + bsf
             acc += (value,)
     has_register_component: gl.constexpr = (
-        layout.component_in_reg(_A_PAYLOAD)
-        or layout.component_in_reg(_B_PAYLOAD)
-        or (sched.component_present(_A_SCALE) and layout.component_in_reg(_A_SCALE))
-        or (sched.component_present(_B_SCALE) and layout.component_in_reg(_B_SCALE))
+        layout.component_in_reg(A_PAYLOAD)
+        or layout.component_in_reg(B_PAYLOAD)
+        or (sched.component_present(A_SCALE) and layout.component_in_reg(A_SCALE))
+        or (sched.component_present(B_SCALE) and layout.component_in_reg(B_SCALE))
     )
     if require_constexpr(IN_LOOP and has_register_component and not warp):
         gl.amd.cdna4.sched_barrier(0)
@@ -876,14 +878,7 @@ def _last_mfma(pc, regs):
                         ni * layout.num_k_slots,
                         layout.num_k_slots,
                     ),
-                    regs.acc[
-                        _panel_index(
-                            mi,
-                            ni,
-                            layout.num_m_slots,
-                            layout.num_n_slots,
-                        )
-                    ],
+                    regs.acc[Panel(mi, ni).linear_index(layout.num_m_slots)],
                     layout.num_k_slots,
                     pc.func_cfg,
                     tc,
