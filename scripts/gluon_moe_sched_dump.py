@@ -152,8 +152,7 @@ def _steps(schedule):
     """
     depth, unroll = maybe_unwrap(schedule.depth), maybe_unwrap(schedule.unroll)
     out = [
-        (f"prologue r={r}", schedule.prologue_step(r), False)
-        for r in range(1 - depth, 0)
+        (f"prologue x={x}", schedule.prologue_step(x), False) for x in range(-depth, -1)
     ]
     out.append(("warmup", schedule.warmup_step(), False))
     out += [
@@ -223,7 +222,7 @@ def dump_case(name, cfg, dq_a, dq_b, K, out):
         D, R = schedule.num_buffers(c), schedule.steps_per_buffer(c)
         F = schedule.load_to_mfma_distance(c)
         out(f"  {CNAME[c]} D={D} R={R} L={(D - 1) * R + 1} F={F} "
-            f"via_lds={bool(layout.component_via_lds(c))} pphase={(1 - F) % R} "
+            f"via_lds={bool(layout.component_via_lds(c))} pphase={-F % R} "
             f"nonk_ratio={layout.scale_slot_nonk(op) // layout.slot_nonk(op)} "
             f"buffer_load_slots={tuple(schedule.buffer_load_pane(CompSlot(c, t)) for t in range(num_slots))} "
             f"ds_read_slots={tuple(schedule.ds_read_pane(CompSlot(c, t)) for t in range(num_slots))} "

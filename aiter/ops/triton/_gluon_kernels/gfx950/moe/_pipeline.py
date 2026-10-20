@@ -156,11 +156,13 @@ def _take_reg_pairs(payload, scale, LO: gl.constexpr, N: gl.constexpr):
 @gluon.jit
 def _index(
     sched,
-    step,
+    ds_read_tile,
     STEP: gl.constexpr,
     component,
     BUFFER_LOAD: gl.constexpr,
 ):
+    # The LDS buffer of the K tile this step DS-reads, `ds_read_tile`, or of the one
+    # its buffer load copies, F - 1 tiles later.
     static: gl.constexpr = sched.static_lds_index(STEP, component, BUFFER_LOAD)
     if require_constexpr(static is not None):
         out = static
@@ -170,7 +172,7 @@ def _index(
         advance: gl.constexpr = (
             sched.load_to_mfma_distance(component) - 1 if BUFFER_LOAD else 0
         )
-        k_tile = (step + advance) // r
+        k_tile = (ds_read_tile + advance) // r
         if require_constexpr(sched.reg_buffer_period == 1):
             gl.assume(k_tile >= 0)
         out = k_tile % depth
@@ -289,7 +291,7 @@ def _buffer_load_pane(
     pc,
     ptrs,
     buffers,
-    step,
+    ds_read_tile,
     STEP: gl.constexpr,
     mi: gl.constexpr,
     ni: gl.constexpr,
@@ -328,7 +330,7 @@ def _buffer_load_pane(
             pc.lds_ptrs.buffer_load_payload(
                 0,
                 True,
-                _index(sched, step, STEP, A_PAYLOAD, True),
+                _index(sched, ds_read_tile, STEP, A_PAYLOAD, True),
                 ops[0],
                 ptrs.a_hbm_ptr,
                 pc.a_hbm_offs[ops[0]],
@@ -356,7 +358,7 @@ def _buffer_load_pane(
             pc.lds_ptrs.buffer_load_scale(
                 0,
                 True,
-                _index(sched, step, STEP, A_SCALE, True),
+                _index(sched, ds_read_tile, STEP, A_SCALE, True),
                 ops[1],
                 ptrs.a_scale_hbm_ptr,
                 pc.a_scale_hbm_offs[ops[1]],
@@ -401,7 +403,7 @@ def _buffer_load_pane(
             pc.lds_ptrs.buffer_load_payload(
                 1,
                 True,
-                _index(sched, step, STEP, B_PAYLOAD, True),
+                _index(sched, ds_read_tile, STEP, B_PAYLOAD, True),
                 ops[2],
                 ptrs.b_hbm_ptr,
                 pc.b_hbm_offs[ops[2]],
@@ -414,7 +416,7 @@ def _buffer_load_pane(
             pc.lds_ptrs.buffer_load_scale(
                 1,
                 True,
-                _index(sched, step, STEP, B_SCALE, True),
+                _index(sched, ds_read_tile, STEP, B_SCALE, True),
                 ops[3],
                 ptrs.b_scale_hbm_ptr,
                 pc.b_scale_hbm_offs[ops[3]],
@@ -490,7 +492,7 @@ def _advance(pc, ptrs, STEP: gl.constexpr):
 @gluon.jit
 def _ds_read_payload(
     pc,
-    step,
+    ds_read_tile,
     STEP: gl.constexpr,
     slot: gl.constexpr,
     operand: gl.constexpr,
@@ -502,7 +504,7 @@ def _ds_read_payload(
     for k in gl.static_range(layout.num_k_slots):
         payload, _ = pc.lds_ptrs.ds_read_frag(
             operand,
-            _index(sched, step, STEP, component, False),
+            _index(sched, ds_read_tile, STEP, component, False),
             slot,
             k,
             READ_PAYLOAD=True,
@@ -515,7 +517,7 @@ def _ds_read_payload(
 @gluon.jit
 def _ds_read_scale(
     pc,
-    step,
+    ds_read_tile,
     STEP: gl.constexpr,
     slot: gl.constexpr,
     operand: gl.constexpr,
@@ -524,7 +526,7 @@ def _ds_read_scale(
     component: gl.constexpr = Component(operand, True)
     return pc.lds_ptrs.ds_read_scale(
         operand,
-        _index(sched, step, STEP, component, False),
+        _index(sched, ds_read_tile, STEP, component, False),
         slot,
     )
 
@@ -532,7 +534,7 @@ def _ds_read_scale(
 @gluon.jit
 def _ds_read_pane(
     pc,
-    step,
+    ds_read_tile,
     STEP: gl.constexpr,
     mi: gl.constexpr,
     ni: gl.constexpr,
@@ -549,23 +551,23 @@ def _ds_read_pane(
     if require_constexpr(
         at is not None and sched.ds_read_in_mfma(CompSlot(A_PAYLOAD, at)) == MFMA
     ):
-        a = _ds_read_payload(pc, step, STEP, at, 0)
+        a = _ds_read_payload(pc, ds_read_tile, STEP, at, 0)
     if require_constexpr(
         ast is not None
         and sched.ds_reads(STEP, A_SCALE)
         and sched.ds_read_in_mfma(CompSlot(A_SCALE, ast)) == MFMA
     ):
-        a_scale = _ds_read_scale(pc, step, STEP, ast, 0)
+        a_scale = _ds_read_scale(pc, ds_read_tile, STEP, ast, 0)
     if require_constexpr(
         bt is not None and sched.ds_read_in_mfma(CompSlot(B_PAYLOAD, bt)) == MFMA
     ):
-        b = _ds_read_payload(pc, step, STEP, bt, 1)
+        b = _ds_read_payload(pc, ds_read_tile, STEP, bt, 1)
     if require_constexpr(
         bst is not None
         and sched.ds_reads(STEP, B_SCALE)
         and sched.ds_read_in_mfma(CompSlot(B_SCALE, bst)) == MFMA
     ):
-        b_scale = _ds_read_scale(pc, step, STEP, bst, 1)
+        b_scale = _ds_read_scale(pc, ds_read_tile, STEP, bst, 1)
     return a, b, a_scale, b_scale
 
 
@@ -613,6 +615,8 @@ def _take_operand_pairs(
 
 @gluon.jit
 def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
+    # Step `step` issues the MFMAs of K tile `step` and DS-reads K tile `step + 1`.
+    ds_read_tile = step + 1
     tc: gl.constexpr = pc.tuning_cfg
     layout: gl.constexpr = pc.layout
     sched: gl.constexpr = pc.schedule
@@ -648,9 +652,9 @@ def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
             if require_constexpr(not DOT and mi == 0 and ni == 0):
                 gl.amd.cdna4.sched_barrier(0)
             with region("mem"):
-                am, bm, asm, bsm = _ds_read_pane(pc, step, STEP, mi, ni, False)
+                am, bm, asm, bsm = _ds_read_pane(pc, ds_read_tile, STEP, mi, ni, False)
                 buffers = _buffer_load_pane(
-                    pc, ptrs, buffers, step, STEP, mi, ni, MARK_TILE=False
+                    pc, ptrs, buffers, ds_read_tile, STEP, mi, ni, MARK_TILE=False
                 )
                 if require_constexpr(
                     sched.commit_per_tile
@@ -669,7 +673,7 @@ def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
                         layout,
                         0,
                         mi,
-                        PHASE - 1,
+                        PHASE,
                         a_buffer,
                         a_scale_buffer,
                     )
@@ -681,7 +685,7 @@ def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
                         layout,
                         1,
                         ni,
-                        PHASE - 1,
+                        PHASE,
                         b_buffer,
                         b_scale_buffer,
                     )
@@ -696,9 +700,9 @@ def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
                     tc,
                     layout,
                     DOT,
-                    (PHASE - 1) * tc.BLOCK_K // 128 % 2,
+                    PHASE * tc.BLOCK_K // 128 % 2,
                 )
-                af, bf, asf, bsf = _ds_read_pane(pc, step, STEP, mi, ni, True)
+                af, bf, asf, bsf = _ds_read_pane(pc, ds_read_tile, STEP, mi, ni, True)
                 if require_constexpr(mi == nm - 1 and ni == nn - 1):
                     ptrs = _advance(pc, ptrs, STEP)
             if require_constexpr(
@@ -755,20 +759,20 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
     remaining = main - peeled
     unroll_end = remaining // unroll * unroll
     buffers = _init_buffers(pc)
-    for r in gl.static_range(1 - depth, 0):
+    for x in gl.static_range(-depth, -1):
         for ni in gl.static_range(layout.num_n_slots):
             for mi in gl.static_range(layout.num_m_slots):
                 buffers = _buffer_load_pane(
                     pc,
                     ptrs,
                     buffers,
-                    r,
-                    sched.prologue_step(r),
+                    x + 1,
+                    sched.prologue_step(x),
                     mi,
                     ni,
                 )
-        ptrs = _advance(pc, ptrs, sched.prologue_step(r))
-        buffers = _rotate_buffers(buffers, sched, layout, r)
+        ptrs = _advance(pc, ptrs, sched.prologue_step(x))
+        buffers = _rotate_buffers(buffers, sched, layout, x)
     acc = ()
     for ni in gl.static_range(layout.num_n_slots):
         for mi in gl.static_range(layout.num_m_slots):
@@ -780,11 +784,9 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
                 ),
             )
     regs = _PipelineRegFragments((), (), (), (), acc)
-    ptrs, buffers, regs = _step(pc, ptrs, buffers, regs, 0, sched.warmup_step())
+    ptrs, buffers, regs = _step(pc, ptrs, buffers, regs, -1, sched.warmup_step())
     for x in gl.static_range(peeled):
-        ptrs, buffers, regs = _step(
-            pc, ptrs, buffers, regs, x + 1, sched.peeled_step(x)
-        )
+        ptrs, buffers, regs = _step(pc, ptrs, buffers, regs, x, sched.peeled_step(x))
     for base in tl.range(0, unroll_end, unroll):
         for u in gl.static_range(unroll):
             ptrs, buffers, regs = _step(
@@ -792,7 +794,7 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
                 ptrs,
                 buffers,
                 regs,
-                peeled + base + u + 1,
+                peeled + base + u,
                 sched.loop_step(u),
             )
     if require_constexpr(sched.static_remainder):
@@ -803,7 +805,7 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
                     ptrs,
                     buffers,
                     regs,
-                    peeled + unroll_end + u + 1,
+                    peeled + unroll_end + u,
                     sched.remainder_step(u),
                 )
     else:
@@ -813,7 +815,7 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
                 ptrs,
                 buffers,
                 regs,
-                peeled + unroll_end + u + 1,
+                peeled + unroll_end + u,
                 sched.remainder_step(0),
             )
     return ptrs, buffers, regs
@@ -835,7 +837,7 @@ def _drain_buffered_pipeline(pc, ptrs, buffers, regs, NUM_K):
                         ptrs,
                         buffers,
                         regs,
-                        main + j + 1,
+                        main + j,
                         sched.drain_step(p, j),
                     )
     else:
@@ -845,7 +847,7 @@ def _drain_buffered_pipeline(pc, ptrs, buffers, regs, NUM_K):
                 ptrs,
                 buffers,
                 regs,
-                main + j + 1,
+                main + j,
                 sched.drain_step(0, j),
             )
     # The final MFMA's operands, one (payload, scale) pair per K slot of each slot.

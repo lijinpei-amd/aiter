@@ -187,11 +187,15 @@ def _fragments(a, a_scale, b, b_scale, acc):
 
 
 class _Machine:
-    """Literal copy FIFO and immutable fragment lifetimes, with absolute K tiles."""
+    """Literal copy FIFO and immutable fragment lifetimes, with absolute K tiles.
+
+    Step ``x`` issues the MFMAs of K tile ``x``, DS-reads tile ``x + 1`` and copies
+    tile ``x + F``.
+    """
 
     def __init__(self, tc, num_k):
         self.tc, self.num_k = tc, num_k
-        self.current_read = None
+        self.current_step = None
         self.loads, self.reads, self.mfmas = set(), set(), set()
         self.pending, self.committed, self.outstanding = [], [], []
         self.completed = set()
@@ -204,6 +208,10 @@ class _Machine:
         # the reads it guards are checked against it.
         self.wait = None
 
+    @property
+    def ds_read_tile(self):
+        return self.current_step + 1
+
     def load(self, component, ring, mini, pointer):
         tc = self.tc
         operand, is_scale = component.operand_index.value, component.is_scale.value
@@ -214,15 +222,14 @@ class _Machine:
         assert 0 <= tile < self.num_k, "HBM load exceeded the K strip"
         live_span = (tc.depths[component] - 1) * r + 1
         load_to_mfma_distance = live_span - int(tc.component_in_reg(component))
-        lead = load_to_mfma_distance - 1
-        assert tile == self.current_read + lead
+        assert tile == self.current_step + load_to_mfma_distance
         assert tile % r == 0 and mini % q == 0
         token = component, mini, tile
         assert token not in self.loads, "HBM tile loaded more than once"
         self.loads.add(token)
         self.events.append(
             (
-                self.current_read,
+                self.current_step,
                 self.current_in_loop,
                 self.current_drain,
                 "load",
@@ -300,11 +307,11 @@ class _Machine:
                     component
                 ):
                     if component.is_scale.value and (
-                        self.current_read % tc.scale_r(operand)
+                        self.ds_read_tile % tc.scale_r(operand)
                         or mini % tc.scale_q(operand)
                     ):
                         continue
-                    required.add((component, mini, self.current_read))
+                    required.add((component, mini, self.ds_read_tile))
         return required
 
     def check_wait(self, pane):
@@ -317,7 +324,7 @@ class _Machine:
         """
         required = self.required(pane)
         if required:
-            assert self.wait is not None, (self.current_read, pane, "no wait")
+            assert self.wait is not None, (self.current_step, pane, "no wait")
             actual, committed = self.wait
             youngest = max(
                 i
@@ -325,21 +332,21 @@ class _Machine:
                 if required.intersection(group)
             )
             assert actual == committed - youngest - 1, (
-                self.current_read,
+                self.current_step,
                 pane,
                 actual,
                 youngest,
                 self.committed[:committed],
             )
         else:
-            assert self.wait is None, (self.current_read, pane, self.wait)
+            assert self.wait is None, (self.current_step, pane, self.wait)
         self.wait = None
 
     def read(self, component, ring, mini, k):
-        token = component, mini, self.current_read
+        token = component, mini, self.ds_read_tile
         assert token in self.completed, "DS read issued before its async copy completed"
         actual, fragments = self.lds[component, mini, ring]
-        assert actual == self.current_read
+        assert actual == self.ds_read_tile
         self.reads.add(token)
         return fragments[k]
 
@@ -360,10 +367,10 @@ class _Machine:
 
     def ds_read_scale(self, operand, ring, mini):
         component = Component(operand, SCALE)
-        token = component, mini, self.current_read
+        token = component, mini, self.ds_read_tile
         assert token in self.completed, "Scale DS read issued before its copy completed"
         actual, fragments = self.lds[component, mini, ring]
-        assert actual == self.current_read
+        assert actual == self.ds_read_tile
         self.reads.add(token)
         return fragments
 
@@ -372,7 +379,7 @@ class _Machine:
             return accumulator
         self.events.append(
             (
-                self.current_read,
+                self.current_step,
                 self.current_in_loop,
                 self.current_drain,
                 "mfma",
@@ -437,18 +444,18 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
     ds_read_pane_fn = pipeline._ds_read_pane.fn
 
     # Positional layouts: _step(pc, ptrs, buffers, regs, step, STEP),
-    # _buffer_load_pane(pc, ptrs, buffers, step, STEP, mi, ni),
-    # _ds_read_pane(pc, step, STEP, mi, ni, MFMA).
+    # _buffer_load_pane(pc, ptrs, buffers, ds_read_tile, STEP, mi, ni),
+    # _ds_read_pane(pc, ds_read_tile, STEP, mi, ni, MFMA).
     def step(*args, **kwargs):
         assert machine.wait is None, "a wait guarded no read"
-        machine.current_read = args[4]
+        machine.current_step = args[4]
         machine.current_in_loop = schedule.in_loop(args[5])
         machine.current_drain = schedule.is_drain(args[5])
         machine.steps.append((args[4], machine.current_in_loop))
         return step_fn(*args, **kwargs)
 
     def buffer_load(*args, **kwargs):
-        machine.current_read = args[3]
+        machine.current_step = args[3] - 1
         machine.current_in_loop = schedule.in_loop(args[4])
         machine.current_drain = schedule.is_drain(args[4])
         return buffer_load_fn(*args, **kwargs)
@@ -468,7 +475,7 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
     def sched_barrier(mask):
         machine.events.append(
             (
-                machine.current_read,
+                machine.current_step,
                 machine.current_in_loop,
                 machine.current_drain,
                 "sched_barrier",
@@ -574,8 +581,8 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         for ni in range(tc.nn)
         for tile in range(num_k)
     }
-    assert [read for read, in_loop in machine.steps] == list(range(num_k))
-    assert any(in_loop for read, in_loop in machine.steps)
+    assert [step for step, in_loop in machine.steps] == list(range(-1, num_k - 1))
+    assert any(in_loop for step, in_loop in machine.steps)
     assert not machine.pending
     return machine
 
@@ -679,19 +686,19 @@ def test_emitted_unified_pipeline_all_reachable_remainders(
 
 def _sched_barrier_stream(machine):
     return [
-        (event_read, in_loop, drain, value)
-        for event_read, in_loop, drain, op, component, value, mini in machine.events
+        (event_step, in_loop, drain, value)
+        for event_step, in_loop, drain, op, component, value, mini in machine.events
         if op == "sched_barrier"
     ]
 
 
 def _assert_direct_b_stage_barriers(machine):
-    in_loop_reads = [read for read, in_loop in machine.steps if in_loop]
+    in_loop_steps = [step for step, in_loop in machine.steps if in_loop]
     assert _sched_barrier_stream(machine) == [
-        (0, False, False, 0),  # Existing seed barrier for DOT=False.
-        *((read, True, False, 0) for read in in_loop_reads),
+        (-1, False, False, 0),  # Existing seed barrier for DOT=False.
+        *((step, True, False, 0) for step in in_loop_steps),
     ]
-    return in_loop_reads
+    return in_loop_steps
 
 
 @pytest.mark.parametrize(
@@ -709,7 +716,7 @@ def test_depth_two_direct_component_mfma_reads_its_ring(
 ):
     """At depth two a register component has F == 1 and no DS read.
 
-    Its copy of tile ``t`` lands at step ``t``, and the MFMA of step ``t + 1`` reads
+    Its copy of tile ``t`` lands at step ``t - 1``, and the MFMA of step ``t`` reads
     it from the ring itself; the machine's MFMA check rejects a stale fragment.
     """
     depths = [3, 3, 3, 3]
@@ -725,12 +732,12 @@ def test_depth_two_direct_component_mfma_reads_its_ring(
     machine = _execute(tc, num_k, monkeypatch)
 
     loads = [
-        (event_read, tile)
-        for event_read, _, _, op, loaded, tile, _ in machine.events
+        (event_step, tile)
+        for event_step, _, _, op, loaded, tile, _ in machine.events
         if op == "load" and loaded == component
     ]
     assert loads
-    assert all(event_read == tile for event_read, tile in loads)
+    assert all(event_step + 1 == tile for event_step, tile in loads)
 
 
 def test_middle_direct_b_scale_ignores_ds_read_placement(monkeypatch):
@@ -776,12 +783,12 @@ def test_direct_scale_producer_phase_and_soffset_stream_match(
     load_streams = []
     for machine in machines:
         loads = [
-            (event_read, in_loop, drain, tile, mini)
-            for event_read, in_loop, drain, op, loaded, tile, mini in machine.events
+            (event_step, in_loop, drain, tile, mini)
+            for event_step, in_loop, drain, op, loaded, tile, mini in machine.events
             if op == "load" and loaded == component
         ]
         assert loads
-        assert {event_read % r for event_read, *_ in loads} == {1 % r}
+        assert {event_step % r for event_step, *_ in loads} == {0}
         load_streams.append(loads)
     assert load_streams[0] == load_streams[1]
 
@@ -799,39 +806,39 @@ def test_direct_b3_fills_k_plus_2_while_mfma_consumes_k(soff, monkeypatch):
     num_k = tc.minimum_num_k() + 1
     machine = _execute(tc, num_k, monkeypatch)
 
-    in_loop_reads = _assert_direct_b_stage_barriers(machine)
-    assert len(in_loop_reads) == tc.sizing()[2] == 3
-    for read in in_loop_reads:
+    in_loop_steps = _assert_direct_b_stage_barriers(machine)
+    assert len(in_loop_steps) == tc.sizing()[2] == 3
+    for step in in_loop_steps:
         assert [
             op
-            for event_read, in_loop, drain, op, component, tile, mini in machine.events
-            if in_loop and not drain and event_read == read
+            for event_step, in_loop, drain, op, component, tile, mini in machine.events
+            if in_loop and not drain and event_step == step
         ][-1] == "sched_barrier"
         mfma_tiles = [
             tile
-            for event_read, in_loop, drain, op, component, tile, mini in machine.events
-            if in_loop and not drain and event_read == read and op == "mfma"
+            for event_step, in_loop, drain, op, component, tile, mini in machine.events
+            if in_loop and not drain and event_step == step and op == "mfma"
         ]
-        assert mfma_tiles == [read - 1] * (tc.nm * tc.nn)
+        assert mfma_tiles == [step] * (tc.nm * tc.nn)
 
         loads = [
             (component, tile, mini)
-            for event_read, in_loop, drain, op, component, tile, mini in machine.events
-            if in_loop and not drain and event_read == read and op == "load"
+            for event_step, in_loop, drain, op, component, tile, mini in machine.events
+            if in_loop and not drain and event_step == step and op == "load"
         ]
         assert {
             (tile, mini) for component, tile, mini in loads if component == A_PAYLOAD
-        } == {(read + 2, mi) for mi in range(tc.nm)}
+        } == {(step + 3, mi) for mi in range(tc.nm)}
         assert {
             (tile, mini) for component, tile, mini in loads if component == B_PAYLOAD
-        } == {(read + 1, ni) for ni in range(tc.nn)}
+        } == {(step + 2, ni) for ni in range(tc.nn)}
 
     drain_b_loads = {
-        (event_read, tile, mini)
-        for event_read, in_loop, drain, op, component, tile, mini in machine.events
+        (event_step, tile, mini)
+        for event_step, in_loop, drain, op, component, tile, mini in machine.events
         if drain and op == "load" and component == B_PAYLOAD
     }
-    assert drain_b_loads == {(num_k - 2, num_k - 1, ni) for ni in range(tc.nn)}
+    assert drain_b_loads == {(num_k - 3, num_k - 1, ni) for ni in range(tc.nn)}
 
 
 @pytest.mark.parametrize("soff", [False, True], ids=["pointer-step", "soffset-unroll"])
@@ -848,47 +855,49 @@ def test_direct_b2_fills_k_plus_1_while_mfma_consumes_k(soff, monkeypatch):
     machine = _execute(tc, num_k, monkeypatch)
 
     assert {
-        (event_read, tile, mini)
-        for event_read, in_loop, drain, op, component, tile, mini in machine.events
-        if event_read < 0 and op == "load" and component == B_PAYLOAD
+        (event_step, tile, mini)
+        for event_step, in_loop, drain, op, component, tile, mini in machine.events
+        if event_step < -1 and op == "load" and component == B_PAYLOAD
     } == set()
     assert {
         (tile, mini)
-        for event_read, in_loop, drain, op, component, tile, mini in machine.events
-        if event_read == 0 and op == "load" and component == B_PAYLOAD
+        for event_step, in_loop, drain, op, component, tile, mini in machine.events
+        if event_step == -1 and op == "load" and component == B_PAYLOAD
     } == {(0, ni) for ni in range(tc.nn)}
 
-    in_loop_reads = _assert_direct_b_stage_barriers(machine)
-    assert len(in_loop_reads) == tc.sizing()[2] == 6
-    for read in in_loop_reads:
+    in_loop_steps = _assert_direct_b_stage_barriers(machine)
+    assert len(in_loop_steps) == tc.sizing()[2] == 6
+    for step in in_loop_steps:
         assert [
             op
-            for event_read, in_loop, drain, op, component, tile, mini in machine.events
-            if in_loop and not drain and event_read == read
+            for event_step, in_loop, drain, op, component, tile, mini in machine.events
+            if in_loop and not drain and event_step == step
         ][-1] == "sched_barrier"
         mfma_tiles = [
             tile
-            for event_read, in_loop, drain, op, component, tile, mini in machine.events
-            if in_loop and not drain and event_read == read and op == "mfma"
+            for event_step, in_loop, drain, op, component, tile, mini in machine.events
+            if in_loop and not drain and event_step == step and op == "mfma"
         ]
-        assert mfma_tiles == [read - 1] * (tc.nm * tc.nn)
+        assert mfma_tiles == [step] * (tc.nm * tc.nn)
         assert {
             (tile, mini)
-            for event_read, in_loop, drain, op, component, tile, mini in machine.events
+            for event_step, in_loop, drain, op, component, tile, mini in machine.events
             if in_loop
             and not drain
-            and event_read == read
+            and event_step == step
             and op == "load"
             and component == B_PAYLOAD
-        } == {(read, ni) for ni in range(tc.nn)}
+        } == {(step + 1, ni) for ni in range(tc.nn)}
 
     drain_b_loads = {
-        (event_read, tile, mini)
-        for event_read, in_loop, drain, op, component, tile, mini in machine.events
+        (event_step, tile, mini)
+        for event_step, in_loop, drain, op, component, tile, mini in machine.events
         if drain and op == "load" and component == B_PAYLOAD
     }
     assert drain_b_loads == {
-        (read, read, ni) for read in range(num_k - 2, num_k) for ni in range(tc.nn)
+        (step, step + 1, ni)
+        for step in range(num_k - 3, num_k - 1)
+        for ni in range(tc.nn)
     }
 
 
@@ -902,8 +911,8 @@ def test_lds_b_has_only_the_existing_seed_sched_barrier(monkeypatch):
     num_k = tc.minimum_num_k() + 1
     machine = _execute(tc, num_k, monkeypatch)
 
-    assert any(in_loop for read, in_loop in machine.steps)
-    assert _sched_barrier_stream(machine) == [(0, False, False, 0)]
+    assert any(in_loop for step, in_loop in machine.steps)
+    assert _sched_barrier_stream(machine) == [(-1, False, False, 0)]
 
 
 def test_compiler_pipeline_owns_register_stage_ordering(monkeypatch):
@@ -917,11 +926,11 @@ def test_compiler_pipeline_owns_register_stage_ordering(monkeypatch):
     machine = _execute(tc, num_k, monkeypatch)
 
     assert any(in_loop for _, in_loop in machine.steps)
-    assert _sched_barrier_stream(machine) == [(0, False, False, 0)]
+    assert _sched_barrier_stream(machine) == [(-1, False, False, 0)]
 
 
 def _straight_line_waits(schedule, tc, last):
-    """Wait immediates of K steps ``0..last`` as if every one were emitted in a line.
+    """Wait immediates of K steps ``-1..last`` as if every one were emitted in a line.
 
     An independent FIFO over the schedule's public commit plan and DS reads: the
     prologue and warm-up steps as emitted, then one step per K tile with the loop
@@ -939,9 +948,10 @@ def _straight_line_waits(schedule, tc, last):
     committed, waits = [], {}
 
     def required(step, pane):
+        # Step `step` DS-reads K tile `step + 1`, copied F steps before its MFMAs.
         return {
             (
-                step - schedule.load_to_mfma_distance(c) + 1,
+                step + 1 - schedule.load_to_mfma_distance(c),
                 c,
                 schedule.ds_read_slot(pane, c),
             )
@@ -957,26 +967,26 @@ def _straight_line_waits(schedule, tc, last):
         youngest = max(i for i, group in enumerate(committed) if need & set(group))
         return len(committed) - youngest - 1
 
-    for step in range(1 - depth, last + 1):
-        if step < 0:
+    for step in range(-depth, last + 1):
+        if step < -1:
             index = schedule.prologue_step(step)
-        elif step == 0:
+        elif step == -1:
             index = schedule.warmup_step()
         else:
-            index = schedule.loop_step((step - peeled - 1) % unroll)
-        if step >= 0 and per_tile:
+            index = schedule.loop_step((step - peeled) % unroll)
+        if step >= -1 and per_tile:
             waits[step] = immediate(
                 set().union(*(required(step, pane) for pane in range(panes)))
             )
         vector = []
         for pane in range(panes):
-            if step >= 0 and not per_tile:
+            if step >= -1 and not per_tile:
                 vector.append(immediate(required(step, pane)))
             for group in schedule.commits(index, pane):
                 committed.append(
                     tuple((step, cs.component, cs.index.value) for cs in group)
                 )
-        if step >= 0 and not per_tile:
+        if step >= -1 and not per_tile:
             waits[step] = tuple(vector)
     return waits
 
@@ -1014,13 +1024,13 @@ def test_peeled_wait_prefix_is_minimal(scheme, register_mask, extra):
             return schedule.wait(index)
         return tuple(schedule.wait(index, pane) for pane in range(tc.nm * tc.nn))
 
-    differs = [x for x in range(depth * 2) if waits[x + 1] != steady(x + 1)]
+    differs = [x for x in range(depth * 2) if waits[x] != steady(x)]
     assert peeled == max(1, (max(differs) + 1) if differs else 0)
-    assert emitted(schedule.warmup_step()) == waits[0]
+    assert emitted(schedule.warmup_step()) == waits[-1]
     for x in range(peeled):
-        assert emitted(schedule.peeled_step(x)) == waits[x + 1]
+        assert emitted(schedule.peeled_step(x)) == waits[x]
     for u in range(unroll):
-        assert emitted(schedule.loop_step(u)) == steady(peeled + u + 1)
+        assert emitted(schedule.loop_step(u)) == steady(peeled + u)
 
 
 @pytest.mark.parametrize("nn", [1, 2, 3, 4])
