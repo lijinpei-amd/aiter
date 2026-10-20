@@ -29,8 +29,8 @@ from op_tests.triton_tests.moe.test_moe_gemm_gluon_registers import (
     _register_config,
 )
 
-#: ``_buffer_load_order_frozen`` for every 1..4 x 1..4 panel grid: payload copies as
-#: ``(is_a, tile)`` in panel order. 2x2 is the tuned interleave, the rest alternate A
+#: ``_buffer_load_order_frozen`` for every 1..4 x 1..4 pane grid: payload copies as
+#: ``(is_a, tile)`` in pane order. 2x2 is the tuned interleave, the rest alternate A
 #: and B from A(0). Pinned when the frozen module stopped sharing code with the live
 #: schedule, so the snapshot no longer has a live counterpart to agree with.
 _FROZEN_FILL_ORDER = {

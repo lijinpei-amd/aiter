@@ -130,13 +130,13 @@ class WarpPipeline(IntEnum):
 class WaitCommitScheme(IntEnum):
     """Commit granularity and wait placement for the live HBM-to-LDS pipeline.
 
-    ``PER_OP`` commits each asynchronous copy separately, ``PER_PANEL`` commits after
-    each panel, and the per-stage modes commit once at their respective pipeline
+    ``PER_OP`` commits each asynchronous copy separately, ``PER_PANE`` commits after
+    each pane, and the per-stage modes commit once at their respective pipeline
     boundary. Direct-register loads contribute no asynchronous group.
     """
 
     PER_OP = 1
-    PER_PANEL = 2
+    PER_PANE = 2
     # Preserve the whole-stage setting used by existing cold-bench recipes.
     PER_STAGE_WHOLE = 3
     PER_STAGE_WARP_PIPELINE = 4

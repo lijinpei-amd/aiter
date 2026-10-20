@@ -256,7 +256,7 @@ class KernelLayout:
     _scale_slot_fragment_layout: gl.constexpr
     _scale_fragment_layout_slot: gl.constexpr
     acc_vgprs_per_lane: gl.constexpr
-    accumulator_fragment_shape_panel: gl.constexpr
+    accumulator_fragment_shape_pane: gl.constexpr
     dot_result_fragment_layout: gl.constexpr
     output_n_slot: gl.constexpr
     output_block_n: gl.constexpr
@@ -355,7 +355,7 @@ class KernelLayout:
 
         threads = num_warps * WARP_SIZE
         acc_vgprs_per_lane = BM * BN // threads
-        accumulator_fragment_shape_panel = [SLOT_M, SLOT_N]
+        accumulator_fragment_shape_pane = [SLOT_M, SLOT_N]
         dot_result_fragment_layout = gl.amd.AMDMFMALayout(
             version=4,
             instr_shape=instr,
@@ -709,8 +709,8 @@ class KernelLayout:
         self._scale_fragment_layout_slot = gl.constexpr(scale_fragment_layout_slot)
 
         self.acc_vgprs_per_lane = gl.constexpr(acc_vgprs_per_lane)
-        self.accumulator_fragment_shape_panel = gl.constexpr(
-            accumulator_fragment_shape_panel
+        self.accumulator_fragment_shape_pane = gl.constexpr(
+            accumulator_fragment_shape_pane
         )
         self.dot_result_fragment_layout = gl.constexpr(dot_result_fragment_layout)
 
@@ -808,7 +808,7 @@ class KernelLayout:
 
     @gluon.constexpr_function
     def slot_nonk(self, idx):
-        return self.accumulator_fragment_shape_panel.value[idx]
+        return self.accumulator_fragment_shape_pane.value[idx]
 
     @gluon.constexpr_function
     def scale_slot_nonk(self, idx):
@@ -880,7 +880,7 @@ class KernelLayout:
     @gluon.constexpr_function
     def quant_amax_lane_elems(self, extent_m=None, output_n=None):
         extent_m = (
-            self.accumulator_fragment_shape_panel.value[0]
+            self.accumulator_fragment_shape_pane.value[0]
             if extent_m is None
             else extent_m
         )
@@ -893,7 +893,7 @@ class KernelLayout:
 
     @gluon.jit
     def n_start(self, pid_n, n_slot_idx: gl.constexpr, N):
-        n_slot: gl.constexpr = self.accumulator_fragment_shape_panel[1]
+        n_slot: gl.constexpr = self.accumulator_fragment_shape_pane[1]
         if require_constexpr(self._weight_gu_hbm_layout == _WEIGHT_GU_SPLIT):
             out = pid_n * n_slot + n_slot_idx * (N // 2)
         else:
@@ -902,7 +902,7 @@ class KernelLayout:
 
     @gluon.jit
     def n_split_offs(self, pid_n, i, N):
-        n_slot: gl.constexpr = self.accumulator_fragment_shape_panel[1]
+        n_slot: gl.constexpr = self.accumulator_fragment_shape_pane[1]
         if require_constexpr(self._weight_gu_hbm_layout == _WEIGHT_GU_SPLIT):
             out = pid_n * n_slot + (i // n_slot) * (N // 2) + i % n_slot
         else:

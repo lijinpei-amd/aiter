@@ -738,7 +738,7 @@ def get_gluon_config_uncached(
                 "RESULT_SCALE_CACHE_MODIFIER", "", "RESULT_SCALE_MOD"
             ),
             # Which inter-wave ping-pong the K-loop step lays borders down for, a
-            # WarpPipeline: 0 none, 1 hand each panel's MFMAs and its ds_read/copy
+            # WarpPipeline: 0 none, 1 hand each pane's MFMAs and its ds_read/copy
             # shadow to TritonAMDGPUWarpPipeline as an mfma/mem stage pair, 2 the
             # hand-emitted rendezvous (FROZEN_STEP=1 only). 1 and 2 need
             # VGPR_PREFETCH_K == BLOCK_K.
@@ -775,7 +775,7 @@ def get_gluon_config_uncached(
             # reachable only through the environment, and only the hand-pinned MXFP4
             # cases set it -- which is why those benchmarked ~3% faster than the ladder.
             "ACT_FAST_RCP": bool(_env_int("AITER_TRITON_MOE_GLUON_ACT_FAST_RCP", 1)),
-            # PER_OP (1) commits each async copy; PER_PANEL (2) commits each panel.
+            # PER_OP (1) commits each async copy; PER_PANE (2) commits each pane.
             # Both wait before each DS-read slot. PER_STAGE (3) commits the whole K
             # stage and waits once at the read stage's head. Counts and copy ownership
             # come from the same schedule; see WaitCommitScheme.
@@ -1321,9 +1321,9 @@ def gluon_supported(
     )
     if pipeline_error is not None:
         return False, pipeline_error
-    # Fill ownership no longer requires both axes split: a single-panel step copies both
-    # operands, since the schedule maps each component's slots to panels rather
-    # than handing each panel one copy. validate_pipeline() asserts the mapping
+    # Fill ownership no longer requires both axes split: a single-pane step copies both
+    # operands, since the schedule maps each component's slots to panes rather
+    # than handing each pane one copy. validate_pipeline() asserts the mapping
     # invariant itself as the in-kernel backstop.
     #
     # gate/up split is a separate matter, and a real one: it packs the two operand

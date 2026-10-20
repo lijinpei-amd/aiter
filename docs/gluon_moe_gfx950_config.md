@@ -37,10 +37,10 @@ mismatch before preparing scales or launching the GEMM.
 | `SCHED_MODE` | `SchedMode.NONE`, `IGLP_0`, `IGLP_1`, `MFMA_16`, or `MFMA_8`. Hints apply outside compiler warp-pipeline regions. |
 | `FROZEN_STEP` | Select the preserved reference body in `_frozen.py`, with an unfused final MFMA. Its existing restrictions on component overrides, register flags and packed K128 scales remain. |
 | `SOFF_UNROLL` | Advance HBM pointers once per unrolled body and use scalar offsets within it. With packed K128 scales and odd unroll, use per-fill pointer advances so scale-word phases remain correct. |
-| `SCALE_FILL_MID` | At a 2x2 mini-tile split, fill scales in the middle panels; wait counts use the same setting. |
+| `SCALE_FILL_MID` | At a 2x2 mini-tile split, fill scales in the middle panes; wait counts use the same setting. |
 | `UNROLL_EPILOGUE` | Statically expand the live pipeline's finite main-loop remainder. Disable it to use a runtime remainder loop and reduce register pressure; the runtime loop requires every active scale to advance once per payload step. Defaults to `True`. |
-| `WAIT_COMMIT_SCHEME` | `PER_OP=1`, `PER_PANEL=2`, `PER_STAGE_WHOLE=3`, or `PER_STAGE_WARP_PIPELINE=4`; see the boundaries below. |
-| `ALLOW_B_VIA_LDS` | Allow the B payload to be staged through LDS. `False` explicitly loads it into registers with `buffer_load` at its normal global-load panel, bypassing LDS staging. That explicit request requires `B_PRESHUFFLED=True`; an automatic register fallback for a small B tile does not. Defaults to `True`. |
+| `WAIT_COMMIT_SCHEME` | `PER_OP=1`, `PER_PANE=2`, `PER_STAGE_WHOLE=3`, or `PER_STAGE_WARP_PIPELINE=4`; see the boundaries below. |
+| `ALLOW_B_VIA_LDS` | Allow the B payload to be staged through LDS. `False` explicitly loads it into registers with `buffer_load` at its normal global-load pane, bypassing LDS staging. That explicit request requires `B_PRESHUFFLED=True`; an automatic register fallback for a small B tile does not. Defaults to `True`. |
 | `ALLOW_A_SCALE_VIA_LDS`, `ALLOW_B_SCALE_VIA_LDS` | Allow the selected scale component to be staged through LDS; `False` loads it directly into registers. Both options are independent of each other and of `ALLOW_B_VIA_LDS`; neither requires preshuffled B payload. Defaults to `True`. |
 | `A_NUM_BUFFER`, `B_NUM_BUFFER` | Number of pipeline buffers for each payload component. Omitted or zero values inherit `NUM_LDS_BUFFER`; each resolved active depth must be at least 2. |
 | `A_SCALE_NUM_BUFFER`, `B_SCALE_NUM_BUFFER` | Number of buffers for each active scale component, independent of the payload counts and at least 2 after inheritance. Absent scales do not participate in validation or scheduling. `A_SCALE_NUMB_BUFFER` is accepted as a dictionary/environment alias for `A_SCALE_NUM_BUFFER`. |
@@ -113,9 +113,9 @@ preserves the whole-stage boundary used by the cold-bench recipes; callers that
 previously selected `PER_STAGE` with the compiler warp pipeline should select
 `PER_STAGE_WARP_PIPELINE` for the memory-region boundary.
 
-Per-stage schemes wait before the `ni`/`mi` panel walk; `PER_OP` and `PER_PANEL`
-wait before each panel's LDS reads. Wait counts follow each component's producer
-and the actual committed groups, including empty panel/stage groups during the
+Per-stage schemes wait before the `ni`/`mi` pane walk; `PER_OP` and `PER_PANE`
+wait before each pane's LDS reads. Wait counts follow each component's producer
+and the actual committed groups, including empty pane/stage groups during the
 prologue and drain. Direct-register loads own no LDS async-copy groups. Their
 register dependencies provide VMEM completion before use. A direct scale producer
 uses residue `(1-F) % R`, while its DS read remains on residue zero; this shifts its
@@ -201,15 +201,15 @@ machine-code hashes and resource metadata for all three dtypes.
 
 The driver takes invariant data in `_PipelineConst`. Each active stream has its
 own physical ring depth `D`, K-Step ratio `R`, LDS ring or register queue, and
-HBM pointer. B register loads occupy the same logical buffer-load panel as B LDS
-copies. Scale register loads also use their configured buffer-load panels,
+HBM pointer. B register loads occupy the same logical buffer-load pane as B LDS
+copies. Scale register loads also use their configured buffer-load panes,
 including `SCALE_FILL_MID`.
 
 The DS read of a direct-register ring entry occurs `F-1` steps after its
 producer, and the MFMA consumes it on the following step. At the minimum `D=2`,
 `R=1` case, production and DS read share a step; the producer is emitted first
 even when the configured read region would otherwise precede its buffer-load
-panel.
+pane.
 
 The prologue has `PIPELINE_DEPTH - 1` fill-only stages. A component with
 load-to-MFMA distance `F = Schedule.load_to_mfma_distance(component)` begins
@@ -246,12 +246,12 @@ The K loop carries two aggregates plus the component register rings:
 - `_PipelineRegFragments` contains separate A/B payload and scale tuples and the
   MFMA accumulators. Operand tuples run by non-K mini block, with one whole-`BLOCK_K`
   payload fragment per stage;
-  accumulators follow the N-outer, M-inner panel traversal.
+  accumulators follow the N-outer, M-inner pane traversal.
 
 `_PipelineConst.lds_ptrs` holds the `LDSManager` descriptors, named
 `a_payload_lds_ptr`, `a_scale_lds_ptr`, `b_payload_lds_ptr`, and `b_scale_lds_ptr`.
-LDS tile `t` occupies buffer `t % NB` for that component. `_buffer_load_panel` issues
-copies and commits, `_ds_read_panel` supplies the next register fragments, and
+LDS tile `t` occupies buffer `t % NB` for that component. `_buffer_load_pane` issues
+copies and commits, `_ds_read_pane` supplies the next register fragments, and
 `_advance` moves only pointers whose streams actually filled. With
 `SOFF_UNROLL`, the last step advances by the complete body's fill count.
 Cooperative LDS barriers and read-result dependencies protect buffer reuse.

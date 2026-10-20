@@ -4931,13 +4931,13 @@ def _validate_frozen(tc, N, K, layout=None):
     # -- commit-group granularity --
     assert _v(tc.WAIT_COMMIT_SCHEME) in (
         int(WaitCommitScheme.PER_OP),
-        int(WaitCommitScheme.PER_PANEL),
+        int(WaitCommitScheme.PER_PANE),
         int(WaitCommitScheme.PER_STAGE_WARP_PIPELINE),
         int(WaitCommitScheme.PER_STAGE_WHOLE),
     ), (
         f"WAIT_COMMIT_SCHEME {_v(tc.WAIT_COMMIT_SCHEME)} is not a WaitCommitScheme: "
         f"PER_OP {int(WaitCommitScheme.PER_OP)}, "
-        f"PER_PANEL {int(WaitCommitScheme.PER_PANEL)}, "
+        f"PER_PANE {int(WaitCommitScheme.PER_PANE)}, "
         f"PER_STAGE_WARP_PIPELINE {int(WaitCommitScheme.PER_STAGE_WARP_PIPELINE)}, "
         f"PER_STAGE_WHOLE {int(WaitCommitScheme.PER_STAGE_WHOLE)}"
     )

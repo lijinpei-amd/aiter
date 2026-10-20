@@ -82,11 +82,11 @@ def validate(tc, N, K, layout=None):
             )
 
     # -- warp pipelining (the inter-wave ping-pong) --
-    # A panel's MFMAs are handed to TritonAMDGPUWarpPipeline as the `mfma` stage and
+    # A pane's MFMAs are handed to TritonAMDGPUWarpPipeline as the `mfma` stage and
     # its ds_reads plus global->LDS copies as the `mem` stage. That is only a legal
-    # split when the MFMAs read nothing the same panel loads, i.e. when the whole
+    # split when the MFMAs read nothing the same pane loads, i.e. when the whole
     # BLOCK_K window is carried in registers from the previous stage. The pass also
-    # rejects a wait inside a stage region, which is why the per-panel wait_group is
+    # rejects a wait inside a stage region, which is why the per-pane wait_group is
     # emitted before the `mfma` region rather than inside the `mem` one.
     assert tc.WARP_PIPELINE.value in (
         int(WarpPipeline.NONE),
@@ -100,8 +100,8 @@ def validate(tc, N, K, layout=None):
     if tc.warp_pipeline_enabled():
         assert layout.num_prefetch_k_slots.value == layout.num_k_slots.value, (
             f"WARP_PIPELINE needs VGPR_PREFETCH_K == BLOCK_K (got "
-            f"{tc.VGPR_PREFETCH_K.value} vs {BK}): with a partial window the panel's "
-            "MFMAs depend on the panel's own ds_read and there is no mem stage to "
+            f"{tc.VGPR_PREFETCH_K.value} vs {BK}): with a partial window the pane's "
+            "MFMAs depend on the pane's own ds_read and there is no mem stage to "
             "hide behind them"
         )
 
@@ -119,13 +119,13 @@ def validate(tc, N, K, layout=None):
     # Reject unknown schemes before building the shared copy/group schedule.
     assert tc.WAIT_COMMIT_SCHEME.value in (
         int(WaitCommitScheme.PER_OP),
-        int(WaitCommitScheme.PER_PANEL),
+        int(WaitCommitScheme.PER_PANE),
         int(WaitCommitScheme.PER_STAGE_WARP_PIPELINE),
         int(WaitCommitScheme.PER_STAGE_WHOLE),
     ), (
         f"WAIT_COMMIT_SCHEME {tc.WAIT_COMMIT_SCHEME.value} is not a WaitCommitScheme: "
         f"PER_OP {int(WaitCommitScheme.PER_OP)}, "
-        f"PER_PANEL {int(WaitCommitScheme.PER_PANEL)}, "
+        f"PER_PANE {int(WaitCommitScheme.PER_PANE)}, "
         f"PER_STAGE_WARP_PIPELINE {int(WaitCommitScheme.PER_STAGE_WARP_PIPELINE)}, "
         f"PER_STAGE_WHOLE {int(WaitCommitScheme.PER_STAGE_WHOLE)}"
     )
@@ -263,12 +263,12 @@ def validate_pipeline(tc, layout, K, schedule=None):
     validate_buffer_counts(tc)
     if schedule is None:
         schedule = Schedule(tc, layout, K)
-    # Copy ownership maps each component's slots onto panels, so every mapped
-    # panel has to exist and no component may copy two of its own slots in one
-    # panel -- a panel carries one optional copy per component. Different components
-    # sharing a panel is fine, which is what lets a single-panel step copy both
+    # Copy ownership maps each component's slots onto panes, so every mapped
+    # pane has to exist and no component may copy two of its own slots in one
+    # pane -- a pane carries one optional copy per component. Different components
+    # sharing a pane is fine, which is what lets a single-pane step copy both
     # operands.
-    assert schedule.buffer_load_panels_valid.value, (
+    assert schedule.buffer_load_panes_valid.value, (
         f"buffer-load ownership is not a valid mapping for num_m_slots "
         f"{layout.num_m_slots.value} x num_n_slots {layout.num_n_slots.value} "
         f"(SLOT_M {tc.SLOT_M.value} vs BLOCK_M {tc.BLOCK_M.value}, "
