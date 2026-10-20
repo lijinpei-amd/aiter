@@ -51,67 +51,161 @@ has to come after the buffer's last reader, and the readers hold the buffer for 
 lengths. Through LDS the last reader is the `ds_read` at `t - 1`, so the buffer sits idle
 for `R - 1` steps (step `t` here). In registers every MFMA of the value reads the buffer,
 the last at `t + R - 1`, so the refill comes on the next step and the buffer never idles.
-Through LDS `s` is therefore a multiple of `R`; in registers `s % R == 1`. The copy in a
+A value's first MFMA step `t` is a multiple of `R`, so through LDS `s % R == R - 1` and in
+registers `s` is a multiple of `R`. The copy in a
 step never fills the buffer that step's MFMAs read, since `F = (D - 1) * R` puts them
 `D - 1` buffers apart; at `D = 2`, `R = 1` (`F = 1`) a copy is read by the next step's
 MFMA.
 
-A copy issued at step `s` carries K tile `s + F - 1`. That tile is DS-read at step
-`t - 1 = s + F - 1`, and its MFMAs issue at step `t`. So every step DS-reads the K tile
-with its own number and issues the MFMAs of the tile before: through LDS from fragments
-the previous step DS-read, in registers from the ring itself. The whole `BLOCK_K` tile is
-carried in registers (`VGPR_PREFETCH_K == BLOCK_K`, asserted), and a step's MFMAs never
-wait on its own DS reads.
-
-Depth 3, every component `F = 3`:
-
-| step | -2 | -1 | 0 | 1 | ... | t | ... | num_k-2 | num_k-1 | final |
-|---|---|---|---|---|---|---|---|---|---|---|
-| kind | prologue | prologue | warm-up | peeled | | loop / remainder | | drain | drain | final MFMA |
-| copies tile | 0 | 1 | 2 | 3 | | t+2 | | - | - | - |
-| DS-reads tile | - | - | 0 | 1 | | t | | num_k-2 | num_k-1 | - |
-| MFMAs tile | - | - | - | 0 | | t-1 | | num_k-3 | num_k-2 | num_k-1 |
-
-A component copies at step `s` only when both hold (`_step_plan`):
-
-- `active`: its target tile lies in `[0, num_k)`. A component with a smaller `F` starts
-  copying later in the prologue and keeps copying into the drain, through drain step
-  `depth - F - 1`.
-- `loads`: its ring advances, `(s + F - 1) % R == 0`. A payload copies at every active
-  step, a scale once every `R`.
-
-An LDS component DS-reads at step `t - 1` when `(t - 1) % R == 0`, so only at multiples
-of `R` (`Schedule.ds_reads`).
-
 ## Steps
 
-`_run_buffered_pipeline` and `_drain_buffered_pipeline` emit the steps; `moe_gemm.py`
-then issues the final MFMA. Every emitted step has an index into the `Schedule` tables,
-`STEP`, from `prologue_step`, `warmup_step`, `peeled_step`, `loop_step`,
-`remainder_step` or `drain_step`. `_step` also takes `step`, the absolute step number,
-which may be a runtime value and feeds the runtime LDS ring indices.
+A step is numbered by the K tile its MFMAs consume: step `x` issues the MFMAs of K tile
+`x`, DS-reads tile `x + 1`, and copies tile `x + F(c)` of each component `c`. A scale value
+covers `R(c)` K tiles, from a multiple of `R(c)`. Before peeling and unrolling, the
+pipelined K loop is:
 
-| kind | emitted | executed | does |
+```
+def step(x):
+    for each component c:
+        k = x + F(c)
+        if 0 <= k < num_k and k % R(c) == 0:   # active and loads in _step_plan
+            buffer_load K tile k of c
+    if 0 <= x + 1 < num_k:
+        ds_read K tile x + 1                   # LDS components with (x + 1) % R(c) == 0
+    if x >= 0:
+        mfma K tile x                          # a register component: from its ring
+
+for x in -depth .. num_k - 1:
+    step(x)
+```
+
+Three transformations turn this loop into the emitted program.
+
+**1. Split by kind.** Every condition in `step` depends on `x` alone, and each stays
+fixed over one of five ranges of `x`. Split at those bounds, each part knows at compile
+time what its steps issue:
+
+```
+for x in -depth .. -2:                         # prologue: buffer_load only
+    step(x)
+step(-1)                                       # warm-up: buffer_load and ds_read
+for x in 0 .. main - 1:                        # main: all three, every component
+    step(x)
+for j in 0 .. depth - 2:                       # drain: ds_read and mfma; buffer_load only
+    step(main + j)                             #   by components with j < depth - F(c)
+step(num_k - 1)                                # final MFMA: mfma only
+```
+
+The ranges, given `1 <= F(c) <= depth`:
+
+| kind | steps `x` | count | `buffer_load` | `ds_read` | MFMA |
+|---|---|---|---|---|---|
+| prologue | `-depth .. -2` | `depth - 1` | components with `x >= -F` | - | - |
+| warm-up | `-1` | 1 | all | yes | - |
+| main | `0 .. main - 1` | `main = num_k - depth` | all | yes | yes |
+| drain | `main .. num_k - 2` | `depth - 1` | components with `x < num_k - F` | yes | yes |
+| final MFMA | `num_k - 1` | 1 | - | - | yes |
+
+- The prologue starts at the first copy: tile 0, by a component with `F = depth`, at
+  step `-depth`.
+- Main ends at that component's last copy, of tile `num_k - 1`, at step `main - 1`. A
+  component with a smaller `F` keeps copying through drain step `depth - F - 1`.
+- Prologue and drain both have `depth - 1` steps, the lead of an `F = depth` copy over
+  its `ds_read`. In all, `num_k + depth` steps, the last one the final MFMA.
+- `depth` is the largest `L`, not the largest `F`: if the deepest ring is in registers
+  and no component reaches `F = depth`, prologue step `-depth` copies nothing.
+
+Only main has a runtime trip count. The other parts have at most `depth - 1` steps and
+are emitted straight-line. The drain's steps `main + j` still depend on the runtime
+`num_k`; see Drain below.
+
+**2. Unroll main.** A main step still depends on `x` through its rings:
+
+- the LDS buffer it copies into and DS-reads from, `((x + F) // R) % D`;
+- the register buffer it copies into and its MFMA reads, a tuple index that must be
+  compile-time;
+- for a scale with `R > 1`, whether it copies and DS-reads at this step, and which K
+  tile of the value its MFMA takes, `x % R`.
+
+All of these repeat every `buffer_period = lcm(D * R)` steps over the present
+components. Unrolled by `unroll = lcm(K_UNROLL, buffer_period)`, they depend on `u` alone
+and fold to constants, which also gives immediate LDS offsets:
+
+```
+iters, rem = main // unroll, main % unroll
+for i in 0 .. iters - 1:                       # a runtime loop
+    for u in 0 .. unroll - 1:                  # unrolled: rings depend on u only
+        step(i * unroll + u)
+for u in 0 .. rem - 1:                         # remainder
+    step(iters * unroll + u)
+```
+
+`main` depends on the runtime `num_k`, so the remainder runs the `rem` steps that do not
+fill a loop body.
+
+**3. Peel the first main steps.** Two things set them apart:
+
+- Step 0's MFMA accumulates into zeros. Out of the loop, the compiler sees the zero
+  accumulator.
+- Under `PER_OP`, an early step can need a smaller wait immediate than later iterations
+  of its loop step (see Peeling). A loop step takes the smallest immediate over its
+  iterations, so in the loop it would tighten the wait of every iteration.
+
+So `peeled >= 1` main steps run straight-line before the loop:
+
+```
+for x in 0 .. peeled - 1:                      # peeled: straight-line
+    step(x)
+iters, rem = (main - peeled) // unroll, (main - peeled) % unroll
+for i in 0 .. iters - 1:
+    for u in 0 .. unroll - 1:
+        step(peeled + i * unroll + u)
+for u in 0 .. rem - 1:
+    step(peeled + iters * unroll + u)
+```
+
+All together, with the `Schedule` accessor that indexes each part:
+
+```
+for x in -depth .. -2:                         # prologue: prologue_step(x)    
+    step(x)
+step(-1)                                       # warm-up: warmup_step()
+for x in 0 .. peeled - 1:                      # peeled: peeled_step(x)
+    step(x)
+for i in 0 .. iters - 1:                       # loop: a runtime tl.range loop
+    for u in 0 .. unroll - 1:                  #   whose body is unrolled: loop_step(u)
+        step(peeled + i * unroll + u)
+for u in 0 .. rem - 1:                         # remainder: remainder_step(u)
+    step(peeled + iters * unroll + u)
+for j in 0 .. depth - 2:                       # drain: drain_step(p, j)
+    step(main + j)
+step(num_k - 1)                                # final MFMA
+```
+
+`validate_pipeline` requires `num_k >= depth + peeled + unroll`, so the loop body runs at
+least once.
+
+These sketches show the steps that execute. `_run_buffered_pipeline` and
+`_drain_buffered_pipeline` emit them, and `moe_gemm.py` then issues the final MFMA. Each
+emitted step has an index into the `Schedule` tables, `STEP`, from the accessor in its
+comment. `_step` also takes `step`, the step number `x`, which may be a runtime value.
+Its LDS ring indices count from `ds_read_tile = step + 1`, the tile it DS-reads.
+
+| kind | emitted | executed | emitted as |
 |---|---|---|---|
-| prologue | `depth - 1` | `depth - 1` | steps `1 - depth .. -1`, copies only; inline in `_run_buffered_pipeline`, not `_step` |
-| warm-up | 1 | 1 | step 0: copies and DS reads, no MFMA |
-| peeled | `peeled` | `peeled` | steps `1 .. peeled`, straight-line |
+| prologue | `depth - 1` | `depth - 1` | copies inline in `_run_buffered_pipeline`, not `_step` |
+| warm-up | 1 | 1 | one `_step` |
+| peeled | `peeled` | `peeled` | straight-line `_step`s |
 | loop | `unroll` | `iters * unroll` | a `tl.range` loop whose body is `unroll` steps |
-| remainder | `unroll - 1` if `static_remainder`, else 1 | `rem` | the steps the loop leaves over |
-| drain | `drain_phases * (depth - 1)` | `depth - 1` | DS-reads the last tiles; shallower components finish their copies |
-| final MFMA | - | 1 | `_last_mfma` or `_drain_last_fused`: the last tile's MFMAs from registers; no copy, DS read or wait |
+| remainder | `unroll - 1` if `static_remainder`, else 1 | `rem` | see Remainder below |
+| drain | `drain_phases * (depth - 1)` | `depth - 1` | `_drain_buffered_pipeline`; see Drain below |
+| final MFMA | - | 1 | `_last_mfma` or `_drain_last_fused`; no copy, DS read or wait |
 
-With `main = num_k - depth`, `iters = (main - peeled) // unroll` and
-`rem = (main - peeled) % unroll`. In all, `num_k + depth - 1` steps plus the final MFMA.
-`validate_pipeline` requires `num_k >= depth + peeled + unroll`.
+Per emitted step, `Schedule` stores its kind, `phase` (the step number its ring
+arithmetic uses), unroll position `ki`, `in_loop`, and `dot` (false for prologue and
+warm-up). `phase` is `x` on straight-line steps and `peeled + u` on loop step `u`, which
+is congruent to it modulo `unroll`.
 
-Per emitted step, `Schedule` stores its kind, `phase` (the step number its ring arithmetic
-uses), unroll position `ki`, `in_loop`, and `dot` (false for prologue and warm-up).
-`phase` is the absolute step number on straight-line steps and `peeled + u + 1` on loop
-step `u`, which is congruent to it modulo `unroll`.
-
-- **Unroll.** `unroll = lcm(K_UNROLL, buffer_period)`: every ring is back at buffer 0
-  after one loop body, so each loop step's ring indices are compile-time.
 - **Remainder.** With `UNROLL_EPILOGUE` (`static_remainder`): `unroll - 1` straight-line
   steps, each behind a runtime `if`, with compile-time LDS indices. Without it: one step
   body in a runtime loop at phase 0, with runtime indices, which needs every scale at
@@ -131,8 +225,8 @@ M inner):
    1. The pane wait, `wait(STEP, pane_index)`, under `PER_OP` and `PER_PANE`.
    2. `mem` region: the pane's DS reads placed in the memory region, then its copies
       (`issued`) in `COMPONENTS` order, with their commits.
-   3. `mfma` region: the pane's MFMAs of the previous K tile (when `dot`), then the DS reads
-      placed in the MFMA region. The last pane advances the HBM pointers.
+   3. `mfma` region: the pane's MFMAs of K tile `x` (when `dot`), then the DS reads placed
+      in the MFMA region. The last pane advances the HBM pointers.
    4. `commit` region: the `PER_STAGE_WHOLE` commit, after the last pane.
 3. A `sched_barrier` after a loop step that holds a register ring (not under the warp
    pipeline). Straight-line steps rotate the register rings.
@@ -165,20 +259,22 @@ Resolved once in `Schedule.__init__`:
 
 ## Ring indices
 
-A copy issued at step `s` fills buffer `((s + F - 1) // R) % D`, which is
-`((t - 1) // R) % D`: the buffer the `ds_read` at step `t - 1` reads through LDS, and the
-one the MFMA at step `t` reads in registers.
+A copy issued at step `s` fills buffer `((s + F) // R) % D`, which is `(t // R) % D`, the
+buffer of K tile `t`: the `ds_read` at step `t - 1` reads it through LDS, and the MFMA at
+step `t` in registers.
 
 - **LDS ring** (`_index`): compile-time when `static_lds_index` has a value (loop, static
   remainder and static drain steps), which gives immediate LDS offsets. Otherwise the
-  same formula at runtime from `step`, with `gl.assume(k_tile >= 0)` so the modulo needs
-  no signed fix-up.
+  same formula at runtime from `ds_read_tile = step + 1`, with `gl.assume(k_tile >= 0)`
+  so the modulo needs no signed fix-up. `_step_live` adds the 1 once, up front: adding
+  it inside `_index` changed the drain's codegen.
 - **Register ring**: a tuple has no runtime index. Straight-line steps rotate it
-  (`_rotate_buffers`) so index 0 is the current value. Loop steps never rotate; they index
-  from the loop's first step, which needs `unroll` to be a multiple of
-  `reg_buffer_period`. `register_index(step, component)` is the buffer a step's MFMAs
-  read and `register_index(step, component, True)` the one its copy fills;
-  `final_register_index` is the buffer the final MFMA reads.
+  (`_rotate_buffers`) so index 0 holds the value of K tile `x + 1`, the next step's MFMA
+  operand. Loop steps never rotate; they index from the loop's first step, as if at step
+  `peeled`, which needs `unroll` to be a multiple of `reg_buffer_period`.
+  `register_index(step, component)` is the buffer a step's MFMAs read and
+  `register_index(step, component, True)` the one its copy fills; `final_register_index`
+  is the buffer the final MFMA reads.
 
 ## Commit plan
 
@@ -231,25 +327,26 @@ group `j` has already retired, because the outstanding groups are always the new
 
 The loop body's immediates are the minimum over all its iterations. Under `PER_OP`, an
 early step can need a smaller one than the loop: its needed copies were issued in the
-prologue, before components with a smaller `F` started copying, so fewer groups separate
-them from the step. Those steps are peeled out of the loop instead of tightening every
-iteration.
+prologue, before components with a smaller `F` started copying (see Steps), so fewer
+groups separate them from the step. Those steps are peeled out of the loop instead of
+tightening every iteration.
 
-- **Rule.** Replay the prologue, the warm-up and steps `1 .. settled` with no end.
-  `peeled` is the last step in `[1, depth - 2]` whose immediates differ from its
-  steady twin, the first step `>= 2 * depth` with the same phase modulo `async_period`
-  (`lcm(R)` over the LDS components). It is at least 1, so the first main step keeps its
-  visible zero accumulator.
+- **Rule.** Replay the prologue, the warm-up and steps `0 .. settled - 1` with no end.
+  The peeled steps run through the last step in `[0, depth - 3]` whose immediates differ
+  from its steady twin, the first step `>= 2 * depth - 1` congruent to it modulo
+  `async_period` (`lcm(R)` over the LDS components). Step 0 is always peeled, so the
+  first MFMA keeps its visible zero accumulator.
 - **Last, not first.** The differing steps can have gaps, so a first-match rule would
   leave a differing step in the loop with a too-large immediate: a race. Example:
   `PER_OP`, 2x2, ring depths `(2, 4, 6, 3)` in `COMPONENTS` order, both scales at
-  `R = 2`, B payload in registers: depth 7, step 1 matches, step 2 differs, `peeled = 2`.
+  `R = 2`, B payload in registers: depth 7, step 0 matches, step 1 differs, `peeled = 2`.
 - **Only `PER_OP` peels more than one step.** The other schemes commit a fixed number of
   groups per pane or step, whether a component copies or not.
-- **Bounds.** From step `depth - 1` on, every needed copy was issued at a step `>= 0`,
-  where all LDS components copy, so the candidates stop at `depth - 2`. `settled` must
-  reach the largest twin, `2 * depth + async_period - 1`; a shorter trace compares
-  against a missing twin and peels for nothing. The code uses `3 * depth + async_period`.
+- **Bounds.** From step `depth - 2` on, every needed copy was issued at the warm-up or
+  later, where all LDS components copy, so the candidates stop at `depth - 3`. The replay
+  must reach the largest twin, step `2 * depth + async_period - 2`, so
+  `settled >= 2 * depth + async_period - 1`; a shorter trace compares against a missing
+  twin and peels for nothing. The code uses `3 * depth + async_period`.
 
 ## Emission invariants
 
@@ -270,17 +367,3 @@ see the last two, which only the symbolic tests cover.
   once per loop body, at its last step. One without the other advances twice. It is off
   by default (a measured regression).
 - `_step = _step_live`: the symbolic tests replace `_step`.
-
-## Where to change what
-
-| change | edit |
-|---|---|
-| which pane copies or DS-reads a slot | `buffer_load_pane` / `ds_read_pane` in `Schedule.__init__`; keep the fragment order |
-| what a step copies, commits or needs | `_step_plan`, and the emitter's copy and commit points with it |
-| step kinds, counts or phases | the `steps` table in `Schedule.__init__` and the `*_step` accessors, then `_run_buffered_pipeline` / `_drain_buffered_pipeline` |
-| a commit scheme | `_step_plan`'s grouping, the commit points in `_buffer_load_pane` / `_step_live`, `WaitCommitScheme` |
-
-Verify per REGRESSION_TESTS.md. T0 shows any change to a schedule table. T1 runs the real
-`_pipeline.py` on a symbolic machine (`test_moe_gemm_gluon_buffered_schedule.py`) and
-checks the emitted groups and waits against a reference
-(`test_moe_gemm_gluon_wait_commit.py`); it is the only coverage of the register rings.
