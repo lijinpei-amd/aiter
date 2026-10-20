@@ -40,6 +40,8 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     ActivationSpec,
     ActKind,
     B,
+    Component,
+    CompSlot,
     DSReadOperand,
     DtypeQuant,
     EpilogueMode,
@@ -650,8 +652,8 @@ def test_commit_scheme_counts_real_payload_and_scale_groups(
     config["WAIT_COMMIT_SCHEME"] = int(scheme)
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     layout = KernelLayout(tc)
-    assert _plain(layout.component_via_lds((0, True)))
-    assert _plain(layout.component_via_lds((1, True)))
+    assert _plain(layout.component_via_lds(A_SCALE))
+    assert _plain(layout.component_via_lds(B_SCALE))
     schedule = _schedule(tc, layout, 64)
     loop = schedule.loop_step(0)
     panels = _plain(maybe_unwrap(layout.num_m_slots)) * _plain(
@@ -851,10 +853,10 @@ def test_register_storage_options_are_independent(config, storage_mask):
     )
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     layout = KernelLayout(tc)
-    assert _plain(layout.component_via_lds((0, False)))
-    assert _plain(layout.component_via_lds((1, False))) is not bool(storage_mask & 1)
-    assert _plain(layout.component_via_lds((0, True))) is not bool(storage_mask & 4)
-    assert _plain(layout.component_via_lds((1, True))) is not bool(storage_mask & 2)
+    assert _plain(layout.component_via_lds(A_PAYLOAD))
+    assert _plain(layout.component_via_lds(B_PAYLOAD)) is not bool(storage_mask & 1)
+    assert _plain(layout.component_via_lds(A_SCALE)) is not bool(storage_mask & 4)
+    assert _plain(layout.component_via_lds(B_SCALE)) is not bool(storage_mask & 2)
     expected_via_lds = {
         A_PAYLOAD: True,
         A_SCALE: not bool(storage_mask & 4),
@@ -1013,8 +1015,8 @@ def test_absent_scales_do_not_participate_in_depth_unroll_or_validation(
         maybe_unwrap(layout.num_m_slots) * maybe_unwrap(layout.num_n_slots)
     ):
         slots = schedule.buffer_load_slots(panel)
-        assert slots[COMPONENTS.index(A_SCALE)] is None
-        assert slots[COMPONENTS.index(B_SCALE)] is None
+        assert slots[A_SCALE.index()] is None
+        assert slots[B_SCALE.index()] is None
     assert maybe_unwrap(schedule.depth) == 4
     assert maybe_unwrap(schedule.unroll) == 12
     assert _plain(host._validate_selected_pipeline(tc, layout, 7168))
@@ -1333,7 +1335,7 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
     depths, ratios, via_lds, producer_phases = {}, {}, {}, {}
     load_to_mfma_distances = {}
     for component in COMPONENTS:
-        operand, is_scale = component
+        operand, is_scale = component.operand_index.value, component.is_scale.value
         depths[component] = _plain(tc.num_buffers(operand, is_scale))
         ratios[component] = (
             _plain(layout.scale_slot_k(operand)) // _plain(layout.scale_block_k)
@@ -1357,15 +1359,15 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
     }
     buffer_load_panels = [[] for _ in range(npanels)]
     for panel, (component, tile) in enumerate(payloads):
-        operand, is_scale = component
-        assert not is_scale
+        operand = component.operand_index.value
+        assert not component.is_scale.value
         buffer_load_panels[panel].append((component, tile))
         if not has_scale[operand] or tile % non_k_ratios[operand]:
             continue
         scale_slot = (
             tile + 1 if (nm, nn) == (2, 2) and _plain(tc.SCALE_FILL_MID) else panel
         )
-        buffer_load_panels[scale_slot].append(((operand, SCALE), tile))
+        buffer_load_panels[scale_slot].append((Component(operand, SCALE), tile))
     component_rank = {
         A_PAYLOAD: 0,
         A_SCALE: 1,
@@ -1384,7 +1386,9 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
     ds_read_panels = [[] for _ in range(npanels)]
     for copy, buffer_load_panel in buffer_load_panel_for.items():
         component, tile = copy
-        nominal = payload_panels[((component[0], False), tile)]
+        nominal = payload_panels[
+            (Component(component.operand_index.value, False), tile)
+        ]
         ds_read_panel = nominal
         if not via_lds[component] and load_to_mfma_distances[component] == 1:
             ds_read_panel = max(ds_read_panel, buffer_load_panel)
@@ -1467,7 +1471,7 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
             schedule.commits(index, panel) for panel in range(npanels)
         )
         assert actual_groups == tuple(
-            tuple(tuple(token[1:] for token in group) for group in groups)
+            tuple(tuple(CompSlot(*token[1:]) for token in group) for group in groups)
             for groups in expected_groups
         )
 

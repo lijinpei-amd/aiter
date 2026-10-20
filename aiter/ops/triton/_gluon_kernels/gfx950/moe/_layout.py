@@ -14,7 +14,7 @@ from ._packed_scale import (
     packed_scale_lds_view_layout,
     packed_scale_sel,
 )
-from ._types import WeightGuHbmLayout
+from ._types import Component, WeightGuHbmLayout
 
 __all__ = ["KernelLayout"]
 
@@ -384,7 +384,7 @@ class KernelLayout:
         storage_bits = tuple(ty.primitive_bitwidth for ty in storage_dtype)
         payload_copy_contiguity = tuple(128 // bits for bits in storage_bits)
         payload_via_lds = tuple(
-            bool(tc.allow_component_via_lds((idx, False)))
+            bool(tc.allow_component_via_lds(Component(idx, False)))
             and (
                 payload_shape_slot[idx][0] * payload_shape_slot[idx][1]
                 >= WARP_SIZE * payload_copy_contiguity[idx] * num_warps
@@ -503,7 +503,7 @@ class KernelLayout:
             component_via_lds.append(
                 (
                     payload_via_lds[idx],
-                    bool(tc.allow_component_via_lds((idx, True)))
+                    bool(tc.allow_component_via_lds(Component(idx, True)))
                     and (
                         bool(scale_preshuffled[idx])
                         or (
@@ -781,8 +781,7 @@ class KernelLayout:
 
     @gluon.constexpr_function
     def component_via_lds(self, component):
-        operand, is_scale = component[0], bool(component[1])
-        assert operand in (0, 1), "component operand must be 0 (A) or 1 (B)"
+        operand, is_scale = component.operand_index.value, component.is_scale.value
         return self._component_via_lds.value[operand][int(is_scale)]
 
     @gluon.constexpr_function
@@ -998,7 +997,7 @@ class KernelLayout:
         SCALE_RATIO: gl.constexpr = SCALE_M // M_SLOT
 
         if require_constexpr(
-            tuning_cfg.preshuffled(0, True) and self.component_in_reg((0, True))
+            tuning_cfg.preshuffled(0, True) and self.component_in_reg(Component(0, True))
         ):
             a_scale_hbm_offsets_tile = ()
             for m_slot_idx in gl.static_range(NUM_M_SLOTS):
@@ -1074,7 +1073,7 @@ class KernelLayout:
         )
 
         if require_constexpr(
-            tuning_cfg.preshuffled(1, True) and self.component_in_reg((1, True))
+            tuning_cfg.preshuffled(1, True) and self.component_in_reg(Component(1, True))
         ):
             b_scale_hbm_offsets_tile = ()
             for n_slot_idx in gl.static_range(NUM_N_SLOTS):

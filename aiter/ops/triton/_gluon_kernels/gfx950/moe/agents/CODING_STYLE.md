@@ -70,5 +70,5 @@ func_cfg.has_scale(idx)                   # one method for A and B
 layout.fragment_shape_slot(idx, is_scale)  # one method for A/B and payload/scale
 ```
 
-Methods that already take a component `(operand, is_scale)`, such as
+Methods that already take a `Component`, such as
 `component_via_lds(component)`, satisfy the same rule.

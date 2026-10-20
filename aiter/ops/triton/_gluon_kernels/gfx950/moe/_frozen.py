@@ -55,7 +55,6 @@ from ._lang import WARP_SIZE, require_constexpr
 from ._lang import optional as _opt
 from ._lang import unwrap as _v
 from ._types import (
-    COMPONENTS,
     A,
     DotKind,
     DtypeQuant,
@@ -69,6 +68,9 @@ from ._types import (
     dq_mx_format,
     dq_pack_divisor,
 )
+
+# (operand, is_scale) pairs in _types.COMPONENTS order, kept as tuples here.
+COMPONENTS = ((0, False), (0, True), (1, False), (1, True))
 
 
 # --- vendored config rephrasings ------------------------------------------------

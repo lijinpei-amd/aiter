@@ -365,15 +365,14 @@ class KernelTuningConfig:
 
     @gluon.constexpr_function
     def allow_component_via_lds(self, component):
-        """Whether tuning permits staging an ``(operand, is_scale)`` through LDS.
+        """Whether tuning permits staging a :class:`Component` through LDS.
 
         A payload reads ``ALLOW_B_VIA_LDS`` for B; A has no knob and is always
         permitted. A scale reads ``ALLOW_A_SCALE_VIA_LDS`` / ``ALLOW_B_SCALE_VIA_LDS``.
         A permitted component can still land in registers when its tile cannot take
         the copy; see ``KernelLayout.component_via_lds``.
         """
-        operand, is_scale = component[0], bool(component[1])
-        assert operand in (0, 1), "component operand must be 0 (A) or 1 (B)"
+        operand, is_scale = component.operand_index.value, component.is_scale.value
         if is_scale:
             flag = (
                 self.ALLOW_A_SCALE_VIA_LDS

@@ -30,8 +30,10 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     PAYLOAD,
     SCALE,
     A,
+    Component,
+    CompSlot,
+    Panel,
     WaitCommitScheme,
-    _panel_index,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import validate
 from op_tests.triton_tests.moe.test_moe_gemm_gluon_scale_layout import _HostView
@@ -84,7 +86,7 @@ class _Config(_ScheduleConfig):
         self.output_quant = None
 
     def num_buffers(self, operand, scale=False):
-        return self.depths[(operand, bool(scale))]
+        return self.depths[Component(operand, scale)]
 
     def buffer_live_span(self, operand, scale=False):
         return (self.num_buffers(operand, scale) - 1) * (
@@ -95,7 +97,8 @@ class _Config(_ScheduleConfig):
         return tuple(
             component
             for component in COMPONENTS
-            if not component[1] or self.has_scale(component[0])
+            if not component.is_scale.value
+            or self.has_scale(component.operand_index.value)
         )
 
     def sizing(self):
@@ -162,7 +165,7 @@ class _Config(_ScheduleConfig):
 
 @dataclass(frozen=True)
 class _Fragment:
-    component: tuple[int, bool]
+    component: Component
     tile: int
     mini: int
     k: int
@@ -203,7 +206,7 @@ class _Machine:
 
     def load(self, component, ring, mini, pointer):
         tc = self.tc
-        operand, is_scale = component
+        operand, is_scale = component.operand_index.value, component.is_scale.value
         tile = pointer
         ratio = tc.ratio_k(operand) if is_scale else 1
         nonk = tc.ratio_non_k(operand) if is_scale else 1
@@ -250,12 +253,12 @@ class _Machine:
     def buffer_load_payload(
         self, operand, VIA_LDS, ring, mini, pointer, offset, soff=0
     ):
-        fragments = self.load((operand, PAYLOAD), ring, mini, pointer + soff)
+        fragments = self.load(Component(operand, PAYLOAD), ring, mini, pointer + soff)
         if not VIA_LDS:
             return fragments
 
     def buffer_load_scale(self, operand, VIA_LDS, ring, mini, pointer, offset, soff=0):
-        fragments = self.load((operand, SCALE), ring, mini, pointer + soff)
+        fragments = self.load(Component(operand, SCALE), ring, mini, pointer + soff)
         if not VIA_LDS:
             return fragments
 
@@ -275,28 +278,28 @@ class _Machine:
         tc = self.tc
         if (tc.nm, tc.nn) == (2, 2):
             payloads = [
-                (B_PAYLOAD, 0),
-                (A_PAYLOAD, 0),
-                (A_PAYLOAD, 1),
-                (B_PAYLOAD, 1),
+                CompSlot(B_PAYLOAD, 0),
+                CompSlot(A_PAYLOAD, 0),
+                CompSlot(A_PAYLOAD, 1),
+                CompSlot(B_PAYLOAD, 1),
             ]
         else:
             payloads = []
             for tile in range(max(tc.nm, tc.nn)):
                 if tile < tc.nm:
-                    payloads.append((A_PAYLOAD, tile))
+                    payloads.append(CompSlot(A_PAYLOAD, tile))
                 if tile < tc.nn:
-                    payloads.append((B_PAYLOAD, tile))
+                    payloads.append(CompSlot(B_PAYLOAD, tile))
         required = set()
-        for pos, (payload_component, mini) in enumerate(payloads):
+        for pos, payload in enumerate(payloads):
             if panel is not None and panel != pos:
                 continue
-            operand, _ = payload_component
-            for component in ((operand, PAYLOAD), (operand, SCALE)):
+            operand, mini = payload.component.operand_index.value, payload.index.value
+            for component in (Component(operand, PAYLOAD), Component(operand, SCALE)):
                 if component in tc.active_components() and tc.component_via_lds(
                     component
                 ):
-                    if component[1] and (
+                    if component.is_scale.value and (
                         self.current_read % tc.ratio_k(operand)
                         or mini % tc.ratio_non_k(operand)
                     ):
@@ -343,16 +346,20 @@ class _Machine:
     def ds_read_frag(
         self, operand, ring, mini, k, *, READ_PAYLOAD, READ_SCALE, SCALE_READ_IDX=None
     ):
-        payload = self.read((operand, PAYLOAD), ring, mini, k) if READ_PAYLOAD else None
+        payload = (
+            self.read(Component(operand, PAYLOAD), ring, mini, k)
+            if READ_PAYLOAD
+            else None
+        )
         scale = (
-            self.read((operand, SCALE), SCALE_READ_IDX, mini, k)
+            self.read(Component(operand, SCALE), SCALE_READ_IDX, mini, k)
             if READ_SCALE and self.tc.has_scale(operand)
             else None
         )
         return payload, scale
 
     def ds_read_scale(self, operand, ring, mini):
-        component = (operand, SCALE)
+        component = Component(operand, SCALE)
         token = component, mini, self.current_read
         assert token in self.completed, "Scale DS read issued before its copy completed"
         actual, fragments = self.lds[component, mini, ring]
@@ -379,13 +386,14 @@ class _Machine:
         for operand, fragments in zip(OPERANDS, (a, b)):
             for k in range(mk):
                 payload, scale = fragments[k * 2 : k * 2 + 2]
-                assert payload.component == (operand, PAYLOAD) and payload.k == k
+                assert payload.component == Component(operand, PAYLOAD)
+                assert payload.k == k
                 assert payload.tile == accumulator, (
                     "MFMA consumed stale or overwritten registers"
                 )
                 if tc.has_scale(operand):
                     assert scale == _Fragment(
-                        (operand, SCALE), accumulator, payload.mini, k
+                        Component(operand, SCALE), accumulator, payload.mini, k
                     )
                 self.reads.add((payload.component, payload.mini, accumulator))
                 if tc.has_scale(operand):
@@ -450,7 +458,7 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
 
     def ds_read_panel(*args, **kwargs):
         if not args[6]:  # the panel's first read, right after its wait
-            panel = _panel_index(args[4], args[5], tc.nm, tc.nn)
+            panel = Panel(args[4], args[5]).linear_index(tc.nm)
             if not per_tile:
                 machine.check_wait(panel)
             elif panel == 0:
@@ -458,7 +466,7 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         return ds_read_panel_fn(*args, **kwargs)
 
     def ds_read_payload(*args, **kwargs):
-        component = (args[5], PAYLOAD)
+        component = Component(args[5], PAYLOAD)
         if tc.component_in_reg(component):
             machine.events.append(
                 (
@@ -475,7 +483,7 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
 
     def ds_read_scale(*args, **kwargs):
         operand = args[5]
-        component = (operand, SCALE)
+        component = Component(operand, SCALE)
         if tc.component_in_reg(component):
             ratio = tc.ratio_k(operand)
             machine.events.append(
@@ -517,9 +525,13 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
                 (None,)
                 * (
                     tc.depths[component]
-                    * (tc.nm if component[0] == A else tc.nn)
+                    * (tc.nm if component.operand_index.value == A else tc.nn)
                     * tc.num_k_slots
-                    * (tc.ratio_k(component[0]) if component[1] else 1)
+                    * (
+                        tc.ratio_k(component.operand_index.value)
+                        if component.is_scale.value
+                        else 1
+                    )
                 )
                 if component in tc.active_components()
                 and not tc.component_via_lds(component)
@@ -580,13 +592,17 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         for component in tc.active_components()
         for mini in range(
             0,
-            tc.nm if component[0] == A else tc.nn,
-            tc.ratio_non_k(component[0]) if component[1] else 1,
+            tc.nm if component.operand_index.value == A else tc.nn,
+            (
+                tc.ratio_non_k(component.operand_index.value)
+                if component.is_scale.value
+                else 1
+            ),
         )
         for tile in range(
             0,
             num_k,
-            tc.ratio_k(component[0]) if component[1] else 1,
+            tc.ratio_k(component.operand_index.value) if component.is_scale.value else 1,
         )
     }
     assert machine.loads == expected
@@ -731,7 +747,7 @@ def test_depth_two_direct_component_ds_reads_after_same_step_fill(
     component, register_mask, monkeypatch
 ):
     depths = [3, 3, 3, 3]
-    depths[COMPONENTS.index(component)] = 2
+    depths[component.index()] = 2
     tc = _Config(
         WaitCommitScheme.PER_STAGE_WHOLE,
         tuple(depths),
@@ -1009,7 +1025,9 @@ def _straight_line_waits(schedule, tc, last):
             if step >= 0 and not per_tile:
                 vector.append(immediate(required(step, panel)))
             for group in schedule.commits(index, panel):
-                committed.append(tuple((step, c, t) for c, t in group))
+                committed.append(
+                    tuple((step, cs.component, cs.index.value) for cs in group)
+                )
         if step >= 0 and not per_tile:
             waits[step] = tuple(vector)
     return waits
@@ -1075,16 +1093,17 @@ def test_every_payload_tile_is_filled_exactly_once(nm, nn, middle):
         schedule.buffer_load_panels_valid
     ), "ownership is not a valid mapping"
     for component in COMPONENTS:
-        num_slots = nm if component[0] == A else nn
+        operand = component.operand_index.value
+        num_slots = nm if operand == A else nn
         loaded_slots = [
             slot
             for panel in range(nm * nn)
             for slot in (
-                schedule.buffer_load_slots(panel)[COMPONENTS.index(component)],
+                schedule.buffer_load_slots(panel)[component.index()],
             )
             if slot is not None
         ]
-        ratio = tc.ratio_non_k(component[0]) if component[1] else 1
+        ratio = tc.ratio_non_k(operand) if component.is_scale.value else 1
         expected = [t for t in range(num_slots) if t % ratio == 0]
         assert sorted(loaded_slots) == expected, (
             component,
@@ -1107,21 +1126,28 @@ def test_scale_fill_mid_moves_only_the_scale_buffer_load_panels(shape):
     on_schedule = Schedule(on, on, on.BLOCK_K)
     nm, nn = shape
     for component in (A_PAYLOAD, B_PAYLOAD):
-        slots = range(nm if component[0] == A else nn)
-        assert [off_schedule.buffer_load_panel(component, t) for t in slots] == [
-            on_schedule.buffer_load_panel(component, t) for t in slots
+        slots = range(nm if component.operand_index.value == A else nn)
+        assert [
+            off_schedule.buffer_load_panel(CompSlot(component, t)) for t in slots
+        ] == [
+            on_schedule.buffer_load_panel(CompSlot(component, t)) for t in slots
         ], component
     for component in COMPONENTS:
-        slots = range(nm if component[0] == A else nn)
-        assert [off_schedule.ds_read_panel(component, t) for t in slots] == [
-            on_schedule.ds_read_panel(component, t) for t in slots
+        operand, is_scale = component.operand_index.value, component.is_scale.value
+        slots = range(nm if operand == A else nn)
+        assert [off_schedule.ds_read_panel(CompSlot(component, t)) for t in slots] == [
+            on_schedule.ds_read_panel(CompSlot(component, t)) for t in slots
         ], component
-        assert off.ds_read_in_mfma(*component) == on.ds_read_in_mfma(*component)
+        assert off.ds_read_in_mfma(operand, is_scale) == on.ds_read_in_mfma(
+            operand, is_scale
+        )
 
-    scale_off = [off_schedule.buffer_load_panel(A_SCALE, t) for t in range(nm)]
-    scale_on = [on_schedule.buffer_load_panel(A_SCALE, t) for t in range(nm)]
-    b_off = [off_schedule.buffer_load_panel(B_SCALE, t) for t in range(nn)]
-    b_on = [on_schedule.buffer_load_panel(B_SCALE, t) for t in range(nn)]
+    scale_off = [
+        off_schedule.buffer_load_panel(CompSlot(A_SCALE, t)) for t in range(nm)
+    ]
+    scale_on = [on_schedule.buffer_load_panel(CompSlot(A_SCALE, t)) for t in range(nm)]
+    b_off = [off_schedule.buffer_load_panel(CompSlot(B_SCALE, t)) for t in range(nn)]
+    b_on = [on_schedule.buffer_load_panel(CompSlot(B_SCALE, t)) for t in range(nn)]
     if shape == (2, 2):
         # The guarded case: A scale already owns the middle panels, so only B moves.
         assert scale_off == scale_on == [1, 2]

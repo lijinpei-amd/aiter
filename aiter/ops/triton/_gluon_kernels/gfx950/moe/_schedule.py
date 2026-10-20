@@ -11,7 +11,7 @@ from triton.language.core import _aggregate as aggregate
 
 from ._lang import maybe_unwrap as _v
 from ._lang import strip_annotate
-from ._types import COMPONENTS, A
+from ._types import COMPONENTS, A, CompSlot
 
 __all__ = ["Schedule"]
 
@@ -50,11 +50,13 @@ def _payload_buffer_load_panels(nm, nn):
 
 
 @gluon.constexpr_function
-def _by_panel_index(panel_index_of, keys, num_panels):
+def _by_panel_index(panel_index_of, comp_slots, num_panels):
     slot_of = {}
-    for (component_index, slot), panel_index in panel_index_of.items():
-        if (component_index, slot) in keys:
-            slot_of.setdefault((panel_index, component_index), slot)
+    for comp_slot, panel_index in panel_index_of.items():
+        if comp_slot in comp_slots:
+            slot_of.setdefault(
+                (panel_index, comp_slot.component.index()), comp_slot.index.value
+            )
     return tuple(
         tuple(
             slot_of.get((panel_index, component_index))
@@ -65,17 +67,19 @@ def _by_panel_index(panel_index_of, keys, num_panels):
 
 
 @gluon.constexpr_function
-def _panel_index_of(by_panel_index, component, slot):
-    component_index = _component_index(component)
+def _panel_index_of(by_panel_index, comp_slot):
+    component_index = comp_slot.component.index()
     for panel_index, slots in enumerate(by_panel_index):
-        if slots[component_index] == slot:
+        if slots[component_index] == comp_slot.index.value:
             return panel_index
     return None
 
 
 @gluon.constexpr_function
 def _steps_per_buffer(scale_steps_per_buffer, component, axis):
-    return scale_steps_per_buffer[component[0]][axis] if component[1] else 1
+    if not component.is_scale.value:
+        return 1
+    return scale_steps_per_buffer[component.operand_index.value][axis]
 
 
 @gluon.constexpr_function
@@ -239,9 +243,12 @@ class Schedule:
         num_k = layout.num_k_tiles(K)
 
         component_present = tuple(
-            not is_scale or bool(fc.has_scale(op)) for op, is_scale in COMPONENTS
+            not c.is_scale.value or bool(fc.has_scale(c.operand_index.value))
+            for c in COMPONENTS
         )
-        num_buffers = tuple(tc.num_buffers(op, is_scale) for op, is_scale in COMPONENTS)
+        num_buffers = tuple(
+            tc.num_buffers(c.operand_index.value, c.is_scale.value) for c in COMPONENTS
+        )
         scale_steps_per_buffer = _v(layout.scale_steps_per_buffer)
         buffer_live_span = tuple(
             (d - 1) * _steps_per_buffer(scale_steps_per_buffer, c, 1) + 1
@@ -276,26 +283,26 @@ class Schedule:
             ((1, 2), (1, 2)) if fill_mid else (a_panels, b_panels)
         )
         slots = {
-            (component_index, slot)
-            for component_index, (op, _) in enumerate(COMPONENTS)
-            for slot in range(nm if op == A else nn)
+            CompSlot(c, slot)
+            for c in COMPONENTS
+            for slot in range(nm if c.operand_index.value == A else nn)
         }
         non_k_ratio = tuple(
             _steps_per_buffer(scale_steps_per_buffer, c, 0) for c in COMPONENTS
         )
         first_slots = {
-            (component_index, slot)
-            for component_index, slot in slots
-            if component_present[component_index]
-            and slot % non_k_ratio[component_index] == 0
+            comp_slot
+            for comp_slot in slots
+            if component_present[comp_slot.component.index()]
+            and comp_slot.index.value % non_k_ratio[comp_slot.component.index()] == 0
         }
         buffer_load_panel = {
-            (component_index, slot): panel_index
-            for component_index, (op, is_scale) in enumerate(COMPONENTS)
+            CompSlot(c, slot): panel_index
+            for c in COMPONENTS
             for slot, panel_index in enumerate(
-                (a_scale_panels if op == A else b_scale_panels)
-                if is_scale
-                else (a_panels if op == A else b_panels)
+                (a_scale_panels if c.operand_index.value == A else b_scale_panels)
+                if c.is_scale.value
+                else (a_panels if c.operand_index.value == A else b_panels)
             )
         }
         buffer_load_panels_valid = (
@@ -306,22 +313,22 @@ class Schedule:
             )
             and len(
                 {
-                    (key[0], panel_index)
-                    for key, panel_index in buffer_load_panel.items()
+                    (comp_slot.component, panel_index)
+                    for comp_slot, panel_index in buffer_load_panel.items()
                 }
             )
             == len(buffer_load_panel)
         )
         buffer_load_slots = _by_panel_index(buffer_load_panel, first_slots, num_panels)
         ds_read_panel, ds_read_in_mfma = {}, {}
-        for component_index, (op, is_scale) in enumerate(COMPONENTS):
+        for c in COMPONENTS:
+            op, is_scale = c.operand_index.value, c.is_scale.value
             payload_panels = a_panels if op == A else b_panels
             for slot in range(len(payload_panels)):
-                key = (component_index, slot)
+                key = CompSlot(c, slot)
                 ds_read = payload_panels[slot]
                 same_step = (
-                    layout.component_in_reg((op, is_scale))
-                    and load_to_mfma_distance[component_index] == 1
+                    layout.component_in_reg(c) and load_to_mfma_distance[c.index()] == 1
                 )
                 if (
                     same_step
@@ -341,7 +348,7 @@ class Schedule:
                     assert ds_read > buffer_load or (
                         ds_read == buffer_load and ds_read_in_mfma[key]
                     ), (
-                        f"component {(op, is_scale)} is in registers at F == 1, so "
+                        f"component {c} is in registers at F == 1, so "
                         f"its DS read of slot {slot} (panel {ds_read}) must follow "
                         f"the same step's buffer load (panel {buffer_load})"
                     )
@@ -398,10 +405,10 @@ class Schedule:
         self._ds_read_in_mfma = gl.constexpr(
             tuple(
                 tuple(
-                    ds_read_in_mfma[(component_index, slot)]
-                    for slot in range(nm if op == A else nn)
+                    ds_read_in_mfma[CompSlot(c, slot)]
+                    for slot in range(nm if c.operand_index.value == A else nn)
                 )
-                for component_index, (op, _) in enumerate(COMPONENTS)
+                for c in COMPONENTS
             )
         )
         self._buffer_load_slots = gl.constexpr(buffer_load_slots)
@@ -574,11 +581,11 @@ class Schedule:
 
     @gluon.constexpr_function
     def active(self, step, component):
-        return self._active.value[step][_component_index(component)]
+        return self._active.value[step][component.index()]
 
     @gluon.constexpr_function
     def loads(self, step, component):
-        return self._loads.value[step][_component_index(component)]
+        return self._loads.value[step][component.index()]
 
     @gluon.constexpr_function
     def issued(self, step, panel_index):
@@ -604,7 +611,8 @@ class Schedule:
     def commits(self, step, panel_index):
         return tuple(
             tuple(
-                (COMPONENTS[component_index], slot) for component_index, slot in group
+                CompSlot(COMPONENTS[component_index], slot)
+                for component_index, slot in group
             )
             for group in self._commits.value[step][panel_index]
         )
@@ -620,11 +628,11 @@ class Schedule:
 
     @gluon.constexpr_function
     def component_present(self, component):
-        return self._component_present.value[_component_index(component)]
+        return self._component_present.value[component.index()]
 
     @gluon.constexpr_function
     def num_buffers(self, component):
-        return self._num_buffers.value[_component_index(component)]
+        return self._num_buffers.value[component.index()]
 
     @gluon.constexpr_function
     def steps_per_buffer(self, component):
@@ -632,19 +640,20 @@ class Schedule:
 
     @gluon.constexpr_function
     def load_to_mfma_distance(self, component):
-        return self._load_to_mfma_distance.value[_component_index(component)]
+        return self._load_to_mfma_distance.value[component.index()]
 
     @gluon.constexpr_function
-    def buffer_load_panel(self, component, slot):
-        return _panel_index_of(self._buffer_load_slots.value, component, slot)
+    def buffer_load_panel(self, comp_slot):
+        return _panel_index_of(self._buffer_load_slots.value, comp_slot)
 
     @gluon.constexpr_function
-    def ds_read_panel(self, component, slot):
-        return _panel_index_of(self._ds_read_slots.value, component, slot)
+    def ds_read_panel(self, comp_slot):
+        return _panel_index_of(self._ds_read_slots.value, comp_slot)
 
     @gluon.constexpr_function
-    def ds_read_in_mfma(self, component, slot):
-        return self._ds_read_in_mfma.value[_component_index(component)][slot]
+    def ds_read_in_mfma(self, comp_slot):
+        component_index = comp_slot.component.index()
+        return self._ds_read_in_mfma.value[component_index][comp_slot.index.value]
 
     @gluon.constexpr_function
     def buffer_load_slots(self, panel_index):
@@ -652,7 +661,7 @@ class Schedule:
 
     @gluon.constexpr_function
     def ds_read_slot(self, panel_index, component):
-        return self._ds_read_slots.value[panel_index][_component_index(component)]
+        return self._ds_read_slots.value[panel_index][component.index()]
 
     @gluon.constexpr_function
     def register_index(self, step, component, buffer_load=False):
@@ -694,12 +703,3 @@ class Schedule:
         first_producer = (start - producer_phase + ratio - 1) // ratio
         producer = (start + offset_step - producer_phase) // ratio
         return (producer - first_producer) * ratio
-
-
-@gluon.constexpr_function
-def _component_index(component):
-    key = (component[0], bool(component[1]))
-    for component_index, candidate in enumerate(COMPONENTS):
-        if candidate == key:
-            return component_index
-    raise AssertionError(f"{key} is not a component")
