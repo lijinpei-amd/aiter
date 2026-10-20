@@ -1309,9 +1309,9 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
     """Compare the commit and wait plans with a complete chronological simulation.
 
     The oracle records absolute K tiles and group sequence numbers, and does not use
-    the schedule's replay. It verifies direct-register DS reads against the
-    independent producer history; the buffered-pipeline oracle separately checks
-    exact ring-bank contents and overwrite safety.
+    the schedule's replay. A register component has no DS read: the oracle checks
+    that each MFMA reading one finds its copy already issued; the buffered-pipeline
+    oracle separately checks exact ring-bank contents and overwrite safety.
     """
     schedule = _schedule(tc, layout, num_k, epilogue_groups)
     nm = _plain(maybe_unwrap(layout.num_m_slots))
@@ -1382,14 +1382,14 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
         copy: pane for pane, copies in enumerate(buffer_load_panes) for copy in copies
     }
     ds_read_panes = [[] for _ in range(npanes)]
-    for copy, buffer_load_pane in buffer_load_pane_for.items():
+    for copy in buffer_load_pane_for:
         component, tile = copy
-        nominal = payload_panes[(Component(component.operand_index.value, False), tile)]
-        ds_read_pane = nominal
-        if not via_lds[component] and load_to_mfma_distances[component] == 1:
-            ds_read_pane = max(ds_read_pane, buffer_load_pane)
-        assert all(existing[0] != component for existing in ds_read_panes[ds_read_pane])
-        ds_read_panes[ds_read_pane].append(copy)
+        if not via_lds[component]:
+            continue
+        pane = payload_panes[(Component(component.operand_index.value, False), tile)]
+        assert all(existing[0] != component for existing in ds_read_panes[pane])
+        ds_read_panes[pane].append(copy)
+    register_copies = [copy for copy in buffer_load_pane_for if not via_lds[copy[0]]]
     for pane, expected in enumerate(buffer_load_panes):
         actual = schedule.buffer_load_slots(pane)
         assert (
@@ -1436,6 +1436,17 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
         # One immediate serves every execution of an emitted step, so this checks
         # each loop-body step once per loop iteration.
         assert schedule.wait(_executed_step(schedule, num_k, stage), pane) == expected
+
+    def mfma_reads_registers(stage):
+        # The MFMAs of `stage` read K tile `stage - 1`; a register value is consumed
+        # by the MFMA of its first tile.
+        read = stage - 1
+        for component, tile in register_copies:
+            if read % rs[component]:
+                continue
+            token = (read - load_to_mfma_distances[component] + 1, component, tile)
+            assert token in issued, "register MFMA operand read before its producer"
+            consumed.add(token)
 
     for stage in range(1 - depth, num_k):
         pending_stage = []
@@ -1494,43 +1505,35 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
                     group_for_copy[token] = len(committed)
                 committed.append(group)
 
-        def ds_read_pane(pane, after_fill, ds_read_stage=stage):
+        def ds_read_pane(pane, ds_read_stage=stage):
             for component, tile in ds_read_panes[pane]:
                 if ds_read_stage % rs[component]:
-                    continue
-                same_pane_fill = (
-                    not via_lds[component]
-                    and load_to_mfma_distances[component] == 1
-                    and buffer_load_pane_for[component, tile] == pane
-                )
-                if same_pane_fill != after_fill:
                     continue
                 token = (
                     ds_read_stage - load_to_mfma_distances[component] + 1,
                     component,
                     tile,
                 )
-                if via_lds[component]:
-                    ring = ds_read_stage // rs[component] % depths[component]
-                    assert lds[component, tile, ring] == ds_read_stage
-                else:
-                    assert token in issued, "register DS-read before its producer"
+                ring = ds_read_stage // rs[component] % depths[component]
+                assert lds[component, tile, ring] == ds_read_stage
                 consumed.add(token)
 
         if stage < 0:
             for pane in range(npanes):
                 fill_pane(pane)
+        if stage >= 1:
+            mfma_reads_registers(stage)
         if stage >= 0:
             if per_stage:
                 check_wait(stage, None)
             for pane in range(npanes):
                 if not per_stage:
                     check_wait(stage, pane)
-                ds_read_pane(pane, False)
+                ds_read_pane(pane)
                 fill_pane(pane)
-                ds_read_pane(pane, True)
         if stage == main:
             committed.extend(() for _ in range(epilogue_groups))
+    mfma_reads_registers(num_k)
     expected_loads = {
         (target - load_to_mfma_distances[component] + 1, component, tile)
         for ops in buffer_load_panes

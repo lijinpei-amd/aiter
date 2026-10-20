@@ -347,8 +347,8 @@ class TuningSpec(NamedTuple):
     #: and hence how many groups a ``wait_group`` count has to walk past.
     WAIT_COMMIT_SCHEME: int = int(WaitCommitScheme.PER_OP)
     #: DS-read each component in its pane's MFMA region rather than its memory
-    #: region. A register ring at F == 1 overrides it to the MFMA region in the pane
-    #: of its buffer load, since the DS read must follow that load.
+    #: region. Only LDS components have a DS read: the MFMA reads a register ring
+    #: itself, so the flag does nothing for a component in registers.
     DS_READ_A_PAYLOAD_IN_MFMA: bool = False
     DS_READ_A_SCALE_IN_MFMA: bool = False
     DS_READ_B_PAYLOAD_IN_MFMA: bool = False

@@ -435,13 +435,10 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
     )
     step_fn, buffer_load_fn = pipeline._step.fn, pipeline._buffer_load_pane.fn
     ds_read_pane_fn = pipeline._ds_read_pane.fn
-    ds_read_payload_fn = pipeline._ds_read_payload.fn
-    ds_read_scale_fn = pipeline._ds_read_scale.fn
 
     # Positional layouts: _step(pc, ptrs, buffers, regs, step, STEP),
     # _buffer_load_pane(pc, ptrs, buffers, step, STEP, mi, ni),
-    # _ds_read_pane(pc, buffers, step, STEP, mi, ni, MFMA),
-    # _ds_read_payload/_ds_read_scale(pc, buffers, step, STEP, slot, operand).
+    # _ds_read_pane(pc, step, STEP, mi, ni, MFMA).
     def step(*args, **kwargs):
         assert machine.wait is None, "a wait guarded no read"
         machine.current_read = args[4]
@@ -457,47 +454,13 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         return buffer_load_fn(*args, **kwargs)
 
     def ds_read_pane(*args, **kwargs):
-        if not args[6]:  # the pane's first read, right after its wait
-            pane = Pane(args[4], args[5]).linear_index(tc.nm)
+        if not args[5]:  # the pane's first read, right after its wait
+            pane = Pane(args[3], args[4]).linear_index(tc.nm)
             if not per_tile:
                 machine.check_wait(pane)
             elif pane == 0:
                 machine.check_wait(None)
         return ds_read_pane_fn(*args, **kwargs)
-
-    def ds_read_payload(*args, **kwargs):
-        component = Component(args[5], PAYLOAD)
-        if tc.component_in_reg(component):
-            machine.events.append(
-                (
-                    machine.current_read,
-                    machine.current_in_loop,
-                    machine.current_drain,
-                    "ds_read",
-                    component,
-                    machine.current_read,
-                    args[4],
-                )
-            )
-        return ds_read_payload_fn(*args, **kwargs)
-
-    def ds_read_scale(*args, **kwargs):
-        operand = args[5]
-        component = Component(operand, SCALE)
-        if tc.component_in_reg(component):
-            r = tc.scale_r(operand)
-            machine.events.append(
-                (
-                    machine.current_read,
-                    machine.current_in_loop,
-                    machine.current_drain,
-                    "ds_read",
-                    component,
-                    machine.current_read - machine.current_read % r,
-                    args[4],
-                )
-            )
-        return ds_read_scale_fn(*args, **kwargs)
 
     def check_assumption(value):
         assert value
@@ -561,8 +524,6 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         patch.setattr(pipeline, "_step", step)
         patch.setattr(pipeline, "_buffer_load_pane", buffer_load)
         patch.setattr(pipeline, "_ds_read_pane", ds_read_pane)
-        patch.setattr(pipeline, "_ds_read_payload", ds_read_payload)
-        patch.setattr(pipeline, "_ds_read_scale", ds_read_scale)
         patch.setattr(pipeline, "_init_buffers", init_buffers)
         patch.setattr(pipeline, "_maybe_block_dot", machine.dot)
         patch.setattr(
@@ -743,9 +704,14 @@ def _assert_direct_b_stage_barriers(machine):
     ],
     ids=["a-payload", "a-scale", "b-payload", "b-scale"],
 )
-def test_depth_two_direct_component_ds_reads_after_same_step_fill(
+def test_depth_two_direct_component_mfma_reads_its_ring(
     component, register_mask, monkeypatch
 ):
+    """At depth two a register component has F == 1 and no DS read.
+
+    Its copy of tile ``t`` lands at step ``t``, and the MFMA of step ``t + 1`` reads
+    it from the ring itself; the machine's MFMA check rejects a stale fragment.
+    """
     depths = [3, 3, 3, 3]
     depths[component.index()] = 2
     tc = _Config(
@@ -754,55 +720,37 @@ def test_depth_two_direct_component_ds_reads_after_same_step_fill(
         register_mask,
         unroll=2,
     )
+    assert Schedule(tc, tc, tc.BLOCK_K).load_to_mfma_distance(component) == 1
     num_k = tc.minimum_num_k() + 1
     machine = _execute(tc, num_k, monkeypatch)
 
-    ds_reads = [
-        (pos, event)
-        for pos, event in enumerate(machine.events)
-        if event[3] == "ds_read" and event[4] == component
+    loads = [
+        (event_read, tile)
+        for event_read, _, _, op, loaded, tile, _ in machine.events
+        if op == "load" and loaded == component
     ]
-    assert ds_reads
-    for ds_read_pos, ds_read in ds_reads:
-        event_read, _, _, _, _, tile, mini = ds_read
-        matching_loads = [
-            pos
-            for pos, event in enumerate(machine.events[:ds_read_pos])
-            if event[0] == event_read
-            and event[3] == "load"
-            and event[4:] == (component, tile, mini)
-        ]
-        assert matching_loads, "F=1 direct DS read must follow its same-step fill"
+    assert loads
+    assert all(event_read == tile for event_read, tile in loads)
 
 
-@pytest.mark.parametrize("read_mask", [0, 8], ids=["configured-mem", "configured-mfma"])
-def test_middle_direct_b_scale_defers_tile_zero_and_preserves_order(
-    read_mask, monkeypatch
-):
-    tc = _Config(
-        WaitCommitScheme.PER_STAGE_WHOLE,
-        (3, 3, 3, 2),
-        4,
-        middle=True,
-        read_mask=read_mask,
-    )
-    num_k = tc.minimum_num_k() + 1
-    machine = _execute(tc, num_k, monkeypatch)
+def test_middle_direct_b_scale_ignores_ds_read_placement(monkeypatch):
+    """DS_READ_B_SCALE_IN_MFMA changes nothing for a B scale in registers.
 
-    for event_read in range(num_k):
-        events = [
-            (pos, event)
-            for pos, event in enumerate(machine.events)
-            if event[0] == event_read and event[4] == B_SCALE
-        ]
-        ds_reads = [(pos, event) for pos, event in events if event[3] == "ds_read"]
-        assert [event[6] for _, event in ds_reads] == [0, 1]
-        tile_zero_load = next(
-            pos
-            for pos, event in events
-            if event[3] == "load" and event[5:] == (event_read, 0)
+    With SCALE_FILL_MID the B scale is copied at panes 1 and 2, not with the B payload
+    at panes 0 and 3. At depth two (F == 1) the next step's MFMA reads each copy
+    straight from the ring, so the configured DS-read region does not enter.
+    """
+    streams = []
+    for read_mask in (0, 8):
+        tc = _Config(
+            WaitCommitScheme.PER_STAGE_WHOLE,
+            (3, 3, 3, 2),
+            4,
+            middle=True,
+            read_mask=read_mask,
         )
-        assert tile_zero_load < ds_reads[0][0]
+        streams.append(_execute(tc, tc.minimum_num_k() + 1, monkeypatch).events)
+    assert streams[0] == streams[1]
 
 
 @pytest.mark.parametrize("component,register_mask", [(A_SCALE, 2), (B_SCALE, 4)])
