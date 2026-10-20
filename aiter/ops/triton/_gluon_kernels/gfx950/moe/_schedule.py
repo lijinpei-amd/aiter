@@ -11,7 +11,7 @@ from triton.language.core import _aggregate as aggregate
 
 from ._lang import maybe_unwrap as _v
 from ._lang import strip_annotate
-from ._types import COMPONENTS, A, CompSlot
+from ._types import A, A_PAYLOAD, B_PAYLOAD, COMPONENTS, CompSlot
 
 __all__ = ["Schedule"]
 
@@ -39,14 +39,11 @@ def _payload_buffer_load_order(nm, nn):
 
 
 @gluon.constexpr_function
-def _payload_buffer_load_panes(nm, nn):
+def _payload_buffer_load_pane(nm, nn, operand_index, slot):
     if nm > 1 and nn > 1:
         order = _payload_buffer_load_order(nm, nn)
-        return (
-            tuple(order.index((1, slot)) for slot in range(nm)),
-            tuple(order.index((0, slot)) for slot in range(nn)),
-        )
-    return tuple(range(nm)), tuple(range(nn))
+        return order.index((1 if operand_index == A else 0, slot))
+    return slot
 
 
 @gluon.constexpr_function
@@ -285,11 +282,7 @@ class Schedule:
         assert k_unroll >= 1, "K_UNROLL must be at least 1"
         unroll = math.lcm(k_unroll, buffer_period)
 
-        a_panes, b_panes = _payload_buffer_load_panes(nm, nn)
         fill_mid = bool(_v(tc.SCALE_FILL_MID)) and nm == 2 and nn == 2
-        a_scale_panes, b_scale_panes = (
-            ((1, 2), (1, 2)) if fill_mid else (a_panes, b_panes)
-        )
         slots = {
             CompSlot(c, slot)
             for c in COMPONENTS
@@ -304,14 +297,15 @@ class Schedule:
             if component_present[comp_slot.component.index()]
             and comp_slot.index.value % non_k_ratio[comp_slot.component.index()] == 0
         }
+        # The pane index that issues each component slot's buffer load.
         buffer_load_pane = {
-            CompSlot(c, slot): pane_index
-            for c in COMPONENTS
-            for slot, pane_index in enumerate(
-                (a_scale_panes if c.operand_index.value == A else b_scale_panes)
-                if c.is_scale.value
-                else (a_panes if c.operand_index.value == A else b_panes)
+            CompSlot(c, slot): (
+                (1, 2)[slot]
+                if fill_mid and c.is_scale.value
+                else _payload_buffer_load_pane(nm, nn, c.operand_index.value, slot)
             )
+            for c in COMPONENTS
+            for slot in range(nm if c.operand_index.value == A else nn)
         }
         buffer_load_panes_valid = (
             set(buffer_load_pane) == slots
@@ -326,14 +320,15 @@ class Schedule:
             )
             == len(buffer_load_pane)
         )
+        # Per pane index, the slot of each component it buffer-loads, or None.
         buffer_load_slots = _by_pane_index(buffer_load_pane, first_slots, num_panes)
         ds_read_pane, ds_read_in_mfma = {}, {}
         for c in COMPONENTS:
             op, is_scale = c.operand_index.value, c.is_scale.value
-            payload_panes = a_panes if op == A else b_panes
-            for slot in range(len(payload_panes)):
+            payload = A_PAYLOAD if op == A else B_PAYLOAD
+            for slot in range(nm if op == A else nn):
                 key = CompSlot(c, slot)
-                ds_read = payload_panes[slot]
+                ds_read = buffer_load_pane[CompSlot(payload, slot)]
                 same_step = (
                     layout.component_in_reg(c) and load_to_mfma_distance[c.index()] == 1
                 )
