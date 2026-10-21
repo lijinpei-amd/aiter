@@ -53,6 +53,9 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import validate
 from aiter.ops.triton.moe import moe_op_gemm_gluon as host
+from op_tests.triton_tests.moe.test_moe_gemm_gluon_buffered_schedule import (
+    _assert_minimal_peel,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -1572,6 +1575,7 @@ def test_independent_buffer_waits_match_copy_history(
     # second commits output-epilogue copies before shallow queues finish filling.
     _audit_buffer_schedule(tc, layout, minimum)
     _audit_buffer_schedule(tc, layout, minimum + 3, epilogue_groups=2)
+    _assert_minimal_peel(_schedule(tc, layout, minimum), layout)
 
 
 @pytest.mark.parametrize("scheme", list(WaitCommitScheme))
@@ -1597,3 +1601,4 @@ def test_independent_buffer_schedule_without_scales(config, scheme, register_b, 
     minimum = _minimum(tc, layout)
     _audit_buffer_schedule(tc, layout, minimum)
     _audit_buffer_schedule(tc, layout, minimum + 3, epilogue_groups=2)
+    _assert_minimal_peel(_schedule(tc, layout, minimum), layout)

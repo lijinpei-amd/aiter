@@ -63,11 +63,9 @@ the prologue or the loop.
 
 `PER_PANE` commits one group per pane per step, and the per-stage schemes one per step,
 even when nothing was copied through LDS (PIPELINE.md, Commit plan: "empty included").
-Empty groups make the compiler's wait counts conservative. `UpdateAsyncWaitCount`
-(Triton, `third_party/amd/lib/TritonAMDGPUTransforms/UpdateAsyncWaitCount.cpp`) turns
-`wait_group(n)` into a `vmcnt` by walking back `n + 1` commit groups and summing their
-LDS-copy instructions, taking the minimum over every control-flow path. An empty group
-uses up one of the `n` but adds no instruction.
+An empty group counts in a wait's immediate, but it repeats the previous asyncmark, so
+it moves no `vmcnt` on a straight path (PIPELINE.md, Wait plan). Dropping empty groups
+makes the plan simpler and the emitter commit exactly `commits`.
 
 Affected today (T0, emitted steps): only drain steps, once no LDS component copies any
 more. That covers the 10 production pins under `PER_STAGE_WHOLE` (a4w4, a8w4 and bf16 at
@@ -85,188 +83,105 @@ Plan, about half a day:
    (`commit_per_pane`, the prologue's `MARK_TILE`) and in `_step_live` (both per-stage
    commit points). Gate each on a non-empty `Schedule.commits(STEP, pane_index)`, so
    that the plan and the emitted program stay one.
-3. Waits: with a varying group count per step, a non-`PER_OP` scheme can have early steps
-   whose immediates differ from the steady ones, so `peeled` can exceed 1. The peeling
-   scan already handles it; check that `test_peeled_wait_prefix_is_minimal` still holds.
+3. Waits: with a varying group count per step, early steps can have immediates that
+   differ from the steady ones. The window peel already compares immediates; check that
+   `test_peeled_wait_prefix_is_minimal` still holds.
 4. Test oracles that assume a fixed group count per pane or step:
    `_audit_buffer_schedule` in `test_moe_gemm_gluon_config.py` and the symbolic machine
    in `test_moe_gemm_gluon_buffered_schedule.py`. Add a test that no step commits an
    empty group.
 5. Docs, PIPELINE.md: the Commit plan table ("empty included" three times, and "An empty
-   group still takes a FIFO slot"), the `PER_OP` bullet in Steps, step 2, and Peeling's
-   "Only `PER_OP` peels more than one step". Then delete this item.
+   group still takes a FIFO slot") and the Wait plan's empty-group bullet. Then delete
+   this item.
 
 Check:
 
 - T0: only the cases above change, in their commits and waits. T0b SAME.
-- Asm, the 20 production cells: confirm the claim first. Every changed
-  `s_waitcnt vmcnt` should be larger (less conservative), never smaller; count them.
-  Unaffected cells are identical.
+- Asm, the 20 production cells: no `s_waitcnt vmcnt` should change; count any that do.
+  Instruction order may still move where an empty asyncmark disappears.
 - The affected outputs are bit-identical, because only waits move. The suite has no new
   failures against the latest base.
 - If the loop's waits change, A/B in-process (`a8small/ab.sh`). Drain-only changes are
   unlikely to show up in timing; keep them for the simpler plan.
 
-## Peel on the copies in a wait's window, not only its group count
+## Keep a wait's immediate under 17 after a join
 
-Priority: low. Checked 2026-10-20 over all 35 T0 cases: at every loop wait, the window on
-the first iteration holds the same copies as in steady state, so no `peeled` changes.
-Two things would raise it: a config that breaks that, typically an LDS component with
-`F < depth` under `PER_PANE`, or wanting the constexpr time back. The peeling replay is
-skipped in 94% of the sweep's configs, and is at most `depth - 3 + async_period` steps
-long instead of `3 * depth + async_period`.
+Priority: high for any config that reaches it. No production pin does: their largest
+immediate is 11.
 
-The peeling scan compares each early step's wait immediate `n` (in commit groups) with
-its steady twin's. The compiler waits on a `vmcnt`, though. `UpdateAsyncWaitCount` sums
-the LDS-copy instructions in the `n` newest groups (the window) and takes the minimum
-over every control-flow path, and a loop-body wait has a path that enters the loop from
-the peeled steps and the prologue. If a window on that path holds fewer copies, because
-an LDS component with `F < depth` has not started copying, every iteration gets the
-smaller `vmcnt` even though `n` matches. The non-`PER_OP` schemes are the likely case:
-their `n` never changes, so they never peel. On the test grids only `PER_PANE` hits it
-(below).
+LLVM's `SIInsertWaitcnts` keeps the 16 newest asyncmarks where it merges paths
+(`mergeAsyncMarks`), but `recordAsyncMark` pushes with no cap, and `determineAsyncWait`
+clamps the immediate only while exactly 16 marks are held. After a join that dropped
+marks, one more commit leaves 17. A wait with an immediate `n >= 17` then finds no more
+than `n` marks and emits no `s_waitcnt vmcnt`, although the mark it needs was dropped by
+the merge, not retired. Found in review, 2026-10-21: in the kernel of
+`test_rectangular_read_schedule[4x2-PER_OP-none]` (`PER_OP`, 4x2 panes, bias and gammas
+staged through LDS), 16 of the 54 waits with `n >= 16` emit no `vmcnt`, for example a
+`wait_asyncmark(17)`. Immediates that large need `PER_OP` with many panes, where each
+copy is its own group.
 
-**Upper bound.** A wait is per pane (`PER_OP`, `PER_PANE`) or per step (per-stage). At
-step `x` it needs, for each LDS component `c` it DS-reads (`(x + 1) % R(c) == 0`), the
-copy issued at step `x + 1 - F(c)`.
+Options, safest first:
 
-1. History. The window starts right after the newest needed copy, the one with the
-   smallest `F` in the wait's set, and ends at the wait. So it lies in steps
-   `x + 1 - G(x) .. x`, where `G(x)` is the largest, over the waits of step `x`, of the
-   smallest `F` that wait needs. Both `n` and the window depend on the commits of these
-   steps only. `G` repeats every `async_period` steps. The most history a wait depends
-   on is `H = max G`, at most the largest LDS `F`, at most `depth`.
-2. First steady step. A step commits like the loop step at the same phase once every
-   LDS component is active (`x + F(c) >= 0`). Register components commit nothing. That
-   is every step from `y0 = -F_lds` on, where `F_lds` is the smallest `F` over the LDS
-   components. `F_lds >= 2`, so `y0 <= -2`. If every LDS component has `F = depth`,
-   `y0 = -depth` and every step commits like the loop, as in all of today's T0 cases
-   under non-`PER_OP` schemes.
-3. Bound. Step `x`'s window matches the steady one if it starts at `y0` or later:
-   `x + 1 - G(x) >= y0`, that is `x >= G(x) - 1 - F_lds`. Every step from `peeled_f` on
-   passes:
+1. In `Schedule`, clamp every wait immediate after a join (remainder and drain) to 15,
+   as LLVM does with exactly 16 marks held. It stays safe: waiting on a newer group
+   retires the older ones in order. It tightens only waits above 15.
+2. Fix LLVM: remember that a merge dropped marks, and clamp `N` to the marks held minus
+   one. Report it upstream either way.
+3. Reject configs whose waits exceed 15 in `validate_pipeline`.
 
-   ```
-   peeled_f = max(1, 1 + max{x >= 0 : x < G(x) - 1 - F_lds})
-   ```
+Check: in that kernel's asm every `wait_asyncmark` gets a `vmcnt`; production asm is
+unchanged; the suite passes.
 
-   Since `G(x) <= H`, `peeled_f <= max(1, H - 1 - F_lds) <= max(1, depth - 3)`.
+## Emit only this `K`'s remainder steps and drain phase
 
-The bound is not tight. It counts all of step `s = x + 1 - G(x)` as inside the window,
-but the window starts after the needed copy's group, inside step `s`.
+Priority: low. It costs a few loads once per tile.
 
-- Under `PER_OP` and `PER_PANE`, the groups committed before it in step `s` are outside
-  the window: earlier panes, and under `PER_OP` also earlier components of its pane. A
-  copy missing there does not matter.
-- Under the per-stage schemes, the needed copy's group is all of step `s`, so the tight
-  rule is `x >= G(x) - 2 - F_lds`. The grid never has `G(x) > F_lds + 1` there, so both
-  rules give 1.
+The static remainder emits `unroll - 1` steps, each behind a runtime `if`, and the
+static drain one copy per value of `main % buffer_period`, behind `if phase == p`. LLVM
+merges the asyncmarks over every path through them (PIPELINE.md, Wait plan), including
+remainder counts this `K` never runs. With a component at `R > 1`, an odd count moves
+that component's copies by one step, so the merge lowers some executed waits.
 
-A tight closed form for the per-pane schemes needs the commit order inside a step, which
-`_replay` already walks. The gap grows with `async_period`: `G(x)` peaks once per
-`async_period` steps, so wrongly failing a peak step can move the last failing step by
-up to `async_period`. That bound is observed, not proven.
+Measured 2026-10-21 with a model of LLVM's asyncmark merge over the real control flow,
+which reproduces all 187 asyncmark waits of the 11 distinct production kernels:
 
-**Tight peel factor.** Replay only the candidates below the bound:
+- Prod a8w8 T1024/T4096 (`PER_OP`, LDS scales at `R = 2`, `rem = 2`): 7 of the 24 drain
+  waits get `vmcnt` 17-22 where this `K` needs 20-25, or no wait for 3 of them.
+- The same pin under `PER_STAGE_WHOLE` emits `vmcnt(12)` at remainder step 1, where 16
+  is needed.
+- At `R = 1` nothing changes: every other production cell, and every static drain
+  (`buffer_period <= 3` rules out `R > 1`). In T0, only the three `R > 1` cases.
+- The loop-skip path changes no wait. LLVM keeps the zero-trip guard only in the
+  static-drain kernels (a8w4 and a8w8 T16-T256, all bf16).
 
-1. If `peeled_f == 1`, then `peeled = 1`, with no peeling replay: the only candidate,
-   step 0, is always peeled.
-2. Otherwise, replay the prologue, the warm-up and steps
-   `0 .. peeled_f + async_period - 1`, so `settled = peeled_f + async_period`. Steps
-   from `peeled_f` on are steady, and windows repeat every `async_period` steps. So the
-   twin of a candidate `x < peeled_f` is the step in
-   `[peeled_f, peeled_f + async_period - 1]` congruent to `x` modulo `async_period`.
-3. Peel through the last candidate whose `(n, window)` differs from its twin's.
+Peeling cannot fix this: these are not loop steps.
 
-Checked 2026-10-20 with a throwaway sweep over 17920 configs: 4 schemes, 7 ring-depth
-sets, 5 pane shapes, both `middle`, 16 placements, 4 `R` mixes. 1120 of them have no
-LDS component.
+Plan: `K` is constexpr and the host passes `NUM_K = num_k_tiles(K)` (Wait plan,
+Precondition), so `rem` and `main % buffer_period` are compile-time values. Emit exactly
+this `K`'s `rem` remainder steps and its drain phase, without the runtime `if`s, which
+also drops their dead code. Nesting the `if`s is not enough: it keeps the odd counts.
+`NUM_K` is a runtime argument on purpose
+(`test_num_k_is_a_runtime_scalar_without_specialization`), so decide whether the kernel
+asserts `NUM_K == num_k_tiles(K)` or keeps a runtime path for other values.
 
-- The two-stage peel equals the exact one in all 16800 configs with an LDS component.
-  The exact peel compares each step with a steady step far out.
-- The replay is skipped in 15864 of them. When it runs, it reaches at most step 15.
-- The bound alone peels too many steps as follows. The columns count configs per
-  scheme, for `PER_OP` and `PER_PANE` each; the per-stage schemes are exact throughout.
-  The uniform bound `H - 1 - F_lds` peels 1-5 steps too many in 928 configs.
+Check: in prod a8w8 T1024 the 7 drain waits rise to the executed path's `vmcnt`, no
+other production kernel's waits change, the outputs stay bit-identical and the suite
+passes.
 
-  | `async_period` | configs | exact | +1 | +2 | +3 | +4 |
-  |---|---|---|---|---|---|---|
-  | 1 | 1960 | 1910 | 50 | - | - | - |
-  | 2 | 1120 | 1080 | 20 | 20 | - | - |
-  | 4 | 1120 | 1080 | 24 | 2 | 4 | 10 |
+## Count register buffer loads in a wait's `vmcnt`: verify, then drop
 
-- The exact window peel exceeds today's `peeled` only under `PER_PANE`, in 414 of 4200
-  configs. `PER_OP` and the per-stage schemes never exceed it.
+This item assumed that Triton's `UpdateAsyncWaitCount` sets the `vmcnt` and counts only
+direct-to-LDS copies, so a wait would block on every register `buffer_load` issued after
+its needed copy. On gfx950 that pass skips its count: Triton lowers waits to LLVM
+asyncmarks, and LLVM's `vmcnt` counts every load after the needed group's last LDS
+copy, register loads included (PIPELINE.md, Wait plan).
 
-Example: `PER_PANE`, 2x2, ring depths `(2, 4, 6, 3)`, all through LDS, both scales at
-`R = 2`, so `F = (2, 7, 6, 5)`, `F_lds = 2` and `y0 = -2`. A B pane needs the B payload
-(`F = 6`), plus the B scale (`F = 5`) on scale steps, so `G` alternates between 6 and 5
-and `H = 6`. Steps 0, 1 and 2 fail the bound and differ from their twins, so
-`peeled = 3`. Today it is 1.
+Evidence, 2026-10-21: in prod a8w4 T1024, B payload in registers, each loop step issues
+12 LDS-copy instructions and 8 register `buffer_load`s, and its `wait_group(1)` becomes
+`vmcnt(20)`. A model of LLVM's asyncmark merge that counts register loads reproduces all
+187 asyncmark waits of the 11 distinct production kernels.
 
-Plan, about 3 hours:
-
-1. In `_replay`, return each wait's window next to its immediate: the multiset of
-   `(component_index, slot)` copies in the `n` newest groups, per pane or per step.
-2. In `Schedule.__init__`, compute `F_lds`, `G(x)` over one `async_period` (from
-   `ds_read_slots`, the DS-read phases and `F`) and `peeled_f`. Then run the two-stage
-   peel above, and assert `peeled <= peeled_f`. This replaces the scan over
-   `[0, depth - 3]` and `settled = 3 * depth + async_period`.
-3. Remainder and drain waits also have a path that skips the loop, since the compiler
-   does not know `iters >= 1`. Check whether those windows differ, and record the
-   result here if peeling cannot fix them.
-4. Tests: over the grids of `test_peeled_wait_prefix_is_minimal`
-   (`test_moe_gemm_gluon_buffered_schedule.py`: commit schemes, register masks, `R`) and
-   `test_independent_buffer_waits_match_copy_history` (`test_moe_gemm_gluon_config.py`:
-   ring depths, placements), assert that:
-   - the first-iteration window of every loop wait equals the steady one;
-   - `peeled` equals the exact peel from a comparison against far steady steps;
-   - `peeled <= peeled_f`.
-5. Docs: PIPELINE.md's Peeling (the rule, and "Bounds", including "The code uses
-   `3 * depth + async_period`") and Steps, step 2. Then delete this item.
-
-Check:
-
-- `tests/gate.sh <label> --fast`: T0 SAME (it prints `peeled` and the waits), T1 passes.
-- `tests/gate.sh <label>`: T2d asm x20 SAME.
-- A throwaway sweep over the two test grids lists the configs whose `peeled` grows. For
-  one of them, the loop's `s_waitcnt vmcnt` in the asm matches the steady value only
-  with the change.
-
-## Count register buffer loads in a wait's `vmcnt`
-
-The hardware `vmcnt` counts every outstanding vector-memory load, but
-`UpdateAsyncWaitCount` counts only the direct-to-LDS ones (its header: "We ignore loads
-to registers since we do not control the vectorization"). Take a wait whose needed copy
-is followed by `n_lds` newer LDS-copy instructions and `n_reg` newer register
-`buffer_load`s. The safe `vmcnt` is `n_lds + n_reg`, but the pass emits `n_lds`. Loads
-retire in order, so the wait blocks on `n_reg` more loads than the DS read needs. This
-happens in the loop, so it costs every iteration.
-
-Affected today (T0): the production pins a8w4 T1024 and T4096 (B payload in registers,
-`F = 2`), and the T0 cases `breg`, `ascale-reg`, `bscale-reg` and `bscale-reg-d2`.
-
-Plan, about half a day to measure; the fix depends on step 2:
-
-1. Measure: in the asm of prod-a8w4-t1024, for each loop `s_waitcnt vmcnt(N)`, count
-   the LDS and register loads issued between its needed copy and the wait, and compare
-   `N` with `n_lds + n_reg`. If they already match, record that here and drop the item.
-2. Bound the gain: raise the loop's `vmcnt`s to the safe values by hand in the
-   `.amdgcn` (`TRITON_KERNEL_OVERRIDE=1`, `TRITON_OVERRIDE_DIR`), then A/B in-process
-   against the unpatched kernel (`a8small/ab.sh`, `BLOCK=40 WARM=15`). Stop here if it
-   does not win beyond noise.
-3. Fix, preferred first:
-   - Upstream: let the pass count `amdgpu.buffer_load` to registers as well. Its
-     instruction count is fixed by the lowering, the same way the pass already counts
-     `BufferLoadToLocalOp`.
-   - Locally: Gluon's `wait_group` takes only a group count, so a local fix needs a raw
-     `vmcnt` wait. That means duplicating the lowering's instruction counts.
-4. Docs: a note in PIPELINE.md's Wait plan that the immediate in groups is not the
-   final `vmcnt`. Then delete this item.
-
-Check:
-
-- In the affected cells' asm, every changed loop `vmcnt` rises to `n_lds + n_reg` and
-  none goes above it, since that would be a race. Other cells are identical.
-- The affected outputs are bit-identical; the suite has no new failures.
-- The in-process A/B on a8w4 T1024 and T4096 wins beyond noise.
+To close it, about 30 minutes: compile the T0 register cases `breg`, `ascale-reg`,
+`bscale-reg` and `bscale-reg-d2`, and check that each loop `s_waitcnt vmcnt(N)` after a
+`; wait_asyncmark(n)` equals the LDS-copy plus register-load instructions issued after
+its needed group's last LDS copy. If they all do, delete this item.

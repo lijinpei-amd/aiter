@@ -124,16 +124,15 @@ Two more reasons peel the first main steps, `peeled >= 1` of them:
 
 - Step 0's MFMA accumulates into zeros. Out of the loop, the compiler sees the zero
   accumulator.
-- Under `PER_OP`, an early step can need a smaller wait immediate than later iterations
-  of its loop step. `PER_OP` commits one group per copy, and before every component has
-  started copying, fewer groups separate a copy from its DS read. The other schemes
-  commit a fixed number of groups per pane or step, so their immediates repeat from the
-  warm-up on. A loop step takes the smallest immediate over its iterations, so in the
-  loop it would tighten the wait of every iteration.
+- An early step's wait can leave fewer loads in flight than later iterations of its
+  loop step. Before every component has started copying, fewer copies, and under
+  `PER_OP` fewer groups, separate a needed copy from its DS read. A loop wait gets the
+  smallest `vmcnt` over the paths into the loop (Wait plan), so in the loop that step
+  would tighten the wait of every iteration.
 
-`peeled` is one past the last step in `[0, depth - 3]` whose wait immediates differ from
-its steady twin's, and at least 1 (the rule is under Peeling). In all, `depth + peeled`
-steps come off the front and `depth` off the back. The loop keeps steps
+`peeled` is one past the last step whose wait differs from its steady twin's, in its
+immediate or its window, and at least 1 (the rule is under Peeling). In all,
+`depth + peeled` steps come off the front and `depth` off the back. The loop keeps steps
 `peeled .. main - 1`, unrolled as in 1:
 
 ```
@@ -312,6 +311,32 @@ first. For a DS read whose newest needed copy is in group `j` of the `count` gro
 committed so far, the tightest safe immediate is `n = count - j - 1`. It stays safe when
 group `j` has already retired, because the outstanding groups are always the newest.
 
+**From immediate to `vmcnt`.** On gfx950, Triton lowers a commit to
+`llvm.amdgcn.asyncmark` and `wait_group(n)` to `llvm.amdgcn.wait.asyncmark(n)`, and
+LLVM's `SIInsertWaitcnts` computes the `s_waitcnt vmcnt`; Triton's
+`UpdateAsyncWaitCount` skips its own count on this target. Each mark remembers the
+newest LDS copy issued before it. The wait leaves in flight every load issued after the
+`(n + 1)`-th newest mark's copy, the last LDS copy of group `j`: that is the wait's
+**window**. It holds register `buffer_load`s too, since `vmcnt` retires every vector
+memory load in order. The schedule takes the issue order as emitted (panes in order,
+`COMPONENTS` order in a pane); loads never cross a mark, but LLVM's scheduler can move
+them between two marks, so a window is a model of the `vmcnt`, not its exact value. Example, prod a8w4 T1024: each loop step issues 6 LDS copies as 12
+`buffer_load ... lds` instructions and 2 register B-payload copies as 8 `buffer_load`s,
+and its `wait_group(1)` becomes `vmcnt(20)`. `vmcnt` counts instructions; the schedule
+compares windows as copies, which is enough because a copy issues the same instructions
+at every step.
+
+- Where paths join (the loop header, after a remainder `if`), LLVM lines the marks up
+  newest first and keeps the smaller window, so one emitted wait gets the smallest
+  `vmcnt` over the paths into it. Peeling depends on this. The remainder `if`s also
+  merge remainder counts this `K` never runs (TODO.md).
+- An empty group repeats the previous mark, so it changes no `vmcnt` on a straight path.
+- A join keeps at most the 16 newest marks. With exactly 16 held, LLVM clamps a larger
+  immediate to 15, which waits for more than needed. But a commit after a join that
+  dropped marks leaves 17 or more, and a wait with an immediate at least that large
+  then gets no `s_waitcnt vmcnt` at all, although its group may still be in flight
+  (TODO.md). Production immediates are at most 11.
+
 `_replay` computes every immediate:
 
 - **Demand.** A pane (`PER_OP`, `PER_PANE`) or a step (per-stage schemes) needs, for each
@@ -336,28 +361,42 @@ group `j` has already retired, because the outstanding groups are always the new
 
 ## Peeling
 
-The loop body's immediates are the minimum over all its iterations. Under `PER_OP`, an
-early step can need a smaller one than the loop: its needed copies were issued in the
-prologue, before components with a smaller `F` started copying (see Steps), so fewer
-groups separate them from the step. Those steps are peeled out of the loop instead of
-tightening every iteration.
+A loop wait gets one `vmcnt` for all its iterations, the smallest over the paths into
+the loop (Wait plan), and the first iteration's path comes from the prologue. An early
+step's window can reach back to steps where some component had not started copying, so
+it holds fewer loads than the same wait in later iterations, and under `PER_OP` its
+immediate can be smaller too. Left in the loop, that step would tighten the wait of
+every iteration, so it is peeled out instead.
 
-- **Rule.** Replay the prologue, the warm-up and steps `0 .. settled - 1` with no end.
-  The peeled steps run through the last step in `[0, depth - 3]` whose immediates differ
-  from its steady twin, the first step `>= 2 * depth - 1` congruent to it modulo
-  `async_period` (`lcm(R)` over the LDS components). Step 0 is always peeled, so the
-  first MFMA keeps its visible zero accumulator.
+- **Rule.** Compare each wait's immediate and window (per pane, or per step under the
+  per-stage schemes) with its steady twin's, a later step congruent to it modulo
+  `copy_period`, `lcm(R)` over the present components. Register copies count: they are
+  in the window. The peeled steps run through the last step that differs. Step 0 is
+  always peeled, so the first MFMA keeps its visible zero accumulator.
+- **Bound.** Every component copies from step `-min(F)` on, so a step whose waits'
+  windows all start there or later is steady. A wait of step `x` needs, for each LDS
+  component it DS-reads, the copy from step `x + 1 - F`, and its window starts at the
+  newest of them, the one with the smallest `F`. With `reach(x)` the largest such `F`
+  over the step's waits (0 when none needs a copy), step `x` is steady once
+  `x + 1 - reach(x) >= -min(F)`. `bound` is one past the last step that fails, at least
+  1; `reach <= depth` and `F >= 1`, so `bound <= max(1, depth - 2)`.
+- **Two stages.** At `bound = 1` there is no replay: `peeled = 1`. Otherwise
+  `_replay(..., windows=True)` runs the prologue, the warm-up and steps
+  `0 .. bound + copy_period - 1`, and each step below `bound` is compared with its twin
+  in `[bound, bound + copy_period - 1]`. A symbolic sweep of 17920 configs (4 schemes,
+  7 ring-depth sets, 5 pane shapes, both `SCALE_FILL_MID`, 16 placements, 4 `R` mixes)
+  has 16800 with an LDS component. In those the replay is skipped 77% of the time and
+  never goes past step 15, and the peel equals the one found by comparing every step
+  with a steady step far out.
 - **Last, not first.** The differing steps can have gaps, so a first-match rule would
-  leave a differing step in the loop with a too-large immediate: a race. Example:
-  `PER_OP`, 2x2, ring depths `(2, 4, 6, 3)` in `COMPONENTS` order, both scales at
-  `R = 2`, B payload in registers: depth 7, step 0 matches, step 1 differs, `peeled = 2`.
-- **Only `PER_OP` peels more than one step.** The other schemes commit a fixed number of
-  groups per pane or step, whether a component copies or not.
-- **Bounds.** From step `depth - 2` on, every needed copy was issued at the warm-up or
-  later, where all LDS components copy, so the candidates stop at `depth - 3`. The replay
-  must reach the largest twin, step `2 * depth + async_period - 2`, so
-  `settled >= 2 * depth + async_period - 1`; a shorter trace compares against a missing
-  twin and peels for nothing. The code uses `3 * depth + async_period`.
+  leave a differing step in the loop. Example: `PER_OP`, 2x2, ring depths `(2, 4, 6, 3)`
+  in `COMPONENTS` order, both scales at `R = 2`, B payload in registers: depth 7, step 0
+  matches, step 1 differs, `peeled = 2`.
+- **Any scheme can peel more than one step.** Example: `PER_PANE`, 2x2, ring depths
+  `(2, 4, 6, 3)`, all through LDS, both scales at `R = 2`, so `F = (2, 7, 6, 5)`: every
+  immediate matches its twin's, but the windows of steps 0, 1 and 2 hold fewer copies,
+  so `peeled = 3`. Under the per-stage schemes, a register ring with a small `F` does
+  the same.
 
 ## Emission invariants
 
