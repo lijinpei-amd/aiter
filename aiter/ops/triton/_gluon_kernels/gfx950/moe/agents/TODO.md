@@ -2,58 +2,28 @@
 
 Open work in this folder. Each item says what to change, why, and how to check it.
 
-## Refill an LDS scale with `R > 1` right after its `ds_read`
+## Refill an LDS scale with `R > 1` right after its `ds_read`: tried, no win
 
-Through LDS, a buffer is free once its `ds_read` has run, at step `t - 1`, but the next
-copy into it comes at `s + D * R = t + R - 1`, `R` steps later (`F = L = (D - 1) * R + 1`).
-The buffer idles `R - 1` of every `D * R` steps: in PIPELINE.md's `D = 3`, `R = 2` table it
-is free at `t` and refilled at `t + 1`. A payload, at `R = 1`, is already refilled at `t`.
+Tried 2026-10-21, then dropped. An LDS component was copied `D * R` steps before its
+MFMAs (`F = D * R` instead of `(D - 1) * R + 1`), so a scale at `R > 1` refilled its
+buffer the step after its `ds_read` instead of idling `R - 1` steps.
 
-Issuing the copy at `t` gives `F = D * R` through LDS, `R - 1` more steps of prefetch from
-the same LDS. LDS copies then issue at multiples of `R`, as register copies already do. At
-`R = 1` nothing changes.
+- In-process A/B behind a temporary knob (`a8small/ab.sh`, `BLOCK=40 WARM=15`, four
+  weight placements): a8w8 T1024 350.4 -> 352.6 us (+0.6%), T4096 1147.2 -> 1151.3 us
+  (+0.4%), slower in all 8 placement pairs.
+- Why: every loop wait there also needs a payload copy (`F = 3`), newer than the
+  scale's (`F` 5 -> 6), and loads retire in order, so the earlier scale copy changes no
+  `vmcnt`: the loop's 24 waits stay identical. The loop body grew by 29 instructions
+  (`s_nop`, `v_accvgpr` moves) and the pipeline by one step.
+- The schedule itself was right: T0 changed in exactly the 4 predicted cases, and the
+  four schedule test files (1370 tests) passed with the knob on.
 
-Affected today (T0): the production pins a8w8 T1024 and T4096 (A and B scale at `D = 3`,
-`R = 2`: `F` 5 -> 6, depth 5 -> 6), and the T0 cases `mxfp4-bk128-sk8-R2` (depth 5 -> 6)
-and `mxfp4-bk128-sk16-R4` (`R = 4`: depth 9 -> 12).
-
-Plan, about half a day including the A/B:
-
-1. In `Schedule.__init__`, set `load_to_mfma_distance` of an LDS component to
-   `num_buffers * R`, and `depth` to the largest of `L` and `F` over the present
-   components (an LDS `F` now exceeds its `L` when `R > 1`). Register `F` stays
-   `(D - 1) * R`. Put the change behind a temporary constexpr knob for the A/B in step 6.
-2. Confirm that every consumer takes `F` as an input and needs no change of its own:
-   `_step_plan` (`active`, and `loads` at `(x + F) % R == 0`), `_replay` (the copy at
-   `x + 1 - F`), `_index` / `static_lds_index` (`(x + F) // R`), `scale_soff_steps`
-   (producer phase `-F % R`), and the peeling bounds.
-3. Ordering: the copy at step `t` now overwrites the buffer the `ds_read` at `t - 1`
-   read, as a payload copy already does. The pipeline issues no barrier of its own;
-   Triton's membar pass inserts one. In the asm of the affected cells, confirm an
-   `s_barrier` separates every scale `ds_read` from the next copy into its buffer, and
-   count the `s_barrier` and `s_waitcnt` changes.
-4. Test oracles: `_audit_buffer_schedule` in `test_moe_gemm_gluon_config.py` and the
-   symbolic machine in `test_moe_gemm_gluon_buffered_schedule.py` derive `F` on their
-   own; change both. Add a test that an LDS scale at `R > 1` copies at `x % R == 0` and
-   refills its buffer at the step after the `ds_read`.
-5. The minimum K (`num_k >= depth + peeled + unroll`) grows with the depth. Check that
-   the ladder's and the tests' smallest K per dtype still validate.
-6. A/B the knob in-process on a8w8 T1024 and T4096 (`bench_out/gluon_moe_regression/
-   a8small/ab.sh`, `BLOCK=40 WARM=15`). Keep the change only if it wins beyond noise,
-   then remove the knob; otherwise record the result here and drop it.
-7. Docs: in PIPELINE.md, the `F` definition, the `D = 3`, `R = 2` table (the LDS copy
-   moves to `t - 6` and its refill to `t`), the copy residues mod `R`, and the
-   `s + D * R` paragraph. Decide whether `L` stays `(D - 1) * R + 1` or becomes the true
-   LDS live span, `D * R`. Then delete this item.
-
-Check:
-
-- T0 differs only for the four cases above; T0b SAME.
-- T2d and the production asm (`/tmp/prodasm`-style, 20 cells): only cells with an LDS
-  scale at `R > 1` change. The two determinism shas are unchanged.
-- The affected cells' outputs are bit-identical before and after: the MFMAs and their
-  order do not change, only when the scale arrives.
-- Suite: no new failures against the latest base.
+Revisit only for a config where an LDS scale at `R > 1` is the newest copy some wait
+needs: its `F` below its payload's, or its payload in registers. The change is small. In
+`Schedule.__init__`, an LDS component's `F` becomes `num_buffers * R` and `depth` the
+largest of `L` and `F`; the oracles that derive `F` themselves
+(`_audit_buffer_schedule`, `_Machine.load`,
+`test_scale_k_step_ratio_sets_buffer_span_and_unroll`) change the same way.
 
 ## Keep a wait's immediate under 17 after a join
 
