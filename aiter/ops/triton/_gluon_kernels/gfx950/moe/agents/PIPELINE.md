@@ -2,7 +2,7 @@
 
 The pipelined K loop is split in two files. `_schedule.py` plans it:
 `Schedule(tuning_cfg, layout, K)` evaluates every per-step decision once, at build time,
-into tables indexed by an emitted step index. `_pipeline.py` emits it: its `@gluon.jit`
+into tables keyed by emitted step, a `Step`. `_pipeline.py` emits it: its `@gluon.jit`
 functions read those tables through constexpr lookups and decide nothing themselves.
 
 Step, pane, slot, component, ring, `D`, `R`, `Q` and DS read are defined in CONCEPTS.md.
@@ -236,13 +236,16 @@ least once.
 
 These sketches show the steps that execute. `_run_buffered_pipeline` and
 `_drain_buffered_pipeline` emit them, and `moe_gemm.py` then issues the final MFMA. Each
-emitted step has an index into the `Schedule` tables, `STEP`, from the accessor in its
-comment. `_step` also takes `step`, the step number `x`, which may be a runtime value.
+emitted step is a `Step(kind, index)`, `STEP`, from the accessor in its comment: a
+`StepKind` and the body's place among its kind's emitted bodies, from 0 in emission
+order. Prologue step `x` is `x + depth`, peeled step `x` is `x`, loop and remainder step
+`u` is `u`, and drain step `(p, j)` is `p * (depth - 1) + j`, so no index depends on
+`num_k`. `_step` also takes `step`, the step number `x`, which may be a runtime value.
 Its LDS ring indices count from `ds_read_tile = step + 1`, the tile it DS-reads.
 
-Per emitted step, `Schedule` stores its kind, `stage`, `phase` (the step number its ring
-arithmetic uses), unroll position `ki`, `in_loop`, a static flag, and `dot` (false in
-the prologue):
+Per emitted step, `Schedule` stores its `stage`, `phase` (the step number its ring
+arithmetic uses) and unroll position `ki`. `in_loop`, `dot` (false in the prologue) and
+`is_drain` read the step's kind:
 
 - `stage` sets which components copy: `x` on prologue and peeled steps, `j` on drain
   step `main + j`, none (every component) on loop and remainder steps.
@@ -252,8 +255,7 @@ the prologue):
 - `ki` is `u` on loop and static-remainder steps, `p + j - peeled` on static-drain step
   `(p, j)`, so `peeled + ki` is congruent to `x` modulo `buffer_period` in the phase
   `p` that runs, and 0 elsewhere.
-- The static flag marks static-remainder and static-drain steps. With `in_loop`, it is
-  what `static_lds_index` requires.
+- `static_lds_index` requires a loop, static-remainder or static-drain step.
 
 - **Prologue.** Steps `-depth .. -2` only copy, so `_run_buffered_pipeline` issues their
   copies inline, not through `_step`. Step `-1` also waits and DS-reads K tile 0: it is
