@@ -237,7 +237,8 @@ M inner):
       (`issued`) in `COMPONENTS` order, with their commits.
    3. `mfma` region: the pane's MFMAs of K tile `x` (when `dot`), then the DS reads placed
       in the MFMA region. The last pane advances the HBM pointers.
-   4. `commit` region: the `PER_STAGE_WHOLE` commit, after the last pane.
+   4. `commit` region: the `PER_STAGE_WHOLE` commit, after the last pane, when the step
+      copied through LDS.
 3. A `sched_barrier` after a loop step that holds a register ring (not under the warp
    pipeline). Straight-line steps rotate the register rings.
 
@@ -290,19 +291,24 @@ step `t` in registers.
 
 Each LDS copy belongs to one commit group. Register copies are not asynchronous and
 commit nothing. `_step_plan` returns the groups each pane closes (`commits`), and the
-emitter closes exactly those.
+emitter closes exactly those: every commit point is gated on `closes_group`. A group
+holds at least one copy, so a pane or step that copies nothing through LDS commits
+nothing.
 
 | `WAIT_COMMIT_SCHEME` | commit point | groups per step | waits |
 |---|---|---|---|
 | `PER_OP` (1) | after each LDS copy | one per LDS copy | one per pane |
-| `PER_PANE` (2) | after each pane's copies | one per pane, empty included | one per pane |
-| `PER_STAGE_WHOLE` (3) | after the last pane's MFMA region, in its own `commit` region | one, empty included | one per step |
-| `PER_STAGE_WARP_PIPELINE` (4) | end of the last pane's `mem` region | one, empty included | one per step |
+| `PER_PANE` (2) | after each pane's copies | one per pane that copies through LDS | one per pane |
+| `PER_STAGE_WHOLE` (3) | after the last pane's MFMA region, in its own `commit` region | one, if the step copies through LDS | one per step |
+| `PER_STAGE_WARP_PIPELINE` (4) | end of the last pane's `mem` region | one, if the step copies through LDS | one per step |
 
 In the prologue, both per-stage schemes commit after the last pane's copies
-(`_buffer_load_pane`, `MARK_TILE`). An empty group still takes a FIFO slot. Under
-`PER_OP` a pane's groups follow `COMPONENTS` order, the order `_buffer_load_pane` copies
-in; reorder both together.
+(`_buffer_load_pane`, `MARK_TILE`). Under `PER_OP` a pane's groups follow `COMPONENTS`
+order, the order `_buffer_load_pane` copies in; reorder both together.
+
+Today only drain steps copy nothing through LDS, once every LDS component has stopped
+copying. Dropping their groups shortened drain immediates but moved no `vmcnt`: an empty
+group repeats the previous mark (Wait plan).
 
 ## Wait plan
 
@@ -330,7 +336,8 @@ at every step.
   newest first and keeps the smaller window, so one emitted wait gets the smallest
   `vmcnt` over the paths into it. Peeling depends on this. The remainder `if`s also
   merge remainder counts this `K` never runs (TODO.md).
-- An empty group repeats the previous mark, so it changes no `vmcnt` on a straight path.
+- An empty group would repeat the previous mark: it would count in the immediate but
+  change no `vmcnt` on a straight path. The schedule commits none (Commit plan).
 - A join keeps at most the 16 newest marks. With exactly 16 held, LLVM clamps a larger
   immediate to 15, which waits for more than needed. But a commit after a join that
   dropped marks leaves 17 or more, and a wait with an immediate at least that large

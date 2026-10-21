@@ -1463,13 +1463,15 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
         ]
         for pane, copies in enumerate(stage_copies):
             asynchronous = tuple(token for token in copies if via_lds[token[1]])
+            # A pane or step that copies nothing through LDS commits no group.
             if scheme == WaitCommitScheme.PER_OP:
                 groups = tuple((copy,) for copy in asynchronous)
             elif scheme == WaitCommitScheme.PER_PANE:
-                groups = (asynchronous,)
+                groups = (asynchronous,) if asynchronous else ()
             else:
                 pending_stage.extend(asynchronous)
-                groups = (tuple(pending_stage),) if pane == npanes - 1 else ()
+                last = pane == npanes - 1
+                groups = (tuple(pending_stage),) if last and pending_stage else ()
             expected_groups.append(groups)
         index = _executed_step(schedule, num_k, stage)
         actual_groups = tuple(schedule.commits(index, pane) for pane in range(npanes))

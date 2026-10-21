@@ -277,10 +277,18 @@ class _Machine:
 
     def commit_buffer_load(self):
         group = tuple(self.pending)
+        assert group, "committed an empty group"
         self.pending.clear()
         self.committed.append(group)
         self.outstanding.append(group)
-        self.group_ends.append(max((self.copy_events[t] for t in group), default=-1))
+        self.group_ends.append(max(self.copy_events[t] for t in group))
+
+    def commit_epilogue_group(self):
+        # `_stage_epilogue_inputs`' bias and gamma copies: a group with no copy of
+        # the pipeline's. Its mark repeats the previous one, as an asyncmark does.
+        self.committed.append(())
+        self.outstanding.append(())
+        self.group_ends.append(self.group_ends[-1] if self.group_ends else -1)
 
     def wait_buffer_load_groups(self, count):
         assert self.wait is None, "two waits before one read point"
@@ -564,7 +572,7 @@ def _execute(tc, num_k, monkeypatch, epilogue_groups=2):
         main = num_k - maybe_unwrap(schedule.depth)
         assert regs.acc == (main,) * (tc.nm * tc.nn)
         for _ in range(epilogue_groups):
-            machine.commit_buffer_load()
+            machine.commit_epilogue_group()
         regs = pipeline._drain_buffered_pipeline.fn(pc, pointers, buffers, regs, num_k)
         assert regs.acc == (num_k - 1,) * (tc.nm * tc.nn)
         assert machine.wait is None, "a wait guarded no read"
@@ -1154,6 +1162,53 @@ def test_peeled_wait_prefix_is_minimal(scheme, register_mask, extra, shape, midd
     unroll = tc.sizing()[2]
     schedule = Schedule(tc, tc, (tc.minimum_num_k() + 2 * unroll) * tc.BLOCK_K)
     _assert_minimal_peel(schedule, tc)
+
+
+def _emitted_steps(schedule):
+    """Every emitted step index, through the schedule's step-kind accessors."""
+    depth, peeled, unroll = (
+        maybe_unwrap(schedule.depth),
+        maybe_unwrap(schedule.peeled),
+        maybe_unwrap(schedule.unroll),
+    )
+    steps = [schedule.prologue_step(x) for x in range(-depth, -1)]
+    steps.append(schedule.warmup_step())
+    steps += [schedule.peeled_step(x) for x in range(peeled)]
+    steps += [schedule.loop_step(u) for u in range(unroll)]
+    remainders = unroll - 1 if maybe_unwrap(schedule.static_remainder) else 1
+    steps += [schedule.remainder_step(u) for u in range(remainders)]
+    phases = (
+        maybe_unwrap(schedule.buffer_period)
+        if maybe_unwrap(schedule.static_drain)
+        else 1
+    )
+    steps += [
+        schedule.drain_step(p, j) for p in range(phases) for j in range(depth - 1)
+    ]
+    return steps
+
+
+@pytest.mark.parametrize(
+    "scheme", list(WaitCommitScheme), ids=lambda scheme: scheme.name
+)
+@pytest.mark.parametrize("register_mask", range(16))
+@pytest.mark.parametrize(
+    "extra", [{}, {"packed": True}, {"scale_steps": (4, 1)}], ids=["R1", "R2", "R4R1"]
+)
+def test_no_step_commits_an_empty_group(scheme, register_mask, extra):
+    """A pane or step that copies nothing through LDS commits no group.
+
+    An empty group would count toward a wait's immediate without holding a copy. The
+    emitted program agrees: `_Machine` rejects an empty commit from the emitter.
+    """
+    tc = _Config(scheme, (2, 4, 6, 3), register_mask, middle=True, **extra)
+    unroll = tc.sizing()[2]
+    schedule = Schedule(tc, tc, (tc.minimum_num_k() + 2 * unroll) * tc.BLOCK_K)
+    for step in _emitted_steps(schedule):
+        for pane in range(tc.nm * tc.nn):
+            groups = schedule.commits(step, pane)
+            assert all(groups), (step, pane, groups)
+            assert schedule.closes_group(step, pane) == bool(groups)
 
 
 @pytest.mark.parametrize("nn", [1, 2, 3, 4])

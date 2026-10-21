@@ -301,7 +301,8 @@ def _buffer_load_pane(
     sched: gl.constexpr = pc.schedule
     nm: gl.constexpr = layout.num_m_slots
     nn: gl.constexpr = layout.num_n_slots
-    ops: gl.constexpr = sched.issued(STEP, Pane(mi, ni).linear_index(nm))
+    pane_index: gl.constexpr = Pane(mi, ni).linear_index(nm)
+    ops: gl.constexpr = sched.issued(STEP, pane_index)
     mk: gl.constexpr = layout.num_k_slots
     offset_step: gl.constexpr = sched.ki(STEP) if sched.soff_unroll(STEP) else 0
     a_soff: gl.constexpr = (
@@ -442,13 +443,16 @@ def _buffer_load_pane(
                 * sched.steps_per_buffer(B_SCALE),
             )
     if require_constexpr(
-        sched.commit_per_pane
-        or (
-            MARK_TILE
-            and sched.commit_per_tile
-            and mi == layout.num_m_slots - 1
-            and ni == layout.num_n_slots - 1
+        (
+            sched.commit_per_pane
+            or (
+                MARK_TILE
+                and sched.commit_per_tile
+                and mi == layout.num_m_slots - 1
+                and ni == layout.num_n_slots - 1
+            )
         )
+        and sched.closes_group(STEP, pane_index)
     ):
         pc.lds_ptrs.commit_buffer_load()
     return a, b, a_scale, b_scale
@@ -661,6 +665,7 @@ def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
                     and not sched.tile_commit_after_mfma
                     and mi == nm - 1
                     and ni == nn - 1
+                    and sched.closes_group(STEP, Pane(mi, ni).linear_index(nm))
                 ):
                     pc.lds_ptrs.commit_buffer_load()
             with region("mfma"):
@@ -710,6 +715,7 @@ def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
                 and sched.tile_commit_after_mfma
                 and mi == nm - 1
                 and ni == nn - 1
+                and sched.closes_group(STEP, Pane(mi, ni).linear_index(nm))
             ):
                 with region("commit"):
                     pc.lds_ptrs.commit_buffer_load()
