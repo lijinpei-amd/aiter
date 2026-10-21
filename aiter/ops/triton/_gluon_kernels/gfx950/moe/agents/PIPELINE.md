@@ -193,16 +193,18 @@ Drain under Step kinds.
 ## Step kinds
 
 The DS read's guard `x + 1 < num_k` splits the back once more: only step `num_k - 1`
-fails it, and issues only its MFMAs. Each kind is a range of steps:
+fails it, and issues only its MFMAs. Each kind is a range of steps. `executed` counts the
+steps that run; `emitted` counts the step bodies in the code, each one entry in the
+`Schedule` tables:
 
-| kind | steps `x` | count | `buffer_load` | `ds_read` | MFMA |
-|---|---|---|---|---|---|
-| prologue | `-depth .. -1` | `depth` | components with `x >= -F` | at `x = -1` | - |
-| peeled | `0 .. peeled - 1` | `peeled` | all | yes | yes |
-| loop | `peeled .. peeled + iters * unroll - 1` | `iters * unroll` | all | yes | yes |
-| remainder | `peeled + iters * unroll .. main - 1` | `rem` | all | yes | yes |
-| drain | `main .. num_k - 2` | `depth - 1` | components with `x < num_k - F` | yes | yes |
-| final MFMA | `num_k - 1` | 1 | - | - | yes |
+| kind | steps `x` | executed | emitted | `buffer_load` | `ds_read` | MFMA | emitted as |
+|---|---|---|---|---|---|---|---|
+| prologue | `-depth .. -1` | `depth` | `depth` | components with `x >= -F` | at `x = -1` | - | see Prologue below |
+| peeled | `0 .. peeled - 1` | `peeled` | `peeled` | all | yes | yes | straight-line `_step`s |
+| loop | `peeled .. peeled + iters * unroll - 1` | `iters * unroll` | `unroll` | all | yes | yes | a `tl.range` loop whose body is `unroll` steps |
+| remainder | `peeled + iters * unroll .. main - 1` | `rem` | `unroll - 1` if `static_remainder`, else 1 | all | yes | yes | see Remainder below |
+| drain | `main .. num_k - 2` | `depth - 1` | `drain_phases * (depth - 1)` | components with `x < num_k - F` | yes | yes | `_drain_buffered_pipeline`; see Drain below |
+| final MFMA | `num_k - 1` | 1 | - | - | - | yes | `_last_mfma` or `_drain_last_fused`; no wait |
 
 - Prologue step `-1` copies for every component, since `x + F >= 0` at `F >= 1`, and is
   the only prologue step that passes the DS read's `x + 1 >= 0`: it DS-reads K tile 0.
@@ -237,15 +239,6 @@ These sketches show the steps that execute. `_run_buffered_pipeline` and
 emitted step has an index into the `Schedule` tables, `STEP`, from the accessor in its
 comment. `_step` also takes `step`, the step number `x`, which may be a runtime value.
 Its LDS ring indices count from `ds_read_tile = step + 1`, the tile it DS-reads.
-
-| kind | emitted | executed | emitted as |
-|---|---|---|---|
-| prologue | `depth` | `depth` | see Prologue below |
-| peeled | `peeled` | `peeled` | straight-line `_step`s |
-| loop | `unroll` | `iters * unroll` | a `tl.range` loop whose body is `unroll` steps |
-| remainder | `unroll - 1` if `static_remainder`, else 1 | `rem` | see Remainder below |
-| drain | `drain_phases * (depth - 1)` | `depth - 1` | `_drain_buffered_pipeline`; see Drain below |
-| final MFMA | - | 1 | `_last_mfma` or `_drain_last_fused`; no copy, DS read or wait |
 
 Per emitted step, `Schedule` stores its kind, `phase` (the step number its ring
 arithmetic uses), unroll position `ki`, `in_loop`, and `dot` (false in the prologue).
