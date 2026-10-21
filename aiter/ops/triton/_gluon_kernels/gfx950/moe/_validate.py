@@ -260,17 +260,6 @@ def validate_pipeline(tc, layout, K, schedule=None):
     validate_buffer_counts(tc)
     if schedule is None:
         schedule = Schedule(tc, layout, K)
-    # Copy ownership maps each component's slots onto panes, so every mapped
-    # pane has to exist and no component may copy two of its own slots in one
-    # pane -- a pane carries one optional copy per component. Different components
-    # sharing a pane is fine, which is what lets a single-pane step copy both
-    # operands.
-    assert schedule.buffer_load_panes_valid.value, (
-        f"buffer-load ownership is not a valid mapping for num_m_slots "
-        f"{layout.num_m_slots.value} x num_n_slots {layout.num_n_slots.value} "
-        f"(SLOT_M {tc.SLOT_M.value} vs BLOCK_M {tc.BLOCK_M.value}, "
-        f"SLOT_N {tc.SLOT_N.value} vs BLOCK_N {tc.BLOCK_N.value})"
-    )
     num_k = schedule.num_k.value
     depth = schedule.depth.value
     peeled = schedule.peeled.value

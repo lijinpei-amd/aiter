@@ -1221,9 +1221,6 @@ def test_every_payload_tile_is_filled_exactly_once(nm, nn, middle):
     tc = _Config(WaitCommitScheme.PER_OP, (3, 3, 3, 3), 0, shape=(nm, nn),
                  middle=middle)
     schedule = Schedule(tc, tc, tc.BLOCK_K)
-    assert maybe_unwrap(
-        schedule.buffer_load_panes_valid
-    ), "ownership is not a valid mapping"
     for component in COMPONENTS:
         operand = component.operand_index.value
         num_slots = nm if operand == A else nn

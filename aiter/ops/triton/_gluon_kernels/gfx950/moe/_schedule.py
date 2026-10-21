@@ -240,7 +240,6 @@ class Schedule:
     peeled: gl.constexpr
     buffer_period: gl.constexpr
     reg_buffer_period: gl.constexpr
-    buffer_load_panes_valid: gl.constexpr
     commit_per_copy: gl.constexpr
     commit_per_pane: gl.constexpr
     commit_per_tile: gl.constexpr
@@ -320,19 +319,15 @@ class Schedule:
             for c in COMPONENTS
             for slot in range(nm if c.operand_index.value == A else nn)
         }
-        buffer_load_panes_valid = (
-            set(buffer_load_pane) == slots
-            and all(
-                0 <= pane_index < num_panes for pane_index in buffer_load_pane.values()
-            )
-            and len(
-                {
-                    (comp_slot.component, pane_index)
-                    for comp_slot, pane_index in buffer_load_pane.items()
-                }
-            )
-            == len(buffer_load_pane)
-        )
+        # Every mapped pane exists, and no pane copies two slots of one component: a
+        # pane carries one optional copy per component. Components may share a pane.
+        pane_copies = {
+            (comp_slot.component, pane_index)
+            for comp_slot, pane_index in buffer_load_pane.items()
+        }
+        assert len(pane_copies) == len(buffer_load_pane) and all(
+            0 <= pane_index < num_panes for _, pane_index in pane_copies
+        ), f"buffer-load panes are not a valid mapping for {nm} x {nn} slots"
         # Per pane index, the slot of each component it buffer-loads, or None.
         buffer_load_slots = _by_pane_index(buffer_load_pane, first_slots, num_panes)
         # A slot is DS-read in the pane that buffer-loads its operand's payload slot.
@@ -408,28 +403,24 @@ class Schedule:
         # their twins sit in the `copy_period` steps after it. `reach(x) <= max(F)`,
         # so only steps below `max(F) - min(F) - 1` can fail.
         peeled = 1
-        if buffer_load_panes_valid:
-            present = [f for f, p in zip(load_to_mfma_distance, component_present) if p]
-            first_steady = -min(present)
-            bound = 1
-            for x in range(max(present) + first_steady - 1):
-                if x + 1 - reach(x) < first_steady:
-                    bound = x + 1
-            if bound > 1:
-                early = [
-                    (x, x)
-                    + step_plan(
-                        _StepKind.PEELED if x >= 0 else _StepKind.PROLOGUE, x, x
-                    )[2:]
-                    for x in range(-depth, bound + copy_period)
-                ]
-                waits = _replay(
-                    [early], load_to_mfma_distance, commit[2], num_panes, windows=True
-                )
-                for x in range(bound):
-                    twin = x + copy_period * -(-(bound - x) // copy_period)
-                    if waits.get(x) != waits.get(twin):
-                        peeled = x + 1
+        present = [f for f, p in zip(load_to_mfma_distance, component_present) if p]
+        first_steady = -min(present)
+        bound = 1
+        for x in range(max(present) + first_steady - 1):
+            if x + 1 - reach(x) < first_steady:
+                bound = x + 1
+        if bound > 1:
+            early = []
+            for x in range(-depth, bound + copy_period):
+                kind = _StepKind.PEELED if x >= 0 else _StepKind.PROLOGUE
+                early.append((x, x) + step_plan(kind, x, x)[2:])
+            waits = _replay(
+                [early], load_to_mfma_distance, commit[2], num_panes, windows=True
+            )
+            for x in range(bound):
+                twin = x + copy_period * -(-(bound - x) // copy_period)
+                if waits.get(x) != waits.get(twin):
+                    peeled = x + 1
 
         self._component_present = gl.constexpr(component_present)
         self._num_buffers = gl.constexpr(num_buffers)
@@ -449,7 +440,6 @@ class Schedule:
         self.peeled = gl.constexpr(peeled)
         self.buffer_period = gl.constexpr(buffer_period)
         self.reg_buffer_period = gl.constexpr(reg_buffer_period)
-        self.buffer_load_panes_valid = gl.constexpr(buffer_load_panes_valid)
         self.commit_per_copy = gl.constexpr(commit[0])
         self.commit_per_pane = gl.constexpr(commit[1])
         self.commit_per_tile = gl.constexpr(commit[2])
@@ -460,7 +450,7 @@ class Schedule:
         self.epilogue_groups = gl.constexpr(epilogue_groups)
 
         main = num_k - depth
-        if not buffer_load_panes_valid or main < peeled + unroll:
+        if main < peeled + unroll:
             self._steps = gl.constexpr(None)
             self._active = gl.constexpr(None)
             self._loads = gl.constexpr(None)

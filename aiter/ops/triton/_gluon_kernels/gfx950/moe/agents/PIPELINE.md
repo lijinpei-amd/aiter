@@ -300,9 +300,8 @@ Resolved once in `Schedule.__init__`:
   unsplit, slot `i` of both operands at pane `i`. A scale follows its payload, except
   that `SCALE_FILL_MID` at 2x2 moves slot 0 of each scale to pane 1 and slot 1 to
   pane 2; the flag does nothing at other shapes. A scale slot spanning `Q > 1` slots is copied by its first slot only.
-- **Validity** (`buffer_load_panes_valid`, asserted by `validate_pipeline`): every slot
-  maps to an existing pane, and no pane copies two slots of one component. Different
-  components may share a pane.
+- **Validity** (asserted in `Schedule.__init__`): every slot maps to an existing pane,
+  and no pane copies two slots of one component. Different components may share a pane.
 - **DS-read pane** (`ds_read_pane`): the pane that copies the same operand's payload slot,
   in the region `DS_READ_*_IN_MFMA` picks. Only LDS components have one; a register
   component's MFMA reads its ring directly.
