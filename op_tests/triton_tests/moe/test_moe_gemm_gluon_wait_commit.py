@@ -224,14 +224,14 @@ def _reference_groups(tc, copies):
     def is_async(copy):
         return tc.component_via_lds(copy.component)
 
+    # A pane or step that copies nothing through LDS commits no group.
     asynchronous = [tuple(copy for copy in pane if is_async(copy)) for pane in copies]
     if tc.WAIT_COMMIT_SCHEME == WaitCommitScheme.PER_OP:
         return tuple(tuple((copy,) for copy in pane) for pane in asynchronous)
     if tc.WAIT_COMMIT_SCHEME == WaitCommitScheme.PER_PANE:
-        return tuple((pane,) for pane in asynchronous)
-    return ((),) * (len(copies) - 1) + (
-        (tuple(copy for pane in asynchronous for copy in pane),),
-    )
+        return tuple((pane,) if pane else () for pane in asynchronous)
+    whole = tuple(copy for pane in asynchronous for copy in pane)
+    return ((),) * (len(copies) - 1) + (((whole,) if whole else ()),)
 
 
 class _Descriptor:
@@ -507,22 +507,28 @@ def test_register_only_panes_need_no_cooperative_fence(scheme, monkeypatch):
 )
 @pytest.mark.parametrize("compiler", [False, True], ids=["none", "compiler"])
 @pytest.mark.parametrize(
-    "dot,in_loop,drain",
+    "dot,in_loop,drain,a_depth",
     [
-        (False, False, False),
-        (True, True, False),
-        (True, False, True),
+        (False, False, False, 3),
+        (True, True, False, 3),
+        (True, False, True, 2),
+        (True, False, True, 3),
     ],
-    ids=["prefetch", "loop", "drain"],
+    ids=["prefetch", "loop", "drain", "drain-copies-nothing"],
 )
 def test_pipeline_stage_commit_boundaries(
-    scheme, compiler, dot, in_loop, drain, monkeypatch
+    scheme, compiler, dot, in_loop, drain, a_depth, monkeypatch
 ):
-    """Execute the unified step and record ordering at its actual region borders."""
+    """Execute the unified step and record ordering at its actual region borders.
+
+    The drain's first step still copies A (F = 2 against depth 3) at ``a_depth = 2``,
+    and copies nothing at ``a_depth = 3``, when it must commit no group.
+    """
     from aiter.ops.triton._gluon_kernels.gfx950.moe import _pipeline as pipeline
 
     events = []
     tc = _config((2, 2), scheme, False, "no-scales")
+    tc.num_buffers = lambda operand, scale=False: a_depth if operand == 0 else 3
     tc.num_k_slots = 1
     tc.warp_pipeline_compiler = lambda: compiler
     tc.commit_per_stage_warp_pipeline = lambda: (
@@ -587,8 +593,10 @@ def test_pipeline_stage_commit_boundaries(
     pipeline._step_live.fn(pc, None, ((), (), (), ()), regs, 1, step)
     assert [event for event in events if event[0] == "wait"] == [("wait", wait)]
     assert events[0] == ("wait", wait)
-    # Stage/pane commit schemes retain empty groups during the drain. The FIFO
-    # accounting models those exact commits, including their region placement.
+    if drain and a_depth == 3:
+        # Nothing copied through LDS: no group, and no commit region either.
+        assert ("commit",) not in events and ("enter", "commit") not in events
+        return
     assert events.count(("commit",)) == 1
     commit = events.index(("commit",))
     assert events[:commit].count(("load",)) == 4

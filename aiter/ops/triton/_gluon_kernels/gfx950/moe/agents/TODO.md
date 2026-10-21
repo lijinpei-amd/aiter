@@ -55,55 +55,6 @@ Check:
   order do not change, only when the scale arrives.
 - Suite: no new failures against the latest base.
 
-## Drop empty commit groups
-
-Priority: low. Today's configs have empty groups only in drain steps, never in the
-prologue or the loop, so no steady-state wait changes. Raise it if a config puts one in
-the prologue or the loop.
-
-`PER_PANE` commits one group per pane per step, and the per-stage schemes one per step,
-even when nothing was copied through LDS (PIPELINE.md, Commit plan: "empty included").
-An empty group counts in a wait's immediate, but it repeats the previous asyncmark, so
-it moves no `vmcnt` on a straight path (PIPELINE.md, Wait plan). Dropping empty groups
-makes the plan simpler and the emitter commit exactly `commits`.
-
-Affected today (T0, emitted steps): only drain steps, once no LDS component copies any
-more. That covers the 10 production pins under `PER_STAGE_WHOLE` (a4w4, a8w4 and bf16 at
-T256-T4096, a8w8 T256) and the T0 cases `tuned-mxfp4-PER_PANE`,
-`tuned-mxfp4-PER_STAGE_WHOLE` and `tuned-mxfp4-PER_STAGE_WARP_PIPELINE`. In production
-no prologue step is empty: some LDS component copies at every step from `-depth` on.
-Other ring depths, placements or pane ownerships can add empty groups elsewhere.
-
-Plan, about half a day:
-
-1. In `_step_plan`, close a group only when it holds a copy: under `PER_PANE`
-   `(ops,) if ops else ()`, and under the per-stage schemes `(whole,)` only if `whole`.
-   `_replay` counts the groups in `commits`, so the immediates follow.
-2. `_pipeline.py` commits by scheme flag, not from `commits`: in `_buffer_load_pane`
-   (`commit_per_pane`, the prologue's `MARK_TILE`) and in `_step_live` (both per-stage
-   commit points). Gate each on a non-empty `Schedule.commits(STEP, pane_index)`, so
-   that the plan and the emitted program stay one.
-3. Waits: with a varying group count per step, early steps can have immediates that
-   differ from the steady ones. The window peel already compares immediates; check that
-   `test_peeled_wait_prefix_is_minimal` still holds.
-4. Test oracles that assume a fixed group count per pane or step:
-   `_audit_buffer_schedule` in `test_moe_gemm_gluon_config.py` and the symbolic machine
-   in `test_moe_gemm_gluon_buffered_schedule.py`. Add a test that no step commits an
-   empty group.
-5. Docs, PIPELINE.md: the Commit plan table ("empty included" three times, and "An empty
-   group still takes a FIFO slot") and the Wait plan's empty-group bullet. Then delete
-   this item.
-
-Check:
-
-- T0: only the cases above change, in their commits and waits. T0b SAME.
-- Asm, the 20 production cells: no `s_waitcnt vmcnt` should change; count any that do.
-  Instruction order may still move where an empty asyncmark disappears.
-- The affected outputs are bit-identical, because only waits move. The suite has no new
-  failures against the latest base.
-- If the loop's waits change, A/B in-process (`a8small/ab.sh`). Drain-only changes are
-  unlikely to show up in timing; keep them for the simpler plan.
-
 ## Keep a wait's immediate under 17 after a join
 
 Priority: high for any config that reaches it. No production pin does: their largest

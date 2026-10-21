@@ -131,13 +131,14 @@ def _step_plan(
             if slot is not None
             and layout.component_via_lds(COMPONENTS[component_index])
         )
+        # A group closes only when it holds a copy.
         if per_copy:
             groups = tuple((op,) for op in ops)
         elif per_pane:
-            groups = (ops,)
+            groups = (ops,) if ops else ()
         else:
             whole += ops
-            groups = (whole,) if pane_index == len(issued) - 1 else ()
+            groups = (whole,) if pane_index == len(issued) - 1 and whole else ()
         commits.append(groups)
     if kind == _StepKind.PROLOGUE:
         demand = ()
@@ -645,6 +646,12 @@ class Schedule:
             )
             for group in self._commits.value[step][pane_index]
         )
+
+    @gluon.constexpr_function
+    def closes_group(self, step, pane_index):
+        # Whether the pane commits a group at this step: not when it copies nothing
+        # through LDS, or under the per-stage schemes, before the last pane.
+        return bool(self._commits.value[step][pane_index])
 
     @gluon.constexpr_function
     def wait(self, step, pane_index=None):
