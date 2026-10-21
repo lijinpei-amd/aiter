@@ -406,14 +406,14 @@ class Schedule:
         # in the immediate or in the loads its window holds (PIPELINE.md, Peeling).
         # From step `first_steady` on every component copies, so a step whose window
         # starts there or later is steady: only steps below `bound` can differ, and
-        # their twins sit in the `copy_period` steps after it.
+        # their twins sit in the `copy_period` steps after it. `reach(x) <= max(F)`,
+        # so only steps below `max(F) - min(F) - 1` can fail.
         peeled = 1
         if buffer_load_panes_valid:
-            first_steady = -min(
-                f for f, p in zip(load_to_mfma_distance, component_present) if p
-            )
+            present = [f for f, p in zip(load_to_mfma_distance, component_present) if p]
+            first_steady = -min(present)
             bound = 1
-            for x in range(depth):
+            for x in range(max(present) + first_steady - 1):
                 if x + 1 - reach(x) < first_steady:
                     bound = x + 1
             if bound > 1:
