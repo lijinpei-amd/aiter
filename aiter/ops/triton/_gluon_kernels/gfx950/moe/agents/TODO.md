@@ -106,3 +106,41 @@ To close it, about 30 minutes: compile the T0 register cases `breg`, `ascale-reg
 `bscale-reg` and `bscale-reg-d2`, and check that each loop `s_waitcnt vmcnt(N)` after a
 `; wait_asyncmark(n)` equals the LDS-copy plus register-load instructions issued after
 its needed group's last LDS copy. If they all do, delete this item.
+
+## Make `K` a runtime argument
+
+Priority: low until one tuning config must serve many `K`. Audited 2026-10-21; nothing
+changed yet.
+
+The schedule already runs any valid `NUM_K` with exact waits (PIPELINE.md, Wait plan,
+Precondition). The constexpr `K` (`CFG_K`) still reaches the live kernel in four places:
+
+1. `validate` and `validate_pipeline`, as `static_assert`s: `K % BLOCK_K`, whole
+   `SCALE_SLOT_K` tiles, the minimum `num_k`. The host already runs both for each `K`
+   (`_validate_launch_config`), so the kernel can drop the parts that read `K`.
+2. `Schedule(tc, layout, K)`: build it for any valid `num_k`, a multiple of `lcm(R)` of
+   at least `depth + peeled + unroll`. `num_k` reaches the code only modulo `R`
+   (`final_register_index`, the drain's and final MFMA's `PHASE` and `K_PHASE`), and
+   `validate` makes `num_k % R == 0`.
+3. HBM offsets: `K` is the stripe stride of a shuffled scale
+   (`_shuffled_scale_register_offsets`, `_shuffled_scale_stage_offsets`) and of
+   preshuffled B (`K_STORAGE` in `b_payload_hbm_offsets`). They are computed once per
+   tile, so a runtime multiply is cheap; expect asm changes outside the K loop only.
+4. Raw scale row strides: `a_scale_stride_m` and `B_SCALE_STRIDE_N` are `K / 32`, kept
+   constexpr so direct-to-LDS scale copies keep their sub-16-byte alignment
+   (`test_a_scale_row_stride_preserves_sub_16_byte_alignment`). A runtime stride needs a
+   constexpr alignment hint (`gl.multiple_of`), so one kernel serves each alignment.
+
+Also:
+
+- `A_HIDDEN_DIM` and `B_HIDDEN_DIM` are constexpr `K` that nothing in the live path
+  reads.
+- `_frozen.py` takes a constexpr `K` and keeps it: pass it only to `FROZEN_STEP` builds.
+- The launch metadata reads `CFG_K` for the kernel name and flops.
+- The host picks the tuning config by `(M, N, K)`, so one binary serves only the `K`
+  that share a config.
+- This works against "Emit only this `K`'s remainder steps and drain phase" above,
+  which specializes on `K` further.
+
+Check: T2d asm unchanged inside the K loop, the determinism shas, the suite, and one
+build that serves two `K` values bit-exactly.
