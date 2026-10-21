@@ -1280,9 +1280,9 @@ def test_invalid_controls_are_rejected(config, field, value, error):
 def _executed_step(schedule, num_k, k_step):
     """Index of the emitted step that executes K step ``k_step`` for this K.
 
-    Stated from the loop structure alone: the prologue, the warm-up and peeled
-    steps, whole loop bodies, the remainder, then the drain copy for the ring phase
-    the main steps end on.
+    Stated from the loop structure alone: the prologue and peeled steps, whole loop
+    bodies, the remainder, then the drain copy for the ring phase the main steps end
+    on.
     """
     depth, peeled, unroll = (
         maybe_unwrap(schedule.depth),
@@ -1290,10 +1290,8 @@ def _executed_step(schedule, num_k, k_step):
         maybe_unwrap(schedule.unroll),
     )
     main = num_k - depth
-    if k_step < -1:
+    if k_step < 0:
         return schedule.prologue_step(k_step)
-    if k_step == -1:
-        return schedule.warmup_step()
     if k_step < peeled:
         return schedule.peeled_step(k_step)
     if k_step >= main:
@@ -1573,7 +1571,7 @@ def test_independent_buffer_waits_match_copy_history(
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     layout = KernelLayout(tc)
     minimum = _minimum(tc, layout)
-    # Both strips contain warmup, a runtime main body and a complete drain. The
+    # Both strips contain a prologue, a runtime main body and a complete drain. The
     # second commits output-epilogue copies before shallow queues finish filling.
     _audit_buffer_schedule(tc, layout, minimum)
     _audit_buffer_schedule(tc, layout, minimum + 3, epilogue_groups=2)

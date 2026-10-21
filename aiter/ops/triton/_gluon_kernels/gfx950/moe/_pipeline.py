@@ -765,6 +765,7 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
     remaining = main - peeled
     unroll_end = remaining // unroll * unroll
     buffers = _init_buffers(pc)
+    # Prologue steps before -1 only copy; step -1 also waits and DS-reads K tile 0.
     for x in gl.static_range(-depth, -1):
         for ni in gl.static_range(layout.num_n_slots):
             for mi in gl.static_range(layout.num_m_slots):
@@ -790,7 +791,7 @@ def _run_buffered_pipeline(pc, ptrs, NUM_K):
                 ),
             )
     regs = _PipelineRegFragments((), (), (), (), acc)
-    ptrs, buffers, regs = _step(pc, ptrs, buffers, regs, -1, sched.warmup_step())
+    ptrs, buffers, regs = _step(pc, ptrs, buffers, regs, -1, sched.prologue_step(-1))
     for x in gl.static_range(peeled):
         ptrs, buffers, regs = _step(pc, ptrs, buffers, regs, x, sched.peeled_step(x))
     for base in tl.range(0, unroll_end, unroll):

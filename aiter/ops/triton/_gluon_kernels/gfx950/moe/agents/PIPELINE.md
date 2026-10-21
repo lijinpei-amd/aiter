@@ -79,10 +79,12 @@ for x in -depth .. num_k - 1:
     step(x)
 ```
 
-Unrolling and then peeling turn this loop into the emitted program. The step kinds are
+Unrolling and then peeling turn this loop into the emitted program; Step kinds lists
 the parts they leave.
 
-**1. Unroll.** `step(x)` depends on `x` through its rings:
+### Unroll
+
+`step(x)` depends on `x` through its rings:
 
 - the LDS buffer it copies into and DS-reads from, `((x + F) // R) % D`;
 - the register buffer it copies into and its MFMA reads, a tuple index that must be
@@ -110,8 +112,10 @@ for u in 0 .. rem - 1:                         # remainder
 
 The guards in `step` still test `x`, which now depends on the runtime `i`.
 
-**2. Peel.** Peeling moves steps off the front and the back of the loop, as straight-line
-code, until every guard holds in every iteration. Given `1 <= F(c) <= depth`:
+### Peeling
+
+Peeling moves steps off the front and the back of the loop, as straight-line code,
+until every guard holds in every iteration. Given `1 <= F(c) <= depth`:
 
 - Front: the MFMA's `x >= 0` and each copy's `x + F(c) >= 0` hold from step 0 on. The
   first copy, tile 0 by a component with `F = depth`, is at step `-depth`: `depth` steps,
@@ -124,16 +128,49 @@ Two more reasons peel the first main steps, `peeled >= 1` of them:
 
 - Step 0's MFMA accumulates into zeros. Out of the loop, the compiler sees the zero
   accumulator.
-- An early step's wait can leave fewer loads in flight than later iterations of its
-  loop step. Before every component has started copying, fewer copies, and under
-  `PER_OP` fewer groups, separate a needed copy from its DS read. A loop wait gets the
-  smallest `vmcnt` over the paths into the loop (Wait plan), so in the loop that step
-  would tighten the wait of every iteration.
+- An early step's wait can differ from its loop step's steady wait. In the loop it
+  would set the `vmcnt` of every iteration (Wait plan).
 
-`peeled` is one past the last step whose wait differs from its steady twin's, in its
-immediate or its window, and at least 1 (the rule is under Peeling). In all,
-`depth + peeled` steps come off the front and `depth` off the back. The loop keeps steps
-`peeled .. main - 1`, unrolled as in 1:
+How many steps the second reason peels:
+
+1. **First steady step: `-min(F)`.** From it on every component copies, so each step
+   issues and commits what a loop step of its phase does.
+2. **History: `reach(x)` steps.** Step `x`'s wait counts groups and loads from its
+   newest needed copy, issued at `x + 1 - reach(x)`. `reach(x)` is the smallest `F` it
+   DS-reads, the largest over the step's waits (0 if none).
+3. **Bound.** The wait is steady once its history is: `x + 1 - reach(x) >= -min(F)`,
+   or `x >= reach(x) - 1 - min(F)`. Peeling `bound` steps, one past the last that
+   fails, makes every loop wait steady. `reach(x) <= max(F)`, so
+   `1 <= bound <= max(1, max(F) - min(F) - 1)`, at most `max(1, depth - 2)`.
+
+`bound` only caps the peel: a step below it can still match its steady twin. A replay
+finds the exact `peeled <= bound`:
+
+- **Rule.** Compare each wait's immediate and window (per pane, or per step under the
+  per-stage schemes) with its steady twin's, a later step congruent to it modulo
+  `copy_period`, `lcm(R)` over the present components. Register copies count: they are
+  in the window. `peeled` is one past the last step that differs, and at least 1, so
+  the first MFMA keeps its visible zero accumulator.
+- **Two stages.** At `bound = 1` there is no replay: `peeled = 1`. Otherwise
+  `_replay(..., windows=True)` runs the prologue and steps `0 .. bound + copy_period - 1`,
+  and each step below `bound` is compared with its twin in
+  `[bound, bound + copy_period - 1]`. A symbolic sweep of 17920 configs (4 schemes,
+  7 ring-depth sets, 5 pane shapes, both `SCALE_FILL_MID`, 16 placements, 4 `R` mixes)
+  has 16800 with an LDS component. In those the replay is skipped 77% of the time and
+  never goes past step 15, and the peel equals the one found by comparing every step
+  with a steady step far out.
+- **Last, not first.** The differing steps can have gaps, so a first-match rule would
+  leave a differing step in the loop. Example: `PER_OP`, 2x2, ring depths `(2, 4, 6, 3)`
+  in `COMPONENTS` order, both scales at `R = 2`, B payload in registers: depth 7, step 0
+  matches, step 1 differs, `peeled = 2`.
+- **Any scheme can peel more than one step.** Example: `PER_PANE`, 2x2, ring depths
+  `(2, 4, 6, 3)`, all through LDS, both scales at `R = 2`, so `F = (2, 7, 6, 5)`: every
+  immediate matches its twin's, but the windows of steps 0, 1 and 2 hold fewer copies,
+  so `peeled = 3`. Under the per-stage schemes, a register ring with a small `F` does
+  the same.
+
+In all, `depth + peeled` steps come off the front and `depth` off the back. The loop
+keeps steps `peeled .. main - 1`, unrolled as in Unroll:
 
 ```
 for x in -depth .. peeled - 1:                 # front: straight-line
@@ -151,35 +188,35 @@ for x in main .. num_k - 1:                    # back: straight-line
 A front step has a compile-time `x`, so its guards and rings fold. A back step `main + j`
 still depends on the runtime `num_k`, but its guards do not: `x + F < num_k` is
 `j < depth - F`, and the others hold. Its rings depend on `main % buffer_period`; see
-Drain below.
+Drain under Step kinds.
 
-**3. Step kinds.** The DS read's guards split the front and the back once more: only
-step `-1` has `x + 1 >= 0` in the front, and only step `num_k - 1` fails `x + 1 < num_k`
-in the back. Each kind is a range of steps that issues a fixed set of instructions:
+## Step kinds
+
+The DS read's guard `x + 1 < num_k` splits the back once more: only step `num_k - 1`
+fails it, and issues only its MFMAs. Each kind is a range of steps:
 
 | kind | steps `x` | count | `buffer_load` | `ds_read` | MFMA |
 |---|---|---|---|---|---|
-| prologue | `-depth .. -2` | `depth - 1` | components with `x >= -F` | - | - |
-| warm-up | `-1` | 1 | all | yes | - |
+| prologue | `-depth .. -1` | `depth` | components with `x >= -F` | at `x = -1` | - |
 | peeled | `0 .. peeled - 1` | `peeled` | all | yes | yes |
 | loop | `peeled .. peeled + iters * unroll - 1` | `iters * unroll` | all | yes | yes |
 | remainder | `peeled + iters * unroll .. main - 1` | `rem` | all | yes | yes |
 | drain | `main .. num_k - 2` | `depth - 1` | components with `x < num_k - F` | yes | yes |
 | final MFMA | `num_k - 1` | 1 | - | - | yes |
 
-- The warm-up copies for every component, since `x + F >= 0` at `F >= 1`, and DS-reads
-  K tile 0.
-- Prologue and drain both have `depth - 1` steps, the lead of an `F = depth` copy over
-  its `ds_read`. In all, `num_k + depth` steps, the last one the final MFMA.
+- Prologue step `-1` copies for every component, since `x + F >= 0` at `F >= 1`, and is
+  the only prologue step that passes the DS read's `x + 1 >= 0`: it DS-reads K tile 0.
+- The prologue is the `depth`-step lead of an `F = depth` copy over its MFMA; the drain
+  and the final MFMA are the same `depth` steps at the back. In all, `num_k + depth`
+  steps, the last one the final MFMA.
 - `depth` is the largest `L`, not the largest `F`: if the deepest ring is in registers
   and no component reaches `F = depth`, prologue step `-depth` copies nothing.
 
 All together, with the `Schedule` accessor that indexes each kind:
 
 ```
-for x in -depth .. -2:                         # prologue: prologue_step(x)
+for x in -depth .. -1:                         # prologue: prologue_step(x)
     step(x)
-step(-1)                                       # warm-up: warmup_step()
 for x in 0 .. peeled - 1:                      # peeled: peeled_step(x)
     step(x)
 for i in 0 .. iters - 1:                       # loop: a runtime tl.range loop
@@ -203,8 +240,7 @@ Its LDS ring indices count from `ds_read_tile = step + 1`, the tile it DS-reads.
 
 | kind | emitted | executed | emitted as |
 |---|---|---|---|
-| prologue | `depth - 1` | `depth - 1` | copies inline in `_run_buffered_pipeline`, not `_step` |
-| warm-up | 1 | 1 | one `_step` |
+| prologue | `depth` | `depth` | see Prologue below |
 | peeled | `peeled` | `peeled` | straight-line `_step`s |
 | loop | `unroll` | `iters * unroll` | a `tl.range` loop whose body is `unroll` steps |
 | remainder | `unroll - 1` if `static_remainder`, else 1 | `rem` | see Remainder below |
@@ -212,10 +248,13 @@ Its LDS ring indices count from `ds_read_tile = step + 1`, the tile it DS-reads.
 | final MFMA | - | 1 | `_last_mfma` or `_drain_last_fused`; no copy, DS read or wait |
 
 Per emitted step, `Schedule` stores its kind, `phase` (the step number its ring
-arithmetic uses), unroll position `ki`, `in_loop`, and `dot` (false for prologue and
-warm-up). `phase` is `x` on straight-line steps and `peeled + u` on loop step `u`, which
-is congruent to it modulo `unroll`.
+arithmetic uses), unroll position `ki`, `in_loop`, and `dot` (false in the prologue).
+`phase` is `x` on straight-line steps and `peeled + u` on loop step `u`, which is
+congruent to it modulo `unroll`.
 
+- **Prologue.** Steps `-depth .. -2` only copy, so `_run_buffered_pipeline` issues their
+  copies inline, not through `_step`. Step `-1` also waits and DS-reads K tile 0: it is
+  one `_step`.
 - **Remainder.** With `UNROLL_EPILOGUE` (`static_remainder`): `unroll - 1` straight-line
   steps, each behind a runtime `if`, with compile-time LDS indices. Without it: one step
   body in a runtime loop at phase 0, with runtime indices, which needs every scale at
@@ -242,7 +281,8 @@ M inner):
 3. A `sched_barrier` after a loop step that holds a register ring (not under the warp
    pipeline). Straight-line steps rotate the register rings.
 
-The warm-up step also issues a `sched_barrier` before its first pane's `mem` region.
+Prologue step `-1`, the one `_step` without MFMAs, also issues a `sched_barrier` before
+its first pane's `mem` region.
 
 The regions are `TritonAMDGPUWarpPipeline` stages only in loop steps with
 `WARP_PIPELINE=1`; elsewhere `pick_warp_pipeline_stage` makes them no-ops. Waits sit
@@ -302,9 +342,9 @@ nothing.
 | `PER_STAGE_WHOLE` (3) | after the last pane's MFMA region, in its own `commit` region | one, if the step copies through LDS | one per step |
 | `PER_STAGE_WARP_PIPELINE` (4) | end of the last pane's `mem` region | one, if the step copies through LDS | one per step |
 
-In the prologue, both per-stage schemes commit after the last pane's copies
-(`_buffer_load_pane`, `MARK_TILE`). Under `PER_OP` a pane's groups follow `COMPONENTS`
-order, the order `_buffer_load_pane` copies in; reorder both together.
+In the inline prologue steps (before `-1`), both per-stage schemes commit after the last
+pane's copies (`_buffer_load_pane`, `MARK_TILE`). Under `PER_OP` a pane's groups follow
+`COMPONENTS` order, the order `_buffer_load_pane` copies in; reorder both together.
 
 Today only drain steps copy nothing through LDS, once every LDS component has stopped
 copying. Dropping their groups shortened drain immediates but moved no `vmcnt`: an empty
@@ -350,9 +390,9 @@ at every step.
   LDS component it DS-reads at this phase (step `t - 1`), the copy issued at `s = t - F`. A
   register ring needs nothing. No demand, no wait (`None`).
 - **Execution order.** The replay walks the commit plan in execution order for this `K`:
-  prologue, warm-up, peeled steps, every loop iteration, the remainder, the epilogue's
-  commit groups, the drain. It asserts that each needed copy was committed earlier, and
-  that no copy is committed twice.
+  prologue, peeled steps, every loop iteration, the remainder, the epilogue's commit
+  groups, the drain. It asserts that each needed copy was committed earlier, and that no
+  copy is committed twice.
 - **One immediate per emitted step.** A loop step runs many times and keeps the smallest
   immediate over its executions.
 - **Emitted, not executed.** Static-remainder steps past `rem` take their immediates from
@@ -365,45 +405,6 @@ at every step.
 - **Precondition.** The replay uses `num_k_tiles(K)` with `K` constexpr, while the loop
   bound `NUM_K` is a runtime argument. The host passes `num_k_tiles(K)`; any other
   `NUM_K` can run a drain phase on borrowed immediates.
-
-## Peeling
-
-A loop wait gets one `vmcnt` for all its iterations, the smallest over the paths into
-the loop (Wait plan), and the first iteration's path comes from the prologue. An early
-step's window can reach back to steps where some component had not started copying, so
-it holds fewer loads than the same wait in later iterations, and under `PER_OP` its
-immediate can be smaller too. Left in the loop, that step would tighten the wait of
-every iteration, so it is peeled out instead.
-
-- **Rule.** Compare each wait's immediate and window (per pane, or per step under the
-  per-stage schemes) with its steady twin's, a later step congruent to it modulo
-  `copy_period`, `lcm(R)` over the present components. Register copies count: they are
-  in the window. The peeled steps run through the last step that differs. Step 0 is
-  always peeled, so the first MFMA keeps its visible zero accumulator.
-- **Bound.** Every component copies from step `-min(F)` on, so a step whose waits'
-  windows all start there or later is steady. A wait of step `x` needs, for each LDS
-  component it DS-reads, the copy from step `x + 1 - F`, and its window starts at the
-  newest of them, the one with the smallest `F`. With `reach(x)` the largest such `F`
-  over the step's waits (0 when none needs a copy), step `x` is steady once
-  `x + 1 - reach(x) >= -min(F)`. `bound` is one past the last step that fails, at least
-  1; `reach <= depth` and `F >= 1`, so `bound <= max(1, depth - 2)`.
-- **Two stages.** At `bound = 1` there is no replay: `peeled = 1`. Otherwise
-  `_replay(..., windows=True)` runs the prologue, the warm-up and steps
-  `0 .. bound + copy_period - 1`, and each step below `bound` is compared with its twin
-  in `[bound, bound + copy_period - 1]`. A symbolic sweep of 17920 configs (4 schemes,
-  7 ring-depth sets, 5 pane shapes, both `SCALE_FILL_MID`, 16 placements, 4 `R` mixes)
-  has 16800 with an LDS component. In those the replay is skipped 77% of the time and
-  never goes past step 15, and the peel equals the one found by comparing every step
-  with a steady step far out.
-- **Last, not first.** The differing steps can have gaps, so a first-match rule would
-  leave a differing step in the loop. Example: `PER_OP`, 2x2, ring depths `(2, 4, 6, 3)`
-  in `COMPONENTS` order, both scales at `R = 2`, B payload in registers: depth 7, step 0
-  matches, step 1 differs, `peeled = 2`.
-- **Any scheme can peel more than one step.** Example: `PER_PANE`, 2x2, ring depths
-  `(2, 4, 6, 3)`, all through LDS, both scales at `R = 2`, so `F = (2, 7, 6, 5)`: every
-  immediate matches its twin's, but the windows of steps 0, 1 and 2 hold fewer copies,
-  so `peeled = 3`. Under the per-stage schemes, a register ring with a small `F` does
-  the same.
 
 ## Emission invariants
 

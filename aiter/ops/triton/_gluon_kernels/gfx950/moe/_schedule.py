@@ -18,11 +18,10 @@ __all__ = ["Schedule"]
 
 class _StepKind(IntEnum):
     PROLOGUE = 0
-    WARMUP = 1
-    PEELED = 2
-    LOOP = 3
-    REMAINDER = 4
-    DRAIN = 5
+    PEELED = 1
+    LOOP = 2
+    REMAINDER = 3
+    DRAIN = 4
 
 
 @gluon.constexpr_function
@@ -140,7 +139,8 @@ def _step_plan(
             whole += ops
             groups = (whole,) if pane_index == len(issued) - 1 and whole else ()
         commits.append(groups)
-    if kind == _StepKind.PROLOGUE:
+    if kind == _StepKind.PROLOGUE and phase < -1:
+        # Step `phase` DS-reads K tile `phase + 1`: in the prologue, only step -1.
         demand = ()
     else:
         ds_reads = tuple(
@@ -417,15 +417,15 @@ class Schedule:
                 if x + 1 - reach(x) < first_steady:
                     bound = x + 1
             if bound > 1:
-                warm = [
-                    (None, x) + step_plan(_StepKind.PROLOGUE, x, x)[2:]
-                    for x in range(-depth, -1)
+                early = [
+                    (x, x)
+                    + step_plan(
+                        _StepKind.PEELED if x >= 0 else _StepKind.PROLOGUE, x, x
+                    )[2:]
+                    for x in range(-depth, bound + copy_period)
                 ]
-                for x in range(-1, bound + copy_period):
-                    kind = _StepKind.PEELED if x >= 0 else _StepKind.WARMUP
-                    warm.append((x, x) + step_plan(kind, x, x)[2:])
                 waits = _replay(
-                    [warm], load_to_mfma_distance, commit[2], num_panes, windows=True
+                    [early], load_to_mfma_distance, commit[2], num_panes, windows=True
                 )
                 for x in range(bound):
                     twin = x + copy_period * -(-(bound - x) // copy_period)
@@ -472,9 +472,8 @@ class Schedule:
         drain_phases = buffer_period if static_drain else 1
         steps = [
             (int(_StepKind.PROLOGUE), x, x, 0, False, False, False)
-            for x in range(-depth, -1)
+            for x in range(-depth, 0)
         ]
-        steps.append((int(_StepKind.WARMUP), -1, -1, 0, False, False, False))
         steps += [
             (int(_StepKind.PEELED), x, x, 0, False, False, True) for x in range(peeled)
         ]
@@ -504,8 +503,7 @@ class Schedule:
         ]
         plans = [step_plan(s[0], s[1], s[2]) for s in steps]
 
-        warmup = depth - 1
-        loop = warmup + 1 + peeled
+        loop = depth + peeled
         remainder = loop + unroll
         drain = len(steps) - drain_phases * (depth - 1)
         remaining = main - peeled
@@ -514,7 +512,7 @@ class Schedule:
         def entry(index, step):
             return (index, step) + plans[index][2:]
 
-        head = [entry(i, steps[i][1]) for i in range(warmup + 1 + peeled)]
+        head = [entry(i, steps[i][1]) for i in range(loop)]
         head += [
             entry(loop + u, peeled + it * unroll + u)
             for it in range(iters)
@@ -557,12 +555,8 @@ class Schedule:
     @gluon.constexpr_function
     def prologue_step(self, x):
         depth = self.depth.value
-        assert -depth <= x < -1, f"no prologue step {x}"
+        assert -depth <= x < 0, f"no prologue step {x}"
         return x + depth
-
-    @gluon.constexpr_function
-    def warmup_step(self):
-        return self.depth.value - 1
 
     @gluon.constexpr_function
     def peeled_step(self, x):
