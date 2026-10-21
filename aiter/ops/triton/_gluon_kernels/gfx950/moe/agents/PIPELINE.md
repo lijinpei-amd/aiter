@@ -405,14 +405,22 @@ at every step.
 - **Emitted, not executed.** Remainder steps this `K` does not run take their immediates
   from a second replay with the longest remainder: static-remainder steps past `rem`,
   and the dynamic remainder step when `rem == 0`. The drain copies for the other phases
-  borrow the executed phase's immediates.
+  borrow the executed phase's immediates, which are exact for them too (Precondition).
 - **Epilogue groups.** `_stage_epilogue_inputs` commits `epilogue_groups` groups (bias
   and gammas staged in LDS) between the main loop and the drain. The replay counts them
   there, so they lengthen only the drain waits whose newest needed copy is older. After
   the drain, `wait_group(epilogue_wait())` and a barrier retire them.
 - **Precondition.** The replay uses `num_k_tiles(K)` with `K` constexpr, while the loop
-  bound `NUM_K` is a runtime argument. The host passes `num_k_tiles(K)`; any other
-  `NUM_K` can run a drain phase on borrowed immediates.
+  bound `NUM_K` is a runtime argument. The host passes `num_k_tiles(K)`, but any `NUM_K`
+  that `validate` accepts, at least `depth + peeled + unroll` and a multiple of every
+  `R`, gets exact immediates too. Loop steps are steady from `peeled` on, and remainder
+  steps this `K` skips take the longest replay's. With `NUM_K % R == 0`, a drain step's
+  copies, DS reads and the history its waits reach back into depend only on `j`, so
+  every drain phase's borrowed immediates are its own. Between such `K` the tables
+  differ only in the drain rows' `phase`, which the emitter uses modulo `R`. Checked
+  2026-10-21: the symbolic emitter (`_execute` in `test_moe_gemm_gluon_buffered_schedule`)
+  ran a schedule built for one `num_k` at every other valid `num_k` over two unroll
+  periods, for 26 configs under all 4 schemes, and every wait was exact.
 
 ## Emission invariants
 
