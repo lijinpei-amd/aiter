@@ -13,15 +13,56 @@ from ._lang import maybe_unwrap as _v
 from ._lang import strip_annotate
 from ._types import A, A_PAYLOAD, B_PAYLOAD, COMPONENTS, CompSlot
 
-__all__ = ["Schedule"]
+__all__ = ["Schedule", "Step", "StepKind"]
 
 
-class _StepKind(IntEnum):
+class StepKind(IntEnum):
     PROLOGUE = 0
     PEELED = 1
     LOOP = 2
     REMAINDER = 3
     DRAIN = 4
+
+
+@aggregate
+@strip_annotate
+class Step:
+    """One emitted step body: its kind and its place among that kind's bodies. Equal
+    by value, so it keys dicts and sets.
+
+    ``index`` counts the kind's bodies from 0 in emission order and never depends on
+    ``num_k``: prologue step ``x`` is ``x + depth``, peeled step ``x`` is ``x``, loop
+    and remainder step ``u`` is ``u``, and drain step ``j`` of drain phase ``p`` is
+    ``p * (depth - 1) + j``.
+    """
+
+    #: A ``StepKind``, stored as an int.
+    kind: gl.constexpr
+    #: The body's place among its kind's emitted bodies, from 0.
+    index: gl.constexpr
+
+    @gluon.constexpr_function
+    def __init__(self, kind, index):
+        assert index >= 0, f"step index {index} is negative"
+        self.kind = gl.constexpr(int(kind))
+        self.index = gl.constexpr(index)
+
+    @gluon.constexpr_function
+    def __eq__(self, other):
+        return (
+            type(other) is type(self)
+            and other.kind.value == self.kind.value
+            and other.index.value == self.index.value
+        )
+
+    @gluon.constexpr_function
+    def __hash__(self):
+        return hash((self.kind.value, self.index.value))
+
+    @gluon.constexpr_function
+    def __repr__(self):
+        # A jit helper that takes a `Step` specializes on this string.
+        return f"Step({self.kind.value}, {self.index.value})"
 
 
 @gluon.constexpr_function
@@ -100,7 +141,7 @@ def _step_plan(
     phase,
 ):
     steps_per_buffer = tuple(_scale_r(scale_slot_span, c) for c in COMPONENTS)
-    if kind == _StepKind.DRAIN:
+    if kind == StepKind.DRAIN:
         active = tuple(
             p and stage < depth - f
             for p, f in zip(component_present, load_to_mfma_distance)
@@ -139,7 +180,7 @@ def _step_plan(
             whole += ops
             groups = (whole,) if pane_index == len(issued) - 1 and whole else ()
         commits.append(groups)
-    if kind == _StepKind.PROLOGUE and phase < -1:
+    if kind == StepKind.PROLOGUE and phase < -1:
         # Step `phase` DS-reads K tile `phase + 1`: in the prologue, only step -1.
         demand = ()
     else:
@@ -248,6 +289,7 @@ class Schedule:
     static_remainder: gl.constexpr
     static_drain: gl.constexpr
     epilogue_groups: gl.constexpr
+    _step_counts: gl.constexpr
     _steps: gl.constexpr
     _active: gl.constexpr
     _loads: gl.constexpr
@@ -412,7 +454,7 @@ class Schedule:
         if bound > 1:
             early = []
             for x in range(-depth, bound + copy_period):
-                kind = _StepKind.PEELED if x >= 0 else _StepKind.PROLOGUE
+                kind = StepKind.PEELED if x >= 0 else StepKind.PROLOGUE
                 early.append((x, x) + step_plan(kind, x, x)[2:])
             waits = _replay(
                 [early], load_to_mfma_distance, commit[2], num_panes, windows=True
@@ -449,6 +491,17 @@ class Schedule:
         self.static_drain = gl.constexpr(static_drain)
         self.epilogue_groups = gl.constexpr(epilogue_groups)
 
+        drain_phases = buffer_period if static_drain else 1
+        # Emitted bodies per kind, in `StepKind` order; none depends on `num_k`.
+        step_counts = (
+            depth,
+            peeled,
+            unroll,
+            unroll - 1 if static_remainder else 1,
+            drain_phases * (depth - 1),
+        )
+        self._step_counts = gl.constexpr(step_counts)
+
         main = num_k - depth
         if main < peeled + unroll:
             self._steps = gl.constexpr(None)
@@ -458,38 +511,28 @@ class Schedule:
             self._waits = gl.constexpr(None)
             return
 
-        drain_phases = buffer_period if static_drain else 1
-        steps = [
-            (int(_StepKind.PROLOGUE), x, x, 0, False, False, False)
-            for x in range(-depth, 0)
-        ]
-        steps += [
-            (int(_StepKind.PEELED), x, x, 0, False, False, True) for x in range(peeled)
-        ]
-        steps += [
-            (int(_StepKind.LOOP), None, peeled + u, u, True, False, True)
-            for u in range(unroll)
-        ]
+        # One row per emitted body, in `_row` order: (kind, stage, phase, ki).
+        steps = [(int(StepKind.PROLOGUE), x, x, 0) for x in range(-depth, 0)]
+        steps += [(int(StepKind.PEELED), x, x, 0) for x in range(peeled)]
+        steps += [(int(StepKind.LOOP), None, peeled + u, u) for u in range(unroll)]
         if static_remainder:
             steps += [
-                (int(_StepKind.REMAINDER), None, peeled + u, u, False, True, True)
+                (int(StepKind.REMAINDER), None, peeled + u, u)
                 for u in range(unroll - 1)
             ]
         else:
-            steps.append((int(_StepKind.REMAINDER), None, 0, 0, False, False, True))
+            steps.append((int(StepKind.REMAINDER), None, 0, 0))
         steps += [
             (
-                int(_StepKind.DRAIN),
+                int(StepKind.DRAIN),
                 j,
                 num_k - depth + j,
                 p + j - peeled if static_drain else 0,
-                False,
-                static_drain,
-                True,
             )
             for p in range(drain_phases)
             for j in range(depth - 1)
         ]
+        assert len(steps) == sum(step_counts)
         plans = [step_plan(s[0], s[1], s[2]) for s in steps]
 
         loop = depth + peeled
@@ -545,66 +588,75 @@ class Schedule:
     def prologue_step(self, x):
         depth = self.depth.value
         assert -depth <= x < 0, f"no prologue step {x}"
-        return x + depth
+        return Step(StepKind.PROLOGUE, x + depth)
 
     @gluon.constexpr_function
     def peeled_step(self, x):
         assert 0 <= x < self.peeled.value, f"no peeled step {x}"
-        return self.depth.value + x
+        return Step(StepKind.PEELED, x)
 
     @gluon.constexpr_function
     def loop_step(self, u):
         assert 0 <= u < self.unroll.value, f"no loop step {u}"
-        return self.depth.value + self.peeled.value + u
+        return Step(StepKind.LOOP, u)
 
     @gluon.constexpr_function
     def remainder_step(self, u):
-        unroll = self.unroll.value
-        count = unroll - 1 if self.static_remainder.value else 1
+        count = self._step_counts.value[StepKind.REMAINDER]
         assert 0 <= u < count, f"no remainder step {u}"
-        return self.depth.value + self.peeled.value + unroll + u
+        return Step(StepKind.REMAINDER, u)
 
     @gluon.constexpr_function
     def drain_step(self, p, j):
         depth = self.depth.value
         phases = self.buffer_period.value if self.static_drain.value else 1
         assert 0 <= p < phases and 0 <= j < depth - 1, f"no drain step {p, j}"
-        return len(self._steps.value) - (phases - p) * (depth - 1) + j
+        return Step(StepKind.DRAIN, p * (depth - 1) + j)
+
+    @gluon.constexpr_function
+    def _row(self, step):
+        # The step's row in the per-step tables, which hold the kinds' bodies in
+        # `StepKind` order.
+        counts = self._step_counts.value
+        kind, index = step.kind.value, step.index.value
+        assert index < counts[kind], f"no step {step!r}"
+        return sum(counts[:kind]) + index
 
     @gluon.constexpr_function
     def phase(self, step):
-        return self._steps.value[step][2]
+        return self._steps.value[self._row(step)][2]
 
     @gluon.constexpr_function
     def ki(self, step):
-        return self._steps.value[step][3]
+        return self._steps.value[self._row(step)][3]
 
     @gluon.constexpr_function
     def in_loop(self, step):
-        return self._steps.value[step][4]
+        return step.kind.value == StepKind.LOOP
 
     @gluon.constexpr_function
     def dot(self, step):
-        return self._steps.value[step][6]
+        return step.kind.value != StepKind.PROLOGUE
 
     @gluon.constexpr_function
     def is_drain(self, step):
-        return self._steps.value[step][0] == _StepKind.DRAIN
+        return step.kind.value == StepKind.DRAIN
 
     @gluon.constexpr_function
     def active(self, step, component):
-        return self._active.value[step][component.index()]
+        return self._active.value[self._row(step)][component.index()]
 
     @gluon.constexpr_function
     def loads(self, step, component):
-        return self._loads.value[step][component.index()]
+        return self._loads.value[self._row(step)][component.index()]
 
     @gluon.constexpr_function
     def issued(self, step, pane_index):
         return tuple(
             slot if load else None
             for slot, load in zip(
-                self._buffer_load_slots.value[pane_index], self._loads.value[step]
+                self._buffer_load_slots.value[pane_index],
+                self._loads.value[self._row(step)],
             )
         )
 
@@ -627,18 +679,18 @@ class Schedule:
                 CompSlot(COMPONENTS[component_index], slot)
                 for component_index, slot in group
             )
-            for group in self._commits.value[step][pane_index]
+            for group in self._commits.value[self._row(step)][pane_index]
         )
 
     @gluon.constexpr_function
     def closes_group(self, step, pane_index):
         # Whether the pane commits a group at this step: not when it copies nothing
         # through LDS, or under the per-stage schemes, before the last pane.
-        return bool(self._commits.value[step][pane_index])
+        return bool(self._commits.value[self._row(step)][pane_index])
 
     @gluon.constexpr_function
     def wait(self, step, pane_index=None):
-        tile, pane_waits = self._waits.value[step]
+        tile, pane_waits = self._waits.value[self._row(step)]
         return tile if pane_index is None else pane_waits[pane_index]
 
     @gluon.constexpr_function
@@ -713,7 +765,12 @@ class Schedule:
         if not self.component_present(component):
             return 0
         depth, r = self.num_buffers(component), self.steps_per_buffer(component)
-        if not (self.in_loop(step) or self._steps.value[step][5]):
+        kind = step.kind.value
+        if not (
+            kind == StepKind.LOOP
+            or (kind == StepKind.REMAINDER and self.static_remainder.value)
+            or (kind == StepKind.DRAIN and self.static_drain.value)
+        ):
             return None
         if self.unroll.value % (depth * r) != 0:
             return None

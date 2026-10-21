@@ -236,8 +236,8 @@ def dump_case(name, cfg, dq_a, dq_b, K, out):
                 f"ds_read_non_k_slots={ds_read}")
 
     # every emitted step: what it copies, commits and waits on, and its ring indices
-    for label, step, static_phase in _steps(schedule):
-        out(f"  step {step} {label}: phase={schedule.phase(step)} "
+    for row, (label, step, static_phase) in enumerate(_steps(schedule)):
+        out(f"  step {row} {label}: phase={schedule.phase(step)} "
             f"ki={schedule.ki(step)} in_loop={schedule.in_loop(step)} "
             f"static_phase={static_phase} dot={schedule.dot(step)} "
             f"soff={schedule.soff_unroll(step)}")
