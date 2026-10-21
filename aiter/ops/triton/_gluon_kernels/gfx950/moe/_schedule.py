@@ -359,7 +359,6 @@ class Schedule:
         static_remainder = bool(_v(tc.UNROLL_EPILOGUE))
         static_drain = (
             buffer_period <= 3
-            and unroll % buffer_period == 0
             and reg_buffer_period == 1
             and _v(fc.output_quant) is None
         )
