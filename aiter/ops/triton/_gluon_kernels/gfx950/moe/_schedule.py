@@ -156,12 +156,16 @@ def _step_plan(
             )
             for slots in ds_read_slots
         )
-    return active, loads, tuple(commits), demand
+    return active, loads, issued, tuple(commits), demand
 
 
 @gluon.constexpr_function
-def _replay(orders, load_to_mfma_distance, per_tile, num_panes):
-    def _immediate(position, count, step, need, load_to_mfma_distance):
+def _replay(orders, load_to_mfma_distance, per_tile, num_panes, windows=False):
+    # A wait's immediate counts the groups committed after the newest one it needs.
+    # With `windows`, each wait also gets its window: the loads it leaves in flight,
+    # every copy (LDS or register) issued after that group's last LDS copy, in emission
+    # order. That models what LLVM counts into the vmcnt (PIPELINE.md, Wait plan).
+    def _wait(position, ends, stream, count, step, need):
         if not need:
             return None
         latest = -1
@@ -176,38 +180,42 @@ def _replay(orders, load_to_mfma_distance, per_tile, num_panes):
                 copy in position
             ), f"copy {copy} is DS-read at step {step} but was never committed before it"
             latest = max(latest, position[copy])
-        return count - latest - 1
+        if not windows:
+            return count - latest - 1
+        return count - latest - 1, tuple(sorted(stream[ends[latest] + 1 :]))
 
     def _smaller(a, b):
         return b if a is None else a if b is None else min(a, b)
 
     out = {}
     for order in orders:
-        position, count = {}, 0
-        for key, step, commits, demand in order:
+        # `stream` holds every copy in issue order; `ends[g]` is the stream position
+        # of group g's last LDS copy.
+        position, ends, stream, count = {}, [], [], 0
+        for key, step, issued, commits, demand in order:
             measure = key is not None and bool(demand)
             if measure:
                 tile, pane_waits = out.get(key, (None, (None,) * num_panes))
                 pane_waits = list(pane_waits)
                 if per_tile:
                     need = tuple(copy for copies in demand for copy in copies)
-                    now = _immediate(position, count, step, need, load_to_mfma_distance)
+                    now = _wait(position, ends, stream, count, step, need)
                     tile = _smaller(tile, now)
+            where = {}
             for pane_index, groups in enumerate(commits):
                 if measure and not per_tile:
-                    now = _immediate(
-                        position,
-                        count,
-                        step,
-                        demand[pane_index],
-                        load_to_mfma_distance,
-                    )
+                    now = _wait(position, ends, stream, count, step, demand[pane_index])
                     pane_waits[pane_index] = _smaller(pane_waits[pane_index], now)
+                for component_index, slot in enumerate(issued[pane_index]):
+                    if slot is not None:
+                        where[(component_index, slot)] = len(stream)
+                        stream.append((component_index, slot))
                 for group in groups:
                     for component_index, slot in group:
                         copy = (step, component_index, slot)
                         assert copy not in position, f"copy {copy} committed twice"
                         position[copy] = count
+                    ends.append(max((where[op] for op in group), default=-1))
                     count += 1
             if measure:
                 out[key] = (tile, tuple(pane_waits))
@@ -271,7 +279,7 @@ class Schedule:
             for s, c in zip(buffer_live_span, COMPONENTS)
         )
 
-        depth, buffer_period, reg_buffer_period, async_period = 0, 1, 1, 1
+        depth, buffer_period, reg_buffer_period, copy_period = 0, 1, 1, 1
         for component_index, c in enumerate(COMPONENTS):
             if component_present[component_index]:
                 r = _scale_r(scale_slot_span, c)
@@ -279,9 +287,8 @@ class Schedule:
                 buffer_period = math.lcm(
                     buffer_period, num_buffers[component_index] * r
                 )
-                if layout.component_via_lds(c):
-                    async_period = math.lcm(async_period, r)
-                else:
+                copy_period = math.lcm(copy_period, r)
+                if not layout.component_via_lds(c):
                     reg_buffer_period = math.lcm(
                         reg_buffer_period, num_buffers[component_index] * r
                     )
@@ -376,21 +383,53 @@ class Schedule:
                 phase,
             )
 
+        def reach(x):
+            # How far back the waits of step x reach: per wait, the smallest F among
+            # the LDS components it DS-reads, whose copy is the newest it needs; the
+            # largest over the step's waits, or 0 when none needs a copy.
+            needs = [
+                [
+                    load_to_mfma_distance[component_index]
+                    for component_index, slot in enumerate(slots)
+                    if slot is not None
+                    and (x + 1) % _scale_r(scale_slot_span, COMPONENTS[component_index])
+                    == 0
+                ]
+                for slots in ds_read_slots
+            ]
+            if commit[2]:
+                needs = [[f for fs in needs for f in fs]]
+            return max((min(fs) for fs in needs if fs), default=0)
+
+        # Peel through the last early step whose wait differs from its steady twin's,
+        # in the immediate or in the loads its window holds (PIPELINE.md, Peeling).
+        # From step `first_steady` on every component copies, so a step whose window
+        # starts there or later is steady: only steps below `bound` can differ, and
+        # their twins sit in the `copy_period` steps after it.
         peeled = 1
         if buffer_load_panes_valid:
-            settled = 3 * depth + async_period
-            warm = [
-                (None, x) + step_plan(_StepKind.PROLOGUE, x, x)[2:]
-                for x in range(-depth, -1)
-            ]
-            for x in range(-1, settled):
-                kind = _StepKind.PEELED if x >= 0 else _StepKind.WARMUP
-                warm.append((x, x) + step_plan(kind, x, x)[2:])
-            waits = _replay([warm], load_to_mfma_distance, commit[2], num_panes)
-            for x in range(depth - 2):
-                steady = x + async_period * -(-(2 * depth - 1 - x) // async_period)
-                if waits.get(x) != waits.get(steady):
-                    peeled = x + 1
+            first_steady = -min(
+                f for f, p in zip(load_to_mfma_distance, component_present) if p
+            )
+            bound = 1
+            for x in range(depth):
+                if x + 1 - reach(x) < first_steady:
+                    bound = x + 1
+            if bound > 1:
+                warm = [
+                    (None, x) + step_plan(_StepKind.PROLOGUE, x, x)[2:]
+                    for x in range(-depth, -1)
+                ]
+                for x in range(-1, bound + copy_period):
+                    kind = _StepKind.PEELED if x >= 0 else _StepKind.WARMUP
+                    warm.append((x, x) + step_plan(kind, x, x)[2:])
+                waits = _replay(
+                    [warm], load_to_mfma_distance, commit[2], num_panes, windows=True
+                )
+                for x in range(bound):
+                    twin = x + copy_period * -(-(bound - x) // copy_period)
+                    if waits.get(x) != waits.get(twin):
+                        peeled = x + 1
 
         self._component_present = gl.constexpr(component_present)
         self._num_buffers = gl.constexpr(num_buffers)
@@ -472,7 +511,7 @@ class Schedule:
         iters, rem = remaining // unroll, remaining % unroll
 
         def entry(index, step):
-            return (index, step, plans[index][2], plans[index][3])
+            return (index, step) + plans[index][2:]
 
         head = [entry(i, steps[i][1]) for i in range(warmup + 1 + peeled)]
         head += [
@@ -490,7 +529,7 @@ class Schedule:
 
         phase = main % buffer_period if static_drain else 0
         executed = head + tail(rem)
-        executed.append((None, None, (((),) * epilogue_groups,), ()))
+        executed.append((None, None, ((),), (((),) * epilogue_groups,), ()))
         executed += [
             entry(drain + phase * (depth - 1) + j, main + j) for j in range(depth - 1)
         ]
@@ -509,7 +548,7 @@ class Schedule:
         self._steps = gl.constexpr(tuple(steps))
         self._active = gl.constexpr(tuple(plan[0] for plan in plans))
         self._loads = gl.constexpr(tuple(plan[1] for plan in plans))
-        self._commits = gl.constexpr(tuple(plan[2] for plan in plans))
+        self._commits = gl.constexpr(tuple(plan[3] for plan in plans))
         self._waits = gl.constexpr(
             tuple(waits.get(index, idle) for index in range(len(steps)))
         )

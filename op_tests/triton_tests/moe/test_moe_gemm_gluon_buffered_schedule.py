@@ -198,15 +198,20 @@ class _Machine:
         self.current_step = None
         self.loads, self.reads, self.mfmas = set(), set(), set()
         self.pending, self.committed, self.outstanding = [], [], []
+        self.copy_events = {}
         self.completed = set()
         self.lds = {}
         self.steps = []
         self.current_in_loop = False
         self.current_drain = False
         self.events = []
-        # The latest wait as (immediate, groups committed when it issued), held until
-        # the reads it guards are checked against it.
+        # The latest wait as (immediate, groups committed and events recorded when it
+        # issued), held until the reads it guards are checked against it.
         self.wait = None
+        # Per group, the events index of its last LDS copy; per checked wait,
+        # (step, pane, in loop, (immediate, window)), the window read off the
+        # emitted loads as LLVM's asyncmark wait counts them.
+        self.group_ends, self.windows = [], []
 
     @property
     def ds_read_tile(self):
@@ -244,6 +249,7 @@ class _Machine:
             for k in range(mk * r)
         )
         if tc.component_via_lds(component):
+            self.copy_events[token] = len(self.events) - 1
             key = component, mini, ring
             if key in self.lds:
                 old = self.lds[key][0]
@@ -274,10 +280,11 @@ class _Machine:
         self.pending.clear()
         self.committed.append(group)
         self.outstanding.append(group)
+        self.group_ends.append(max((self.copy_events[t] for t in group), default=-1))
 
     def wait_buffer_load_groups(self, count):
         assert self.wait is None, "two waits before one read point"
-        self.wait = count, len(self.committed)
+        self.wait = count, len(self.committed), len(self.events)
         while len(self.outstanding) > count:
             self.completed.update(self.outstanding.pop(0))
 
@@ -325,11 +332,19 @@ class _Machine:
         required = self.required(pane)
         if required:
             assert self.wait is not None, (self.current_step, pane, "no wait")
-            actual, committed = self.wait
+            actual, committed, issued = self.wait
             youngest = max(
                 i
                 for i, group in enumerate(self.committed[:committed])
                 if required.intersection(group)
+            )
+            window = sorted(
+                (event[4].index(), event[6])
+                for event in self.events[self.group_ends[youngest] + 1 : issued]
+                if event[3] == "load"
+            )
+            self.windows.append(
+                (self.current_step, pane, self.current_in_loop, (actual, tuple(window)))
             )
             assert actual == committed - youngest - 1, (
                 self.current_step,
@@ -622,6 +637,7 @@ def test_unroll_epilogue_selects_remainder_loop(
         ((3, 3, 3, 3), 4, {"read_mask": 10}),
         ((3, 3, 3, 3), 15, {"read_mask": 15}),
         ((5, 5, 2, 2), 0, {"read_mask": 10}),
+        ((5, 5, 2, 2), 1, {"packed": True}),
         ((5, 2, 2, 3), 15, {"middle": True, "soff": True}),
         ((2, 4, 3, 2), 6, {"shape": (4, 2), "read_mask": 5}),
         ((3, 2, 4, 3), 0, {"shape": (2, 4), "read_mask": 10}),
@@ -682,6 +698,42 @@ def test_emitted_unified_pipeline_all_reachable_remainders(
         _execute(tc, num_k, monkeypatch)
     # Re-enter the same static register-ring mapping from another runtime loop body.
     _execute(tc, first + 2 * unroll, monkeypatch)
+
+
+@pytest.mark.parametrize(
+    "scheme", list(WaitCommitScheme), ids=lambda scheme: scheme.name
+)
+@pytest.mark.parametrize(
+    "depths,register_mask,options",
+    [
+        ((5, 5, 2, 2), 1, {"packed": True}),
+        ((2, 4, 6, 3), 0, {"packed": True}),
+        ((2, 4, 6, 3), 1, {"packed": True, "middle": True}),
+        ((3, 3, 3, 3), 9, {"scale_steps": (2, 4), "shape": (1, 1)}),
+    ],
+)
+def test_emitted_loop_waits_leave_steady_windows(
+    scheme, depths, register_mask, options, monkeypatch
+):
+    """Each loop wait leaves the same loads in flight in every iteration.
+
+    Read off the emitted program: a wait's window is every load `_Machine` saw issued
+    after the last LDS copy of the newest group it needs, which is what LLVM's
+    asyncmark wait counts into the vmcnt. A first iteration with a smaller window
+    would give the loop's one vmcnt that smaller value in every iteration, so the
+    peel must keep such a step out of the loop. The configs are ones whose peel the
+    windows lengthen.
+    """
+    tc = _Config(scheme, depths, register_mask, **options)
+    _, peeled, unroll = tc.sizing()
+    machine = _execute(tc, tc.minimum_num_k() + 2 * unroll, monkeypatch)
+    loop = {}
+    for step, pane, in_loop, wait in machine.windows:
+        if in_loop:
+            loop.setdefault(((step - peeled) % unroll, pane), []).append(wait)
+    assert loop
+    for key, waits in loop.items():
+        assert len(waits) == 3 and len(set(waits)) == 1, (key, waits)
 
 
 def _sched_barrier_stream(machine):
@@ -929,23 +981,26 @@ def test_compiler_pipeline_owns_register_stage_ordering(monkeypatch):
     assert _sched_barrier_stream(machine) == [(-1, False, False, 0)]
 
 
-def _straight_line_waits(schedule, tc, last):
-    """Wait immediates of K steps ``-1..last`` as if every one were emitted in a line.
+def _straight_line_waits(schedule, layout, last):
+    """The waits of K steps ``-1..last`` as if every one were emitted in a line.
 
-    An independent FIFO over the schedule's public commit plan and DS reads: the
-    prologue and warm-up steps as emitted, then one step per K tile with the loop
-    body's commit pattern for that K phase -- which is what every step after the
-    warm-up issues. Returns ``{step: tile wait}`` for a per-tile scheme, else
-    ``{step: per-pane waits}``.
+    An independent FIFO over the schedule's public copy and commit plan and DS reads:
+    the prologue and warm-up steps as emitted, then one step per K tile with the loop
+    body's pattern for that K phase -- which is what every step after the warm-up
+    issues. A wait is ``(immediate, window)``, or ``None`` when it needs no copy. Its
+    window is what LLVM's asyncmark wait counts into the vmcnt: every copy, LDS or
+    register, issued after the last LDS copy of the newest group it needs, as a
+    sorted ``(component index, slot)`` multiset. Returns ``{step: tile wait}`` for a
+    per-tile scheme, else ``{step: per-pane waits}``.
     """
-    panes = tc.nm * tc.nn
-    per_tile = tc.commit_per_stage()
+    panes = maybe_unwrap(layout.num_m_slots) * maybe_unwrap(layout.num_n_slots)
+    per_tile = maybe_unwrap(schedule.commit_per_tile)
     depth, peeled, unroll = (
         maybe_unwrap(schedule.depth),
         maybe_unwrap(schedule.peeled),
         maybe_unwrap(schedule.unroll),
     )
-    committed, waits = [], {}
+    committed, issued, position, waits = [], [], {}, {}
 
     def required(step, pane):
         # Step `step` DS-reads K tile `step + 1`, copied F steps before its MFMAs.
@@ -957,15 +1012,17 @@ def _straight_line_waits(schedule, tc, last):
             )
             for c in COMPONENTS
             if schedule.ds_read_slot(pane, c) is not None
-            and tc.component_via_lds(c)
+            and layout.component_via_lds(c)
             and schedule.ds_reads_at_phase(c, step)
         }
 
-    def immediate(need):
+    def wait(need):
         if not need:
             return None
         youngest = max(i for i, group in enumerate(committed) if need & set(group))
-        return len(committed) - youngest - 1
+        last_copy = max(position[copy] for copy in committed[youngest])
+        window = sorted((c.index(), slot) for _, c, slot in issued[last_copy + 1 :])
+        return len(committed) - youngest - 1, tuple(window)
 
     for step in range(-depth, last + 1):
         if step < -1:
@@ -975,13 +1032,18 @@ def _straight_line_waits(schedule, tc, last):
         else:
             index = schedule.loop_step((step - peeled) % unroll)
         if step >= -1 and per_tile:
-            waits[step] = immediate(
+            waits[step] = wait(
                 set().union(*(required(step, pane) for pane in range(panes)))
             )
         vector = []
         for pane in range(panes):
             if step >= -1 and not per_tile:
-                vector.append(immediate(required(step, pane)))
+                vector.append(wait(required(step, pane)))
+            # A pane copies in COMPONENTS order, the order `_buffer_load_pane` issues.
+            for c, slot in zip(COMPONENTS, schedule.issued(index, pane)):
+                if slot is not None:
+                    position[(step, c, slot)] = len(issued)
+                    issued.append((step, c, slot))
             for group in schedule.commits(index, pane):
                 committed.append(
                     tuple((step, cs.component, cs.index.value) for cs in group)
@@ -989,6 +1051,77 @@ def _straight_line_waits(schedule, tc, last):
         if step >= -1 and not per_tile:
             waits[step] = tuple(vector)
     return waits
+
+
+def _assert_minimal_peel(schedule, layout):
+    """The peel covers exactly the startup steps whose wait differs from the loop's.
+
+    A wait differs when its immediate or its window does: a loop wait whose first
+    iteration leaves fewer loads in flight than later ones gets that smaller vmcnt in
+    every iteration, because LLVM takes the smallest over the paths into the loop.
+    Compared *at the same K phase*, against a steady step far out. Also checks that
+    every loop wait's first-iteration window is the steady one, that the emitted waits
+    are the straight-line ones, and that the peel stays under the closed-form bound
+    (PIPELINE.md, Peeling).
+    """
+    depth, peeled, unroll = (
+        maybe_unwrap(schedule.depth),
+        maybe_unwrap(schedule.peeled),
+        maybe_unwrap(schedule.unroll),
+    )
+    panes = maybe_unwrap(layout.num_m_slots) * maybe_unwrap(layout.num_n_slots)
+    per_tile = maybe_unwrap(schedule.commit_per_tile)
+    settled = unroll * -(-(4 * depth) // unroll)
+    waits = _straight_line_waits(schedule, layout, settled + 2 * depth + unroll)
+
+    def steady(step):
+        return waits[step + settled]
+
+    def emitted(index):
+        if per_tile:
+            return schedule.wait(index)
+        return tuple(schedule.wait(index, pane) for pane in range(panes))
+
+    def immediates(step):
+        if per_tile:
+            return None if waits[step] is None else waits[step][0]
+        return tuple(None if wait is None else wait[0] for wait in waits[step])
+
+    differs = [x for x in range(depth * 2) if waits[x] != steady(x)]
+    assert peeled == max(1, (max(differs) + 1) if differs else 0)
+    for u in range(unroll):
+        assert waits[peeled + u] == steady(peeled + u)
+    assert emitted(schedule.warmup_step()) == immediates(-1)
+    for x in range(peeled):
+        assert emitted(schedule.peeled_step(x)) == immediates(x)
+    for u in range(unroll):
+        assert emitted(schedule.loop_step(u)) == immediates(peeled + u + settled)
+
+    # The bound: a wait of step x reaches back to the newest copy it needs, and every
+    # component copies from step -min(F) on, so step x is steady once
+    # x + 1 - reach >= -min(F).
+    def reach(x):
+        needs = [
+            {
+                x + 1 - schedule.load_to_mfma_distance(c)
+                for c in COMPONENTS
+                if schedule.ds_read_slot(pane, c) is not None
+                and layout.component_via_lds(c)
+                and schedule.ds_reads_at_phase(c, x)
+            }
+            for pane in range(panes)
+        ]
+        if per_tile:
+            needs = [set().union(*needs)]
+        return max((x + 1 - max(need) for need in needs if need), default=0)
+
+    first_steady = -min(
+        schedule.load_to_mfma_distance(c)
+        for c in COMPONENTS
+        if schedule.component_present(c)
+    )
+    failing = [x for x in range(depth) if x + 1 - reach(x) < first_steady]
+    assert peeled <= max([1] + [x + 1 for x in failing])
 
 
 @pytest.mark.parametrize(
@@ -1001,7 +1134,12 @@ def _straight_line_waits(schedule, tc, last):
      {"scale_steps": (4, 1)}],
     ids=["R1", "R2", "R2R4", "R4R1"],
 )
-def test_peeled_wait_prefix_is_minimal(scheme, register_mask, extra):
+@pytest.mark.parametrize(
+    "shape,middle",
+    [((2, 2), True), ((2, 2), False), ((1, 2), False)],
+    ids=["2x2-middle", "2x2", "1x2"],
+)
+def test_peeled_wait_prefix_is_minimal(scheme, register_mask, extra, shape, middle):
     """The peel covers exactly the startup steps whose wait differs from the loop's.
 
     Compared *at the same K phase*: with a scale K-step ratio above one the phases
@@ -1010,27 +1148,12 @@ def test_peeled_wait_prefix_is_minimal(scheme, register_mask, extra):
     emitted wait plan must also be the straight-line one: peeled steps keep their own
     immediates and the loop body carries the steady ones.
     """
-    tc = _Config(scheme, (2, 4, 6, 3), register_mask, middle=True, **extra)
-    depth, peeled, unroll = tc.sizing()
+    tc = _Config(
+        scheme, (2, 4, 6, 3), register_mask, shape=shape, middle=middle, **extra
+    )
+    unroll = tc.sizing()[2]
     schedule = Schedule(tc, tc, (tc.minimum_num_k() + 2 * unroll) * tc.BLOCK_K)
-    settled = unroll * -(-(4 * depth) // unroll)
-    waits = _straight_line_waits(schedule, tc, settled + 2 * depth + unroll)
-
-    def steady(step):
-        return waits[step + settled]
-
-    def emitted(index):
-        if tc.commit_per_stage():
-            return schedule.wait(index)
-        return tuple(schedule.wait(index, pane) for pane in range(tc.nm * tc.nn))
-
-    differs = [x for x in range(depth * 2) if waits[x] != steady(x)]
-    assert peeled == max(1, (max(differs) + 1) if differs else 0)
-    assert emitted(schedule.warmup_step()) == waits[-1]
-    for x in range(peeled):
-        assert emitted(schedule.peeled_step(x)) == waits[x]
-    for u in range(unroll):
-        assert emitted(schedule.loop_step(u)) == steady(peeled + u)
+    _assert_minimal_peel(schedule, tc)
 
 
 @pytest.mark.parametrize("nn", [1, 2, 3, 4])
