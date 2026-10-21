@@ -152,9 +152,8 @@ def _steps(schedule):
     """
     depth, unroll = maybe_unwrap(schedule.depth), maybe_unwrap(schedule.unroll)
     out = [
-        (f"prologue x={x}", schedule.prologue_step(x), False) for x in range(-depth, -1)
+        (f"prologue x={x}", schedule.prologue_step(x), False) for x in range(-depth, 0)
     ]
-    out.append(("warmup", schedule.warmup_step(), False))
     out += [
         (f"peeled x={x}", schedule.peeled_step(x), False)
         for x in range(maybe_unwrap(schedule.peeled))

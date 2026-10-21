@@ -540,7 +540,7 @@ def test_pipeline_stage_commit_boundaries(
     tc.ds_read_in_mfma = lambda *args: False
     schedule = tc.make_schedule(epilogue_groups=2)
     if not dot:
-        step = schedule.warmup_step()
+        step = schedule.prologue_step(-1)
     elif in_loop:
         step = schedule.loop_step(0)
     else:

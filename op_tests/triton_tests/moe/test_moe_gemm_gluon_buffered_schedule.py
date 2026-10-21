@@ -993,9 +993,8 @@ def _straight_line_waits(schedule, layout, last):
     """The waits of K steps ``-1..last`` as if every one were emitted in a line.
 
     An independent FIFO over the schedule's public copy and commit plan and DS reads:
-    the prologue and warm-up steps as emitted, then one step per K tile with the loop
-    body's pattern for that K phase -- which is what every step after the warm-up
-    issues. A wait is ``(immediate, window)``, or ``None`` when it needs no copy. Its
+    the prologue steps as emitted, then one step per K tile with the loop body's
+    pattern for that K phase -- which is what every step after the prologue issues. A wait is ``(immediate, window)``, or ``None`` when it needs no copy. Its
     window is what LLVM's asyncmark wait counts into the vmcnt: every copy, LDS or
     register, issued after the last LDS copy of the newest group it needs, as a
     sorted ``(component index, slot)`` multiset. Returns ``{step: tile wait}`` for a
@@ -1033,10 +1032,8 @@ def _straight_line_waits(schedule, layout, last):
         return len(committed) - youngest - 1, tuple(window)
 
     for step in range(-depth, last + 1):
-        if step < -1:
+        if step < 0:
             index = schedule.prologue_step(step)
-        elif step == -1:
-            index = schedule.warmup_step()
         else:
             index = schedule.loop_step((step - peeled) % unroll)
         if step >= -1 and per_tile:
@@ -1099,7 +1096,7 @@ def _assert_minimal_peel(schedule, layout):
     assert peeled == max(1, (max(differs) + 1) if differs else 0)
     for u in range(unroll):
         assert waits[peeled + u] == steady(peeled + u)
-    assert emitted(schedule.warmup_step()) == immediates(-1)
+    assert emitted(schedule.prologue_step(-1)) == immediates(-1)
     for x in range(peeled):
         assert emitted(schedule.peeled_step(x)) == immediates(x)
     for u in range(unroll):
@@ -1171,8 +1168,7 @@ def _emitted_steps(schedule):
         maybe_unwrap(schedule.peeled),
         maybe_unwrap(schedule.unroll),
     )
-    steps = [schedule.prologue_step(x) for x in range(-depth, -1)]
-    steps.append(schedule.warmup_step())
+    steps = [schedule.prologue_step(x) for x in range(-depth, 0)]
     steps += [schedule.peeled_step(x) for x in range(peeled)]
     steps += [schedule.loop_step(u) for u in range(unroll)]
     remainders = unroll - 1 if maybe_unwrap(schedule.static_remainder) else 1
@@ -1339,7 +1335,7 @@ def test_absent_scale_ring_indices_ignore_invalid_unused_depths(scale_depths):
     assert maybe_unwrap(schedule.depth) == 2
     assert maybe_unwrap(schedule.reg_buffer_period) == 1
     for component in (A_SCALE, B_SCALE):
-        for step in (schedule.warmup_step(), schedule.loop_step(1)):
+        for step in (schedule.prologue_step(-1), schedule.loop_step(1)):
             for buffer_load in (False, True):
                 index = pipeline._index.fn(schedule, 7, step, component, buffer_load)
                 assert index == 0
