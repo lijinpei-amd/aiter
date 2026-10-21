@@ -240,10 +240,20 @@ emitted step has an index into the `Schedule` tables, `STEP`, from the accessor 
 comment. `_step` also takes `step`, the step number `x`, which may be a runtime value.
 Its LDS ring indices count from `ds_read_tile = step + 1`, the tile it DS-reads.
 
-Per emitted step, `Schedule` stores its kind, `phase` (the step number its ring
-arithmetic uses), unroll position `ki`, `in_loop`, and `dot` (false in the prologue).
-`phase` is `x` on straight-line steps and `peeled + u` on loop step `u`, which is
-congruent to it modulo `unroll`.
+Per emitted step, `Schedule` stores its kind, `stage`, `phase` (the step number its ring
+arithmetic uses), unroll position `ki`, `in_loop`, a static flag, and `dot` (false in
+the prologue):
+
+- `stage` sets which components copy: `x` on prologue and peeled steps, `j` on drain
+  step `main + j`, none (every component) on loop and remainder steps.
+- `phase` is `x` on prologue, peeled and drain steps; `peeled + u` on loop step `u` and
+  static-remainder step `u`, congruent to `x` modulo `unroll`; 0 on the dynamic
+  remainder.
+- `ki` is `u` on loop and static-remainder steps, `p + j - peeled` on static-drain step
+  `(p, j)`, so `peeled + ki` is congruent to `x` modulo `buffer_period` in the phase
+  `p` that runs, and 0 elsewhere.
+- The static flag marks static-remainder and static-drain steps. With `in_loop`, it is
+  what `static_lds_index` requires.
 
 - **Prologue.** Steps `-depth .. -2` only copy, so `_run_buffered_pipeline` issues their
   copies inline, not through `_step`. Step `-1` also waits and DS-reads K tile 0: it is
@@ -288,8 +298,8 @@ Resolved once in `Schedule.__init__`:
 - **Buffer-load pane** (`buffer_load_pane`). Payload: at 2x2, `B0, A0, A1, B1` over panes
   0-3; with both axes split, `A0, B0, A1, B1, ...` over pane indices; with one axis
   unsplit, slot `i` of both operands at pane `i`. A scale follows its payload, except
-  that `SCALE_FILL_MID` at 2x2 moves both scales to panes 1 and 2; the flag does nothing
-  at other shapes. A scale slot spanning `Q > 1` slots is copied by its first slot only.
+  that `SCALE_FILL_MID` at 2x2 moves slot 0 of each scale to pane 1 and slot 1 to
+  pane 2; the flag does nothing at other shapes. A scale slot spanning `Q > 1` slots is copied by its first slot only.
 - **Validity** (`buffer_load_panes_valid`, asserted by `validate_pipeline`): every slot
   maps to an existing pane, and no pane copies two slots of one component. Different
   components may share a pane.
@@ -339,9 +349,12 @@ In the inline prologue steps (before `-1`), both per-stage schemes commit after 
 pane's copies (`_buffer_load_pane`, `MARK_TILE`). Under `PER_OP` a pane's groups follow
 `COMPONENTS` order, the order `_buffer_load_pane` copies in; reorder both together.
 
-Today only drain steps copy nothing through LDS, once every LDS component has stopped
-copying. Dropping their groups shortened drain immediates but moved no `vmcnt`: an empty
-group repeats the previous mark (Wait plan).
+An LDS component copies only at steps `-F <= x < num_k - F`, and a scale with `R > 1`
+only one step in `R`. So a step can copy nothing through LDS anywhere: drain steps once
+every LDS component has stopped, prologue steps before or between the first LDS copies
+(a deep scale at `R = 4`), and, with both payloads in registers, every step off the LDS
+scales' phase, loop steps included. Dropping their groups shortened drain immediates but
+moved no `vmcnt`: an empty group repeats the previous mark (Wait plan).
 
 ## Wait plan
 
@@ -388,8 +401,9 @@ at every step.
   copy is committed twice.
 - **One immediate per emitted step.** A loop step runs many times and keeps the smallest
   immediate over its executions.
-- **Emitted, not executed.** Static-remainder steps past `rem` take their immediates from
-  a second replay with the longest remainder. The drain copies for the other phases
+- **Emitted, not executed.** Remainder steps this `K` does not run take their immediates
+  from a second replay with the longest remainder: static-remainder steps past `rem`,
+  and the dynamic remainder step when `rem == 0`. The drain copies for the other phases
   borrow the executed phase's immediates.
 - **Epilogue groups.** `_stage_epilogue_inputs` commits `epilogue_groups` groups (bias
   and gammas staged in LDS) between the main loop and the drain. The replay counts them
