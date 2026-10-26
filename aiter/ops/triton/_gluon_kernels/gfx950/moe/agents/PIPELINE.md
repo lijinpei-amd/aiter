@@ -152,8 +152,8 @@ finds the exact `peeled <= bound`:
   in the window. `peeled` is one past the last step that differs, and at least 1, so
   the first MFMA keeps its visible zero accumulator.
 - **Two stages.** At `bound = 1` there is no replay: `peeled = 1`. Otherwise
-  `_replay(..., windows=True)` runs the prologue and steps `0 .. bound + copy_period - 1`,
-  and each step below `bound` is compared with its twin in
+  `_compute_wait_plan(..., windows=True)` runs the prologue and steps
+  `0 .. bound + copy_period - 1`, and each step below `bound` is compared with its twin in
   `[bound, bound + copy_period - 1]`. A symbolic sweep of 17920 configs (4 schemes,
   7 ring-depth sets, 5 pane shapes, both `SCALE_FILL_MID`, 16 placements, 4 `R` mixes)
   has 16800 with an LDS component. In those the replay is skipped 77% of the time and
@@ -391,7 +391,7 @@ at every step.
   then gets no `s_waitcnt vmcnt` at all, although its group may still be in flight
   (TODO.md). Production immediates are at most 11.
 
-`_replay` computes every immediate:
+`_compute_wait_plan` computes every immediate:
 
 - **Demand.** A pane (`PER_OP`, `PER_PANE`) or a step (per-stage schemes) needs, for each
   LDS component it DS-reads at this phase (step `t - 1`), the copy issued at `s = t - F`. A
