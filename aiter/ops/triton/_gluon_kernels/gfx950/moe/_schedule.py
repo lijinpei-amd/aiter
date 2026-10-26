@@ -202,7 +202,9 @@ def _step_plan(
 
 
 @gluon.constexpr_function
-def _replay(orders, load_to_mfma_distance, per_tile, num_panes, windows=False):
+def _compute_wait_plan(
+    orders, load_to_mfma_distance, per_tile, num_panes, windows=False
+):
     # A wait's immediate counts the groups committed after the newest one it needs.
     # With `windows`, each wait also gets its window: the loads it leaves in flight,
     # every copy (LDS or register) issued after that group's last LDS copy, in emission
@@ -456,7 +458,7 @@ class Schedule:
             for x in range(-depth, bound + copy_period):
                 kind = StepKind.PEELED if x >= 0 else StepKind.PROLOGUE
                 early.append((x, x) + step_plan(kind, x, x)[2:])
-            waits = _replay(
+            waits = _compute_wait_plan(
                 [early], load_to_mfma_distance, commit[2], num_panes, windows=True
             )
             for x in range(bound):
@@ -568,7 +570,7 @@ class Schedule:
         longest = unroll - 1 if static_remainder else 1
         if rem < longest:
             orders.append(head + tail(longest))
-        waits = _replay(orders, load_to_mfma_distance, commit[2], num_panes)
+        waits = _compute_wait_plan(orders, load_to_mfma_distance, commit[2], num_panes)
         for p in range(drain_phases):
             for j in range(depth - 1):
                 executed_copy = drain + phase * (depth - 1) + j
