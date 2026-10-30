@@ -477,12 +477,13 @@ def _mla_gluon(
     ################ loop
     for i in range(num_iter - 2):
         async_idx = (buf_idx + 1) % 2
+        cur_idx = buf_idx % 2
 
         gl.amd.cdna4.async_copy.wait_group(0)
         #### global load page number
         offs_n_page = start_n + BLOCK_N + offs_page_raw
         offs_page = batch_page_start + offs_n_page // PAGE_SIZE
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_page.index(buf_idx), Req_to_tokens, offs_page, offs_n_page < split_kv_end)
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_page.index(cur_idx), Req_to_tokens, offs_page, offs_n_page < split_kv_end)
         gl.amd.cdna4.async_copy.commit_group()
 
         #### global load K
@@ -519,11 +520,11 @@ def _mla_gluon(
             gl.amd.cdna4.async_copy.commit_group()
 
         #### dot, softmax, dot (part0)
-        k_c = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_kv.index(buf_idx), mfma_layout_b)
+        k_c = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_kv.index(cur_idx), mfma_layout_b)
         zeros = gl.zeros([BLOCK_H, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
         qk = gl.amd.cdna4.mfma(q_nope, k_c.to(dtype), zeros)
         if HAS_PE:
-            k_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_kpe.index(buf_idx), mfma_layout_b)
+            k_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_kpe.index(cur_idx), mfma_layout_b)
             qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(dtype), qk)
 
         # local load page number for slice 1
@@ -559,7 +560,7 @@ def _mla_gluon(
         p = p.to(dtype)
         p = gl.convert_layout(p, mfma_layout_a)
         acc *= re_scale[:, None]
-        v_c = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_kv.index(buf_idx), linear_v)
+        v_c = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_kv.index(cur_idx), linear_v)
         v_c = v_c.to(dtype)
         v_c = gl.permute(v_c, [1, 0])
         v_c = gl.convert_layout(v_c, mfma_layout_b)
@@ -576,6 +577,7 @@ def _mla_gluon(
     # out there; for the bh16 regimes it stays a runtime branch.
     if num_iter >= 2:
         async_idx = (buf_idx + 1) % 2
+        cur_idx = buf_idx % 2
 
         #### global load K
         # local load page number
@@ -608,12 +610,12 @@ def _mla_gluon(
 
         # dot, softmax, dot
         gl.amd.cdna4.async_copy.wait_group(2 if HAS_PE else 1)
-        k_c = bufs_kv.index(buf_idx).load(layout=mfma_layout_b)
+        k_c = bufs_kv.index(cur_idx).load(layout=mfma_layout_b)
         zeros = gl.zeros([BLOCK_H, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
         qk = gl.amd.cdna4.mfma(q_nope, k_c.to(dtype), zeros)
 
         if HAS_PE:
-            k_pe = bufs_kpe.index(buf_idx).load(layout=mfma_layout_b)
+            k_pe = bufs_kpe.index(cur_idx).load(layout=mfma_layout_b)
             qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(dtype), qk)
         qk *= qk_scale
         offs_n_qk = split_kv_start + (num_iter - 2) * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))
@@ -629,7 +631,7 @@ def _mla_gluon(
         p = p.to(dtype)
         p = gl.convert_layout(p, mfma_layout_a)
         acc *= re_scale[:, None]
-        v_c = bufs_kv.index(buf_idx).load(layout=linear_v)
+        v_c = bufs_kv.index(cur_idx).load(layout=linear_v)
         v_c = v_c.to(dtype)
         v_c = gl.permute(v_c, [1, 0])
         v_c = gl.convert_layout(v_c, mfma_layout_b)
