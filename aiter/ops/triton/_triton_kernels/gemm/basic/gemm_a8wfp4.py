@@ -135,6 +135,25 @@ def _gemm_a8wfp4_kernel(
 
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         for k in range(num_k_iter):
+            # The B scales are needed before the next A and B tiles, so load them first.
+            offs_ks = (
+                (pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE))
+                + k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE)
+                + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
+            )
+            b_scale_ptrs = (
+                b_scales_ptr
+                + offs_bn[:, None] * stride_bsn
+                + offs_ks[None, :] * stride_bsk
+            )
+            if RAW_MASKED_LOADS:
+                bs_k_mask = offs_ks[None, :] < (K // SCALE_GROUP_SIZE)
+                bs_n_scale_mask = offs_bn_raw[:, None] < N
+                bs_mask = bs_k_mask & bs_n_scale_mask
+                b_scales = tl.load(b_scale_ptrs, mask=bs_mask, other=0)
+            else:
+                b_scales = tl.load(b_scale_ptrs)
+
             # Load A inside the loop with correct K offset
             offs_ak = tl.arange(0, BLOCK_SIZE_K) + k * BLOCK_SIZE_K  # Add k offset
             offs_ak_split = pid_k * SPLITK_BLOCK_SIZE + offs_ak
@@ -155,16 +174,6 @@ def _gemm_a8wfp4_kernel(
             b_ptrs = b_ptr + (
                 offs_bk_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
             )
-            offs_ks = (
-                (pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE))
-                + k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE)
-                + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
-            )
-            b_scale_ptrs = (
-                b_scales_ptr
-                + offs_bn[:, None] * stride_bsn
-                + offs_ks[None, :] * stride_bsk
-            )
             if RAW_MASKED_LOADS:
                 b_k_mask = offs_bk_split[:, None] < (K // 2)
                 b_n_mask = offs_bn_raw[None, :] < N
@@ -173,17 +182,12 @@ def _gemm_a8wfp4_kernel(
                     b = tl.load(b_ptrs, mask=b_mask, cache_modifier=cache_modifier)
                 else:
                     b = tl.load(b_ptrs, mask=b_mask, other=0)
-                bs_k_mask = offs_ks[None, :] < (K // SCALE_GROUP_SIZE)
-                bs_n_scale_mask = offs_bn_raw[:, None] < N
-                bs_mask = bs_k_mask & bs_n_scale_mask
-                b_scales = tl.load(b_scale_ptrs, mask=bs_mask, other=0)
             else:
                 if EVEN_K:
                     b = tl.load(b_ptrs, cache_modifier=cache_modifier)
                 else:
                     b_mask = offs_bk[:, None] < K - k * (BLOCK_SIZE_K // 2)
                     b = tl.load(b_ptrs, mask=b_mask, other=0)
-                b_scales = tl.load(b_scale_ptrs)
             accumulator = tl.dot_scaled(
                 a, a_ones_scale, "e4m3", b, b_scales, "e2m1", acc=accumulator
             )

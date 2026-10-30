@@ -163,6 +163,10 @@ def _gemm_a8w8_blockscale_kernel(
             # SPLITK_BLOCK_SIZE is rounded up, so the last split can run past K
             k_end = tl.minimum(k_end, tl.cdiv(K, BLOCK_SIZE_K))
         for k in tl.range(pid_k * num_k_iter, k_end, num_stages=num_stages):
+            # Small tiles need the scales before the next A and B tiles, so load them first.
+            if BLOCK_SIZE_M <= 64:
+                a_scale = tl.load(a_scale_ptrs)
+                b_scale = tl.load(b_scale_ptrs)
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
@@ -176,8 +180,9 @@ def _gemm_a8w8_blockscale_kernel(
                     b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0
                 )
 
-            a_scale = tl.load(a_scale_ptrs)
-            b_scale = tl.load(b_scale_ptrs)
+            if BLOCK_SIZE_M > 64:
+                a_scale = tl.load(a_scale_ptrs)
+                b_scale = tl.load(b_scale_ptrs)
 
             # Perform dot operation and apply scale
             accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
