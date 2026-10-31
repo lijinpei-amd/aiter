@@ -378,6 +378,8 @@ def main():
         else:
             if args.mode == "smoke":
                 result["smoke"] = bc.smoke_validate(built)
+            # fill_(0), not zero_(): newer torch turns zero_() into a hipMemset,
+            # whose kernel the trace auditor rejects (it expects FillFunctor).
             flush = torch.empty(768 << 20, dtype=torch.uint8, device="cuda")
             torch.cuda.synchronize()
             print(
@@ -386,11 +388,11 @@ def main():
                 flush=True,
             )
             for _ in range(args.warmups):
-                flush.zero_()
+                flush.fill_(0)
                 built["call"]()
             torch.cuda.synchronize()
             for _ in range(args.samples):
-                flush.zero_()
+                flush.fill_(0)
                 built["call"]()
             torch.cuda.synchronize()
             result["timing_protocol"] = {
