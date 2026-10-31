@@ -2139,19 +2139,12 @@ def moe_gemm_gluon(
     fast = _fast_launch(kernel, grid_x, args, num_warps, waves_per_eu, constexpr_args)
     if fast is not None:
         return fast
-    if _LLVM_FN_ATTRS:
-        compiled = kernel[(grid_x,)](
-            *args,
-            num_warps=num_warps,
-            waves_per_eu=waves_per_eu,
-            llvm_fn_attrs=_LLVM_FN_ATTRS,
-        )
-    else:
-        compiled = kernel[(grid_x,)](
-            *args,
-            num_warps=num_warps,
-            waves_per_eu=waves_per_eu,
-        )
+    compiled = kernel[(grid_x,)](
+        *args,
+        num_warps=num_warps,
+        waves_per_eu=waves_per_eu,
+        **_LLVM_COMPILE_OPTIONS,
+    )
     _fast_launch_memoise(
         kernel, grid_x, args, num_warps, waves_per_eu, constexpr_args, compiled
     )
@@ -2171,6 +2164,20 @@ def moe_gemm_gluon(
 #:
 #:     AITER_TRITON_MOE_GLUON_LLVM_FN_ATTRS=amdgpu-ieee=false
 _LLVM_FN_ATTRS = os.environ.get("AITER_TRITON_MOE_GLUON_LLVM_FN_ATTRS", "")
+
+#: Extra LLVM command line options for the Gluon MoE kernels, comma separated, passed
+#: through Triton's ``llvm_cl_opts`` compile option; bare names are set to true. Lets a
+#: benchmark run a code generator built from patched LLVM with its opt-in flags, e.g.
+#:
+#:     AITER_TRITON_MOE_GLUON_LLVM_CL_OPTS=amdgpu-ds-read-agpr,amdgpu-mfma-tied-cd
+_LLVM_CL_OPTS = os.environ.get("AITER_TRITON_MOE_GLUON_LLVM_CL_OPTS", "")
+
+# Only the options that are set: a Triton without one of them rejects the keyword.
+_LLVM_COMPILE_OPTIONS = {
+    key: value
+    for key, value in (("llvm_fn_attrs", _LLVM_FN_ATTRS), ("llvm_cl_opts", _LLVM_CL_OPTS))
+    if value
+}
 
 
 def try_gluon_grouped_gemm(
