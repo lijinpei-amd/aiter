@@ -12,7 +12,12 @@ from aiter.ops.triton.utils.common_utils import strip_annotate
 from ._config import KernelFuncConfig, KernelTuningConfig
 from ._lang import optional as _opt
 from ._lang import pick_warp_pipeline_stage as pick_stage
-from ._lang import require_constexpr
+from ._lang import (
+    HAS_IGLP_OPT,
+    HAS_SCHED_GROUP_BARRIER,
+    amd_sched_barrier,
+    require_constexpr,
+)
 from ._layout import KernelLayout
 from ._lds import LDSManager
 from ._mfma import _maybe_block_dot
@@ -34,16 +39,16 @@ _SG_VMEM: gl.constexpr = gl.constexpr(16)
 
 @gluon.jit
 def _sched_hint(MODE: gl.constexpr):
-    if require_constexpr(MODE == 1):
+    if require_constexpr(MODE == 1 and HAS_IGLP_OPT):
         gl.amd.cdna4.iglp_opt(0)
-    elif require_constexpr(MODE == 2):
+    elif require_constexpr(MODE == 2 and HAS_IGLP_OPT):
         gl.amd.cdna4.iglp_opt(1)
-    elif require_constexpr(MODE == 3):
+    elif require_constexpr(MODE == 3 and HAS_SCHED_GROUP_BARRIER):
         for _ in gl.static_range(4):
             gl.amd.cdna4.sched_group_barrier(_SG_MFMA, 16, 0)
             gl.amd.cdna4.sched_group_barrier(_SG_DS_READ, 6, 0)
             gl.amd.cdna4.sched_group_barrier(_SG_VMEM, 4, 0)
-    elif require_constexpr(MODE == 4):
+    elif require_constexpr(MODE == 4 and HAS_SCHED_GROUP_BARRIER):
         for _ in gl.static_range(8):
             gl.amd.cdna4.sched_group_barrier(_SG_MFMA, 8, 0)
             gl.amd.cdna4.sched_group_barrier(_SG_DS_READ, 3, 0)
@@ -654,7 +659,7 @@ def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
                     sched.wait(STEP, Pane(mi, ni).linear_index(nm))
                 )
             if require_constexpr(not DOT and mi == 0 and ni == 0):
-                gl.amd.cdna4.sched_barrier(0)
+                amd_sched_barrier()
             with region("mem"):
                 am, bm, asm, bsm = _ds_read_pane(pc, ds_read_tile, STEP, mi, ni, False)
                 buffers = _buffer_load_pane(
@@ -731,7 +736,7 @@ def _step_live(pc, ptrs, buffers, regs, step, STEP: gl.constexpr):
         or (sched.component_present(B_SCALE) and layout.component_in_reg(B_SCALE))
     )
     if require_constexpr(IN_LOOP and has_register_component and not warp):
-        gl.amd.cdna4.sched_barrier(0)
+        amd_sched_barrier()
     if require_constexpr(not IN_LOOP):
         buffers = _rotate_buffers(buffers, sched, layout, PHASE)
     if require_constexpr(not pc.func_cfg.has_scale(0)):

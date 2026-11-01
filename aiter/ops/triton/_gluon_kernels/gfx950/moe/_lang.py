@@ -3,6 +3,7 @@
 
 """Triton/Gluon constants and language plumbing shared by the gfx950 MoE modules."""
 
+import inspect
 from enum import IntEnum
 
 from triton.experimental import gluon
@@ -12,6 +13,11 @@ from triton.experimental.gluon.language.amd import warp_pipeline_stage
 from aiter.ops.triton.utils.common_utils import strip_annotate
 
 __all__ = [
+    "HAS_BUFFER_LOAD_CONTIGUITY",
+    "HAS_IGLP_OPT",
+    "HAS_MFMA_SCALED_PACKED",
+    "HAS_SCHED_GROUP_BARRIER",
+    "amd_sched_barrier",
     "MX_GROUP",
     "MX_GROUP_CE",
     "WARP_SIZE",
@@ -274,3 +280,32 @@ def pick_warp_pipeline_stage(enabled):
     returned, so an off switch costs nothing at all in the emitted IR.
     """
     return warp_pipeline_stage if enabled else nop_warp_pipeline_stage
+
+
+def _takes(fn, name):
+    try:
+        return name in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+# Builtins that only a patched Triton provides. Each is True when the running Triton has
+# it; when it is False the kernel takes a path that plain upstream Triton can compile,
+# trading some performance: unpacked scales (one v_perm_b32 per scale word), scalar
+# loads of shuffled register scales, and no scheduling-group hints.
+HAS_MFMA_SCALED_PACKED = gl.constexpr(hasattr(gl.amd.cdna4, "mfma_scaled_packed"))
+HAS_BUFFER_LOAD_CONTIGUITY = gl.constexpr(
+    _takes(gl.amd.cdna4.buffer_load, "contiguity")
+)
+HAS_SCHED_GROUP_BARRIER = gl.constexpr(hasattr(gl.amd.cdna4, "sched_group_barrier"))
+HAS_IGLP_OPT = gl.constexpr(hasattr(gl.amd.cdna4, "iglp_opt"))
+_HAS_CDNA4_SCHED_BARRIER = gl.constexpr(hasattr(gl.amd.cdna4, "sched_barrier"))
+
+
+@gluon.jit
+def amd_sched_barrier():
+    """``sched_barrier`` letting nothing cross, from whichever API the Triton has."""
+    if require_constexpr(_HAS_CDNA4_SCHED_BARRIER):
+        gl.amd.cdna4.sched_barrier(0)
+    else:
+        gl.amd.hint.sched_barrier()
