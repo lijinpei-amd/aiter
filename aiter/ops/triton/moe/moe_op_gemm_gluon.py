@@ -1607,11 +1607,26 @@ def _sorted_shuffle_a_scales(x_scales, routing_data, gather_indx, K, cfg):
     ):
         return None
 
-    from aiter.ops.moe_mxfp4_aux import mxfp4_moe_sort_scales
+    from aiter.ops.moe_mxfp4_aux import (
+        MXFP4_MOE_SUPPORTED_SHAPES,
+        mxfp4_moe_sort_scales,
+    )
 
     dev = x_scales.device
     expt_data = routing_data.expt_data
     n_expts_act = routing_data.n_expts_act
+    # The C++ side is a codegen'd template keyed on (BM, NE, D_HIDDEN), BM in
+    # {32, 64, 128}. The module is torch-free, so a missing instance aborts the process
+    # instead of raising: check the shape table first and fall back to raw scales.
+    n_expts_tot = int(expt_data.hist.numel())
+    if block_m not in (32, 64, 128) or not any(
+        ne == n_expts_tot and h == K for ne, h, _e, _topk in MXFP4_MOE_SUPPORTED_SHAPES
+    ):
+        _LOGGER.info(
+            "sorted-shuffled A scales unavailable, using raw scales: no aux instance "
+            f"for BM={block_m} NE={n_expts_tot} H={K}"
+        )
+        return None
     # _launch_spec requires the config and routing to use the same BLOCK_M, so this
     # bound sizes the scale buffer in the same block space as the launch grid.
     n_blocks = routing_data.n_blocks(int(gather_indx.shape[0]), block_m)
@@ -1625,24 +1640,17 @@ def _sorted_shuffle_a_scales(x_scales, routing_data, gather_indx, K, cfg):
     out = torch.empty(
         n_blocks * c_m1 * c_k1 * 4 * 16 * 4, dtype=torch.uint8, device=dev
     )
-    try:
-        mxfp4_moe_sort_scales(
-            x_scales,
-            sorted_token_ids,
-            cumsum,
-            out,
-            int(expt_data.hist.numel()),
-            int(n_expts_act),
-            int(K),  # D_HIDDEN
-            int(block_m),  # MB
-            max_sorted,
-        )
-    except RuntimeError as e:
-        # The C++ side is a codegen'd template keyed on (BM, NE, D_HIDDEN); a shape
-        # outside csrc/.../codegen/gen_instances.py::SHAPES has no instance. Fall back
-        # to the raw scale path rather than failing the launch.
-        _LOGGER.info(f"sorted-shuffled A scales unavailable, using raw scales: {e}")
-        return None
+    mxfp4_moe_sort_scales(
+        x_scales,
+        sorted_token_ids,
+        cumsum,
+        out,
+        n_expts_tot,
+        int(n_expts_act),
+        int(K),  # D_HIDDEN
+        int(block_m),  # MB
+        max_sorted,
+    )
     return out
 
 

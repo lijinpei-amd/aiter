@@ -144,3 +144,19 @@ Also:
 
 Check: T2d asm unchanged inside the K loop, the determinism shas, the suite, and one
 build that serves two `K` values bit-exactly.
+
+## Probe the sorted-scale aux table exactly
+
+Priority: low. `_sorted_shuffle_a_scales` (`moe_op_gemm_gluon.py`) checks
+`aiter/ops/moe_mxfp4_aux.py::MXFP4_MOE_SUPPORTED_SHAPES` before it calls
+`mxfp4_moe_sort_scales`, because the aux module is torch-free since the 2026-11-02
+rebase and a missing instance now aborts the process instead of raising. That set is
+a hand-kept subset of `gen_instances.py::SHAPES`: on 2026-11-02 it lacked the
+`(NE, H)` pairs `(256, 6144)`, `(384, 6144)` and `(512, 2048)`, which then take the raw
+scale path although an instance exists. No benchmarked shape is affected (all use
+`NE=33, H=7168`).
+
+- Fix: add a C++ `mxfp4_moe_sort_scales_is_supported(NE, D_HIDDEN, MB)` probe beside
+  `mxfp4_moe_sort_internal_is_supported`, and call it instead of the set.
+- Check: `op_tests/triton_tests/moe/test_moe_gemm_gluon_isa.py` still passes, and the
+  T2d asm hashes stay the same.
