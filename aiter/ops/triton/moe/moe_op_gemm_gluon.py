@@ -804,6 +804,8 @@ def moe_gemm_gluon(
         dq_b,
         apply_swiglu,
     )
+    small_grid = _small_grid(routing_data, y.shape[1], N)
+    multi_block = _multi_block(routing_data, y.shape[1])
 
     if apply_swiglu:
         act = ActivationSpec(
@@ -827,7 +829,7 @@ def moe_gemm_gluon(
             K,
             dq_a,
             dq_b,
-            _small_grid(routing_data, y.shape[1], N),
+            small_grid,
             bias is not None,
             gammas is not None,
             gather_indx is not None,
@@ -838,7 +840,7 @@ def moe_gemm_gluon(
             gate_up_split,
             epilogue,
             stream_expert_payload,
-            _multi_block(routing_data, y.shape[1]),
+            multi_block,
         )
 
     grid_n, constexpr_args, num_warps, waves_per_eu, _cfg, _tc = _spec(

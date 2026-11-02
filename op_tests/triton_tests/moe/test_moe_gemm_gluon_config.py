@@ -740,14 +740,7 @@ def test_gemm2_families_hold_tuning_values_only(family):
         assert entry and set(entry) <= known - {"BLOCK_M"}
 
 
-@pytest.mark.parametrize(
-    "dq_a,dq_b",
-    [
-        (DtypeQuant.MXFP4, DtypeQuant.MXFP4),
-        (DtypeQuant.MXFP8, DtypeQuant.MXFP4),
-        (DtypeQuant.MXFP8, DtypeQuant.MXFP8),
-    ],
-)
+@pytest.mark.parametrize("dq_a,dq_b", list(conf._GEMM2_FAMILIES))
 def test_gemm2_multi_block_streams_the_result_and_caches_the_weights(dq_a, dq_b):
     # Experts with several M blocks (T=16384 in the matrix): the large intermediate is
     # stored non-temporally, so it does not evict the weights the other blocks reuse.
@@ -768,12 +761,12 @@ def test_gemm2_multi_block_streams_the_result_and_caches_the_weights(dq_a, dq_b)
 
 
 def test_gemm2_grid_entry_overlays_the_any_entry(gemm2_tables):
-    # bm16_small lists only what differs from bm16_any.
-    assert gemm2_tables["A4W4-GEMM2"]["bm16_small"] == {"BLOCK_N": 128}
-    small = conf._gemm2_tuned(16, DtypeQuant.MXFP4, DtypeQuant.MXFP4, "small")
-    assert small == dict(
-        conf._gemm2_tuned(16, DtypeQuant.MXFP4, DtypeQuant.MXFP4, "any"), BLOCK_N=128
-    )
+    # A grid entry lists only the keys it changes on top of bm<block_m>_any.
+    gemm2_tables["A4W4-GEMM2"]["bm64_multi"] = {"GROUP_M": 2}
+    args = (64, DtypeQuant.MXFP4, DtypeQuant.MXFP4)
+    any_entry = conf._gemm2_tuned(*args, "any")
+    assert any_entry["GROUP_M"] != 2
+    assert conf._gemm2_tuned(*args, "multi") == dict(any_entry, GROUP_M=2)
 
 
 def test_gemm2_tuning_is_read_from_its_family(gemm2_tables):

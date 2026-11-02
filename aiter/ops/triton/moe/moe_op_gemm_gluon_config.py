@@ -780,15 +780,16 @@ _GEMM2_FAMILIES = {
 
 def _gemm2_tuned(block_m, dq_a, dq_b, grid) -> dict:
     """The operands' GEMM2 family entry, or {}: ``bm<block_m>_any``, overlaid by
-    ``bm<block_m>_<grid>`` when ``grid`` is "small" or "multi" and the family has that
-    entry. A copy, with JSON lists as the tuples the config uses."""
+    ``bm<block_m>_<grid>`` ("small" or "multi") when the family has that entry. A
+    copy, with JSON lists as the tuples the config uses."""
     family = _GEMM2_FAMILIES.get((dq_a, dq_b))
     if family is None:
         return {}
     table = get_moe_dispatch(family, get_arch(), "gluon")
-    entry = dict(table.get(f"bm{block_m}_any", {}))
-    if grid != "any":
-        entry.update(table.get(f"bm{block_m}_{grid}", {}))
+    entry = {
+        **table.get(f"bm{block_m}_any", {}),
+        **table.get(f"bm{block_m}_{grid}", {}),
+    }
     return {k: _hashable(v) for k, v in entry.items()}
 
 

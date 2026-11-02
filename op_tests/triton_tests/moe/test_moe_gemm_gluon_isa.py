@@ -66,20 +66,15 @@ def _isa_blocks_with(asm: str, mnemonic: str):
     return [b for b in blocks if mnemonic in b]
 
 
-@pytest.mark.parametrize(
-    "m, n, k, n_expts_tot, n_expts_act, swiglu, x_tag, w_tag", _CASES
-)
-def test_gluon_moe_isa(
-    m, n, k, n_expts_tot, n_expts_act, swiglu, x_tag, w_tag, device="cuda"
-):
+def _compile(m, n, k, n_expts_tot, n_expts_act, swiglu, x_tag, w_tag, device):
+    """Launch the Gluon MoE GEMM once and return (compiled kernel, routing data)."""
     if get_arch() != "gfx950":
         pytest.skip("Gluon MoE kernels are gfx950 only.")
     rdata, gindx, x, x_scale, w, w_scale, bias, gammas = _build(
         m, n, k, n_expts_tot, n_expts_act, x_tag, w_tag, device
     )
-    M = gindx.shape[0]
     out_n = n // 2 if swiglu else n
-    y = torch.empty((1, M, out_n), dtype=torch.bfloat16, device=device)
+    y = torch.empty((1, gindx.shape[0], out_n), dtype=torch.bfloat16, device=device)
     pgm = moe_gemm_gluon(
         y,
         x,
@@ -99,6 +94,16 @@ def test_gluon_moe_isa(
         False,
     )
     assert pgm is not None, "the wrapper must return the compiled kernel handle"
+    return pgm, rdata
+
+
+@pytest.mark.parametrize(
+    "m, n, k, n_expts_tot, n_expts_act, swiglu, x_tag, w_tag", _CASES
+)
+def test_gluon_moe_isa(
+    m, n, k, n_expts_tot, n_expts_act, swiglu, x_tag, w_tag, device="cuda"
+):
+    pgm, _ = _compile(m, n, k, n_expts_tot, n_expts_act, swiglu, x_tag, w_tag, device)
     amdgcn = pgm.asm["amdgcn"]
     ttgir = pgm.asm["ttgir"]
 
@@ -143,33 +148,9 @@ def test_gemm2_multi_block_cache_hints(device="cuda"):
     """GEMM2 whose experts average several M blocks: the intermediate rows are stored
     non-temporally (``nt``) and the register-B weight loads stay cacheable, so the
     other M blocks of an expert can reuse its weights."""
-    if get_arch() != "gfx950":
-        pytest.skip("Gluon MoE kernels are gfx950 only.")
     # 4096 tokens x top-4 over 32 experts: 512 rows, four block_m 128 blocks each.
-    n, k = 4096, 2048
-    rdata, gindx, x, x_scale, w, w_scale, bias, gammas = _build(
-        4096, n, k, 32, 4, "mxfp8", "mxfp4", device
-    )
+    pgm, rdata = _compile(4096, 4096, 2048, 32, 4, False, "mxfp8", "mxfp4", device)
     assert rdata.block_m == 128
-    y = torch.empty((1, gindx.shape[0], n), dtype=torch.bfloat16, device=device)
-    pgm = moe_gemm_gluon(
-        y,
-        x,
-        w,
-        x_scale,
-        w_scale,
-        bias,
-        gammas,
-        rdata,
-        gindx,
-        None,
-        n,
-        k,
-        False,
-        1.0,
-        None,
-        False,
-    )
     amdgcn = pgm.asm["amdgcn"]
     stores = re.findall(r"^\s*buffer_store_dword\S*[^\n]*", amdgcn, re.MULTILINE)
     assert stores and all(" nt" in s for s in stores), "\n".join(stores[:4])
