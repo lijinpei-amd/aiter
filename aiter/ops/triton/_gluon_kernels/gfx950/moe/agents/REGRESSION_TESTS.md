@@ -150,8 +150,10 @@ cannot pass.
   `registers`, at about 280 s cold. The old runner, one process per file, took 35
   minutes cold (2088 s) back to back with the new one.
 - **Outputs:** one `$OUT/suite_<label>/<file>[.NN].log` per unit, whose last line is
-  the pytest summary, and `units.json` with each unit's tests, GPU and duration. A
-  rerun of a label deletes the old logs first. The console ends with the per-file
+  the pytest summary, `units.json` with each unit's tests, GPU and duration, and
+  `outcomes.json` with the outcome of every test, read from each unit's JUnit XML
+  (`<file>[.NN].xml`). A unit whose JUnit outcomes do not match its summary is
+  broken. A rerun of a label deletes the old outputs first. The console ends with the per-file
   totals, `accounted N of N collected tests, 0 broken units: OK`, the longest unit
   and the wall time.
 - **Broken units fail the comparison.** A unit that crashes, times out or leaves
@@ -185,6 +187,14 @@ cannot pass.
 
 - **Pass criterion:** `compare_suite.py` prints `SUITE PASS`, meaning no test that
   passes on the base fails or errors after the change.
+- **Added tests:** when both runs have `units.json` with node ids, the comparison
+  also checks the test inventory. A base test that is missing after the change
+  fails (`MISSING TEST`), and so does a broken unit after it. A test added since the
+  base counts by its outcome in the new run's `outcomes.json`: an added pass or skip
+  raises the expected count, an added failure is a `NEW FAILURE`. A new run without
+  `outcomes.json` (made before 2026-11-02) cannot account for added tests and fails.
+  When both runs have `outcomes.json`, a base pass that is now skipped fails too.
+  `op_tests/triton_tests/moe/test_moe_gemm_gluon_suite_compare.py` tests these rules.
 - **Expected numbers:** 1862 passed / 20 failed / 22 skipped since the slot rename,
   which added 14 tests and renamed `scale_miniblocks` to `scale_slots` and its
   `mini_block` tests to `slot`. Against an older base, rename those IDs in a copy

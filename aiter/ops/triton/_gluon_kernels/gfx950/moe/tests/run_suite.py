@@ -28,8 +28,10 @@ unit that crashes, times out or leaves tests unaccounted for gets an ERROR line
 per test and an "N error" summary appended, so compare_suite.py fails on it. A
 unit that fails with out of GPU memory is rerun once, one worker per GPU, after
 the rest; its first log stays as <unit>.log.oom. DIR/units.json records each
-unit's tests, GPU and duration. --plan prints the units and the predicted wall
-time, and runs nothing. Ending the runner, by any signal including SIGKILL, kills
+unit's tests, GPU and duration, and DIR/outcomes.json the outcome of every test
+(passed, failed, skipped or error), read from each unit's JUnit XML; compare_suite.py
+uses it to account for tests added since a baseline. --plan prints the units and the
+predicted wall time, and runs nothing. Ending the runner, by any signal including SIGKILL, kills
 every pytest process it started.
 """
 
@@ -47,6 +49,7 @@ import subprocess
 import sys
 import threading
 import time
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
@@ -86,6 +89,8 @@ class Unit:
     counts: dict = field(default_factory=lambda: dict.fromkeys(KINDS, 0))
     reason: str = ""  # why the unit counts as broken; empty if it ran cleanly
     retried: bool = False  # rerun alone on its GPU after running out of memory
+    # Node id -> outcome, from the JUnit XML; written to outcomes.json, not units.json.
+    outcomes: dict = field(default_factory=dict)
 
 
 def suite_dir(arg):
@@ -266,11 +271,43 @@ def summary(log):
     return counts
 
 
+def junit_name(nid):
+    """(classname, name) of a node id in pytest's JUnit XML (its mangle_test_address)."""
+    path, bracket, params = nid.partition("[")
+    names = path.split("::")
+    names[0] = re.sub(r"\.py$", "", names[0].replace("/", "."))
+    names[-1] += bracket + params
+    return ".".join(names[:-1]), names[-1]
+
+
+def outcomes(xml, ids):
+    """Node id -> outcome from one unit's JUnit XML; {} if the file is unreadable.
+
+    A test case with an error (setup or teardown) counts as error, then failure, then
+    skip (xfail included, as in pytest's summary), else passed.
+    """
+    try:
+        cases = ET.parse(xml).getroot().iter("testcase")
+    except (OSError, ET.ParseError):
+        return {}
+    known = {junit_name(nid): nid for nid in ids or []}
+    rank = {"passed": 0, "skipped": 1, "failed": 2, "error": 3}
+    tag_kind = {"error": "error", "failure": "failed", "skipped": "skipped"}
+    found = {}
+    for case in cases:
+        key = (case.get("classname", ""), case.get("name", ""))
+        nid = known.get(key, "::".join(key))
+        kinds = [tag_kind[c.tag] for c in case if c.tag in tag_kind]
+        found[nid] = max([found.get(nid, "passed"), *kinds], key=rank.get)
+    return found
+
+
 def run(unit, gpu, out):
     """Run one unit on one GPU; mark it broken unless pytest accounted for it."""
     log = out / f"{unit.name}.log"
+    xml = out / f"{unit.name}.xml"
     unit.gpu, unit.start = gpu, time.time()
-    cmd = [*PYTEST, "-rfE", *unit.args]
+    cmd = [*PYTEST, "-rfE", f"--junitxml={xml}", *unit.args]
     with (
         open(log, "w") as fh,
         spawn(cmd, gpu, stdout=fh, stderr=subprocess.STDOUT) as proc,
@@ -292,10 +329,17 @@ def run(unit, gpu, out):
     # A file that failed collection in planning ran whole: pytest's count stands.
     elif unit.ids is not None and sum(counts.values()) != len(unit.ids):
         unit.reason = f"summary counts {sum(counts.values())} of {len(unit.ids)} tests"
+    else:
+        unit.outcomes = outcomes(xml, unit.ids)
+        tally = {k: list(unit.outcomes.values()).count(k) for k in KINDS}
+        missing = unit.ids is not None and set(unit.outcomes) != set(unit.ids)
+        if tally != counts or missing:
+            unit.reason = f"JUnit outcomes {fmt(tally)} do not match the summary"
     if not unit.reason:
         unit.counts = counts
         return
     bad = unit.ids or [unit.file]
+    unit.outcomes = dict.fromkeys(bad, "error")
     unit.counts = dict.fromkeys(KINDS, 0) | {"error": len(bad)}
     with open(log, "a") as fh:
         fh.write(f"\n# run_suite.py: unit {unit.name} {unit.reason}\n")
@@ -367,7 +411,8 @@ def suite(args, paths):
         return True
 
     args.out.mkdir(parents=True, exist_ok=True)
-    for stale in [*args.out.glob("*.log*"), *args.out.glob("units.json")]:
+    patterns = ("*.log*", "*.xml*", "units.json", "outcomes.json")
+    for stale in [p for pattern in patterns for p in args.out.glob(pattern)]:
         stale.unlink()  # a rerun of a label must not mix in old chunk logs
     drain(units, args.gpus, JOBS_PER_GPU, args.out)
     # A unit that ran out of GPU memory next to its neighbours gets one rerun with a
@@ -378,6 +423,9 @@ def suite(args, paths):
         failed = u.counts["failed"] + u.counts["error"]
         if failed and OOM.search(log.read_text(errors="replace")):
             log.rename(log.with_suffix(".log.oom"))
+            xml = log.with_suffix(".xml")
+            if xml.exists():
+                xml.rename(xml.with_suffix(".xml.oom"))
             oom.append(Unit(u.name, u.file, u.args, u.ids, u.est, retried=True))
     if oom:
         print(f"rerunning {len(oom)} units that ran out of GPU memory, alone")
@@ -424,11 +472,17 @@ def suite(args, paths):
                 "jobs_per_gpu": JOBS_PER_GPU,
                 "unit_seconds": UNIT_SECONDS,
                 "collected": collected,
-                "units": [asdict(u) | {"start": max(0, u.start - t0)} for u in units],
+                "units": [
+                    {k: v for k, v in asdict(u).items() if k != "outcomes"}
+                    | {"start": max(0, u.start - t0)}
+                    for u in units
+                ],
             },
             indent=1,
         )
     )
+    tests = {nid: kind for u in units for nid, kind in u.outcomes.items()}
+    (args.out / "outcomes.json").write_text(json.dumps(tests, indent=0, sort_keys=True))
     return ok
 
 
