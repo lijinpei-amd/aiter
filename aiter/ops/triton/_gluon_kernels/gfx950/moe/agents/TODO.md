@@ -42,26 +42,36 @@ Gluon/FlyDSL geomean is now 1.0014, 1.0019 and 0.9739 (control in the same runs:
 1.0229, 1.0250, 0.9847). Table: `bench_out/gluon_moe_regression/gemm2/
 compare_gemm2_20261103_r3.md`.
 
+Done 2026-11-03 (round 4): when the experts average two or more M blocks (T=16384 in
+the matrix) a `bm<block_m>_multi` entry streams the result (`.cs`) and reads the
+weights with the default cache policy (Gluon -4.8..+0.1%); block_m 64 holds B in
+registers like block_m 128. Final acceptance against dac620634 (four HIP 7 pairs, 14
+triggered cells re-timed alone): Gluon/FlyDSL geomean 0.9918, 0.9965 and 0.9673, no
+cell above 1.10 (a8w4 dsv4-flash T=16384 1.095), output bit-identical in 72/72 cells.
+Table and protocol: `bench_out/gluon_moe_regression/gemm2/compare_gemm2_20261103_r4.md`.
+
 Tried 2026-11-03, not kept: the in-kernel last-producer combine (the CTA that counts the
-last of a token's gates sums them in gate order). Bit-identical to `reduce_grouped`,
-but slower in every cell measured: x1.33 at T=1, x1.05-1.10 at T 8-32, x1.00-1.05 at
-T=1024, x1.39 at a4w4 glm52-base T=4096. The register-B block_m 128 tile holds one CTA
-per CU, so each CTA's tail (store completion, counter round trip, dependent loads,
-masked sums) runs exposed, and `reduce_grouped` is already at its bandwidth limit
-(BLOCK_N 512-4096 and 2-8 warps give the same time). The generic agent-scope fences
-cost x4 (acquire, `buffer_inv sc1`) to x16 (release, `buffer_wbl2 sc1`) more. Hiding the
-tail needs a persistent kernel. Design, numbers and patches:
-`bench_out/gluon_moe_regression/gemm2/r3/T7_RESULT.md`.
+last of a token's gates sums them in gate order). Bit-identical to `reduce_grouped`.
+On HIP 7 it is faster only at minimax-m3 T=1024 (topk 4, block_m 64): a8w4 0.948,
+a8w8 0.959, a4w4 0.981. Elsewhere it is slower or noise: x1.37 at T=1, x1.00-1.08 at T 8-32,
+x1.03-1.13 at the other T=1024 cells, x1.40 at a4w4 glm52-base T=4096, x1.11 at a8w4
+minimax-m3 T=16384. The register-B tiles hold one CTA per CU, so each CTA's tail (store
+completion, counter round trip, dependent loads, masked sums) runs exposed. The generic
+agent-scope fences cost x4 (acquire, `buffer_inv sc1`) to x16 (release,
+`buffer_wbl2 sc1`) more. A kept version needs a topk-dependent dispatch and the full
+qualification (cross-XCD publication, poisoned buffers, graph replay, torch.compile).
+Design, numbers and patches: `bench_out/gluon_moe_regression/gemm2/r3/T7_RESULT.md`.
 
 Remaining gap, largest first:
 
-- a8w4 dsv4-flash T=16384 is 1.127x FlyDSL. No knob screened in round 3 moves it
-  (scale placement, GROUP_M and XCD order, buffer depths, K unroll, BLOCK_N 128,
-  32x32x64 MFMA). Its separate reduce is 219 us of ~1530 us, and the GEMM itself is 22%
-  slower than our a4w4 at the same cell, while FlyDSL's a8w4 is faster than its a4w4.
-- The a4w4 and a8w4 means are just above 1.00. T=1 (1.09-1.29, gaps 1.2-4.0 us), T=8
-  (a4w4 dsv4-flash 1.07, minimax-m3 1.06; a8w4 minimax-m3 1.06) and T=1024 (a4w4
-  dsv4-flash 1.09, a8w4 glm52-base 1.08) keep them there.
+- a8w4 dsv4-flash T=16384 is 1.095x FlyDSL, close to the 1.10 limit. The GEMM (~1245
+  us) is faster than FlyDSL's whole stage 2 (1355 us, a tuned atomic kernel), but the
+  separate deterministic reduce adds ~237 us at ~4.6 TB/s. No reduce launch shape, a
+  token-major intermediate (-4% of the reduce) or a constexpr split-K count moves it,
+  and no GEMM knob on top of the cache policy helps (dsas, SCHED_MODE 4, SOFF_UNROLL,
+  SCALE_FILL_MID, B scales in registers: flat to +1.8%).
+- T=1 (up to 1.28, gaps 1.2-3.9 us): the Gluon GEMM alone is at or below FlyDSL's stage
+  2; the gap is the ~2.5 us `reduce_grouped` launch (index load, row loads, store).
 - The full matrix in one process moves some cells by up to 6% on both backends (weight
   placement), and T=1 cells drift together. Isolated runs of the same kernels agree
   within 2%, so measure suspect cells alone.
