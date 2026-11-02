@@ -194,6 +194,12 @@ cannot pass.
   raises the expected count, an added failure is a `NEW FAILURE`. A new run without
   `outcomes.json` (made before 2026-11-02) cannot account for added tests and fails.
   When both runs have `outcomes.json`, a base pass that is now skipped fails too.
+  A `units.json` with a unit that has no node ids or with a node id twice fails,
+  and so does an `outcomes.json` that does not list exactly the run's tests, has an
+  unknown outcome, or whose failures and errors differ from the logs' FAILED/ERROR
+  lines. Only a run without `units.json` is compared by counts alone. A unit that
+  ran whole after its planning collection failed is collected again after the run;
+  without node ids it is broken.
   `op_tests/triton_tests/moe/test_moe_gemm_gluon_suite_compare.py` tests these rules.
 - **Expected numbers:** 2649 passed / 20 failed / 22 skipped on 2026-11-02 (round 1
   of the GEMM2 work: 2602 at `dac620634` plus 47 added tests). Earlier: 1862 passed /

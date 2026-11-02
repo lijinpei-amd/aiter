@@ -11,12 +11,16 @@ Exit 0 only if the after-run has no failure/error the before-run did not have an
 the passed/skipped counts match. A side that does not exist, holds no *.log or
 *.txt, or has one that does not end in a pytest summary line fails the comparison.
 
-When both sides have units.json with node ids, the test inventories are compared
-too: a before-test missing after fails, and so does a broken after-unit. Tests added
-after the before-run count only with their outcome from the after-run's
-outcomes.json: an added pass or skip raises the expected count, an added failure
-is a new failure. Without outcomes.json, added tests fail the comparison. When both
-sides have outcomes.json, a before-pass that is now skipped fails as well.
+When both sides have units.json, the test inventories are compared too: a
+before-test missing after fails, and so does a broken after-unit. A units.json
+with a unit that has no node ids, or with a node id twice, fails: only a run
+without units.json (a legacy run) is compared by counts alone. Tests added after the
+before-run count only with their outcome from the after-run's outcomes.json: an
+added pass or skip raises the expected count, an added failure is a new failure.
+Without outcomes.json, added tests fail the comparison. An outcomes.json must list
+exactly the run's tests, with known outcomes, and its failures and errors must be
+the FAILED/ERROR lines of the logs. When both sides have outcomes.json, a
+before-pass that is now skipped fails as well.
 """
 
 import json
@@ -38,7 +42,8 @@ class Run:
     path: Path
     totals: dict
     bad: set  # failed or errored node ids
-    tests: set | None  # node ids from units.json; None if unknown
+    tests: set | None  # node ids from units.json; None without units.json
+    manifest_problems: list  # what makes units.json or outcomes.json unusable
     outcomes: dict | None  # node id -> outcome from outcomes.json; None if absent
     broken: list  # units.json units that did not run cleanly
 
@@ -52,7 +57,8 @@ def load(arg):
     for log in logs:
         text = log.read_text(errors="replace")
         for line in text.splitlines():
-            m = re.match(r"(FAILED|ERROR) (\S+)", line)
+            # "FAILED <node id> - <message>"; a node id can hold spaces.
+            m = re.match(r"(FAILED|ERROR) (.+?)(?: - |$)", line)
             if m:
                 bad.add(m.group(2))
         last = text.strip().splitlines()[-1] if text.strip() else ""
@@ -63,16 +69,52 @@ def load(arg):
             totals[k] += int(n)
     if unfinished:
         sys.exit(f"SUITE FAIL: no pytest summary ends {d}/{', '.join(unfinished)}")
-    tests, broken = None, []
+    tests, broken, problems = None, [], []
     if (d / "units.json").is_file():
         units = json.loads((d / "units.json").read_text())["units"]
-        if all(u.get("ids") is not None for u in units):
-            tests = {nid for u in units for nid in u["ids"]}
+        ids = [nid for u in units for nid in u.get("ids") or []]
+        tests = set(ids)
         broken = [u["name"] for u in units if u.get("reason")]
+        problems += [
+            f"NO NODE IDS for unit {u['name']} in {d.name}"
+            for u in units
+            if u.get("ids") is None
+        ]
+        problems += [
+            f"DUPLICATE TEST {t} in {d.name}" for t, n in Counter(ids).items() if n > 1
+        ]
     outcomes = None
     if (d / "outcomes.json").is_file():
         outcomes = json.loads((d / "outcomes.json").read_text())
-    return Run(d, totals, bad, tests, outcomes, broken)
+        problems += outcome_problems(d.name, outcomes, tests, totals, bad)
+    return Run(d, totals, bad, tests, problems, outcomes, broken)
+
+
+def outcome_problems(name, outcomes, tests, totals, bad):
+    """Why an outcomes.json does not describe the run of its directory."""
+    problems = [
+        f"UNKNOWN OUTCOME {k!r} of {t} in {name}"
+        for t, k in outcomes.items()
+        if k not in KINDS
+    ]
+    tally = Counter(outcomes.values())
+    if any(tally[k] != totals[k] for k in KINDS):
+        problems.append(
+            f"outcomes.json {dict(tally)} disagrees with the logs of {name}"
+        )
+    if tests is None:
+        problems.append(f"outcomes.json without units.json in {name}")
+    elif set(outcomes) != tests:
+        problems.append(
+            f"outcomes.json of {name} lists {len(set(outcomes) - tests)} tests "
+            f"outside units.json and lacks {len(tests - set(outcomes))}"
+        )
+    failing = {t for t, k in outcomes.items() if k in ("failed", "error")}
+    if failing != bad:
+        problems.append(
+            f"failed/error tests of outcomes.json and the logs of {name} differ"
+        )
+    return problems
 
 
 def compare(a, b):
@@ -81,12 +123,9 @@ def compare(a, b):
     new, fixed = sorted(b.bad - a.bad), sorted(a.bad - b.bad)
     lines += [f"NEW FAILURE {t}" for t in new]
     lines += [f"now passing {t}" for t in fixed]
-    problems = [f"BROKEN UNIT {name}" for name in b.broken]
+    problems = a.manifest_problems + b.manifest_problems
+    problems += [f"BROKEN UNIT {name}" for name in b.broken]
     passed, skipped = a.totals["passed"] + len(fixed), a.totals["skipped"]
-    if b.outcomes is not None:
-        tally = Counter(b.outcomes.values())
-        if any(tally[k] != b.totals[k] for k in KINDS):
-            problems.append(f"outcomes.json {dict(tally)} disagrees with the logs")
     if a.tests is not None and b.tests is not None:
         problems += [f"MISSING TEST {t}" for t in sorted(a.tests - b.tests)]
         added = b.tests - a.tests

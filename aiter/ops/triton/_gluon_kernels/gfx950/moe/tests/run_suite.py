@@ -12,8 +12,9 @@ UNIT_SECONDS (default 60) of estimated test time. Units run longest first from o
 queue on JOBS_PER_GPU (default 8) workers per GPU, each pinned with
 HIP_VISIBLE_DEVICES. UNIT_TIMEOUT (default 1800 s) bounds one unit and
 COLLECT_TIMEOUT (default 300 s) one collection. A failed collection is retried once
-and the tail of its output printed; a file that still fails runs whole, and counts
-by its own pytest summary if that run is clean.
+and the tail of its output printed; a file that still fails runs whole. That run
+counts only if it is clean and a collection after it gives the node ids of all
+its tests; otherwise the unit is broken.
 
 Estimates come from suite_weights.json: the seconds of each test, listed per test
 function in collection order. A function whose parameters changed costs its old
@@ -89,6 +90,8 @@ class Unit:
     counts: dict = field(default_factory=lambda: dict.fromkeys(KINDS, 0))
     reason: str = ""  # why the unit counts as broken; empty if it ran cleanly
     retried: bool = False  # rerun alone on its GPU after running out of memory
+    # Collection failed in planning, so the file ran whole; ids were collected after.
+    recollected: bool = False
     # Node id -> outcome, from the JUnit XML; written to outcomes.json, not units.json.
     outcomes: dict = field(default_factory=dict)
 
@@ -326,14 +329,19 @@ def run(unit, gpu, out):
         unit.reason = f"pytest exited with {unit.rc}"
     elif counts is None:
         unit.reason = f"left no pytest summary (exit {unit.rc})"
-    # A file that failed collection in planning ran whole: pytest's count stands.
-    elif unit.ids is not None and sum(counts.values()) != len(unit.ids):
+    elif unit.ids is None:
+        # Collection failed in planning and the file ran whole: every test still
+        # needs its node id, so collect once more and check the run against it.
+        unit.ids, _ = collect(unit.file, gpu)
+        unit.recollected = True
+        if unit.ids is None:
+            unit.reason = "ran whole, but its node ids could not be collected"
+    if not unit.reason and sum(counts.values()) != len(unit.ids):
         unit.reason = f"summary counts {sum(counts.values())} of {len(unit.ids)} tests"
-    else:
+    if not unit.reason:
         unit.outcomes = outcomes(xml, unit.ids)
         tally = {k: list(unit.outcomes.values()).count(k) for k in KINDS}
-        missing = unit.ids is not None and set(unit.outcomes) != set(unit.ids)
-        if tally != counts or missing:
+        if tally != counts or set(unit.outcomes) != set(unit.ids):
             unit.reason = f"JUnit outcomes {fmt(tally)} do not match the summary"
     if not unit.reason:
         unit.counts = counts
@@ -446,7 +454,7 @@ def suite(args, paths):
         print(f"{Path(path).stem + '.log':50} {line}")
     longest = max(units, key=lambda u: u.seconds)
     broken = [u for u in units if u.reason]
-    late = [u for u in units if u.ids is None and not u.reason]
+    late = [u for u in units if u.recollected and not u.reason]
     collected += sum(sum(u.counts.values()) for u in late)
     ok = not broken and sum(total.values()) == collected
     print(f"total: {fmt(total)}")

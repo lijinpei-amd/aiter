@@ -3,6 +3,7 @@
 
 """CPU checks for the regression suite comparison (tests/compare_suite.py)."""
 
+import contextlib
 import importlib.util
 import json
 from pathlib import Path
@@ -24,8 +25,13 @@ _BASE = {f"{_FILE}::test_{i}": "passed" for i in range(4)} | {
 }
 
 
-def _run(root, name, outcomes, manifest=True, reason="", summary=True):
-    """A run_suite.py output directory with one unit holding ``outcomes``."""
+def _run(
+    root, name, outcomes, manifest=True, reason="", summary=True, ids=None, units=True
+):
+    """A run_suite.py output directory with one unit holding ``outcomes``.
+
+    ``ids`` overrides the unit's node ids in units.json (``"none"`` writes null), and
+    ``manifest`` may be a dict written as outcomes.json instead of ``outcomes``."""
     d = root / name
     d.mkdir()
     counts = {k: list(outcomes.values()).count(k) for k in compare_suite.KINDS}
@@ -34,10 +40,13 @@ def _run(root, name, outcomes, manifest=True, reason="", summary=True):
     if summary:
         log.append(", ".join(f"{n} {k}" for k, n in counts.items() if n) + " in 1.0s")
     (d / "test_x.log").write_text("\n".join(log) + "\n")
-    unit = {"name": "test_x", "ids": sorted(outcomes), "reason": reason}
-    (d / "units.json").write_text(json.dumps({"units": [unit]}))
+    unit_ids = None if ids == "none" else sorted(outcomes) if ids is None else ids
+    unit = {"name": "test_x", "ids": unit_ids, "reason": reason}
+    if units:
+        (d / "units.json").write_text(json.dumps({"units": [unit]}))
     if manifest:
-        (d / "outcomes.json").write_text(json.dumps(outcomes))
+        written = manifest if isinstance(manifest, dict) else outcomes
+        (d / "outcomes.json").write_text(json.dumps(written))
     return compare_suite.load(str(d))
 
 
@@ -114,3 +123,108 @@ def test_legacy_runs_without_units_json_compare_counts_only(tmp_path):
     (a.path / "units.json").unlink()
     ok, report = compare_suite.compare(compare_suite.load(str(a.path)), b)
     assert not ok and "expected 4 passed" in "\n".join(report)
+
+
+def test_unit_without_node_ids_fails(tmp_path):
+    # A whole-file unit without canonical ids must not switch off the inventory check:
+    # here it hides that test_old is gone.
+    a = _run(tmp_path, "before", {f"{_FILE}::test_old": "passed"} | _BASE)
+    after = {f"{_FILE}::test_new": "passed"} | _BASE
+    b = _run(tmp_path, "after", after, ids="none")
+    ok, report = compare_suite.compare(a, b)
+    assert not ok and "NO NODE IDS" in "\n".join(report)
+
+
+def test_outcomes_outside_the_inventory_fail(tmp_path):
+    # units.json keeps test_old, outcomes.json swaps it for test_new: totals match.
+    before = {f"{_FILE}::test_old": "passed"} | _BASE
+    manifest = {f"{_FILE}::test_new": "passed"} | _BASE
+    a = _run(tmp_path, "before", before, manifest=False)
+    b = _run(tmp_path, "after", before, manifest=manifest)
+    ok, report = compare_suite.compare(a, b)
+    assert not ok and "outside units.json" in "\n".join(report)
+
+
+def test_duplicate_node_ids_fail(tmp_path):
+    ids = sorted(_BASE) + [f"{_FILE}::test_0"]
+    a = _run(tmp_path, "before", _BASE, manifest=False)
+    b = _run(tmp_path, "after", dict(_BASE), ids=ids)
+    ok, report = compare_suite.compare(a, b)
+    assert not ok and f"DUPLICATE TEST {_FILE}::test_0" in "\n".join(report)
+
+
+def test_unknown_outcome_kind_fails(tmp_path):
+    a = _run(tmp_path, "before", _BASE, manifest=False)
+    b = _run(
+        tmp_path, "after", dict(_BASE), manifest=_BASE | {f"{_FILE}::test_0": "ok"}
+    )
+    ok, report = compare_suite.compare(a, b)
+    assert not ok and "UNKNOWN OUTCOME 'ok'" in "\n".join(report)
+
+
+def test_outcome_failures_must_match_the_logs(tmp_path):
+    # Same counts, but outcomes.json names a different failing test than the logs.
+    manifest = _BASE | {
+        f"{_FILE}::test_old_fail": "passed",
+        f"{_FILE}::test_0": "failed",
+    }
+    a = _run(tmp_path, "before", _BASE, manifest=False)
+    b = _run(tmp_path, "after", dict(_BASE), manifest=manifest)
+    ok, report = compare_suite.compare(a, b)
+    assert not ok and "failed/error tests" in "\n".join(report)
+
+
+def test_incomplete_baseline_inventory_fails(tmp_path):
+    a = _run(tmp_path, "before", _BASE, manifest=False, ids="none")
+    ok, report = compare_suite.compare(a, _run(tmp_path, "after", dict(_BASE)))
+    assert not ok and "NO NODE IDS" in "\n".join(report)
+
+
+def test_node_ids_with_spaces_are_parsed_from_the_logs(tmp_path):
+    spaced = {f"{_FILE}::test_p[a b]": "failed"} | _BASE
+    a = _run(tmp_path, "before", spaced, manifest=True)
+    ok, report = compare_suite.compare(a, _run(tmp_path, "after", dict(spaced)))
+    assert ok, report
+
+
+_RUNNER = _SCRIPT.with_name("run_suite.py")
+_RSPEC = importlib.util.spec_from_file_location("run_suite", _RUNNER)
+run_suite = importlib.util.module_from_spec(_RSPEC)
+_RSPEC.loader.exec_module(run_suite)
+
+
+@pytest.mark.parametrize("collect_ok", [True, False])
+def test_whole_file_unit_needs_its_node_ids(tmp_path, monkeypatch, collect_ok):
+    """A unit whose planning collection failed runs whole; it counts only once a
+    later collection gives the node ids that its JUnit outcomes cover."""
+    ids = [f"{_FILE}::test_a", f"{_FILE}::test_b"]
+
+    class _Proc:
+        def wait(self, timeout=None):
+            return 0
+
+    @contextlib.contextmanager
+    def fake_spawn(cmd, gpu, stdout=None, **_):
+        xml = next(a.split("=", 1)[1] for a in cmd if a.startswith("--junitxml="))
+        cases = "".join(
+            f'<testcase classname="{run_suite.junit_name(n)[0]}" '
+            f'name="{run_suite.junit_name(n)[1]}"/>'
+            for n in ids
+        )
+        Path(xml).write_text(f"<testsuites><testsuite>{cases}</testsuite></testsuites>")
+        stdout.write("2 passed in 1.00s\n")
+        stdout.flush()
+        yield _Proc()
+
+    monkeypatch.setattr(run_suite, "spawn", fake_spawn)
+    monkeypatch.setattr(
+        run_suite, "collect", lambda *_: (ids if collect_ok else None, "")
+    )
+    unit = run_suite.Unit("test_x", _FILE, [_FILE], None, 1.0)
+    run_suite.run(unit, "0", tmp_path)
+    if collect_ok:
+        assert unit.reason == "" and unit.ids == ids and unit.recollected
+        assert unit.outcomes == dict.fromkeys(ids, "passed")
+    else:
+        assert "could not be collected" in unit.reason
+        assert unit.outcomes == {_FILE: "error"}
