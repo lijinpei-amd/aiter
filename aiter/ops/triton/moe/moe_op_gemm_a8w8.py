@@ -306,29 +306,34 @@ def moe_gemm_a8w8(
     expt_hist_sum = None if expt_data is None else expt_data.token_offs_pad[-1]
     expt_token_offs_raw = None if expt_data is None else expt_data.token_offs_raw
     expt_block_pid_map = None if expt_data is None else expt_data.block_pid_map
-    if _try_gluon(
-        op_name="MOE_GEMM_A8W8",
-        y=y,
-        x=x,
-        w=w,
-        x_scales=x_scales,
-        w_scales=w_scales,
-        bias=bias,
-        gammas=gammas,
-        routing_data=routing_data,
-        gather_indx=gather_indx,
-        scatter_indx=scatter_indx,
-        N=N,
-        K=K,
-        apply_swiglu=apply_swiglu_matmul,
-        alpha=alpha,
-        limit=limit,
-        swiglu_add_residual=swiglu_add_residual,
-        split_k=config["split_k"],
-        x_static_scale=x_static_scale,
-        quant_static_scale=quant_static_scale,
-        swizzle_mx_scale=swizzle_mx_scale,
-        w_static_scale=w_static_scale,
+    # The gfx950 Gluon kernel has no per-token or per-expert scale.
+    if (
+        x_token_scale is None
+        and w_expt_scale is None
+        and _try_gluon(
+            op_name="MOE_GEMM_A8W8",
+            y=y,
+            x=x,
+            w=w,
+            x_scales=x_scales,
+            w_scales=w_scales,
+            bias=bias,
+            gammas=gammas,
+            routing_data=routing_data,
+            gather_indx=gather_indx,
+            scatter_indx=scatter_indx,
+            N=N,
+            K=K,
+            apply_swiglu=apply_swiglu_matmul,
+            alpha=alpha,
+            limit=limit,
+            swiglu_add_residual=swiglu_add_residual,
+            split_k=config["split_k"],
+            x_static_scale=x_static_scale,
+            quant_static_scale=quant_static_scale,
+            swizzle_mx_scale=swizzle_mx_scale,
+            w_static_scale=w_static_scale,
+        )
     ):
         group_indx = (
             None

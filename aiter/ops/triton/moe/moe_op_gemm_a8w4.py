@@ -564,10 +564,12 @@ def moe_gemm_a8w4(
     # and reads the same (E, K/2, N) weight layout the Triton path wants, so it is
     # offered only when the gfx1250 transpose above did not happen.
     # `out_mx_quant` returns (fp8 values, ue8m0 scales) instead of going through
-    # reduce_grouped, so it is a different contract and stays on the Triton path.
+    # reduce_grouped, and `ep_scatter` delivers into a staging window, so both are
+    # different contracts and stay on the Triton path.
     if (
         not use_gluon
         and not out_mx_quant
+        and ep_scatter is None
         and _try_gluon(
             op_name="MOE_GEMM_A8W4",
             y=y,
@@ -608,6 +610,11 @@ def moe_gemm_a8w4(
             out_dtype=out_dtype,
             swiglu_add_residual=swiglu_add_residual,
             residual=residual,
+            indx_valid=(
+                None
+                if (gate_valid is None or scatter_indx is None)
+                else gate_valid.view(-1, routing_data.n_expts_act)
+            ),
         )
 
     expt_data = routing_data.expt_data
