@@ -161,8 +161,10 @@ cannot pass.
 - **Collection failures:** a file that fails collection is collected again once, and
   the console prints the tail of each failed attempt. If the second attempt fails
   too, the file runs whole as one unit, as `COLLECTION FAILED <file>: running it
-  whole` says. A clean run then counts by its own pytest summary, and the console
-  ends with `collected only when run whole`. Otherwise the unit is broken.
+  whole` says. After the run the file is collected once more: the unit counts only
+  if that gives its node ids and its JUnit outcomes cover exactly those ids and
+  match its pytest summary. The console then ends with `collected only when run
+  whole`. Otherwise the unit is broken.
 - **Stopping it:** ending the runner kills every pytest process it started, for any
   signal including SIGKILL. A signal it inherits as ignored stays ignored, so
   `nohup` still keeps it alive through a hangup.

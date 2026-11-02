@@ -29,25 +29,42 @@ Done 2026-11-02 (round 2): the GEMM2 tuning is in the `A4W4-GEMM2`, `A8W4-GEMM2`
 and 128; block_m 128 also takes the 4x2 warp tile, one wave per SIMD and per-stage
 commits, with BLOCK_K 256 (a4w4) or 128 (a8w4, a8w8). block_m 64 keeps B in LDS. Cost:
 the launch keeps a preshuffled copy of each GEMM2 weight on the tensor (twice the weight
-memory). Gluon/FlyDSL geomean is now 1.01, 1.02 and 0.98 (control in the same runs:
-1.04, 1.10, 1.01). Table: `bench_out/gluon_moe_regression/gemm2/
+memory). Gluon/FlyDSL geomean is now 1.013, 1.015 and 0.978 (control in the same runs:
+1.030, 1.098, 1.012). Table: `bench_out/gluon_moe_regression/gemm2/
 compare_gemm2_20261102_r2.md`.
+
+Done 2026-11-03 (round 3): a `bm16_small` entry (small grid, T=1 here) gives a4w4 and
+a8w4 a 128-column N tile; the block_m 128 entries read B scales from registers (a4w4,
+a8w4), address unrolled steps through soffset (a4w4) and read A scales in the MFMA
+region (a8w8); `routing_block_m` also raises an exact mean of 64 (dsv4-pro T=4096 now
+runs block_m 128: GEMM2 Gluon -2.5..-12.5%, Triton -2..-8%, GEMM1 faster in a screen).
+Gluon/FlyDSL geomean is now 1.0014, 1.0019 and 0.9739 (control in the same runs:
+1.0229, 1.0250, 0.9847). Table: `bench_out/gluon_moe_regression/gemm2/
+compare_gemm2_20261103_r3.md`.
+
+Tried 2026-11-03, not kept: the in-kernel last-producer combine (the CTA that counts the
+last of a token's gates sums them in gate order). Bit-identical to `reduce_grouped`,
+but slower in every cell measured: x1.33 at T=1, x1.05-1.10 at T 8-32, x1.00-1.05 at
+T=1024, x1.39 at a4w4 glm52-base T=4096. The register-B block_m 128 tile holds one CTA
+per CU, so each CTA's tail (store completion, counter round trip, dependent loads,
+masked sums) runs exposed, and `reduce_grouped` is already at its bandwidth limit
+(BLOCK_N 512-4096 and 2-8 warps give the same time). The generic agent-scope fences
+cost x4 (acquire, `buffer_inv sc1`) to x16 (release, `buffer_wbl2 sc1`) more. Hiding the
+tail needs a persistent kernel. Design, numbers and patches:
+`bench_out/gluon_moe_regression/gemm2/r3/T7_RESULT.md`.
 
 Remaining gap, largest first:
 
-- The separate `_reduce_grouped` kernel: 2.5-3.5 us at T 1-8, 11.5 us at dsv4-flash
-  T=1024 and 434 us at glm52-base a8w8 T=16384. The two cells still above
-  1.10 (a8w4 dsv4-flash T=16384 1.13, a4w4 glm52-base T=4096 1.10) and the T=1 cells
-  (gaps 2.2-4.2 us) wait on it. FlyDSL adds the rows in its epilogue (`mode="atomic"`),
-  which is not deterministic. Plan: the last CTA that writes a token's rows adds them in
-  gate order, so the sum is bit-identical to `_reduce_grouped`.
-- Mean 64 (dsv4-pro T=4096) still splits into two M blocks. With the new block_m 128
-  tiles, block_m 128 is faster for all three dtypes there (screen: a4w4 1414 -> 1327 us,
-  a8w4 1538 -> 1488, a8w8 2593 -> 2231). Needs Triton and GEMM1 numbers before the
-  routing rule changes.
+- a8w4 dsv4-flash T=16384 is 1.127x FlyDSL. No knob screened in round 3 moves it
+  (scale placement, GROUP_M and XCD order, buffer depths, K unroll, BLOCK_N 128,
+  32x32x64 MFMA). Its separate reduce is 219 us of ~1530 us, and the GEMM itself is 22%
+  slower than our a4w4 at the same cell, while FlyDSL's a8w4 is faster than its a4w4.
+- The a4w4 and a8w4 means are just above 1.00. T=1 (1.09-1.29, gaps 1.2-4.0 us), T=8
+  (a4w4 dsv4-flash 1.07, minimax-m3 1.06; a8w4 minimax-m3 1.06) and T=1024 (a4w4
+  dsv4-flash 1.09, a8w4 glm52-base 1.08) keep them there.
 - The full matrix in one process moves some cells by up to 6% on both backends (weight
-  placement). Isolated runs of the same cells agree within 0.2% when the kernels are
-  the same, so measure suspect cells alone.
+  placement), and T=1 cells drift together. Isolated runs of the same kernels agree
+  within 2%, so measure suspect cells alone.
 
 Check: kernel time with `aiter.test_common.run_perftest` on HIP 7 against FlyDSL's
 `us_stage2` (`op_tests/test_moe_2stage.py --kernel`), and the sha256 of every cell's
