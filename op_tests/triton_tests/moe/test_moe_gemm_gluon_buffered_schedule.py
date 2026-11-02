@@ -1296,6 +1296,7 @@ def test_absent_scale_ring_indices_ignore_invalid_unused_depths(scale_depths):
     from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import KernelLayout
     from aiter.ops.triton._gluon_kernels.gfx950.moe._types import DtypeQuant
     from aiter.ops.triton.moe import moe_op_gemm_gluon as host
+    from aiter.ops.triton.moe import moe_op_gemm_gluon_config as conf
     from op_tests.triton_tests.moe.test_moe_gemm_gluon_registers import (
         _register_config,
     )
@@ -1321,7 +1322,7 @@ def test_absent_scale_ring_indices_ignore_invalid_unused_depths(scale_depths):
         False,
         None,
         None,
-        tuple((key, host._hashable(value)) for key, value in config.items()),
+        tuple((key, conf._hashable(value)) for key, value in config.items()),
     )[-1]
     assert validate(tc, 512, 960)
     schedule = Schedule(tc, KernelLayout(tc), 960)

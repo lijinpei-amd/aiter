@@ -79,6 +79,7 @@ def build_gluon(data, tuning, artifact_dir):
     from aiter.ops.triton._gluon_kernels.gfx950.moe._types import WeightGuHbmLayout
     from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import validate
     from aiter.ops.triton.moe import moe_op_gemm_gluon as host
+    from aiter.ops.triton.moe import moe_op_gemm_gluon_config as conf
 
     assert Path(host.__file__).resolve().is_relative_to(REPO), host.__file__
     quantized_output = data["identity"]["precision"] == "a4w4"
@@ -148,7 +149,7 @@ def build_gluon(data, tuning, artifact_dir):
     assert (func_spec.output_quant is not None) == quantized_output
     effective = tuning_spec._asdict()
     requested_effective = dict(
-        zip(tuning_spec._fields, host._tuning_args(tuning), strict=True)
+        zip(tuning_spec._fields, conf._tuning_args(tuning), strict=True)
     )
     for field, requested in requested_effective.items():
         actual = effective[field]

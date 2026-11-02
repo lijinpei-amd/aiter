@@ -49,7 +49,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import (  # noqa: E402
     validate,
     validate_pipeline,
 )
-from aiter.ops.triton.moe import moe_op_gemm_gluon as host  # noqa: E402
+from aiter.ops.triton.moe import moe_op_gemm_gluon_config as conf  # noqa: E402
 
 CNAME = {c: n for c, n in zip(COMPONENTS, ("A_PAY", "A_SCL", "B_PAY", "B_SCL"))}
 
@@ -97,7 +97,7 @@ def _production_cases():
         for tokens, block_m in BLOCK_MS:
             seb = (dq_a == dq_b == DQ.MXFP8
                    and (tokens * 8 + 33 * block_m - 1) // (33 * block_m) <= 1)
-            cfg = dict(host._default_launch_config(
+            cfg = dict(conf._default_launch_config(
                 block_m, N_DEFAULT, K_DEFAULT, dq_a, dq_b, False, True,
                 stream_expert_payload=seb))
             i, w, t = cfg["mfma_instr_shape"], cfg["warps_per_cta"], cfg["tiles_per_warp"]
@@ -177,7 +177,7 @@ def _steps(schedule):
 
 def dump_case(name, cfg, dq_a, dq_b, K, out):
     try:
-        tc = host._probe_tuning_config(cfg, dq_a, dq_b)
+        tc = conf._probe_tuning_config(cfg, dq_a, dq_b)
         layout = KernelLayout(tc)
         validate(tc, N_DEFAULT, K, layout)
         schedule = Schedule(tc, layout, K)

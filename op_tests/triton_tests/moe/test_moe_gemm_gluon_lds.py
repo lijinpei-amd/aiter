@@ -14,7 +14,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import maybe_unwrap
 from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import KernelLayout
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lds import LDSManager
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import DtypeQuant
-from aiter.ops.triton.moe import moe_op_gemm_gluon as host
+from aiter.ops.triton.moe import moe_op_gemm_gluon_config as conf
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from op_tests.triton_tests.moe.test_moe_gemm_gluon_registers import _register_config
 
@@ -55,7 +55,7 @@ def test_register_load_does_not_stage_through_lds(operand, scale, block_k):
         A_SCALE_SORTED_SHUFFLED=False,
         B_SCALE_SHUFFLED=False,
     )
-    tc = host._probe_tuning_config(config, DtypeQuant.MXFP4, DtypeQuant.MXFP4)
+    tc = conf._probe_tuning_config(config, DtypeQuant.MXFP4, DtypeQuant.MXFP4)
     layout = KernelLayout(tc)
     shape = layout.lds_shape_slot(operand, scale)
     elements = shape[0] * shape[1]

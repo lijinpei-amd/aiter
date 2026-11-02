@@ -66,7 +66,7 @@ the measured loop.
 
 ### Configurations
 
-- **Gluon:** what the production config ladder in `moe_op_gemm_gluon.py` emits for
+- **Gluon:** what the production config ladder in `moe_op_gemm_gluon_config.py` emits for
   the tuned `BLOCK_M`, with the committed cache policies. BF16 at T=16/64 resolves to
   one N slot, so those two cells use the tuned pinned config instead. Source:
   `gluon_config_source.json`, `cases.json`.

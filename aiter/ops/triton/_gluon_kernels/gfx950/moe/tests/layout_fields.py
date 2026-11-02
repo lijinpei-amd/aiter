@@ -76,7 +76,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     WeightGuHbmLayout,
     dq_pack_divisor,
 )
-from aiter.ops.triton.moe import moe_op_gemm_gluon as host
+from aiter.ops.triton.moe import moe_op_gemm_gluon_config as conf
 
 if hasattr(L, "compute_kernel_layout"):
     API, build_layout = "compute_kernel_layout", L.compute_kernel_layout
@@ -167,12 +167,12 @@ def exc_line(exc):
 
 def _tuning_spec(cfg):
     """test_moe_gemm_gluon_config._tuning_spec; also what _launch_spec builds."""
-    return TuningSpec(*(host._hashable(v) for v in host._tuning_args(cfg)))
+    return TuningSpec(*(conf._hashable(v) for v in conf._tuning_args(cfg)))
 
 
 def _config_fixture():
     """test_moe_gemm_gluon_config.config (a pytest fixture)."""
-    cfg = host.get_gluon_config_uncached(128, 4096, 7168, DQ.MXFP4, DQ.MXFP4)
+    cfg = conf.get_gluon_config_uncached(128, 4096, 7168, DQ.MXFP4, DQ.MXFP4)
     cfg.update(
         SLOT_M=64,
         SLOT_N=128,
@@ -412,7 +412,7 @@ def _effective_cfg(cfg, dq_a, dq_b, N, K, swiglu):
         bool(c.get("A_SCALE_SORTED_SHUFFLED", False))
         and swiglu
         and dq_a in scaled
-        and host._scale_shuffle_supported(c, 0)
+        and conf._scale_shuffle_supported(c, 0)
         and int(c["BLOCK_M"]) % 32 == 0
         and int(c["SLOT_M"]) % 32 == 0
         and K % 256 == 0
@@ -420,7 +420,7 @@ def _effective_cfg(cfg, dq_a, dq_b, N, K, swiglu):
     b_sh = (
         bool(c.get("B_SCALE_SHUFFLED", False))
         and dq_b in scaled
-        and host._scale_shuffle_supported(c, 1)
+        and conf._scale_shuffle_supported(c, 1)
         and int(c["SLOT_N"]) % 32 == 0
         and N % 32 == 0
         and (K // 32) % 8 == 0
@@ -452,11 +452,11 @@ def production_cases():
                 M = T * TOPK
                 bm = _router_block_m(T)
                 small = _n_blocks(M, bm) * max(1, N // 128) < 512
-                stream = host._stream_mxfp8_gemm1_expert_payload(
+                stream = conf._stream_mxfp8_gemm1_expert_payload(
                     M, E_TOT, bm, dq_a, dq_b, swiglu
                 )
                 try:
-                    raw = host._default_launch_config(
+                    raw = conf._default_launch_config(
                         bm, N, K, dq_a, dq_b, small, swiglu, stream
                     )
                     eff = _effective_cfg(raw, dq_a, dq_b, N, K, swiglu)
@@ -487,7 +487,7 @@ def production_cases():
         ("mxfp8-noact", DQ.MXFP8, DQ.MXFP8, False),
         ("a8w4", DQ.MXFP8, DQ.MXFP4, True),
     ):
-        cfg = host._default_launch_config(
+        cfg = conf._default_launch_config(
             128, 512, 2560, dq_a, dq_b, False, swiglu, False
         )
         fs = func_spec(
@@ -504,7 +504,7 @@ def sched_cases():
         out.append(
             (
                 f"sched/{name}",
-                lambda c=cfg, a=dq_a, b=dq_b: host._probe_tuning_config(c, a, b),
+                lambda c=cfg, a=dq_a, b=dq_b: conf._probe_tuning_config(c, a, b),
             )
         )
     # Deltas on the same benchmarked base (SD._case), for branches the list misses.
@@ -587,7 +587,7 @@ def sched_cases():
         out.append(
             (
                 f"sched+/{name}",
-                lambda c=cfg, a=a, b=b: host._probe_tuning_config(c, a, b),
+                lambda c=cfg, a=a, b=b: conf._probe_tuning_config(c, a, b),
             )
         )
     return out
@@ -670,7 +670,7 @@ def config_test_cases():
             _config_func_spec()._replace(output_quant=oq),
         )
     # test_independent_buffer_waits_match_copy_history (geometry variants)
-    counts = dict(zip(host._COMPONENT_BUFFER_KEYS, (2, 4, 3, 2)))
+    counts = dict(zip(conf._COMPONENT_BUFFER_KEYS, (2, 4, 3, 2)))
     add(
         "middle_shared_a",
         dict(
@@ -686,7 +686,7 @@ def config_test_cases():
         add(
             f"no_scales_register_b{int(reg_b)}",
             dict(
-                zip(host._COMPONENT_BUFFER_KEYS, (3, 2, 1, 1)),
+                zip(conf._COMPONENT_BUFFER_KEYS, (3, 2, 1, 1)),
                 ALLOW_B_VIA_LDS=not reg_b,
                 B_PRESHUFFLED=reg_b,
             ),
@@ -805,7 +805,7 @@ def register_test_cases():
         def thunk():
             cfg = _register_config(dtype)
             cfg.update(updates)
-            return host._probe_tuning_config(cfg, dqs[dtype], dqs[dtype])
+            return conf._probe_tuning_config(cfg, dqs[dtype], dqs[dtype])
 
         out.append((f"test/registers/{name}", thunk))
 

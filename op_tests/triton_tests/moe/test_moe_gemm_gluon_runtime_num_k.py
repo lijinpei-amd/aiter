@@ -12,6 +12,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import KernelLayout
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import Schedule
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import DtypeQuant
 from aiter.ops.triton.moe import moe_op_gemm_gluon as host
+from aiter.ops.triton.moe import moe_op_gemm_gluon_config as conf
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import moe_gemm_torch
 from op_tests.triton_tests.utils.mxfp_ref import upcast_from_mxfp
 from aiter.ops.triton.utils._triton.arch_info import get_arch
@@ -52,12 +53,12 @@ def test_same_compiled_entry_honors_runtime_num_k(gated, depth, dtype, monkeypat
         B_SCALE_NUM_BUFFER=depth,
     )
     assert case.route.block_m == config["BLOCK_M"]
-    tc = host._probe_tuning_config(config, quant, quant)
+    tc = conf._probe_tuning_config(config, quant, quant)
     layout = KernelLayout(tc)
     schedule = Schedule(tc, layout, case.k)
     full_num_k = case.k // config["BLOCK_K"]
     minimum = sum(
-        host._cval(value)
+        conf._cval(value)
         for value in (schedule.depth, schedule.peeled, schedule.unroll)
     )
     # Depth three exercises every specialized drain phase in the same binary.
@@ -66,7 +67,7 @@ def test_same_compiled_entry_honors_runtime_num_k(gated, depth, dtype, monkeypat
     for short_num_k in short_counts:
         short_k = short_num_k * config["BLOCK_K"]
         assert short_num_k < full_num_k
-        assert host._validate_selected_pipeline(tc, layout, short_k)
+        assert conf._validate_selected_pipeline(tc, layout, short_k)
         prefix = moe_gemm_torch(
             x_ref[:, :short_k].float(),
             w_ref[:, :short_k, :].float(),
@@ -92,7 +93,7 @@ def test_same_compiled_entry_honors_runtime_num_k(gated, depth, dtype, monkeypat
     launch_args = list(captured["args"])
     num_k_arg = kernel.arg_names.index("NUM_K")
     cfg_k_arg = kernel.arg_names.index("CFG_K")
-    assert host._cval(launch_args[cfg_k_arg]) == case.k
+    assert conf._cval(launch_args[cfg_k_arg]) == case.k
     function = compiled.function
     run = compiled.run
     stream = torch.cuda.current_stream().cuda_stream
@@ -126,4 +127,4 @@ def test_same_compiled_entry_honors_runtime_num_k(gated, depth, dtype, monkeypat
             assert torch.equal(case.output.view(torch.int32), previous[num_k])
         previous[num_k] = case.output.view(torch.int32).clone()
         assert compiled.function == function
-        assert host._cval(launch_args[cfg_k_arg]) == case.k
+        assert conf._cval(launch_args[cfg_k_arg]) == case.k

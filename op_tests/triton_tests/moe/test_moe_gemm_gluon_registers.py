@@ -20,6 +20,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     EpilogueMode,
 )
 from aiter.ops.triton.moe import moe_op_gemm_gluon as host
+from aiter.ops.triton.moe import moe_op_gemm_gluon_config as conf
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import moe_gemm_torch
 from aiter.ops.triton.moe.moe_op_gemm_gluon import moe_gemm_gluon
 from aiter.ops.triton.moe.moe_routing.routing import routing
@@ -231,7 +232,7 @@ def test_register_buffers_with_compiler_pipeline(register_case, read_mask):
         A_SCALE_NUM_BUFFER=4,
         B_SCALE_NUM_BUFFER=2,
     )
-    config.update(host._ds_read_flags(read_mask))
+    config.update(conf._ds_read_flags(read_mask))
     _assert_register_case(register_case, config)
 
 
@@ -299,10 +300,10 @@ def test_small_a_payload_uses_register_ring(monkeypatch):
         K_UNROLL=3,
     )
     layout = KernelLayout(
-        host._probe_tuning_config(config, DtypeQuant.BF16, DtypeQuant.BF16)
+        conf._probe_tuning_config(config, DtypeQuant.BF16, DtypeQuant.BF16)
     )
-    assert host._cval(layout.component_in_reg(A_PAYLOAD))
-    assert host._cval(layout.component_via_lds(B_PAYLOAD))
+    assert conf._cval(layout.component_in_reg(A_PAYLOAD))
+    assert conf._cval(layout.component_via_lds(B_PAYLOAD))
 
     kernel = _launch_register_case(case, config)
     torch.testing.assert_close(case.output[0], case.expected, rtol=3e-4, atol=3e-5)
@@ -335,10 +336,10 @@ def test_small_b_payload_uses_register_ring_without_preshuffle(monkeypatch):
         B_PRESHUFFLED=False,
     )
     layout = KernelLayout(
-        host._probe_tuning_config(config, DtypeQuant.BF16, DtypeQuant.BF16)
+        conf._probe_tuning_config(config, DtypeQuant.BF16, DtypeQuant.BF16)
     )
-    assert host._cval(layout.component_via_lds(A_PAYLOAD))
-    assert host._cval(layout.component_in_reg(B_PAYLOAD))
+    assert conf._cval(layout.component_via_lds(A_PAYLOAD))
+    assert conf._cval(layout.component_in_reg(B_PAYLOAD))
 
     kernel = _launch_register_case(case, config)
     torch.testing.assert_close(case.output[0], case.expected, rtol=3e-4, atol=3e-5)
@@ -371,10 +372,10 @@ def test_small_a_and_b_payloads_share_register_pipeline(monkeypatch):
         B_PRESHUFFLED=False,
     )
     layout = KernelLayout(
-        host._probe_tuning_config(config, DtypeQuant.BF16, DtypeQuant.BF16)
+        conf._probe_tuning_config(config, DtypeQuant.BF16, DtypeQuant.BF16)
     )
-    assert host._cval(layout.component_in_reg(A_PAYLOAD))
-    assert host._cval(layout.component_in_reg(B_PAYLOAD))
+    assert conf._cval(layout.component_in_reg(A_PAYLOAD))
+    assert conf._cval(layout.component_in_reg(B_PAYLOAD))
 
     kernel = _launch_register_case(case, config)
     torch.testing.assert_close(case.output[0], case.expected, rtol=3e-4, atol=3e-5)
@@ -642,8 +643,8 @@ def test_minimum_k_and_every_reachable_unroll_remainder(dtype, schedule, monkeyp
     dtype_quant = getattr(
         DtypeQuant, {"mxfp4": "MXFP4", "mxfp8": "MXFP8", "bf16": "BF16"}[dtype]
     )
-    tc = host._probe_tuning_config(config, dtype_quant, dtype_quant)
-    sizing = Schedule(tc, KernelLayout(tc), host._cval(tc.BLOCK_K))
+    tc = conf._probe_tuning_config(config, dtype_quant, dtype_quant)
+    sizing = Schedule(tc, KernelLayout(tc), conf._cval(tc.BLOCK_K))
     minimum = (
         maybe_unwrap(sizing.depth)
         + maybe_unwrap(sizing.peeled)

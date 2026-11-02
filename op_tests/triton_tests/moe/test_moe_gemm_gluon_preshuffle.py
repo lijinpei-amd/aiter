@@ -11,6 +11,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import maybe_unwrap
 from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import KernelLayout
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import DtypeQuant
 from aiter.ops.triton.moe import moe_op_gemm_gluon as host
+from aiter.ops.triton.moe import moe_op_gemm_gluon_config as conf
 from op_tests.triton_tests.moe.test_moe_gemm_gluon_registers import _register_config
 
 # (storage dtype, quant, logical elements per stored element)
@@ -61,7 +62,7 @@ def test_preshuffled_b_lds_keeps_hbm_order(dtype, instr, block_k):
     config = dict(_register_config(dtype), B_PRESHUFFLED=True, mfma_instr_shape=instr)
     if block_k is not None:
         config["BLOCK_K"] = block_k
-    layout = KernelLayout(host._probe_tuning_config(config, quant, quant))
+    layout = KernelLayout(conf._probe_tuning_config(config, quant, quant))
     assert maybe_unwrap(layout.payload_byte_unit_lds_ok(1))
     shape = [int(x) for x in maybe_unwrap(layout.lds_shape_slot(1, False))]
     bases = maybe_unwrap(layout.lds_layout(1, False)).offset_bases

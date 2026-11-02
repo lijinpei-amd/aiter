@@ -155,6 +155,7 @@ def run_worker(args):
     sources = list((REPO / "aiter/ops/triton/_gluon_kernels/gfx950/moe").glob("*.py"))
     sources += [
         REPO / "aiter/ops/triton/moe/moe_op_gemm_gluon.py",
+        REPO / "aiter/ops/triton/moe/moe_op_gemm_gluon_config.py",
         Path(__file__),
         REPO / "op_tests/triton_tests/moe/test_moe_gemm_gluon_registers.py",
     ]

@@ -52,6 +52,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import validate
 from aiter.ops.triton.moe import moe_op_gemm_gluon as host
+from aiter.ops.triton.moe import moe_op_gemm_gluon_config as conf
 from op_tests.triton_tests.moe.test_moe_gemm_gluon_buffered_schedule import (
     _assert_minimal_peel,
 )
@@ -63,15 +64,15 @@ def _clean_tuning_environment(monkeypatch):
         if name.startswith("AITER_TRITON_MOE_GLUON_"):
             monkeypatch.delenv(name)
     host._launch_spec.cache_clear()
-    host._get_gluon_config_cached.cache_clear()
+    conf._get_gluon_config_cached.cache_clear()
     yield
     host._launch_spec.cache_clear()
-    host._get_gluon_config_cached.cache_clear()
+    conf._get_gluon_config_cached.cache_clear()
 
 
 @pytest.fixture
 def config():
-    cfg = host.get_gluon_config_uncached(
+    cfg = conf.get_gluon_config_uncached(
         128, 4096, 7168, DtypeQuant.MXFP4, DtypeQuant.MXFP4
     )
     cfg.update(
@@ -103,18 +104,18 @@ def _func_spec(epilogue=EpilogueMode.DEFAULT):
 
 
 def _tuning_spec(config):
-    return TuningSpec(*(host._hashable(v) for v in host._tuning_args(config)))
+    return TuningSpec(*(conf._hashable(v) for v in conf._tuning_args(config)))
 
 
 def _plain(value):
-    value = host._cval(value)
+    value = conf._cval(value)
     return tuple(value) if isinstance(value, list) else value
 
 
 def _validate(tc, N, K):
     layout = KernelLayout(tc)
     validate(tc, N, K, layout)
-    return host._validate_selected_pipeline(tc, layout, K)
+    return conf._validate_selected_pipeline(tc, layout, K)
 
 
 def _schedule(tc, layout, num_k=1, epilogue_groups=0):
@@ -275,7 +276,7 @@ def test_cache_modifier_environment_names(
 ):
     suffix = legacy_env if legacy else canonical_env
     monkeypatch.setenv("AITER_TRITON_MOE_GLUON_" + suffix, ".ca")
-    config = host.get_gluon_config_uncached(
+    config = conf.get_gluon_config_uncached(
         128, 4096, 7168, DtypeQuant.MXFP4, DtypeQuant.MXFP4
     )
     assert config[field] == ".ca"
@@ -298,9 +299,9 @@ def test_legacy_slot_config_names(config, legacy, renamed, field):
     config.pop(field, None)
     config[legacy] = 96
     # The legacy scale K counted payload K; its new name counts scale columns.
-    expected = 96 // host._LEGACY_SLOT_DIVISORS.get(field, 1)
+    expected = 96 // conf._LEGACY_SLOT_DIVISORS.get(field, 1)
     # A raw launch config is renamed before the host reads any slot key from it.
-    canonical = host._canonical_slot_keys(config)
+    canonical = conf._canonical_slot_keys(config)
     assert canonical[renamed] == expected and legacy not in canonical
     assert getattr(_tuning_spec(config), field) == expected
 
@@ -309,16 +310,16 @@ def test_legacy_slot_config_names(config, legacy, renamed, field):
         _tuning_spec(config)
 
 
-@pytest.mark.parametrize("canonical", list(host._LEGACY_SLOT_KEYS))
+@pytest.mark.parametrize("canonical", list(conf._LEGACY_SLOT_KEYS))
 def test_legacy_slot_environment_names(monkeypatch, canonical):
     prefix = "AITER_TRITON_MOE_GLUON_"
-    legacy = host._LEGACY_SLOT_KEYS[canonical]
+    legacy = conf._LEGACY_SLOT_KEYS[canonical]
     monkeypatch.delenv(prefix + canonical, raising=False)
     monkeypatch.setenv(prefix + legacy, "64")
-    expected = 64 // host._LEGACY_SLOT_DIVISORS.get(canonical, 1)
-    assert host._env_slot_int(canonical, 0) == expected
+    expected = 64 // conf._LEGACY_SLOT_DIVISORS.get(canonical, 1)
+    assert conf._env_slot_int(canonical, 0) == expected
     monkeypatch.setenv(prefix + canonical, "128")
-    assert host._env_slot_int(canonical, 0) == 128
+    assert conf._env_slot_int(canonical, 0) == 128
 
 
 def test_legacy_scale_slot_environment_reaches_the_config(monkeypatch):
@@ -326,7 +327,7 @@ def test_legacy_scale_slot_environment_reaches_the_config(monkeypatch):
         if name.startswith("AITER_TRITON_MOE_GLUON_"):
             monkeypatch.delenv(name)
     monkeypatch.setenv("AITER_TRITON_MOE_GLUON_SCALE_MINI_BLOCK_K", "512")
-    config = host.get_gluon_config_uncached(
+    config = conf.get_gluon_config_uncached(
         128, 4096, 7168, DtypeQuant.MXFP4, DtypeQuant.MXFP4
     )
     # The legacy name counted payload K; SCALE_SLOT_K counts scale columns.
@@ -344,7 +345,7 @@ def test_legacy_scale_slot_environment_reaches_the_config(monkeypatch):
     ],
 )
 def test_expected_m_tiles_per_expert(M, n_expts_tot, block_m, expected):
-    assert host._expected_m_tiles_per_expert(M, n_expts_tot, block_m) == expected
+    assert conf._expected_m_tiles_per_expert(M, n_expts_tot, block_m) == expected
 
 
 @pytest.mark.parametrize(
@@ -361,7 +362,7 @@ def test_streaming_expert_payload_is_scoped_to_one_tile_mxfp8_gemm1(
     dq_a, dq_b, apply_swiglu, M, expected
 ):
     assert (
-        host._stream_mxfp8_gemm1_expert_payload(
+        conf._stream_mxfp8_gemm1_expert_payload(
             M, 33, 64, dq_a, dq_b, apply_swiglu
         )
         is expected
@@ -408,17 +409,17 @@ def test_t256_mxfp8_gemm1_uses_validated_streaming_geometry():
         "expert_cache_modifier": ".cg",
     }
     assert {name: config[name] for name in expected} == expected
-    tuning = host._probe_tuning_config(
+    tuning = conf._probe_tuning_config(
         config, DtypeQuant.MXFP8, DtypeQuant.MXFP8
     )
-    assert host._cval(validate(tuning, 4096, 7168))
+    assert conf._cval(validate(tuning, 4096, 7168))
     layout = KernelLayout(tuning)
-    assert host._cval(host._validate_selected_pipeline(tuning, layout, 7168))
-    assert host._probe_lds_bytes(
+    assert conf._cval(conf._validate_selected_pipeline(tuning, layout, 7168))
+    assert conf._probe_lds_bytes(
         config, DtypeQuant.MXFP8, DtypeQuant.MXFP8
     ) <= host.LDS_USABLE_BYTES
 
-    reused = host._default_launch_config(
+    reused = conf._default_launch_config(
         64,
         4096,
         7168,
@@ -442,7 +443,7 @@ def test_t256_mxfp8_gemm1_uses_validated_streaming_geometry():
     "dq_b,ctas_per_cu", [(DtypeQuant.MXFP8, 2), (DtypeQuant.MXFP4, 3)]
 )
 def test_small_t_mxfp8_gemm1_fits_several_ctas_per_cu(dq_b, ctas_per_cu):
-    config = host._default_launch_config(
+    config = conf._default_launch_config(
         32, 4096, 7168, DtypeQuant.MXFP8, dq_b, False, True
     )
     expected = {
@@ -458,11 +459,11 @@ def test_small_t_mxfp8_gemm1_fits_several_ctas_per_cu(dq_b, ctas_per_cu):
         "expert_scale_cache_modifier": ".cg",
     }
     assert {name: config[name] for name in expected} == expected
-    tuning = host._probe_tuning_config(config, DtypeQuant.MXFP8, dq_b)
-    assert host._cval(validate(tuning, 4096, 7168))
+    tuning = conf._probe_tuning_config(config, DtypeQuant.MXFP8, dq_b)
+    assert conf._cval(validate(tuning, 4096, 7168))
     # The point of the tile: several CTAs share a CU's LDS.
     assert (
-        host._probe_lds_bytes(config, DtypeQuant.MXFP8, dq_b)
+        conf._probe_lds_bytes(config, DtypeQuant.MXFP8, dq_b)
         <= host.LDS_USABLE_BYTES // ctas_per_cu
     )
 
@@ -476,7 +477,7 @@ def test_large_t_mxfp8_mxfp4_gemm1_interleaves_mfma_with_memory(
     # The environment still wins over the measured default.
     if env is not None:
         monkeypatch.setenv("AITER_TRITON_MOE_GLUON_SCHED_MODE", env)
-    config = host._default_launch_config(
+    config = conf._default_launch_config(
         128, 4096, 7168, DtypeQuant.MXFP8, DtypeQuant.MXFP4, False, True
     )
     expected = {
@@ -488,10 +489,10 @@ def test_large_t_mxfp8_mxfp4_gemm1_interleaves_mfma_with_memory(
         "GROUP_M": 4,
     }
     assert {name: config[name] for name in expected} == expected
-    tuning = host._probe_tuning_config(config, DtypeQuant.MXFP8, DtypeQuant.MXFP4)
-    assert host._cval(validate(tuning, 4096, 7168))
+    tuning = conf._probe_tuning_config(config, DtypeQuant.MXFP8, DtypeQuant.MXFP4)
+    assert conf._cval(validate(tuning, 4096, 7168))
     layout = KernelLayout(tuning)
-    assert host._cval(host._validate_selected_pipeline(tuning, layout, 7168))
+    assert conf._cval(conf._validate_selected_pipeline(tuning, layout, 7168))
 
 
 @pytest.mark.parametrize(
@@ -519,8 +520,8 @@ def test_t256_mxfp8_gemm1_geometry_override_is_narrow(overrides):
         "stream_expert_payload": True,
     }
     args.update(overrides)
-    selected = host._default_launch_config(**args)
-    baseline = host.get_gluon_config(
+    selected = conf._default_launch_config(**args)
+    baseline = conf.get_gluon_config(
         args["block_m"],
         args["N"],
         args["K"],
@@ -576,7 +577,7 @@ _GEMM2_TILE = {
 )
 def test_gemm2_large_block_m_tile(dq_a, dq_b, block_m, block_k):
     N, K = 6144, 2048
-    config = host._default_launch_config(block_m, N, K, dq_a, dq_b, False, False)
+    config = conf._default_launch_config(block_m, N, K, dq_a, dq_b, False, False)
     expected = dict(
         _GEMM2_TILE,
         BLOCK_M=block_m,
@@ -585,7 +586,7 @@ def test_gemm2_large_block_m_tile(dq_a, dq_b, block_m, block_k):
         VGPR_PREFETCH_K=block_k,
     )
     assert {name: config[name] for name in expected} == expected
-    assert _plain(_validate(host._probe_tuning_config(config, dq_a, dq_b), N, K))
+    assert _plain(_validate(conf._probe_tuning_config(config, dq_a, dq_b), N, K))
 
 
 @pytest.mark.parametrize(
@@ -598,10 +599,10 @@ def test_gemm2_large_block_m_tile(dq_a, dq_b, block_m, block_k):
 )
 @pytest.mark.parametrize("block_m,small_grid", [(16, True), (16, False), (32, False)])
 def test_gemm2_small_block_m_shuffles_b_scales(dq_a, dq_b, block_m, small_grid):
-    config = host._default_launch_config(
+    config = conf._default_launch_config(
         block_m, 7168, 3072, dq_a, dq_b, small_grid, False
     )
-    ladder = host.get_gluon_config(block_m, 7168, 3072, dq_a, dq_b, small_grid)
+    ladder = conf.get_gluon_config(block_m, 7168, 3072, dq_a, dq_b, small_grid)
     changed = {name for name in config if config[name] != ladder[name]}
     # Only the shuffle changes: GEMM2 does not take GEMM1's `.cg` hint for shuffled
     # MXFP8 scales.
@@ -626,8 +627,8 @@ def test_gemm2_small_block_m_shuffles_b_scales(dq_a, dq_b, block_m, small_grid):
     ],
 )
 def test_gemm2_tile_keeps_the_ladder_elsewhere(dq_a, dq_b, block_m, N, K):
-    config = host._default_launch_config(block_m, N, K, dq_a, dq_b, False, False)
-    assert config == host.get_gluon_config(block_m, N, K, dq_a, dq_b)
+    config = conf._default_launch_config(block_m, N, K, dq_a, dq_b, False, False)
+    assert config == conf.get_gluon_config(block_m, N, K, dq_a, dq_b)
 
 
 def _launchable(config, dq_a, dq_b, N, K):
@@ -635,8 +636,8 @@ def _launchable(config, dq_a, dq_b, N, K):
     return (
         N % config["BLOCK_N"] == 0
         and K % config["BLOCK_K"] == 0
-        and host._pipeline_error(host._cfg_key(config), dq_a, dq_b, K) is None
-        and host._probe_lds_bytes(config, dq_a, dq_b) <= host.LDS_USABLE_BYTES
+        and conf._pipeline_error(conf._cfg_key(config), dq_a, dq_b, K) is None
+        and conf._probe_lds_bytes(config, dq_a, dq_b) <= host.LDS_USABLE_BYTES
     )
 
 
@@ -653,10 +654,10 @@ def test_gemm2_config_never_drops_a_launchable_ladder(dq_a, dq_b, block_m):
     for N in (512, 2880, 7168):
         for K in (512, 1024, 1280, 1536, 2048, 2816, 3072):
             for small_grid in (False, True):
-                ladder = host.get_gluon_config(block_m, N, K, dq_a, dq_b, small_grid)
+                ladder = conf.get_gluon_config(block_m, N, K, dq_a, dq_b, small_grid)
                 if not _launchable(ladder, dq_a, dq_b, N, K):
                     continue
-                config = host._default_launch_config(
+                config = conf._default_launch_config(
                     block_m, N, K, dq_a, dq_b, small_grid, False
                 )
                 assert _launchable(config, dq_a, dq_b, N, K), (N, K, small_grid)
@@ -668,7 +669,7 @@ def test_streaming_expert_payload_respects_environment_override(
     monkeypatch, suffix, override
 ):
     monkeypatch.setenv("AITER_TRITON_MOE_GLUON_" + suffix, override)
-    config = host.get_gluon_config_uncached(
+    config = conf.get_gluon_config_uncached(
         64,
         4096,
         7168,
@@ -682,7 +683,7 @@ def test_streaming_expert_payload_respects_environment_override(
 
 @pytest.mark.parametrize("explicit", ["", ".ca"])
 def test_streaming_expert_payload_respects_explicit_config(explicit):
-    config = host.get_gluon_config_uncached(
+    config = conf.get_gluon_config_uncached(
         64, 4096, 7168, DtypeQuant.MXFP8, DtypeQuant.MXFP8
     )
     config["expert_cache_modifier"] = explicit
@@ -700,7 +701,7 @@ def test_streaming_expert_payload_respects_explicit_config(explicit):
         act=ActivationSpec(int(ActKind.SILU), 1.0, None, False),
         out_quant=None,
         config_items=tuple(
-            sorted((key, host._hashable(value)) for key, value in config.items())
+            sorted((key, conf._hashable(value)) for key, value in config.items())
         ),
         stream_expert_payload=True,
     )[4]
@@ -728,7 +729,7 @@ def test_streaming_expert_payload_respects_explicit_config(explicit):
 def test_mxfp8_weight_scale_hint_cases(
     dq_b, block_m, K, stream, block_k, shuffled, expected
 ):
-    config = host._default_launch_config(
+    config = conf._default_launch_config(
         block_m, 4096, K, DtypeQuant.MXFP8, dq_b, False, True, stream
     )
     assert (config["BLOCK_K"], config["B_SCALE_SHUFFLED"]) == (block_k, shuffled)
@@ -747,7 +748,7 @@ def test_mxfp8_weight_scale_hint_cases(
 def test_mxfp8_weight_scale_hint_respects_environment(monkeypatch, env, expected):
     for name, value in env.items():
         monkeypatch.setenv("AITER_TRITON_MOE_GLUON_" + name, value)
-    config = host._default_launch_config(
+    config = conf._default_launch_config(
         16, 4096, 1024, DtypeQuant.MXFP8, DtypeQuant.MXFP8, False, True
     )
     assert config["BLOCK_K"] == 128
@@ -828,7 +829,7 @@ def test_pipeline_state_aggregates_round_trip_separately(has_scales):
 
 @pytest.mark.parametrize("mask", range(16))
 def test_payload_and_scale_read_placement_are_independent(config, mask):
-    config.update(host._ds_read_flags(mask))
+    config.update(conf._ds_read_flags(mask))
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     actual = {
         component
@@ -846,12 +847,12 @@ def test_payload_and_scale_read_placement_are_independent(config, mask):
 
 @pytest.mark.parametrize("mask", [0, 5, 15])
 def test_legacy_read_placement_config_key(config, mask):
-    for name, _ in host._DS_READ_FIELDS:
+    for name, _ in conf._DS_READ_FIELDS:
         config.pop(name)
     config["DS_READ_IN_MFMA"] = mask
     tuning = _tuning_spec(config)
     actual = sum(
-        int(bit) for name, bit in host._DS_READ_FIELDS if getattr(tuning, name)
+        int(bit) for name, bit in conf._DS_READ_FIELDS if getattr(tuning, name)
     )
     assert actual == mask
 
@@ -862,7 +863,7 @@ def test_legacy_read_placement_config_key(config, mask):
 
 @pytest.mark.parametrize("mask", [-1, 16])
 def test_legacy_read_placement_config_key_rejects_unknown_bits(config, mask):
-    for name, _ in host._DS_READ_FIELDS:
+    for name, _ in conf._DS_READ_FIELDS:
         config.pop(name)
     config["DS_READ_IN_MFMA"] = mask
     with pytest.raises(AssertionError, match="unknown operand bits"):
@@ -883,26 +884,26 @@ def test_legacy_read_placement_config_key_rejects_unknown_bits(config, mask):
 def test_legacy_read_placement_translation(monkeypatch, settings, expected):
     for name, value in settings.items():
         monkeypatch.setenv("AITER_TRITON_MOE_GLUON_" + name, value)
-    config = host.get_gluon_config_uncached(
+    config = conf.get_gluon_config_uncached(
         128, 4096, 7168, DtypeQuant.MXFP4, DtypeQuant.MXFP4
     )
     tuning = _tuning_spec(config)
     actual = sum(
-        int(bit) for name, bit in host._DS_READ_FIELDS if getattr(tuning, name)
+        int(bit) for name, bit in conf._DS_READ_FIELDS if getattr(tuning, name)
     )
     assert actual == expected
 
 
-@pytest.mark.parametrize("field,bit", host._DS_READ_FIELDS)
+@pytest.mark.parametrize("field,bit", conf._DS_READ_FIELDS)
 def test_individual_read_placement_environment(monkeypatch, field, bit):
     monkeypatch.setenv("AITER_TRITON_MOE_GLUON_" + field, "1")
-    config = host.get_gluon_config_uncached(
+    config = conf.get_gluon_config_uncached(
         128, 4096, 7168, DtypeQuant.MXFP4, DtypeQuant.MXFP4
     )
     tuning = _tuning_spec(config)
     actual = sum(
         int(component)
-        for name, component in host._DS_READ_FIELDS
+        for name, component in conf._DS_READ_FIELDS
         if getattr(tuning, name)
     )
     assert actual == int(bit)
@@ -915,7 +916,7 @@ def test_legacy_schedule_settings_reach_the_tuning_spec(monkeypatch):
         "SCALE_FILL_MID": "1",
     }.items():
         monkeypatch.setenv("AITER_TRITON_MOE_GLUON_" + name, value)
-    config = host.get_gluon_config_uncached(
+    config = conf.get_gluon_config_uncached(
         128, 4096, 7168, DtypeQuant.MXFP4, DtypeQuant.MXFP4
     )
     tuning = _tuning_spec(config)
@@ -927,11 +928,11 @@ def test_legacy_schedule_settings_reach_the_tuning_spec(monkeypatch):
 
 
 def test_unroll_epilogue_environment_control_is_removed(monkeypatch):
-    baseline = host.get_gluon_config_uncached(
+    baseline = conf.get_gluon_config_uncached(
         128, 4096, 7168, DtypeQuant.MXFP4, DtypeQuant.MXFP4
     )
     monkeypatch.setenv("AITER_TRITON_MOE_GLUON_UNROLL_EPILOGUE", "0")
-    actual = host.get_gluon_config_uncached(
+    actual = conf.get_gluon_config_uncached(
         128, 4096, 7168, DtypeQuant.MXFP4, DtypeQuant.MXFP4
     )
     assert actual == baseline
@@ -940,11 +941,11 @@ def test_unroll_epilogue_environment_control_is_removed(monkeypatch):
 
 @pytest.mark.parametrize("field", ["MANUAL_PP", "MINI_BLOCK_K", "FROZEN_STEP"])
 def test_removed_controls_do_not_change_tuning(config, monkeypatch, field):
-    baseline = host.get_gluon_config_uncached(
+    baseline = conf.get_gluon_config_uncached(
         128, 4096, 7168, DtypeQuant.MXFP4, DtypeQuant.MXFP4
     )
     monkeypatch.setenv("AITER_TRITON_MOE_GLUON_" + field, "1")
-    actual = host.get_gluon_config_uncached(
+    actual = conf.get_gluon_config_uncached(
         128, 4096, 7168, DtypeQuant.MXFP4, DtypeQuant.MXFP4
     )
     assert actual == baseline
@@ -1000,7 +1001,7 @@ def test_register_storage_options_are_independent(config, storage_mask):
     assert _plain(_validate(tc, 4096, 7168))
     assert _plain(_validate(tc, 4096, bk * _minimum(tc, layout)))
     with pytest.raises(AssertionError, match="NUM_K"):
-        host._validate_selected_pipeline(tc, layout, bk)
+        conf._validate_selected_pipeline(tc, layout, bk)
 
 
 @pytest.mark.parametrize(
@@ -1014,7 +1015,7 @@ def test_register_storage_options_are_independent(config, storage_mask):
 def test_all_component_buffer_counts_determine_lcm_unroll(
     config, counts, period, expected
 ):
-    config.update(zip(host._COMPONENT_BUFFER_KEYS, counts, strict=True))
+    config.update(zip(conf._COMPONENT_BUFFER_KEYS, counts, strict=True))
     config.update(
         K_UNROLL=7,
         ALLOW_B_VIA_LDS=False,
@@ -1128,10 +1129,10 @@ def test_absent_scales_do_not_participate_in_depth_unroll_or_validation(
         assert slots[B_SCALE.index()] is None
     assert maybe_unwrap(schedule.depth) == 4
     assert maybe_unwrap(schedule.unroll) == 12
-    assert _plain(host._validate_selected_pipeline(tc, layout, 7168))
+    assert _plain(conf._validate_selected_pipeline(tc, layout, 7168))
 
 
-@pytest.mark.parametrize("field", host._COMPONENT_BUFFER_KEYS)
+@pytest.mark.parametrize("field", conf._COMPONENT_BUFFER_KEYS)
 @pytest.mark.parametrize("depth", [-1, 1])
 def test_active_component_buffer_counts_below_two_are_rejected(config, field, depth):
     config[field] = depth
@@ -1146,8 +1147,8 @@ def test_inherited_buffer_counts_are_validated_after_resolution(config, depth):
     fc = KernelFuncConfig(*_func_spec())
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
     with pytest.raises(AssertionError, match="A_NUM_BUFFER.*must be at least 2"):
-        host._validate_selected_pipeline(tc, KernelLayout(tc), 7168)
-    config.update(dict.fromkeys(host._COMPONENT_BUFFER_KEYS, 2))
+        conf._validate_selected_pipeline(tc, KernelLayout(tc), 7168)
+    config.update(dict.fromkeys(conf._COMPONENT_BUFFER_KEYS, 2))
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
     assert _plain(_validate(tc, 4096, 7168))
 
@@ -1158,7 +1159,7 @@ def test_unroll_must_be_positive_even_with_register_rings(config, unroll, regist
     config.update(K_UNROLL=unroll, ALLOW_A_SCALE_VIA_LDS=not registers)
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     with pytest.raises(AssertionError, match="K_UNROLL must be at least 1"):
-        host._validate_selected_pipeline(tc, KernelLayout(tc), 7168)
+        conf._validate_selected_pipeline(tc, KernelLayout(tc), 7168)
 
 
 @pytest.mark.parametrize("depth", [2, 3])
@@ -1177,7 +1178,7 @@ def test_shared_depth_exact_minimum_and_all_unroll_remainders(config, depth, unr
     with pytest.raises(
         AssertionError, match="NUM_K.*PIPELINE_DEPTH.*PEELED.*UNROLL"
     ):
-        host._validate_selected_pipeline(tc, layout, (minimum - 1) * config["BLOCK_K"])
+        conf._validate_selected_pipeline(tc, layout, (minimum - 1) * config["BLOCK_K"])
 
 
 def test_register_weights_require_preshuffle(config):
@@ -1212,16 +1213,16 @@ def test_component_buffers_still_require_nonempty_k(config):
     config["A_NUM_BUFFER"] = 2
     tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
     with pytest.raises(AssertionError, match="NUM_K.*must be at least"):
-        host._validate_selected_pipeline(tc, KernelLayout(tc), 0)
+        conf._validate_selected_pipeline(tc, KernelLayout(tc), 0)
 
 
 @pytest.mark.parametrize(
-    "field", host._COMPONENT_BUFFER_KEYS + host._ALLOW_VIA_LDS_KEYS
+    "field", conf._COMPONENT_BUFFER_KEYS + conf._ALLOW_VIA_LDS_KEYS
 )
 def test_storage_environment_settings_reach_tuning_spec(monkeypatch, field):
-    value = 0 if field in host._ALLOW_VIA_LDS_KEYS else 2
+    value = 0 if field in conf._ALLOW_VIA_LDS_KEYS else 2
     monkeypatch.setenv("AITER_TRITON_MOE_GLUON_" + field, str(value))
-    config = host.get_gluon_config_uncached(
+    config = conf.get_gluon_config_uncached(
         128, 4096, 7168, DtypeQuant.MXFP4, DtypeQuant.MXFP4
     )
     assert getattr(_tuning_spec(config), field) == value
@@ -1236,7 +1237,7 @@ def test_a_scale_buffer_alias_is_accepted(config, monkeypatch):
     ):
         _tuning_spec(config)
     monkeypatch.setenv("AITER_TRITON_MOE_GLUON_A_SCALE_NUMB_BUFFER", "2")
-    env_config = host.get_gluon_config_uncached(
+    env_config = conf.get_gluon_config_uncached(
         128, 4096, 7168, DtypeQuant.MXFP4, DtypeQuant.MXFP4
     )
     assert _tuning_spec(env_config).A_SCALE_NUM_BUFFER == 2
@@ -1263,8 +1264,8 @@ def test_shuffled_k128_scales_constrain_lcm_unroll(config, independent):
     tc = KernelTuningConfig(fc, *_tuning_spec(config))
     assert maybe_unwrap(_schedule(tc, KernelLayout(tc)).unroll) == 6
     assert _plain(_validate(tc, 4096, 7168))
-    assert host._scale_shuffle_supported(config, 0)
-    assert host._scale_shuffle_supported(config, 1)
+    assert conf._scale_shuffle_supported(config, 0)
+    assert conf._scale_shuffle_supported(config, 1)
 
 
 def test_runtime_epilogue_rejects_multistep_scale_cadence(config):
@@ -1343,7 +1344,7 @@ def test_epilogue_launch_specs_are_cached_separately(config, monkeypatch):
         "act": _func_spec().activation,
         "out_quant": int(DtypeQuant.MXFP4),
         "config_items": tuple(
-            sorted((k, host._hashable(v)) for k, v in config.items())
+            sorted((k, conf._hashable(v)) for k, v in config.items())
         ),
         "gate_up_split": True,
     }
@@ -1649,7 +1650,7 @@ def _audit_buffer_schedule(tc, layout, num_k, epilogue_groups=0):
 def test_independent_buffer_waits_match_copy_history(
     config, monkeypatch, scheme, storage_mask, counts, geometry
 ):
-    config.update(zip(host._COMPONENT_BUFFER_KEYS, counts, strict=True))
+    config.update(zip(conf._COMPONENT_BUFFER_KEYS, counts, strict=True))
     config.update(
         WAIT_COMMIT_SCHEME=int(scheme),
         ALLOW_B_VIA_LDS=not (storage_mask & 1),
@@ -1677,7 +1678,7 @@ def test_independent_buffer_waits_match_copy_history(
 @pytest.mark.parametrize("register_b", [False, True])
 @pytest.mark.parametrize("counts", [(3, 2, 1, 1), (2, 2, 1, 1)])
 def test_independent_buffer_schedule_without_scales(config, scheme, register_b, counts):
-    config.update(zip(host._COMPONENT_BUFFER_KEYS, counts, strict=True))
+    config.update(zip(conf._COMPONENT_BUFFER_KEYS, counts, strict=True))
     config.update(
         WAIT_COMMIT_SCHEME=int(scheme),
         ALLOW_B_VIA_LDS=not register_b,

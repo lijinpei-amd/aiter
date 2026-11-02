@@ -11,7 +11,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import (
     byte_unit_lds_layout,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import DtypeQuant
-from aiter.ops.triton.moe import moe_op_gemm_gluon as host
+from aiter.ops.triton.moe import moe_op_gemm_gluon_config as conf
 
 # Triton's ds_read_b128 model: each group of 16 lanes reads 16 x 16 B across the 64
 # four-byte banks in one cycle.
@@ -73,10 +73,10 @@ def _worst_read(addresses, rows, k_bytes, width):
 )
 def test_production_payloads_read_conflict_free(dtype, block_m, expected):
     quant, itemsize = _QUANT[dtype]
-    config = host._default_launch_config(
+    config = conf._default_launch_config(
         block_m, 4096, 7168, quant, quant, False, True, True
     )
-    layout = KernelLayout(host._probe_tuning_config(config, quant, quant))
+    layout = KernelLayout(conf._probe_tuning_config(config, quant, quant))
     ok = tuple(bool(maybe_unwrap(layout.payload_byte_unit_lds_ok(i))) for i in (0, 1))
     assert ok == expected
     for idx in (0, 1):
@@ -111,10 +111,10 @@ def test_32_wide_reads_are_excluded():
     assert _worst_read(addresses, 64, 256, 16) == 1
     assert _worst_read(addresses, 64, 256, 32) == 2
     config = dict(
-        host._default_launch_config(64, 4096, 7168, *[DtypeQuant.BF16] * 2, False, True),
+        conf._default_launch_config(64, 4096, 7168, *[DtypeQuant.BF16] * 2, False, True),
         mfma_instr_shape=(32, 32, 16),
         SLOT_N=128,
     )
-    tc = host._probe_tuning_config(config, DtypeQuant.BF16, DtypeQuant.BF16)
+    tc = conf._probe_tuning_config(config, DtypeQuant.BF16, DtypeQuant.BF16)
     layout = KernelLayout(tc)
     assert not any(maybe_unwrap(layout.payload_byte_unit_lds_ok(i)) for i in (0, 1))

@@ -15,6 +15,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     WarpPipeline,
 )
 from aiter.ops.triton.moe import moe_op_gemm_gluon as host
+from aiter.ops.triton.moe import moe_op_gemm_gluon_config as conf
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import moe_gemm_torch
 from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
@@ -33,7 +34,7 @@ def case():
                 patch.delenv(name)
         patch.delenv("AITER_TRITON_MOE_DISABLE_GLUON", raising=False)
         host._launch_spec.cache_clear()
-        host._get_gluon_config_cached.cache_clear()
+        conf._get_gluon_config_cached.cache_clear()
         torch.manual_seed(73)
         # NE33/K7168 has a generated C++ scale-sort instance. The routed row count
         # chooses BM128 and includes partial expert tiles. 56 K128 stages exercise
@@ -70,7 +71,7 @@ def case():
             True: torch.nn.functional.silu(gate) * linear,
             False: torch.nn.functional.silu(raw[:, ::2]) * raw[:, 1::2],
         }
-        cfg = host.get_gluon_config_uncached(
+        cfg = conf.get_gluon_config_uncached(
             128, n, k, DtypeQuant.MXFP8, DtypeQuant.MXFP8
         )
         cfg.update(
@@ -100,7 +101,7 @@ def case():
             config=cfg,
         )
         host._launch_spec.cache_clear()
-        host._get_gluon_config_cached.cache_clear()
+        conf._get_gluon_config_cached.cache_clear()
 
 
 def _check(case, monkeypatch, *, config=None, split=True, packed=True, public=False):
@@ -110,7 +111,7 @@ def _check(case, monkeypatch, *, config=None, split=True, packed=True, public=Fa
 
     def capture(kernel, grid, args, *metadata):
         named = dict(zip(kernel.arg_names, args))
-        tuning = host._cval(named["CFG_TUNING"])
+        tuning = conf._cval(named["CFG_TUNING"])
         shuffled = packed if isinstance(packed, tuple) else (packed, packed)
         assert (tuning.A_SCALE_SORTED_SHUFFLED, tuning.B_SCALE_SHUFFLED) == shuffled
         assert tuning.BLOCK_K == (config or case.config)["BLOCK_K"]

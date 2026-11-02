@@ -21,6 +21,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import validate
 from aiter.ops.triton.moe import moe_op_gemm_gluon as host
+from aiter.ops.triton.moe import moe_op_gemm_gluon_config as conf
 
 
 @pytest.fixture(autouse=True)
@@ -30,11 +31,11 @@ def _clean_tuning_environment(monkeypatch):
             monkeypatch.delenv(name)
     host._launch_spec.cache_clear()
     host._validate_launch_config.cache_clear()
-    host._get_gluon_config_cached.cache_clear()
+    conf._get_gluon_config_cached.cache_clear()
     yield
     host._launch_spec.cache_clear()
     host._validate_launch_config.cache_clear()
-    host._get_gluon_config_cached.cache_clear()
+    conf._get_gluon_config_cached.cache_clear()
 
 
 def _spec(**overrides):
@@ -71,7 +72,7 @@ def test_mxfp8_gemm1_default_uses_paired_k128_scales(split):
     assert cfg["tiles_per_warp"] == (2, 2)
     assert cfg["A_SCALE_SORTED_SHUFFLED"] and cfg["B_SCALE_SHUFFLED"]
     assert not cfg["B_PRESHUFFLED"]
-    assert host._cval(spec[1][0]).weight_gu_hbm_layout == (
+    assert conf._cval(spec[1][0]).weight_gu_hbm_layout == (
         WeightGuHbmLayout.SPLIT if split else WeightGuHbmLayout.INTERLEAVED
     )
 
@@ -90,7 +91,7 @@ def test_other_launches_keep_the_existing_tuning_ladder(overrides):
         # test_gemm2_large_block_m_tile), not the ladder and not GEMM1's tile.
         assert (cfg["GROUP_M"], cfg["A_SCALE_SORTED_SHUFFLED"]) == (8, False)
         return
-    expected = dict(host.get_gluon_config(
+    expected = dict(conf.get_gluon_config(
         overrides.get("block_m", 128), overrides.get("N", 512),
         overrides.get("K", 2560), overrides.get("dq_a", DtypeQuant.MXFP8),
         overrides.get("dq_b", DtypeQuant.MXFP8), False,
@@ -107,7 +108,7 @@ def test_other_launches_keep_the_existing_tuning_ladder(overrides):
 @pytest.mark.parametrize("block_m", [16, 32, 64, 128])
 @pytest.mark.parametrize("small_grid", [False, True])
 def test_a4_defaults_are_unchanged(block_m, small_grid):
-    expected = host.get_gluon_config(
+    expected = conf.get_gluon_config(
         block_m, 4096, 7168, DtypeQuant.MXFP4, DtypeQuant.MXFP4, small_grid
     )
     cfg = _spec(block_m=block_m, N=4096, K=7168, small_grid=small_grid,
@@ -120,8 +121,8 @@ def test_a4_defaults_are_unchanged(block_m, small_grid):
 def test_stage1_capability_uses_the_selected_default_geometry(k):
     cfg = _spec(K=k)[4]
     tc = _spec(K=k)[5]
-    assert host._cval(validate(tc, 512, k))
-    assert host._probe_lds_bytes(cfg, DtypeQuant.MXFP8, DtypeQuant.MXFP8) <= host.LDS_USABLE_BYTES
+    assert conf._cval(validate(tc, 512, k))
+    assert conf._probe_lds_bytes(cfg, DtypeQuant.MXFP8, DtypeQuant.MXFP8) <= host.LDS_USABLE_BYTES
     case = _inputs(k=k)
     ok, why = host.gluon_supported(
         x=case.x, w=case.w, x_scales=case.xs, w_scales=case.ws,
@@ -134,7 +135,7 @@ def test_stage1_capability_uses_the_selected_default_geometry(k):
 
 
 def test_explicit_configs_keep_their_geometry():
-    cfg = host.get_gluon_config(128, 512, 2560, DtypeQuant.MXFP8, DtypeQuant.MXFP8)
+    cfg = conf.get_gluon_config(128, 512, 2560, DtypeQuant.MXFP8, DtypeQuant.MXFP8)
     explicit = _spec(config_items=tuple(sorted(cfg.items())))[4]
     assert explicit == cfg
 
@@ -145,8 +146,8 @@ def test_explicit_configs_keep_their_geometry():
 ])
 def test_incompatible_k128_geometry_refuses_scale_preparation(field, value):
     cfg = dict(_config(), **{field: value})
-    assert not host._scale_shuffle_supported(cfg, 0)
-    assert not host._scale_shuffle_supported(cfg, 1)
+    assert not conf._scale_shuffle_supported(cfg, 0)
+    assert not conf._scale_shuffle_supported(cfg, 1)
 
 
 @pytest.mark.parametrize(
@@ -161,8 +162,8 @@ def test_incompatible_k128_geometry_refuses_scale_preparation(field, value):
 def test_scale_shuffle_requires_valid_scale_k(block_k, scale_k, expected):
     cfg = _config(block_k)
     cfg["SCALE_SLOT_K"] = scale_k
-    assert host._scale_shuffle_supported(cfg, 0) is expected
-    assert host._scale_shuffle_supported(cfg, 1) is expected
+    assert conf._scale_shuffle_supported(cfg, 0) is expected
+    assert conf._scale_shuffle_supported(cfg, 1) is expected
 
 
 @pytest.mark.parametrize("operand", [0, 1])
@@ -170,8 +171,8 @@ def test_k128_packing_requires_both_non_k_tiles_in_the_wave(operand):
     tiles = [2, 2]
     tiles[operand] = 1
     cfg = dict(_config(), tiles_per_warp=tuple(tiles))
-    assert not host._scale_shuffle_supported(cfg, operand)
-    assert host._scale_shuffle_supported(cfg, 1 - operand)
+    assert not conf._scale_shuffle_supported(cfg, operand)
+    assert conf._scale_shuffle_supported(cfg, 1 - operand)
 
 
 def test_b_preshuffle_preserves_n_order_and_reuses_the_k256_format():
@@ -235,8 +236,8 @@ def _capture_launch(case, config, split, monkeypatch):
     )
     assert result is sentinel
     assert captured["a_ptr"] is case.x and captured["b_ptr"] is case.w
-    assert captured["NUM_K"] == case.k // host._cval(captured["CFG_TUNING"]).BLOCK_K
-    assert host._cval(captured["CFG_FUNC"]).weight_gu_hbm_layout == (
+    assert captured["NUM_K"] == case.k // conf._cval(captured["CFG_TUNING"]).BLOCK_K
+    assert conf._cval(captured["CFG_FUNC"]).weight_gu_hbm_layout == (
         WeightGuHbmLayout.SPLIT if split else WeightGuHbmLayout.INTERLEAVED
     )
     return captured
@@ -292,7 +293,7 @@ def test_minimum_uses_resolved_scale_storage_after_preparation(
     case = _inputs(k=768)
     cfg = dict(_config(), K_UNROLL=1, A_SCALE_NUM_BUFFER=4, B_SCALE_NUM_BUFFER=4,
                A_SCALE_SORTED_SHUFFLED=requested, B_SCALE_SHUFFLED=requested)
-    raw_tc = host._probe_tuning_config(
+    raw_tc = conf._probe_tuning_config(
         dict(cfg, A_SCALE_SORTED_SHUFFLED=False, B_SCALE_SHUFFLED=False),
         DtypeQuant.MXFP8, DtypeQuant.MXFP8,
     )
@@ -301,7 +302,7 @@ def test_minimum_uses_resolved_scale_storage_after_preparation(
         maybe_unwrap(raw.depth) + maybe_unwrap(raw.peeled) + maybe_unwrap(raw.unroll)
         == 9
     )
-    packed_tc = host._probe_tuning_config(
+    packed_tc = conf._probe_tuning_config(
         dict(cfg, A_SCALE_SORTED_SHUFFLED=True, B_SCALE_SHUFFLED=True),
         DtypeQuant.MXFP8, DtypeQuant.MXFP8,
     )
@@ -322,7 +323,7 @@ def test_minimum_uses_resolved_scale_storage_after_preparation(
     if available:
         args = _capture_launch(case, cfg, True, monkeypatch)
         assert args["NUM_K"] == 6
-        assert host._cval(args["CFG_TUNING"]).A_SCALE_SORTED_SHUFFLED
+        assert conf._cval(args["CFG_TUNING"]).A_SCALE_SORTED_SHUFFLED
     else:
         with pytest.raises(AssertionError, match="NUM_K.*UNROLL \\(4\\)"):
             _capture_launch(case, cfg, True, monkeypatch)
@@ -378,17 +379,17 @@ def test_raw_scale_inputs_are_prepared_or_restored_atomically(
     effective = tuple(want and have for want, have in zip(requested, available))
     if block_k == 128 and not all(effective):
         effective = (False, False)
-    tuning = host._cval(args["CFG_TUNING"])
+    tuning = conf._cval(args["CFG_TUNING"])
     assert (tuning.A_SCALE_SORTED_SHUFFLED, tuning.B_SCALE_SHUFFLED) == effective
     assert args["a_scale_ptr"] is (prepared_a if effective[0] else case.xs)
     assert args["b_scale_ptr"] is (prepared_b if effective[1] else case.ws)
     assert args["a_scale_stride_m"] == (0 if effective[0] else case.xs.stride(0))
     assert args["A_SCALE_STRIDE_K"] == (32 if effective[0] else case.xs.stride(1))
     assert args["B_SCALE_STRIDE_K"] == (32 if effective[1] else case.ws.stride(1))
-    assert host._cval(args["A_SCALE_SWIZZLE"]) == (
+    assert conf._cval(args["A_SCALE_SWIZZLE"]) == (
         ScaleSwizzle.SORTED_SHUFFLED if effective[0] else ScaleSwizzle.NONE
     )
-    assert host._cval(args["B_SCALE_SWIZZLE"]) == (
+    assert conf._cval(args["B_SCALE_SWIZZLE"]) == (
         ScaleSwizzle.CDNA4_SCALE if effective[1] else ScaleSwizzle.NONE
     )
 

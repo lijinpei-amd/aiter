@@ -13,6 +13,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import Schedule
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import Component, DtypeQuant
 from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import validate
 from aiter.ops.triton.moe import moe_op_gemm_gluon as host
+from aiter.ops.triton.moe import moe_op_gemm_gluon_config as conf
 from op_tests.triton_tests.moe.test_moe_gemm_gluon_scale_layout import _config
 
 
@@ -22,22 +23,22 @@ def test_scale_slot_config_and_environment_aliases(monkeypatch, axis, value):
     for name in tuple(host.os.environ):
         if name.startswith("AITER_TRITON_MOE_GLUON_"):
             monkeypatch.delenv(name)
-    config = host.get_gluon_config_uncached(
+    config = conf.get_gluon_config_uncached(
         128, 4096, 7168, DtypeQuant.MXFP4, DtypeQuant.MXFP4
     )
     config[field.lower()] = value
-    assert dict(zip(host.TuningSpec._fields, host._tuning_args(config)))[field] == value
+    assert dict(zip(host.TuningSpec._fields, conf._tuning_args(config)))[field] == value
     config[field] = value
-    assert dict(zip(host.TuningSpec._fields, host._tuning_args(config)))[field] == value
+    assert dict(zip(host.TuningSpec._fields, conf._tuning_args(config)))[field] == value
     config[field] = value * 2
     with pytest.raises(ValueError, match="disagree"):
-        host._tuning_args(config)
+        conf._tuning_args(config)
     monkeypatch.setenv("AITER_TRITON_MOE_GLUON_" + field, str(value))
-    from_environment = host.get_gluon_config_uncached(
+    from_environment = conf.get_gluon_config_uncached(
         128, 4096, 7168, DtypeQuant.MXFP4, DtypeQuant.MXFP4
     )
     assert (
-        dict(zip(host.TuningSpec._fields, host._tuning_args(from_environment)))[field]
+        dict(zip(host.TuningSpec._fields, conf._tuning_args(from_environment)))[field]
         == value
     )
 
