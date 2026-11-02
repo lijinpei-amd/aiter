@@ -4,6 +4,12 @@
         "B_PRESHUFFLED": true,
         "ALLOW_B_VIA_LDS": false
     },
+    "bm16_small": {
+        "B_SCALE_SHUFFLED": true,
+        "B_PRESHUFFLED": true,
+        "ALLOW_B_VIA_LDS": false,
+        "BLOCK_N": 128
+    },
     "bm32_any": {
         "B_SCALE_SHUFFLED": true,
         "B_PRESHUFFLED": true,

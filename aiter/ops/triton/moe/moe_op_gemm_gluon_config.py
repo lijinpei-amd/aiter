@@ -778,13 +778,17 @@ _GEMM2_FAMILIES = {
 }
 
 
-def _gemm2_tuned(block_m, dq_a, dq_b) -> dict:
-    """The ``bm<block_m>_any`` entry of the operands' GEMM2 family, or {}; a copy,
-    with JSON lists as the tuples the config uses."""
+def _gemm2_tuned(block_m, dq_a, dq_b, small_grid=False) -> dict:
+    """The operands' GEMM2 family entry, or {}: ``bm<block_m>_small`` on a small grid
+    when the family has one, else ``bm<block_m>_any``. A copy, with JSON lists as the
+    tuples the config uses."""
     family = _GEMM2_FAMILIES.get((dq_a, dq_b))
     if family is None:
         return {}
-    entry = get_moe_dispatch(family, get_arch(), "gluon").get(f"bm{block_m}_any", {})
+    table = get_moe_dispatch(family, get_arch(), "gluon")
+    entry = (table.get(f"bm{block_m}_small") if small_grid else None) or table.get(
+        f"bm{block_m}_any", {}
+    )
     return {k: _hashable(v) for k, v in entry.items()}
 
 
@@ -803,7 +807,7 @@ def _launch_error(cfg_items: tuple, dq_a, dq_b, N, K):
 
 @cache
 def _gemm2_launch_config(
-    ladder_items: tuple, block_m, N, K, dq_a, dq_b, group_m: int | None
+    ladder_items: tuple, block_m, N, K, dq_a, dq_b, group_m: int | None, small_grid
 ) -> tuple:
     """GEMM2 (no activation) config: the ladder with its family's tuned entry on top,
     as sorted config items. ``group_m`` is the GROUP_M environment override, if any.
@@ -811,7 +815,7 @@ def _gemm2_launch_config(
     The entry applies only where the launch can run the result as is; elsewhere the
     ladder stays. Memoised because ``gluon_supported`` asks for it on every launch.
     """
-    tuned = _gemm2_tuned(block_m, dq_a, dq_b)
+    tuned = _gemm2_tuned(block_m, dq_a, dq_b, small_grid)
     new = dict(ladder_items, **tuned)
     # The entries were measured with N and K multiples of 256 only, and an entry that
     # keeps the ladder's BLOCK_K at BLOCK_K 256 only. Those N and K also satisfy
@@ -858,7 +862,9 @@ def _default_launch_config(
     if not apply_swiglu and (dq_a, dq_b) in _GEMM2_FAMILIES:
         # Every override below needs apply_swiglu, so none applies to GEMM2.
         group_m = _env_int("AITER_TRITON_MOE_GLUON_GROUP_M", None)
-        ladder = _gemm2_launch_config(ladder, block_m, N, K, dq_a, dq_b, group_m)
+        ladder = _gemm2_launch_config(
+            ladder, block_m, N, K, dq_a, dq_b, group_m, bool(small_grid)
+        )
     c = dict(ladder)
     if (
         not small_grid
