@@ -30,7 +30,10 @@ from op_tests.triton_tests.moe.moe_test_utils import assert_close
         (1024, 8, 256, 64),  # mean 32, exact: one level up
         (1024, 4, 128, 64),  # mean 32, exact: one level up
         (1056, 8, 256, 64),  # mean 33
-        (4096, 6, 384, 64),  # mean 64, exact: above the range, unchanged
+        (4095, 6, 384, 64),  # mean 63.98
+        (4096, 6, 384, 128),  # mean 64, exact: one level up
+        (4097, 6, 384, 64),  # mean 64.02, not exact: unchanged
+        (2048, 8, 256, 128),  # mean 64, exact: one level up
         (4096, 8, 256, 128),  # mean 128
         (16384, 8, 256, 128),  # the 128 cap
     ],
@@ -150,7 +153,8 @@ def test_routing(n_tokens, n_expts_tot, n_expts_act, sm_first):
 
 
 @pytest.mark.parametrize(
-    "n_tokens, n_expts_tot, n_expts_act", [(1024, 384, 6), (1024, 256, 8)]
+    "n_tokens, n_expts_tot, n_expts_act",
+    [(1024, 384, 6), (1024, 256, 8), (4096, 384, 6)],
 )
 def test_routing_block_m_changes_only_the_m_tiling(
     monkeypatch, n_tokens, n_expts_tot, n_expts_act
