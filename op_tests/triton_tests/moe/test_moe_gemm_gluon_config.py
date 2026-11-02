@@ -581,6 +581,26 @@ _GEMM2_REGISTER_B_TILE = dict(
 )
 
 
+#: Per-dtype additions of the block_m 128 entries: soffset addressing and B scales in
+#: registers (a4w4), B scales in registers (a8w4), A-scale reads in the MFMA region
+#: (a8w8).
+_GEMM2_BM128_EXTRA = {
+    (DtypeQuant.MXFP4, DtypeQuant.MXFP4): {
+        "SOFF_UNROLL": True,
+        "ALLOW_B_SCALE_VIA_LDS": False,
+    },
+    (DtypeQuant.MXFP8, DtypeQuant.MXFP4): {
+        "SOFF_UNROLL": False,
+        "ALLOW_B_SCALE_VIA_LDS": False,
+    },
+    (DtypeQuant.MXFP8, DtypeQuant.MXFP8): {
+        "SOFF_UNROLL": False,
+        "ALLOW_B_SCALE_VIA_LDS": True,
+        "DS_READ_A_SCALE_IN_MFMA": True,
+    },
+}
+
+
 @pytest.mark.parametrize(
     "dq_a,dq_b,block_m,block_k",
     [
@@ -601,6 +621,7 @@ def test_gemm2_large_block_m_tile(dq_a, dq_b, block_m, block_k):
         BLOCK_K=block_k,
         K_UNROLL=3 * 256 // block_k,
         VGPR_PREFETCH_K=block_k,
+        **(_GEMM2_BM128_EXTRA[(dq_a, dq_b)] if block_m == 128 else {}),
     )
     assert {name: config[name] for name in expected} == expected
     assert _plain(_validate(conf._probe_tuning_config(config, dq_a, dq_b), N, K))

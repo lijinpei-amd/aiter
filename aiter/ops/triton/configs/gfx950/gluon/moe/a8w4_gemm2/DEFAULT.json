@@ -65,6 +65,7 @@
         "GROUP_M": 8,
         "B_SCALE_SHUFFLED": true,
         "B_PRESHUFFLED": true,
-        "ALLOW_B_VIA_LDS": false
+        "ALLOW_B_VIA_LDS": false,
+        "ALLOW_B_SCALE_VIA_LDS": false
     }
 }
