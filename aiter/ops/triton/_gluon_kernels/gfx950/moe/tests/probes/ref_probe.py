@@ -15,8 +15,10 @@ from op_tests.triton_tests.moe.test_moe_gemm_a4w4 import _run_case
 
 REPS = int(sys.argv[1]) if len(sys.argv) > 1 else 5
 CASES = [
-    # gather+scatter on, gammas on, swiglu on, fused quant off/on -- the benchmark
-    # calls moe_gemm_gluon with apply_swiglu=True and gather indices.
+    # gather+scatter on, gammas on, swiglu on -- the benchmark calls moe_gemm_gluon
+    # with apply_swiglu=True and gather indices. The fused-quant case went with
+    # moe_gemm_a4w4's static output quant (origin/main dropped it). `backend="triton"`
+    # is the non-gfx1250 path, which offers the gfx950 Gluon kernel first.
     {
         "m": 4096,
         "n": 4096,
@@ -25,23 +27,11 @@ CASES = [
         "do_scatter": False,
         "has_y_gammas": True,
         "apply_swiglu": True,
-        "fused_quant": False,
         "n_expts_tot": 33,
         "n_expts_act": 8,
         "hbm_swizzling": True,
-    },
-    {
-        "m": 4096,
-        "n": 4096,
-        "k": 7168,
-        "do_gather": True,
-        "do_scatter": False,
-        "has_y_gammas": True,
-        "apply_swiglu": True,
-        "fused_quant": True,
-        "n_expts_tot": 33,
-        "n_expts_act": 8,
-        "hbm_swizzling": True,
+        "preshuffle_weights": False,
+        "backend": "triton",
     },
     {
         "m": 4096,
@@ -51,10 +41,11 @@ CASES = [
         "do_scatter": True,
         "has_y_gammas": True,
         "apply_swiglu": True,
-        "fused_quant": False,
         "n_expts_tot": 33,
         "n_expts_act": 8,
         "hbm_swizzling": True,
+        "preshuffle_weights": False,
+        "backend": "triton",
     },
 ]
 fails = 0
