@@ -4,9 +4,9 @@
 #   gate.sh <label> [--fast | --full]
 #
 # Writes $OUT/{sched,layout_fields,build,asm}_<label>.txt and compares them with the
-# *_baseline.txt files in $OUT, falling back to tests/reference/gate/ (recorded at
-# commit 1d3431e50, T0b's when the KernelLayout fields went public; valid only for
-# the same toolchain). To record fresh baselines, run the label `baseline` on the
+# *_baseline.txt files in $OUT, falling back to data/baseline/gate/ (recorded at
+# 96a384028 on the 2026-10-30 venv), then tests/reference/gate/ (recorded at
+# commit 1d3431e50; valid only for the same toolchain). To record fresh baselines, run the label `baseline` on the
 # unmodified tree, in the same checkout or in a git worktree with aiter/jit/*.so
 # symlinked from a built tree (without them kernels silently differ; _env.sh warns).
 #
@@ -38,8 +38,12 @@ cd "$REPO"
 fail=0
 echo "### gate: $LABEL${MODE:+ $MODE}"
 
-base() {  # baseline file: $OUT's if recorded, else the committed reference
-  if [[ -f $OUT/$1 ]]; then echo "$OUT/$1"; else echo "$TESTS_DIR/reference/gate/$1"; fi
+base() {  # baseline file: $OUT's if recorded, else data/baseline/gate/, else tests/reference/gate/
+  local d
+  for d in "$OUT" "$TESTS_DIR/../data/baseline/gate" "$TESTS_DIR/reference/gate"; do
+    [[ -f $d/$1 ]] && { echo "$d/$1"; return; }
+  done
+  echo "$TESTS_DIR/reference/gate/$1"
 }
 same() {  # same <name> <baseline> <new>; hunks are labelled with their "== case"
   if [[ ! -f $2 ]]; then echo "$1  (no baseline)"

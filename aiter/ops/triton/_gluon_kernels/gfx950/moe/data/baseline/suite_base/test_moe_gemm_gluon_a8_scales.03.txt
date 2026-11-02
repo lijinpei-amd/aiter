@@ -1,0 +1,5 @@
+FAILED op_tests/triton_tests/moe/test_moe_gemm_gluon_a8_scales.py::test_independent_scale_slots[register-k1024-PER_OP]
+FAILED op_tests/triton_tests/moe/test_moe_gemm_gluon_a8_scales.py::test_independent_scale_slots[register-k1024-PER_PANE]
+FAILED op_tests/triton_tests/moe/test_moe_gemm_gluon_a8_scales.py::test_independent_scale_slots[register-k1024-PER_STAGE_WHOLE]
+FAILED op_tests/triton_tests/moe/test_moe_gemm_gluon_a8_scales.py::test_independent_scale_slots[register-k1024-PER_STAGE_WARP_PIPELINE]
+4 failed, 3 passed, 4 warnings in 62.48s (0:01:02)
