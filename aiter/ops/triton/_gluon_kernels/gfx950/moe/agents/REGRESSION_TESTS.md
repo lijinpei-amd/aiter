@@ -273,6 +273,14 @@ idle driver contexts on yours. Without it, the harness waits forever; see
 - Do not benchmark with the asm-hash cells. They pin 2026-09-09 configs, for
   example 143.6 µs instead of 112 µs for a4w4 at T=16.
 
+## Current baselines (commit `96a384028`, 2026-11-02)
+
+Stored in `data/baseline/` (see its `README.md`): gate files, a trimmed base suite and
+the `hv_new` cold run on physical GPU 5. `gate.sh` uses `data/baseline/gate/` when
+`$OUT` holds no baseline. Pass the directories to `compare_suite.py` and
+`compare_cold.py` as the "before" side. They supersede the 2026-10-13 references below
+for this toolchain.
+
 ## Reference results (commit `1d3431e50`, 2026-10-13)
 
 Stored in `tests/reference/`. Use them as the "before" side when the base commit is
