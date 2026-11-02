@@ -32,6 +32,9 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     dq_pack_divisor,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import (
+    validate,
+)
+from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import (
     validate_pipeline as _validate_live_pipeline,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
@@ -782,7 +785,20 @@ def _gemm2_tuned(block_m, dq_a, dq_b) -> dict:
     if family is None:
         return {}
     entry = get_moe_dispatch(family, get_arch(), "gluon").get(f"bm{block_m}_any", {})
-    return {k: tuple(v) if isinstance(v, list) else v for k, v in entry.items()}
+    return {k: _hashable(v) for k, v in entry.items()}
+
+
+@cache
+def _launch_error(cfg_items: tuple, dq_a, dq_b, N, K):
+    """The first check the launch (``_validate_launch_config``) fails, or None."""
+    try:
+        tc = _probe_tuning_config(dict(cfg_items), dq_a, dq_b)
+        layout = KernelLayout(tc)
+        validate(tc, N, K, layout)
+        _validate_selected_pipeline(tc, layout, K)
+    except AssertionError as error:
+        return str(error)
+    return None
 
 
 @cache
@@ -795,26 +811,25 @@ def _gemm2_launch_config(
     The entry applies only where the launch can run the result as is; elsewhere the
     ladder stays. Memoised because ``gluon_supported`` asks for it on every launch.
     """
-    c = dict(ladder_items)
     tuned = _gemm2_tuned(block_m, dq_a, dq_b)
-    # The entries were measured with N and K multiples of 256 only.
-    if not tuned or N % 256 or K % 256:
+    new = dict(ladder_items, **tuned)
+    # The entries were measured with N and K multiples of 256 only, and an entry that
+    # keeps the ladder's BLOCK_K at BLOCK_K 256 only. Those N and K also satisfy
+    # _preshuffled_b and _shuffled_b_scales.
+    if (
+        not tuned
+        or N % 256
+        or K % 256
+        or ("BLOCK_K" not in tuned and new["BLOCK_K"] < 256)
+    ):
         return ladder_items
-    # An entry that keeps the ladder's BLOCK_K was measured at BLOCK_K 256 only.
-    if "BLOCK_K" not in tuned and c["BLOCK_K"] < 256:
-        return ladder_items
-    new = dict(c, **tuned)
     if group_m is not None and "GROUP_M" in tuned:
         new["GROUP_M"] = group_m
     key = _cfg_key(new)
     # The launch drops a shuffle it cannot prepare, so check that too:
-    # gluon_supported must judge the config that runs. N and K multiples of 256
-    # satisfy _preshuffled_b, so register B only needs the entry to ask for it.
-    if (
-        (not new["ALLOW_B_VIA_LDS"] and not new["B_PRESHUFFLED"])
-        or (new["B_SCALE_SHUFFLED"] and not _b_scale_shuffle_fits(new))
-        or _pipeline_error(key, dq_a, dq_b, K) is not None
-        or _probe_lds_bytes_cached(key, dq_a, dq_b) > LDS_USABLE_BYTES
+    # gluon_supported must judge the config that runs.
+    if (new["B_SCALE_SHUFFLED"] and not _b_scale_shuffle_fits(new)) or _launch_error(
+        key, dq_a, dq_b, N, K
     ):
         return ladder_items
     return key
@@ -840,12 +855,10 @@ def _default_launch_config(
         bool(small_grid),
         bool(stream_expert_payload),
     )
-    if not apply_swiglu:
+    if not apply_swiglu and (dq_a, dq_b) in _GEMM2_FAMILIES:
         # Every override below needs apply_swiglu, so none applies to GEMM2.
-        group_m = os.environ.get("AITER_TRITON_MOE_GLUON_GROUP_M")
-        ladder = _gemm2_launch_config(
-            ladder, block_m, N, K, dq_a, dq_b, None if group_m is None else int(group_m)
-        )
+        group_m = _env_int("AITER_TRITON_MOE_GLUON_GROUP_M", None)
+        ladder = _gemm2_launch_config(ladder, block_m, N, K, dq_a, dq_b, group_m)
     c = dict(ladder)
     if (
         not small_grid

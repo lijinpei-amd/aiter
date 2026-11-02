@@ -64,11 +64,16 @@ def _clean_tuning_environment(monkeypatch):
     for name in os.environ:
         if name.startswith("AITER_TRITON_MOE_GLUON_"):
             monkeypatch.delenv(name)
-    host._launch_spec.cache_clear()
-    conf._get_gluon_config_cached.cache_clear()
+    caches = (
+        host._launch_spec,
+        conf._get_gluon_config_cached,
+        conf._gemm2_launch_config,
+    )
+    for cached in caches:
+        cached.cache_clear()
     yield
-    host._launch_spec.cache_clear()
-    conf._get_gluon_config_cached.cache_clear()
+    for cached in caches:
+        cached.cache_clear()
 
 
 @pytest.fixture
@@ -676,7 +681,20 @@ def test_gemm2_config_never_drops_a_launchable_ladder(dq_a, dq_b, block_m):
                 assert _launchable(config, dq_a, dq_b, N, K), (N, K, small_grid)
 
 
-@pytest.mark.parametrize("family", ["A4W4-GEMM2", "A8W4-GEMM2", "A8W8-GEMM2"])
+@pytest.fixture
+def gemm2_tables(monkeypatch):
+    """Editable copies of the GEMM2 families, served in place of the JSON files."""
+    tables = {
+        family: {
+            k: dict(v) for k, v in get_moe_dispatch(family, "gfx950", "gluon").items()
+        }
+        for family in conf._GEMM2_FAMILIES.values()
+    }
+    monkeypatch.setattr(conf, "get_moe_dispatch", lambda name, *_: tables[name])
+    return tables
+
+
+@pytest.mark.parametrize("family", sorted(conf._GEMM2_FAMILIES.values()))
 def test_gemm2_families_hold_tuning_values_only(family):
     table = get_moe_dispatch(family, "gfx950", "gluon")
     assert set(table) == {"bm16_any", "bm32_any", "bm64_any", "bm128_any"}
@@ -689,42 +707,21 @@ def test_gemm2_families_hold_tuning_values_only(family):
         assert entry and set(entry) <= known - {"BLOCK_M"}
 
 
-def test_gemm2_tuning_is_read_from_its_family(monkeypatch):
-    tables = {
-        family: {
-            k: dict(v) for k, v in get_moe_dispatch(family, "gfx950", "gluon").items()
-        }
-        for family in ("A4W4-GEMM2", "A8W4-GEMM2", "A8W8-GEMM2")
-    }
-    tables["A8W8-GEMM2"]["bm128_any"]["GROUP_M"] = 2
-    monkeypatch.setattr(conf, "get_moe_dispatch", lambda name, *_: tables[name])
-    conf._gemm2_launch_config.cache_clear()
-    try:
-        config = conf._default_launch_config(
-            128, 6144, 2048, DtypeQuant.MXFP8, DtypeQuant.MXFP8, False, False
-        )
-    finally:
-        conf._gemm2_launch_config.cache_clear()
+def test_gemm2_tuning_is_read_from_its_family(gemm2_tables):
+    gemm2_tables["A8W8-GEMM2"]["bm128_any"]["GROUP_M"] = 2
+    config = conf._default_launch_config(
+        128, 6144, 2048, DtypeQuant.MXFP8, DtypeQuant.MXFP8, False, False
+    )
     assert config["GROUP_M"] == 2
 
 
-def test_gemm2_register_b_entry_needs_preshuffled_weights(monkeypatch):
+def test_gemm2_register_b_entry_needs_preshuffled_weights(gemm2_tables):
     # The launch rejects register B on plain weights, so such an entry keeps the ladder.
-    tables = {
-        family: {
-            k: dict(v) for k, v in get_moe_dispatch(family, "gfx950", "gluon").items()
-        }
-        for family in ("A4W4-GEMM2", "A8W4-GEMM2", "A8W8-GEMM2")
-    }
-    tables["A4W4-GEMM2"]["bm32_any"]["B_PRESHUFFLED"] = False
-    monkeypatch.setattr(conf, "get_moe_dispatch", lambda name, *_: tables[name])
+    gemm2_tables["A4W4-GEMM2"]["bm32_any"]["B_PRESHUFFLED"] = False
     args = (32, 7168, 3072, DtypeQuant.MXFP4, DtypeQuant.MXFP4)
-    conf._gemm2_launch_config.cache_clear()
-    try:
-        config = conf._default_launch_config(*args, False, False)
-    finally:
-        conf._gemm2_launch_config.cache_clear()
-    assert config == conf.get_gluon_config(*args)
+    assert conf._default_launch_config(*args, False, False) == conf.get_gluon_config(
+        *args
+    )
 
 
 def test_gemm2_group_m_environment_override_is_not_cached_away(monkeypatch):

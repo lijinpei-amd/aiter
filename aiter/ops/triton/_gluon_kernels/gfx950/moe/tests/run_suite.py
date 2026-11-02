@@ -90,8 +90,6 @@ class Unit:
     counts: dict = field(default_factory=lambda: dict.fromkeys(KINDS, 0))
     reason: str = ""  # why the unit counts as broken; empty if it ran cleanly
     retried: bool = False  # rerun alone on its GPU after running out of memory
-    # Collection failed in planning, so the file ran whole; ids were collected after.
-    recollected: bool = False
     # Node id -> outcome, from the JUnit XML; written to outcomes.json, not units.json.
     outcomes: dict = field(default_factory=dict)
 
@@ -333,7 +331,6 @@ def run(unit, gpu, out):
         # Collection failed in planning and the file ran whole: every test still
         # needs its node id, so collect once more and check the run against it.
         unit.ids, _ = collect(unit.file, gpu)
-        unit.recollected = True
         if unit.ids is None:
             unit.reason = "ran whole, but its node ids could not be collected"
     if not unit.reason and sum(counts.values()) != len(unit.ids):
@@ -454,7 +451,8 @@ def suite(args, paths):
         print(f"{Path(path).stem + '.log':50} {line}")
     longest = max(units, key=lambda u: u.seconds)
     broken = [u for u in units if u.reason]
-    late = [u for u in units if u.recollected and not u.reason]
+    # Units whose collection failed in planning ran whole; count them once they ran.
+    late = [u for u in units if ids[u.file] is None and not u.reason]
     collected += sum(sum(u.counts.values()) for u in late)
     ok = not broken and sum(total.values()) == collected
     print(f"total: {fmt(total)}")

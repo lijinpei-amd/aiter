@@ -10,13 +10,22 @@ from pathlib import Path
 
 import pytest
 
-_SCRIPT = (
+_TESTS = (
     Path(__file__).resolve().parents[3]
-    / "aiter/ops/triton/_gluon_kernels/gfx950/moe/tests/compare_suite.py"
+    / "aiter/ops/triton/_gluon_kernels/gfx950/moe/tests"
 )
-_SPEC = importlib.util.spec_from_file_location("compare_suite", _SCRIPT)
-compare_suite = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(compare_suite)
+
+
+def _load(name):
+    """A script of the suite tooling, loaded by path (tests/ is not a package)."""
+    spec = importlib.util.spec_from_file_location(name, _TESTS / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+compare_suite = _load("compare_suite")
+run_suite = _load("run_suite")
 
 _FILE = "op_tests/triton_tests/moe/test_x.py"
 _BASE = {f"{_FILE}::test_{i}": "passed" for i in range(4)} | {
@@ -25,9 +34,7 @@ _BASE = {f"{_FILE}::test_{i}": "passed" for i in range(4)} | {
 }
 
 
-def _run(
-    root, name, outcomes, manifest=True, reason="", summary=True, ids=None, units=True
-):
+def _run(root, name, outcomes, manifest=True, reason="", summary=True, ids=None):
     """A run_suite.py output directory with one unit holding ``outcomes``.
 
     ``ids`` overrides the unit's node ids in units.json (``"none"`` writes null), and
@@ -42,8 +49,7 @@ def _run(
     (d / "test_x.log").write_text("\n".join(log) + "\n")
     unit_ids = None if ids == "none" else sorted(outcomes) if ids is None else ids
     unit = {"name": "test_x", "ids": unit_ids, "reason": reason}
-    if units:
-        (d / "units.json").write_text(json.dumps({"units": [unit]}))
+    (d / "units.json").write_text(json.dumps({"units": [unit]}))
     if manifest:
         written = manifest if isinstance(manifest, dict) else outcomes
         (d / "outcomes.json").write_text(json.dumps(written))
@@ -182,15 +188,9 @@ def test_incomplete_baseline_inventory_fails(tmp_path):
 
 def test_node_ids_with_spaces_are_parsed_from_the_logs(tmp_path):
     spaced = {f"{_FILE}::test_p[a b]": "failed"} | _BASE
-    a = _run(tmp_path, "before", spaced, manifest=True)
+    a = _run(tmp_path, "before", spaced)
     ok, report = compare_suite.compare(a, _run(tmp_path, "after", dict(spaced)))
     assert ok, report
-
-
-_RUNNER = _SCRIPT.with_name("run_suite.py")
-_RSPEC = importlib.util.spec_from_file_location("run_suite", _RUNNER)
-run_suite = importlib.util.module_from_spec(_RSPEC)
-_RSPEC.loader.exec_module(run_suite)
 
 
 @pytest.mark.parametrize("collect_ok", [True, False])
@@ -223,7 +223,7 @@ def test_whole_file_unit_needs_its_node_ids(tmp_path, monkeypatch, collect_ok):
     unit = run_suite.Unit("test_x", _FILE, [_FILE], None, 1.0)
     run_suite.run(unit, "0", tmp_path)
     if collect_ok:
-        assert unit.reason == "" and unit.ids == ids and unit.recollected
+        assert unit.reason == "" and unit.ids == ids
         assert unit.outcomes == dict.fromkeys(ids, "passed")
     else:
         assert "could not be collected" in unit.reason
