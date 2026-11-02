@@ -239,9 +239,10 @@ there is no file. Do not change the returned dict.
   A `bm<block_m>_small` or `bm<block_m>_multi` entry lists only the keys it
   changes on top of `bm<block_m>_any`. The launch applies `bm<block_m>_small`
   when the launch grid is small (`small_grid` in `moe_op_gemm_gluon_config.py`:
-  fewer than 512 CTAs at 128-column N tiles, in practice one token). It applies
-  `bm<block_m>_multi` when the experts average two or more M blocks
-  (`_multi_block` in `moe_op_gemm_gluon.py`: M ≥ 2 · block_m · E).
+  fewer than 512 CTAs at 128-column N tiles, in practice one token). Else it
+  applies `bm<block_m>_multi` when the experts average two or more M blocks
+  (`_multi_block` in `moe_op_gemm_gluon.py`: M ≥ 2 · block_m · E). A small grid
+  never takes `_multi`.
 
 ## Conv
 

@@ -738,6 +738,11 @@ def test_gemm2_families_hold_tuning_values_only(family):
     )
     for entry in table.values():
         assert entry and set(entry) <= known - {"BLOCK_M"}
+    # A grid entry lists only what it changes on top of the any entry.
+    for key, entry in table.items():
+        if not key.endswith("_any"):
+            base = table[key.rsplit("_", 1)[0] + "_any"]
+            assert not {k for k, v in entry.items() if base.get(k) == v}, key
 
 
 @pytest.mark.parametrize("dq_a,dq_b", list(conf._GEMM2_FAMILIES))

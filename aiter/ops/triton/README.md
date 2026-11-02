@@ -167,6 +167,14 @@ def _get_config(M: int, N: int, K: int):
     return get_gemm_config("GEMM-A16W16", M, N, K)  # returns (config, is_tuned)
 ```
 
+MOE tables use `bm<block_m>` keys and are read with `get_moe_dispatch()`. The
+gfx950 Gluon MoE GEMM2 families (`configs/gfx950/gluon/moe/{a4w4,a8w4,a8w8}_gemm2/`)
+have a `bm<block_m>_any` entry for each `block_m`. An optional
+`bm<block_m>_small` or `bm<block_m>_multi` entry lists only the keys that it
+changes, and the launch merges it over `bm<block_m>_any`. A small launch grid
+takes `_small`. Other launches take `_multi` when the experts average two or
+more M blocks. All other launches take `_any` alone.
+
 [`configs/AGENTS.md`](configs/AGENTS.md) has the layout, the file names, the
 loaders, the JSON format and the steps to add a config. To tune a GEMM, use
 the scripts in [`utils/_triton/tuning/`](utils/_triton/tuning/README.md).

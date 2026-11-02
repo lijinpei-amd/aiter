@@ -158,6 +158,16 @@ In MOE dispatch tables, flag:
   value.
 - Triton keys (`BLOCK_SIZE_N`, `num_stages`) in a Gluon file, or Gluon keys
   (`block_n`, `num_buffers`, `persistent_iters`) in a Triton file.
+- In a gfx950 Gluon GEMM2 family (`a4w4_gemm2`, `a8w4_gemm2`, `a8w8_gemm2`):
+  a key other than `bm<block_m>_any`, `bm<block_m>_small` and
+  `bm<block_m>_multi`; a `_small` or `_multi` entry without the `_any` entry
+  of its `block_m`; a `_small` or `_multi` entry that repeats a key of `_any`
+  with the same value; a merged entry with `"ALLOW_B_VIA_LDS": false` and
+  without `"B_PRESHUFFLED": true`.
+
+Do not flag a GEMM2 `_small` or `_multi` entry that has only a few keys. The
+launch merges it over `bm<block_m>_any`: `_small` for a small launch grid,
+else `_multi` when the experts average two or more M blocks.
 
 ## Configs: Python code
 
