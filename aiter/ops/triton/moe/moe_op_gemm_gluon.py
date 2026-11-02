@@ -829,6 +829,56 @@ def get_gluon_config_uncached(
     return cfg
 
 
+@cache
+def _gemm2_launch_config(ladder_items: tuple, block_m, N, K, dq_a, dq_b) -> tuple:
+    """GEMM2 (no activation) geometry for MX operands, as sorted config items.
+
+    It changes the ladder only where the launch can run the result as is. Memoised
+    because ``gluon_supported`` asks for the config on every launch.
+    """
+    c = dict(ladder_items)
+    if N % 256 or K % 256:
+        return ladder_items
+    if block_m <= 32:
+        # Shuffled B scales; measured at the ladder's BLOCK_K 256 only.
+        if c["BLOCK_K"] < 256:
+            return ladder_items
+        new = dict(c, B_SCALE_SHUFFLED=True)
+    else:
+        # BLOCK_K holds 128 B of B payload; a8w4 at block_m 128 does not fit LDS
+        # at BLOCK_K 256.
+        narrow_k = dq_b == DtypeQuant.MXFP8 or (
+            block_m == 128 and dq_a == DtypeQuant.MXFP8
+        )
+        block_k = 128 if narrow_k else 256
+        new = dict(
+            c,
+            BLOCK_N=256,
+            BLOCK_K=block_k,
+            SLOT_M=64,
+            SLOT_N=128,
+            mfma_instr_shape=(16, 16, 128),
+            warps_per_cta=(1, 4),
+            tiles_per_warp=(2, 2),
+            NUM_LDS_BUFFER=3,
+            # One unroll covers the buffer ring and the K256 scale unit.
+            K_UNROLL=3 * 256 // block_k,
+            VGPR_PREFETCH_K=block_k,
+            GROUP_M=_env_int("AITER_TRITON_MOE_GLUON_GROUP_M", 8),
+            B_SCALE_SHUFFLED=True,
+        )
+    key = _cfg_key(new)
+    # The launch drops a shuffle it cannot prepare, so check that too:
+    # gluon_supported must judge the config that runs.
+    if (
+        not _b_scale_shuffle_fits(new)
+        or _pipeline_error(key, dq_a, dq_b, K) is not None
+        or _probe_lds_bytes_cached(key, dq_a, dq_b) > LDS_USABLE_BYTES
+    ):
+        return ladder_items
+    return key
+
+
 def _default_launch_config(
     block_m,
     N,
@@ -840,15 +890,19 @@ def _default_launch_config(
     stream_expert_payload=False,
 ):
     """Share automatic stage-specific geometry with the capability check."""
-    c = get_gluon_config(
+    ladder = _get_gluon_config_cached(
         block_m,
         N,
         K,
         dq_a,
         dq_b,
-        small_grid,
-        stream_expert_payload,
+        bool(small_grid),
+        bool(stream_expert_payload),
     )
+    if not apply_swiglu and dq_a in _SCALED and dq_b in _SCALED:
+        # Every override below needs apply_swiglu, so none applies to GEMM2.
+        ladder = _gemm2_launch_config(ladder, block_m, N, K, dq_a, dq_b)
+    c = dict(ladder)
     if (
         not small_grid
         and stream_expert_payload
@@ -1129,7 +1183,9 @@ def _default_launch_config(
             VGPR_PREFETCH_K=128,
         )
     if dq_b == DtypeQuant.MXFP8 and (
-        c["B_SCALE_SHUFFLED"]
+        # Not for GEMM2: its shuffled scales at block_m 32 are 1.3-2.5% slower with
+        # the hint, and block_m 16 is flat.
+        (c["B_SCALE_SHUFFLED"] and apply_swiglu)
         or (
             c["BLOCK_K"] == 128
             and _probe_b_scale_via_lds(_cfg_key(c), dq_a, dq_b)
@@ -1533,6 +1589,13 @@ def _scale_shuffle_supported(cfg, operand):
     return True
 
 
+def _b_scale_shuffle_fits(cfg):
+    """The config half of what ``_shuffled_b_scales`` needs to shuffle B scales."""
+    # Stripe-based like the A shuffle: one 256 B run per 32 columns, so a slot that
+    # is a whole number of stripes is a contiguous slice of the tile.
+    return _scale_shuffle_supported(cfg, 1) and int(cfg["SLOT_N"]) % 32 == 0
+
+
 def _sorted_shuffle_a_scales(x_scales, routing_data, gather_indx, K, cfg):
     """Run the C++ pre-pass that sorts + fragment-permutes the token scales.
 
@@ -1681,10 +1744,7 @@ def _shuffled_b_scales(w_scales, cfg):
     if w_scales is None:
         return None
     if (
-        not _scale_shuffle_supported(cfg, 1)
-        # Stripe-based like the A shuffle: one 256 B run per 32 columns, so a slot
-        # that is a whole number of stripes is a contiguous slice of the tile.
-        or int(cfg["SLOT_N"]) % 32 != 0
+        not _b_scale_shuffle_fits(cfg)
         or w_scales.shape[-1] % 32 != 0
         or w_scales.shape[-2] % 8 != 0
     ):

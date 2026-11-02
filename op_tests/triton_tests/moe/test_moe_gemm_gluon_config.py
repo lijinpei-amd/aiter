@@ -542,8 +542,124 @@ def test_t256_mxfp8_gemm1_geometry_override_is_narrow(overrides):
         # tile is BLOCK_N 128 with SLOT_N 64, this one is 256 with 128.
         assert selected != baseline
         assert (selected["BLOCK_N"], selected["SLOT_N"]) == (256, 128)
+    elif overrides == {"apply_swiglu": False}:
+        # GEMM2 has its own measured tile (test_gemm2_large_block_m_tile), not this
+        # GEMM1 one, which is BLOCK_N 128 with SLOT_N 64.
+        assert (selected["BLOCK_N"], selected["SLOT_N"]) == (256, 128)
     else:
         assert selected == baseline
+
+
+_GEMM2_TILE = {
+    "BLOCK_N": 256,
+    "SLOT_M": 64,
+    "SLOT_N": 128,
+    "mfma_instr_shape": (16, 16, 128),
+    "warps_per_cta": (1, 4),
+    "tiles_per_warp": (2, 2),
+    "NUM_LDS_BUFFER": 3,
+    "GROUP_M": 8,
+    "B_SCALE_SHUFFLED": True,
+}
+
+
+@pytest.mark.parametrize(
+    "dq_a,dq_b,block_m,block_k",
+    [
+        (DtypeQuant.MXFP4, DtypeQuant.MXFP4, 64, 256),
+        (DtypeQuant.MXFP4, DtypeQuant.MXFP4, 128, 256),
+        (DtypeQuant.MXFP8, DtypeQuant.MXFP4, 64, 256),
+        (DtypeQuant.MXFP8, DtypeQuant.MXFP4, 128, 128),
+        (DtypeQuant.MXFP8, DtypeQuant.MXFP8, 64, 128),
+        (DtypeQuant.MXFP8, DtypeQuant.MXFP8, 128, 128),
+    ],
+)
+def test_gemm2_large_block_m_tile(dq_a, dq_b, block_m, block_k):
+    N, K = 6144, 2048
+    config = host._default_launch_config(block_m, N, K, dq_a, dq_b, False, False)
+    expected = dict(
+        _GEMM2_TILE,
+        BLOCK_M=block_m,
+        BLOCK_K=block_k,
+        K_UNROLL=3 * 256 // block_k,
+        VGPR_PREFETCH_K=block_k,
+    )
+    assert {name: config[name] for name in expected} == expected
+    assert _plain(_validate(host._probe_tuning_config(config, dq_a, dq_b), N, K))
+
+
+@pytest.mark.parametrize(
+    "dq_a,dq_b",
+    [
+        (DtypeQuant.MXFP4, DtypeQuant.MXFP4),
+        (DtypeQuant.MXFP8, DtypeQuant.MXFP4),
+        (DtypeQuant.MXFP8, DtypeQuant.MXFP8),
+    ],
+)
+@pytest.mark.parametrize("block_m,small_grid", [(16, True), (16, False), (32, False)])
+def test_gemm2_small_block_m_shuffles_b_scales(dq_a, dq_b, block_m, small_grid):
+    config = host._default_launch_config(
+        block_m, 7168, 3072, dq_a, dq_b, small_grid, False
+    )
+    ladder = host.get_gluon_config(block_m, 7168, 3072, dq_a, dq_b, small_grid)
+    changed = {name for name in config if config[name] != ladder[name]}
+    # Only the shuffle changes: GEMM2 does not take GEMM1's `.cg` hint for shuffled
+    # MXFP8 scales.
+    assert changed == {"B_SCALE_SHUFFLED"}
+
+
+@pytest.mark.parametrize(
+    "dq_a,dq_b,block_m,N,K",
+    [
+        # N or K off the 256 grid that the measured shapes share.
+        (DtypeQuant.MXFP4, DtypeQuant.MXFP4, 128, 2880, 2048),
+        (DtypeQuant.MXFP4, DtypeQuant.MXFP4, 128, 4096, 2880),
+        (DtypeQuant.MXFP4, DtypeQuant.MXFP4, 32, 2880, 2048),
+        # Too few K steps for the tile's pipeline.
+        (DtypeQuant.MXFP4, DtypeQuant.MXFP4, 128, 4096, 1024),
+        # The ladder's BLOCK_K 128, where shuffled scales double the unroll.
+        (DtypeQuant.MXFP4, DtypeQuant.MXFP4, 16, 4096, 1024),
+        (DtypeQuant.MXFP8, DtypeQuant.MXFP4, 32, 7168, 1280),
+        # No MX activations or weights.
+        (DtypeQuant.FP8_E4M3, DtypeQuant.MXFP4, 128, 4096, 2048),
+        (DtypeQuant.BF16, DtypeQuant.BF16, 128, 4096, 2048),
+    ],
+)
+def test_gemm2_tile_keeps_the_ladder_elsewhere(dq_a, dq_b, block_m, N, K):
+    config = host._default_launch_config(block_m, N, K, dq_a, dq_b, False, False)
+    assert config == host.get_gluon_config(block_m, N, K, dq_a, dq_b)
+
+
+def _launchable(config, dq_a, dq_b, N, K):
+    """The config checks gluon_supported makes; a failure falls back to Triton."""
+    return (
+        N % config["BLOCK_N"] == 0
+        and K % config["BLOCK_K"] == 0
+        and host._pipeline_error(host._cfg_key(config), dq_a, dq_b, K) is None
+        and host._probe_lds_bytes(config, dq_a, dq_b) <= host.LDS_USABLE_BYTES
+    )
+
+
+@pytest.mark.parametrize(
+    "dq_a,dq_b",
+    [
+        (DtypeQuant.MXFP4, DtypeQuant.MXFP4),
+        (DtypeQuant.MXFP8, DtypeQuant.MXFP4),
+        (DtypeQuant.MXFP8, DtypeQuant.MXFP8),
+    ],
+)
+@pytest.mark.parametrize("block_m", [16, 32, 64, 128])
+def test_gemm2_config_never_drops_a_launchable_ladder(dq_a, dq_b, block_m):
+    for N in (512, 2880, 7168):
+        for K in (512, 1024, 1280, 1536, 2048, 2816, 3072):
+            for small_grid in (False, True):
+                ladder = host.get_gluon_config(block_m, N, K, dq_a, dq_b, small_grid)
+                if not _launchable(ladder, dq_a, dq_b, N, K):
+                    continue
+                config = host._default_launch_config(
+                    block_m, N, K, dq_a, dq_b, small_grid, False
+                )
+                assert _launchable(config, dq_a, dq_b, N, K), (N, K, small_grid)
 
 
 @pytest.mark.parametrize("suffix", ["EXPERT_CACHE_MODIFIER", "EXPERT_MOD"])
