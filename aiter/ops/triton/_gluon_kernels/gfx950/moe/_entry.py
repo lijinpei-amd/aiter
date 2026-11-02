@@ -7,12 +7,11 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from ._config import KernelFuncConfig, KernelTuningConfig
-from ._frozen import _moe_gemm_body_frozen
-from ._lang import constexpr_fields, require_constexpr
+from ._lang import constexpr_fields
 from ._lang import unwrap_attr as _cv
 from ._layout import KernelLayout
 from ._types import QuantExpertTensor, QuantTokenTensor, ResultTensor, RoutingMeta
-from .moe_gemm import _moe_gemm_body as _moe_gemm_body_live
+from .moe_gemm import _moe_gemm_body as _moe_gemm_body_with_layout
 
 __all__ = [
     "_moe_gluon_gemm1",
@@ -38,47 +37,25 @@ def _moe_gemm_body(
     K: gl.constexpr,
     NUM_K,
 ):
-    """Select the frozen or live body once, before entering either implementation.
-
-    The live layout is computed only for the live body. The frozen body is a
-    self-contained snapshot and builds its own layout from ``tuning_cfg``.
-    """
-    if require_constexpr(tuning_cfg.FROZEN_STEP):
-        _moe_gemm_body_frozen(
-            a,
-            b,
-            res,
-            rt,
-            bias_hbm_ptr,
-            stride_bias_e,
-            x_static_scale_hbm_ptr,
-            grid_m,
-            grid_n,
-            func_cfg,
-            tuning_cfg,
-            N,
-            K,
-            NUM_K,
-        )
-    else:
-        layout = KernelLayout(tuning_cfg)
-        _moe_gemm_body_live(
-            a,
-            b,
-            res,
-            rt,
-            bias_hbm_ptr,
-            stride_bias_e,
-            x_static_scale_hbm_ptr,
-            grid_m,
-            grid_n,
-            func_cfg,
-            tuning_cfg,
-            layout,
-            N,
-            K,
-            NUM_K,
-        )
+    """Build the layout from ``tuning_cfg`` and run the body."""
+    layout = KernelLayout(tuning_cfg)
+    _moe_gemm_body_with_layout(
+        a,
+        b,
+        res,
+        rt,
+        bias_hbm_ptr,
+        stride_bias_e,
+        x_static_scale_hbm_ptr,
+        grid_m,
+        grid_n,
+        func_cfg,
+        tuning_cfg,
+        layout,
+        N,
+        K,
+        NUM_K,
+    )
 
 
 def moe_gemm_launch_metadata(grid, kernel, args):

@@ -17,7 +17,6 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._entry import (
     _moe_gluon_gemm1,
     _moe_gluon_gemm2,
 )
-from aiter.ops.triton._gluon_kernels.gfx950.moe._frozen import _validate_frozen
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import (
     SchedMode,
     constexpr_fields,
@@ -155,7 +154,6 @@ def test_a_scale_row_stride_preserves_sub_16_byte_alignment(kernel):
         ("DS_READ_B_PAYLOAD_IN_MFMA", True),
         ("DS_READ_B_SCALE_IN_MFMA", True),
         ("SCHED_MODE", int(SchedMode.MFMA_16)),
-        ("FROZEN_STEP", True),
         ("SOFF_UNROLL", True),
         ("SCALE_FILL_MID", True),
         ("UNROLL_EPILOGUE", False),
@@ -797,7 +795,6 @@ def test_individual_read_placement_environment(monkeypatch, field, bit):
 def test_legacy_schedule_settings_reach_the_tuning_spec(monkeypatch):
     for name, value in {
         "SCHED_MODE": "4",
-        "FROZEN_STEP": "1",
         "SOFF_UNROLL": "1",
         "SCALE_FILL_MID": "1",
     }.items():
@@ -808,10 +805,9 @@ def test_legacy_schedule_settings_reach_the_tuning_spec(monkeypatch):
     tuning = _tuning_spec(config)
     assert (
         tuning.SCHED_MODE,
-        tuning.FROZEN_STEP,
         tuning.SOFF_UNROLL,
         tuning.SCALE_FILL_MID,
-    ) == (SchedMode.MFMA_8, True, True, True)
+    ) == (SchedMode.MFMA_8, True, True)
 
 
 def test_unroll_epilogue_environment_control_is_removed(monkeypatch):
@@ -826,7 +822,7 @@ def test_unroll_epilogue_environment_control_is_removed(monkeypatch):
     assert actual["UNROLL_EPILOGUE"] is True
 
 
-@pytest.mark.parametrize("field", ["MANUAL_PP", "MINI_BLOCK_K"])
+@pytest.mark.parametrize("field", ["MANUAL_PP", "MINI_BLOCK_K", "FROZEN_STEP"])
 def test_removed_controls_do_not_change_tuning(config, monkeypatch, field):
     baseline = host.get_gluon_config_uncached(
         128, 4096, 7168, DtypeQuant.MXFP4, DtypeQuant.MXFP4
@@ -978,12 +974,6 @@ def test_small_payload_tiles_use_register_rings(config):
     assert _plain(maybe_unwrap(layout.lds_bytes)) == 0
     assert _plain(_validate(tc, 64, 512))
 
-    # A FROZEN_STEP build is validated by the frozen snapshot's own copy.
-    config.update(A_NUM_BUFFER=0, B_NUM_BUFFER=0, FROZEN_STEP=True)
-    frozen = KernelTuningConfig(fc, *_tuning_spec(config))
-    with pytest.raises(AssertionError, match="requires operand 0's payload in LDS"):
-        _validate_frozen(frozen, 64, 512)
-
 
 @pytest.mark.parametrize("register_b", [False, True])
 def test_absent_scales_do_not_participate_in_depth_unroll_or_validation(
@@ -1072,17 +1062,6 @@ def test_shared_depth_exact_minimum_and_all_unroll_remainders(config, depth, unr
         AssertionError, match="NUM_K.*PIPELINE_DEPTH.*PEELED.*UNROLL"
     ):
         host._validate_selected_pipeline(tc, layout, (minimum - 1) * config["BLOCK_K"])
-
-
-@pytest.mark.parametrize(
-    "field", host._COMPONENT_BUFFER_KEYS + host._ALLOW_VIA_LDS_KEYS
-)
-def test_frozen_reference_rejects_new_storage_options(config, field):
-    config.update(FROZEN_STEP=True, B_PRESHUFFLED=True)
-    config[field] = 0 if field in host._ALLOW_VIA_LDS_KEYS else 1
-    tc = KernelTuningConfig(KernelFuncConfig(*_func_spec()), *_tuning_spec(config))
-    with pytest.raises(AssertionError, match="FROZEN_STEP does not support"):
-        _validate_frozen(tc, 4096, 7168)
 
 
 def test_register_weights_require_preshuffle(config):

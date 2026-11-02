@@ -78,7 +78,6 @@ class _Config(_ScheduleConfig):
         self.K_UNROLL = unroll
         self.UNROLL_EPILOGUE = unroll_epilogue
         self.SOFF_UNROLL = soff
-        self.FROZEN_STEP = False
         self.SCHED_MODE = 0
         self.SLOT_M = self.SLOT_N = 1
         self.BLOCK_K = 128 if packed else 256
@@ -146,9 +145,6 @@ class _Config(_ScheduleConfig):
 
     def warp_pipeline_compiler(self):
         return self.compiler_pipeline
-
-    def warp_pipeline_manual(self):
-        return False
 
     def commit_per_stage_warp_pipeline(self):
         return self.WAIT_COMMIT_SCHEME == WaitCommitScheme.PER_STAGE_WARP_PIPELINE

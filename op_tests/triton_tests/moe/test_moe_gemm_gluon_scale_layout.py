@@ -14,7 +14,6 @@ from types import SimpleNamespace
 import pytest
 from triton.experimental.gluon import language as gl
 
-from aiter.ops.triton._gluon_kernels.gfx950.moe import _frozen as frozen
 from aiter.ops.triton._gluon_kernels.gfx950.moe import _mfma
 from aiter.ops.triton._gluon_kernels.gfx950.moe import _pipeline as buffered
 from aiter.ops.triton._gluon_kernels.gfx950.moe import moe_gemm as kernel
@@ -183,7 +182,7 @@ def test_packed_words_and_selectors_match_producer(
     assert len(physical_word) == len(producer) // 4
     for phase in (0, 1):
         selectors = layout.scale_packed_sel(operand, phase)
-        # Retain the frozen K256 contract, including its nontrivial byte order.
+        # Retain the K256 contract, including its nontrivial byte order.
         assert selectors == (
             [0, 2, 1, 3] if block_k == 256 else [2 * phase, 2 * phase + 1]
         )
@@ -266,15 +265,12 @@ def test_wide_packed_scale_slot_fragment_layout_matches_producer(
     "changes,k,diagnostic",
     [
         ({"BLOCK_K": 64, "VGPR_PREFETCH_K": 64}, 7168, None),
-        ({"FROZEN_STEP": True}, 7168, None),
         ({}, 384, "complete"),
     ],
 )
 def test_invalid_packed_k128_configs_are_rejected(changes, k, diagnostic):
-    # A FROZEN_STEP build is validated by the frozen snapshot's own copy.
-    check = frozen._validate_frozen if changes.get("FROZEN_STEP") else validate
     with pytest.raises(AssertionError, match=diagnostic):
-        check(_config(**changes), 4096, k)
+        validate(_config(**changes), 4096, k)
 
 
 class _HostView:
@@ -323,31 +319,6 @@ def test_dot_helpers_forward_scale_phase(monkeypatch, block_k, dtype, phase):
     assert calls == []
     assert _mfma._maybe_block_dot.fn(*args, True, phase) == 14
     assert len(calls) == 1
-
-
-@pytest.mark.parametrize("phase", [0, 1])
-def test_frozen_dot_helper_forwards_scale_phase(monkeypatch, phase):
-    tc = _HostView(
-        _config(
-            BLOCK_K=256,
-            VGPR_PREFETCH_K=256,
-            FROZEN_STEP=True,
-        )
-    )
-    layout = _HostView(frozen._compute_frozen_layout(tc.config))
-    fc = _HostView(tc.func_cfg)
-    phases = []
-
-    def dot(_a, _a_scale, _b, _b_scale, acc, _fc, _tc, _layout, k_phase):
-        phases.append(k_phase)
-        return acc + 1
-
-    monkeypatch.setattr(gl, "static_range", range)
-    monkeypatch.setattr(frozen, "_dot", dot)
-    a = ("A", "A-scale")
-    b = ("B", "B-scale")
-    assert frozen._maybe_block_dot.fn(a, b, 13, 1, fc, tc, layout, True, phase) == 14
-    assert phases == [phase]
 
 
 @dataclass

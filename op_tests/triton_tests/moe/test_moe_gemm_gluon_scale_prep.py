@@ -128,20 +128,14 @@ def test_stage1_capability_uses_the_selected_default_geometry(k):
     assert ok, why
 
 
-def test_explicit_and_frozen_configs_keep_their_geometry(monkeypatch):
+def test_explicit_configs_keep_their_geometry():
     cfg = host.get_gluon_config(128, 512, 2560, DtypeQuant.MXFP8, DtypeQuant.MXFP8)
     explicit = _spec(config_items=tuple(sorted(cfg.items())))[4]
     assert explicit == cfg
-    monkeypatch.setenv("AITER_TRITON_MOE_GLUON_FROZEN_STEP", "1")
-    host._launch_spec.cache_clear()
-    host._get_gluon_config_cached.cache_clear()
-    frozen = _spec()[4]
-    assert frozen["FROZEN_STEP"]
-    assert not frozen["A_SCALE_SORTED_SHUFFLED"] and not frozen["B_SCALE_SHUFFLED"]
 
 
 @pytest.mark.parametrize("field,value", [
-    ("BLOCK_K", 64), ("FROZEN_STEP", True),
+    ("BLOCK_K", 64),
     ("mfma_instr_shape", (32, 32, 64)),
 ])
 def test_incompatible_k128_geometry_refuses_scale_preparation(field, value):

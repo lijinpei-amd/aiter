@@ -7,7 +7,6 @@ import math
 
 import pytest
 
-from aiter.ops.triton._gluon_kernels.gfx950.moe._frozen import _validate_frozen
 from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import maybe_unwrap
 from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import KernelLayout
 from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import Schedule
@@ -129,19 +128,6 @@ def test_shuffled_scale_k_cannot_be_narrower_than_payload_k():
     )
     with pytest.raises(AssertionError):
         validate(tc, 4096, 7168)
-
-
-def test_frozen_shuffled_scales_reject_k_wider_than_256():
-    tc = _config(
-        BLOCK_K=512,
-        SCALE_SLOT_K=16,
-        VGPR_PREFETCH_K=512,
-        FROZEN_STEP=True,
-    )
-    with pytest.raises(
-        AssertionError, match="BLOCK_K == SCALE_SLOT_K == 256"
-    ):
-        _validate_frozen(tc, 4096, 7168)
 
 
 @pytest.mark.parametrize(

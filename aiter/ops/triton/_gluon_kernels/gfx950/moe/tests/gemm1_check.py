@@ -105,58 +105,20 @@ def read_regs(cache_dir):
 #: regression. A paired A/B of the two binaries then measured -4.0 us, CI [-8.5, +0.6]:
 #: the new build is if anything faster, and the apparent regression was cross-run drift.
 #:
-#: The no-act build is listed BECAUSE it was the one previously missing. The act build
-#: was verified byte-identical every round while the no-act build silently changed, so
-#: "the frozen contract is untouched" was being asserted on incomplete evidence.
-#:
 #: A CHANGED line is not automatically a bug -- but it must be explained, not absorbed.
-#: (label, probe, FROZEN_STEP, NO_EPI, instrs, regs, out-sha, asm-md5)
+#: (label, probe, instrs, regs, out-sha, asm-md5)
 BUILD_REFS = [
-    (
-        "g4q  frozen act",
-        "q",
-        "1",
-        None,
-        2549,
-        "vgpr=384 agpr=128 sgpr=95 spill=0",
-        "0cfa77fb04450594",
-        "7f2e1712d857",
-    ),
-    (
-        "g4q  frozen no-act",
-        "q",
-        "1",
-        "1",
-        2321,
-        "vgpr=384 agpr=128 sgpr=95 spill=0",
-        "e7417a39061bafc5",
-        "68d330b516bd",
-    ),
     (
         "g4q  impl act",
         "q",
-        "0",
-        None,
         2757,
         "vgpr=388 agpr=132 sgpr=106 spill=0",
         "0cfa77fb04450594",
         "81ec5684b4f8",
     ),
     (
-        "bf16 frozen act",
-        "b",
-        "1",
-        None,
-        2190,
-        "vgpr=384 agpr=128 sgpr=100 spill=0",
-        "59d442f663991659",
-        "7c2fb1fd33d6",
-    ),
-    (
         "bf16 impl act",
         "b",
-        "0",
-        None,
         2386,
         "vgpr=388 agpr=132 sgpr=106 spill=0",
         "59d442f663991659",
@@ -172,12 +134,9 @@ def check_builds(gpu, job, learn=False):
 
     ok = True
     print("build identity")
-    for label, kind, fz, no_epi, n_ref, r_ref, sha_ref, md5_ref in BUILD_REFS:
+    for label, kind, n_ref, r_ref, sha_ref, md5_ref in BUILD_REFS:
         cache = job / ("bld_" + label.replace(" ", "_"))
         shutil.rmtree(cache, ignore_errors=True)
-        extra = {"AITER_TRITON_MOE_GLUON_FROZEN_STEP": fz}
-        if no_epi:
-            extra["AITER_TRITON_MOE_GLUON_NO_EPI"] = no_epi
         if kind == "q":
             cmd = [sys.executable, str(PROBES / "corr_probe_q.py"), "0"]
         else:
@@ -191,7 +150,7 @@ def check_builds(gpu, job, learn=False):
             ]
         proc = subprocess.run(
             cmd,
-            env=gluon_env(cache, gpu, extra),
+            env=gluon_env(cache, gpu),
             cwd=str(REPO),
             capture_output=True,
             text=True,

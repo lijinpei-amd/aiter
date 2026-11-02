@@ -3,13 +3,12 @@
 `moe_gemm.py` takes its options from `KernelFuncConfig` and
 `KernelTuningConfig`; it does not read the environment. The host launcher still
 translates legacy benchmark environment variables, so `~/gluon_cold_bench.sh`
-continues to select the recorded impl and frozen configurations.
+continues to select the recorded impl configuration.
 
 The low-level entry points `_moe_gluon_gemm1` and `_moe_gluon_gemm2` and launch
 metadata live in `_entry.py`. Each entry constructs `KernelFuncConfig` and
-`KernelTuningConfig` from the launch specs and dispatches once to the live body in
-`moe_gemm.py` or the self-contained reference body in `_frozen.py`, alongside
-constexpr `N` and `K` and a runtime `NUM_K` scalar.
+`KernelTuningConfig` from the launch specs and calls the body in `moe_gemm.py`,
+with constexpr `N` and `K` and a runtime `NUM_K` scalar.
 The host computes `NUM_K = K // BLOCK_K` and disables specialization of that
 argument. Shape and layout calculations may still use constexpr `K`; the K-loop
 bounds derive from the runtime scalar. The A-scale row stride is constexpr so
@@ -17,8 +16,7 @@ raw rows retain their 4- or 8-byte alignment when they are not 16-byte aligned.
 The host caches the two specs and
 dimensions as four constexpr arguments. `_pipeline.py` implements the live driver for
 shared and independent component depths together with its compile-time issue history
-and waits. `_frozen.py` owns the preserved LDS,
-dot, pipeline-state, loop, drain, and final-MFMA path.
+and waits.
 `_layout.py` owns operation shapes, data layouts, A/B HBM offsets, and slot indices;
 `_epilogue.py` owns output activation, quantization, staging, and stores. The host
 launch API is unchanged.
@@ -35,7 +33,6 @@ mismatch before preparing scales or launching the GEMM.
 | --- | --- |
 | `DS_READ_A_PAYLOAD_IN_MFMA`, `DS_READ_A_SCALE_IN_MFMA`, `DS_READ_B_PAYLOAD_IN_MFMA`, `DS_READ_B_SCALE_IN_MFMA` | Independent booleans selecting whether each component read belongs to the MFMA region rather than the memory region. Components loaded directly into registers follow the same placement. |
 | `SCHED_MODE` | `SchedMode.NONE`, `IGLP_0`, `IGLP_1`, `MFMA_16`, or `MFMA_8`. Hints apply outside compiler warp-pipeline regions. |
-| `FROZEN_STEP` | Select the preserved reference body in `_frozen.py`, with an unfused final MFMA. Its existing restrictions on component overrides, register flags and packed K128 scales remain. |
 | `SOFF_UNROLL` | Advance HBM pointers once per unrolled body and use scalar offsets within it. With packed K128 scales and odd unroll, use per-fill pointer advances so scale-word phases remain correct. |
 | `SCALE_FILL_MID` | At a 2x2 mini-tile split, fill scales in the middle panes; wait counts use the same setting. |
 | `UNROLL_EPILOGUE` | Statically expand the live pipeline's finite main-loop remainder. Disable it to use a runtime remainder loop and reduce register pressure; the runtime loop requires every active scale to advance once per payload step. Defaults to `True`. |
@@ -54,8 +51,7 @@ the scale K-step ratio also participates
 directly. This returns every ring and scale phase to its initial state at the end
 of a complete unrolled body. For example, active depths 2 and 3 have period 6:
 requested `K_UNROLL=4` becomes `UNROLL=12`, and requested `K_UNROLL=7` becomes
-`UNROLL=42`. Absent scales never participate. `FROZEN_STEP` retains its existing
-rejection of explicit component-depth and register-storage options.
+`UNROLL=42`. Absent scales never participate.
 
 Placement is split in two. The tuning config only states the knob policy,
 `allow_component_via_lds((operand, is_scale))`, read from
@@ -88,7 +84,7 @@ This guarantees at least one complete runtime unrolled body. Configurations that
 need only the mandatory first peel have
 `NUM_K >= PIPELINE_DEPTH + UNROLL + 1`. `K % BLOCK_K == 0` and all
 layout-specific divisibility rules still apply, including complete K256 words
-for packed K128 scales. The selected live or frozen pipeline validator applies
+for packed K128 scales. The pipeline validator applies
 the resolved-depth and K checks beside `_validate.validate`. The
 launcher checks depths and K divisibility before preparation, then validates the
 complete effective configuration before launch. The final check matters when
@@ -272,7 +268,7 @@ dequantization, including a per-tensor input scale. They are benchmark ablations
 If `epilogue` is omitted, the host accepts the legacy `NO_EPI` value; an explicit
 mode overrides it.
 
-## Fixed behavior and the frozen reference
+## Fixed behavior
 
 `WAIT_BIAS`, `NO_MFMA`, and `MEM_PRIO` no longer control the live kernel.
 The live kernel always uses late LDS-read retirement and relaxed epilogue loads,
@@ -283,12 +279,9 @@ stages the whole block before its flush. The interleaved activation passes
 alternate packing). Eligible live gate/up split kernels fuse the final activation
 into the MFMA drain.
 
-The frozen body keeps its fixed prologue fence and literal priority instructions,
-its runtime loop and drain, and its original LDS and dot-selection behavior in
-`_frozen.py`. It retains an unfused final MFMA and its existing restrictions. It
-does not acquire the live step's read-placement or scheduling options. Use the
-complete frozen recipe from the cold benchmark wrapper when comparing it with the
-best impl recipe.
+The frozen reference body (`_frozen.py`, `FROZEN_STEP`) and its manual
+warp-pipeline rendezvous (`WARP_PIPELINE=2`) were removed. The records below still
+name it as a control arm.
 
 The encoded-code comparisons and timing results below describe earlier
 refactors, before the unified runtime loop. The current refactor's source

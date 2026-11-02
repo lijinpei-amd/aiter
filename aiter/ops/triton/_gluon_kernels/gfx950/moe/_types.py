@@ -354,8 +354,6 @@ class TuningSpec(NamedTuple):
     DS_READ_B_PAYLOAD_IN_MFMA: bool = False
     DS_READ_B_SCALE_IN_MFMA: bool = False
     SCHED_MODE: int = int(SchedMode.NONE)
-    #: Dispatch to the preserved reference body in ``_frozen.py``.
-    FROZEN_STEP: bool = False
     #: Advance HBM pointers per unrolled body and address its steps through soffset.
     SOFF_UNROLL: bool = False
     #: At a 2x2 slot split, fill scales in the two middle panes.

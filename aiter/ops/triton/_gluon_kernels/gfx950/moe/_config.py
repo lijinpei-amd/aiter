@@ -228,7 +228,6 @@ class KernelTuningConfig:
     DS_READ_B_PAYLOAD_IN_MFMA: gl.constexpr
     DS_READ_B_SCALE_IN_MFMA: gl.constexpr
     SCHED_MODE: gl.constexpr
-    FROZEN_STEP: gl.constexpr
     SOFF_UNROLL: gl.constexpr
     SCALE_FILL_MID: gl.constexpr
     ALLOW_B_VIA_LDS: gl.constexpr
@@ -281,7 +280,6 @@ class KernelTuningConfig:
         DS_READ_B_PAYLOAD_IN_MFMA=False,
         DS_READ_B_SCALE_IN_MFMA=False,
         SCHED_MODE=int(SchedMode.NONE),
-        FROZEN_STEP=False,
         SOFF_UNROLL=False,
         SCALE_FILL_MID=False,
         ALLOW_B_VIA_LDS=True,
@@ -319,7 +317,7 @@ class KernelTuningConfig:
         self.expert_scale_cache_modifier = gl.constexpr(expert_scale_cache_modifier)
         self.result_cache_modifier = gl.constexpr(result_cache_modifier)
         self.result_scale_cache_modifier = gl.constexpr(result_scale_cache_modifier)
-        # int, not bool: WarpPipeline has three values and True still lands on COMPILER.
+        # int, not bool: WarpPipeline has two values and True still lands on COMPILER.
         self.WARP_PIPELINE = gl.constexpr(int(WARP_PIPELINE))
         self.VGPR_PREFETCH_K = gl.constexpr(int(VGPR_PREFETCH_K))
         self.A_SCALE_SORTED_SHUFFLED = gl.constexpr(bool(A_SCALE_SORTED_SHUFFLED))
@@ -332,7 +330,6 @@ class KernelTuningConfig:
         self.DS_READ_B_PAYLOAD_IN_MFMA = gl.constexpr(bool(DS_READ_B_PAYLOAD_IN_MFMA))
         self.DS_READ_B_SCALE_IN_MFMA = gl.constexpr(bool(DS_READ_B_SCALE_IN_MFMA))
         self.SCHED_MODE = gl.constexpr(int(SCHED_MODE))
-        self.FROZEN_STEP = gl.constexpr(bool(FROZEN_STEP))
         self.SOFF_UNROLL = gl.constexpr(bool(SOFF_UNROLL))
         self.SCALE_FILL_MID = gl.constexpr(bool(SCALE_FILL_MID))
         self.ALLOW_B_VIA_LDS = gl.constexpr(bool(ALLOW_B_VIA_LDS))
@@ -424,7 +421,6 @@ class KernelTuningConfig:
         return bool(flag.value)
 
     # -- inter-wave ping-pong (WarpPipeline) ----------------------------------------
-    # NONE and COMPILER share the live step body; MANUAL selects the frozen body.
     # See _lang.pick_warp_pipeline_stage.
 
     @gluon.constexpr_function
@@ -436,11 +432,6 @@ class KernelTuningConfig:
     def warp_pipeline_compiler(self):
         """Hand the mfma/mem halves to TritonAMDGPUWarpPipeline."""
         return self.WARP_PIPELINE.value == int(WarpPipeline.COMPILER)
-
-    @gluon.constexpr_function
-    def warp_pipeline_manual(self):
-        """The hand-emitted rendezvous -- ``_pipeline_step_frozen`` only, for now."""
-        return self.WARP_PIPELINE.value == int(WarpPipeline.MANUAL)
 
     # -- commit-group granularity (WaitCommitScheme) --------------------------------
     # Emission and wait arithmetic use the same copy schedule and group boundaries.

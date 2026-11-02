@@ -3,7 +3,7 @@
 These rules apply to the generator code: `gluon.constexpr_function`s, aggregate
 constructors and methods, and host Python, the code that decides what the kernel
 emits. The generated code, the `@gluon.jit` functions, takes whatever shape reads
-best for the kernel. `_frozen.py` is a snapshot; it keeps its own names.
+best for the kernel.
 
 ## Fields, not accessors
 

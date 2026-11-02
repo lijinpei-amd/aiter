@@ -746,13 +746,8 @@ _step = _step_live
 
 @gluon.jit
 def _run_buffered_pipeline(pc, ptrs, NUM_K):
-    tc: gl.constexpr = pc.tuning_cfg
     layout: gl.constexpr = pc.layout
     sched: gl.constexpr = pc.schedule
-    gl.static_assert(
-        not tc.warp_pipeline_manual(),
-        "the live pipeline requires WARP_PIPELINE=0 or 1",
-    )
     gl.static_assert(
         layout.num_prefetch_k_slots == layout.num_k_slots,
         "the pipeline requires VGPR_PREFETCH_K == BLOCK_K",

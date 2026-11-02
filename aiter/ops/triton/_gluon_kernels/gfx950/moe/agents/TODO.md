@@ -133,9 +133,8 @@ Precondition). The constexpr `K` (`CFG_K`) still reaches the live kernel in four
 
 Also:
 
-- `A_HIDDEN_DIM` and `B_HIDDEN_DIM` are constexpr `K` that nothing in the live path
+- `A_HIDDEN_DIM` and `B_HIDDEN_DIM` are constexpr `K` that nothing in the kernel
   reads.
-- `_frozen.py` takes a constexpr `K` and keeps it: pass it only to `FROZEN_STEP` builds.
 - The launch metadata reads `CFG_K` for the kernel name and flops.
 - The host picks the tuning config by `(M, N, K)`, so one binary serves only the `K`
   that share a config.

@@ -10,13 +10,10 @@ prints the provenance it used so a number can always be traced back to a build.
 
     python scripts/gluon_moe_gemm1_run_best.py                 # perf + tests
     python scripts/gluon_moe_gemm1_run_best.py --perf --rounds 3
-    python scripts/gluon_moe_gemm1_run_best.py --ab AITER_TRITON_MOE_GLUON_FROZEN_STEP
+    python scripts/gluon_moe_gemm1_run_best.py --ab AITER_TRITON_MOE_GLUON_SOFF_UNROLL
 
 ``--ab KEY`` interleaves KEY=0 against KEY=1 round by round and reports paired
-deltas. Use it while refactoring ``_pipeline._step_live``: ``FROZEN_STEP=1`` runs
-``_pipeline_step_frozen``, the verbatim snapshot of the step this number was measured
-with, so a refactor is compared against the known-good schedule rather than against a
-remembered figure. Sequential sweeps have disagreed in sign with interleaved ones
+deltas. Sequential sweeps have disagreed in sign with interleaved ones
 repeatedly on this kernel, which is why --ab interleaves rather than running one arm
 after the other.
 

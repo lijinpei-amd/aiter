@@ -1,0 +1,129 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""Runtime loop bounds of the component pipeline."""
+
+import os
+
+import pytest
+import torch
+
+from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import KernelLayout
+from aiter.ops.triton._gluon_kernels.gfx950.moe._schedule import Schedule
+from aiter.ops.triton._gluon_kernels.gfx950.moe._types import DtypeQuant
+from aiter.ops.triton.moe import moe_op_gemm_gluon as host
+from aiter.ops.triton.moe.moe_op_gemm_a4w4 import moe_gemm_torch
+from op_tests.triton_tests.utils.mxfp_ref import upcast_from_mxfp
+from aiter.ops.triton.utils._triton.arch_info import get_arch
+from op_tests.triton_tests.moe.test_moe_gemm_gluon_registers import (
+    _build_register_case,
+    _launch_register_case,
+    _register_config,
+)
+
+
+@pytest.mark.parametrize("gated", [False, True], ids=["gemm2", "gemm1"])
+@pytest.mark.parametrize("depth", [2, 3])
+@pytest.mark.parametrize("dtype", ["bf16", "mxfp4"])
+def test_same_compiled_entry_honors_runtime_num_k(gated, depth, dtype, monkeypatch):
+    if get_arch() != "gfx950":
+        pytest.skip("Gluon MoE kernels are gfx950 only.")
+    for name in os.environ:
+        if name.startswith("AITER_TRITON_MOE_GLUON_"):
+            monkeypatch.delenv(name)
+    monkeypatch.setenv("AITER_TRITON_MOE_GLUON_B_PRESHUFFLED", "1")
+    if dtype == "bf16":
+        case = _build_register_case(dtype, m=257, n=512, k=2048, experts=4, topk=2)
+        x_ref, w_ref = case.x, case.w
+        quant = DtypeQuant.BF16
+    else:
+        case = _build_register_case(dtype)
+        x_ref = upcast_from_mxfp(case.x, case.xs, torch.bfloat16, axis=-1)
+        w_ref = upcast_from_mxfp(case.w, case.ws, torch.bfloat16, axis=1)
+        quant = DtypeQuant.MXFP4
+    if not gated:
+        case.output = torch.empty_like(case.raw).unsqueeze(0)
+    config = dict(
+        _register_config(dtype),
+        NUM_LDS_BUFFER=0,
+        A_NUM_BUFFER=depth,
+        B_NUM_BUFFER=depth,
+        A_SCALE_NUM_BUFFER=depth,
+        B_SCALE_NUM_BUFFER=depth,
+    )
+    assert case.route.block_m == config["BLOCK_M"]
+    tc = host._probe_tuning_config(config, quant, quant)
+    layout = KernelLayout(tc)
+    schedule = Schedule(tc, layout, case.k)
+    full_num_k = case.k // config["BLOCK_K"]
+    minimum = sum(
+        host._cval(value)
+        for value in (schedule.depth, schedule.peeled, schedule.unroll)
+    )
+    # Depth three exercises every specialized drain phase in the same binary.
+    short_counts = (minimum + 1,) if depth == 2 else range(minimum, minimum + depth)
+    references = {full_num_k: case.expected if gated else case.raw}
+    for short_num_k in short_counts:
+        short_k = short_num_k * config["BLOCK_K"]
+        assert short_num_k < full_num_k
+        assert host._validate_selected_pipeline(tc, layout, short_k)
+        prefix = moe_gemm_torch(
+            x_ref[:, :short_k].float(),
+            w_ref[:, :short_k, :].float(),
+            None,
+            case.route,
+            case.gather,
+        )
+        if gated:
+            gate, up = prefix.chunk(2, dim=-1)
+            prefix = torch.nn.functional.silu(gate) * up
+        references[short_num_k] = prefix
+    captured = {}
+
+    def capture_launch(kernel, grid, args, *_metadata):
+        captured.update(kernel=kernel, grid=grid, args=args)
+
+    monkeypatch.setattr(host, "_fast_launch", capture_launch)
+    compiled = _launch_register_case(case, config, swiglu=gated, split=gated)
+    torch.testing.assert_close(
+        case.output[0], references[full_num_k], rtol=3e-4, atol=3e-5
+    )
+    kernel = captured["kernel"]
+    launch_args = list(captured["args"])
+    num_k_arg = kernel.arg_names.index("NUM_K")
+    cfg_k_arg = kernel.arg_names.index("CFG_K")
+    assert host._cval(launch_args[cfg_k_arg]) == case.k
+    function = compiled.function
+    run = compiled.run
+    stream = torch.cuda.current_stream().cuda_stream
+
+    def unexpected_jit(*_args, **_kwargs):
+        pytest.fail("changing NUM_K must execute the same compiled entry")
+
+    monkeypatch.setattr(kernel, "run", unexpected_jit)
+    previous = {}
+    for num_k in (*short_counts, full_num_k, *short_counts, full_num_k):
+        case.output.fill_(float("nan"))
+        launch_args[num_k_arg] = num_k
+        # Keep every layout/shape argument fixed, including CFG_K, A/B strides,
+        # and pointers. This invokes the already-loaded binary without JIT entry.
+        run(
+            captured["grid"],
+            1,
+            1,
+            stream,
+            function,
+            compiled.packed_metadata,
+            None,
+            None,
+            None,
+            *launch_args,
+        )
+        torch.testing.assert_close(
+            case.output[0], references[num_k], rtol=3e-4, atol=3e-5
+        )
+        if num_k in previous:
+            assert torch.equal(case.output.view(torch.int32), previous[num_k])
+        previous[num_k] = case.output.view(torch.int32).clone()
+        assert compiled.function == function
+        assert host._cval(launch_args[cfg_k_arg]) == case.k

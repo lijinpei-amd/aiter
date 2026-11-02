@@ -138,10 +138,10 @@ def _stage_epilogue_inputs(
         # waits place at their exact FIFO position: after the last main step, before
         # the first drain step. They therefore lengthen the wait only for reads whose
         # newest copy is older -- in practice the first drain step or two -- and not
-        # for the rest. Passing a blanket slack to every drain step, as the frozen
-        # path still does via WAIT_SLACK, would over-wait the later ones. There are
-        # none with neither vector present: EPI_LDS is only a layout-feasibility
-        # flag, and an empty group would still occupy a FIFO position.
+        # for the rest. Passing a blanket slack to every drain step would over-wait
+        # the later ones. There are none with neither vector present: EPI_LDS is
+        # only a layout-feasibility flag, and an empty group would still occupy a
+        # FIFO position.
         for _ in gl.static_range(schedule.epilogue_groups):
             gl.amd.cdna4.async_copy.commit_group()
     return _EpilogueInputs(bias_hbm_base, gammas_hbm_ptr, gamma_lds_ptr, bias_lds_ptr)

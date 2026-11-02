@@ -107,10 +107,8 @@ class DotKind(IntEnum):
 class WarpPipeline(IntEnum):
     """Which inter-wave ping-pong the K-loop step is built for.
 
-    ``NONE`` and ``COMPILER`` use the live component-pipeline driver. The live step
-    places MFMA and memory work in regions selected by
-    ``_lang.pick_warp_pipeline_stage``; the separate frozen body retains the
-    reference's manual rendezvous sequence.
+    The step places MFMA and memory work in regions selected by
+    ``_lang.pick_warp_pipeline_stage``.
 
     * ``NONE`` -- no borders. One wave group, the MFMAs and the memory work overlapped
       only by the machine scheduler.
@@ -118,13 +116,10 @@ class WarpPipeline(IntEnum):
       ``TritonAMDGPUWarpPipeline``, which turns the interleave into a two-wave-group
       ping-pong. Needs ``VGPR_PREFETCH_K == BLOCK_K`` and only applies inside the
       ``tl.range`` body.
-    * ``MANUAL`` -- the hand-emitted rendezvous instead of the pass. It is implemented
-      only by the frozen pipeline.
     """
 
     NONE = 0
     COMPILER = 1
-    MANUAL = 2
 
 
 class WaitCommitScheme(IntEnum):
@@ -156,10 +151,6 @@ def maybe_unwrap(x):
     reachable from a jit body ("Unsupported function referenced").
     """
     return x
-
-
-#: The pre-rename name, kept only for ``_frozen.py``, a snapshot that is not edited.
-unwrap = maybe_unwrap
 
 
 @gluon.constexpr_function

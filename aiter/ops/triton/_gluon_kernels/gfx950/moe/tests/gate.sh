@@ -13,7 +13,7 @@
 #   T0  schedule tables (CPU only, ~16 s)               byte-identical
 #   T0b KernelLayout fields, 224 configs (CPU, ~9 s)    byte-identical
 #   T1  symbolic emitter + config tests (~1.5 min)      all pass
-#   T2a frozen pipeline tests (~1 min cold, ~10 s warm) all pass
+#   T2a runtime NUM_K tests (~1 min cold, ~10 s warm)   all pass
 #   T2b tuned gemm1 builds + 2 determinism shas         --full; identity SAME, both PASS
 #   T2d assembly md5 of all 20 dispatchable cells       --full; byte-identical (~1 min)
 #
@@ -78,8 +78,8 @@ if [[ "$MODE" != "--fast" ]]; then
   [[ "$out" == *failed* || "$out" == *error* ]] && fail=1
 
   out=$(HIP_VISIBLE_DEVICES=$GPU timeout 1800 "$PY" -m pytest -q -p no:cacheprovider \
-    op_tests/triton_tests/moe/test_moe_gemm_gluon_frozen.py 2>&1 | tail -1)
-  echo "T2a frozen         $out"
+    op_tests/triton_tests/moe/test_moe_gemm_gluon_runtime_num_k.py 2>&1 | tail -1)
+  echo "T2a runtime NUM_K  $out"
   [[ "$out" == *failed* || "$out" == *error* ]] && fail=1
 fi
 

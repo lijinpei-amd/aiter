@@ -35,12 +35,6 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._entry import (
     _moe_gluon_gemm1,
     _moe_gluon_gemm2,
 )
-from aiter.ops.triton._gluon_kernels.gfx950.moe._frozen import (
-    _compute_frozen_layout,
-    _validate_frozen,
-    _validate_frozen_buffer_counts,
-    _validate_frozen_pipeline,
-)
 from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import KernelLayout
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     B_SCALE,
@@ -350,11 +344,8 @@ def _probe_lds_bytes(cfg: dict, dq_a, dq_b) -> int:
 def _probe_lds_bytes_uncached(cfg: dict, dq_a, dq_b) -> int:
     """LDS footprint of a candidate config, computed by the *aggregate* rather than by a
     second copy of the arithmetic -- the host and the device must not be able to
-    disagree about whether a config fits. A FROZEN_STEP config is sized by the frozen
-    snapshot's own layout, which is what its kernel allocates."""
+    disagree about whether a config fits."""
     tc = _probe_tuning_config(cfg, dq_a, dq_b)
-    if _cval(tc.FROZEN_STEP):
-        return _compute_frozen_layout(tc).lds_bytes()
     return _cval(KernelLayout(tc).lds_bytes)
 
 
@@ -391,13 +382,7 @@ def _probe_tuning_config(cfg: dict, dq_a, dq_b):
 
 
 def _validate_selected_pipeline(tuning_cfg, layout, K):
-    """Validate the pipeline the build runs. ``layout`` is the live layout, or None.
-
-    A FROZEN_STEP build is checked by the frozen snapshot against its own layout, so
-    ``layout`` is ignored there; None builds the live one only when it is needed.
-    """
-    if _cval(tuning_cfg.FROZEN_STEP):
-        return _validate_frozen_pipeline(tuning_cfg, K)
+    """Validate the pipeline the build runs. ``layout`` is the layout, or None."""
     if layout is None:
         layout = KernelLayout(tuning_cfg)
     return _validate_live_pipeline(tuning_cfg, layout, K)
@@ -739,8 +724,7 @@ def get_gluon_config_uncached(
             ),
             # Which inter-wave ping-pong the K-loop step lays borders down for, a
             # WarpPipeline: 0 none, 1 hand each pane's MFMAs and its ds_read/copy
-            # shadow to TritonAMDGPUWarpPipeline as an mfma/mem stage pair, 2 the
-            # hand-emitted rendezvous (FROZEN_STEP=1 only). 1 and 2 need
+            # shadow to TritonAMDGPUWarpPipeline as an mfma/mem stage pair. 1 needs
             # VGPR_PREFETCH_K == BLOCK_K.
             # Off by default. Was a bool, and 1 still means what True did.
             "WARP_PIPELINE": _env_int(
@@ -787,14 +771,13 @@ def get_gluon_config_uncached(
             "SCHED_MODE": _env_int(
                 "AITER_TRITON_MOE_GLUON_SCHED_MODE", int(SchedMode.NONE)
             ),
-            "FROZEN_STEP": bool(_env_int("AITER_TRITON_MOE_GLUON_FROZEN_STEP", 0)),
             "SOFF_UNROLL": bool(_env_int("AITER_TRITON_MOE_GLUON_SOFF_UNROLL", 0)),
             "SCALE_FILL_MID": bool(
                 _env_int("AITER_TRITON_MOE_GLUON_SCALE_FILL_MID", 0)
             ),
             "UNROLL_EPILOGUE": True,
             # Read the complete BLOCK_K payload stage into registers one pipeline step
-            # before its MFMAs consume it. The live and frozen drivers require this
+            # before its MFMAs consume it. The pipeline requires this
             # whole-stage handoff; there is no disabled or partial K-prefetch mode.
             "VGPR_PREFETCH_K": _env_int("AITER_TRITON_MOE_GLUON_VGPR_PREFETCH_K", bk),
         }
@@ -866,10 +849,6 @@ def _default_launch_config(
         small_grid,
         stream_expert_payload,
     )
-    if c["FROZEN_STEP"]:
-        # The frozen body is a pinned snapshot whose acceptance test is identical
-        # assembly, so none of the measured geometry overrides below may reshape it.
-        return c
     if (
         not small_grid
         and stream_expert_payload
@@ -1432,21 +1411,10 @@ def _launch_spec(
     # Storage can still change during scale preparation, which changes the exact
     # minimum K. Validate inherited depths and shape arithmetic now; validate the
     # complete effective configuration once preparation has resolved its layouts.
-    # A FROZEN_STEP build takes its checks and launch geometry from the frozen
-    # snapshot's own copies, as in _validate_launch_config, so no live KernelLayout
-    # is built for it. The snapshot has no grid_N; its N tile is BLOCK_N, the same
-    # divisor the live grid_N uses.
-    if _cval(tuning_cfg_host.FROZEN_STEP):
-        _validate_frozen_buffer_counts(tuning_cfg_host)
-        _compute_frozen_layout(tuning_cfg_host).num_k_tiles(K)
-        block_n = _cval(tuning_cfg_host.BLOCK_N)
-        assert N % block_n == 0, f"N ({N}) must be a multiple of BLOCK_N ({block_n})"
-        grid_n = N // block_n
-    else:
-        validate_buffer_counts(tuning_cfg_host)
-        layout_host = KernelLayout(tuning_cfg_host)
-        layout_host.num_k_tiles(K)
-        grid_n = _cval(layout_host.grid_N(N))
+    validate_buffer_counts(tuning_cfg_host)
+    layout_host = KernelLayout(tuning_cfg_host)
+    layout_host.num_k_tiles(K)
+    grid_n = _cval(layout_host.grid_N(N))
     # Keep each spec in one constexpr so launch specialization sees four leaves.
     constexpr_args = (
         gl.constexpr(func_spec),
@@ -1460,15 +1428,7 @@ def _launch_spec(
 
 @cache
 def _validate_launch_config(tuning_cfg, N, K):
-    """Validate each cached effective layout once, before any kernel launch.
-
-    A FROZEN_STEP build runs the frozen snapshot's own copies of the checks, over its
-    own layout, so a live validation change cannot move which frozen builds launch.
-    """
-    if _cval(tuning_cfg.FROZEN_STEP):
-        layout = _compute_frozen_layout(tuning_cfg)
-        _validate_frozen(tuning_cfg, N, K, layout)
-        return _validate_frozen_pipeline(tuning_cfg, K, layout)
+    """Validate each cached effective layout once, before any kernel launch."""
     layout = KernelLayout(tuning_cfg)
     validate(tuning_cfg, N, K, layout)
     return _validate_selected_pipeline(tuning_cfg, layout, K)
@@ -1566,8 +1526,6 @@ def _scale_shuffle_supported(cfg, operand):
         or (scale_k & (scale_k - 1)) != 0
     ):
         return False
-    if cfg.get("FROZEN_STEP", False):
-        return block_k == 256 and scale_k == scale_block_k
     if block_k == 128:
         # Preserve the K128 stage's dword-load eligibility: both non-K bytes
         # belong to this wave while the component pipeline retains the next half.

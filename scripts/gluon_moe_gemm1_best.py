@@ -5,8 +5,7 @@
 
 The host launcher translates this script's environment variables into kernel tuning
 configuration. ``BEST`` records the tuned recipe, including ``WAIT_COMMIT_SCHEME``,
-so measurements can be reproduced. The frozen reference owns its fixed rendezvous
-schedule.
+so measurements can be reproduced.
 
 Perf is measured the way the reported numbers were: ``rocprofv3 --kernel-trace`` over a
 saturating back-to-back launch loop, median of the dispatch durations with the warmup
@@ -58,16 +57,14 @@ BEST = {
     "AITER_TRITON_MOE_GLUON_SORTED_SCALES": "1",
     "AITER_TRITON_MOE_GLUON_SHUFFLED_W_SCALES": "1",
     "AITER_TRITON_MOE_GLUON_SCALE_FILL_MID": "1",
-    # WarpPipeline: 0 none, 1 the TritonAMDGPUWarpPipeline pass, 2 the hand-emitted
-    # rendezvous (which only _pipeline_step_frozen implements, so it needs FROZEN_STEP=1
-    # -- the live step refuses it rather than running unpipelined).
+    # WarpPipeline: 0 none, 1 the TritonAMDGPUWarpPipeline pass.
     "AITER_TRITON_MOE_GLUON_WARP_PIPELINE": "0",
     "AITER_TRITON_MOE_GLUON_DS_IN_MFMA": "1",
     "AITER_TRITON_MOE_GLUON_ACT_FAST_RCP": "1",
     # WaitCommitScheme.PER_OP: commit each async payload/scale copy and wait per
     # DS-read slot. Every arm runs this, including the cold-bench impl arm -- cold_bench
     # applies only the OV variable and gluon_moe_gemm1_check sets only WARP_PIPELINE
-    # and the llc flags. The frozen arm keeps its private snapshot's schedule.
+    # and the llc flags.
     "AITER_TRITON_MOE_GLUON_WAIT_COMMIT_SCHEME": "1",
 }
 

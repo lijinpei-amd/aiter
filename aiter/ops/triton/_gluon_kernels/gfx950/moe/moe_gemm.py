@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Live Gluon (gfx950 / CDNA4) MoE grouped GEMM body and helpers.
+"""Gluon (gfx950 / CDNA4) MoE grouped GEMM body and helpers.
 
-The entry points in :mod:`._entry` dispatch once between this live body and the
-self-contained reference body in :mod:`._frozen`:
+The entry points in :mod:`._entry` build the layout and call this body:
 
 * :func:`_moe_gluon_gemm1` -- gemm1 + fused activation. Gathers tokens according to the
   routing metadata and writes its output contiguously (dense, expert-sorted

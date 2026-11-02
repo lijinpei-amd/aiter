@@ -79,28 +79,14 @@ WARPS = 4
 #: Perf arms, interleaved in this order every round. `flydsl no-act` drops only the
 #: transcendentals (exp2 + rcp) and keeps the reduction shape and store byte count, so
 #: no MFMA and no store is DCE'd -- the delta is the swiglu and nothing else.
-#:
-#: **The Gluon contract is the FROZEN step, not impl.** ``_pipeline_step_frozen`` holds
-#: the best measured schedule, and it is what must not regress while
-#: ``_pipeline`` is being refactored. Frozen is NOT insulated from that work:
-#: it shares the epilogue, ``_ds_read_operand``, ``_maybe_block_dot``, the
-#: LDS helpers, the tuning config and the whole kernel body, so any change to those
-#: shows up here. Only the step itself is pinned.
-#:
-#: ``impl act`` rides along as a progress arm: during the refactor it says how far the
-#: live path is from the contract. It is not a regression gate -- it is expected to move.
 ARMS = [
-    ("frozen act",    "g4q", {"AITER_TRITON_MOE_GLUON_FROZEN_STEP": "1"}),
-    ("frozen no-act", "g4q", {"AITER_TRITON_MOE_GLUON_FROZEN_STEP": "1",
-                              "AITER_TRITON_MOE_GLUON_NO_EPI": "1"}),
     ("impl act",      "g4q", {}),
-    # Gate/up as N halves instead of column-interleaved. Compare against `impl act`,
-    # not against frozen: it changes the epilogue, which frozen shares, so the pair
-    # (impl act, impl split) is the only clean A/B. cold_bench permutes the weights
-    # when it sees GU_SPLIT, so the two arms compute the same thing bit for bit.
+    ("impl no-act",   "g4q", {"AITER_TRITON_MOE_GLUON_NO_EPI": "1"}),
+    # Gate/up as N halves instead of column-interleaved. cold_bench permutes the
+    # weights when it sees GU_SPLIT, so the two arms compute the same thing bit for bit.
     ("impl split",    "g4q", {"AITER_TRITON_MOE_GLUON_GU_SPLIT": "1"}),
     # ... plus the last K step peeled so the gate half's silu overlaps the linear
-    # half's MFMAs. Needs FROZEN_STEP off, which `impl` already is.
+    # half's MFMAs.
     ("impl split fuse", "g4q", {"AITER_TRITON_MOE_GLUON_GU_SPLIT": "1",
                                 "AITER_TRITON_MOE_GLUON_FUSE_ACT_MFMA": "1"}),
     ("flydsl act",    "fly", {}),
@@ -115,17 +101,15 @@ KERNEL_PAT = {"g8": "_moe_gluon_gemm1", "g4": "_moe_gluon_gemm1", "g4q": "_moe_g
 #: Recorded 2026-09-02. **Pooled over four independent 5-round runs** (20 paired
 #: samples), not one, because this comparison was measured four times that day on
 #: byte-identical Gluon machine code and the per-run estimates of
-#: "frozen - flydsl, act" came out +6.6, +8.8, +13.5 and +11.2. A gate anchored to any
+#: "Gluon - flydsl, act" came out +6.6, +8.8, +13.5 and +11.2. A gate anchored to any
 #: single one of those would false-alarm on the next. Absolute figures are the median of
 #: the per-run medians.
 #:
 #: The noise is asymmetric and it is worth knowing which way: across those runs the
-#: `flydsl act` median spans 2.6 us while `frozen act` spans 8.5 us and its worst round
+#: `flydsl act` median spans 2.6 us while the Gluon arm spans 8.5 us and its worst round
 #: pair spans 21 us. The Gluon kernel is markedly less reproducible cold than FlyDSL,
 #: so a Gluon-side "improvement" of <5 us in one run is not evidence of anything.
 BASELINE_ABS = {
-    "frozen act": 634.0,
-    "frozen no-act": 620.6,
     "impl act": 685.6,
     "flydsl act": 623.2,
     "flydsl no-act": 624.3,
@@ -133,18 +117,14 @@ BASELINE_ABS = {
 #: (label, minuend, subtrahend, pooled delta, envelope of the per-run 95% CIs).
 #: The envelope -- not a single run's CI -- is what the overlap test compares against,
 #: so the gate tolerates the observed between-run spread and fires only on a real move.
-#: The first two are the contract. "impl - frozen" is progress, not a gate: it is
-#: expected to shrink toward 0 as the refactor restores the manual schedule.
 BASELINE_PAIRED = [
     # Not a gate yet -- no recorded baseline; reported so the layout A/B is visible in
     # the same paired, drift-robust form as everything else.
     ("gate/up split - interleaved", "impl split", "impl act",       None, None),
     ("act/mfma fuse - split",       "impl split fuse", "impl split", None, None),
-    ("activation cost, frozen",  "frozen act",    "frozen no-act",  +12.5, (+3.9, +22.4)),
+    ("activation cost, impl",    "impl act",      "impl no-act",     None, None),
     ("activation cost, flydsl",  "flydsl act",    "flydsl no-act",   -1.2, (-8.3, +8.1)),
-    ("frozen - flydsl, act",     "frozen act",    "flydsl act",     +10.0, (-0.3, +18.0)),
-    ("frozen - flydsl, no-act",  "frozen no-act", "flydsl no-act",   -3.6, (-13.6, +8.1)),
-    ("impl - frozen, act",       "impl act",      "frozen act",     +52.1, (+43.4, +62.8)),
+    ("impl - flydsl, act",       "impl act",      "flydsl act",      None, None),
 ]
 
 #: Bit-exactness gates. The bf16 sha has been stable across every variant of this
@@ -275,13 +255,13 @@ def run_perf(rounds, gpu, job):
           + ("" if verdict == PASS
              else "  (a '!!' line means the new CI does not overlap the recorded one)"))
 
-    # Arm 0's cache, i.e. the FROZEN g4q build -- not the bf16 one run_best reports
+    # Arm 0's cache, i.e. the impl g4q build -- not the bf16 one run_best reports
     # (388/132/89), which has a different epilogue and different pressure. Spills must
     # stay 0: this kernel goes from ~630 us to ~4000 us the moment it spills.
     regs = read_regs(job / "coldcache_g4q_chk0r0")
     if regs:
-        print(f"registers (frozen, mxfp4 build): {regs}"
-              f"   (baseline vgpr=384 agpr=128 sgpr=95 spill=0)")
+        print(f"registers (impl, mxfp4 build): {regs}"
+              f"   (baseline vgpr=388 agpr=132 sgpr=106 spill=0)")
     return verdict != FAIL
 
 
@@ -309,22 +289,12 @@ def read_regs(cache_dir):
 #: regression. A paired A/B of the two binaries then measured -4.0 us, CI [-8.5, +0.6]:
 #: the new build is if anything faster, and the apparent regression was cross-run drift.
 #:
-#: The no-act build is listed BECAUSE it was the one previously missing. The act build
-#: was verified byte-identical every round while the no-act build silently changed, so
-#: "the frozen contract is untouched" was being asserted on incomplete evidence.
-#:
 #: A CHANGED line is not automatically a bug -- but it must be explained, not absorbed.
-#: (label, probe, FROZEN_STEP, NO_EPI, instrs, regs, out-sha, asm-md5)
+#: (label, probe, instrs, regs, out-sha, asm-md5)
 BUILD_REFS = [
-    ("g4q  frozen act",    "q", "1", None, 2549, "vgpr=384 agpr=128 sgpr=95 spill=0",
-     "0cfa77fb04450594", "7f2e1712d857"),
-    ("g4q  frozen no-act", "q", "1", "1",  2321, "vgpr=384 agpr=128 sgpr=95 spill=0",
-     "e7417a39061bafc5", "68d330b516bd"),
-    ("g4q  impl act",      "q", "0", None, 2757, "vgpr=388 agpr=132 sgpr=106 spill=0",
+    ("g4q  impl act",      "q", 2757, "vgpr=388 agpr=132 sgpr=106 spill=0",
      "0cfa77fb04450594", "81ec5684b4f8"),
-    ("bf16 frozen act",    "b", "1", None, 2190, "vgpr=384 agpr=128 sgpr=100 spill=0",
-     "59d442f663991659", "7c2fb1fd33d6"),
-    ("bf16 impl act",      "b", "0", None, 2386, "vgpr=388 agpr=132 sgpr=106 spill=0",
+    ("bf16 impl act",      "b", 2386, "vgpr=388 agpr=132 sgpr=106 spill=0",
      "59d442f663991659", "957ca25a510a"),
 ]
 
@@ -336,18 +306,15 @@ def check_builds(gpu, job, learn=False):
 
     ok = True
     print("build identity")
-    for label, kind, fz, no_epi, n_ref, r_ref, sha_ref, md5_ref in BUILD_REFS:
+    for label, kind, n_ref, r_ref, sha_ref, md5_ref in BUILD_REFS:
         cache = job / ("bld_" + label.replace(" ", "_"))
         shutil.rmtree(cache, ignore_errors=True)
-        extra = {"AITER_TRITON_MOE_GLUON_FROZEN_STEP": fz}
-        if no_epi:
-            extra["AITER_TRITON_MOE_GLUON_NO_EPI"] = no_epi
         if kind == "q":
             cmd = [sys.executable, str(MOE_RERUN / "corr_probe_q.py"), "0"]
         else:
             cmd = [sys.executable, str(MOE_RERUN / "corr_probe.py"),
                    "--mode", "determinism", "--reps", "0"]
-        proc = subprocess.run(cmd, env=gluon_env(cache, gpu, extra), cwd=str(REPO),
+        proc = subprocess.run(cmd, env=gluon_env(cache, gpu), cwd=str(REPO),
                               capture_output=True, text=True, timeout=3600, check=False)
         hits = glob.glob(str(cache / "**" / "_moe_gluon_gemm1.amdgcn"), recursive=True)
         if not hits:

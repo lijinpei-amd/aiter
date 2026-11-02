@@ -88,11 +88,9 @@ def validate(tc, N, K, layout=None):
     assert tc.WARP_PIPELINE.value in (
         int(WarpPipeline.NONE),
         int(WarpPipeline.COMPILER),
-        int(WarpPipeline.MANUAL),
     ), (
         f"WARP_PIPELINE {tc.WARP_PIPELINE.value} is not a WarpPipeline: "
-        f"NONE {int(WarpPipeline.NONE)}, COMPILER {int(WarpPipeline.COMPILER)}, "
-        f"MANUAL {int(WarpPipeline.MANUAL)}"
+        f"NONE {int(WarpPipeline.NONE)}, COMPILER {int(WarpPipeline.COMPILER)}"
     )
     if tc.warp_pipeline_enabled():
         assert layout.num_prefetch_k_slots.value == layout.num_k_slots.value, (
