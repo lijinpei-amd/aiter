@@ -30,7 +30,8 @@ from aiter.ops.triton.moe.moe_op_gemm_gluon import (
     moe_gemm_gluon,
 )
 from aiter.ops.triton.moe.moe_routing.routing import routing
-from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp, upcast_from_mxfp
+from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
+from op_tests.triton_tests.utils.mxfp_ref import upcast_from_mxfp
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from op_tests.triton_tests.moe.test_moe_gemm_a4w4 import assert_close
 

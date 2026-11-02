@@ -211,7 +211,7 @@ def e8m0_to_float(scales):
 
 
 def reference_sorted(data):
-    from aiter.ops.triton.moe.quant_moe import upcast_from_mxfp
+    from op_tests.triton_tests.utils.mxfp_ref import upcast_from_mxfp
 
     x, w = data["x"], data["w"]
     if data["xs"] is not None:

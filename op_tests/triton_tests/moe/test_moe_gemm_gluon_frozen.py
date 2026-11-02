@@ -21,7 +21,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._frozen import (
 from aiter.ops.triton._gluon_kernels.gfx950.moe._types import DtypeQuant, WarpPipeline
 from aiter.ops.triton.moe import moe_op_gemm_gluon as host
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import moe_gemm_torch
-from aiter.ops.triton.moe.quant_moe import upcast_from_mxfp
+from op_tests.triton_tests.utils.mxfp_ref import upcast_from_mxfp
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from op_tests.triton_tests.moe.test_moe_gemm_gluon_registers import (
     _build_register_case,
