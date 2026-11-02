@@ -570,7 +570,7 @@ _GEMM2_TILE = {
     "B_PRESHUFFLED": False,
     "ALLOW_B_VIA_LDS": True,
 }
-#: Register B at block_m 128: no B ring in LDS pays for the taller warp tile.
+#: Register B at block_m 64 and 128: no B ring in LDS pays for the taller warp tile.
 _GEMM2_REGISTER_B_TILE = dict(
     _GEMM2_TILE,
     tiles_per_warp=(4, 2),
@@ -608,15 +608,16 @@ _GEMM2_BM128_EXTRA = {
         (DtypeQuant.MXFP4, DtypeQuant.MXFP4, 128, 256),
         (DtypeQuant.MXFP8, DtypeQuant.MXFP4, 64, 256),
         (DtypeQuant.MXFP8, DtypeQuant.MXFP4, 128, 128),
-        (DtypeQuant.MXFP8, DtypeQuant.MXFP8, 64, 128),
+        (DtypeQuant.MXFP8, DtypeQuant.MXFP8, 64, 256),
         (DtypeQuant.MXFP8, DtypeQuant.MXFP8, 128, 128),
     ],
 )
 def test_gemm2_large_block_m_tile(dq_a, dq_b, block_m, block_k):
     N, K = 6144, 2048
     config = conf._default_launch_config(block_m, N, K, dq_a, dq_b, False, False)
+    # Both take the register-B tile; block_m 64 holds one M slot and BLOCK_K 256.
     expected = dict(
-        _GEMM2_REGISTER_B_TILE if block_m == 128 else _GEMM2_TILE,
+        _GEMM2_REGISTER_B_TILE,
         BLOCK_M=block_m,
         BLOCK_K=block_k,
         K_UNROLL=3 * 256 // block_k,
