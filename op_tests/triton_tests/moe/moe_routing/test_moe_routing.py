@@ -1,12 +1,13 @@
 import pytest
 import torch
 import torch.nn.functional as F
-import triton
 
+import aiter.ops.triton.moe.moe_routing.routing as routing_module
 from aiter.ops.topk import biased_grouped_topk_torch, grouped_topk_torch
 from aiter.ops.triton.moe.moe_routing.routing import (
     compute_expt_data_torch,
     routing,
+    routing_block_m,
     routing_from_hash,
     routing_torch,
 )
@@ -22,8 +23,29 @@ def _routing_block_m(n_tokens, n_expts_act, n_expts_tot):
     Uses the raw logits shape and the originally requested n_expts_act (before
     any shared-expert widening), exactly as `routing` does internally.
     """
-    tokens_per_expt = max(1, (n_tokens * n_expts_act) // n_expts_tot)
-    return max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
+    return routing_block_m(n_tokens, n_expts_act, n_expts_tot)
+
+
+@pytest.mark.parametrize(
+    "n_tokens, n_expts_act, n_expts_tot, expected",
+    [
+        (1, 6, 256, 16),  # decode: the 16 floor
+        (32, 8, 256, 16),  # mean 1
+        (512, 6, 384, 16),  # mean 8, exact: below the range, unchanged
+        (1023, 6, 384, 16),  # mean 15.98
+        (1024, 6, 384, 32),  # mean 16, exact: one level up
+        (1025, 6, 384, 16),  # mean 16.02, not exact: unchanged
+        (1024, 6, 256, 32),  # mean 24
+        (1024, 8, 256, 64),  # mean 32, exact: one level up
+        (1024, 4, 128, 64),  # mean 32, exact: one level up
+        (1056, 8, 256, 64),  # mean 33
+        (4096, 6, 384, 64),  # mean 64, exact: above the range, unchanged
+        (4096, 8, 256, 128),  # mean 128
+        (16384, 8, 256, 128),  # the 128 cap
+    ],
+)
+def test_routing_block_m(n_tokens, n_expts_act, n_expts_tot, expected):
+    assert routing_block_m(n_tokens, n_expts_act, n_expts_tot) == expected
 
 
 def assert_equal(ref, tri):
@@ -134,6 +156,40 @@ def test_routing(n_tokens, n_expts_tot, n_expts_act, sm_first):
 
     _assert_indx_equal(ref_gather, tri_gather)
     _assert_indx_equal(ref_scatter, tri_scatter)
+
+
+@pytest.mark.parametrize(
+    "n_tokens, n_expts_tot, n_expts_act", [(1024, 384, 6), (1024, 256, 8)]
+)
+def test_routing_block_m_changes_only_the_m_tiling(
+    monkeypatch, n_tokens, n_expts_tot, n_expts_act
+):
+    """The raised block_m keeps every routed row, gate and index; only the tiling
+    (padded offsets and the block map) follows the new block_m."""
+    if get_arch() not in ["gfx950", "gfx1250"]:
+        pytest.skip("MOE stack not fully implemented on non-CDNA4 arch yet.")
+    torch.manual_seed(2)
+    logits = init_data(n_tokens, n_expts_tot, device="cuda", dtype=torch.float32)
+    new, new_gather, new_scatter = routing(logits, n_expts_act)
+    old_block_m = new.block_m // 2
+    monkeypatch.setattr(routing_module, "routing_block_m", lambda *_: old_block_m)
+    old, old_gather, old_scatter = routing(logits, n_expts_act)
+
+    assert old.block_m == old_block_m
+    assert_equal(old_gather, new_gather)
+    assert_equal(old_scatter, new_scatter)
+    assert_equal(old.gate_scal, new.gate_scal)
+    assert_equal(old.expt_hist, new.expt_hist)
+    assert_equal(old.expt_data.token_offs_raw, new.expt_data.token_offs_raw)
+    n_gates = n_tokens * n_expts_act
+    for data in (old, new):
+        ref = compute_expt_data_torch(
+            data.expt_hist, n_expts_tot, n_gates, data.block_m
+        )
+        assert_equal(ref.token_offs_pad, data.expt_data.token_offs_pad)
+        assert_equal(ref.block_pid_map, data.expt_data.block_pid_map)
+    # The new tile holds each expert's rows in fewer M blocks.
+    assert new.n_blocks(n_gates, new.block_m) <= old.n_blocks(n_gates, old.block_m)
 
 
 # --------------------------

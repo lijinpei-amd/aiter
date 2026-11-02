@@ -12,22 +12,31 @@ Done 2026-11-02: GEMM2 has its own launch config (`_gemm2_launch_config`): shuff
 scales at block_m 16/32, and the BLOCK_N 256 16x16x128 tile at block_m 64/128. Kernel
 time on HIP 7, median of 4 back-to-back pairs, new/old geomean 0.82 (a4w4), 0.87
 (a8w4), 0.85 (a8w8). Gluon/FlyDSL geomean is now 1.06, 1.12 and 1.04 (was 1.29, 1.29
-and 1.23 in the same runs). Table: `bench_out/gluon_moe_regression/gemm2/
+and 1.23 in the same runs). Table (diagnostic: its source identity was not
+recorded, see its header): `bench_out/gluon_moe_regression/gemm2/
 compare_gemm2_20261102_r0.md`.
+
+Done 2026-11-02 (round 1): `routing.py::routing_block_m` takes one more power of two
+when the mean rows per expert is exactly 16 or 32, so those experts no longer split
+into a second M block. At dsv4-pro, glm52-base and minimax-m3 T=1024, GEMM2 new/old is
+0.70-0.91 (Gluon) and 0.67-0.98 (Triton); GEMM1 at the same cells is also faster
+(screened on HIP 4: Gluon -12..-32%, Triton -1..-36%). Gluon/FlyDSL geomean is now
+1.04, 1.10 and 1.01 (control in the same runs: 1.07, 1.12, 1.04). Table:
+`bench_out/gluon_moe_regression/gemm2/compare_gemm2_20261102_r1.md`.
 
 Remaining gap, largest first:
 
-- T=1024 (1.16-1.38 in all dtypes). The router's `block_m = next_pow2(T * topk / E)`
-  splits experts when the mean is a power of two: dsv4-pro (mean 16), glm52-base and
-  minimax-m3 (mean 32). Forcing block_m 32 at dsv4-pro measured 1795 -> 1213 us
-  (Gluon) and 1540 -> 998 us (Triton) before this config. `routing.py` is shared with
-  Triton, so measure both.
+- Mean 64 (dsv4-pro T=4096) splits the same way. block_m 128 is faster for a4w4 (-8%)
+  and a8w8 (-18%) but slower for a8w4 (+27%), whose block_m 128 tile is the weak one
+  (next item). Revisit the routing rule after that tile improves.
 - a8w4 at block_m 128 (1.13-1.26 at T 4096/16384): BLOCK_K 256 does not fit LDS with B
   staged. Try GEMM1's a8w4 block_m 128 tile (B in registers, preshuffled weights).
 - The separate `_reduce_grouped` kernel (434 us at glm52-base a8w8 T16384). FlyDSL adds
   the rows in its epilogue (`mode="atomic"`). A fused epilogue changes the summation
   order, so it needs a bit-exact design or an agreed tolerance.
 - T=1: a8w4 minimax-m3 is 17 us against 10 us; the shuffle does not help a8w4 at T=1.
+- T=8 (dsv4-flash a4w4/a8w4 1.10-1.11) and the block_m 128 a4w4 cells at T=4096
+  (glm52-base 1.15, minimax-m3 1.12).
 
 Check: kernel time with `aiter.test_common.run_perftest` on HIP 7 against FlyDSL's
 `us_stage2` (`op_tests/test_moe_2stage.py --kernel`), and the sha256 of every cell's
