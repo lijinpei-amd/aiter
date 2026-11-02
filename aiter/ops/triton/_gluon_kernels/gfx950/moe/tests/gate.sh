@@ -39,9 +39,12 @@ fail=0
 echo "### gate: $LABEL${MODE:+ $MODE}"
 
 base() {  # baseline file: $OUT's if recorded, else data/baseline/gate/, else tests/reference/gate/
-  local d
+  local d parts
   for d in "$OUT" "$TESTS_DIR/../data/baseline/gate" "$TESTS_DIR/reference/gate"; do
     [[ -f $d/$1 ]] && { echo "$d/$1"; return; }
+    # A long baseline is stored in parts, <name>.partNN.txt; join them in order.
+    parts=$(compgen -G "$d/${1%.txt}.part*.txt" | sort)
+    [[ -n $parts ]] && { cat $parts > "$OUT/joined_$1"; echo "$OUT/joined_$1"; return; }
   done
   echo "$TESTS_DIR/reference/gate/$1"
 }

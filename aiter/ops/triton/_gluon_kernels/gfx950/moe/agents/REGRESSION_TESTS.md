@@ -283,7 +283,12 @@ idle driver contexts on yours. Without it, the harness waits forever; see
 
 Stored in `data/baseline/` (see its `README.md`): gate files, a trimmed base suite and
 the `hv_new` cold run on physical GPU 5. `gate.sh` uses `data/baseline/gate/` when
-`$OUT` holds no baseline. Pass the directories to `compare_suite.py` and
+`$OUT` holds no baseline. The T0b baseline there is stored in parts of under 2000
+lines, `layout_fields_baseline.partNN.txt`; `gate.sh` joins them in order into
+`$OUT/joined_layout_fields_baseline.txt` before the compare. To re-record it, split the
+new `layout_fields_<label>.txt` at `== ` case lines the same way. It was re-recorded on
+2026-11-02 for the GEMM2 launch config (only `prod/g2-*` and
+`prod/scale_prep-mxfp8-noact` changed). Pass the directories to `compare_suite.py` and
 `compare_cold.py` as the "before" side. They supersede the 2026-10-13 references below
 for this toolchain.
 
