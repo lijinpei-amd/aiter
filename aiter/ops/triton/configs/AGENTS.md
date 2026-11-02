@@ -220,7 +220,7 @@ there is no file. Do not change the returned dict.
 | `A8W4` | `triton` | `bm<block_m>_n<N>_k<K>` | `BLOCK_SIZE_N`, `BLOCK_SIZE_K`, `num_warps`, `num_stages`, `waves_per_eu`, `matrix_instr_nonkdim` |
 | `A8W4` | `gluon` | `bm<block_m>_n<N>_k<K>_<bucket>`, then `bm<block_m>_any` | `block_n`, `block_k`, `num_buffers`, `num_warps`, `persistent_iters` |
 | `A4W4` | `gluon` | `bm<block_m>_n<N>_k<K>_<bucket>`, then `bm<block_m>_any` | `block_n`, `block_k`, `num_buffers`, `num_warps` |
-| `A4W4-GEMM2`, `A8W4-GEMM2`, `A8W8-GEMM2` | `gluon` (gfx950) | `bm<block_m>_any` | keys of the gfx950 Gluon MoE tuning config, e.g. `BLOCK_N`, `BLOCK_K`, `SLOT_M`, `SLOT_N`, `mfma_instr_shape`, `warps_per_cta`, `tiles_per_warp`, `NUM_LDS_BUFFER`, `K_UNROLL`, `VGPR_PREFETCH_K`, `GROUP_M`, `B_SCALE_SHUFFLED` |
+| `A4W4-GEMM2`, `A8W4-GEMM2`, `A8W8-GEMM2` | `gluon` (gfx950) | `bm<block_m>_any` | keys of the gfx950 Gluon MoE tuning config, e.g. `BLOCK_N`, `BLOCK_K`, `SLOT_M`, `SLOT_N`, `mfma_instr_shape`, `warps_per_cta`, `tiles_per_warp`, `NUM_LDS_BUFFER`, `K_UNROLL`, `VGPR_PREFETCH_K`, `WAVES_PER_EU`, `WAIT_COMMIT_SCHEME`, `GROUP_M`, `B_SCALE_SHUFFLED`, `B_PRESHUFFLED`, `ALLOW_B_VIA_LDS` |
 
 - `block_m` is the key. Do not put `BLOCK_SIZE_M` or `block_m` in an entry.
 - `<bucket>` comes from `m2bucket()`: `tiny` (M ≤ 8), `small` (M ≤ 32),
@@ -233,6 +233,9 @@ there is no file. Do not change the returned dict.
   it changes on top of the Python ladder of `moe_op_gemm_gluon_config.py`; a
   list value stands for a tuple. The Python code keeps the eligibility and
   resource checks and falls back to the ladder where an entry cannot run.
+  An entry with `"ALLOW_B_VIA_LDS": false` (B in registers) must also set
+  `"B_PRESHUFFLED": true`. The launch then keeps a preshuffled copy of the
+  weights on the weight tensor, so the weights use twice the memory.
 
 ## Conv
 

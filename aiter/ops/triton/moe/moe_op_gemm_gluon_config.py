@@ -808,9 +808,11 @@ def _gemm2_launch_config(
         new["GROUP_M"] = group_m
     key = _cfg_key(new)
     # The launch drops a shuffle it cannot prepare, so check that too:
-    # gluon_supported must judge the config that runs.
+    # gluon_supported must judge the config that runs. N and K multiples of 256
+    # satisfy _preshuffled_b, so register B only needs the entry to ask for it.
     if (
-        (new["B_SCALE_SHUFFLED"] and not _b_scale_shuffle_fits(new))
+        (not new["ALLOW_B_VIA_LDS"] and not new["B_PRESHUFFLED"])
+        or (new["B_SCALE_SHUFFLED"] and not _b_scale_shuffle_fits(new))
         or _pipeline_error(key, dq_a, dq_b, K) is not None
         or _probe_lds_bytes_cached(key, dq_a, dq_b) > LDS_USABLE_BYTES
     ):

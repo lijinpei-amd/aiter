@@ -24,19 +24,30 @@ into a second M block. At dsv4-pro, glm52-base and minimax-m3 T=1024, GEMM2 new/
 1.04, 1.10 and 1.01 (control in the same runs: 1.07, 1.12, 1.04). Table:
 `bench_out/gluon_moe_regression/gemm2/compare_gemm2_20261102_r1.md`.
 
+Done 2026-11-02 (round 2): the GEMM2 tuning is in the `A4W4-GEMM2`, `A8W4-GEMM2` and
+`A8W8-GEMM2` JSON families. B is in registers (preshuffled weights) at block_m 16, 32
+and 128; block_m 128 also takes the 4x2 warp tile, one wave per SIMD and per-stage
+commits, with BLOCK_K 256 (a4w4) or 128 (a8w4, a8w8). block_m 64 keeps B in LDS. Cost:
+the launch keeps a preshuffled copy of each GEMM2 weight on the tensor (twice the weight
+memory). Gluon/FlyDSL geomean is now 1.01, 1.02 and 0.98 (control in the same runs:
+1.04, 1.10, 1.01). Table: `bench_out/gluon_moe_regression/gemm2/
+compare_gemm2_20261102_r2.md`.
+
 Remaining gap, largest first:
 
-- Mean 64 (dsv4-pro T=4096) splits the same way. block_m 128 is faster for a4w4 (-8%)
-  and a8w8 (-18%) but slower for a8w4 (+27%), whose block_m 128 tile is the weak one
-  (next item). Revisit the routing rule after that tile improves.
-- a8w4 at block_m 128 (1.13-1.26 at T 4096/16384): BLOCK_K 256 does not fit LDS with B
-  staged. Try GEMM1's a8w4 block_m 128 tile (B in registers, preshuffled weights).
-- The separate `_reduce_grouped` kernel (434 us at glm52-base a8w8 T16384). FlyDSL adds
-  the rows in its epilogue (`mode="atomic"`). A fused epilogue changes the summation
-  order, so it needs a bit-exact design or an agreed tolerance.
-- T=1: a8w4 minimax-m3 is 17 us against 10 us; the shuffle does not help a8w4 at T=1.
-- T=8 (dsv4-flash a4w4/a8w4 1.10-1.11) and the block_m 128 a4w4 cells at T=4096
-  (glm52-base 1.15, minimax-m3 1.12).
+- The separate `_reduce_grouped` kernel: 2.5-3.5 us at T 1-8, 11.5 us at dsv4-flash
+  T=1024 and 434 us at glm52-base a8w8 T=16384. The two cells still above
+  1.10 (a8w4 dsv4-flash T=16384 1.13, a4w4 glm52-base T=4096 1.10) and the T=1 cells
+  (gaps 2.2-4.2 us) wait on it. FlyDSL adds the rows in its epilogue (`mode="atomic"`),
+  which is not deterministic. Plan: the last CTA that writes a token's rows adds them in
+  gate order, so the sum is bit-identical to `_reduce_grouped`.
+- Mean 64 (dsv4-pro T=4096) still splits into two M blocks. With the new block_m 128
+  tiles, block_m 128 is faster for all three dtypes there (screen: a4w4 1414 -> 1327 us,
+  a8w4 1538 -> 1488, a8w8 2593 -> 2231). Needs Triton and GEMM1 numbers before the
+  routing rule changes.
+- The full matrix in one process moves some cells by up to 6% on both backends (weight
+  placement). Isolated runs of the same cells agree within 0.2% when the kernels are
+  the same, so measure suspect cells alone.
 
 Check: kernel time with `aiter.test_common.run_perftest` on HIP 7 against FlyDSL's
 `us_stage2` (`op_tests/test_moe_2stage.py --kernel`), and the sha256 of every cell's

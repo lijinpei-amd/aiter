@@ -1,9 +1,13 @@
 {
     "bm16_any": {
-        "B_SCALE_SHUFFLED": true
+        "B_SCALE_SHUFFLED": true,
+        "B_PRESHUFFLED": true,
+        "ALLOW_B_VIA_LDS": false
     },
     "bm32_any": {
-        "B_SCALE_SHUFFLED": true
+        "B_SCALE_SHUFFLED": true,
+        "B_PRESHUFFLED": true,
+        "ALLOW_B_VIA_LDS": false
     },
     "bm64_any": {
         "BLOCK_N": 256,
@@ -44,13 +48,17 @@
             4
         ],
         "tiles_per_warp": [
-            2,
+            4,
             2
         ],
         "NUM_LDS_BUFFER": 3,
         "K_UNROLL": 3,
         "VGPR_PREFETCH_K": 256,
+        "WAVES_PER_EU": 1,
+        "WAIT_COMMIT_SCHEME": 3,
         "GROUP_M": 8,
-        "B_SCALE_SHUFFLED": true
+        "B_SCALE_SHUFFLED": true,
+        "B_PRESHUFFLED": true,
+        "ALLOW_B_VIA_LDS": false
     }
 }

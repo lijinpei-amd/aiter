@@ -562,7 +562,18 @@ _GEMM2_TILE = {
     "NUM_LDS_BUFFER": 3,
     "GROUP_M": 8,
     "B_SCALE_SHUFFLED": True,
+    "B_PRESHUFFLED": False,
+    "ALLOW_B_VIA_LDS": True,
 }
+#: Register B at block_m 128: no B ring in LDS pays for the taller warp tile.
+_GEMM2_REGISTER_B_TILE = dict(
+    _GEMM2_TILE,
+    tiles_per_warp=(4, 2),
+    WAVES_PER_EU=1,
+    WAIT_COMMIT_SCHEME=3,
+    B_PRESHUFFLED=True,
+    ALLOW_B_VIA_LDS=False,
+)
 
 
 @pytest.mark.parametrize(
@@ -580,7 +591,7 @@ def test_gemm2_large_block_m_tile(dq_a, dq_b, block_m, block_k):
     N, K = 6144, 2048
     config = conf._default_launch_config(block_m, N, K, dq_a, dq_b, False, False)
     expected = dict(
-        _GEMM2_TILE,
+        _GEMM2_REGISTER_B_TILE if block_m == 128 else _GEMM2_TILE,
         BLOCK_M=block_m,
         BLOCK_K=block_k,
         K_UNROLL=3 * 256 // block_k,
@@ -599,15 +610,16 @@ def test_gemm2_large_block_m_tile(dq_a, dq_b, block_m, block_k):
     ],
 )
 @pytest.mark.parametrize("block_m,small_grid", [(16, True), (16, False), (32, False)])
-def test_gemm2_small_block_m_shuffles_b_scales(dq_a, dq_b, block_m, small_grid):
+def test_gemm2_small_block_m_reads_preshuffled_b(dq_a, dq_b, block_m, small_grid):
     config = conf._default_launch_config(
         block_m, 7168, 3072, dq_a, dq_b, small_grid, False
     )
     ladder = conf.get_gluon_config(block_m, 7168, 3072, dq_a, dq_b, small_grid)
     changed = {name for name in config if config[name] != ladder[name]}
-    # Only the shuffle changes: GEMM2 does not take GEMM1's `.cg` hint for shuffled
+    # Only the B layout changes: GEMM2 does not take GEMM1's `.cg` hint for shuffled
     # MXFP8 scales.
-    assert changed == {"B_SCALE_SHUFFLED"}
+    assert changed == {"B_SCALE_SHUFFLED", "B_PRESHUFFLED", "ALLOW_B_VIA_LDS"}
+    assert config["B_PRESHUFFLED"] and not config["ALLOW_B_VIA_LDS"]
 
 
 @pytest.mark.parametrize(
@@ -694,6 +706,25 @@ def test_gemm2_tuning_is_read_from_its_family(monkeypatch):
     finally:
         conf._gemm2_launch_config.cache_clear()
     assert config["GROUP_M"] == 2
+
+
+def test_gemm2_register_b_entry_needs_preshuffled_weights(monkeypatch):
+    # The launch rejects register B on plain weights, so such an entry keeps the ladder.
+    tables = {
+        family: {
+            k: dict(v) for k, v in get_moe_dispatch(family, "gfx950", "gluon").items()
+        }
+        for family in ("A4W4-GEMM2", "A8W4-GEMM2", "A8W8-GEMM2")
+    }
+    tables["A4W4-GEMM2"]["bm32_any"]["B_PRESHUFFLED"] = False
+    monkeypatch.setattr(conf, "get_moe_dispatch", lambda name, *_: tables[name])
+    args = (32, 7168, 3072, DtypeQuant.MXFP4, DtypeQuant.MXFP4)
+    conf._gemm2_launch_config.cache_clear()
+    try:
+        config = conf._default_launch_config(*args, False, False)
+    finally:
+        conf._gemm2_launch_config.cache_clear()
+    assert config == conf.get_gluon_config(*args)
 
 
 def test_gemm2_group_m_environment_override_is_not_cached_away(monkeypatch):

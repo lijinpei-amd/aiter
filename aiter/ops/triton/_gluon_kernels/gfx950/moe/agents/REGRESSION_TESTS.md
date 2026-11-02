@@ -201,8 +201,8 @@ cannot pass.
   ran whole after its planning collection failed is collected again after the run;
   without node ids it is broken.
   `op_tests/triton_tests/moe/test_moe_gemm_gluon_suite_compare.py` tests these rules.
-- **Expected numbers:** 2649 passed / 20 failed / 22 skipped on 2026-11-02 (round 1
-  of the GEMM2 work: 2602 at `dac620634` plus 47 added tests). Earlier: 1862 passed /
+- **Expected numbers:** 2664 passed / 20 failed / 22 skipped on 2026-11-02 (round 2
+  of the GEMM2 work: 2602 at `dac620634` plus 62 added tests). Earlier: 1862 passed /
   20 failed / 22 skipped since the slot rename,
   which added 14 tests and renamed `scale_miniblocks` to `scale_slots` and its
   `mini_block` tests to `slot`. Against an older base, rename those IDs in a copy
