@@ -46,7 +46,7 @@ from triton.language.core import _aggregate as aggregate
 from triton.language.core import base_value
 from triton.language.extra.hip import libdevice as hip_libdevice
 
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.common_utils import strip_annotate
 
 from ._lang import MX_GROUP as MX_GROUP_INT

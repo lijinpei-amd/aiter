@@ -68,7 +68,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu_gate
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import pid_grid, remap_xcd
 
 from ._epilogue import _epi_bias_tiles, _epilogue_store, _stage_epilogue_inputs
 from ._lang import require_constexpr
