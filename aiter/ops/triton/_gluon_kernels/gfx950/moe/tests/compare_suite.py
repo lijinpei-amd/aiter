@@ -102,7 +102,9 @@ def compare(a, b):
             problems += [
                 f"NOW {b.outcomes.get(t, 'missing').upper()} {t}"
                 for t in sorted(a.tests & b.tests)
-                if a.outcomes.get(t) == "passed" and b.outcomes.get(t) != "passed"
+                # A new failure or error is already a NEW FAILURE line.
+                if a.outcomes.get(t) == "passed"
+                and b.outcomes.get(t) not in ("passed", "failed", "error")
             ]
     lines += problems
     ok = (

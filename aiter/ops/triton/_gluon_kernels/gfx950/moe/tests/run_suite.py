@@ -29,9 +29,9 @@ per test and an "N error" summary appended, so compare_suite.py fails on it. A
 unit that fails with out of GPU memory is rerun once, one worker per GPU, after
 the rest; its first log stays as <unit>.log.oom. DIR/units.json records each
 unit's tests, GPU and duration, and DIR/outcomes.json the outcome of every test
-(passed, failed, skipped or error), read from each unit's JUnit XML; compare_suite.py
-uses it to account for tests added since a baseline. --plan prints the units and the
-predicted wall time, and runs nothing. Ending the runner, by any signal including SIGKILL, kills
+(passed, failed, skipped or error), read from each unit's JUnit XML;
+compare_suite.py uses it to account for tests added since a baseline. --plan
+prints the units and the predicted wall time, and runs nothing. Ending the runner, by any signal including SIGKILL, kills
 every pytest process it started.
 """
 
@@ -284,7 +284,7 @@ def outcomes(xml, ids):
     """Node id -> outcome from one unit's JUnit XML; {} if the file is unreadable.
 
     A test case with an error (setup or teardown) counts as error, then failure, then
-    skip (xfail included, as in pytest's summary), else passed.
+    skip, else passed. The suite has no xfail tests; JUnit reports one as skipped.
     """
     try:
         cases = ET.parse(xml).getroot().iter("testcase")

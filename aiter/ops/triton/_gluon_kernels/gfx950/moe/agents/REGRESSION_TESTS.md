@@ -151,11 +151,11 @@ cannot pass.
   minutes cold (2088 s) back to back with the new one.
 - **Outputs:** one `$OUT/suite_<label>/<file>[.NN].log` per unit, whose last line is
   the pytest summary, `units.json` with each unit's tests, GPU and duration, and
-  `outcomes.json` with the outcome of every test, read from each unit's JUnit XML
-  (`<file>[.NN].xml`). A unit whose JUnit outcomes do not match its summary is
-  broken. A rerun of a label deletes the old outputs first. The console ends with the per-file
-  totals, `accounted N of N collected tests, 0 broken units: OK`, the longest unit
-  and the wall time.
+  `outcomes.json` with the outcome of every test, read from each unit's JUnit
+  XML (`<file>[.NN].xml`). A unit whose JUnit outcomes do not match its summary
+  is broken. A rerun of a label deletes the old outputs first. The console ends
+  with the per-file totals, `accounted N of N collected tests, 0 broken units: OK`,
+  the longest unit and the wall time.
 - **Broken units fail the comparison.** A unit that crashes, times out or leaves
   tests unaccounted for gets one `ERROR <test>` line per test.
 - **Collection failures:** a file that fails collection is collected again once, and
@@ -195,7 +195,9 @@ cannot pass.
   `outcomes.json` (made before 2026-11-02) cannot account for added tests and fails.
   When both runs have `outcomes.json`, a base pass that is now skipped fails too.
   `op_tests/triton_tests/moe/test_moe_gemm_gluon_suite_compare.py` tests these rules.
-- **Expected numbers:** 1862 passed / 20 failed / 22 skipped since the slot rename,
+- **Expected numbers:** 2649 passed / 20 failed / 22 skipped on 2026-11-02 (round 1
+  of the GEMM2 work: 2602 at `dac620634` plus 47 added tests). Earlier: 1862 passed /
+  20 failed / 22 skipped since the slot rename,
   which added 14 tests and renamed `scale_miniblocks` to `scale_slots` and its
   `mini_block` tests to `slot`. Against an older base, rename those IDs in a copy
   of the base logs first. 1848 / 20 / 22 after the `Schedule` refactor. Before it: 1812 / 58 / 22 at commit `1b24ca9db` (1811 / 58 / 22 at
