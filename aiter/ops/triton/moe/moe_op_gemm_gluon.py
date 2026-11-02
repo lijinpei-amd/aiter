@@ -134,6 +134,12 @@ def _small_grid(routing_data, M, N) -> bool:
     return grid_m * max(1, N // 128) < 512
 
 
+def _multi_block(routing_data, M) -> bool:
+    """True when the experts average at least two M blocks, so each expert's weights
+    are read by several CTAs and the launch writes a large intermediate."""
+    return M >= 2 * routing_data.block_m * routing_data.n_expts_tot
+
+
 def gluon_supported(
     *,
     x: torch.Tensor,
@@ -214,6 +220,7 @@ def gluon_supported(
             dq_b,
             apply_swiglu,
         ),
+        _multi_block(routing_data, y.shape[1]),
     )
     if N % cfg["BLOCK_N"] != 0:
         return False, f"N {N} % BLOCK_N {cfg['BLOCK_N']} != 0"
@@ -288,6 +295,7 @@ def _launch_spec(
     gate_up_split=False,
     epilogue=int(EpilogueMode.DEFAULT),
     stream_expert_payload=False,
+    multi_block=False,
 ):
     """Host-side constexpr work, memoised.
 
@@ -308,6 +316,7 @@ def _launch_spec(
             small_grid,
             act is not None,
             stream_expert_payload,
+            multi_block,
         )
     )
     assert c["BLOCK_M"] == block_m, (
@@ -829,6 +838,7 @@ def moe_gemm_gluon(
             gate_up_split,
             epilogue,
             stream_expert_payload,
+            _multi_block(routing_data, y.shape[1]),
         )
 
     grid_n, constexpr_args, num_warps, waves_per_eu, _cfg, _tc = _spec(

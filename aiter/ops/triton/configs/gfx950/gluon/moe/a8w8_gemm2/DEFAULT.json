@@ -61,5 +61,9 @@
         "B_PRESHUFFLED": true,
         "ALLOW_B_VIA_LDS": false,
         "DS_READ_A_SCALE_IN_MFMA": true
+    },
+    "bm128_multi": {
+        "result_cache_modifier": ".cs",
+        "expert_cache_modifier": ""
     }
 }

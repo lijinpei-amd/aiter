@@ -5,9 +5,6 @@
         "ALLOW_B_VIA_LDS": false
     },
     "bm16_small": {
-        "B_SCALE_SHUFFLED": true,
-        "B_PRESHUFFLED": true,
-        "ALLOW_B_VIA_LDS": false,
         "BLOCK_N": 128
     },
     "bm32_any": {
@@ -67,5 +64,10 @@
         "B_PRESHUFFLED": true,
         "ALLOW_B_VIA_LDS": false,
         "ALLOW_B_SCALE_VIA_LDS": false
+    },
+    "bm128_multi": {
+        "result_cache_modifier": ".cs",
+        "expert_cache_modifier": "",
+        "expert_scale_cache_modifier": ""
     }
 }

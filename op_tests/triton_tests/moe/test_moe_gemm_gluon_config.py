@@ -642,7 +642,7 @@ def test_gemm2_small_block_m_reads_preshuffled_b(dq_a, dq_b, block_m, small_grid
     )
     ladder = conf.get_gluon_config(block_m, 7168, 3072, dq_a, dq_b, small_grid)
     changed = {name for name in config if config[name] != ladder[name]}
-    # Only the B layout changes, plus a narrower N tile on a small grid (T=1) where
+    # Only the B layout changes, plus a 128-column N tile on a small grid (T=1) where
     # the family has a bm16_small entry: GEMM2 does not take GEMM1's `.cg` hint for
     # shuffled MXFP8 scales.
     narrow = small_grid and dq_b == DtypeQuant.MXFP4
@@ -724,8 +724,12 @@ def gemm2_tables(monkeypatch):
 def test_gemm2_families_hold_tuning_values_only(family):
     table = get_moe_dispatch(family, "gfx950", "gluon")
     any_keys = {f"bm{bm}_any" for bm in conf._SUPPORTED_BLOCK_M}
-    small_keys = {f"bm{bm}_small" for bm in conf._SUPPORTED_BLOCK_M}
-    assert any_keys <= set(table) <= any_keys | small_keys
+    grid_keys = {
+        f"bm{bm}_{grid}"
+        for bm in conf._SUPPORTED_BLOCK_M
+        for grid in ("small", "multi")
+    }
+    assert any_keys <= set(table) <= any_keys | grid_keys
     known = set(
         conf.get_gluon_config_uncached(
             128, 4096, 2048, DtypeQuant.MXFP4, DtypeQuant.MXFP4
@@ -733,6 +737,42 @@ def test_gemm2_families_hold_tuning_values_only(family):
     )
     for entry in table.values():
         assert entry and set(entry) <= known - {"BLOCK_M"}
+
+
+@pytest.mark.parametrize(
+    "dq_a,dq_b",
+    [
+        (DtypeQuant.MXFP4, DtypeQuant.MXFP4),
+        (DtypeQuant.MXFP8, DtypeQuant.MXFP4),
+        (DtypeQuant.MXFP8, DtypeQuant.MXFP8),
+    ],
+)
+def test_gemm2_multi_block_streams_the_result_and_caches_the_weights(dq_a, dq_b):
+    # Experts with several M blocks (T=16384 in the matrix): the large intermediate is
+    # stored non-temporally, so it does not evict the weights the other blocks reuse.
+    # MXFP4 weight scales are cached too; MXFP8 ones keep their `.cg` hint.
+    args = (128, 6144, 2048, dq_a, dq_b, False, False)
+    multi = conf._default_launch_config(*args, multi_block=True)
+    plain = conf._default_launch_config(*args)
+    modifiers = (
+        "result_cache_modifier",
+        "expert_cache_modifier",
+        "expert_scale_cache_modifier",
+    )
+    scale = "" if dq_b == DtypeQuant.MXFP4 else ".cg"
+    assert [multi[k] for k in modifiers] == [".cs", "", scale]
+    assert plain["result_cache_modifier"] == "" and plain["expert_cache_modifier"]
+    changed = {k for k in multi if multi[k] != plain[k]}
+    assert changed <= set(modifiers)
+
+
+def test_gemm2_grid_entry_overlays_the_any_entry(gemm2_tables):
+    # bm16_small lists only what differs from bm16_any.
+    assert gemm2_tables["A4W4-GEMM2"]["bm16_small"] == {"BLOCK_N": 128}
+    small = conf._gemm2_tuned(16, DtypeQuant.MXFP4, DtypeQuant.MXFP4, "small")
+    assert small == dict(
+        conf._gemm2_tuned(16, DtypeQuant.MXFP4, DtypeQuant.MXFP4, "any"), BLOCK_N=128
+    )
 
 
 def test_gemm2_tuning_is_read_from_its_family(gemm2_tables):

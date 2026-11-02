@@ -137,3 +137,45 @@ def test_gluon_moe_isa(
     ), "ttg.convert_layout inside the K loop:\n" + "\n".join(
         li for li in in_loop if "convert_layout" in li
     )
+
+
+def test_gemm2_multi_block_cache_hints(device="cuda"):
+    """GEMM2 whose experts average several M blocks: the intermediate rows are stored
+    non-temporally (``nt``) and the register-B weight loads stay cacheable, so the
+    other M blocks of an expert can reuse its weights."""
+    if get_arch() != "gfx950":
+        pytest.skip("Gluon MoE kernels are gfx950 only.")
+    # 4096 tokens x top-4 over 32 experts: 512 rows, four block_m 128 blocks each.
+    n, k = 4096, 2048
+    rdata, gindx, x, x_scale, w, w_scale, bias, gammas = _build(
+        4096, n, k, 32, 4, "mxfp8", "mxfp4", device
+    )
+    assert rdata.block_m == 128
+    y = torch.empty((1, gindx.shape[0], n), dtype=torch.bfloat16, device=device)
+    pgm = moe_gemm_gluon(
+        y,
+        x,
+        w,
+        x_scale,
+        w_scale,
+        bias,
+        gammas,
+        rdata,
+        gindx,
+        None,
+        n,
+        k,
+        False,
+        1.0,
+        None,
+        False,
+    )
+    amdgcn = pgm.asm["amdgcn"]
+    stores = re.findall(r"^\s*buffer_store_dword\S*[^\n]*", amdgcn, re.MULTILINE)
+    assert stores and all(" nt" in s for s in stores), "\n".join(stores[:4])
+    register_loads = [
+        line
+        for line in re.findall(r"^\s*buffer_load_dwordx4[^\n]*", amdgcn, re.MULTILINE)
+        if " lds" not in line
+    ]
+    assert register_loads and not any(" nt" in line for line in register_loads)
