@@ -10,12 +10,12 @@ import, so we toggle them by monkeypatching the module globals.
 import pytest
 import torch
 import torch.nn.functional as F
-import triton
 
 import aiter.ops.triton.moe.moe_routing.routing as routing_mod
 from aiter.ops.triton.moe.moe_routing.routing import (
     compute_expt_data_torch,
     routing,
+    routing_block_m,
     routing_torch,
 )
 from aiter.ops.triton.moe.moe_routing.topk import topk
@@ -35,12 +35,6 @@ def _skip_if_unsupported():
 def _init_logits(n_tokens, n_expts_tot, device="cuda", seed=2):
     torch.manual_seed(seed)
     return torch.randn((n_tokens, n_expts_tot), dtype=torch.float32, device=device)
-
-
-def _block_m(n_tokens, n_expts_act, n_expts_tot):
-    """block_m heuristic used by routing() internally."""
-    tokens_per_expt = max(1, (n_tokens * n_expts_act) // n_expts_tot)
-    return max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
 
 
 def _enable_herd(monkeypatch, min_m=0, max_m=1 << 30):
@@ -207,7 +201,7 @@ def test_routing_herd_enabled(
 ):
     _skip_if_unsupported()
     logits = _init_logits(n_tokens, n_expts_tot)
-    block_m = _block_m(n_tokens, n_expts_act, n_expts_tot)
+    block_m = routing_block_m(n_tokens, n_expts_act, n_expts_tot)
 
     ref_w, ref_ids = _minunique_select_torch(logits.clone(), n_expts_act, sm_first)
 
@@ -291,7 +285,7 @@ def test_herd_gating_window(monkeypatch, n_tokens, engaged):
     _skip_if_unsupported()
     n_expts_tot, k = 128, 4
     logits = _init_logits(n_tokens, n_expts_tot)
-    block_m = _block_m(n_tokens, k, n_expts_tot)
+    block_m = routing_block_m(n_tokens, k, n_expts_tot)
 
     _enable_herd(monkeypatch, min_m=16, max_m=128)
     tri_rd, tri_g, tri_s = routing(logits, k, sm_first=False)
@@ -414,7 +408,7 @@ def test_routing_herd_sqrtsoftplus(
     _skip_if_unsupported()
     logits = _init_logits(n_tokens, n_expts_tot)
     bias = _init_bias(n_expts_tot)
-    block_m = _block_m(n_tokens, n_expts_act, n_expts_tot)
+    block_m = routing_block_m(n_tokens, n_expts_act, n_expts_tot)
 
     ref_w, ref_ids = _minunique_select_sqrtsoftplus_torch(
         logits.clone(), n_expts_act, bias, renorm, routed_scaling_factor
@@ -487,7 +481,7 @@ def test_herd_sqrtsoftplus_gating_window(monkeypatch, n_tokens, engaged):
     n_expts_tot, k = 128, 4
     logits = _init_logits(n_tokens, n_expts_tot)
     bias = _init_bias(n_expts_tot)
-    block_m = _block_m(n_tokens, k, n_expts_tot)
+    block_m = routing_block_m(n_tokens, k, n_expts_tot)
 
     _enable_herd(monkeypatch, min_m=16, max_m=128)
     tri_rd, tri_g, tri_s = routing(

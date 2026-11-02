@@ -17,15 +17,6 @@ from aiter.ops.triton.utils._triton.arch_info import get_arch
 from op_tests.triton_tests.moe.moe_test_utils import assert_close
 
 
-def _routing_block_m(n_tokens, n_expts_act, n_expts_tot):
-    """block_m heuristic used by `routing`.
-
-    Uses the raw logits shape and the originally requested n_expts_act (before
-    any shared-expert widening), exactly as `routing` does internally.
-    """
-    return routing_block_m(n_tokens, n_expts_act, n_expts_tot)
-
-
 @pytest.mark.parametrize(
     "n_tokens, n_expts_act, n_expts_tot, expected",
     [
@@ -44,7 +35,7 @@ def _routing_block_m(n_tokens, n_expts_act, n_expts_tot):
         (16384, 8, 256, 128),  # the 128 cap
     ],
 )
-def test_routing_block_m(n_tokens, n_expts_act, n_expts_tot, expected):
+def testrouting_block_m(n_tokens, n_expts_act, n_expts_tot, expected):
     assert routing_block_m(n_tokens, n_expts_act, n_expts_tot) == expected
 
 
@@ -447,7 +438,7 @@ def test_routing_score_mode(
     )
 
     # routing derives block_m internally; mirror that here for the ref.
-    block_m = _routing_block_m(n_tokens, n_expts_act, n_expts_tot)
+    block_m = routing_block_m(n_tokens, n_expts_act, n_expts_tot)
 
     ref_pack = routing_score_mode_torch(
         logits.clone(),
@@ -900,7 +891,7 @@ def test_routing_score_mode_grouped(
     score_mode, renorm, scale = "sqrtsoftplus", True, 2.5
 
     # routing derives block_m from the raw shape + n_expts_act.
-    block_m = _routing_block_m(n_tokens, n_expts_act, n_expts_tot)
+    block_m = routing_block_m(n_tokens, n_expts_act, n_expts_tot)
 
     # The selection the kernel makes (deterministic for fixed inputs); used as
     # ground truth for the sort/scatter pipeline check.

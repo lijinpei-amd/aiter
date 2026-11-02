@@ -81,6 +81,7 @@ from aiter.ops.triton.moe.moe_routing.routing import (
     _compute_expt_data_internal,
     ep_sort_routing,
     routing,
+    routing_block_m,
 )
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 from aiter.ops.triton.utils._triton.arch_info import get_arch
@@ -328,8 +329,7 @@ def ep_routing(logits, n_expts_act, n_expts_local, rank=0, ep_scatter_geometry=N
     )
 
     # block_m off the GLOBAL expert count -- see the docstring.
-    tokens_per_expt = max(1, n_gates // n_expts_tot)
-    block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
+    block_m = routing_block_m(batch, n_expts_act, n_expts_tot)
     expt_data_bufs = _compute_expt_data_internal(n_expts_local, n_gates, block_m, dev)
     token_offs_raw, token_offs_pad, block_pid_map = expt_data_bufs[:3]
 

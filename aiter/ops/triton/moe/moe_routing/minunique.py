@@ -7,6 +7,7 @@ from aiter.ops.triton.moe.moe_routing.routing import (
     ExptData,
     RoutingData,
     _compute_expt_data_internal,
+    routing_block_m,
 )
 from aiter.ops.triton.moe.moe_routing.topk import topk
 from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
@@ -145,9 +146,7 @@ def routing_minunique(logits, n_expts_act, *, sm_first=False):
     """Flat-topk min-unique routing. Mirror of `routing(..., score_mode=None)`."""
     num_tokens, n_expts_tot = logits.shape
     k = n_expts_act
-    m = num_tokens * k
-    tokens_per_expt = max(1, m // n_expts_tot)
-    block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
+    block_m = routing_block_m(num_tokens, k, n_expts_tot)
     if sm_first:
         logits = torch.softmax(logits, dim=-1)
     HIST_BLOCK_M = 32
@@ -197,9 +196,7 @@ def routing_minunique_fused(
     """Fused-scoring min-unique routing (sqrtsoftplus + bias + renorm)."""
     num_tokens, n_expts_tot = logits.shape
     k = n_expts_act
-    m = num_tokens * k
-    tokens_per_expt = max(1, m // n_expts_tot)
-    block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
+    block_m = routing_block_m(num_tokens, k, n_expts_tot)
     HIST_BLOCK_M = 32
     num_blocks = triton.cdiv(num_tokens, HIST_BLOCK_M)
 
