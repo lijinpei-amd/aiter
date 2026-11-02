@@ -6,10 +6,12 @@ import argparse
 import copy
 import csv
 import fcntl
+import gzip
 import importlib.util
 import json
 import math
 import os
+import shutil
 import statistics as st
 import subprocess
 import sys
@@ -21,6 +23,12 @@ ROOT = Path(__file__).resolve().parent
 REPO = ROOT.parents[7]
 # Labels, the compile cache and the lock file go here, never next to the sources.
 RUNS = Path(os.environ.get("HARNESS_OUT", "")).resolve()
+# The compile cache. cold_bench.sh gives each label its own and deletes it after a
+# clean run; it only saves compile time, which the cold method never times.
+CACHE = Path(os.environ.get("HARNESS_CACHE") or RUNS / "cache").resolve()
+# Set to 1 to keep each process's kernel copies (`gluon_artifact/`, `fly_artifact/`).
+# Their hashes are in worker.json either way; the copies are ~90% of a run's disk.
+KEEP_ARTIFACTS = os.environ.get("BENCH_KEEP_ARTIFACTS") == "1"
 sys.path.insert(0, str(ROOT))
 
 import bench_utils as common
@@ -184,7 +192,7 @@ def environment(case, tokens, gpu, specs):
             or key == "GPU_DEVICE_ORDINAL"
         ):
             env.pop(key)
-    cache = RUNS / "cache" / f"{case}_t{tokens}"
+    cache = CACHE / f"{case}_t{tokens}"
     env.update(
         BENCH_REPO=str(REPO),
         PYTHONPATH=str(REPO),
@@ -300,13 +308,28 @@ def stable_kernel(value):
     return value
 
 
+def trace_rows(run, name):
+    """Rows of the rocprofv3 `*<name>.csv` files, gzipped (`.csv.gz`) or not."""
+    for path in sorted((run / "trace").rglob(f"*{name}.csv*")):
+        opener = gzip.open if path.suffix == ".gz" else open
+        with opener(path, "rt", newline="") as handle:
+            yield from csv.DictReader(handle)
+
+
+def shrink(run):
+    """Drop what a finished process no longer needs; keep every input of the report."""
+    if not KEEP_ARTIFACTS:
+        for name in ("gluon_artifact", "fly_artifact"):
+            shutil.rmtree(run / name, ignore_errors=True)
+    for path in (run / "trace").rglob("*.csv"):
+        with path.open("rb") as src, gzip.open(f"{path}.gz", "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        path.unlink()
+
+
 def trace_values(run, pattern, warmups, sample_count):
     rows = sorted(
-        (
-            row
-            for path in (run / "trace").rglob("*kernel_trace.csv")
-            for row in csv.DictReader(path.open())
-        ),
+        trace_rows(run, "kernel_trace"),
         key=lambda row: int(row["Start_Timestamp"]),
     )
     indices = [index for index, row in enumerate(rows) if pattern in row["Kernel_Name"]]
@@ -339,11 +362,7 @@ def trace_values(run, pattern, warmups, sample_count):
     )
 
     node = int(rows[cold[0]]["Agent_Id"].split()[-1])
-    agents = [
-        row
-        for path in (run / "trace").rglob("*agent_info.csv")
-        for row in csv.DictReader(path.open())
-    ]
+    agents = list(trace_rows(run, "agent_info"))
     agent = next(row for row in agents if int(row["Node_Id"]) == node)
     location = int(agent["Location_Id"])
     pci = (
@@ -519,6 +538,7 @@ def execute(
         assert result["validation"]["cold_exact_replays"] == validation_replays
     elif mode == "smoke":
         assert result["smoke"]["pass"]
+    shrink(run)
     write(completed, {"pass": True, "provenance": identities})
     return result
 
