@@ -421,19 +421,22 @@ def test_a_sorter_uses_the_same_k256_allocation(block_k, available, monkeypatch)
         assert token_ids.numel() == 2 * 128
         assert cumsum.item() == 2 * 128
         seen.append(shape)
-        if not available:
-            raise RuntimeError("no generated scale-sort instance")
         out.fill_(47)
 
+    # A missing instance aborts the torch-free aux module, so the host checks the
+    # shape table and never calls it for a shape without one.
+    shapes = {(2, case.k, 256, 2)} if available else set()
+    monkeypatch.setattr(moe_mxfp4_aux, "MXFP4_MOE_SUPPORTED_SHAPES", shapes)
     monkeypatch.setattr(moe_mxfp4_aux, "mxfp4_moe_sort_scales", sort_scales)
     out = host._sorted_shuffle_a_scales(
         case.xs, case.routing_data, case.gather, case.k, _config(block_k)
     )
-    assert seen == [(2, 2, case.k, 128, 2 * 128)]
     if available:
+        assert seen == [(2, 2, case.k, 128, 2 * 128)]
         assert out.shape == (2 * 128 * case.k // 32,)
         assert torch.all(out == 47)
     else:
+        assert seen == []
         assert out is None
 
 
