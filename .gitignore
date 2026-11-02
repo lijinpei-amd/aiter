@@ -115,3 +115,6 @@ csrc/opus_gemm/gen_co/**/asm/
 # RLCR loop state and local benchmark output; never committed.
 .hmz*
 bench_out/
+
+# rocprofv3 scratch (counter values) written to the working directory of a run.
+.rocprofv3/
