@@ -10,6 +10,9 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w8 import (
     _moe_gemm_a8w8,
 )
 from aiter.ops.triton.moe.moe_op_gemm_gluon import (
+    gluon_combine_out as _gluon_combine_out,
+)
+from aiter.ops.triton.moe.moe_op_gemm_gluon import (
     try_gluon_grouped_gemm as _try_gluon,
 )
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
@@ -306,16 +309,12 @@ def moe_gemm_a8w8(
     expt_hist_sum = None if expt_data is None else expt_data.token_offs_pad[-1]
     expt_token_offs_raw = None if expt_data is None else expt_data.token_offs_raw
     expt_block_pid_map = None if expt_data is None else expt_data.block_pid_map
-    # The gfx950 Gluon kernel has no per-token or per-expert scale.
-    # The plain grouped sum can run inside the gfx950 GEMM2 kernel: the hook then
-    # fills y_final itself and reduce_grouped below is skipped.
-    combine_out = (
-        y_final
-        if scatter_indx is not None
-        and not apply_swiglu_reduction
-        and reduction_n_reduction == 1
-        else None
+    # The gfx950 hook may fill y_final itself (in-kernel combine): then the
+    # reduce_grouped below is skipped.
+    combine_out = _gluon_combine_out(
+        y_final, scatter_indx, apply_swiglu_reduction, reduction_n_reduction
     )
+    # The gfx950 Gluon kernel has no per-token or per-expert scale.
     if (
         x_token_scale is None
         and w_expt_scale is None

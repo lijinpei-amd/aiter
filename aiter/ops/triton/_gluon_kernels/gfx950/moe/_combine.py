@@ -20,41 +20,13 @@ GEMM2 writes one bf16 row per (token, gate) in expert-sorted order, and
 
 No CTA waits for another: a producer that is not last is done after its increment.
 The counters and the inverse of ``scatter_indx`` are built per launch by
-:func:`_combine_prep`, so a repeated call or a graph replay starts from zero.
+``_entry._combine_prep``, so a repeated call or a graph replay starts from zero.
 """
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-__all__ = ["_combine_prep", "_combine_rows"]
-
-
-@gluon.jit
-def _combine_prep(
-    scatter_ptr,
-    row_gate_ptr,
-    counters_ptr,
-    n_gates,
-    n_counters,
-    BLOCK: gl.constexpr,
-    NUM_WARPS: gl.constexpr,
-):
-    """``row_gate[scatter[f]] = f`` for every gate ``f``, and zero every counter.
-
-    ``scatter`` must be a permutation of the gates (a full routing); an index outside
-    it is skipped rather than written out of bounds.
-    """
-    L: gl.constexpr = gl.BlockedLayout(
-        [BLOCK // (64 * NUM_WARPS)], [64], [NUM_WARPS], [0]
-    )
-    offs = gl.program_id(0) * BLOCK + gl.arange(0, BLOCK, layout=L)
-    in_gates = offs < n_gates
-    # uint16 or int32, as routing() emits them
-    row = gl.load(scatter_ptr + offs, mask=in_gates, other=0).to(gl.int32)
-    gl.store(row_gate_ptr + row, offs, mask=in_gates & (row < n_gates))
-    gl.store(
-        counters_ptr + offs, gl.zeros([BLOCK], gl.int32, L), mask=offs < n_counters
-    )
+__all__ = ["_combine_rows"]
 
 
 @gluon.jit

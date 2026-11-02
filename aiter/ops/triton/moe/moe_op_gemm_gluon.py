@@ -28,13 +28,14 @@ import os
 from functools import cache
 
 import torch
+import triton
 
-from aiter.ops.triton._gluon_kernels.gfx950.moe._combine import _combine_prep
 from aiter.ops.triton._gluon_kernels.gfx950.moe._config import (
     KernelFuncConfig,
     KernelTuningConfig,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._entry import (
+    _combine_prep,
     _moe_gluon_gemm1,
     _moe_gluon_gemm2,
 )
@@ -759,8 +760,10 @@ def _combine_selected(cfg, y, scatter_indx, combine_out, routing_data, N, K) -> 
     )
 
 
+@cache
 def _combine_error(tc, N) -> str | None:
-    """Why the tuning config cannot run the combine (``validate_combine``), or None."""
+    """Why the tuning config cannot run the combine (``validate_combine``), or None.
+    Memoised: building the layout costs milliseconds."""
     try:
         validate_combine(tc, KernelLayout(tc), N)
     except AssertionError as error:
@@ -782,7 +785,7 @@ def _combine_workspace(scatter_indx, combine_out, n_slots):
     n_counters = combine_out.shape[0] * n_slots
     ws = torch.empty(n_gates + n_counters, dtype=torch.int32, device=combine_out.device)
     row_gate, counters = ws[:n_gates], ws[n_gates:]
-    grid = -(-max(n_gates, n_counters) // _COMBINE_PREP_BLOCK)
+    grid = triton.cdiv(max(n_gates, n_counters), _COMBINE_PREP_BLOCK)
     _combine_prep[(grid,)](
         scatter_indx,
         row_gate,
@@ -790,7 +793,6 @@ def _combine_workspace(scatter_indx, combine_out, n_slots):
         n_gates,
         n_counters,
         BLOCK=_COMBINE_PREP_BLOCK,
-        NUM_WARPS=4,
         num_warps=4,
     )
     return counters, row_gate, n_slots
@@ -1210,7 +1212,7 @@ def try_gluon_grouped_gemm(
     if not ok:
         _LOGGER.debug(f"{op_name}: falling back to the Triton kernel: {why}")
         return False
-    args = (
+    moe_gemm_gluon(
         y,
         x,
         w,
@@ -1227,8 +1229,9 @@ def try_gluon_grouped_gemm(
         alpha,
         limit,
         swiglu_add_residual,
+        x_static_scale=x_static_scale,
+        combine_out=combine_out,
     )
-    moe_gemm_gluon(*args, x_static_scale=x_static_scale, combine_out=combine_out)
     return True
 
 
@@ -1250,7 +1253,31 @@ def gluon_combine_supported(y, scatter_indx, combine_out, routing_data):
         return False, f"combine_out shape {tuple(combine_out.shape)}"
     if combine_out.stride(1) != 1 or combine_out.device != y.device:
         return False, "combine_out must be row-major on y's device"
+    if _can_overflow_int32(combine_out):
+        return False, "combine_out exceeds the 2 GB buffer window"
     return True, ""
+
+
+def gluon_combine_out(
+    y_final,
+    scatter_indx,
+    apply_swiglu_reduction,
+    reduction_n_reduction,
+    gate_valid=None,
+    residual=None,
+):
+    """``y_final`` when a wrapper's ``reduce_grouped`` call is the plain grouped sum
+    (``reduce_grouped(y, scatter_indx.view(-1, topk), y_final)``), else None. Passed
+    to :func:`try_gluon_grouped_gemm` as ``combine_out``: the hook then fills
+    ``y_final`` itself and the wrapper skips its ``reduce_grouped``."""
+    plain = (
+        scatter_indx is not None
+        and gate_valid is None
+        and residual is None
+        and not apply_swiglu_reduction
+        and reduction_n_reduction == 1
+    )
+    return y_final if plain else None
 
 
 def moe_gemm1_a4w4_mxfp4_out(

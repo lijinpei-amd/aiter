@@ -140,8 +140,9 @@ def _bits(t):
 
 
 def _run_both(op, t, monkeypatch, paths, **kwargs):
-    """(reduce_grouped output, fused output) of one call, after checking the path
-    each one took and that every (token, N slot) counter saw exactly topk rows."""
+    """The reduce_grouped output of one call, after checking that the fused call
+    took the combine, that every (token, N slot) counter saw exactly topk rows, and
+    that both gave the same bits."""
     monkeypatch.setenv("AITER_TRITON_MOE_GLUON_COMBINE", "0")
     ref = _call(op, t, **kwargs).clone()
     assert not paths["fused"] and paths["reduce"] == 1
@@ -151,17 +152,15 @@ def _run_both(op, t, monkeypatch, paths, **kwargs):
     assert len(paths["fused"]) == 1 and paths["reduce"] == 1, "the combine did not run"
     counters = paths["fused"][-1]
     assert torch.all(counters == t["rdata"].n_expts_act), "a row was not published once"
-    return ref, out
+    assert torch.equal(_bits(out), _bits(ref))
+    return ref
 
 
 @pytest.mark.parametrize("op", sorted(_OPS))
 @pytest.mark.parametrize("shape", _SHAPES, ids=[s[0] for s in _SHAPES])
 def test_combine_equals_reduce_grouped(op, shape, monkeypatch, paths):
     _, m, n_expts_tot, n_expts_act = shape
-    ref, out = _run_both(
-        op, _inputs(op, m, n_expts_tot, n_expts_act), monkeypatch, paths
-    )
-    assert torch.equal(_bits(out), _bits(ref))
+    _run_both(op, _inputs(op, m, n_expts_tot, n_expts_act), monkeypatch, paths)
 
 
 def test_combine_sums_repeated_experts_of_one_token(monkeypatch, paths):
@@ -172,8 +171,7 @@ def test_combine_sums_repeated_experts_of_one_token(monkeypatch, paths):
     expt = torch.randint(0, n_expts_tot, (m, 3), device="cuda", generator=g)
     expt_indx = torch.cat([expt, expt[:, :1]], dim=1)
     t = _inputs("a8w4", m, n_expts_tot, n_expts_act, expt_indx, block_m=64)
-    ref, out = _run_both("a8w4", t, monkeypatch, paths)
-    assert torch.equal(_bits(out), _bits(ref))
+    _run_both("a8w4", t, monkeypatch, paths)
 
 
 def test_combine_ignores_padded_rows(monkeypatch, paths):
@@ -184,8 +182,7 @@ def test_combine_ignores_padded_rows(monkeypatch, paths):
     # such a stray write land after token 0's real one often enough to see.
     t = _inputs("a8w4", 4096, 128, 4, n=6144, k=3072)
     assert t["rdata"].block_m == 128
-    ref, out = _run_both("a8w4", t, monkeypatch, paths)
-    assert torch.equal(_bits(out), _bits(ref))
+    ref = _run_both("a8w4", t, monkeypatch, paths)
     for _ in range(20):
         assert torch.equal(_bits(_call("a8w4", t)), _bits(ref))
 
@@ -196,8 +193,7 @@ def test_combine_is_independent_of_the_cta_order(group_m, monkeypatch, paths):
     t = _inputs("a8w8", 1024, 128, 4)
     monkeypatch.setenv("AITER_TRITON_MOE_GLUON_GROUP_M", str(group_m))
     G._launch_spec.cache_clear()
-    ref, out = _run_both("a8w8", t, monkeypatch, paths)
-    assert torch.equal(_bits(out), _bits(ref))
+    ref = _run_both("a8w8", t, monkeypatch, paths)
     for _ in range(5):
         assert torch.equal(_bits(_call("a8w8", t)), _bits(ref))
 
