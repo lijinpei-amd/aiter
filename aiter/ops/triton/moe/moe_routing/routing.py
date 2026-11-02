@@ -238,12 +238,13 @@ def sort_tokens_fused(
 def routing_block_m(num_tokens: int, n_expts_act: int, n_expts_tot: int) -> int:
     """The M tile of the MoE GEMMs: the power of two at or above the floored mean
     rows per expert, ``num_tokens * n_expts_act // n_expts_tot``, in [16, 128]. At an
-    exact mean of 16, 32 or 64 it is one power of two more, so that the experts above
-    the mean do not need a second, almost empty M block."""
+    exact mean that is itself a power of two (16, 32 or 64 inside the bounds) it is one
+    power of two more, so that the experts above the mean do not need a second, almost
+    empty M block."""
     m = num_tokens * n_expts_act
     tokens_per_expt = max(1, m // n_expts_tot)
     block_m = triton.next_power_of_2(tokens_per_expt)
-    if m % n_expts_tot == 0 and tokens_per_expt in (16, 32, 64):
+    if m % n_expts_tot == 0 and block_m == tokens_per_expt:
         block_m *= 2
     return max(16, min(block_m, 128))
 

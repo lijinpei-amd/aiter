@@ -649,7 +649,8 @@ def test_gemm2_small_block_m_reads_preshuffled_b(dq_a, dq_b, block_m, small_grid
     expected = {"B_SCALE_SHUFFLED", "B_PRESHUFFLED", "ALLOW_B_VIA_LDS"}
     assert changed == expected | ({"BLOCK_N"} if narrow else set())
     assert config["B_PRESHUFFLED"] and not config["ALLOW_B_VIA_LDS"]
-    assert config["BLOCK_N"] == (128 if narrow else ladder["BLOCK_N"])
+    if narrow:
+        assert config["BLOCK_N"] == 128
 
 
 @pytest.mark.parametrize(
@@ -722,11 +723,9 @@ def gemm2_tables(monkeypatch):
 @pytest.mark.parametrize("family", sorted(conf._GEMM2_FAMILIES.values()))
 def test_gemm2_families_hold_tuning_values_only(family):
     table = get_moe_dispatch(family, "gfx950", "gluon")
-    block_ms = (16, 32, 64, 128)
-    assert {f"bm{bm}_any" for bm in block_ms} <= set(table)
-    assert set(table) <= {
-        f"bm{bm}_{grid}" for bm in block_ms for grid in ("any", "small")
-    }
+    any_keys = {f"bm{bm}_any" for bm in conf._SUPPORTED_BLOCK_M}
+    small_keys = {f"bm{bm}_small" for bm in conf._SUPPORTED_BLOCK_M}
+    assert any_keys <= set(table) <= any_keys | small_keys
     known = set(
         conf.get_gluon_config_uncached(
             128, 4096, 2048, DtypeQuant.MXFP4, DtypeQuant.MXFP4

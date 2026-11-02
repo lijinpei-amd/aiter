@@ -778,7 +778,7 @@ _GEMM2_FAMILIES = {
 }
 
 
-def _gemm2_tuned(block_m, dq_a, dq_b, small_grid=False) -> dict:
+def _gemm2_tuned(block_m, dq_a, dq_b, small_grid) -> dict:
     """The operands' GEMM2 family entry, or {}: ``bm<block_m>_small`` on a small grid
     when the family has one, else ``bm<block_m>_any``. A copy, with JSON lists as the
     tuples the config uses."""
@@ -786,9 +786,9 @@ def _gemm2_tuned(block_m, dq_a, dq_b, small_grid=False) -> dict:
     if family is None:
         return {}
     table = get_moe_dispatch(family, get_arch(), "gluon")
-    entry = (table.get(f"bm{block_m}_small") if small_grid else None) or table.get(
-        f"bm{block_m}_any", {}
-    )
+    entry = table.get(f"bm{block_m}_any", {})
+    if small_grid:
+        entry = table.get(f"bm{block_m}_small", entry)
     return {k: _hashable(v) for k, v in entry.items()}
 
 
@@ -850,20 +850,21 @@ def _default_launch_config(
     stream_expert_payload=False,
 ):
     """Share automatic stage-specific geometry with the capability check."""
+    small_grid = bool(small_grid)
     ladder = _get_gluon_config_cached(
         block_m,
         N,
         K,
         dq_a,
         dq_b,
-        bool(small_grid),
+        small_grid,
         bool(stream_expert_payload),
     )
     if not apply_swiglu and (dq_a, dq_b) in _GEMM2_FAMILIES:
         # Every override below needs apply_swiglu, so none applies to GEMM2.
         group_m = _env_int("AITER_TRITON_MOE_GLUON_GROUP_M", None)
         ladder = _gemm2_launch_config(
-            ladder, block_m, N, K, dq_a, dq_b, group_m, bool(small_grid)
+            ladder, block_m, N, K, dq_a, dq_b, group_m, small_grid
         )
     c = dict(ladder)
     if (
