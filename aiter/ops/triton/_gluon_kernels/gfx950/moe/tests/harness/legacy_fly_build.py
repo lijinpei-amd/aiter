@@ -444,6 +444,8 @@ def build_fly(
                 BK=tile_k,
                 interleave=False,
                 xcd_swizzle=xcd_swizzle,
+                # origin/main clamps plain SiLU at 7.0 by default; +inf is no clamp.
+                swiglu_limit=float("inf"),
             )
         finally:
             mk._run_compiled = real_run

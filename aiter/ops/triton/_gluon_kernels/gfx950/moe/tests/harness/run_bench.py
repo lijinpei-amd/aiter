@@ -195,7 +195,13 @@ def environment(case, tokens, gpu, specs):
     cache = CACHE / f"{case}_t{tokens}"
     env.update(
         BENCH_REPO=str(REPO),
-        PYTHONPATH=str(REPO),
+        # HARNESS_EXTRA_PYTHONPATH goes after the repo, e.g. a flydsl site dir newer
+        # than the venv's.
+        PYTHONPATH=os.pathsep.join(
+            [str(REPO)]
+            + ([os.environ["HARNESS_EXTRA_PYTHONPATH"]]
+               if os.environ.get("HARNESS_EXTRA_PYTHONPATH") else [])
+        ),
         AITER_TRITON_USE_HERD="0",
         TRITON_AMD_NT_ONLY="0",
         CK_DIR=str(REPO / "3rdparty/composable_kernel"),

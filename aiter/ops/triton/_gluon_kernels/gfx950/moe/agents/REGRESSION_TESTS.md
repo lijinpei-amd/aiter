@@ -218,6 +218,12 @@ keeps it, so rerunning the label resumes without recompiling. Extra arguments go
 `compare_cold.py` also accepts the path of any run directory holding a
 `summary.json`.
 
+FlyDSL needs the `flydsl` version `requirements.txt` pins (0.4.1 since the
+2026-11-02 rebase onto origin/main). If the venv has an older one, put a newer site
+dir after the repo on the processes' path with
+`HARNESS_EXTRA_PYTHONPATH=<site dir>`; on this machine,
+`../flydsl-0.4.1-site` next to the checkout.
+
 Add `--tolerant` to `cold_bench.sh` when other users' jobs on other GPUs leave small
 idle driver contexts on yours. Without it, the harness waits forever; see
 `tests/run_bench_tolerant.py`. A real tenant on the same GPU still blocks the run.
@@ -338,7 +344,7 @@ Copied, not moved; the originals are untouched. Edits are limited to paths
 
 | In `tests/` | Origin | Changes |
 |---|---|---|
-| `harness/run_bench.py`, `worker.py`, `bench_common.py`, `case_config.py`, `fly_build.py`, `cases.json`, `base_cases.json` | `bench_out/gluon_flydsl_final_20260924/` | Runs, cache and lock go to `$HARNESS_OUT`. `cases.json` points at the local `base_cases.json`. Its Gluon configs use the slot key names (`SLOT_*`, `SCALE_SLOT_*`) and drop the removed `MINI_BLOCK_K`; the host still accepts the old names. The hashed-source list names the vendored files. `libtriton.so` is located through the imported `triton` package. `worker.py` flushes with `fill_(0)` instead of `zero_()`: torch 2.15 nightlies run `zero_()` as a `hipMemset` (`__amd_rocclr_fillBufferAligned`), which the trace auditor rejects; `fill_(0)` keeps the `FillFunctor<unsigned char>` kernel the auditor expects. `run_bench.py` deletes a finished process's kernel copies, gzips its trace, and takes the compile cache from `HARNESS_CACHE`. |
+| `harness/run_bench.py`, `worker.py`, `bench_common.py`, `case_config.py`, `fly_build.py`, `cases.json`, `base_cases.json` | `bench_out/gluon_flydsl_final_20260924/` | Runs, cache and lock go to `$HARNESS_OUT`. `cases.json` points at the local `base_cases.json`. Its Gluon configs use the slot key names (`SLOT_*`, `SCALE_SLOT_*`) and drop the removed `MINI_BLOCK_K`; the host still accepts the old names. The hashed-source list names the vendored files. `libtriton.so` is located through the imported `triton` package. `worker.py` flushes with `fill_(0)` instead of `zero_()`: torch 2.15 nightlies run `zero_()` as a `hipMemset` (`__amd_rocclr_fillBufferAligned`), which the trace auditor rejects; `fill_(0)` keeps the `FillFunctor<unsigned char>` kernel the auditor expects. `run_bench.py` appends `HARNESS_EXTRA_PYTHONPATH` to the processes' `PYTHONPATH` and deletes a finished process's kernel copies, gzips its trace, and takes the compile cache from `HARNESS_CACHE`. |
 | `harness/bench_utils.py` | `bench_out/gluon_scale_ptr_unify_20260907/a4/bench_utils.py` | Only the functions the harness calls. `PY` is the running interpreter, the llc comes from `TRITON_HIP_DS_AGPR_LLC`, and the inert `CLAUDE_JOB_DIR` is no longer set. |
 | `harness/legacy_a4_common.py`, `harness/legacy_fly_build.py` | `bench_out/gluon_flydsl_small_tokens_20260908/{bench_common,fly_build}.py` | Renamed. Lint-only edits. |
 | `harness/legacy_dense_common.py` | `bench_out/gluon_flydsl_a8a16_20260907/bench_common.py` | Renamed. Lint-only edits. |
