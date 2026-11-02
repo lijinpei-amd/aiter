@@ -34,6 +34,8 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
 from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import (
     validate_pipeline as _validate_live_pipeline,
 )
+from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
 
 #: MX group size. Fixed by the OCP microscaling spec for both E2M1 and E4M3; not a knob.
 MX_GROUP_SIZE = 32
@@ -765,49 +767,50 @@ def get_gluon_config_uncached(
     return cfg
 
 
-@cache
-def _gemm2_launch_config(ladder_items: tuple, block_m, N, K, dq_a, dq_b) -> tuple:
-    """GEMM2 (no activation) geometry for MX operands, as sorted config items.
+#: Tuned GEMM2 (no activation) families, ``configs/gfx950/gluon/moe/<family>/``.
+_GEMM2_FAMILIES = {
+    (DtypeQuant.MXFP4, DtypeQuant.MXFP4): "A4W4-GEMM2",
+    (DtypeQuant.MXFP8, DtypeQuant.MXFP4): "A8W4-GEMM2",
+    (DtypeQuant.MXFP8, DtypeQuant.MXFP8): "A8W8-GEMM2",
+}
 
-    It changes the ladder only where the launch can run the result as is. Memoised
-    because ``gluon_supported`` asks for the config on every launch.
+
+def _gemm2_tuned(block_m, dq_a, dq_b) -> dict:
+    """The ``bm<block_m>_any`` entry of the operands' GEMM2 family, or {}; a copy,
+    with JSON lists as the tuples the config uses."""
+    family = _GEMM2_FAMILIES.get((dq_a, dq_b))
+    if family is None:
+        return {}
+    entry = get_moe_dispatch(family, get_arch(), "gluon").get(f"bm{block_m}_any", {})
+    return {k: tuple(v) if isinstance(v, list) else v for k, v in entry.items()}
+
+
+@cache
+def _gemm2_launch_config(
+    ladder_items: tuple, block_m, N, K, dq_a, dq_b, group_m: int | None
+) -> tuple:
+    """GEMM2 (no activation) config: the ladder with its family's tuned entry on top,
+    as sorted config items. ``group_m`` is the GROUP_M environment override, if any.
+
+    The entry applies only where the launch can run the result as is; elsewhere the
+    ladder stays. Memoised because ``gluon_supported`` asks for it on every launch.
     """
     c = dict(ladder_items)
-    if N % 256 or K % 256:
+    tuned = _gemm2_tuned(block_m, dq_a, dq_b)
+    # The entries were measured with N and K multiples of 256 only.
+    if not tuned or N % 256 or K % 256:
         return ladder_items
-    if block_m <= 32:
-        # Shuffled B scales; measured at the ladder's BLOCK_K 256 only.
-        if c["BLOCK_K"] < 256:
-            return ladder_items
-        new = dict(c, B_SCALE_SHUFFLED=True)
-    else:
-        # BLOCK_K holds 128 B of B payload; a8w4 at block_m 128 does not fit LDS
-        # at BLOCK_K 256.
-        narrow_k = dq_b == DtypeQuant.MXFP8 or (
-            block_m == 128 and dq_a == DtypeQuant.MXFP8
-        )
-        block_k = 128 if narrow_k else 256
-        new = dict(
-            c,
-            BLOCK_N=256,
-            BLOCK_K=block_k,
-            SLOT_M=64,
-            SLOT_N=128,
-            mfma_instr_shape=(16, 16, 128),
-            warps_per_cta=(1, 4),
-            tiles_per_warp=(2, 2),
-            NUM_LDS_BUFFER=3,
-            # One unroll covers the buffer ring and the K256 scale unit.
-            K_UNROLL=3 * 256 // block_k,
-            VGPR_PREFETCH_K=block_k,
-            GROUP_M=_env_int("AITER_TRITON_MOE_GLUON_GROUP_M", 8),
-            B_SCALE_SHUFFLED=True,
-        )
+    # An entry that keeps the ladder's BLOCK_K was measured at BLOCK_K 256 only.
+    if "BLOCK_K" not in tuned and c["BLOCK_K"] < 256:
+        return ladder_items
+    new = dict(c, **tuned)
+    if group_m is not None and "GROUP_M" in tuned:
+        new["GROUP_M"] = group_m
     key = _cfg_key(new)
     # The launch drops a shuffle it cannot prepare, so check that too:
     # gluon_supported must judge the config that runs.
     if (
-        not _b_scale_shuffle_fits(new)
+        (new["B_SCALE_SHUFFLED"] and not _b_scale_shuffle_fits(new))
         or _pipeline_error(key, dq_a, dq_b, K) is not None
         or _probe_lds_bytes_cached(key, dq_a, dq_b) > LDS_USABLE_BYTES
     ):
@@ -835,9 +838,12 @@ def _default_launch_config(
         bool(small_grid),
         bool(stream_expert_payload),
     )
-    if not apply_swiglu and dq_a in _SCALED and dq_b in _SCALED:
+    if not apply_swiglu:
         # Every override below needs apply_swiglu, so none applies to GEMM2.
-        ladder = _gemm2_launch_config(ladder, block_m, N, K, dq_a, dq_b)
+        group_m = os.environ.get("AITER_TRITON_MOE_GLUON_GROUP_M")
+        ladder = _gemm2_launch_config(
+            ladder, block_m, N, K, dq_a, dq_b, None if group_m is None else int(group_m)
+        )
     c = dict(ladder)
     if (
         not small_grid

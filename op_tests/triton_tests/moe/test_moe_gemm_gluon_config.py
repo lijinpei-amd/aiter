@@ -53,6 +53,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
 from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import validate
 from aiter.ops.triton.moe import moe_op_gemm_gluon as host
 from aiter.ops.triton.moe import moe_op_gemm_gluon_config as conf
+from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
 from op_tests.triton_tests.moe.test_moe_gemm_gluon_buffered_schedule import (
     _assert_minimal_peel,
 )
@@ -661,6 +662,46 @@ def test_gemm2_config_never_drops_a_launchable_ladder(dq_a, dq_b, block_m):
                     block_m, N, K, dq_a, dq_b, small_grid, False
                 )
                 assert _launchable(config, dq_a, dq_b, N, K), (N, K, small_grid)
+
+
+@pytest.mark.parametrize("family", ["A4W4-GEMM2", "A8W4-GEMM2", "A8W8-GEMM2"])
+def test_gemm2_families_hold_tuning_values_only(family):
+    table = get_moe_dispatch(family, "gfx950", "gluon")
+    assert set(table) == {"bm16_any", "bm32_any", "bm64_any", "bm128_any"}
+    known = set(
+        conf.get_gluon_config_uncached(
+            128, 4096, 2048, DtypeQuant.MXFP4, DtypeQuant.MXFP4
+        )
+    )
+    for entry in table.values():
+        assert entry and set(entry) <= known - {"BLOCK_M"}
+
+
+def test_gemm2_tuning_is_read_from_its_family(monkeypatch):
+    tables = {
+        family: {
+            k: dict(v) for k, v in get_moe_dispatch(family, "gfx950", "gluon").items()
+        }
+        for family in ("A4W4-GEMM2", "A8W4-GEMM2", "A8W8-GEMM2")
+    }
+    tables["A8W8-GEMM2"]["bm128_any"]["GROUP_M"] = 2
+    monkeypatch.setattr(conf, "get_moe_dispatch", lambda name, *_: tables[name])
+    conf._gemm2_launch_config.cache_clear()
+    try:
+        config = conf._default_launch_config(
+            128, 6144, 2048, DtypeQuant.MXFP8, DtypeQuant.MXFP8, False, False
+        )
+    finally:
+        conf._gemm2_launch_config.cache_clear()
+    assert config["GROUP_M"] == 2
+
+
+def test_gemm2_group_m_environment_override_is_not_cached_away(monkeypatch):
+    args = (128, 6144, 2048, DtypeQuant.MXFP4, DtypeQuant.MXFP4, False, False)
+    assert conf._default_launch_config(*args)["GROUP_M"] == 8
+    monkeypatch.setenv("AITER_TRITON_MOE_GLUON_GROUP_M", "4")
+    conf._get_gluon_config_cached.cache_clear()  # only the ladder cache
+    assert conf._default_launch_config(*args)["GROUP_M"] == 4
 
 
 @pytest.mark.parametrize("suffix", ["EXPERT_CACHE_MODIFIER", "EXPERT_MOD"])
