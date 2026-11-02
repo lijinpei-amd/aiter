@@ -17,6 +17,7 @@ from triton.experimental import gluon
 
 from ._lang import (
     MX_GROUP,
+    CombineMode,
     EpilogueMode,
     SchedMode,
     WaitCommitScheme,
@@ -34,6 +35,7 @@ from ._types import (
 __all__ = [
     "validate",
     "validate_buffer_counts",
+    "validate_combine",
     "validate_layout",
     "validate_pipeline",
     "validate_resources",
@@ -70,6 +72,7 @@ def validate(tc, N, K, layout=None):
         int(SchedMode.MFMA_8),
     ), f"SCHED_MODE {tc.SCHED_MODE.value} is not a SchedMode"
     validate_layout(tc, layout, N, K)
+    validate_combine(tc, layout, N)
 
     if not tc.UNROLL_EPILOGUE.value:
         for idx in (0, 1):
@@ -126,6 +129,35 @@ def validate(tc, N, K, layout=None):
     )
 
     validate_resources(tc, layout)
+    return True
+
+
+@gluon.constexpr_function
+def validate_combine(tc, layout, N):
+    """The contract of CombineMode.LAST_PRODUCER (``_combine.py``)."""
+    fc = tc.func_cfg
+    mode = fc.combine.value
+    assert mode in (
+        int(CombineMode.NONE),
+        int(CombineMode.LAST_PRODUCER),
+    ), f"combine {mode} is not a CombineMode"
+    if mode == int(CombineMode.NONE):
+        return True
+    assert (
+        not fc.has_activation() and fc.output_quant.value is None
+    ), "the in-kernel combine sums GEMM2's bf16 rows: no activation, no output quant"
+    assert fc.epilogue.value == int(
+        EpilogueMode.DEFAULT
+    ), "the in-kernel combine needs the default epilogue arithmetic"
+    slot_n = layout.output_n_slot.value
+    assert N % slot_n == 0, f"N {N} must be whole output N slots of {slot_n}"
+    # A row of a pane is published by the wave that stored it, so the release orders
+    # exactly that wave's stores: the bf16 store layout must not split a row.
+    store = layout.result_store_layout(tc.SLOT_M.value, slot_n, 16)
+    assert store.warps_per_cta[1] == 1, (
+        f"the store layout splits a {slot_n}-column row over {store.warps_per_cta[1]} "
+        "waves; the combine needs one wave per row"
+    )
     return True
 
 

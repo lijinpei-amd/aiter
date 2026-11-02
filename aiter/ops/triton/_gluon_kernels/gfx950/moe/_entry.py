@@ -10,7 +10,13 @@ from ._config import KernelFuncConfig, KernelTuningConfig
 from ._lang import constexpr_fields
 from ._lang import unwrap_attr as _cv
 from ._layout import KernelLayout
-from ._types import QuantExpertTensor, QuantTokenTensor, ResultTensor, RoutingMeta
+from ._types import (
+    CombineMeta,
+    QuantExpertTensor,
+    QuantTokenTensor,
+    ResultTensor,
+    RoutingMeta,
+)
 from .moe_gemm import _moe_gemm_body as _moe_gemm_body_with_layout
 
 __all__ = [
@@ -36,6 +42,7 @@ def _moe_gemm_body(
     N: gl.constexpr,
     K: gl.constexpr,
     NUM_K,
+    cmb=None,
 ):
     """Build the layout from ``tuning_cfg`` and run the body."""
     layout = KernelLayout(tuning_cfg)
@@ -55,6 +62,7 @@ def _moe_gemm_body(
         N,
         K,
         NUM_K,
+        cmb,
     )
 
 
@@ -236,6 +244,11 @@ def _moe_gluon_gemm2(
     bias_ptr,
     stride_bias_e,
     x_static_scale_ptr,
+    cmb_out_ptr,
+    cmb_out_stride_m,
+    cmb_out_stride_n,
+    cmb_counters,
+    cmb_row_gate,
     grid_m,
     grid_n,
     NUM_K,
@@ -255,12 +268,14 @@ def _moe_gluon_gemm2(
     RES_STRIDE_N: gl.constexpr,
     RES_OUT_DIM: gl.constexpr,
     RT_N_EXPTS_ACT: gl.constexpr,
+    CMB_N_SLOTS: gl.constexpr,
     CFG_FUNC: gl.constexpr,
     CFG_TUNING: gl.constexpr,
     CFG_N: gl.constexpr,
     CFG_K: gl.constexpr,
 ):
-    """gemm2: X @ W2 + bias, multiplied by the router combine weight (gammas)."""
+    """gemm2: X @ W2 + bias, multiplied by the router combine weight (gammas), and
+    under CombineMode.LAST_PRODUCER summed into each token's row (the cmb_* args)."""
     func_cfg = KernelFuncConfig(*constexpr_fields(CFG_FUNC))
     tuning_cfg = KernelTuningConfig(func_cfg, *constexpr_fields(CFG_TUNING))
     _moe_gemm_body(
@@ -321,4 +336,12 @@ def _moe_gluon_gemm2(
         CFG_N,
         CFG_K,
         NUM_K,
+        CombineMeta(
+            cmb_out_ptr,
+            cmb_out_stride_m,
+            cmb_out_stride_n,
+            cmb_counters,
+            cmb_row_gate,
+            CMB_N_SLOTS,
+        ),
     )

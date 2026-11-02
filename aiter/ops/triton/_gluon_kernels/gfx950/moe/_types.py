@@ -13,6 +13,7 @@ from triton.experimental.gluon import language as gl
 from triton.language.core import _aggregate as aggregate
 
 from ._lang import (
+    CombineMode,
     DotKind,
     DtypeQuant,
     EpilogueMode,
@@ -46,6 +47,8 @@ __all__ = [
     "ActKind",
     "ActivationSpec",
     "B",
+    "CombineMeta",
+    "CombineMode",
     "CompSlot",
     "Component",
     "DSReadOperand",
@@ -292,6 +295,7 @@ class FuncSpec(NamedTuple):
     # anywhere else would silently reinterpret the existing ones.
     weight_gu_hbm_layout: int = int(WeightGuHbmLayout.INTERLEAVED)
     epilogue: int = int(EpilogueMode.DEFAULT)
+    combine: int = int(CombineMode.NONE)
 
 
 class TuningSpec(NamedTuple):
@@ -580,6 +584,22 @@ class ResultTensor(NamedTuple):
             scale_stride_n,
             _c(out_dim),
         )
+
+
+class CombineMeta(NamedTuple):
+    """Where :attr:`CombineMode.LAST_PRODUCER` sums a token's rows.
+
+    ``row_gate[r]`` is the flat ``token * topk + gate`` index of sorted row ``r``, the
+    inverse of ``scatter_indx``. ``counters`` holds one int32 per (token, output N
+    slot), zeroed for this launch; ``n_slots`` is the number of output N slots.
+    """
+
+    out_ptr: gl.tensor  # [n_tokens, N] final rows
+    out_stride_m: gl.tensor
+    out_stride_n: gl.tensor
+    counters: gl.tensor  # int32 [n_tokens * n_slots]
+    row_gate: gl.tensor  # int32 [n_gates]
+    n_slots: gl.constexpr
 
 
 class RoutingMeta(NamedTuple):

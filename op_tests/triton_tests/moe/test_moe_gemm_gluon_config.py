@@ -736,6 +736,8 @@ def test_gemm2_families_hold_tuning_values_only(family):
             128, 4096, 2048, DtypeQuant.MXFP4, DtypeQuant.MXFP4
         )
     )
+    # host-side keys that select the in-kernel combine
+    known |= {"LAST_PRODUCER_TOPK", "LAST_PRODUCER_MIN_N", "LAST_PRODUCER_MIN_K"}
     for entry in table.values():
         assert entry and set(entry) <= known - {"BLOCK_M"}
     # A grid entry lists only what it changes on top of the any entry.

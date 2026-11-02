@@ -868,6 +868,29 @@ class KernelLayout:
         )
 
     @gluon.constexpr_function
+    def combine_publish_lanes(self, extent_m, extent_n, storage_bits):
+        """Lanes that share one row of :meth:`result_store_layout`."""
+        return self.result_store_layout(
+            extent_m, extent_n, storage_bits
+        ).threads_per_warp[1]
+
+    @gluon.constexpr_function
+    def combine_publish_layout(self, extent_m, extent_n, storage_bits):
+        """:meth:`result_store_layout`'s thread grid with one element per thread.
+
+        A ``[extent_m, combine_publish_lanes]`` tensor in it puts row ``r`` in the
+        lanes and wave that store row ``r``, without the replication a row slice of the
+        store layout has, so one lane per row can publish it.
+        """
+        store = self.result_store_layout(extent_m, extent_n, storage_bits)
+        return gl.BlockedLayout(
+            size_per_thread=[1, 1],
+            threads_per_warp=store.threads_per_warp,
+            warps_per_cta=store.warps_per_cta,
+            order=[1, 0],
+        )
+
+    @gluon.constexpr_function
     def quant_payload_storage_shape(self, rows, output_n=None):
         output_n = self.output_n_slot.value if output_n is None else output_n
         return [rows, output_n // 2]

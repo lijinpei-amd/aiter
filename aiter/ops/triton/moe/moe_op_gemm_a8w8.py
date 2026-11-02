@@ -307,6 +307,15 @@ def moe_gemm_a8w8(
     expt_token_offs_raw = None if expt_data is None else expt_data.token_offs_raw
     expt_block_pid_map = None if expt_data is None else expt_data.block_pid_map
     # The gfx950 Gluon kernel has no per-token or per-expert scale.
+    # The plain grouped sum can run inside the gfx950 GEMM2 kernel: the hook then
+    # fills y_final itself and reduce_grouped below is skipped.
+    combine_out = (
+        y_final
+        if scatter_indx is not None
+        and not apply_swiglu_reduction
+        and reduction_n_reduction == 1
+        else None
+    )
     if (
         x_token_scale is None
         and w_expt_scale is None
@@ -333,8 +342,11 @@ def moe_gemm_a8w8(
             quant_static_scale=quant_static_scale,
             swizzle_mx_scale=swizzle_mx_scale,
             w_static_scale=w_static_scale,
+            combine_out=combine_out,
         )
     ):
+        if combine_out is not None:
+            return combine_out
         group_indx = (
             None
             if scatter_indx is None

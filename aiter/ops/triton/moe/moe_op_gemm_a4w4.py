@@ -483,6 +483,16 @@ def moe_gemm_a4w4(
     # `use_gluon` is the *gfx1250* kernel; the gfx950 one reads the plain (E, K/2, N)
     # weight layout and returns through reduce_grouped, so the gfx1250-only contracts
     # (preshuffled weights, MXFP4 emit, EP scatter) stay on their own paths.
+    # The plain grouped sum can run inside the gfx950 GEMM2 kernel: the hook then
+    # fills y_final itself and reduce_grouped below is skipped.
+    combine_out = (
+        y_final
+        if scatter_indx is not None
+        and gate_valid is None
+        and not apply_swiglu_reduction
+        and reduction_n_reduction == 1
+        else None
+    )
     if (
         not use_gluon
         and not preshuffle_weights
@@ -510,8 +520,11 @@ def moe_gemm_a4w4(
             x_static_scale=None,
             quant_static_scale=None,
             swizzle_mx_scale=swizzle_mx_scale,
+            combine_out=combine_out,
         )
     ):
+        if combine_out is not None:
+            return combine_out
         group_indx = (
             None
             if scatter_indx is None

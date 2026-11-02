@@ -163,7 +163,10 @@ In MOE dispatch tables, flag:
   `bm<block_m>_multi`; a `_small` or `_multi` entry without the `_any` entry
   of its `block_m`; a `_small` or `_multi` entry that repeats a key of `_any`
   with the same value; a merged entry with `"ALLOW_B_VIA_LDS": false` and
-  without `"B_PRESHUFFLED": true`.
+  without `"B_PRESHUFFLED": true`; a `LAST_PRODUCER_TOPK` that is not a list
+  of topk values, or a combine selection (`LAST_PRODUCER_TOPK`,
+  `LAST_PRODUCER_MIN_N`, `LAST_PRODUCER_MIN_K`) that a PR adds or widens
+  without a measured gain for that topk, `block_m` and N and K range.
 
 Do not flag a GEMM2 `_small` or `_multi` entry that has only a few keys. The
 launch merges it over `bm<block_m>_any`: `_small` for a small launch grid,

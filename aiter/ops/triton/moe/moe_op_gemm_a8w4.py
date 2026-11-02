@@ -566,6 +566,17 @@ def moe_gemm_a8w4(
     # `out_mx_quant` returns (fp8 values, ue8m0 scales) instead of going through
     # reduce_grouped, and `ep_scatter` delivers into a staging window, so both are
     # different contracts and stay on the Triton path.
+    # The plain grouped sum can run inside the gfx950 GEMM2 kernel: the hook then
+    # fills y_final itself and reduce_grouped below is skipped.
+    combine_out = (
+        y_final
+        if scatter_indx is not None
+        and gate_valid is None
+        and residual is None
+        and not apply_swiglu_reduction
+        and reduction_n_reduction == 1
+        else None
+    )
     if (
         not use_gluon
         and not out_mx_quant
@@ -592,8 +603,11 @@ def moe_gemm_a8w4(
             x_static_scale=x_static_scale,
             quant_static_scale=quant_static_scale,
             swizzle_mx_scale=swizzle_mx_scale,
+            combine_out=combine_out,
         )
     ):
+        if combine_out is not None:
+            return combine_out
         group_indx = (
             None
             if scatter_indx is None

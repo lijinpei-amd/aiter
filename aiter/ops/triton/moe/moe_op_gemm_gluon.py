@@ -29,6 +29,7 @@ from functools import cache
 
 import torch
 
+from aiter.ops.triton._gluon_kernels.gfx950.moe._combine import _combine_prep
 from aiter.ops.triton._gluon_kernels.gfx950.moe._config import (
     KernelFuncConfig,
     KernelTuningConfig,
@@ -42,6 +43,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     LDS_USABLE_BYTES,
     ActivationSpec,
     ActKind,
+    CombineMode,
     DtypeQuant,
     EpilogueMode,
     FuncSpec,
@@ -57,6 +59,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
 from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import (
     validate,
     validate_buffer_counts,
+    validate_combine,
 )
 from aiter.ops.triton.moe.moe_op_gemm_gluon_config import (
     _SUPPORTED_BLOCK_M,
@@ -75,6 +78,7 @@ from aiter.ops.triton.moe.moe_op_gemm_gluon_config import (
     _tuning_args,
     _validate_selected_pipeline,
 )
+from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -296,6 +300,7 @@ def _launch_spec(
     epilogue=int(EpilogueMode.DEFAULT),
     stream_expert_payload=False,
     multi_block=False,
+    combine=int(CombineMode.NONE),
 ):
     """Host-side constexpr work, memoised.
 
@@ -338,6 +343,7 @@ def _launch_spec(
             WeightGuHbmLayout.SPLIT if gate_up_split else WeightGuHbmLayout.INTERLEAVED
         ),
         epilogue,
+        combine,
     )
     tuning_spec = TuningSpec(*(_hashable(v) for v in _tuning_args(c)))
     # Construct the tuning config on the host off exactly the numbers the kernel will
@@ -729,6 +735,67 @@ def _fast_launch_memoise(
     )
 
 
+def _combine_selected(cfg, y, scatter_indx, combine_out, routing_data, N, K) -> bool:
+    """Run :attr:`CombineMode.LAST_PRODUCER` for this GEMM2 launch?
+
+    ``AITER_TRITON_MOE_GLUON_COMBINE=0`` or ``1`` turns it off or on wherever the
+    tensors allow it (A/B runs and exactness sweeps). Otherwise the launch config
+    (the GEMM2 JSON family) selects it: ``LAST_PRODUCER_TOPK`` lists the topk values,
+    and ``LAST_PRODUCER_MIN_N`` / ``LAST_PRODUCER_MIN_K`` bound the shapes, for
+    which the in-kernel combine was measured faster than ``reduce_grouped``.
+    """
+    forced = os.environ.get("AITER_TRITON_MOE_GLUON_COMBINE")
+    if forced is None:
+        wanted = (
+            routing_data.n_expts_act in cfg.get("LAST_PRODUCER_TOPK", ())
+            and N >= cfg.get("LAST_PRODUCER_MIN_N", 0)
+            and K >= cfg.get("LAST_PRODUCER_MIN_K", 0)
+        )
+    else:
+        wanted = forced != "0"
+    return (
+        wanted
+        and gluon_combine_supported(y, scatter_indx, combine_out, routing_data)[0]
+    )
+
+
+def _combine_error(tc, N) -> str | None:
+    """Why the tuning config cannot run the combine (``validate_combine``), or None."""
+    try:
+        validate_combine(tc, KernelLayout(tc), N)
+    except AssertionError as error:
+        return str(error)
+    return None
+
+
+#: Elements per program of the combine preparation kernel.
+_COMBINE_PREP_BLOCK = 1024
+
+
+def _combine_workspace(scatter_indx, combine_out, n_slots):
+    """Per-launch combine state: zeroed counters and the inverse of ``scatter_indx``.
+
+    One int32 allocation and one kernel. Both are rebuilt on every launch, so a
+    graph replay or a repeated call starts from zeroed counters.
+    """
+    n_gates = scatter_indx.shape[0]
+    n_counters = combine_out.shape[0] * n_slots
+    ws = torch.empty(n_gates + n_counters, dtype=torch.int32, device=combine_out.device)
+    row_gate, counters = ws[:n_gates], ws[n_gates:]
+    grid = -(-max(n_gates, n_counters) // _COMBINE_PREP_BLOCK)
+    _combine_prep[(grid,)](
+        scatter_indx,
+        row_gate,
+        counters,
+        n_gates,
+        n_counters,
+        BLOCK=_COMBINE_PREP_BLOCK,
+        NUM_WARPS=4,
+        num_warps=4,
+    )
+    return counters, row_gate, n_slots
+
+
 def moe_gemm_gluon(
     y: torch.Tensor,
     x: torch.Tensor,
@@ -751,6 +818,7 @@ def moe_gemm_gluon(
     config: dict | None = None,
     gate_up_split: bool | None = None,
     epilogue: EpilogueMode | int | None = None,
+    combine_out: torch.Tensor | None = None,
 ):
     """Launch the Gluon grouped GEMM into ``y`` (shape ``(1, M, N // ARN)``).
 
@@ -783,6 +851,13 @@ def moe_gemm_gluon(
 
     ``epilogue`` selects normal arithmetic or the shape-preserving NOP modes in
     :class:`EpilogueMode`. ``None`` accepts the legacy ``NO_EPI`` environment setting.
+
+    ``combine_out`` non-None (gemm2 with a full routing: ``scatter_indx`` a
+    permutation of the gates) also fills ``combine_out[token]`` with the bf16 result
+    of ``reduce_grouped(y, scatter_indx.view(-1, topk))``. The kernel sums the rows
+    itself (:attr:`CombineMode.LAST_PRODUCER`) when :func:`_combine_selected` picks it
+    and the store layout publishes whole rows; otherwise ``reduce_grouped`` runs after
+    the kernel. Both give the same bits.
 
     Returns the compiled kernel handle so callers (the ISA-assertion test) can inspect
     ``.asm``; the result itself is written into ``y`` / ``y_scales``.
@@ -817,6 +892,7 @@ def moe_gemm_gluon(
     else:
         act = None
     out_quant = int(DtypeQuant.MXFP4) if y_scales is not None else None
+    combine = int(CombineMode.NONE)
 
     # Every argument but the config tuple is fixed for this launch, so bind them once.
     # Three of the shuffle branches below rebuild the spec against an amended config,
@@ -841,11 +917,21 @@ def moe_gemm_gluon(
             epilogue,
             stream_expert_payload,
             multi_block,
+            combine,
         )
 
     grid_n, constexpr_args, num_warps, waves_per_eu, _cfg, _tc = _spec(
         _cfg_key(config) if config else None
     )
+    if combine_out is not None and _combine_selected(
+        _cfg, y, scatter_indx, combine_out, routing_data, N, K
+    ):
+        combine = int(CombineMode.LAST_PRODUCER)
+        spec = _spec(_cfg_key(config) if config else None)
+        if _combine_error(spec[-1], N) is None:
+            grid_n, constexpr_args, num_warps, waves_per_eu, _cfg, _tc = spec
+        else:
+            combine = int(CombineMode.NONE)
 
     # Tuning flags request preparation of the public raw scale inputs. Only pass an
     # effective shuffle flag to the kernel when preparation actually succeeded.
@@ -962,6 +1048,22 @@ def moe_gemm_gluon(
     # into the FX graph -- see _moe_gluon_gemm1. Field order must track the NamedTuple
     # definitions in _types.py.
     kernel = _moe_gluon_gemm1 if apply_swiglu else _moe_gluon_gemm2
+    if apply_swiglu:
+        cmb_args, cmb_consts = (), ()
+    elif combine:
+        counters, row_gate, n_slots = _combine_workspace(
+            scatter_indx, combine_out, N // int(_cfg["SLOT_N"])
+        )
+        cmb_args = (
+            combine_out,
+            combine_out.stride(0),
+            combine_out.stride(1),
+            counters,
+            row_gate,
+        )
+        cmb_consts = (n_slots,)
+    else:
+        cmb_args, cmb_consts = (None, 0, 0, None, None), (0,)
     args = (
         a.ptr,
         a.scale_ptr,
@@ -989,6 +1091,7 @@ def moe_gemm_gluon(
         bias,
         0 if bias is None else bias.stride(0),
         x_static_scale,
+        *cmb_args,
         grid_m,
         grid_n,
         K // int(_cfg["BLOCK_K"]),
@@ -1008,28 +1111,28 @@ def moe_gemm_gluon(
         res.stride_n,
         res.out_dim,
         rt.n_expts_act,
+        *cmb_consts,
         *constexpr_args,
     )
     grid_x = grid_m * grid_n
-    fast = _fast_launch(kernel, grid_x, args, num_warps, waves_per_eu, constexpr_args)
-    if fast is not None:
-        return fast
-    if _LLVM_FN_ATTRS:
-        compiled = kernel[(grid_x,)](
-            *args,
-            num_warps=num_warps,
-            waves_per_eu=waves_per_eu,
-            llvm_fn_attrs=_LLVM_FN_ATTRS,
-        )
-    else:
-        compiled = kernel[(grid_x,)](
-            *args,
-            num_warps=num_warps,
-            waves_per_eu=waves_per_eu,
-        )
-    _fast_launch_memoise(
-        kernel, grid_x, args, num_warps, waves_per_eu, constexpr_args, compiled
+    compiled = _fast_launch(
+        kernel, grid_x, args, num_warps, waves_per_eu, constexpr_args
     )
+    if compiled is None:
+        options = {"llvm_fn_attrs": _LLVM_FN_ATTRS} if _LLVM_FN_ATTRS else {}
+        compiled = kernel[(grid_x,)](
+            *args, num_warps=num_warps, waves_per_eu=waves_per_eu, **options
+        )
+        _fast_launch_memoise(
+            kernel, grid_x, args, num_warps, waves_per_eu, constexpr_args, compiled
+        )
+    if combine_out is not None and not combine:
+        reduce_grouped(
+            y,
+            scatter_indx.view(-1, routing_data.n_expts_act),
+            combine_out,
+            out_dtype=combine_out.dtype,
+        )
     return compiled
 
 
@@ -1072,6 +1175,7 @@ def try_gluon_grouped_gemm(
     quant_static_scale=None,
     swizzle_mx_scale=None,
     w_static_scale=None,
+    combine_out: torch.Tensor | None = None,
 ) -> bool:
     """The one hook every ``moe_gemm_*`` wrapper calls.
 
@@ -1079,6 +1183,11 @@ def try_gluon_grouped_gemm(
     fall through to its own Triton kernel. Capability-gated and never asserted: an
     unsupported combination is a fallback, not a failure, so no existing caller silently
     changes behaviour.
+
+    ``combine_out`` asks for the plain grouped sum as well (full routing, no gate
+    mask, no activation): on True it holds ``reduce_grouped(y, scatter_indx.view(-1,
+    topk))``, computed in the GEMM2 kernel or by ``reduce_grouped`` (see
+    :func:`moe_gemm_gluon`).
     """
     ok, why = gluon_supported(
         x=x,
@@ -1101,7 +1210,7 @@ def try_gluon_grouped_gemm(
     if not ok:
         _LOGGER.debug(f"{op_name}: falling back to the Triton kernel: {why}")
         return False
-    moe_gemm_gluon(
+    args = (
         y,
         x,
         w,
@@ -1118,9 +1227,30 @@ def try_gluon_grouped_gemm(
         alpha,
         limit,
         swiglu_add_residual,
-        x_static_scale=x_static_scale,
     )
+    moe_gemm_gluon(*args, x_static_scale=x_static_scale, combine_out=combine_out)
     return True
+
+
+def gluon_combine_supported(y, scatter_indx, combine_out, routing_data):
+    """``(ok, why)``: do the tensors allow GEMM2 to sum the gate rows itself
+    (CombineMode.LAST_PRODUCER)? The tensor contract only; the launch config's store
+    layout is checked by ``validate_combine``."""
+    if scatter_indx is None or scatter_indx.dtype not in (torch.int32, torch.uint16):
+        return False, "needs uint16 or int32 scatter indices"
+    topk = routing_data.n_expts_act
+    n_gates = y.shape[1]
+    if scatter_indx.ndim != 1 or not scatter_indx.is_contiguous():
+        return False, "scatter indices must be one contiguous vector"
+    if scatter_indx.shape[0] != n_gates or n_gates % topk:
+        return False, "scatter indices must cover every gate row"
+    if y.dtype != torch.bfloat16 or combine_out.dtype != torch.bfloat16:
+        return False, "the combine sums bf16 rows into bf16"
+    if combine_out.shape != (n_gates // topk, y.shape[2]):
+        return False, f"combine_out shape {tuple(combine_out.shape)}"
+    if combine_out.stride(1) != 1 or combine_out.device != y.device:
+        return False, "combine_out must be row-major on y's device"
+    return True, ""
 
 
 def moe_gemm1_a4w4_mxfp4_out(
