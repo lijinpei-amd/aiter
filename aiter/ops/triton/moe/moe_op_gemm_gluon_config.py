@@ -771,14 +771,6 @@ def get_gluon_config_uncached(
 
 
 #: Tuned GEMM2 (no activation) families, ``configs/gfx950/gluon/moe/<family>/``.
-#: Host-side keys of a GEMM2 family entry that select the in-kernel combine
-#: (``moe_op_gemm_gluon._combine_selected``); they are not tuning keys.
-_COMBINE_SELECTION_KEYS = (
-    "LAST_PRODUCER_TOPK",
-    "LAST_PRODUCER_MIN_N",
-    "LAST_PRODUCER_MIN_K",
-)
-
 _GEMM2_FAMILIES = {
     (DtypeQuant.MXFP4, DtypeQuant.MXFP4): "A4W4-GEMM2",
     (DtypeQuant.MXFP8, DtypeQuant.MXFP4): "A8W4-GEMM2",

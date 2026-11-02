@@ -6,23 +6,14 @@
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-
 from ._config import KernelFuncConfig, KernelTuningConfig
-from ._lang import WARP_SIZE_CE, constexpr_fields
+from ._lang import constexpr_fields
 from ._lang import unwrap_attr as _cv
 from ._layout import KernelLayout
-from ._types import (
-    CombineMeta,
-    QuantExpertTensor,
-    QuantTokenTensor,
-    ResultTensor,
-    RoutingMeta,
-)
+from ._types import QuantExpertTensor, QuantTokenTensor, ResultTensor, RoutingMeta
 from .moe_gemm import _moe_gemm_body as _moe_gemm_body_with_layout
 
 __all__ = [
-    "_combine_prep",
     "_moe_gluon_gemm1",
     "_moe_gluon_gemm2",
     "moe_gemm_launch_metadata",
@@ -45,7 +36,6 @@ def _moe_gemm_body(
     N: gl.constexpr,
     K: gl.constexpr,
     NUM_K,
-    cmb=None,
 ):
     """Build the layout from ``tuning_cfg`` and run the body."""
     layout = KernelLayout(tuning_cfg)
@@ -65,7 +55,6 @@ def _moe_gemm_body(
         N,
         K,
         NUM_K,
-        cmb,
     )
 
 
@@ -247,11 +236,6 @@ def _moe_gluon_gemm2(
     bias_ptr,
     stride_bias_e,
     x_static_scale_ptr,
-    cmb_out_ptr,
-    cmb_out_stride_m,
-    cmb_out_stride_n,
-    cmb_counters,
-    cmb_row_gate,
     grid_m,
     grid_n,
     NUM_K,
@@ -271,14 +255,12 @@ def _moe_gluon_gemm2(
     RES_STRIDE_N: gl.constexpr,
     RES_OUT_DIM: gl.constexpr,
     RT_N_EXPTS_ACT: gl.constexpr,
-    CMB_N_SLOTS: gl.constexpr,
     CFG_FUNC: gl.constexpr,
     CFG_TUNING: gl.constexpr,
     CFG_N: gl.constexpr,
     CFG_K: gl.constexpr,
 ):
-    """gemm2: X @ W2 + bias, multiplied by the router combine weight (gammas), and
-    under CombineMode.LAST_PRODUCER summed into each token's row (the cmb_* args)."""
+    """gemm2: X @ W2 + bias, multiplied by the router combine weight (gammas)."""
     func_cfg = KernelFuncConfig(*constexpr_fields(CFG_FUNC))
     tuning_cfg = KernelTuningConfig(func_cfg, *constexpr_fields(CFG_TUNING))
     _moe_gemm_body(
@@ -339,45 +321,4 @@ def _moe_gluon_gemm2(
         CFG_N,
         CFG_K,
         NUM_K,
-        CombineMeta(
-            cmb_out_ptr,
-            cmb_out_stride_m,
-            cmb_out_stride_n,
-            cmb_counters,
-            cmb_row_gate,
-            CMB_N_SLOTS,
-        ),
-    )
-
-
-_combine_prep_repr = make_kernel_repr("_combine_prep", ["BLOCK"])
-
-
-@gluon.jit(repr=_combine_prep_repr)
-def _combine_prep(
-    scatter_ptr,
-    row_gate_ptr,
-    counters_ptr,
-    n_gates,
-    n_counters,
-    BLOCK: gl.constexpr,
-):
-    """``row_gate[scatter[f]] = f`` for every gate ``f``, and zero every counter.
-
-    ``scatter`` must be a permutation of the gates (a full routing); an index outside
-    it is skipped rather than written out of bounds.
-    """
-    L: gl.constexpr = gl.BlockedLayout(
-        [BLOCK // (WARP_SIZE_CE * gl.num_warps())],
-        [WARP_SIZE_CE],
-        [gl.num_warps()],
-        [0],
-    )
-    offs = gl.program_id(0) * BLOCK + gl.arange(0, BLOCK, layout=L)
-    in_gates = offs < n_gates
-    # uint16 or int32, as routing() emits them
-    row = gl.load(scatter_ptr + offs, mask=in_gates, other=0).to(gl.int32)
-    gl.store(row_gate_ptr + row, offs, mask=in_gates & (row < n_gates))
-    gl.store(
-        counters_ptr + offs, gl.zeros([BLOCK], gl.int32, L), mask=offs < n_counters
     )

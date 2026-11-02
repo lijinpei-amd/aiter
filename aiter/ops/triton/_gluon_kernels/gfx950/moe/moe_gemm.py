@@ -12,8 +12,7 @@ The entry points in :mod:`._entry` build the layout and call this body:
   contiguously, multiplies by ``gammas``, writes contiguously.
 
 They differ only in the ``KernelFuncConfig`` instantiated in-kernel. The reduce/combine
-step is ``moe/reduce.py::reduce_grouped``, or for gemm2 under
-``CombineMode.LAST_PRODUCER`` the kernel's own deterministic combine (``_combine.py``).
+step stays in the existing ``moe/reduce.py::reduce_grouped``.
 
 Operand dtypes are independent -- everything derived from one (LDS element type, tile
 shape, copy width, ``k_width``, the MFMA shape) is per operand, because the mixed pairs
@@ -70,7 +69,6 @@ from triton.experimental.gluon import language as gl
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu_gate
 from aiter.ops.triton._triton_kernels.common.pid_preprocessing import pid_grid, remap_xcd
 
-from ._combine import _combine_rows
 from ._epilogue import _epi_bias_tiles, _epilogue_store, _stage_epilogue_inputs
 from ._lang import require_constexpr
 from ._lds import LDSManager
@@ -172,7 +170,6 @@ def _moe_gemm_body(
     N: gl.constexpr,
     K: gl.constexpr,
     NUM_K,
-    cmb=None,  # CombineMeta under CombineMode.LAST_PRODUCER
 ):
     gl.static_assert(validate(tuning_cfg, N, K, layout))
     schedule = Schedule(tuning_cfg, layout, K)
@@ -372,5 +369,3 @@ def _moe_gemm_body(
         layout,
         GATE_PRE=FUSE,
     )
-    if require_constexpr(func_cfg.combine != 0):
-        _combine_rows(res, rt, cmb, block_id, pid_n, start_m, M_e, tuning_cfg, layout)

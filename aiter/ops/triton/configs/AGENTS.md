@@ -220,7 +220,7 @@ there is no file. Do not change the returned dict.
 | `A8W4` | `triton` | `bm<block_m>_n<N>_k<K>` | `BLOCK_SIZE_N`, `BLOCK_SIZE_K`, `num_warps`, `num_stages`, `waves_per_eu`, `matrix_instr_nonkdim` |
 | `A8W4` | `gluon` | `bm<block_m>_n<N>_k<K>_<bucket>`, then `bm<block_m>_any` | `block_n`, `block_k`, `num_buffers`, `num_warps`, `persistent_iters` |
 | `A4W4` | `gluon` | `bm<block_m>_n<N>_k<K>_<bucket>`, then `bm<block_m>_any` | `block_n`, `block_k`, `num_buffers`, `num_warps` |
-| `A4W4-GEMM2`, `A8W4-GEMM2`, `A8W8-GEMM2` | `gluon` (gfx950) | `bm<block_m>_any`, optional `bm<block_m>_small` and `bm<block_m>_multi` | keys of the gfx950 Gluon MoE tuning config, e.g. `BLOCK_N`, `BLOCK_K`, `SLOT_M`, `SLOT_N`, `mfma_instr_shape`, `warps_per_cta`, `tiles_per_warp`, `NUM_LDS_BUFFER`, `K_UNROLL`, `VGPR_PREFETCH_K`, `WAVES_PER_EU`, `WAIT_COMMIT_SCHEME`, `SOFF_UNROLL`, `GROUP_M`, `B_SCALE_SHUFFLED`, `B_PRESHUFFLED`, `ALLOW_B_VIA_LDS`, and the combine selection `LAST_PRODUCER_TOPK`, `LAST_PRODUCER_MIN_N`, `LAST_PRODUCER_MIN_K` |
+| `A4W4-GEMM2`, `A8W4-GEMM2`, `A8W8-GEMM2` | `gluon` (gfx950) | `bm<block_m>_any`, optional `bm<block_m>_small` and `bm<block_m>_multi` | keys of the gfx950 Gluon MoE tuning config, e.g. `BLOCK_N`, `BLOCK_K`, `SLOT_M`, `SLOT_N`, `mfma_instr_shape`, `warps_per_cta`, `tiles_per_warp`, `NUM_LDS_BUFFER`, `K_UNROLL`, `VGPR_PREFETCH_K`, `WAVES_PER_EU`, `WAIT_COMMIT_SCHEME`, `SOFF_UNROLL`, `GROUP_M`, `B_SCALE_SHUFFLED`, `B_PRESHUFFLED`, `ALLOW_B_VIA_LDS` |
 
 - `block_m` is the key. Do not put `BLOCK_SIZE_M` or `block_m` in an entry.
 - `<bucket>` comes from `m2bucket()`: `tiny` (M ≤ 8), `small` (M ≤ 32),
@@ -236,12 +236,6 @@ there is no file. Do not change the returned dict.
   An entry with `"ALLOW_B_VIA_LDS": false` (B in registers) must also set
   `"B_PRESHUFFLED": true`. The launch then keeps a preshuffled copy of the
   weights on the weight tensor, so the weights use twice the memory.
-  `LAST_PRODUCER_TOPK` (a list of topk values), `LAST_PRODUCER_MIN_N` and
-  `LAST_PRODUCER_MIN_K` are not kernel tuning keys: a launch whose topk is in the
-  list and whose N and K reach the minimums sums each token's rows inside the
-  GEMM2 kernel (`CombineMode.LAST_PRODUCER`, same bits) instead of in
-  `reduce_grouped`. Give them only the topk and the N and K range where the
-  combine was measured faster.
   A `bm<block_m>_small` or `bm<block_m>_multi` entry lists only the keys it
   changes on top of `bm<block_m>_any`. The launch applies `bm<block_m>_small`
   when the launch grid is small (`small_grid` in `moe_op_gemm_gluon_config.py`:

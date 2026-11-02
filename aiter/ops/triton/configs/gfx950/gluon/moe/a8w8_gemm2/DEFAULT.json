@@ -35,12 +35,7 @@
         "GROUP_M": 8,
         "B_SCALE_SHUFFLED": true,
         "B_PRESHUFFLED": true,
-        "ALLOW_B_VIA_LDS": false,
-        "LAST_PRODUCER_TOPK": [
-            4
-        ],
-        "LAST_PRODUCER_MIN_N": 4096,
-        "LAST_PRODUCER_MIN_K": 2048
+        "ALLOW_B_VIA_LDS": false
     },
     "bm128_any": {
         "BLOCK_N": 256,

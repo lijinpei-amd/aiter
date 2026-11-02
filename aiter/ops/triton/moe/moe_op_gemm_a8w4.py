@@ -22,9 +22,6 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w4 import (
     _moe_gemm_a8w4 as _moe_gemm_a8w4_triton,
 )
 from aiter.ops.triton.moe.moe_op_gemm_gluon import (
-    gluon_combine_out as _gluon_combine_out,
-)
-from aiter.ops.triton.moe.moe_op_gemm_gluon import (
     try_gluon_grouped_gemm as _try_gluon,
 )
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
@@ -563,16 +560,6 @@ def moe_gemm_a8w4(
         stride_y_mx_n = 0
     stride_bias = None if bias is None else bias.stride(0)
     # moe metadata
-    # The gfx950 hook may fill y_final itself (in-kernel combine): then the
-    # reduce_grouped below is skipped.
-    combine_out = _gluon_combine_out(
-        y_final,
-        scatter_indx,
-        apply_swiglu_reduction,
-        reduction_n_reduction,
-        gate_valid,
-        residual,
-    )
     # gfx950 Gluon path. `use_gluon` above is the *gfx1250* kernel; this one is CDNA4
     # and reads the same (E, K/2, N) weight layout the Triton path wants, so it is
     # offered only when the gfx1250 transpose above did not happen.
@@ -605,11 +592,8 @@ def moe_gemm_a8w4(
             x_static_scale=x_static_scale,
             quant_static_scale=quant_static_scale,
             swizzle_mx_scale=swizzle_mx_scale,
-            combine_out=combine_out,
         )
     ):
-        if combine_out is not None:
-            return combine_out
         group_indx = (
             None
             if scatter_indx is None

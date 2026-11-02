@@ -451,18 +451,12 @@ def _epilogue_one_tile(
         sm = gl.arange(0, SLOT_M, layout=gl.SliceLayout(1, store_layout))
         sn = gl.arange(0, OUT_SLOT_N, layout=gl.SliceLayout(0, store_layout))
         rows = BM * block_id + mi * SLOT_M + sm
-        if require_constexpr(func_cfg.combine != 0):
-            # Write-through: the in-kernel combine publishes these rows to other
-            # CUs as soon as the stores complete (_combine.py).
-            y_cache: gl.constexpr = ".wt"
-        else:
-            y_cache: gl.constexpr = tuning_cfg.result_cache_modifier
         gl.amd.cdna4.buffer_store(
             val,
             y_hbm_ptr,
             rows[:, None] * y_stride_m + (out_n0 + sn)[None, :] * y_stride_n,
             mask=(rows < M_e)[:, None],
-            cache=y_cache,
+            cache=tuning_cfg.result_cache_modifier,
         )
     else:
         # Fused MXFP4 output quant, straight off the fp32 accumulator.

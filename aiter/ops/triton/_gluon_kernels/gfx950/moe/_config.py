@@ -15,7 +15,6 @@ from triton.experimental.gluon import language as gl
 from triton.language.core import _aggregate as aggregate
 
 from ._lang import (
-    CombineMode,
     DotKind,
     DtypeQuant,
     EpilogueMode,
@@ -63,9 +62,6 @@ class KernelFuncConfig:
     # without a gated activation, where it is inert, so no use site re-checks that.
     weight_gu_hbm_layout: gl.constexpr
     epilogue: gl.constexpr  # EpilogueMode
-    # CombineMode: whether the kernel also sums each token's gate rows. Independent
-    # of `epilogue`, whose values >= 2 drop bias and gammas.
-    combine: gl.constexpr
 
     @gluon.constexpr_function
     def __init__(
@@ -83,7 +79,6 @@ class KernelFuncConfig:
         has_x_static_scale,
         weight_gu_hbm_layout=int(WeightGuHbmLayout.INTERLEAVED),
         epilogue=int(EpilogueMode.DEFAULT),
-        combine=int(CombineMode.NONE),
     ):
         self.token_dtype_quant = gl.constexpr(token_dtype_quant)
         self.expert_dtype_quant = gl.constexpr(expert_dtype_quant)
@@ -102,7 +97,6 @@ class KernelFuncConfig:
             else int(WeightGuHbmLayout.INTERLEAVED)
         )
         self.epilogue = gl.constexpr(int(epilogue))
-        self.combine = gl.constexpr(int(combine))
 
     # -- activation --
     @gluon.constexpr_function

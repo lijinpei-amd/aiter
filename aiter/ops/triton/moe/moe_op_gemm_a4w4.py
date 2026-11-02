@@ -14,9 +14,6 @@ from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a4w4 import (
 )
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a4w4 import _moe_gemm_a4w4
 from aiter.ops.triton.moe.moe_op_gemm_gluon import (
-    gluon_combine_out as _gluon_combine_out,
-)
-from aiter.ops.triton.moe.moe_op_gemm_gluon import (
     try_gluon_grouped_gemm as _try_gluon,
 )
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
@@ -483,11 +480,6 @@ def moe_gemm_a4w4(
     expt_hist_sum = None if expt_data is None else expt_data.token_offs_pad[-1]
     expt_token_offs_raw = None if expt_data is None else expt_data.token_offs_raw
     expt_block_pid_map = None if expt_data is None else expt_data.block_pid_map
-    # The gfx950 hook may fill y_final itself (in-kernel combine): then the
-    # reduce_grouped below is skipped.
-    combine_out = _gluon_combine_out(
-        y_final, scatter_indx, apply_swiglu_reduction, reduction_n_reduction, gate_valid
-    )
     # `use_gluon` is the *gfx1250* kernel; the gfx950 one reads the plain (E, K/2, N)
     # weight layout and returns through reduce_grouped, so the gfx1250-only contracts
     # (preshuffled weights, MXFP4 emit, EP scatter) stay on their own paths.
@@ -518,11 +510,8 @@ def moe_gemm_a4w4(
             x_static_scale=None,
             quant_static_scale=None,
             swizzle_mx_scale=swizzle_mx_scale,
-            combine_out=combine_out,
         )
     ):
-        if combine_out is not None:
-            return combine_out
         group_indx = (
             None
             if scatter_indx is None

@@ -16,7 +16,6 @@ __all__ = [
     "MX_GROUP_CE",
     "WARP_SIZE",
     "WARP_SIZE_CE",
-    "CombineMode",
     "DotKind",
     "DtypeQuant",
     "EpilogueMode",
@@ -85,19 +84,6 @@ class EpilogueMode(IntEnum):
     DEFAULT = 0
     NOP_ACTIVATION = 1
     NOP = 2
-
-
-class CombineMode(IntEnum):
-    """How GEMM2's rows reach their token, independent of :class:`EpilogueMode`.
-
-    NONE stores one row per (token, gate) and leaves the sum to ``reduce_grouped``.
-    LAST_PRODUCER also adds the rows in the kernel: the CTA that publishes the last of
-    a token's gates for an output N slot reads all of them back in gate order and
-    writes the token row (``_combine.py``).
-    """
-
-    NONE = 0
-    LAST_PRODUCER = 1
 
 
 class SchedMode(IntEnum):
