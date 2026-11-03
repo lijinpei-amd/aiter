@@ -715,6 +715,9 @@ def get_gluon_config_uncached(
                 _env_int("AITER_TRITON_MOE_GLUON_SCALE_FILL_MID", 0)
             ),
             "UNROLL_EPILOGUE": True,
+            # GEMM1: run an M block that holds at most BLOCK_M / 2 rows on the
+            # block_m / 2 config (_gemm1_half_m_config).
+            "HALF_M_TILE": bool(_env_int("AITER_TRITON_MOE_GLUON_HALF_M_TILE", 0)),
             # Read the complete BLOCK_K payload stage into registers one pipeline step
             # before its MFMAs consume it. The pipeline requires this
             # whole-stage handoff; there is no disabled or partial K-prefetch mode.
@@ -1116,6 +1119,12 @@ def _default_launch_config(
             B_SCALE_SHUFFLED=True,
             B_PRESHUFFLED=True,
             ALLOW_B_VIA_LDS=False,
+            # When the experts average at most 64 rows (dsv4-pro T=4096: exactly 64,
+            # which routing_block_m raises to block_m 128), a block of at most 64 rows
+            # runs the block_m 64 tile (_gemm1_half_m_config). GEMM1 kernel at
+            # dsv4-pro T=4096, HIP 2: 2504 -> 1977 us (even routing), 2513 -> 2321 us
+            # (random routing), output bit-identical.
+            HALF_M_TILE=bool(_env_int("AITER_TRITON_MOE_GLUON_HALF_M_TILE", 1)),
         )
     if (
         apply_swiglu
@@ -1258,6 +1267,44 @@ def _default_launch_config(
             ),
         )
     return c
+
+
+#: Keys whose value the half-height tile takes from its launch: the operand copies
+#: that the launch prepares. The GEMM1 kernel reads one copy of each for both tiles.
+_HALF_M_COPY_KEYS = ("A_SCALE_SORTED_SHUFFLED", "B_SCALE_SHUFFLED", "B_PRESHUFFLED")
+
+
+@cache
+def _gemm1_half_m_config(cfg_items: tuple, block_m, N, K, dq_a, dq_b, small_grid):
+    """The half-height tile of a GEMM1 launch whose config is ``cfg_items``, as sorted
+    config items, or None when the launch has none.
+
+    The tile is the ``_default_launch_config`` of ``block_m / 2`` for the same launch,
+    and it reads the launch's operand copies (:data:`_HALF_M_COPY_KEYS`). It must use
+    the launch's grid, warps and waves per EU, so a config that differs in one of them
+    gives no half-height tile.
+    """
+    cfg = dict(cfg_items)
+    if not cfg.get("HALF_M_TILE") or block_m // 2 not in _SUPPORTED_BLOCK_M:
+        return None
+    half = dict(
+        _default_launch_config(block_m // 2, N, K, dq_a, dq_b, small_grid, True),
+        HALF_M_TILE=False,
+        **{key: cfg[key] for key in _HALF_M_COPY_KEYS},
+    )
+    if any(half[k] != cfg[k] for k in ("BLOCK_N", "warps_per_cta", "WAVES_PER_EU")):
+        return None
+    # The copies must be ones the tile can read.
+    if half["A_SCALE_SORTED_SHUFFLED"] and (
+        not _scale_shuffle_supported(half, 0) or int(half["SLOT_M"]) % 32
+    ):
+        return None
+    if half["B_SCALE_SHUFFLED"] and not _b_scale_shuffle_fits(half):
+        return None
+    if not half["ALLOW_B_VIA_LDS"] and not half["B_PRESHUFFLED"]:
+        return None
+    items = _cfg_key(half)
+    return None if _launch_error(items, dq_a, dq_b, N, K) else items
 
 
 def _expected_m_tiles_per_expert(M: int, n_expts_tot: int, block_m: int) -> int:

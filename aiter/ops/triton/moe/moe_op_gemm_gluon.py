@@ -66,6 +66,7 @@ from aiter.ops.triton.moe.moe_op_gemm_gluon_config import (
     _cval,
     _default_launch_config,
     _env_int,
+    _gemm1_half_m_config,
     _hashable,
     _pipeline_error,
     _probe_lds_bytes,
@@ -137,6 +138,13 @@ def _multi_block(routing_data, M) -> bool:
     """True when the experts average at least two M blocks, so each expert's weights
     are read by several CTAs and the launch writes a large intermediate."""
     return M >= 2 * routing_data.block_m * routing_data.n_expts_tot
+
+
+def _half_block(routing_data, M) -> bool:
+    """True when the experts average at most half an M block, so the experts at or
+    below the mean fit a half-height tile (the routing raises block_m at an exact
+    mean, see ``routing_block_m``)."""
+    return 2 * M <= routing_data.block_m * routing_data.n_expts_tot
 
 
 def gluon_supported(
@@ -297,6 +305,7 @@ def _launch_spec(
     stream_expert_payload=False,
     multi_block=False,
     direct_b=False,
+    half_block=False,
 ):
     """Host-side constexpr work, memoised.
 
@@ -324,6 +333,13 @@ def _launch_spec(
     assert c["BLOCK_M"] == block_m, (
         f"config BLOCK_M {c['BLOCK_M']} must match routing block_m {block_m}"
     )
+    half_items = None
+    if act is not None and half_block:
+        half_items = _gemm1_half_m_config(
+            _cfg_key(c), block_m, N, K, dq_a, dq_b, small_grid
+        )
+    # The flag tells the kernel that it gets a half-height tile.
+    c = dict(c, HALF_M_TILE=half_items is not None)
     func_spec = FuncSpec(
         int(dq_a),
         int(dq_b),
@@ -360,8 +376,22 @@ def _launch_spec(
         gl.constexpr(N),
         gl.constexpr(K),
     )
+    half_cfg_host = None
+    if half_items is not None:
+        half_spec = TuningSpec(*(_hashable(v) for v in _tuning_args(dict(half_items))))
+        half_cfg_host = KernelTuningConfig(func_cfg_host, *half_spec)
+        validate_buffer_counts(half_cfg_host)
+        constexpr_args += (gl.constexpr(half_spec),)
     num_warps = c["warps_per_cta"][0] * c["warps_per_cta"][1]
-    return grid_n, constexpr_args, num_warps, c["WAVES_PER_EU"], c, tuning_cfg_host
+    return (
+        grid_n,
+        constexpr_args,
+        num_warps,
+        c["WAVES_PER_EU"],
+        c,
+        tuning_cfg_host,
+        half_cfg_host,
+    )
 
 
 #: Attribute the padded-row token map is memoised under, on the ``ExptData`` instance.
@@ -915,6 +945,7 @@ def moe_gemm_gluon(
     )
     small_grid = _small_grid(routing_data, y.shape[1], N)
     multi_block = _multi_block(routing_data, y.shape[1])
+    half_block = _half_block(routing_data, y.shape[1])
     direct_b = not apply_swiglu and _gemm2_reads_b_directly(w, w_scales, N, K, dq_b)
 
     if apply_swiglu:
@@ -952,9 +983,10 @@ def moe_gemm_gluon(
             stream_expert_payload,
             multi_block,
             direct_b,
+            half_block,
         )
 
-    grid_n, constexpr_args, num_warps, waves_per_eu, _cfg, _tc = _spec(
+    grid_n, constexpr_args, num_warps, waves_per_eu, _cfg, _tc, _half_tc = _spec(
         _cfg_key(config) if config else None
     )
 
@@ -994,7 +1026,7 @@ def moe_gemm_gluon(
         _cfg = dict(
             _cfg, A_SCALE_SORTED_SHUFFLED=a_shuffled, B_SCALE_SHUFFLED=b_shuffled
         )
-        grid_n, constexpr_args, num_warps, waves_per_eu, _cfg, _tc = _spec(
+        grid_n, constexpr_args, num_warps, waves_per_eu, _cfg, _tc, _half_tc = _spec(
             _cfg_key(_cfg)
         )
 
@@ -1026,12 +1058,14 @@ def moe_gemm_gluon(
             w_payload = shuf_b
             if not _cfg.get("B_PRESHUFFLED", False):
                 _cfg = dict(_cfg, B_PRESHUFFLED=True)
-                grid_n, constexpr_args, num_warps, waves_per_eu, _cfg, _tc = _spec(
-                    _cfg_key(_cfg)
+                grid_n, constexpr_args, num_warps, waves_per_eu, _cfg, _tc, _half_tc = (
+                    _spec(_cfg_key(_cfg))
                 )
     if not _cfg.get("ALLOW_B_VIA_LDS", True) and not _cfg.get("B_PRESHUFFLED", False):
         raise ValueError("ALLOW_B_VIA_LDS=False requires B_PRESHUFFLED weights")
     _validate_launch_config(_tc, N, K)
+    if _half_tc is not None:
+        _validate_launch_config(_half_tc, N, K)
 
     # The preshuffled copy is packed, so its expert stride is not the stride of ``w``.
     # The kernel reads only the expert stride of a preshuffled payload.
