@@ -78,8 +78,10 @@ Remaining gap, largest first:
 - T=1 (up to 1.28, gaps 1.2-3.9 us): the Gluon GEMM alone is at or below FlyDSL's stage
   2; the gap is the ~2.5 us `reduce_grouped` launch (index load, row loads, store).
 - The full matrix in one process moves some cells by up to 6% on both backends (weight
-  placement), and T=1 cells drift together. Isolated runs of the same kernels agree
-  within 2%, so measure suspect cells alone.
+  placement), and T=1 cells drift together. A T=1 GEMM2 kernel can sit in a slower
+  state there: a8w8 dsv4-flash T=1 is 12.9 or 13.9 us in the matrix (GEMM2 kernel
+  10.4 vs 11.4 us) and 12.8-13.1 us alone in every pair. Isolated runs of the same
+  kernels agree within 2%, so measure suspect cells alone.
 
 Check: kernel time with `aiter.test_common.run_perftest` on HIP 7 against FlyDSL's
 `us_stage2` (`op_tests/test_moe_2stage.py --kernel`), and the sha256 of every cell's
