@@ -5,8 +5,9 @@
 
 With ``HALF_M_TILE``, an M block that holds at most ``BLOCK_M / 2`` rows runs a
 second tile, ``BLOCK_M / 2`` rows high. Its rows must be bit-identical to the rows
-that the full tile computes. The routing here gives block_m 128 and experts with 1,
-64, 65 and 126 rows, so both tiles run in one launch.
+that the full tile computes. The routing here gives a mean of exactly 64 rows per
+expert, so block_m 128 and the "half" grid class, and experts with 1, 64, 65 and 126
+rows, so both tiles run in one launch.
 """
 
 import os
@@ -23,10 +24,11 @@ from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
-N, K = 512, 2048
-#: Rows of each expert: two blocks take the half-height tile (1 and 64 rows), two
-#: take the full tile (65 and 126 rows).
-ROWS = (1, 64, 65, 126)
+N, K = 4096, 2048
+#: Rows of each expert: half the blocks take the half-height tile (1 and 64 rows),
+#: half take the full tile (65 and 126 rows). 16 experts and N 4096 give 736 CTAs,
+#: which is not a small grid.
+ROWS = (1, 64, 65, 126) * 4
 _FP8, _FP4 = torch.float8_e4m3fn, torch.uint8
 #: op -> (public wrapper, activation storage, weight storage)
 _OPS = {

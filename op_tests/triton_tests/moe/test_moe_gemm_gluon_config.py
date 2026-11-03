@@ -729,7 +729,7 @@ def test_gemm2_families_hold_tuning_values_only(family):
     grid_keys = {
         f"bm{bm}_{grid}"
         for bm in conf._SUPPORTED_BLOCK_M
-        for grid in ("small", "multi")
+        for grid in ("small", "multi", "half")
     }
     assert any_keys <= set(table) <= any_keys | grid_keys
     known = set(
@@ -773,6 +773,38 @@ def test_gemm2_grid_entry_overlays_the_any_entry(gemm2_tables):
     any_entry = conf._gemm2_tuned(*args, "any")
     assert any_entry["GROUP_M"] != 2
     assert conf._gemm2_tuned(*args, "multi") == dict(any_entry, GROUP_M=2)
+
+
+@pytest.mark.parametrize(
+    "small_grid,multi_block,half_block,grid",
+    [
+        (False, False, True, "half"),
+        (False, False, False, "any"),
+        (False, True, False, "multi"),
+        (True, False, True, "small"),
+    ],
+)
+def test_gemm2_grid_class_order(
+    gemm2_tables, small_grid, multi_block, half_block, grid
+):
+    # A small grid wins, then several M blocks per expert, then half an M block.
+    for name in ("small", "multi", "half"):
+        gemm2_tables["A4W4-GEMM2"][f"bm64_{name}"] = {
+            "GROUP_M": {"small": 1, "multi": 2, "half": 16}[name]
+        }
+    config = conf._default_launch_config(
+        64,
+        6144,
+        2048,
+        DtypeQuant.MXFP4,
+        DtypeQuant.MXFP4,
+        small_grid,
+        False,
+        multi_block=multi_block,
+        half_block=half_block,
+    )
+    expected = {"small": 1, "multi": 2, "half": 16, "any": 8}[grid]
+    assert config["GROUP_M"] == expected
 
 
 def test_gemm2_tuning_is_read_from_its_family(gemm2_tables):

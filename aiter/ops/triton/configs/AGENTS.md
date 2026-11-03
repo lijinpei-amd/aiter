@@ -239,21 +239,22 @@ there is no file. Do not change the returned dict.
   An `AITER_TRITON_MOE_GLUON_*` variable that sets a ladder key wins over the
   entry (`_GEMM2_ENV`). For example, `AITER_TRITON_MOE_GLUON_ALLOW_B_VIA_LDS=1`
   reads B from LDS and makes no preshuffled copy.
-  A `bm<block_m>_small` or `bm<block_m>_multi` entry lists only the keys it
-  changes on top of `bm<block_m>_any`. The launch applies `bm<block_m>_small`
-  when the launch grid is small (`small_grid` in `moe_op_gemm_gluon_config.py`:
-  fewer than 512 CTAs at 128-column N tiles, in practice one token). Else it
-  applies `bm<block_m>_multi` when the experts average two or more M blocks
-  (`_multi_block` in `moe_op_gemm_gluon.py`: M ≥ 2 · block_m · E). A small grid
-  never takes `_multi`.
-  An entry with `"HALF_M_TILE": true` gives a launch a second tile,
-  `block_m / 2` rows high, when the experts average at most `block_m / 2` rows
-  (`_half_block` in `moe_op_gemm_gluon.py`: 2 · M ≤ block_m · E). A CTA whose M
-  block holds at most `block_m / 2` rows runs that tile, with the config the
-  launch gets at `block_m / 2` (the `bm<block_m / 2>` entries). Other launches
-  keep one tile: a second code path changes the code of the first. The two
-  tiles must have the same `BLOCK_N`, `warps_per_cta`, `WAVES_PER_EU` and
-  operand layouts (`B_PRESHUFFLED`, `B_SCALE_SHUFFLED`,
+  A `bm<block_m>_small`, `bm<block_m>_multi` or `bm<block_m>_half` entry lists
+  only the keys it changes on top of `bm<block_m>_any`. The launch applies
+  `bm<block_m>_small` when the launch grid is small (`small_grid` in
+  `moe_op_gemm_gluon_config.py`: fewer than 512 CTAs at 128-column N tiles, in
+  practice one token). Else it applies `bm<block_m>_multi` when the experts
+  average two or more M blocks (`_multi_block` in `moe_op_gemm_gluon.py`:
+  M ≥ 2 · block_m · E), and `bm<block_m>_half` when they average at most half
+  an M block (`_half_block`: 2 · M ≤ block_m · E). This is where the routing
+  raised `block_m` for an exact mean, and nearly every expert has one M block.
+  An entry with `"HALF_M_TILE": true` gives a `_half` launch a second tile,
+  `block_m / 2` rows high. A CTA whose M block holds at most `block_m / 2` rows
+  runs that tile, with the config the launch gets at `block_m / 2` (the
+  `bm<block_m / 2>` entries). Other launches keep one tile, also when
+  `AITER_TRITON_MOE_GLUON_HALF_M_TILE=1`: a second code path changes the code
+  of the first. The two tiles must have the same `BLOCK_N`, `warps_per_cta`,
+  `WAVES_PER_EU` and operand layouts (`B_PRESHUFFLED`, `B_SCALE_SHUFFLED`,
   `A_SCALE_SORTED_SHUFFLED`); else the launch has only the `block_m` tile
   (`_gemm2_half_m_config` in `moe_op_gemm_gluon_config.py`).
 

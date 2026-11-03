@@ -76,6 +76,14 @@ ran. On HIP 4 (3 paired rounds), GEMM2 + reduce 1530 -> 1311 us (even routing) a
 1529 -> 1421 us (random), output bit-identical. Table: `bench_out/gluon_moe_regression/
 gemm2/compare_a8w4pro_20261104_c1.md`.
 
+Done 2026-11-04 (round 7): a launch whose experts average at most half an M block takes
+the `bm<block_m>_half` entry. For a8w4 it runs the linear tile order (`TILE_SCHED` 0)
+and streams the result (`.cs`); the a8w4 block_m 64 tile also streams the result. On
+HIP 7 (3 paired rounds) a8w4 dsv4-pro T=4096 is 1323 -> 1255 us (even) and 1464 ->
+1407 us (random); a8w4 glm52-base and minimax-m3 T=1024 0.95-0.99. Output
+bit-identical in 72/72 cells. Gluon / tuned FlyDSL at that cell is 1.16 on HIP 7.
+Table: `bench_out/gluon_moe_regression/gemm2/compare_a8w4pro_20261104_c2.md`.
+
 Remaining gap, largest first:
 
 - a8w4 dsv4-flash T=16384 is 1.095x FlyDSL, close to the 1.10 limit. The GEMM (~1245

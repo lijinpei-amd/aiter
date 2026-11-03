@@ -791,6 +791,7 @@ _GEMM2_ENV = {
             "HALF_M_TILE",
             "K_UNROLL",
             "SOFF_UNROLL",
+            "TILE_SCHED",
             "VGPR_PREFETCH_K",
             "WAIT_COMMIT_SCHEME",
             "WAVES_PER_EU",
@@ -830,8 +831,9 @@ def _gemm2_env_keys() -> tuple:
 
 def _gemm2_tuned(block_m, dq_a, dq_b, grid) -> dict:
     """The operands' GEMM2 family entry (empty when it has none for ``block_m``):
-    ``bm<block_m>_any``, overlaid by ``bm<block_m>_<grid>`` ("small" or "multi") when
-    the family has that entry. A copy, with JSON lists as the tuples the config uses."""
+    ``bm<block_m>_any``, overlaid by ``bm<block_m>_<grid>`` ("small", "multi" or
+    "half") when the family has that entry. A copy, with JSON lists as the tuples the
+    config uses."""
     family = _GEMM2_FAMILIES[(dq_a, dq_b)]
     table = get_moe_dispatch(family, get_arch(), "gluon")
     entry = {
@@ -952,12 +954,14 @@ def _default_launch_config(
     stream_expert_payload=False,
     multi_block=False,
     direct_b=False,
+    half_block=False,
 ):
     """Share automatic stage-specific geometry with the capability check.
 
     ``multi_block``: the experts average at least two M blocks (see the host's
-    ``_multi_block``); with ``small_grid`` it picks GEMM2's grid class, "small",
-    "multi" or "any".
+    ``_multi_block``). ``half_block``: they average at most half an M block (the
+    host's ``_half_block``). With ``small_grid`` they pick GEMM2's grid class,
+    "small", "multi", "half" or "any", in this order.
 
     ``direct_b``: GEMM2 must read the weights and scales directly (see the host's
     ``_gemm2_reads_b_directly``: graph capture, inference or padded tensors). It then
@@ -975,7 +979,12 @@ def _default_launch_config(
     )
     if not apply_swiglu and not direct_b and (dq_a, dq_b) in _GEMM2_FAMILIES:
         # Every override below needs apply_swiglu, so none applies to GEMM2.
-        grid = "small" if small_grid else "multi" if multi_block else "any"
+        if small_grid:
+            grid = "small"
+        elif multi_block:
+            grid = "multi"
+        else:
+            grid = "half" if half_block else "any"
         ladder = _gemm2_launch_config(ladder, block_m, N, K, dq_a, dq_b, env_keys, grid)
     c = dict(ladder)
     if (
