@@ -115,8 +115,20 @@ Remaining gap, largest first:
   the next half's GEMM2 on a second stream is slower than running them in sequence.
   Diagnostic attribution (wrong-data hacks, HIP 3): B scales ~16 us, A rows ~31 us of the
   GEMM2. Not built: the fixed-role ordered combine (slot 5 waits for slots 0-4); it keeps
-  the publication costs round 5 measured as dominant. Data, probes and the per-variant
-  tables: `bench_out/gluon_moe_regression/gemm2/compare_a8w4pro_20261104_l2.md`.
+  the publication costs round 5 measured as dominant. Fourth pass: FlyDSL's own tuned
+  tile with its non-atomic `reduce` epilogue (rows stored, then `moe_reduction`) takes
+  1215.6 us against 1092.3 us atomic on HIP 7 (3 alternating rounds); Gluon (1244.9 us
+  in the same rounds) is 1.024x that deterministic FlyDSL path and 1.140x the atomic one.
+  Implemented and measured, not kept: a dynamic persistent GEMM2 for the half class (256
+  CTAs fetch tiles from a self-resetting device counter, no padded CTAs; bit-exact; HIP 3
+  GEMM2 -25 us even, HIP 7 paired 1.000 even / 1.007 random) and half-height tiles only
+  (bit-exact; slower: the doubled grid's empty CTAs cost ~60 us at one CTA per CU).
+  Diagnostics: twice the MFMA work adds 160-260 us (the MFMAs are mostly exposed at one
+  wave per SIMD); launching only the real tiles saves ~20 us on HIP 3. Next concrete
+  candidate: a half-height tile that fits three waves per SIMD (FlyDSL runs 168 VGPRs);
+  every tested Gluon layout spills at that budget, so it needs the pipeline to hold one A
+  fragment instead of two. Data, probes and the per-variant tables:
+  `bench_out/gluon_moe_regression/gemm2/compare_a8w4pro_20261104_l2.md`.
 - a8w4 dsv4-flash T=16384 is 1.095x FlyDSL, close to the 1.10 limit. The GEMM (~1245
   us) is faster than FlyDSL's whole stage 2 (1355 us, a tuned atomic kernel), but the
   separate deterministic reduce adds ~237 us at ~4.6 TB/s. No reduce launch shape, a
