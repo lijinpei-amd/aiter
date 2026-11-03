@@ -25,6 +25,7 @@ The launch configs (the ladder, the measured overrides and the host probes) are 
 from __future__ import annotations
 
 import os
+import weakref
 from functools import cache
 
 import torch
@@ -524,64 +525,90 @@ def _sorted_shuffle_a_scales(x_scales, routing_data, gather_indx, K, cfg):
     return out
 
 
-#: Attribute the shuffled copy is memoised under, on the source tensor itself. The
-#: weights are static, so in production the shuffle belongs in the checkpoint-load path;
-#: memoising keeps the benchmark honest (paid once, not per call) without changing every
-#: caller. It hangs off the tensor rather than a dict keyed by data_ptr because a freed
-#: tensor's address is reused, and a stale entry then silently pairs one expert's scales
-#: with another's weights -- which is exactly what it did before this was fixed.
-_B_SCALE_SHUFFLE_ATTR = "_aiter_gluon_cdna4_scale_shuffled"
-#: Memoised 16-column-blocked copy of the weight payload, on the source tensor.
-_B_PRESHUFFLE_ATTR = "_aiter_gluon_b_preshuffled"
+#: Kinds of copy made from a caller tensor. The weights are static, so in production
+#: the shuffle belongs in the checkpoint-load path; caching keeps the benchmark honest
+#: (paid once, not per call) without changing every caller.
+_B_SCALE_SHUFFLE_COPY = "cdna4_scale_shuffled"
+_B_PRESHUFFLE_COPY = "b_preshuffled"
 
 
-def _memoised_on(src, attr, make, *dims):
-    """``make()``, kept on ``src`` until ``src`` changes.
+class _Copy:
+    """A cached copy of one caller tensor, and its runtime state.
+
+    The entry is keyed by the tensor object, not by its data_ptr: a freed tensor's
+    address is reused, and a stale entry then pairs one expert's scales with another's
+    weights. A finalizer removes the entry when the tensor dies. Nothing is stored on
+    the tensor itself, so ``torch.save`` and ``copy.deepcopy`` of it see no copy.
+    """
+
+    __slots__ = ("finalizer", "key", "out", "ready", "src")
+
+    def __init__(self, src, slot):
+        self.src = weakref.ref(src)
+        self.finalizer = weakref.finalize(src, _WEIGHT_COPIES.pop, slot, None)
+        self.finalizer.atexit = False
+
+    def fill(self, key, out):
+        """Keep ``out``, made on the current stream, and mark it not yet written."""
+        self.key, self.out, self.ready = key, out, None
+        if out.is_cuda:
+            self.ready = torch.cuda.Event()
+            self.ready.record(torch.cuda.current_stream(out.device))
+
+    def use(self):
+        """The copy, for a launch on the current stream, which waits until it is
+        written."""
+        out = self.out
+        if self.ready is not None:
+            if self.ready.query():
+                self.ready = None
+            else:
+                torch.cuda.current_stream(out.device).wait_event(self.ready)
+        return out
+
+
+#: (id(tensor), kind) -> _Copy.
+_WEIGHT_COPIES: dict = {}
+
+
+def _cached_copy(src, kind, make, *dims):
+    """``make()``, kept for ``src`` until ``src`` changes.
 
     The key is the version counter, which any in-place write through any view
     increments, the storage address and ``dims``. An inference tensor has no version
     counter: its copy stays until :func:`drop_weight_copies`. A copy made while a CUDA
-    graph is captured is not kept. ``make()`` runs on the current stream, so launches
-    on any stream wait for it until it is complete.
+    graph is captured is not kept.
     """
     version = None if src.is_inference() else src._version
     key = (version, src.data_ptr(), *dims)
-    hit = getattr(src, attr, None)
-    if hit is not None and hit[0] == key:
-        _, out, ready = hit
-        if ready is not None:
-            if ready.query():
-                hit[2] = None
-            else:
-                torch.cuda.current_stream(out.device).wait_event(ready)
-        return out
+    slot = (id(src), kind)
+    entry = _WEIGHT_COPIES.get(slot)
+    if entry is not None and entry.src() is src and entry.key == key:
+        return entry.use()
     out = make()
     if torch.cuda.is_current_stream_capturing():
         return out
-    ready = None
-    if out.is_cuda:
-        ready = torch.cuda.Event()
-        ready.record(torch.cuda.current_stream(out.device))
-    try:
-        setattr(src, attr, [key, out, ready])
-    except AttributeError:
-        pass  # not memoisable; correctness is unaffected
+    if entry is None or entry.src() is not src:
+        entry = _WEIGHT_COPIES[slot] = _Copy(src, slot)
+    entry.fill(key, out)
     return out
 
 
 def drop_weight_copies(*tensors):
-    """Drop the reordered copies that the Gluon MoE GEMM keeps on weight tensors.
+    """Drop the reordered copies that the Gluon MoE GEMM keeps for weight tensors.
 
-    The GEMM keeps a preshuffled copy of ``w`` and of ``w_scales`` on those tensors,
-    and makes a new copy after a PyTorch in-place update. Call this function with
-    the tensors after a write that PyTorch does not count: for example the replay of
-    a CUDA graph that writes the weights, a write through ``.data``, or an in-place
-    write to an inference tensor. ``None`` entries are skipped.
+    The GEMM keeps a preshuffled copy of ``w`` and of ``w_scales``, and makes a new
+    copy after a PyTorch in-place update. Call this function with the tensors after a
+    write that PyTorch does not count: for example the replay of a CUDA graph that
+    writes the weights, a write through ``.data``, or an in-place write to an inference
+    tensor. ``None`` entries are skipped.
     """
     for t in tensors:
-        for attr in (_B_PRESHUFFLE_ATTR, _B_SCALE_SHUFFLE_ATTR):
-            if t is not None and hasattr(t, attr):
-                delattr(t, attr)
+        for kind in (_B_PRESHUFFLE_COPY, _B_SCALE_SHUFFLE_COPY):
+            entry = _WEIGHT_COPIES.get((id(t), kind)) if t is not None else None
+            if entry is not None and entry.src() is t:
+                entry.finalizer.detach()
+                del _WEIGHT_COPIES[(id(t), kind)]
 
 
 def _preshuffled_b(w, cfg, N, K, dq_b):
@@ -614,9 +641,9 @@ def _preshuffled_b(w, cfg, N, K, dq_b):
         return None
     E = w.shape[0]
     # (E, K, N) -> (E, N, KB bytes) -> blocked (E, N/16, KB/16, 16, 16) -> flat
-    return _memoised_on(
+    return _cached_copy(
         w,
-        _B_PRESHUFFLE_ATTR,
+        _B_PRESHUFFLE_COPY,
         lambda: w.transpose(-1, -2)
         .contiguous()
         .view(torch.uint8)
@@ -656,9 +683,9 @@ def _shuffled_b_scales(w_scales, cfg, N, K):
     # would undo the very byte order the shuffle exists to produce. What the kernel
     # reads is the pre-transpose (E, N/32, K) tile, which is already contiguous.
     # The N rows keep their input order, including separate gate/up halves.
-    return _memoised_on(
+    return _cached_copy(
         w_scales,
-        _B_SCALE_SHUFFLE_ATTR,
+        _B_SCALE_SHUFFLE_COPY,
         lambda: _shuffle_scale_tile_gfx950(w_scales.transpose(-1, -2), 32, 8),
         N,
         K,
@@ -797,7 +824,7 @@ def _fast_launch_memoise(
         compiled.packed_metadata,
         # Keep constexpr_args alive so its address cannot be recycled by a later
         # allocation and turn a stale entry into a silent hit.
-        # Same hazard as _B_SCALE_SHUFFLE_ATTR above, same fix.
+        # Same hazard as the weight copies (_Copy) above, same fix.
         (kernel, constexpr_args),
         cpp,
     )

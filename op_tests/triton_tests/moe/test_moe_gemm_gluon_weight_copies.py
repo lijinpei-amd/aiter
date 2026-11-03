@@ -11,6 +11,8 @@ the copies, to a copy used from another stream, and to padded weights (unpadded_
 unpadded_K), which keep their stored layout.
 """
 
+import copy
+import io
 import os
 from types import SimpleNamespace
 
@@ -119,6 +121,10 @@ def _gemm2(op, case, w, ws):
     return _call(op, routes, *case.x[op], w, ws)
 
 
+def _has_copy(t):
+    return (id(t), host._B_PRESHUFFLE_COPY) in host._WEIGHT_COPIES
+
+
 def _dense(t):
     """A new K-contiguous copy of ``t``, with no cached data."""
     return t.transpose(1, 2).contiguous().transpose(1, 2)
@@ -160,7 +166,7 @@ def test_in_place_weight_and_scale_updates(op, inference, case, launches):
     # An inference tensor has no version counter, so GEMM2 reads it directly.
     copies = not inference
     assert launches and all(f == (copies, copies) for f in launches), launches
-    assert hasattr(w, host._B_PRESHUFFLE_ATTR) == copies
+    assert _has_copy(w) == copies
 
 
 @pytest.mark.parametrize("op", list(_OPS))
@@ -250,7 +256,7 @@ def test_allow_b_via_lds_environment_skips_the_packed_copy(
         monkeypatch.delenv("AITER_TRITON_MOE_GLUON_ALLOW_B_VIA_LDS")
         _clear_config_caches()
     assert not launches[-1][0]
-    assert not hasattr(plain, host._B_PRESHUFFLE_ATTR)
+    assert not _has_copy(plain)
     assert torch.equal(out, default)
 
 
@@ -331,10 +337,10 @@ def test_versionless_copy_is_kept_until_dropped():
         made.append(src + len(made))
         return made[-1]
 
-    first = host._memoised_on(src, host._B_PRESHUFFLE_ATTR, make)
-    assert host._memoised_on(src, host._B_PRESHUFFLE_ATTR, make) is first
+    first = host._cached_copy(src, host._B_PRESHUFFLE_COPY, make)
+    assert host._cached_copy(src, host._B_PRESHUFFLE_COPY, make) is first
     host.drop_weight_copies(src)
-    assert host._memoised_on(src, host._B_PRESHUFFLE_ATTR, make) is not first
+    assert host._cached_copy(src, host._B_PRESHUFFLE_COPY, make) is not first
     assert len(made) == 2
 
 
@@ -342,5 +348,23 @@ def test_copy_made_during_graph_capture_is_not_kept():
     src = torch.zeros(4, device="cuda")
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        host._memoised_on(src, host._B_PRESHUFFLE_ATTR, lambda: src + 1)
-    assert not hasattr(src, host._B_PRESHUFFLE_ATTR)
+        host._cached_copy(src, host._B_PRESHUFFLE_COPY, lambda: src + 1)
+    assert not _has_copy(src)
+
+
+@pytest.mark.parametrize("op", list(_OPS))
+def test_weights_with_copies_save_and_copy(op, case, launches):
+    w, ws = _weights(op, EXPERTS, seed=14)
+    weight = torch.nn.Parameter(w, requires_grad=False)
+    module = torch.nn.Module()
+    module.weight = weight
+    _gemm2(op, case, weight, ws)
+    assert launches[-1] == (True, True)
+    for obj in (weight, ws, module, {"w": weight, "ws": ws}):
+        torch.save(obj, io.BytesIO())
+    buffer = io.BytesIO()
+    torch.save(ws, buffer)
+    buffer.seek(0)
+    loaded = torch.load(buffer, map_location="cuda")
+    assert torch.equal(loaded, ws) and not vars(loaded)
+    assert torch.equal(copy.deepcopy(ws), ws)
