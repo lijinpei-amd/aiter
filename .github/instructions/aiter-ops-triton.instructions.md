@@ -165,7 +165,9 @@ In MOE dispatch tables, flag:
   with the same value; a merged entry with `"ALLOW_B_VIA_LDS": false` and
   without `"B_PRESHUFFLED": true`.
 - In a gfx950 Gluon GEMM1 family (`a8w4_gemm1`): a key other than
-  `bm<block_m>_any`; an entry key other than `HALF_M_TILE`.
+  `bm<block_m>_any` and `bm<block_m>_half`; a `_half` entry without the `_any`
+  entry of its `block_m`; an entry key other than `HALF_M_TILE` and
+  `result_cache_modifier`.
 
 Do not flag a GEMM2 `_small` or `_multi` entry that has only a few keys. The
 launch merges it over `bm<block_m>_any`: `_small` for a small launch grid,

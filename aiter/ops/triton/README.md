@@ -174,7 +174,9 @@ have a `bm<block_m>_any` entry for each `block_m`. An optional
 changes, and the launch merges it over `bm<block_m>_any`. A small launch grid
 takes `_small`. Other launches take `_multi` when the experts average two or
 more M blocks. All other launches take `_any` alone. The GEMM1 family
-`configs/gfx950/gluon/moe/a8w4_gemm1/` has only `bm<block_m>_any` entries.
+`configs/gfx950/gluon/moe/a8w4_gemm1/` has `bm<block_m>_any` entries and an
+optional `bm<block_m>_half`, which a launch takes when its experts average at
+most half an M block.
 
 [`configs/AGENTS.md`](configs/AGENTS.md) has the layout, the file names, the
 loaders, the JSON format and the steps to add a config. To tune a GEMM, use

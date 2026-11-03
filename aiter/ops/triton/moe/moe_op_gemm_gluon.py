@@ -229,6 +229,7 @@ def gluon_supported(
         ),
         _multi_block(routing_data, y.shape[1]),
         not apply_swiglu and _gemm2_reads_b_directly(w, w_scales, N, K, dq_b),
+        _half_block(routing_data, y.shape[1]),
     )
     if N % cfg["BLOCK_N"] != 0:
         return False, f"N {N} % BLOCK_N {cfg['BLOCK_N']} != 0"
@@ -328,6 +329,7 @@ def _launch_spec(
             stream_expert_payload,
             multi_block,
             direct_b,
+            half_block,
         )
     )
     assert c["BLOCK_M"] == block_m, (

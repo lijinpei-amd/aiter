@@ -822,28 +822,36 @@ _GEMM1_FAMILIES = {(DtypeQuant.MXFP8, DtypeQuant.MXFP4): "A8W4-GEMM1"}
 #: Ladder keys that a GEMM1 family entry can set, with the AITER_TRITON_MOE_GLUON_
 #: variables that set them in the ladder. When one of them is set, the ladder value
 #: (the environment's) wins over the entry.
-_GEMM1_ENV = {"HALF_M_TILE": ("HALF_M_TILE",)}
+_GEMM1_ENV = {
+    "HALF_M_TILE": ("HALF_M_TILE",),
+    "result_cache_modifier": ("RESULT_CACHE_MODIFIER", "RESULT_MOD"),
+}
 
 
 @cache
-def _gemm1_family_entry(block_m, dq_a, dq_b) -> tuple:
-    """The operands' GEMM1 family entry ``bm<block_m>_any`` as sorted items (empty
-    when there is none). Its keys must be in :data:`_GEMM1_ENV`."""
+def _gemm1_family_entry(block_m, dq_a, dq_b, half_block) -> tuple:
+    """The operands' GEMM1 family entry as sorted items (empty when there is none):
+    ``bm<block_m>_any``, overlaid by ``bm<block_m>_half`` when ``half_block``. Its
+    keys must be in :data:`_GEMM1_ENV`."""
     family = _GEMM1_FAMILIES.get((dq_a, dq_b))
     if family is None:
         return ()
-    entry = get_moe_dispatch(family, get_arch(), "gluon").get(f"bm{block_m}_any", {})
+    table = get_moe_dispatch(family, get_arch(), "gluon")
+    entry = {
+        **table.get(f"bm{block_m}_any", {}),
+        **(table.get(f"bm{block_m}_half", {}) if half_block else {}),
+    }
     unknown = set(entry) - set(_GEMM1_ENV)
-    assert not unknown, f"{family} bm{block_m}_any: keys {sorted(unknown)} not allowed"
+    assert not unknown, f"{family} bm{block_m}: keys {sorted(unknown)} not allowed"
     return tuple(sorted((k, _hashable(v)) for k, v in entry.items()))
 
 
-def _gemm1_tuned(block_m, dq_a, dq_b) -> dict:
+def _gemm1_tuned(block_m, dq_a, dq_b, half_block=False) -> dict:
     """The GEMM1 family entry without the keys that the environment sets."""
     prefix = "AITER_TRITON_MOE_GLUON_"
     return {
         key: value
-        for key, value in _gemm1_family_entry(block_m, dq_a, dq_b)
+        for key, value in _gemm1_family_entry(block_m, dq_a, dq_b, bool(half_block))
         if not any(prefix + name in os.environ for name in _GEMM1_ENV[key])
     }
 
@@ -943,6 +951,7 @@ def _default_launch_config(
     stream_expert_payload=False,
     multi_block=False,
     direct_b=False,
+    half_block=False,
 ):
     """Share automatic stage-specific geometry with the capability check.
 
@@ -953,6 +962,9 @@ def _default_launch_config(
     ``direct_b``: GEMM2 must read the weights and scales directly (see the host's
     ``_gemm2_reads_b_directly``: graph capture, inference or padded tensors). It then
     keeps the ladder; the family entries read copies that the host makes and checks.
+
+    ``half_block``: the experts average at most half an M block (see the host's
+    ``_half_block``); GEMM1 then also takes its family's ``bm<block_m>_half`` entry.
     """
     small_grid = bool(small_grid)
     ladder, env_keys = _get_gluon_config_cached(
@@ -1158,8 +1170,9 @@ def _default_launch_config(
         # routing_block_m raises to block_m 128), a block of at most 64 rows runs the
         # block_m 64 tile (_gemm1_half_m_config). GEMM1 kernel at dsv4-pro T=4096,
         # HIP 2: 2504 -> 1977 us (even routing), 2513 -> 2321 us (random routing),
-        # output bit-identical.
-        c.update(_gemm1_tuned(block_m, dq_a, dq_b))
+        # output bit-identical. Its bm128_half entry streams the result (.cs), which
+        # both tiles use: 1985 -> 1870 us (even), 2303 -> 2290 us (random).
+        c.update(_gemm1_tuned(block_m, dq_a, dq_b, half_block))
     if (
         apply_swiglu
         and dq_b == DtypeQuant.MXFP4
@@ -1304,8 +1317,14 @@ def _default_launch_config(
 
 
 #: Keys whose value the half-height tile takes from its launch: the operand copies
-#: that the launch prepares. The GEMM1 kernel reads one copy of each for both tiles.
-_HALF_M_COPY_KEYS = ("A_SCALE_SORTED_SHUFFLED", "B_SCALE_SHUFFLED", "B_PRESHUFFLED")
+#: that the launch prepares (the GEMM1 kernel reads one copy of each for both tiles),
+#: and the cache policy of the result, which both tiles write.
+_HALF_M_LAUNCH_KEYS = (
+    "A_SCALE_SORTED_SHUFFLED",
+    "B_SCALE_SHUFFLED",
+    "B_PRESHUFFLED",
+    "result_cache_modifier",
+)
 
 
 @cache
@@ -1314,7 +1333,8 @@ def _gemm1_half_m_config(cfg_items: tuple, block_m, N, K, dq_a, dq_b, small_grid
     config items, or None when the launch has none.
 
     The tile is the ``_default_launch_config`` of ``block_m / 2`` for the same launch,
-    and it reads the launch's operand copies (:data:`_HALF_M_COPY_KEYS`). It must use
+    and it takes the launch's operand copies and result policy
+    (:data:`_HALF_M_LAUNCH_KEYS`). It must use
     the launch's grid, warps and waves per EU, so a config that differs in one of them
     gives no half-height tile.
     """
@@ -1324,7 +1344,7 @@ def _gemm1_half_m_config(cfg_items: tuple, block_m, N, K, dq_a, dq_b, small_grid
     half = dict(
         _default_launch_config(block_m // 2, N, K, dq_a, dq_b, small_grid, True),
         HALF_M_TILE=False,
-        **{key: cfg[key] for key in _HALF_M_COPY_KEYS},
+        **{key: cfg[key] for key in _HALF_M_LAUNCH_KEYS},
     )
     if any(half[k] != cfg[k] for k in ("BLOCK_N", "warps_per_cta", "WAVES_PER_EU")):
         return None

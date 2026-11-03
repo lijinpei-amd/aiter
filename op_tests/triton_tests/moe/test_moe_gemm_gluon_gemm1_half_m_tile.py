@@ -180,17 +180,44 @@ def test_a8w8_keeps_one_tile(cases, clean_env, launches):
     torch.testing.assert_close(out.float(), ref, atol=0.25, rtol=0.05)
 
 
-def _a8w4_gemm1_config(block_m):
+def _a8w4_gemm1_config(block_m, half_block=False):
     return conf._default_launch_config(
-        block_m, N, K, DtypeQuant.MXFP8, DtypeQuant.MXFP4, False, True
+        block_m,
+        N,
+        K,
+        DtypeQuant.MXFP8,
+        DtypeQuant.MXFP4,
+        False,
+        True,
+        half_block=half_block,
     )
 
 
 def test_a8w4_gemm1_family_sets_the_half_m_tile(clean_env):
-    # The A8W4-GEMM1 family entry asks for the tile at block_m 128 only.
+    # The A8W4-GEMM1 family asks for the tile at block_m 128 only, and streams the
+    # result of a launch whose experts average at most half an M block.
     entry = conf.get_moe_dispatch("A8W4-GEMM1", conf.get_arch(), "gluon")
-    assert {k: v for k, v in entry.items() if v} == {"bm128_any": {"HALF_M_TILE": True}}
+    assert {k: v for k, v in entry.items() if v} == {
+        "bm128_any": {"HALF_M_TILE": True},
+        "bm128_half": {"result_cache_modifier": ".cs"},
+    }
     assert _a8w4_gemm1_config(128)["HALF_M_TILE"] is True
+    assert _a8w4_gemm1_config(128)["result_cache_modifier"] == ""
+    launch = _a8w4_gemm1_config(128, half_block=True)
+    assert launch["result_cache_modifier"] == ".cs"
+    half = dict(
+        conf._gemm1_half_m_config(
+            conf._cfg_key(launch),
+            128,
+            N,
+            K,
+            DtypeQuant.MXFP8,
+            DtypeQuant.MXFP4,
+            False,
+        )
+    )
+    assert half["BLOCK_M"] == 64 and half["result_cache_modifier"] == ".cs"
+    assert _a8w4_gemm1_config(64, half_block=True)["result_cache_modifier"] == ""
     assert _a8w4_gemm1_config(64)["HALF_M_TILE"] is False
     # Not for GEMM2.
     gemm2 = conf._default_launch_config(
@@ -203,6 +230,9 @@ def test_a8w4_gemm1_family_sets_the_half_m_tile(clean_env):
 def test_environment_wins_over_the_gemm1_family(value, clean_env):
     clean_env.setenv("AITER_TRITON_MOE_GLUON_HALF_M_TILE", value)
     assert _a8w4_gemm1_config(128)["HALF_M_TILE"] is (value == "1")
+    clean_env.setenv("AITER_TRITON_MOE_GLUON_RESULT_CACHE_MODIFIER", "")
+    _clear_config_caches()
+    assert _a8w4_gemm1_config(128, half_block=True)["result_cache_modifier"] == ""
 
 
 def test_no_gemm1_family_entry_keeps_one_tile(clean_env, monkeypatch):
