@@ -106,10 +106,17 @@ Remaining gap, largest first:
   SOFF_UNROLL and SCALE_SLOT_K configs and the column split; the reduce hints were
   checked bit-exact standalone; the env knob sweep was timing only. Diagnostic only, not
   a candidate: a tile-contiguous B copy read with a timing hack that loads the wrong
-  bytes (-1.6% on HIP 2), so it says nothing about a correct implementation. Untested: an
-  ordered in-kernel combine (slot order is ascending expert order); an estimate says most
-  tiles would wait for a running predecessor. Data, probes and the per-variant tables:
-  `bench_out/gluon_moe_regression/gemm2/compare_a8w4pro_20261104_l2.md`.
+  bytes (-1.6% on HIP 2), so it says nothing about a correct implementation. Third pass:
+  the round-5 last-producer in-kernel combine (bit-exact, on its own tree 6e9ee75f5)
+  measured 1.163x (even) and 1.193x (random) against the separate reduce at this cell
+  (HIP 3); a half-height tile at occupancy 3 spills 8-147 VGPRs in every tested layout
+  (occupancy 2 without spills: -2% with half tiles only, but the full tile does not fit);
+  8 warps with compiler warp pipelining spills; overlapping one column half's reduce with
+  the next half's GEMM2 on a second stream is slower than running them in sequence.
+  Diagnostic attribution (wrong-data hacks, HIP 3): B scales ~16 us, A rows ~31 us of the
+  GEMM2. Not built: the fixed-role ordered combine (slot 5 waits for slots 0-4); it keeps
+  the publication costs round 5 measured as dominant. Data, probes and the per-variant
+  tables: `bench_out/gluon_moe_regression/gemm2/compare_a8w4pro_20261104_l2.md`.
 - a8w4 dsv4-flash T=16384 is 1.095x FlyDSL, close to the 1.10 limit. The GEMM (~1245
   us) is faster than FlyDSL's whole stage 2 (1355 us, a tuned atomic kernel), but the
   separate deterministic reduce adds ~237 us at ~4.6 TB/s. No reduce launch shape, a
