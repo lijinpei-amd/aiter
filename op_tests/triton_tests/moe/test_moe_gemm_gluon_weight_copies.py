@@ -164,3 +164,30 @@ def test_graph_replay_reads_updated_weights_and_scales(op, case, launches):
     graph.replay()
     assert not torch.equal(out, after_w)
     assert torch.equal(out, _fresh(op, case, w, ws))
+
+
+@pytest.mark.parametrize("write", ["data", "graph"])
+@pytest.mark.parametrize("op", list(_OPS))
+def test_drop_weight_copies_after_untracked_writes(op, write, case, launches):
+    w, ws = _weights(op, EXPERTS, seed=6)
+    new_w, new_ws = _weights(op, EXPERTS, seed=7)
+    if write == "graph":
+        # A graph that only writes the weights: its replay does not count the write.
+        src_w, src_ws = w.clone(), ws.clone()
+        update = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(update):
+            w.copy_(src_w)
+            ws.copy_(src_ws)
+    first = _gemm2(op, case, w, ws)  # makes the copies
+    if write == "graph":
+        src_w.copy_(new_w)
+        src_ws.copy_(new_ws)
+        update.replay()
+    else:
+        w.data.copy_(new_w)
+        ws.data.copy_(new_ws)
+    host.drop_weight_copies(w, ws, None)
+    out = _gemm2(op, case, w, ws)
+    assert not torch.equal(out, first)
+    assert torch.equal(out, _fresh(op, case, w, ws))
+    assert launches and all(flags == (True, True) for flags in launches), launches

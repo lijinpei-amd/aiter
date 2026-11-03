@@ -557,6 +557,21 @@ def _memoised_on(src, attr, make):
     return out
 
 
+def drop_weight_copies(*tensors):
+    """Drop the reordered copies that the Gluon MoE GEMM keeps on weight tensors.
+
+    The GEMM keeps a preshuffled copy of ``w`` and of ``w_scales`` on those tensors,
+    and makes a new copy after a PyTorch in-place update. Call this function with
+    the tensors after a write that PyTorch does not count: for example the replay of
+    a CUDA graph that writes the weights, or a write through ``.data``. ``None``
+    entries are skipped.
+    """
+    for t in tensors:
+        for attr in (_B_PRESHUFFLE_ATTR, _B_SCALE_SHUFFLE_ATTR):
+            if t is not None and hasattr(t, attr):
+                delattr(t, attr)
+
+
 def _preshuffled_b(w, cfg, N, K, dq_b):
     """Weights permuted 16-column blocked, or None if the config cannot read them.
 
