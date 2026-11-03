@@ -399,13 +399,12 @@ def get_gluon_config_uncached(
 ) -> dict:
     """Explicit Python ladder keyed on shape, dtypes and launch-reuse regime.
 
-    ``aiter/ops/triton/configs/gfx950/gluon/moe/`` is empty and the three in-tree config
-    mechanisms are mutually incompatible, so this starts as a ladder; a JSON resolver
-    under ``{arch}/gluon/moe/{dtype}/`` can replace the body without touching callers.
+    The GEMM2 families under ``aiter/ops/triton/configs/gfx950/gluon/moe/`` are merged
+    over this ladder (:func:`_gemm2_launch_config`); everything else is the ladder.
 
-    ``BLOCK_M`` is an input, not a knob: the router picks
-    ``max(16, min(next_pow2(M // n_expts_tot), 128))`` and the kernel must serve it, so
-    it never appears on the left of this ladder.
+    ``BLOCK_M`` is an input, not a knob: the router picks it
+    (``routing.py::routing_block_m``) and the kernel must serve it, so it never appears
+    on the left of this ladder.
 
     The two regimes really are different kernels in everything but source:
 
@@ -826,12 +825,10 @@ def _gemm2_env_keys() -> tuple:
 
 
 def _gemm2_tuned(block_m, dq_a, dq_b, grid) -> dict:
-    """The operands' GEMM2 family entry, or {}: ``bm<block_m>_any``, overlaid by
-    ``bm<block_m>_<grid>`` ("small" or "multi") when the family has that entry. A
-    copy, with JSON lists as the tuples the config uses."""
-    family = _GEMM2_FAMILIES.get((dq_a, dq_b))
-    if family is None:
-        return {}
+    """The operands' GEMM2 family entry (empty when it has none for ``block_m``):
+    ``bm<block_m>_any``, overlaid by ``bm<block_m>_<grid>`` ("small" or "multi") when
+    the family has that entry. A copy, with JSON lists as the tuples the config uses."""
+    family = _GEMM2_FAMILIES[(dq_a, dq_b)]
     table = get_moe_dispatch(family, get_arch(), "gluon")
     entry = {
         **table.get(f"bm{block_m}_any", {}),
@@ -841,13 +838,20 @@ def _gemm2_tuned(block_m, dq_a, dq_b, grid) -> dict:
 
 
 @cache
+def _validate_launch_config(tuning_cfg, N, K):
+    """Validate each cached effective layout once, before any kernel launch."""
+    layout = KernelLayout(tuning_cfg)
+    validate(tuning_cfg, N, K, layout)
+    return _validate_selected_pipeline(tuning_cfg, layout, K)
+
+
+@cache
 def _launch_error(cfg_items: tuple, dq_a, dq_b, N, K):
-    """The first check the launch (``_validate_launch_config``) fails, or None."""
+    """The first check the launch (:func:`_validate_launch_config`) fails, or None."""
     try:
-        tc = _probe_tuning_config(dict(cfg_items), dq_a, dq_b)
-        layout = KernelLayout(tc)
-        validate(tc, N, K, layout)
-        _validate_selected_pipeline(tc, layout, K)
+        _validate_launch_config(
+            _probe_tuning_config(dict(cfg_items), dq_a, dq_b), N, K
+        )
     except AssertionError as error:
         return str(error)
     return None
@@ -1066,7 +1070,7 @@ def _default_launch_config(
         # the other. bench_out/gluon_larget_20260921.
         #
         # Register B needs preshuffled weights, so the launch path repacks W once and
-        # caches it on the tensor. That is a second copy of the weights resident for
+        # caches it for the tensor. That is a second copy of the weights resident for
         # the lifetime of the model -- the reason this is not the default everywhere.
         # The divisibility terms above are exactly _preshuffled_b's preconditions, so
         # a config that asks for registers is always one it can serve.
@@ -1214,7 +1218,10 @@ def _default_launch_config(
         (c["B_SCALE_SHUFFLED"] and apply_swiglu)
         or (
             c["BLOCK_K"] == 128
-            and _probe_b_scale_via_lds(_cfg_key(c), dq_a, dq_b)
+            # Every override above needs apply_swiglu, so without it c is the ladder.
+            and _probe_b_scale_via_lds(
+                _cfg_key(c) if apply_swiglu else ladder, dq_a, dq_b
+            )
         )
     ):
         # The MXFP8 weight-scale exceptions to get_gluon_config's empty hint.

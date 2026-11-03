@@ -3,7 +3,7 @@
 
 """The gfx950 Gluon MoE GEMM2 reads the weights that the caller passes now.
 
-The launch keeps a preshuffled copy of the B payload and of the B scales on the
+The launch keeps a preshuffled copy of the B payload and of the B scales for the
 weight tensors. A strided weight view and an in-place weight or scale update must
 give the same result as fresh contiguous tensors with the same values. This also
 applies to the replay of a CUDA graph, which does not run the host code that checks
@@ -52,6 +52,20 @@ def _activations(rows, k):
     return {op: downcast_to_mxfp(x, q, axis=-1) for op, (_, q, _) in _OPS.items()}
 
 
+def _clear_config_caches():
+    for cached in (
+        host._launch_spec,
+        conf._get_gluon_config_cached,
+        conf._gemm2_launch_config,
+    ):
+        cached.cache_clear()
+
+
+def _assert_launches(launches, copies):
+    """Every launch read the preshuffled B and the shuffled B scales, or neither."""
+    assert launches and all(f == (copies, copies) for f in launches), launches
+
+
 @pytest.fixture(scope="module")
 def case():
     if get_arch() != "gfx950":
@@ -61,8 +75,7 @@ def case():
             if name.startswith("AITER_TRITON_MOE_GLUON_"):
                 patch.delenv(name)
         patch.delenv("AITER_TRITON_MOE_DISABLE_GLUON", raising=False)
-        host._launch_spec.cache_clear()
-        conf._get_gluon_config_cached.cache_clear()
+        _clear_config_caches()
         route, gather, scatter = _routes(M)
         torch.manual_seed(5)
         # 16 rows give block_m 16, the only block_m where unpadded_N/K apply.
@@ -76,8 +89,7 @@ def case():
             routes16=routes16,
             x16=_activations(16, K_PAD),
         )
-        host._launch_spec.cache_clear()
-        conf._get_gluon_config_cached.cache_clear()
+        _clear_config_caches()
 
 
 @pytest.fixture
@@ -140,7 +152,7 @@ def test_strided_weight_view(op, case, launches):
     full, full_scales = _weights(op, 2 * EXPERTS, seed=1)
     w, ws = full[::2], full_scales[::2]
     out = _gemm2(op, case, w, ws)
-    assert launches and all(flags == (True, True) for flags in launches), launches
+    _assert_launches(launches, True)
     assert torch.equal(out, _fresh(op, case, w, ws))
 
 
@@ -165,7 +177,7 @@ def test_in_place_weight_and_scale_updates(op, inference, case, launches):
         assert torch.equal(out, _fresh(op, case, w, ws))
     # An inference tensor has no version counter, so GEMM2 reads it directly.
     copies = not inference
-    assert launches and all(f == (copies, copies) for f in launches), launches
+    _assert_launches(launches, copies)
     assert _has_copy(w) == copies
 
 
@@ -183,7 +195,7 @@ def test_graph_replay_reads_updated_weights_and_scales(op, case, launches):
     with torch.cuda.graph(graph):
         out = _gemm2(op, case, w, ws)
     captured = launches[eager:]
-    assert launches[:eager] and all(f == (True, True) for f in launches[:eager])
+    _assert_launches(launches[:eager], True)
     # The captured launch must not read a copy that a replay cannot refresh.
     assert captured and all(f == (False, False) for f in captured), captured
 
@@ -228,16 +240,7 @@ def test_drop_weight_copies_after_untracked_writes(op, write, case, launches):
     out = _gemm2(op, case, w, ws)
     assert not torch.equal(out, first)
     assert torch.equal(out, _fresh(op, case, w, ws))
-    assert launches and all(flags == (True, True) for flags in launches), launches
-
-
-def _clear_config_caches():
-    for cached in (
-        host._launch_spec,
-        conf._get_gluon_config_cached,
-        conf._gemm2_launch_config,
-    ):
-        cached.cache_clear()
+    _assert_launches(launches, True)
 
 
 @pytest.mark.parametrize("op", list(_OPS))
@@ -247,7 +250,7 @@ def test_allow_b_via_lds_environment_skips_the_packed_copy(
     w, ws = _weights(op, EXPERTS, seed=8)
     default = _gemm2(op, case, w, ws)
     assert launches[-1][0], "the family entry reads a packed B"
-    plain = w.transpose(1, 2).contiguous().transpose(1, 2)
+    plain = _dense(w)
     monkeypatch.setenv("AITER_TRITON_MOE_GLUON_ALLOW_B_VIA_LDS", "1")
     _clear_config_caches()
     try:
@@ -324,7 +327,7 @@ def test_copy_made_on_one_stream_is_complete_on_another(
         out = _gemm2(op, case, w, ws)
     assert second.cuda_stream in waits, "the second stream did not wait"
     torch.cuda.synchronize()
-    assert launches and all(flags == (True, True) for flags in launches), launches
+    _assert_launches(launches, True)
     assert torch.equal(out, _fresh(op, case, w, ws))
 
 
@@ -385,7 +388,7 @@ def test_dropped_copy_stays_allocated_for_a_consumer_stream(
     assert recorded.count(consumer.cuda_stream) == 2, "one record per copy"
     torch.cuda.synchronize()
     del reuse
-    assert launches and all(flags == (True, True) for flags in launches), launches
+    _assert_launches(launches, True)
     assert torch.equal(out, _fresh(op, case, w, ws))
 
 

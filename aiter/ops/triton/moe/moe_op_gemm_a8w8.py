@@ -202,7 +202,7 @@ def moe_gemm_a8w8(
         of x; applied to the accumulator before bias / activation.
     w_expt_scale: optional fp32 per-expert weight scale [n_expts].
 
-    On gfx950 the Gluon path can keep reordered copies of ``w`` and ``w_scales`` on
+    On gfx950 the Gluon path can keep reordered copies of ``w`` and ``w_scales`` for
     those tensors. It makes new copies after a PyTorch in-place update. After a write
     that PyTorch does not count (a CUDA graph replay, a write through ``.data``, an
     in-place write to an inference tensor), call

@@ -53,10 +53,8 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._types import (
     ScaleSwizzle,
     TuningSpec,
     WeightGuHbmLayout,
-    dq_pack_divisor,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import (
-    validate,
     validate_buffer_counts,
 )
 from aiter.ops.triton.moe.moe_op_gemm_gluon_config import (
@@ -74,7 +72,7 @@ from aiter.ops.triton.moe.moe_op_gemm_gluon_config import (
     _scale_shuffle_supported,
     _stream_mxfp8_gemm1_expert_payload,
     _tuning_args,
-    _validate_selected_pipeline,
+    _validate_launch_config,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -366,14 +364,6 @@ def _launch_spec(
     return grid_n, constexpr_args, num_warps, c["WAVES_PER_EU"], c, tuning_cfg_host
 
 
-@cache
-def _validate_launch_config(tuning_cfg, N, K):
-    """Validate each cached effective layout once, before any kernel launch."""
-    layout = KernelLayout(tuning_cfg)
-    validate(tuning_cfg, N, K, layout)
-    return _validate_selected_pipeline(tuning_cfg, layout, K)
-
-
 #: Attribute the padded-row token map is memoised under, on the ``ExptData`` instance.
 #: Every routing call builds a fresh ``ExptData``, so an entry's lifetime is exactly one
 #: routing: the two GEMMs of a layer share one build and a new routing cannot see a
@@ -617,11 +607,17 @@ def drop_weight_copies(*tensors):
     tensor. ``None`` entries are skipped.
     """
     for t in tensors:
+        if t is None:
+            continue
         for kind in (_B_PRESHUFFLE_COPY, _B_SCALE_SHUFFLE_COPY):
-            entry = _WEIGHT_COPIES.get((id(t), kind)) if t is not None else None
+            entry = _WEIGHT_COPIES.get((id(t), kind))
             if entry is not None and entry.src() is t:
-                entry.finalizer.detach()
-                del _WEIGHT_COPIES[(id(t), kind)]
+                entry.finalizer()  # removes the entry
+
+
+def _k_pack(dq) -> int:
+    """``dq_pack_divisor`` for the launch path: its constexpr-function call costs ~1 us."""
+    return 2 if dq == DtypeQuant.MXFP4 else 1
 
 
 def _preshuffled_b(w, cfg, N, K, dq_b):
@@ -646,7 +642,7 @@ def _preshuffled_b(w, cfg, N, K, dq_b):
         return None
     if int(cfg["BLOCK_K"]) % 32 != 0 or N % 16 != 0 or K % 32 != 0:
         return None
-    pack = dq_pack_divisor(dq_b)
+    pack = _k_pack(dq_b)
     if w.shape[-1] != N or w.shape[-2] * pack != K:
         return None
     KB = K // pack * w.element_size()
@@ -715,8 +711,7 @@ def _gemm2_reads_b_directly(w, w_scales, N, K, dq_b) -> bool:
     """
     if torch.cuda.is_current_stream_capturing() or w.is_inference():
         return True
-    # dq_pack_divisor inline: its constexpr-function call costs ~1 us, twice a launch.
-    pack = 2 if dq_b == DtypeQuant.MXFP4 else 1
+    pack = _k_pack(dq_b)
     *_, k_stored, n_stored = w.shape
     if n_stored != N or k_stored * pack != K:
         return True
@@ -837,7 +832,7 @@ def _fast_launch_memoise(
         compiled.packed_metadata,
         # Keep constexpr_args alive so its address cannot be recycled by a later
         # allocation and turn a stale entry into a silent hit.
-        # Same hazard as the weight copies (_Copy) above, same fix.
+        # (The weight copies avoid the same hazard with a finalizer on their tensor.)
         (kernel, constexpr_args),
         cpp,
     )
@@ -1022,17 +1017,18 @@ def moe_gemm_gluon(
     # A direct-register B tile is read through the operand fragment layout, which is
     # only coalesced on a preshuffled weight, so a config that asks for registers is
     # asking for the repack too -- it is not a separate opt-in. The repack is cached
-    # on the weight tensor, so it costs one pass per model rather than one per launch.
+    # per weight tensor (_cached_copy), so it costs one pass per model, not per launch.
     if _env_int("AITER_TRITON_MOE_GLUON_B_PRESHUFFLED", 0) or not _cfg.get(
         "ALLOW_B_VIA_LDS", True
     ):
         shuf_b = _preshuffled_b(w, _cfg, N, K, dq_b)
         if shuf_b is not None:
             w_payload = shuf_b
-            _cfg = dict(_cfg, B_PRESHUFFLED=True)
-            grid_n, constexpr_args, num_warps, waves_per_eu, _cfg, _tc = _spec(
-                _cfg_key(_cfg)
-            )
+            if not _cfg.get("B_PRESHUFFLED", False):
+                _cfg = dict(_cfg, B_PRESHUFFLED=True)
+                grid_n, constexpr_args, num_warps, waves_per_eu, _cfg, _tc = _spec(
+                    _cfg_key(_cfg)
+                )
     if not _cfg.get("ALLOW_B_VIA_LDS", True) and not _cfg.get("B_PRESHUFFLED", False):
         raise ValueError("ALLOW_B_VIA_LDS=False requires B_PRESHUFFLED weights")
     _validate_launch_config(_tc, N, K)

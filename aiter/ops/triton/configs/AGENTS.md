@@ -235,7 +235,7 @@ there is no file. Do not change the returned dict.
   resource checks and falls back to the ladder where an entry cannot run.
   An entry with `"ALLOW_B_VIA_LDS": false` (B in registers) must also set
   `"B_PRESHUFFLED": true`. The launch then keeps a preshuffled copy of the
-  weights on the weight tensor, so the weights use twice the memory.
+  weights for the weight tensor, so the weights use twice the memory.
   An `AITER_TRITON_MOE_GLUON_*` variable that sets a ladder key wins over the
   entry (`_GEMM2_ENV`). For example, `AITER_TRITON_MOE_GLUON_ALLOW_B_VIA_LDS=1`
   reads B from LDS and makes no preshuffled copy.
