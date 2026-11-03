@@ -17,7 +17,7 @@ import os
 import pytest
 import torch
 
-from aiter.ops.triton._gluon_kernels.gfx950.moe._types import ScaleSwizzle
+from aiter.ops.triton._gluon_kernels.gfx950.moe._types import DtypeQuant, ScaleSwizzle
 from aiter.ops.triton.moe import moe_op_gemm_gluon as host
 from aiter.ops.triton.moe import moe_op_gemm_gluon_config as conf
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import moe_gemm_a4w4, moe_gemm_torch
@@ -46,6 +46,7 @@ def _clear_config_caches():
     for cached in (
         host._launch_spec,
         conf._get_gluon_config_cached,
+        conf._gemm1_family_entry,
         conf._gemm1_half_m_config,
     ):
         cached.cache_clear()
@@ -177,3 +178,33 @@ def test_a8w8_keeps_one_tile(cases, clean_env, launches):
     assert [launch[:2] for launch in launches] == [(False, None)]
     ref = _reference("a8w8", cases["a8w8"])
     torch.testing.assert_close(out.float(), ref, atol=0.25, rtol=0.05)
+
+
+def _a8w4_gemm1_config(block_m):
+    return conf._default_launch_config(
+        block_m, N, K, DtypeQuant.MXFP8, DtypeQuant.MXFP4, False, True
+    )
+
+
+def test_a8w4_gemm1_family_sets_the_half_m_tile(clean_env):
+    # The A8W4-GEMM1 family entry asks for the tile at block_m 128 only.
+    entry = conf.get_moe_dispatch("A8W4-GEMM1", conf.get_arch(), "gluon")
+    assert {k: v for k, v in entry.items() if v} == {"bm128_any": {"HALF_M_TILE": True}}
+    assert _a8w4_gemm1_config(128)["HALF_M_TILE"] is True
+    assert _a8w4_gemm1_config(64)["HALF_M_TILE"] is False
+    # Not for GEMM2.
+    gemm2 = conf._default_launch_config(
+        128, N, K, DtypeQuant.MXFP8, DtypeQuant.MXFP4, False, False
+    )
+    assert not gemm2["HALF_M_TILE"]
+
+
+@pytest.mark.parametrize("value", ["0", "1"])
+def test_environment_wins_over_the_gemm1_family(value, clean_env):
+    clean_env.setenv("AITER_TRITON_MOE_GLUON_HALF_M_TILE", value)
+    assert _a8w4_gemm1_config(128)["HALF_M_TILE"] is (value == "1")
+
+
+def test_no_gemm1_family_entry_keeps_one_tile(clean_env, monkeypatch):
+    monkeypatch.setattr(conf, "get_moe_dispatch", lambda *_: {})
+    assert _a8w4_gemm1_config(128)["HALF_M_TILE"] is False

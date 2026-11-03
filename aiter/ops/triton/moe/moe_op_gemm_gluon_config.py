@@ -815,6 +815,39 @@ _GEMM2_ENV = {
 }
 
 
+#: Tuned GEMM1 (gate/up + SwiGLU) families, ``configs/gfx950/gluon/moe/<family>/``.
+#: An entry merges over the tuned tile of ``_default_launch_config``.
+_GEMM1_FAMILIES = {(DtypeQuant.MXFP8, DtypeQuant.MXFP4): "A8W4-GEMM1"}
+
+#: Ladder keys that a GEMM1 family entry can set, with the AITER_TRITON_MOE_GLUON_
+#: variables that set them in the ladder. When one of them is set, the ladder value
+#: (the environment's) wins over the entry.
+_GEMM1_ENV = {"HALF_M_TILE": ("HALF_M_TILE",)}
+
+
+@cache
+def _gemm1_family_entry(block_m, dq_a, dq_b) -> tuple:
+    """The operands' GEMM1 family entry ``bm<block_m>_any`` as sorted items (empty
+    when there is none). Its keys must be in :data:`_GEMM1_ENV`."""
+    family = _GEMM1_FAMILIES.get((dq_a, dq_b))
+    if family is None:
+        return ()
+    entry = get_moe_dispatch(family, get_arch(), "gluon").get(f"bm{block_m}_any", {})
+    unknown = set(entry) - set(_GEMM1_ENV)
+    assert not unknown, f"{family} bm{block_m}_any: keys {sorted(unknown)} not allowed"
+    return tuple(sorted((k, _hashable(v)) for k, v in entry.items()))
+
+
+def _gemm1_tuned(block_m, dq_a, dq_b) -> dict:
+    """The GEMM1 family entry without the keys that the environment sets."""
+    prefix = "AITER_TRITON_MOE_GLUON_"
+    return {
+        key: value
+        for key, value in _gemm1_family_entry(block_m, dq_a, dq_b)
+        if not any(prefix + name in os.environ for name in _GEMM1_ENV[key])
+    }
+
+
 def _gemm2_env_keys() -> tuple:
     """The :data:`_GEMM2_ENV` keys that the environment sets now, sorted."""
     prefix = "AITER_TRITON_MOE_GLUON_"
@@ -1119,13 +1152,14 @@ def _default_launch_config(
             B_SCALE_SHUFFLED=True,
             B_PRESHUFFLED=True,
             ALLOW_B_VIA_LDS=False,
-            # When the experts average at most 64 rows (dsv4-pro T=4096: exactly 64,
-            # which routing_block_m raises to block_m 128), a block of at most 64 rows
-            # runs the block_m 64 tile (_gemm1_half_m_config). GEMM1 kernel at
-            # dsv4-pro T=4096, HIP 2: 2504 -> 1977 us (even routing), 2513 -> 2321 us
-            # (random routing), output bit-identical.
-            HALF_M_TILE=bool(_env_int("AITER_TRITON_MOE_GLUON_HALF_M_TILE", 1)),
         )
+        # The A8W4-GEMM1 family's bm128_any sets HALF_M_TILE: when the experts
+        # average at most 64 rows (dsv4-pro T=4096: exactly 64, which
+        # routing_block_m raises to block_m 128), a block of at most 64 rows runs the
+        # block_m 64 tile (_gemm1_half_m_config). GEMM1 kernel at dsv4-pro T=4096,
+        # HIP 2: 2504 -> 1977 us (even routing), 2513 -> 2321 us (random routing),
+        # output bit-identical.
+        c.update(_gemm1_tuned(block_m, dq_a, dq_b))
     if (
         apply_swiglu
         and dq_b == DtypeQuant.MXFP4

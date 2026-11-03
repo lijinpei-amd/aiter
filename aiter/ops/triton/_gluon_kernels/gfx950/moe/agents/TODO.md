@@ -98,8 +98,8 @@ Done 2026-11-04: the gap was block_m. The mean is exactly 64 rows per expert, so
 `routing_block_m` gives block_m 128 and, with even routing, every M tile is half
 empty. FlyDSL's best kernels use a 64-row tile. A GEMM1 launch whose experts average
 at most half an M block now runs each M block of at most 64 rows on a half-height tile,
-the block_m 64 config (`HALF_M_TILE`, CONCEPTS.md); only the a8w4 block_m 128 config
-asks for it. GEMM1 kernel on HIP 2: 2504 -> 1977 us (even routing), 2513 -> 2321 us
+the block_m 64 config (`HALF_M_TILE`, CONCEPTS.md); only the `A8W4-GEMM1` family's
+`bm128_any` entry asks for it. GEMM1 kernel on HIP 2: 2504 -> 1977 us (even routing), 2513 -> 2321 us
 (random routing); `gluon_perftest` in 4 paired rounds: 0.796 (even), 0.925 (random).
 Output bit-identical in all 72 cells, both routings. Forcing block_m 64 in the routing
 was -24% (even) but +2% (random) for Gluon and +5.5% (random) for Triton.
