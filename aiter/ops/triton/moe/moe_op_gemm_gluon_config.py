@@ -399,8 +399,9 @@ def get_gluon_config_uncached(
 ) -> dict:
     """Explicit Python ladder keyed on shape, dtypes and launch-reuse regime.
 
-    The GEMM2 families under ``aiter/ops/triton/configs/gfx950/gluon/moe/`` are merged
-    over this ladder (:func:`_family_launch_config`); everything else is the ladder.
+    The GEMM1 and GEMM2 families under ``aiter/ops/triton/configs/gfx950/gluon/moe/`` are
+    merged over this ladder (:func:`_family_launch_config`); everything else is the
+    ladder.
 
     ``BLOCK_M`` is an input, not a knob: the router picks it
     (``routing.py::routing_block_m``) and the kernel must serve it, so it never appears
@@ -768,6 +769,10 @@ def get_gluon_config_uncached(
     return cfg
 
 
+#: Tuned GEMM1 (gate/up projection with SwiGLU) families,
+#: ``configs/gfx950/gluon/moe/<family>/``.
+_GEMM1_FAMILIES = {(DtypeQuant.MXFP8, DtypeQuant.MXFP4): "A8W4-GEMM1"}
+
 #: Tuned GEMM2 (no activation) families, ``configs/gfx950/gluon/moe/<family>/``.
 _GEMM2_FAMILIES = {
     (DtypeQuant.MXFP4, DtypeQuant.MXFP4): "A4W4-GEMM2",
@@ -913,7 +918,7 @@ def _default_launch_config(
     ``_multi_block``); with ``small_grid`` it picks GEMM2's grid class, "small",
     "multi" or "any".
 
-    ``direct_b``: GEMM2 must read the weights and scales directly (see the host's
+    ``direct_b``: the launch must read the weights and scales directly (see the host's
     ``_reads_b_directly``: graph capture, inference or padded tensors). It then keeps
     the ladder; the family entries read copies that the host makes and checks.
     """
@@ -933,6 +938,19 @@ def _default_launch_config(
         family = _GEMM2_FAMILIES[(dq_a, dq_b)]
         ladder = _family_launch_config(
             ladder, family, block_m, N, K, dq_a, dq_b, env_keys, grid
+        )
+    if (
+        apply_swiglu
+        and not direct_b
+        and not small_grid
+        and (dq_a, dq_b) in _GEMM1_FAMILIES
+        and not (N == 4096 and K == 7168)
+    ):
+        # The GEMM1 entries were measured on large grids; the September shape keeps the
+        # block_m 32 override below (docs/perf_gemm1_a8w4_bm32.md).
+        family = _GEMM1_FAMILIES[(dq_a, dq_b)]
+        ladder = _family_launch_config(
+            ladder, family, block_m, N, K, dq_a, dq_b, env_keys, "any"
         )
     c = dict(ladder)
     if (

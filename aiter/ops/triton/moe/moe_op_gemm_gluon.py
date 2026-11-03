@@ -220,7 +220,7 @@ def gluon_supported(
             apply_swiglu,
         ),
         _multi_block(routing_data, y.shape[1]),
-        not apply_swiglu and _reads_b_directly(w, w_scales, N, K, dq_b),
+        _reads_b_directly(w, w_scales, N, K, dq_b),
     )
     if N % cfg["BLOCK_N"] != 0:
         return False, f"N {N} % BLOCK_N {cfg['BLOCK_N']} != 0"
@@ -915,7 +915,7 @@ def moe_gemm_gluon(
     )
     small_grid = _small_grid(routing_data, y.shape[1], N)
     multi_block = _multi_block(routing_data, y.shape[1])
-    direct_b = not apply_swiglu and _reads_b_directly(w, w_scales, N, K, dq_b)
+    direct_b = _reads_b_directly(w, w_scales, N, K, dq_b)
 
     if apply_swiglu:
         act = ActivationSpec(

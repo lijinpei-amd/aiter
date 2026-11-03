@@ -221,6 +221,7 @@ there is no file. Do not change the returned dict.
 | `A8W4` | `gluon` | `bm<block_m>_n<N>_k<K>_<bucket>`, then `bm<block_m>_any` | `block_n`, `block_k`, `num_buffers`, `num_warps`, `persistent_iters` |
 | `A4W4` | `gluon` | `bm<block_m>_n<N>_k<K>_<bucket>`, then `bm<block_m>_any` | `block_n`, `block_k`, `num_buffers`, `num_warps` |
 | `A4W4-GEMM2`, `A8W4-GEMM2`, `A8W8-GEMM2` | `gluon` (gfx950) | `bm<block_m>_any`, optional `bm<block_m>_small` and `bm<block_m>_multi` | keys of the gfx950 Gluon MoE tuning config, e.g. `BLOCK_N`, `BLOCK_K`, `SLOT_M`, `SLOT_N`, `mfma_instr_shape`, `warps_per_cta`, `tiles_per_warp`, `NUM_LDS_BUFFER`, `K_UNROLL`, `VGPR_PREFETCH_K`, `WAVES_PER_EU`, `WAIT_COMMIT_SCHEME`, `SOFF_UNROLL`, `GROUP_M`, `B_SCALE_SHUFFLED`, `B_PRESHUFFLED`, `ALLOW_B_VIA_LDS` |
+| `A8W4-GEMM1` | `gluon` (gfx950) | `bm<block_m>_any` | the same keys as the `*-GEMM2` families |
 
 - `block_m` is the key. Do not put `BLOCK_SIZE_M` or `block_m` in an entry.
 - `<bucket>` comes from `m2bucket()`: `tiny` (M ≤ 8), `small` (M ≤ 32),
@@ -246,6 +247,13 @@ there is no file. Do not change the returned dict.
   applies `bm<block_m>_multi` when the experts average two or more M blocks
   (`_multi_block` in `moe_op_gemm_gluon.py`: M ≥ 2 · block_m · E). A small grid
   never takes `_multi`.
+- The `A8W4-GEMM1` family tunes the gfx950 Gluon MoE GEMM1 (the gate/up
+  projection with SwiGLU) for MXFP8 activations and MXFP4 weights. Its entries
+  follow the `*-GEMM2` rules above, but GEMM1 has no grid classes: only
+  `bm<block_m>_any` entries. The launch applies them when the grid is not small,
+  and not at N 4096 with K 7168, which has a Python override. It has entries for
+  block_m 16 and 32; the Python overrides in `_default_launch_config` serve the
+  other block_m.
 
 ## Conv
 

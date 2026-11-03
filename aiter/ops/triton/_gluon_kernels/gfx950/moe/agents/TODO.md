@@ -88,6 +88,51 @@ Check: kernel time with `aiter.test_common.run_perftest` on HIP 7 against FlyDSL
 output against the previous commit. The scripts are in the untracked
 `bench_out/gluon_moe_regression/gemm2/tools/` (`gluon_perftest.py`, `out_hash.py`).
 
+## Close the GEMM1 gap to FlyDSL stage 1 at few rows per expert
+
+Priority: high. Target: a8w4 dsv4-flash T=1024 (256 experts x 24 rows, block_m 32),
+Gluon/FlyDSL <= 1.00 with the same BF16 output, warm, on HIP 3.
+
+Done 2026-11-04: the `A8W4-GEMM1` config family
+(`configs/gfx950/gluon/moe/a8w4_gemm1/`), entry `bm32_any`: B in registers, shuffled
+B scales without `.cg`, BLOCK_N 256, WAVES_PER_EU 2. The cause was the config: no
+override matched, and the ladder tile read 1.26x the ideal HBM bytes (unshuffled B
+scales with `.cg`) and held one CTA per CU. dsv4-flash T=1024: 617.9 ->
+431.3 us, Gluon/FlyDSL 1.36 -> 0.950 (FlyDSL BF16 out 454.0 us). dsv4-pro T=1024:
+2083.1 -> 1644.3 us. Factor table and PMC data: `docs/perf_gemm1_a8w4_bm32.md`.
+
+Done 2026-11-04: entry `bm16_any` (T=8 and T=32 in the model matrix), with
+BLOCK_N 128. In the 72-cell matrix (HIP 3, production path) the two entries change
+10 a8w4 GEMM1 cells, all 16-32% faster with even and random routing; every other
+cell keeps its config and its output. Table: `docs/perf_gemm1_a8w4_bm32.md`.
+
+Remaining:
+
+- The benchmark (`bench_moe_gemm_gluon.py::_run_one`) passes `scatter_indx` to
+  GEMM1, so each timed GEMM1 call also runs a `_reduce_grouped` of 7.0-7.5 us that a
+  real GEMM1 does not run. FlyDSL's stage-1 time has no such kernel.
+- The Gluon grid is `routing_data.n_blocks` x grid_n, an upper bound: at this cell
+  2944 of the 7040 CTAs exit at once (FlyDSL launches exactly 8192 at BLOCK_N 128).
+- Other a8w4 cells the rule changed, Gluon/FlyDSL best BF16 stage 1 on HIP 3: dsv4-pro
+  T=1024 1.009, glm52-base T=32 1.020, dsv4-flash T=32 1.028, minimax-m3 T=8 1.040,
+  dsv4-flash T=8 1.071. FlyDSL wins with tile_m 16 at dsv4-pro T=1024 (16 rows per
+  expert; the router gives block_m 32) and with a K split across waves at T=8.
+- a4w4 dsv4-flash T=1024 is 1.40x FlyDSL (2026-11-03, production path). It is also
+  block_m 32 and also takes the ladder; a8w8 at block_m 16/32 too.
+- The older GEMM1 overrides in `_default_launch_config` (block_m 64 and 128, the
+  September-shape tiles) still hold tuning values in Python. Move them into GEMM1
+  families as `A8W4-GEMM1` does; check that the effective configs do not change.
+
+## B scales from registers fault in a GEMM1 block_m 32 tile
+
+Priority: medium. Found 2026-11-04, not fixed. GEMM1 a8w4 dsv4-flash T=1024 with
+BLOCK_N 128, BLOCK_K 256, SLOT_N 64, warps (1, 4), tiles (2, 1), B preshuffled in
+registers, shuffled B scales and `ALLOW_B_SCALE_VIA_LDS=False` gives
+`hipErrorIllegalAddress` in `_moe_gluon_gemm1`. No production config uses it. GEMM2
+block_m 128 reads B scales from registers without a fault. Reproduce with
+`bench_out/gluon_moe_regression/gemm2/g1/sweep_g1.py` (variant `bscale_reg` in
+`v_screen4.json`), then check the B-scale register offsets for SLOT_N 64.
+
 ## Refill an LDS scale with `R > 1` right after its `ds_read`: tried, no win
 
 Tried 2026-10-21, then dropped. An LDS component was copied `D * R` steps before its

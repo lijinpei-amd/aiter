@@ -474,6 +474,142 @@ def test_small_t_mxfp8_gemm1_fits_several_ctas_per_cu(dq_b, ctas_per_cu):
     )
 
 
+@pytest.mark.parametrize("N,K", [(4096, 4096), (6144, 7168)])
+@pytest.mark.parametrize("block_m", [16, 32])
+def test_small_block_m_mxfp8_mxfp4_gemm1_reads_b_from_registers(block_m, N, K):
+    config = conf._default_launch_config(
+        block_m, N, K, DtypeQuant.MXFP8, DtypeQuant.MXFP4, False, True
+    )
+    ladder = conf.get_gluon_config(
+        block_m, N, K, DtypeQuant.MXFP8, DtypeQuant.MXFP4, False
+    )
+    # block_m 32 takes the wide tile at two CTAs per CU; block_m 16 a narrow one.
+    wide = block_m == 32
+    expected = {
+        "BLOCK_N": 256 if wide else 128,
+        "BLOCK_K": 256,
+        "SLOT_M": block_m,
+        "SLOT_N": 128 if wide else 64,
+        "warps_per_cta": (1, 4),
+        "tiles_per_warp": (2, 2) if wide else (1, 1),
+        "WAVES_PER_EU": 2 if wide else ladder["WAVES_PER_EU"],
+        "B_SCALE_SHUFFLED": True,
+        "B_PRESHUFFLED": True,
+        "ALLOW_B_VIA_LDS": False,
+        "expert_scale_cache_modifier": "",
+    }
+    assert {name: config[name] for name in expected} == expected
+    tuning = conf._probe_tuning_config(config, DtypeQuant.MXFP8, DtypeQuant.MXFP4)
+    assert conf._cval(validate(tuning, N, K))
+    layout = KernelLayout(tuning)
+    assert conf._cval(conf._validate_selected_pipeline(tuning, layout, K))
+    # Two N slots, so a gate/up-split caller can run it too.
+    assert config["BLOCK_N"] // config["SLOT_N"] == 2
+    # B leaves LDS, so LDS does not limit the CTAs per CU.
+    assert (
+        conf._probe_lds_bytes(config, DtypeQuant.MXFP8, DtypeQuant.MXFP4)
+        <= host.LDS_USABLE_BYTES // 4
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"small_grid": True},
+        {"apply_swiglu": False},
+        {"dq_b": DtypeQuant.MXFP8},
+        {"block_m": 64},
+        {"N": 2880},
+        {"N": 4096, "K": 7168},
+        {"N": 4096, "K": 7168, "block_m": 16},
+        # Too few K steps for the tile's pipeline.
+        {"K": 1536},
+        {"K": 1536, "block_m": 16},
+        # Graph capture, inference or padded weights: no host copies.
+        {"direct_b": True},
+    ],
+)
+def test_small_block_m_mxfp8_mxfp4_gemm1_register_b_is_narrow(overrides):
+    args = {
+        "block_m": 32,
+        "N": 4096,
+        "K": 4096,
+        "dq_a": DtypeQuant.MXFP8,
+        "dq_b": DtypeQuant.MXFP4,
+        "small_grid": False,
+        "apply_swiglu": True,
+    }
+    args.update(overrides)
+    config = conf._default_launch_config(**args)
+    # B through LDS: the GEMM1 rule did not apply (GEMM2 has its own families).
+    assert config["ALLOW_B_VIA_LDS"] or not args["apply_swiglu"]
+    assert (
+        config["expert_scale_cache_modifier"] != "" or args["dq_b"] != DtypeQuant.MXFP4
+    )
+
+
+@pytest.fixture
+def gemm1_tables(monkeypatch):
+    """Editable copies of the GEMM1 families, served in place of the JSON files."""
+    tables = {
+        family: {
+            k: dict(v) for k, v in get_moe_dispatch(family, "gfx950", "gluon").items()
+        }
+        for family in conf._GEMM1_FAMILIES.values()
+    }
+    monkeypatch.setattr(conf, "get_moe_dispatch", lambda name, *_: tables[name])
+    return tables
+
+
+#: A launch the A8W4-GEMM1 family serves: dsv4-flash T=1024 (block_m 32).
+_GEMM1_ARGS = (32, 4096, 4096, DtypeQuant.MXFP8, DtypeQuant.MXFP4, False, True)
+
+
+@pytest.mark.parametrize("family", sorted(conf._GEMM1_FAMILIES.values()))
+def test_gemm1_families_hold_tuning_values_only(family):
+    table = get_moe_dispatch(family, "gfx950", "gluon")
+    # Only bm<block_m>_any entries: GEMM1 has no grid classes.
+    assert table
+    assert set(table) <= {f"bm{bm}_any" for bm in conf._SUPPORTED_BLOCK_M}
+    known = set(
+        conf.get_gluon_config_uncached(
+            32, 4096, 4096, DtypeQuant.MXFP8, DtypeQuant.MXFP4
+        )
+    )
+    for entry in table.values():
+        assert entry and set(entry) <= known - {"BLOCK_M"}
+        # Register B reads the preshuffled copy.
+        assert entry.get("ALLOW_B_VIA_LDS", True) or entry.get("B_PRESHUFFLED")
+
+
+def test_gemm1_tuning_is_read_from_its_family(gemm1_tables):
+    gemm1_tables["A8W4-GEMM1"]["bm32_any"]["GROUP_M"] = 2
+    assert conf._default_launch_config(*_GEMM1_ARGS)["GROUP_M"] == 2
+
+
+def test_gemm1_without_an_entry_keeps_the_ladder(gemm1_tables):
+    del gemm1_tables["A8W4-GEMM1"]["bm32_any"]
+    assert conf._default_launch_config(*_GEMM1_ARGS) == conf.get_gluon_config(
+        *_GEMM1_ARGS[:5]
+    )
+
+
+def test_gemm1_entry_that_cannot_launch_keeps_the_ladder(gemm1_tables):
+    # Register B on plain weights is rejected by the launch, so the ladder stays.
+    gemm1_tables["A8W4-GEMM1"]["bm32_any"]["B_PRESHUFFLED"] = False
+    assert conf._default_launch_config(*_GEMM1_ARGS) == conf.get_gluon_config(
+        *_GEMM1_ARGS[:5]
+    )
+
+
+def test_gemm1_environment_override_wins_over_the_family_entry(monkeypatch):
+    tuned = conf._default_launch_config(*_GEMM1_ARGS)
+    assert tuned["WAVES_PER_EU"] == 2
+    monkeypatch.setenv("AITER_TRITON_MOE_GLUON_WAVES_PER_EU", "1")
+    conf._get_gluon_config_cached.cache_clear()  # only the ladder cache
+    assert conf._default_launch_config(*_GEMM1_ARGS) == dict(tuned, WAVES_PER_EU=1)
+
+
 @pytest.mark.parametrize(
     "env,sched_mode", [(None, SchedMode.MFMA_8), ("0", SchedMode.NONE)]
 )
@@ -845,7 +981,8 @@ def test_gemm2_environment_keys_cover_the_family_entries():
         "B_PRESHUFFLED",
         "B_SCALE_SHUFFLED",
     }
-    for family in conf._GEMM2_FAMILIES.values():
+    families = {**conf._GEMM1_FAMILIES, **conf._GEMM2_FAMILIES}.values()
+    for family in families:
         for entry in get_moe_dispatch(family, "gfx950", "gluon").values():
             assert set(entry) <= set(conf._FAMILY_ENV) | no_variable, family
 
