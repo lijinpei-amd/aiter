@@ -350,7 +350,7 @@ def _get_gluon_config_cached(
     small_grid: bool,
     stream_expert_payload: bool,
 ) -> tuple:
-    """The ladder as sorted items, and the :data:`_GEMM2_ENV` keys that the
+    """The ladder as sorted items, and the :data:`_FAMILY_ENV` keys that the
     environment set when it was built. Both read the environment once per entry."""
     ladder = get_gluon_config_uncached(
         block_m,
@@ -361,7 +361,7 @@ def _get_gluon_config_cached(
         small_grid,
         stream_expert_payload,
     )
-    return tuple(sorted(ladder.items())), _gemm2_env_keys()
+    return tuple(sorted(ladder.items())), _family_env_keys()
 
 
 def get_gluon_config(
@@ -400,7 +400,7 @@ def get_gluon_config_uncached(
     """Explicit Python ladder keyed on shape, dtypes and launch-reuse regime.
 
     The GEMM2 families under ``aiter/ops/triton/configs/gfx950/gluon/moe/`` are merged
-    over this ladder (:func:`_gemm2_launch_config`); everything else is the ladder.
+    over this ladder (:func:`_family_launch_config`); everything else is the ladder.
 
     ``BLOCK_M`` is an input, not a knob: the router picks it
     (``routing.py::routing_block_m``) and the kernel must serve it, so it never appears
@@ -775,10 +775,10 @@ _GEMM2_FAMILIES = {
     (DtypeQuant.MXFP8, DtypeQuant.MXFP8): "A8W8-GEMM2",
 }
 
-#: Ladder keys that a GEMM2 family entry can set, with the AITER_TRITON_MOE_GLUON_
+#: Ladder keys that a family entry can set, with the AITER_TRITON_MOE_GLUON_
 #: variables that set them in the ladder. When one of them is set, the ladder value
 #: (the environment's) wins over the entry.
-_GEMM2_ENV = {
+_FAMILY_ENV = {
     **{
         key: (key,)
         for key in (
@@ -812,23 +812,22 @@ _GEMM2_ENV = {
 }
 
 
-def _gemm2_env_keys() -> tuple:
-    """The :data:`_GEMM2_ENV` keys that the environment sets now, sorted."""
+def _family_env_keys() -> tuple:
+    """The :data:`_FAMILY_ENV` keys that the environment sets now, sorted."""
     prefix = "AITER_TRITON_MOE_GLUON_"
     return tuple(
         sorted(
             key
-            for key, names in _GEMM2_ENV.items()
+            for key, names in _FAMILY_ENV.items()
             if any(prefix + name in os.environ for name in names)
         )
     )
 
 
-def _gemm2_tuned(block_m, dq_a, dq_b, grid) -> dict:
-    """The operands' GEMM2 family entry (empty when it has none for ``block_m``):
+def _family_tuned(family, block_m, grid) -> dict:
+    """The ``family`` entry for ``block_m`` (empty when it has none):
     ``bm<block_m>_any``, overlaid by ``bm<block_m>_<grid>`` ("small" or "multi") when
     the family has that entry. A copy, with JSON lists as the tuples the config uses."""
-    family = _GEMM2_FAMILIES[(dq_a, dq_b)]
     table = get_moe_dispatch(family, get_arch(), "gluon")
     entry = {
         **table.get(f"bm{block_m}_any", {}),
@@ -858,18 +857,18 @@ def _launch_error(cfg_items: tuple, dq_a, dq_b, N, K):
 
 
 @cache
-def _gemm2_launch_config(
-    ladder_items: tuple, block_m, N, K, dq_a, dq_b, env_keys: tuple, grid: str
+def _family_launch_config(
+    ladder_items: tuple, family, block_m, N, K, dq_a, dq_b, env_keys: tuple, grid: str
 ) -> tuple:
-    """GEMM2 (no activation) config: the ladder with its family's tuned entry on top,
-    as sorted config items. ``env_keys`` are the ladder keys that the environment
-    set (see :func:`_gemm2_env_keys`); they keep their ladder value. ``grid`` is the
-    launch's grid class (see :func:`_default_launch_config`).
+    """The ladder with the tuned entry of ``family`` on top, as sorted config items.
+    ``env_keys`` are the ladder keys that the environment set (see
+    :func:`_family_env_keys`); they keep their ladder value. ``grid`` is the launch's
+    grid class (see :func:`_default_launch_config`).
 
     The entry applies only where the launch can run the result as is; elsewhere the
     ladder stays. Memoised because ``gluon_supported`` asks for it on every launch.
     """
-    tuned = _gemm2_tuned(block_m, dq_a, dq_b, grid)
+    tuned = _family_tuned(family, block_m, grid)
     ladder = dict(ladder_items)
     new = dict(ladder, **tuned)
     new.update((key, ladder[key]) for key in env_keys)
@@ -915,8 +914,8 @@ def _default_launch_config(
     "multi" or "any".
 
     ``direct_b``: GEMM2 must read the weights and scales directly (see the host's
-    ``_gemm2_reads_b_directly``: graph capture, inference or padded tensors). It then
-    keeps the ladder; the family entries read copies that the host makes and checks.
+    ``_reads_b_directly``: graph capture, inference or padded tensors). It then keeps
+    the ladder; the family entries read copies that the host makes and checks.
     """
     small_grid = bool(small_grid)
     ladder, env_keys = _get_gluon_config_cached(
@@ -931,7 +930,10 @@ def _default_launch_config(
     if not apply_swiglu and not direct_b and (dq_a, dq_b) in _GEMM2_FAMILIES:
         # Every override below needs apply_swiglu, so none applies to GEMM2.
         grid = "small" if small_grid else "multi" if multi_block else "any"
-        ladder = _gemm2_launch_config(ladder, block_m, N, K, dq_a, dq_b, env_keys, grid)
+        family = _GEMM2_FAMILIES[(dq_a, dq_b)]
+        ladder = _family_launch_config(
+            ladder, family, block_m, N, K, dq_a, dq_b, env_keys, grid
+        )
     c = dict(ladder)
     if (
         not small_grid

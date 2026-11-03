@@ -237,7 +237,7 @@ there is no file. Do not change the returned dict.
   `"B_PRESHUFFLED": true`. The launch then keeps a preshuffled copy of the
   weights for the weight tensor, so the weights use twice the memory.
   An `AITER_TRITON_MOE_GLUON_*` variable that sets a ladder key wins over the
-  entry (`_GEMM2_ENV`). For example, `AITER_TRITON_MOE_GLUON_ALLOW_B_VIA_LDS=1`
+  entry (`_FAMILY_ENV`). For example, `AITER_TRITON_MOE_GLUON_ALLOW_B_VIA_LDS=1`
   reads B from LDS and makes no preshuffled copy.
   A `bm<block_m>_small` or `bm<block_m>_multi` entry lists only the keys it
   changes on top of `bm<block_m>_any`. The launch applies `bm<block_m>_small`

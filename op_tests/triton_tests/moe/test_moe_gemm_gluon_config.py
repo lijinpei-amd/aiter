@@ -67,7 +67,7 @@ def _clean_tuning_environment(monkeypatch):
     caches = (
         host._launch_spec,
         conf._get_gluon_config_cached,
-        conf._gemm2_launch_config,
+        conf._family_launch_config,
     )
     for cached in caches:
         cached.cache_clear()
@@ -768,10 +768,9 @@ def test_gemm2_multi_block_streams_the_result_and_caches_the_weights(dq_a, dq_b)
 def test_gemm2_grid_entry_overlays_the_any_entry(gemm2_tables):
     # A grid entry lists only the keys it changes on top of bm<block_m>_any.
     gemm2_tables["A4W4-GEMM2"]["bm64_multi"] = {"GROUP_M": 2}
-    args = (64, DtypeQuant.MXFP4, DtypeQuant.MXFP4)
-    any_entry = conf._gemm2_tuned(*args, "any")
+    any_entry = conf._family_tuned("A4W4-GEMM2", 64, "any")
     assert any_entry["GROUP_M"] != 2
-    assert conf._gemm2_tuned(*args, "multi") == dict(any_entry, GROUP_M=2)
+    assert conf._family_tuned("A4W4-GEMM2", 64, "multi") == dict(any_entry, GROUP_M=2)
 
 
 def test_gemm2_tuning_is_read_from_its_family(gemm2_tables):
@@ -848,7 +847,7 @@ def test_gemm2_environment_keys_cover_the_family_entries():
     }
     for family in conf._GEMM2_FAMILIES.values():
         for entry in get_moe_dispatch(family, "gfx950", "gluon").values():
-            assert set(entry) <= set(conf._GEMM2_ENV) | no_variable, family
+            assert set(entry) <= set(conf._FAMILY_ENV) | no_variable, family
 
 
 @pytest.mark.parametrize("suffix", ["EXPERT_CACHE_MODIFIER", "EXPERT_MOD"])

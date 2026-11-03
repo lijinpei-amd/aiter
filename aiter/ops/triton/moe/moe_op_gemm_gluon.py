@@ -220,7 +220,7 @@ def gluon_supported(
             apply_swiglu,
         ),
         _multi_block(routing_data, y.shape[1]),
-        not apply_swiglu and _gemm2_reads_b_directly(w, w_scales, N, K, dq_b),
+        not apply_swiglu and _reads_b_directly(w, w_scales, N, K, dq_b),
     )
     if N % cfg["BLOCK_N"] != 0:
         return False, f"N {N} % BLOCK_N {cfg['BLOCK_N']} != 0"
@@ -701,9 +701,9 @@ def _shuffled_b_scales(w_scales, cfg, N, K):
     )
 
 
-def _gemm2_reads_b_directly(w, w_scales, N, K, dq_b) -> bool:
-    """True when GEMM2 must read ``w`` and ``w_scales`` directly, through its ladder,
-    instead of the copies that its family entries read.
+def _reads_b_directly(w, w_scales, N, K, dq_b) -> bool:
+    """True when the launch must read ``w`` and ``w_scales`` directly, through its
+    ladder, instead of the copies that the family entries read.
 
     A copy is not valid while a CUDA graph is captured (a replay runs no host check),
     for an inference tensor (no version counter shows its writes) or for a padded
@@ -915,7 +915,7 @@ def moe_gemm_gluon(
     )
     small_grid = _small_grid(routing_data, y.shape[1], N)
     multi_block = _multi_block(routing_data, y.shape[1])
-    direct_b = not apply_swiglu and _gemm2_reads_b_directly(w, w_scales, N, K, dq_b)
+    direct_b = not apply_swiglu and _reads_b_directly(w, w_scales, N, K, dq_b)
 
     if apply_swiglu:
         act = ActivationSpec(

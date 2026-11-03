@@ -56,7 +56,7 @@ def _clear_config_caches():
     for cached in (
         host._launch_spec,
         conf._get_gluon_config_cached,
-        conf._gemm2_launch_config,
+        conf._family_launch_config,
     ):
         cached.cache_clear()
 
