@@ -132,10 +132,11 @@ Remaining gap, largest first:
   occupancy-3 tile to 1-2 spilled VGPRs (`TRITON_HIP_AGPR_ALLOC=64`), but HIP 7 paired
   3 rounds give 1.009 even / 1.011 random in the half class (not kept); the occupancy-3
   tile was no faster on HIP 3 either. HIP 3 screens have not transferred to HIP 7 three
-  times (8 warps, dynamic persistent, one A fragment): screen on HIP 7 directly. Next
-  candidate: the 2-way column split with `.wt` stores, so each half's 176 MB intermediate
-  is read back from MALL (HIP 3 kernel trace: reduce 2 x 36 us vs 101 us, GEMM2 +20 us,
-  net -0.8%), measured on HIP 7. Data, probes and the per-variant tables:
+  times (8 warps, dynamic persistent, one A fragment): screen on HIP 7 directly. The
+  2-way column split with `.wt` stores (each half's intermediate read back from MALL) is
+  bit-exact and flat on HIP 7: 1.000 even, 1.006 random (3 alternating rounds). No
+  remaining candidate has a positive HIP 7 measurement. Data, probes and the per-variant
+  tables:
   `bench_out/gluon_moe_regression/gemm2/compare_a8w4pro_20261104_l2.md`.
 - a8w4 dsv4-flash T=16384 is 1.095x FlyDSL, close to the 1.10 limit. The GEMM (~1245
   us) is faster than FlyDSL's whole stage 2 (1355 us, a tuned atomic kernel), but the
