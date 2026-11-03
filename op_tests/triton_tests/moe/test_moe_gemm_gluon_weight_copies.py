@@ -4,8 +4,8 @@
 """The gfx950 Gluon MoE GEMM2 reads the weights that the caller passes now.
 
 The launch keeps a preshuffled copy of the B payload and of the B scales on the
-weight tensors. A strided weight view must give the same result as fresh contiguous
-tensors with the same values.
+weight tensors. A strided weight view and an in-place weight or scale update must
+give the same result as fresh contiguous tensors with the same values.
 """
 
 import os
@@ -105,3 +105,25 @@ def test_strided_weight_view(op, case, launches):
     out = _gemm2(op, case, w, ws)
     assert launches and all(flags == (True, True) for flags in launches), launches
     assert torch.equal(out, _fresh(op, case, w, ws))
+
+
+@pytest.mark.parametrize("inference", [False, True], ids=["tensor", "inference"])
+@pytest.mark.parametrize("op", list(_OPS))
+def test_in_place_weight_and_scale_updates(op, inference, case, launches):
+    mode = torch.inference_mode() if inference else torch.no_grad()
+    with mode:
+        w, ws = _weights(op, EXPERTS, seed=2)
+        first = _gemm2(op, case, w, ws)
+        assert torch.equal(_gemm2(op, case, w, ws), first)
+
+        new_w, new_ws = _weights(op, EXPERTS, seed=3)
+        w.copy_(new_w)
+        after_w = _gemm2(op, case, w, ws)
+        assert not torch.equal(after_w, first)
+        assert torch.equal(after_w, _fresh(op, case, w, ws))
+
+        ws.copy_(new_ws)
+        out = _gemm2(op, case, w, ws)
+        assert not torch.equal(out, after_w)
+        assert torch.equal(out, _fresh(op, case, w, ws))
+    assert launches and all(flags == (True, True) for flags in launches), launches

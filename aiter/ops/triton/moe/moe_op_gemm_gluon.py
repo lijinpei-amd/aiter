@@ -532,6 +532,28 @@ _B_SCALE_SHUFFLE_ATTR = "_aiter_gluon_cdna4_scale_shuffled"
 _B_PRESHUFFLE_ATTR = "_aiter_gluon_b_preshuffled"
 
 
+def _memoised_on(src, attr, make):
+    """``make()``, kept on ``src`` until ``src`` changes.
+
+    Any in-place write to the storage, through any view, increments the version
+    counter. An inference tensor has no version counter, so it gets a new copy for
+    each call.
+    """
+    try:
+        key = (src._version, src.data_ptr())
+    except RuntimeError:
+        return make()
+    hit = getattr(src, attr, None)
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    out = make()
+    try:
+        setattr(src, attr, (key, out))
+    except AttributeError:
+        pass  # not memoisable; correctness is unaffected
+    return out
+
+
 def _preshuffled_b(w, cfg, N, K, dq_b):
     """Weights permuted 16-column blocked, or None if the config cannot read them.
 
@@ -556,27 +578,20 @@ def _preshuffled_b(w, cfg, N, K, dq_b):
     KB = K // dq_pack_divisor(dq_b) * w.element_size()
     if KB % 16 != 0:
         return None
-    hit = getattr(w, _B_PRESHUFFLE_ATTR, None)
-    if hit is not None:
-        return hit
-
     E = w.shape[0]
     # (E, K, N) -> (E, N, KB bytes) -> blocked (E, N/16, KB/16, 16, 16) -> flat
-    out = (
-        w.transpose(-1, -2)
+    return _memoised_on(
+        w,
+        _B_PRESHUFFLE_ATTR,
+        lambda: w.transpose(-1, -2)
         .contiguous()
         .view(torch.uint8)
         .reshape(E, N // 16, 16, KB // 16, 16)
         .permute(0, 1, 3, 2, 4)
         .reshape(E, N // 16 * KB * 16)
         .contiguous()
-        .view(w.dtype)
+        .view(w.dtype),
     )
-    try:
-        setattr(w, _B_PRESHUFFLE_ATTR, out)
-    except AttributeError:
-        pass
-    return out
 
 
 def _shuffled_b_scales(w_scales, cfg):
@@ -595,21 +610,18 @@ def _shuffled_b_scales(w_scales, cfg):
         or w_scales.shape[-2] % 8 != 0
     ):
         return None
-    hit = getattr(w_scales, _B_SCALE_SHUFFLE_ATTR, None)
-    if hit is None:
-        from aiter.ops.triton.utils.shuffle import _shuffle_scale_tile_gfx950
+    from aiter.ops.triton.utils.shuffle import _shuffle_scale_tile_gfx950
 
-        # The tile permute itself, not shuffle_scale_moe: that transposes the result
-        # back to (E, K*, N/32) for the Triton kernels, and materialising that view
-        # would undo the very byte order the shuffle exists to produce. What the kernel
-        # reads is the pre-transpose (E, N/32, K) tile, which is already contiguous.
-        # The N rows keep their input order, including separate gate/up halves.
-        hit = _shuffle_scale_tile_gfx950(w_scales.transpose(-1, -2), 32, 8)
-        try:
-            setattr(w_scales, _B_SCALE_SHUFFLE_ATTR, hit)
-        except AttributeError:
-            pass  # not memoisable (e.g. a plain view); correctness is unaffected
-    return hit
+    # The tile permute itself, not shuffle_scale_moe: that transposes the result
+    # back to (E, K*, N/32) for the Triton kernels, and materialising that view
+    # would undo the very byte order the shuffle exists to produce. What the kernel
+    # reads is the pre-transpose (E, N/32, K) tile, which is already contiguous.
+    # The N rows keep their input order, including separate gate/up halves.
+    return _memoised_on(
+        w_scales,
+        _B_SCALE_SHUFFLE_ATTR,
+        lambda: _shuffle_scale_tile_gfx950(w_scales.transpose(-1, -2), 32, 8),
+    )
 
 
 #: Compiled kernel + launch constants, keyed by everything that can change the
