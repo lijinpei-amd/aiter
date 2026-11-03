@@ -5,7 +5,9 @@
 
 The launch keeps a preshuffled copy of the B payload and of the B scales on the
 weight tensors. A strided weight view and an in-place weight or scale update must
-give the same result as fresh contiguous tensors with the same values.
+give the same result as fresh contiguous tensors with the same values. This also
+applies to the replay of a CUDA graph, which does not run the host code that checks
+the copies.
 """
 
 import os
@@ -127,3 +129,38 @@ def test_in_place_weight_and_scale_updates(op, inference, case, launches):
         assert not torch.equal(out, after_w)
         assert torch.equal(out, _fresh(op, case, w, ws))
     assert launches and all(flags == (True, True) for flags in launches), launches
+
+
+@pytest.mark.parametrize("op", list(_OPS))
+def test_graph_replay_reads_updated_weights_and_scales(op, case, launches):
+    w, ws = _weights(op, EXPERTS, seed=4)
+    # Warm up on a side stream, as torch.cuda.graph requires. This makes the copies.
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        _gemm2(op, case, w, ws)
+    torch.cuda.current_stream().wait_stream(stream)
+    eager = len(launches)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = _gemm2(op, case, w, ws)
+    captured = launches[eager:]
+    assert launches[:eager] and all(f == (True, True) for f in launches[:eager])
+    # The captured launch must not read a copy that a replay cannot refresh.
+    assert captured and all(f == (False, False) for f in captured), captured
+
+    graph.replay()
+    first = out.clone()
+    assert torch.equal(first, _fresh(op, case, w, ws))
+
+    new_w, new_ws = _weights(op, EXPERTS, seed=5)
+    w.copy_(new_w)
+    graph.replay()
+    after_w = out.clone()
+    assert not torch.equal(after_w, first)
+    assert torch.equal(after_w, _fresh(op, case, w, ws))
+
+    ws.copy_(new_ws)
+    graph.replay()
+    assert not torch.equal(out, after_w)
+    assert torch.equal(out, _fresh(op, case, w, ws))

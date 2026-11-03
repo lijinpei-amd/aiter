@@ -851,12 +851,18 @@ def _default_launch_config(
     apply_swiglu,
     stream_expert_payload=False,
     multi_block=False,
+    graph_capture=False,
 ):
     """Share automatic stage-specific geometry with the capability check.
 
     ``multi_block``: the experts average at least two M blocks (see the host's
     ``_multi_block``); with ``small_grid`` it picks GEMM2's grid class, "small",
     "multi" or "any".
+
+    ``graph_capture``: the launch is captured in a CUDA graph. GEMM2 then keeps the
+    ladder, which reads the weights and scales directly. The family entries read
+    copies that the host makes and checks, and a graph replay does not run that host
+    code, so it would not see an update of the weights.
     """
     small_grid = bool(small_grid)
     ladder = _get_gluon_config_cached(
@@ -868,7 +874,7 @@ def _default_launch_config(
         small_grid,
         bool(stream_expert_payload),
     )
-    if not apply_swiglu and (dq_a, dq_b) in _GEMM2_FAMILIES:
+    if not apply_swiglu and not graph_capture and (dq_a, dq_b) in _GEMM2_FAMILIES:
         # Every override below needs apply_swiglu, so none applies to GEMM2.
         group_m = _env_int("AITER_TRITON_MOE_GLUON_GROUP_M", None)
         grid = "small" if small_grid else "multi" if multi_block else "any"

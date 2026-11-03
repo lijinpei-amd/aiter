@@ -221,6 +221,7 @@ def gluon_supported(
             apply_swiglu,
         ),
         _multi_block(routing_data, y.shape[1]),
+        torch.cuda.is_current_stream_capturing(),
     )
     if N % cfg["BLOCK_N"] != 0:
         return False, f"N {N} % BLOCK_N {cfg['BLOCK_N']} != 0"
@@ -296,6 +297,7 @@ def _launch_spec(
     epilogue=int(EpilogueMode.DEFAULT),
     stream_expert_payload=False,
     multi_block=False,
+    graph_capture=False,
 ):
     """Host-side constexpr work, memoised.
 
@@ -317,6 +319,7 @@ def _launch_spec(
             act is not None,
             stream_expert_payload,
             multi_block,
+            graph_capture,
         )
     )
     assert c["BLOCK_M"] == block_m, (
@@ -818,6 +821,7 @@ def moe_gemm_gluon(
     )
     small_grid = _small_grid(routing_data, y.shape[1], N)
     multi_block = _multi_block(routing_data, y.shape[1])
+    graph_capture = torch.cuda.is_current_stream_capturing()
 
     if apply_swiglu:
         act = ActivationSpec(
@@ -853,6 +857,7 @@ def moe_gemm_gluon(
             epilogue,
             stream_expert_payload,
             multi_block,
+            graph_capture,
         )
 
     grid_n, constexpr_args, num_warps, waves_per_eu, _cfg, _tc = _spec(
