@@ -47,20 +47,25 @@ the matrix) a `bm<block_m>_multi` entry streams the result (`.cs`) and reads the
 weights with the default cache policy (Gluon -4.8..+0.1%); block_m 64 holds B in
 registers like block_m 128. Final acceptance against dac620634 (four HIP 7 pairs, 14
 triggered cells re-timed alone): Gluon/FlyDSL geomean 0.9918, 0.9965 and 0.9673, no
-cell above 1.10 (a8w4 dsv4-flash T=16384 1.095), output bit-identical in 72/72 cells.
-Table and protocol: `bench_out/gluon_moe_regression/gemm2/compare_gemm2_20261103_r4.md`.
+non-exempt cell above 1.10 (a8w4 dsv4-flash T=16384 1.095; T=1 cells above 1.10 have
+gaps below 5 us, at most 3.85 us in the matrix and 3.98 us re-timed alone), output
+bit-identical in 72/72 cells. The two isolated Triton T=1 cells at 1.022 are noise
+(balanced A/A treatment, identical compiled Triton kernels; round 5). Table and
+protocol: `bench_out/gluon_moe_regression/gemm2/compare_gemm2_20261103_r4.md`.
 
-Tried 2026-11-03, not kept: the in-kernel last-producer combine (the CTA that counts the
-last of a token's gates sums them in gate order). Bit-identical to `reduce_grouped`.
-On HIP 7 it is faster only at minimax-m3 T=1024 (topk 4, block_m 64): a8w4 0.948,
-a8w8 0.959, a4w4 0.981. Elsewhere it is slower or noise: x1.37 at T=1, x1.00-1.08 at T 8-32,
-x1.03-1.13 at the other T=1024 cells, x1.40 at a4w4 glm52-base T=4096, x1.11 at a8w4
-minimax-m3 T=16384. The register-B tiles hold one CTA per CU, so each CTA's tail (store
-completion, counter round trip, dependent loads, masked sums) runs exposed. The generic
-agent-scope fences cost x4 (acquire, `buffer_inv sc1`) to x16 (release,
-`buffer_wbl2 sc1`) more. A kept version needs a topk-dependent dispatch and the full
-qualification (cross-XCD publication, poisoned buffers, graph replay, torch.compile).
-Design, numbers and patches: `bench_out/gluon_moe_regression/gemm2/r3/T7_RESULT.md`.
+Tried 2026-11-03 (rounds 3-5), not kept: the in-kernel last-producer combine (the CTA
+whose counter add is the last for a token sums its rows in gate order). It is
+bit-identical to `reduce_grouped` and was qualified in round 5 (33 tests, a padding-row
+race found and fixed, 72/72 cells exact with it forced on), but it is slower in every
+fair measurement: fused/plain 1.02-1.11 at topk 4 / block_m 64, including minimax-m3
+T=1024 (a8w4 1.071, a8w8 1.051); the round 3-4 replays of other cells were already
+slower or flat although they favoured the fused path. Those replays' "gains" (0.95 at
+minimax-m3 T=1024) were an artifact: the fused path spent ~6 ms of host time
+per launch on a layout check, the GPU sat idle, and an idle GPU runs the next kernels
+about 10% faster. Compare kernel times only between paths with the same host cost per
+launch. The register-B tiles hold one CTA per CU, so each CTA's tail runs exposed.
+Design, numbers and the final patch: `bench_out/gluon_moe_regression/gemm2/r3/
+T7_RESULT.md`, `r5/t7_combine_final.patch`.
 
 Remaining gap, largest first:
 
