@@ -94,14 +94,19 @@ Remaining gap, largest first:
   memory-only probe of the same traffic (256 persistent programs, no MFMA, HIP 3) takes
   811 us for B + A + B scales and ~995 us with the 352 MB bf16 store. FlyDSL instead adds
   into the 59 MB output with atomics, which the bit-exact rule excludes. Measured and not
-  kept, all bit-identical (screens on HIP 2/3, the HIP 7 ones marked): XCD-local tile
-  order (-0.5%), a tile-contiguous B copy (-1.6%, timing hack), a persistent loop (HIP 7:
-  -0.9% even, +1.4% random), 8 warps at 2 waves/SIMD (HIP 7: +0.9% even, +4.1% random,
+  kept (screens on HIP 2/3, the HIP 7 ones marked): XCD-local tile order (-0.5%), a
+  persistent loop (HIP 7: -0.9% even, +1.4% random), 8 warps at 2 waves/SIMD (HIP 7:
+  +0.9% even, +4.1% random,
   +3-6% on the a8w4 block_m 64 cells), streaming hints in `_reduce_grouped` (reduce
   -11 us in the pipeline, GEMM2 +7 us; HIP 7: 1.002/0.992), a 2-way column split so
   each intermediate half stays in MALL (reduce 2x36 us, net -0.8% with `.wt` stores),
   and the pipeline knobs (SCHED_MODE, WAIT_COMMIT_SCHEME, DS_READ_IN_MFMA, K_UNROLL,
-  B_NUM_BUFFER, SCALE_SLOT_K, SOFF_UNROLL: all within +-1% or slower). Untested: an
+  B_NUM_BUFFER, SCALE_SLOT_K, SOFF_UNROLL: all within +-1% or slower). Output sha256
+  equal to the base was checked for the persistent loop, the 8-warp, XCD-order,
+  SOFF_UNROLL and SCALE_SLOT_K configs and the column split; the reduce hints were
+  checked bit-exact standalone; the env knob sweep was timing only. Diagnostic only, not
+  a candidate: a tile-contiguous B copy read with a timing hack that loads the wrong
+  bytes (-1.6% on HIP 2), so it says nothing about a correct implementation. Untested: an
   ordered in-kernel combine (slot order is ascending expert order); an estimate says most
   tiles would wait for a running predecessor. Data, probes and the per-variant tables:
   `bench_out/gluon_moe_regression/gemm2/compare_a8w4pro_20261104_l2.md`.
