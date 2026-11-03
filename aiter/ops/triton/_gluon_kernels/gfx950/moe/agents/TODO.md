@@ -119,15 +119,23 @@ Remaining gap, largest first:
   tile with its non-atomic `reduce` epilogue (rows stored, then `moe_reduction`) takes
   1215.6 us against 1092.3 us atomic on HIP 7 (3 alternating rounds); Gluon (1244.9 us
   in the same rounds) is 1.024x that deterministic FlyDSL path and 1.140x the atomic one.
+  Diagnostic only: fly_tune.py validates that path by cosine >= 0.999, not bit identity,
+  and it does not bound a bit-exact Gluon kernel; criterion 1 stays the atomic kernel.
   Implemented and measured, not kept: a dynamic persistent GEMM2 for the half class (256
   CTAs fetch tiles from a self-resetting device counter, no padded CTAs; bit-exact; HIP 3
   GEMM2 -25 us even, HIP 7 paired 1.000 even / 1.007 random) and half-height tiles only
   (bit-exact; slower: the doubled grid's empty CTAs cost ~60 us at one CTA per CU).
   Diagnostics: twice the MFMA work adds 160-260 us (the MFMAs are mostly exposed at one
-  wave per SIMD); launching only the real tiles saves ~20 us on HIP 3. Next concrete
-  candidate: a half-height tile that fits three waves per SIMD (FlyDSL runs 168 VGPRs);
-  every tested Gluon layout spills at that budget, so it needs the pipeline to hold one A
-  fragment instead of two. Data, probes and the per-variant tables:
+  wave per SIMD); launching only the real tiles saves ~20 us on HIP 3. Fifth pass: the
+  one-A-fragment pipeline (DS-read each A slot in the last pane that multiplies it, in
+  its MFMA region) is bit-exact, cuts the half-height tile's AGPRs 73 -> 44 and brings an
+  occupancy-3 tile to 1-2 spilled VGPRs (`TRITON_HIP_AGPR_ALLOC=64`), but HIP 7 paired
+  3 rounds give 1.009 even / 1.011 random in the half class (not kept); the occupancy-3
+  tile was no faster on HIP 3 either. HIP 3 screens have not transferred to HIP 7 three
+  times (8 warps, dynamic persistent, one A fragment): screen on HIP 7 directly. Next
+  candidate: the 2-way column split with `.wt` stores, so each half's 176 MB intermediate
+  is read back from MALL (HIP 3 kernel trace: reduce 2 x 36 us vs 101 us, GEMM2 +20 us,
+  net -0.8%), measured on HIP 7. Data, probes and the per-variant tables:
   `bench_out/gluon_moe_regression/gemm2/compare_a8w4pro_20261104_l2.md`.
 - a8w4 dsv4-flash T=16384 is 1.095x FlyDSL, close to the 1.10 limit. The GEMM (~1245
   us) is faster than FlyDSL's whole stage 2 (1355 us, a tuned atomic kernel), but the
