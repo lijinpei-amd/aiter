@@ -921,11 +921,13 @@ def moe_gemm_gluon(
         raise ValueError("ALLOW_B_VIA_LDS=False requires B_PRESHUFFLED weights")
     _validate_launch_config(_tc, N, K)
 
+    # The preshuffled copy is packed, so its expert stride is not the stride of ``w``.
+    # The kernel reads only the expert stride of a preshuffled payload.
     b = QuantExpertTensor.make(
         dq_b,
         w_payload,
         b_scales,
-        w.stride(0),
+        w_payload.stride(0),
         w.stride(1),
         w.stride(2),
         0 if b_scales is None else b_scales.stride(0),
