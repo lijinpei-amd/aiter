@@ -353,6 +353,43 @@ def test_copy_made_during_graph_capture_is_not_kept():
 
 
 @pytest.mark.parametrize("op", list(_OPS))
+def test_dropped_copy_stays_allocated_for_a_consumer_stream(
+    op, case, launches, monkeypatch
+):
+    # Two streams may share a hardware queue, so a reused block does not always
+    # show; the record on the consumer stream is checked too.
+    recorded = []
+    record_stream = torch.Tensor.record_stream
+
+    def recording(tensor, stream):
+        recorded.append(stream.cuda_stream)
+        return record_stream(tensor, stream)
+
+    monkeypatch.setattr(torch.Tensor, "record_stream", recording)
+    w, ws = _weights(op, EXPERTS, seed=13)
+    _gemm2(op, case, w, ws)  # makes the copies on this stream
+    torch.cuda.synchronize()
+    consumer = torch.cuda.Stream()
+    consumer.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(consumer):
+        torch.cuda._sleep(1 << 27)  # the GEMM below runs after the drop
+        out = _gemm2(op, case, w, ws)
+    host.drop_weight_copies(w, ws)
+    # Blocks of the copies' sizes, written on this stream: freed memory goes here.
+    reuse = [
+        torch.full(
+            (t.numel() * t.element_size(),), 0x7F, dtype=torch.uint8, device="cuda"
+        )
+        for t in (w, ws)
+    ]
+    assert recorded.count(consumer.cuda_stream) == 2, "one record per copy"
+    torch.cuda.synchronize()
+    del reuse
+    assert launches and all(flags == (True, True) for flags in launches), launches
+    assert torch.equal(out, _fresh(op, case, w, ws))
+
+
+@pytest.mark.parametrize("op", list(_OPS))
 def test_weights_with_copies_save_and_copy(op, case, launches):
     w, ws = _weights(op, EXPERTS, seed=14)
     weight = torch.nn.Parameter(w, requires_grad=False)

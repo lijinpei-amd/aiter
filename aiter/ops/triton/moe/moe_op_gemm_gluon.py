@@ -541,7 +541,7 @@ class _Copy:
     the tensor itself, so ``torch.save`` and ``copy.deepcopy`` of it see no copy.
     """
 
-    __slots__ = ("finalizer", "key", "out", "ready", "src")
+    __slots__ = ("finalizer", "key", "out", "ready", "src", "streams")
 
     def __init__(self, src, slot):
         self.src = weakref.ref(src)
@@ -550,20 +550,33 @@ class _Copy:
 
     def fill(self, key, out):
         """Keep ``out``, made on the current stream, and mark it not yet written."""
-        self.key, self.out, self.ready = key, out, None
+        self.key, self.out, self.ready, self.streams = key, out, None, set()
         if out.is_cuda:
+            device = out.get_device()
+            self.streams.add(torch._C._cuda_getCurrentRawStream(device))
             self.ready = torch.cuda.Event()
-            self.ready.record(torch.cuda.current_stream(out.device))
+            self.ready.record(torch.cuda.current_stream(device))
 
     def use(self):
-        """The copy, for a launch on the current stream, which waits until it is
-        written."""
+        """The copy, for a launch on the current stream.
+
+        The stream waits until the copy is written. The first launch from each other
+        stream records that stream on the copy's memory, so freeing the copy (a drop or
+        a new version) waits for that stream's launches before the memory is reused.
+        """
         out = self.out
+        if not out.is_cuda:
+            return out
+        device = out.get_device()
+        stream = torch._C._cuda_getCurrentRawStream(device)
+        if stream not in self.streams and not torch.cuda.is_current_stream_capturing():
+            self.streams.add(stream)
+            out.record_stream(torch.cuda.current_stream(device))
         if self.ready is not None:
             if self.ready.query():
                 self.ready = None
             else:
-                torch.cuda.current_stream(out.device).wait_event(self.ready)
+                torch.cuda.current_stream(device).wait_event(self.ready)
         return out
 
 
