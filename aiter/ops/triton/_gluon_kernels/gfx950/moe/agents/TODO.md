@@ -86,6 +86,20 @@ Table: `bench_out/gluon_moe_regression/gemm2/compare_a8w4pro_20261104_c2.md`.
 
 Remaining gap, largest first:
 
+- a8w4 dsv4-pro T=4096 (even routing) is 1.145x the tuned FlyDSL stage 2 on HIP 7
+  (1249 vs 1091 us, 3 alternating rounds). The gap is the deterministic epilogue, not
+  the main loop. Without the intermediate store, the GEMM2 kernel (956 us) is faster
+  than FlyDSL's whole kernel (1050 us, same GPU class). A memory-only probe of the same
+  traffic (256 persistent programs, no MFMA) takes 811 us for B + A + B scales and 995
+  us with the 352 MB bf16 intermediate store: the store costs ~185 us in the read stream
+  (76 us alone), whatever its footprint, layout or cache policy. The reduce adds ~100
+  us. FlyDSL avoids both with bf16 atomics into the 59 MB output. Measured and not
+  kept (loop 2): XCD-local tile order (-0.5%; it removes the 8.5% A re-fetch), a
+  tile-contiguous B copy (-1.6%), a persistent loop (-0.9% even, +1.4% random), other
+  cache policies (flat or slower). A combine that keeps bit-exactness must add the six
+  rows in slot order, which is ascending expert order; an ordered running sum makes
+  most tiles wait for a predecessor tile that is still running. Data and probes:
+  `bench_out/gluon_moe_regression/gemm2/compare_a8w4pro_20261104_l2.md`.
 - a8w4 dsv4-flash T=16384 is 1.095x FlyDSL, close to the 1.10 limit. The GEMM (~1245
   us) is faster than FlyDSL's whole stage 2 (1355 us, a tuned atomic kernel), but the
   separate deterministic reduce adds ~237 us at ~4.6 TB/s. No reduce launch shape, a
