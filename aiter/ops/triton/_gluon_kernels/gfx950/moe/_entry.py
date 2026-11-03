@@ -7,7 +7,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from ._config import KernelFuncConfig, KernelTuningConfig
-from ._lang import constexpr_fields
+from ._lang import constexpr_fields, require_constexpr
 from ._lang import unwrap_attr as _cv
 from ._layout import KernelLayout
 from ._types import QuantExpertTensor, QuantTokenTensor, ResultTensor, RoutingMeta
@@ -36,9 +36,14 @@ def _moe_gemm_body(
     N: gl.constexpr,
     K: gl.constexpr,
     NUM_K,
+    half_cfg=None,
 ):
-    """Build the layout from ``tuning_cfg`` and run the body."""
+    """Build the layouts from ``tuning_cfg`` and ``half_cfg`` and run the body."""
     layout = KernelLayout(tuning_cfg)
+    if require_constexpr(half_cfg is not None):
+        half_layout = KernelLayout(half_cfg)
+    else:
+        half_layout: gl.constexpr = None
     _moe_gemm_body_with_layout(
         a,
         b,
@@ -55,6 +60,8 @@ def _moe_gemm_body(
         N,
         K,
         NUM_K,
+        half_cfg,
+        half_layout,
     )
 
 
@@ -259,10 +266,18 @@ def _moe_gluon_gemm2(
     CFG_TUNING: gl.constexpr,
     CFG_N: gl.constexpr,
     CFG_K: gl.constexpr,
+    CFG_TUNING_HALF: gl.constexpr = None,
 ):
-    """gemm2: X @ W2 + bias, multiplied by the router combine weight (gammas)."""
+    """gemm2: X @ W2 + bias, multiplied by the router combine weight (gammas).
+
+    ``CFG_TUNING_HALF`` is the half-height tile's ``TuningSpec``, or None.
+    """
     func_cfg = KernelFuncConfig(*constexpr_fields(CFG_FUNC))
     tuning_cfg = KernelTuningConfig(func_cfg, *constexpr_fields(CFG_TUNING))
+    if require_constexpr(CFG_TUNING_HALF is not None):
+        half_cfg = KernelTuningConfig(func_cfg, *constexpr_fields(CFG_TUNING_HALF))
+    else:
+        half_cfg: gl.constexpr = None
     _moe_gemm_body(
         QuantTokenTensor(
             A_DTYPE_QUANT,
@@ -321,4 +336,5 @@ def _moe_gluon_gemm2(
         CFG_N,
         CFG_K,
         NUM_K,
+        half_cfg,
     )

@@ -67,7 +67,8 @@
         "B_SCALE_SHUFFLED": true,
         "B_PRESHUFFLED": true,
         "ALLOW_B_VIA_LDS": false,
-        "ALLOW_B_SCALE_VIA_LDS": false
+        "ALLOW_B_SCALE_VIA_LDS": false,
+        "HALF_M_TILE": true
     },
     "bm128_multi": {
         "result_cache_modifier": ".cs",

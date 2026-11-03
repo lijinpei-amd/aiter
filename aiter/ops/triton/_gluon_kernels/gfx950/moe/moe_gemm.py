@@ -170,11 +170,16 @@ def _moe_gemm_body(
     N: gl.constexpr,
     K: gl.constexpr,
     NUM_K,
+    half_cfg=None,
+    half_layout=None,
 ):
-    gl.static_assert(validate(tuning_cfg, N, K, layout))
-    schedule = Schedule(tuning_cfg, layout, K)
-    gl.static_assert(validate_pipeline(tuning_cfg, layout, K, schedule))
+    """Map the program to its tile and run the tile.
 
+    ``half_cfg`` and ``half_layout`` are the half-height tile's config and layout, or
+    None. With them, an M block that holds at most ``half_cfg.BLOCK_M`` rows runs that
+    tile instead of the ``tuning_cfg`` one.
+    """
+    gl.static_assert(tuning_cfg.HALF_M_TILE == (half_cfg is not None))
     pid = gl.program_id(0)
     if require_constexpr(tuning_cfg.TILE_SCHED == _TS_XCD_GROUP_M):
         # Drop the padded tiles first so the swizzle is a bijection over real work; a
@@ -199,6 +204,84 @@ def _moe_gemm_body(
     block_id = expt_data >> 16
     M_e = gl.load(rt.expt_hist + expt_id)
     start_m = gl.load(rt.expt_offs_raw + expt_id)
+    if require_constexpr(half_cfg is not None):
+        # The half-height tile reads raw A scales: the shuffled ones are kept in
+        # whole BLOCK_M blocks.
+        gl.static_assert(not half_cfg.A_SCALE_SORTED_SHUFFLED)
+        gl.static_assert(tuning_cfg.BLOCK_M == 2 * half_cfg.BLOCK_M)
+        if M_e - block_id * tuning_cfg.BLOCK_M <= half_cfg.BLOCK_M:
+            _moe_gemm_tile(
+                a,
+                b,
+                res,
+                rt,
+                bias_hbm_ptr,
+                stride_bias_e,
+                x_static_scale_hbm_ptr,
+                pid_m,
+                pid_n,
+                expt_id,
+                2 * block_id,
+                M_e,
+                start_m,
+                func_cfg,
+                half_cfg,
+                half_layout,
+                N,
+                K,
+                NUM_K * tuning_cfg.BLOCK_K // half_cfg.BLOCK_K,
+            )
+            return
+    _moe_gemm_tile(
+        a,
+        b,
+        res,
+        rt,
+        bias_hbm_ptr,
+        stride_bias_e,
+        x_static_scale_hbm_ptr,
+        pid_m,
+        pid_n,
+        expt_id,
+        block_id,
+        M_e,
+        start_m,
+        func_cfg,
+        tuning_cfg,
+        layout,
+        N,
+        K,
+        NUM_K,
+    )
+
+
+@gluon.jit
+def _moe_gemm_tile(
+    a,  # QuantTokenTensor
+    b,  # QuantExpertTensor
+    res,  # ResultTensor
+    rt,  # RoutingMeta
+    bias_hbm_ptr,
+    stride_bias_e,
+    x_static_scale_hbm_ptr,
+    pid_m,
+    pid_n,
+    expt_id,
+    block_id,
+    M_e,
+    start_m,
+    func_cfg,
+    tuning_cfg,
+    layout,
+    N: gl.constexpr,
+    K: gl.constexpr,
+    NUM_K,
+):
+    """Compute one tile: M block ``block_id`` of expert ``expt_id`` (``BLOCK_M`` rows
+    of ``tuning_cfg``) by N block ``pid_n``, then run its epilogue."""
+    gl.static_assert(validate(tuning_cfg, N, K, layout))
+    schedule = Schedule(tuning_cfg, layout, K)
+    gl.static_assert(validate_pipeline(tuning_cfg, layout, K, schedule))
 
     # Issued right after the routing scalars it depends on: the gather's table loads are
     # the longest-latency thing in the prologue, so everything below overlaps with them.

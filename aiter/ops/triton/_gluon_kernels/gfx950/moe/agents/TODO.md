@@ -67,6 +67,15 @@ launch. The register-B tiles hold one CTA per CU, so each CTA's tail runs expose
 Design, numbers and the final patch: `bench_out/gluon_moe_regression/gemm2/r3/
 T7_RESULT.md`, `r5/t7_combine_final.patch`.
 
+Done 2026-11-04 (round 6): a8w4 dsv4-pro T=4096 (a mean of exactly 64 rows per
+expert, so the routing gives block_m 128) runs every M block of at most 64 rows on a
+second, half-height tile, the block_m 64 config (`HALF_M_TILE`, CONCEPTS.md). Only
+launches whose experts average at most half an M block get the second path: in every
+block_m 128 launch it changed the schedule of the main loop and cost 1-5% where it never
+ran. On HIP 4 (3 paired rounds), GEMM2 + reduce 1530 -> 1311 us (even routing) and
+1529 -> 1421 us (random), output bit-identical. Table: `bench_out/gluon_moe_regression/
+gemm2/compare_a8w4pro_20261104_c1.md`.
+
 Remaining gap, largest first:
 
 - a8w4 dsv4-flash T=16384 is 1.095x FlyDSL, close to the 1.10 limit. The GEMM (~1245

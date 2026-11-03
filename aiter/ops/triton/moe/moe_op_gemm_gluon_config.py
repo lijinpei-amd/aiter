@@ -715,6 +715,9 @@ def get_gluon_config_uncached(
                 _env_int("AITER_TRITON_MOE_GLUON_SCALE_FILL_MID", 0)
             ),
             "UNROLL_EPILOGUE": True,
+            # GEMM2: run an M block that holds at most BLOCK_M / 2 rows on the
+            # family's bm<BLOCK_M / 2> config (_gemm2_half_m_config).
+            "HALF_M_TILE": bool(_env_int("AITER_TRITON_MOE_GLUON_HALF_M_TILE", 0)),
             # Read the complete BLOCK_K payload stage into registers one pipeline step
             # before its MFMAs consume it. The pipeline requires this
             # whole-stage handoff; there is no disabled or partial K-prefetch mode.
@@ -785,6 +788,7 @@ _GEMM2_ENV = {
             "ALLOW_B_SCALE_VIA_LDS",
             "ALLOW_B_VIA_LDS",
             "GROUP_M",
+            "HALF_M_TILE",
             "K_UNROLL",
             "SOFF_UNROLL",
             "VGPR_PREFETCH_K",
@@ -894,6 +898,47 @@ def _gemm2_launch_config(
     ):
         return ladder_items
     return key
+
+
+@cache
+def _gemm2_half_m_config(
+    cfg_items: tuple, block_m, N, K, dq_a, dq_b, small_grid, multi_block
+):
+    """The half-height tile of a GEMM2 launch whose config is ``cfg_items``, as sorted
+    config items, or None when the launch has none.
+
+    The tile is the ``_default_launch_config`` of ``block_m / 2`` for the same launch.
+    It must use the launch's grid, warps, waves per EU and operand copies, so a config
+    that differs in one of them gives no half-height tile.
+    """
+    cfg = dict(cfg_items)
+    if not cfg.get("HALF_M_TILE") or block_m // 2 not in _SUPPORTED_BLOCK_M:
+        return None
+    half = dict(
+        _default_launch_config(
+            block_m // 2,
+            N,
+            K,
+            dq_a,
+            dq_b,
+            small_grid,
+            False,
+            multi_block=multi_block,
+        ),
+        HALF_M_TILE=False,
+    )
+    shared = (
+        "BLOCK_N",
+        "warps_per_cta",
+        "WAVES_PER_EU",
+        "A_SCALE_SORTED_SHUFFLED",
+        "B_SCALE_SHUFFLED",
+        "B_PRESHUFFLED",
+    )
+    if any(half[key] != cfg[key] for key in shared):
+        return None
+    items = _cfg_key(half)
+    return None if _launch_error(items, dq_a, dq_b, N, K) else items
 
 
 def _default_launch_config(

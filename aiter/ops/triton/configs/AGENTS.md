@@ -246,6 +246,16 @@ there is no file. Do not change the returned dict.
   applies `bm<block_m>_multi` when the experts average two or more M blocks
   (`_multi_block` in `moe_op_gemm_gluon.py`: M ≥ 2 · block_m · E). A small grid
   never takes `_multi`.
+  An entry with `"HALF_M_TILE": true` gives a launch a second tile,
+  `block_m / 2` rows high, when the experts average at most `block_m / 2` rows
+  (`_half_block` in `moe_op_gemm_gluon.py`: 2 · M ≤ block_m · E). A CTA whose M
+  block holds at most `block_m / 2` rows runs that tile, with the config the
+  launch gets at `block_m / 2` (the `bm<block_m / 2>` entries). Other launches
+  keep one tile: a second code path changes the code of the first. The two
+  tiles must have the same `BLOCK_N`, `warps_per_cta`, `WAVES_PER_EU` and
+  operand layouts (`B_PRESHUFFLED`, `B_SCALE_SHUFFLED`,
+  `A_SCALE_SORTED_SHUFFLED`); else the launch has only the `block_m` tile
+  (`_gemm2_half_m_config` in `moe_op_gemm_gluon_config.py`).
 
 ## Conv
 

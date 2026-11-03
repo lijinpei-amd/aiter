@@ -33,5 +33,5 @@ Each python file is a component, and inter files, the import dependency should b
 * `_epilogue.py`: bias, activation, output quantization and output stores, plus staging the epilogue inputs (`_stage_epilogue_inputs`).
 * `_mfma.py`: the matrix instruction. `_dot` issues one MFMA dispatched on the operand pair; `_maybe_block_dot` accumulates a stage's K fragments. Shared by `_pipeline.py` and `moe_gemm.py`.
 * `_pipeline.py`: the pipelined K-loop driver: prologue, main loop, drain and final MFMA, emitting what the build's `Schedule` decides. Also owns the pipeline state aggregates (`_PipelineConst`, `_PipelinePointers`, `_PipelineRegFragments`). See PIPELINE.md.
-* `moe_gemm.py`: the kernel body `_moe_gemm_body`: tile scheduling, routing, pipeline state setup, the drain and epilogue overlap, and the fused final drain step (`_drain_last_fused`).
-* `_entry.py`: the jit entry points (`_moe_gluon_gemm1`, `_moe_gluon_gemm2`) and launch metadata. Builds the `KernelLayout` and calls the body in `moe_gemm.py`.
+* `moe_gemm.py`: the kernel body. `_moe_gemm_body` does the tile scheduling and the routing lookup, and selects the tile: the half-height tile (CONCEPTS.md) for a short M block, else the `BLOCK_M` tile. `_moe_gemm_tile` runs one tile: pipeline state setup, the drain and epilogue overlap, and the fused final drain step (`_drain_last_fused`).
+* `_entry.py`: the jit entry points (`_moe_gluon_gemm1`, `_moe_gluon_gemm2`) and launch metadata. Builds the `KernelLayout` of each tile and calls the body in `moe_gemm.py`.

@@ -68,6 +68,7 @@ def _clean_tuning_environment(monkeypatch):
         host._launch_spec,
         conf._get_gluon_config_cached,
         conf._gemm2_launch_config,
+        conf._gemm2_half_m_config,
     )
     for cached in caches:
         cached.cache_clear()
@@ -789,6 +790,78 @@ def test_gemm2_register_b_entry_needs_preshuffled_weights(gemm2_tables):
     assert conf._default_launch_config(*args, False, False) == conf.get_gluon_config(
         *args
     )
+
+
+def _gemm2_spec(block_m=128, act=None, half_block=True):
+    """``_launch_spec`` of an a8w4 launch with gather and gammas."""
+    return host._launch_spec(
+        block_m,
+        7168,
+        3072,
+        DtypeQuant.MXFP8,
+        DtypeQuant.MXFP4,
+        False,
+        False,
+        True,
+        True,
+        False,
+        act,
+        None,
+        None,
+        half_block=half_block,
+    )
+
+
+def test_gemm2_half_m_tile_is_the_half_block_m_config():
+    # a8w4 block_m 128 runs an M block of at most 64 rows on its block_m 64 config.
+    spec = _gemm2_spec()
+    *_, config, tuning, half = spec
+    assert config["HALF_M_TILE"] and _plain(tuning.HALF_M_TILE)
+    assert len(spec[1]) == 5 and _plain(spec[1][4]) == _tuning_spec(
+        dict(
+            conf._default_launch_config(
+                64, 7168, 3072, DtypeQuant.MXFP8, DtypeQuant.MXFP4, False, False
+            ),
+            HALF_M_TILE=False,
+        )
+    )
+    assert _plain(half.BLOCK_M) == 64 and not _plain(half.HALF_M_TILE)
+    for key in ("BLOCK_N", "WAVES_PER_EU", "B_PRESHUFFLED", "B_SCALE_SHUFFLED"):
+        assert _plain(getattr(half, key)) == _plain(getattr(tuning, key)), key
+
+
+@pytest.mark.parametrize(
+    "block_m,act,half_block",
+    [
+        (64, None, True),  # the a8w4 block_m 64 entry has no half-height tile
+        (128, ActivationSpec(int(ActKind.SILU), 1.0, None, False), True),  # GEMM1
+        (128, None, False),  # the experts average more than half an M block
+    ],
+)
+def test_gemm2_half_m_tile_only_where_the_entry_and_launch_ask(
+    block_m, act, half_block
+):
+    spec = _gemm2_spec(block_m, act, half_block)
+    assert not spec[4].get("HALF_M_TILE") and spec[6] is None and len(spec[1]) == 4
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [("BLOCK_N", 128), ("WAVES_PER_EU", 2), ("B_PRESHUFFLED", False)],
+)
+def test_gemm2_half_m_tile_needs_the_launch_grid_and_operands(gemm2_tables, key, value):
+    # The half-height tile shares the launch's grid, waves and weight copies.
+    entry = gemm2_tables["A8W4-GEMM2"]["bm64_any"]
+    entry[key] = value
+    if key == "B_PRESHUFFLED":
+        entry["ALLOW_B_VIA_LDS"] = True
+    spec = _gemm2_spec()
+    assert not spec[4]["HALF_M_TILE"] and spec[6] is None and len(spec[1]) == 4
+
+
+def test_gemm2_half_m_tile_environment_override(monkeypatch):
+    monkeypatch.setenv("AITER_TRITON_MOE_GLUON_HALF_M_TILE", "0")
+    assert _gemm2_spec()[6] is None
 
 
 def test_gemm2_group_m_environment_override_is_not_cached_away(monkeypatch):
