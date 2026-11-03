@@ -7,8 +7,8 @@ The launch keeps a preshuffled copy of the B payload and of the B scales on the
 weight tensors. A strided weight view and an in-place weight or scale update must
 give the same result as fresh contiguous tensors with the same values. This also
 applies to the replay of a CUDA graph, which does not run the host code that checks
-the copies, and to padded weights (unpadded_N, unpadded_K), which keep their
-stored layout.
+the copies, to a copy used from another stream, and to padded weights (unpadded_N,
+unpadded_K), which keep their stored layout.
 """
 
 import os
@@ -289,6 +289,36 @@ def test_smaller_unpadded_k_after_a_full_k_call(op, case, launches):
     assert torch.equal(out, ref)
 
 
+@pytest.mark.parametrize("op", list(_OPS))
+def test_copy_made_on_one_stream_is_complete_on_another(
+    op, case, launches, monkeypatch
+):
+    # Two streams may share a hardware queue, so an unordered read does not always
+    # show; the wait itself is checked too.
+    waits = []
+    wait_event = torch.cuda.Stream.wait_event
+
+    def recording_wait(stream, event):
+        waits.append(stream.cuda_stream)
+        return wait_event(stream, event)
+
+    monkeypatch.setattr(torch.cuda.Stream, "wait_event", recording_wait)
+    w, ws = _weights(op, EXPERTS, seed=12)
+    first, second = torch.cuda.Stream(), torch.cuda.Stream()
+    for stream in (first, second):
+        stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(first):
+        torch.cuda._sleep(1 << 27)  # holds back the stream that makes the copies
+        _gemm2(op, case, w, ws)
+    waits.clear()  # wait_stream above also waits on an event
+    with torch.cuda.stream(second):
+        out = _gemm2(op, case, w, ws)
+    assert second.cuda_stream in waits, "the second stream did not wait"
+    torch.cuda.synchronize()
+    assert launches and all(flags == (True, True) for flags in launches), launches
+    assert torch.equal(out, _fresh(op, case, w, ws))
+
+
 def test_versionless_copy_is_kept_until_dropped():
     with torch.inference_mode():
         src = torch.zeros(4, device="cuda")
@@ -303,3 +333,11 @@ def test_versionless_copy_is_kept_until_dropped():
     host.drop_weight_copies(src)
     assert host._memoised_on(src, host._B_PRESHUFFLE_ATTR, make) is not first
     assert len(made) == 2
+
+
+def test_copy_made_during_graph_capture_is_not_kept():
+    src = torch.zeros(4, device="cuda")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        host._memoised_on(src, host._B_PRESHUFFLE_ATTR, lambda: src + 1)
+    assert not hasattr(src, host._B_PRESHUFFLE_ATTR)

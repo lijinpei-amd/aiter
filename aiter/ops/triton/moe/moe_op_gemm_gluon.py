@@ -540,16 +540,30 @@ def _memoised_on(src, attr, make, *dims):
 
     The key is the version counter, which any in-place write through any view
     increments, the storage address and ``dims``. An inference tensor has no version
-    counter: its copy stays until :func:`drop_weight_copies`.
+    counter: its copy stays until :func:`drop_weight_copies`. A copy made while a CUDA
+    graph is captured is not kept. ``make()`` runs on the current stream, so launches
+    on any stream wait for it until it is complete.
     """
     version = None if src.is_inference() else src._version
     key = (version, src.data_ptr(), *dims)
     hit = getattr(src, attr, None)
     if hit is not None and hit[0] == key:
-        return hit[1]
+        _, out, ready = hit
+        if ready is not None:
+            if ready.query():
+                hit[2] = None
+            else:
+                torch.cuda.current_stream(out.device).wait_event(ready)
+        return out
     out = make()
+    if torch.cuda.is_current_stream_capturing():
+        return out
+    ready = None
+    if out.is_cuda:
+        ready = torch.cuda.Event()
+        ready.record(torch.cuda.current_stream(out.device))
     try:
-        setattr(src, attr, (key, out))
+        setattr(src, attr, [key, out, ready])
     except AttributeError:
         pass  # not memoisable; correctness is unaffected
     return out
