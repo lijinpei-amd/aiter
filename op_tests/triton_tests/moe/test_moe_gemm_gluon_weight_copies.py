@@ -191,3 +191,32 @@ def test_drop_weight_copies_after_untracked_writes(op, write, case, launches):
     assert not torch.equal(out, first)
     assert torch.equal(out, _fresh(op, case, w, ws))
     assert launches and all(flags == (True, True) for flags in launches), launches
+
+
+def _clear_config_caches():
+    for cached in (
+        host._launch_spec,
+        conf._get_gluon_config_cached,
+        conf._gemm2_launch_config,
+    ):
+        cached.cache_clear()
+
+
+@pytest.mark.parametrize("op", list(_OPS))
+def test_allow_b_via_lds_environment_skips_the_packed_copy(
+    op, case, launches, monkeypatch
+):
+    w, ws = _weights(op, EXPERTS, seed=8)
+    default = _gemm2(op, case, w, ws)
+    assert launches[-1][0], "the family entry reads a packed B"
+    plain = w.transpose(1, 2).contiguous().transpose(1, 2)
+    monkeypatch.setenv("AITER_TRITON_MOE_GLUON_ALLOW_B_VIA_LDS", "1")
+    _clear_config_caches()
+    try:
+        out = _gemm2(op, case, plain, ws)
+    finally:
+        monkeypatch.delenv("AITER_TRITON_MOE_GLUON_ALLOW_B_VIA_LDS")
+        _clear_config_caches()
+    assert not launches[-1][0]
+    assert not hasattr(plain, host._B_PRESHUFFLE_ATTR)
+    assert torch.equal(out, default)

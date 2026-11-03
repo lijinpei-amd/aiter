@@ -350,19 +350,18 @@ def _get_gluon_config_cached(
     small_grid: bool,
     stream_expert_payload: bool,
 ) -> tuple:
-    return tuple(
-        sorted(
-            get_gluon_config_uncached(
-                block_m,
-                N,
-                K,
-                dq_a,
-                dq_b,
-                small_grid,
-                stream_expert_payload,
-            ).items()
-        )
+    """The ladder as sorted items, and the :data:`_GEMM2_ENV` keys that the
+    environment set when it was built. Both read the environment once per entry."""
+    ladder = get_gluon_config_uncached(
+        block_m,
+        N,
+        K,
+        dq_a,
+        dq_b,
+        small_grid,
+        stream_expert_payload,
     )
+    return tuple(sorted(ladder.items())), _gemm2_env_keys()
 
 
 def get_gluon_config(
@@ -385,7 +384,7 @@ def get_gluon_config(
             dq_b,
             bool(small_grid),
             bool(stream_expert_payload),
-        )
+        )[0]
     )
 
 
@@ -777,6 +776,54 @@ _GEMM2_FAMILIES = {
     (DtypeQuant.MXFP8, DtypeQuant.MXFP8): "A8W8-GEMM2",
 }
 
+#: Ladder keys that a GEMM2 family entry can set, with the AITER_TRITON_MOE_GLUON_
+#: variables that set them in the ladder. When one of them is set, the ladder value
+#: (the environment's) wins over the entry.
+_GEMM2_ENV = {
+    **{
+        key: (key,)
+        for key in (
+            "ALLOW_B_SCALE_VIA_LDS",
+            "ALLOW_B_VIA_LDS",
+            "GROUP_M",
+            "K_UNROLL",
+            "SOFF_UNROLL",
+            "VGPR_PREFETCH_K",
+            "WAIT_COMMIT_SCHEME",
+            "WAVES_PER_EU",
+        )
+    },
+    "NUM_LDS_BUFFER": ("NB",),
+    **{key: (key, _LEGACY_SLOT_KEYS[key]) for key in ("SLOT_M", "SLOT_N")},
+    **{
+        name: (name, "DS_READ_IN_MFMA", "DS_IN_MFMA", "DS_MOVE")
+        for name, _ in _DS_READ_FIELDS
+    },
+    **{
+        f"{op}_cache_modifier": (f"{op.upper()}_CACHE_MODIFIER", f"{op.upper()}_MOD")
+        for op in (
+            "token",
+            "token_scale",
+            "expert",
+            "expert_scale",
+            "result",
+            "result_scale",
+        )
+    },
+}
+
+
+def _gemm2_env_keys() -> tuple:
+    """The :data:`_GEMM2_ENV` keys that the environment sets now, sorted."""
+    prefix = "AITER_TRITON_MOE_GLUON_"
+    return tuple(
+        sorted(
+            key
+            for key, names in _GEMM2_ENV.items()
+            if any(prefix + name in os.environ for name in names)
+        )
+    )
+
 
 def _gemm2_tuned(block_m, dq_a, dq_b, grid) -> dict:
     """The operands' GEMM2 family entry, or {}: ``bm<block_m>_any``, overlaid by
@@ -808,17 +855,23 @@ def _launch_error(cfg_items: tuple, dq_a, dq_b, N, K):
 
 @cache
 def _gemm2_launch_config(
-    ladder_items: tuple, block_m, N, K, dq_a, dq_b, group_m: int | None, grid: str
+    ladder_items: tuple, block_m, N, K, dq_a, dq_b, env_keys: tuple, grid: str
 ) -> tuple:
     """GEMM2 (no activation) config: the ladder with its family's tuned entry on top,
-    as sorted config items. ``group_m`` is the GROUP_M environment override, if any;
-    ``grid`` is the launch's grid class (see :func:`_default_launch_config`).
+    as sorted config items. ``env_keys`` are the ladder keys that the environment
+    set (see :func:`_gemm2_env_keys`); they keep their ladder value. ``grid`` is the
+    launch's grid class (see :func:`_default_launch_config`).
 
     The entry applies only where the launch can run the result as is; elsewhere the
     ladder stays. Memoised because ``gluon_supported`` asks for it on every launch.
     """
     tuned = _gemm2_tuned(block_m, dq_a, dq_b, grid)
-    new = dict(ladder_items, **tuned)
+    ladder = dict(ladder_items)
+    new = dict(ladder, **tuned)
+    new.update((key, ladder[key]) for key in env_keys)
+    if "ALLOW_B_VIA_LDS" in env_keys:
+        # B from registers needs the preshuffled copy, and B from LDS needs none.
+        new["B_PRESHUFFLED"] = not new["ALLOW_B_VIA_LDS"]
     # The entries were measured with N and K multiples of 256 only, and an entry that
     # keeps the ladder's BLOCK_K at BLOCK_K 256 only. Those N and K also satisfy
     # _preshuffled_b and _shuffled_b_scales.
@@ -829,8 +882,6 @@ def _gemm2_launch_config(
         or ("BLOCK_K" not in tuned and new["BLOCK_K"] < 256)
     ):
         return ladder_items
-    if group_m is not None and "GROUP_M" in tuned:
-        new["GROUP_M"] = group_m
     key = _cfg_key(new)
     # The launch drops a shuffle it cannot prepare, so check that too:
     # gluon_supported must judge the config that runs.
@@ -865,7 +916,7 @@ def _default_launch_config(
     code, so it would not see an update of the weights.
     """
     small_grid = bool(small_grid)
-    ladder = _get_gluon_config_cached(
+    ladder, env_keys = _get_gluon_config_cached(
         block_m,
         N,
         K,
@@ -876,9 +927,8 @@ def _default_launch_config(
     )
     if not apply_swiglu and not graph_capture and (dq_a, dq_b) in _GEMM2_FAMILIES:
         # Every override below needs apply_swiglu, so none applies to GEMM2.
-        group_m = _env_int("AITER_TRITON_MOE_GLUON_GROUP_M", None)
         grid = "small" if small_grid else "multi" if multi_block else "any"
-        ladder = _gemm2_launch_config(ladder, block_m, N, K, dq_a, dq_b, group_m, grid)
+        ladder = _gemm2_launch_config(ladder, block_m, N, K, dq_a, dq_b, env_keys, grid)
     c = dict(ladder)
     if (
         not small_grid

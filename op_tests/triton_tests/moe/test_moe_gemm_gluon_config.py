@@ -799,6 +799,58 @@ def test_gemm2_group_m_environment_override_is_not_cached_away(monkeypatch):
     assert conf._default_launch_config(*args)["GROUP_M"] == 4
 
 
+@pytest.mark.parametrize(
+    "name, value, key, expected",
+    [
+        ("WAVES_PER_EU", "2", "WAVES_PER_EU", 2),
+        # Set to the ladder's own default: still an explicit request.
+        ("WAVES_PER_EU", "0", "WAVES_PER_EU", 0),
+        ("WAIT_COMMIT_SCHEME", "1", "WAIT_COMMIT_SCHEME", 1),
+        ("ALLOW_B_VIA_LDS", "1", "ALLOW_B_VIA_LDS", True),
+        ("RESULT_CACHE_MODIFIER", ".cg", "result_cache_modifier", ".cg"),
+        ("RESULT_MOD", ".cg", "result_cache_modifier", ".cg"),  # legacy name
+        ("EXPERT_CACHE_MODIFIER", ".cg", "expert_cache_modifier", ".cg"),
+    ],
+)
+def test_gemm2_environment_overrides_win_over_the_family_entry(
+    monkeypatch, name, value, key, expected
+):
+    dq = DtypeQuant.MXFP4
+    args = (128, 6144, 2048, dq, dq, False, False)
+    tuned = conf._default_launch_config(*args, multi_block=True)
+    assert tuned[key] != expected
+    monkeypatch.setenv("AITER_TRITON_MOE_GLUON_" + name, value)
+    conf._get_gluon_config_cached.cache_clear()  # only the ladder cache
+    config = conf._default_launch_config(*args, multi_block=True)
+    assert config[key] == expected
+    # The rest of the entry stays where the result still launches; else the ladder.
+    wanted = dict(tuned, **{key: expected})
+    if key == "ALLOW_B_VIA_LDS":
+        wanted["B_PRESHUFFLED"] = False  # B from LDS needs no packed copy
+    if conf._launch_error(conf._cfg_key(wanted), dq, dq, 6144, 2048) is None:
+        assert config == wanted
+    else:
+        assert config == conf.get_gluon_config(128, 6144, 2048, dq, dq)
+    if key != "ALLOW_B_VIA_LDS":
+        assert config == wanted  # these keys cannot make the entry fail
+
+
+def test_gemm2_environment_keys_cover_the_family_entries():
+    # Every key a GEMM2 entry sets either has its ladder variables listed, or has none.
+    no_variable = {
+        "BLOCK_N",
+        "BLOCK_K",
+        "mfma_instr_shape",
+        "warps_per_cta",
+        "tiles_per_warp",
+        "B_PRESHUFFLED",
+        "B_SCALE_SHUFFLED",
+    }
+    for family in conf._GEMM2_FAMILIES.values():
+        for entry in get_moe_dispatch(family, "gfx950", "gluon").values():
+            assert set(entry) <= set(conf._GEMM2_ENV) | no_variable, family
+
+
 @pytest.mark.parametrize("suffix", ["EXPERT_CACHE_MODIFIER", "EXPERT_MOD"])
 @pytest.mark.parametrize("override", ["", ".ca"])
 def test_streaming_expert_payload_respects_environment_override(
