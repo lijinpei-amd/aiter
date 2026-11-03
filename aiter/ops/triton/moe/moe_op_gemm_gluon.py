@@ -221,7 +221,7 @@ def gluon_supported(
             apply_swiglu,
         ),
         _multi_block(routing_data, y.shape[1]),
-        torch.cuda.is_current_stream_capturing(),
+        not apply_swiglu and _gemm2_reads_b_directly(w, w_scales, N, K, dq_b),
     )
     if N % cfg["BLOCK_N"] != 0:
         return False, f"N {N} % BLOCK_N {cfg['BLOCK_N']} != 0"
@@ -297,7 +297,7 @@ def _launch_spec(
     epilogue=int(EpilogueMode.DEFAULT),
     stream_expert_payload=False,
     multi_block=False,
-    graph_capture=False,
+    direct_b=False,
 ):
     """Host-side constexpr work, memoised.
 
@@ -319,7 +319,7 @@ def _launch_spec(
             act is not None,
             stream_expert_payload,
             multi_block,
-            graph_capture,
+            direct_b,
         )
     )
     assert c["BLOCK_M"] == block_m, (
@@ -535,17 +535,15 @@ _B_SCALE_SHUFFLE_ATTR = "_aiter_gluon_cdna4_scale_shuffled"
 _B_PRESHUFFLE_ATTR = "_aiter_gluon_b_preshuffled"
 
 
-def _memoised_on(src, attr, make):
+def _memoised_on(src, attr, make, *dims):
     """``make()``, kept on ``src`` until ``src`` changes.
 
-    Any in-place write to the storage, through any view, increments the version
-    counter. An inference tensor has no version counter, so it gets a new copy for
-    each call.
+    The key is the version counter, which any in-place write through any view
+    increments, the storage address and ``dims``. An inference tensor has no version
+    counter: its copy stays until :func:`drop_weight_copies`.
     """
-    try:
-        key = (src._version, src.data_ptr())
-    except RuntimeError:
-        return make()
+    version = None if src.is_inference() else src._version
+    key = (version, src.data_ptr(), *dims)
     hit = getattr(src, attr, None)
     if hit is not None and hit[0] == key:
         return hit[1]
@@ -563,8 +561,8 @@ def drop_weight_copies(*tensors):
     The GEMM keeps a preshuffled copy of ``w`` and of ``w_scales`` on those tensors,
     and makes a new copy after a PyTorch in-place update. Call this function with
     the tensors after a write that PyTorch does not count: for example the replay of
-    a CUDA graph that writes the weights, or a write through ``.data``. ``None``
-    entries are skipped.
+    a CUDA graph that writes the weights, a write through ``.data``, or an in-place
+    write to an inference tensor. ``None`` entries are skipped.
     """
     for t in tensors:
         for attr in (_B_PRESHUFFLE_ATTR, _B_SCALE_SHUFFLE_ATTR):
@@ -587,13 +585,17 @@ def _preshuffled_b(w, cfg, N, K, dq_b):
 
     ``byte_unit_lds_layout`` gives the shared tile the matching permutation, so the
     direct-to-LDS copy stays one linear run and the unit drops from 32 rows to 16 and
-    loses its padding.
+    loses its padding. A padded tensor (logical N or K below the stored extent) gets
+    no copy.
     """
     if w is None or w.ndim != 3:
         return None
     if int(cfg["BLOCK_K"]) % 32 != 0 or N % 16 != 0 or K % 32 != 0:
         return None
-    KB = K // dq_pack_divisor(dq_b) * w.element_size()
+    pack = dq_pack_divisor(dq_b)
+    if w.shape[-1] != N or w.shape[-2] * pack != K:
+        return None
+    KB = K // pack * w.element_size()
     if KB % 16 != 0:
         return None
     E = w.shape[0]
@@ -609,16 +611,19 @@ def _preshuffled_b(w, cfg, N, K, dq_b):
         .reshape(E, N // 16 * KB * 16)
         .contiguous()
         .view(w.dtype),
+        N,
+        K,
     )
 
 
-def _shuffled_b_scales(w_scales, cfg):
+def _shuffled_b_scales(w_scales, cfg, N, K):
     """CDNA4_SCALE-preshuffled weight scales, or None if the config cannot read them.
 
     Reuses utils/shuffle.py::shuffle_scale_moe, whose gfx950 permute
     (preshuffle_factor 32, scale_kwidth 8) lands each element in exactly the slot
     ``get_mfma_scale_layout`` assigns for a 16x16x128 operand -- verified base for base
-    against the layout, same as the A-side shuffle.
+    against the layout, same as the A-side shuffle. Padded scales (logical N or K
+    below the stored extent) get no copy.
     """
     if w_scales is None:
         return None
@@ -626,6 +631,8 @@ def _shuffled_b_scales(w_scales, cfg):
         not _b_scale_shuffle_fits(cfg)
         or w_scales.shape[-1] % 32 != 0
         or w_scales.shape[-2] % 8 != 0
+        or w_scales.shape[-1] != N
+        or w_scales.shape[-2] * MX_GROUP_SIZE != K
     ):
         return None
     from aiter.ops.triton.utils.shuffle import _shuffle_scale_tile_gfx950
@@ -639,7 +646,30 @@ def _shuffled_b_scales(w_scales, cfg):
         w_scales,
         _B_SCALE_SHUFFLE_ATTR,
         lambda: _shuffle_scale_tile_gfx950(w_scales.transpose(-1, -2), 32, 8),
+        N,
+        K,
     )
+
+
+def _gemm2_reads_b_directly(w, w_scales, N, K, dq_b) -> bool:
+    """True when GEMM2 must read ``w`` and ``w_scales`` directly, through its ladder,
+    instead of the copies that its family entries read.
+
+    A copy is not valid while a CUDA graph is captured (a replay runs no host check),
+    for an inference tensor (no version counter shows its writes) or for a padded
+    tensor (logical N or K below the stored extent).
+    """
+    if torch.cuda.is_current_stream_capturing() or w.is_inference():
+        return True
+    # dq_pack_divisor inline: its constexpr-function call costs ~1 us, twice a launch.
+    pack = 2 if dq_b == DtypeQuant.MXFP4 else 1
+    *_, k_stored, n_stored = w.shape
+    if n_stored != N or k_stored * pack != K:
+        return True
+    if w_scales is None:
+        return False
+    *_, k_groups, n_scales = w_scales.shape
+    return w_scales.is_inference() or n_scales != N or k_groups * MX_GROUP_SIZE != K
 
 
 #: Compiled kernel + launch constants, keyed by everything that can change the
@@ -836,7 +866,7 @@ def moe_gemm_gluon(
     )
     small_grid = _small_grid(routing_data, y.shape[1], N)
     multi_block = _multi_block(routing_data, y.shape[1])
-    graph_capture = torch.cuda.is_current_stream_capturing()
+    direct_b = not apply_swiglu and _gemm2_reads_b_directly(w, w_scales, N, K, dq_b)
 
     if apply_swiglu:
         act = ActivationSpec(
@@ -872,7 +902,7 @@ def moe_gemm_gluon(
             epilogue,
             stream_expert_payload,
             multi_block,
-            graph_capture,
+            direct_b,
         )
 
     grid_n, constexpr_args, num_warps, waves_per_eu, _cfg, _tc = _spec(
@@ -903,7 +933,7 @@ def moe_gemm_gluon(
     if _cfg.get("B_SCALE_SHUFFLED", False) or _env_int(
         "AITER_TRITON_MOE_GLUON_SHUFFLED_W_SCALES", 0
     ):
-        shuf_w = _shuffled_b_scales(w_scales, _cfg)
+        shuf_w = _shuffled_b_scales(w_scales, _cfg, N, K)
         if shuf_w is not None:
             b_scales, b_swizzle = shuf_w, ScaleSwizzle.CDNA4_SCALE
             b_scale_stride_k = 32

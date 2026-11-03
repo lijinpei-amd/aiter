@@ -181,7 +181,7 @@ def test_b_preshuffle_preserves_n_order_and_reuses_the_k256_format():
         torch.uint8
     ).reshape(experts, n, k // 32).transpose(1, 2)
     original = raw.clone()
-    packed = host._shuffled_b_scales(raw, _config())
+    packed = host._shuffled_b_scales(raw, _config(), n, k)
     assert packed.shape == (experts, n // 32, k)
     flat = packed.reshape(experts, -1)
     # Independent byte address: the two low bits select non-K+16 and K+4.
@@ -194,7 +194,7 @@ def test_b_preshuffle_preserves_n_order_and_reuses_the_k256_format():
                           + ((group % 8) // 4) * 2 + (row % 32) // 16)
                 assert flat[e, offset] == raw[e, group, row]
     torch.testing.assert_close(raw, original)
-    assert host._shuffled_b_scales(raw, _config(256)) is packed
+    assert host._shuffled_b_scales(raw, _config(256), n, k) is packed
 
 
 def _inputs(k=2560):

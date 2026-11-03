@@ -327,8 +327,9 @@ def moe_gemm_a4w4(
 
     On gfx950 the Gluon path can keep reordered copies of ``w`` and ``w_scales`` on
     those tensors. It makes new copies after a PyTorch in-place update. After a write
-    that PyTorch does not count (a CUDA graph replay, a write through ``.data``),
-    call ``moe_op_gemm_gluon.drop_weight_copies(w, w_scales)``.
+    that PyTorch does not count (a CUDA graph replay, a write through ``.data``, an
+    in-place write to an inference tensor), call
+    ``moe_op_gemm_gluon.drop_weight_copies(w, w_scales)``.
     """
     if backend is None:
         backend = "gluon" if get_arch() == "gfx1250" else "triton"

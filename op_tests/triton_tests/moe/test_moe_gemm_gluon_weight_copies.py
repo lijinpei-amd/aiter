@@ -7,7 +7,8 @@ The launch keeps a preshuffled copy of the B payload and of the B scales on the
 weight tensors. A strided weight view and an in-place weight or scale update must
 give the same result as fresh contiguous tensors with the same values. This also
 applies to the replay of a CUDA graph, which does not run the host code that checks
-the copies.
+the copies, and to padded weights (unpadded_N, unpadded_K), which keep their
+stored layout.
 """
 
 import os
@@ -19,16 +20,34 @@ import torch
 from aiter.ops.triton.moe import moe_op_gemm_gluon as host
 from aiter.ops.triton.moe import moe_op_gemm_gluon_config as conf
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import moe_gemm_a4w4
+from aiter.ops.triton.moe.moe_op_gemm_a8w4 import moe_gemm_a8w4
 from aiter.ops.triton.moe.moe_op_gemm_a8w8 import moe_gemm_a8w8
 from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 M, N, K, EXPERTS = 32, 256, 2048, 2
+K_PAD = 3072  # stored K of the padded-K weights
+_FP8, _FP4 = torch.float8_e4m3fn, torch.uint8
+#: op -> (public wrapper, activation storage, weight storage)
 _OPS = {
-    "a8w8": (moe_gemm_a8w8, torch.float8_e4m3fn),
-    "a4w4": (moe_gemm_a4w4, torch.uint8),
+    "a8w8": (moe_gemm_a8w8, _FP8, _FP8),
+    "a8w4": (moe_gemm_a8w4, _FP8, _FP4),
+    "a4w4": (moe_gemm_a4w4, _FP4, _FP4),
 }
+
+
+def _routes(rows):
+    """Rows split evenly over the two experts, one M block each."""
+    logits = torch.zeros((rows, EXPERTS), dtype=torch.float16, device="cuda")
+    logits[: rows // 2, 0] = 1
+    logits[rows // 2 :, 1] = 1
+    return routing(logits, 1)
+
+
+def _activations(rows, k):
+    x = torch.randn((rows, k), dtype=torch.bfloat16, device="cuda")
+    return {op: downcast_to_mxfp(x, q, axis=-1) for op, (_, q, _) in _OPS.items()}
 
 
 @pytest.fixture(scope="module")
@@ -42,18 +61,18 @@ def case():
         patch.delenv("AITER_TRITON_MOE_DISABLE_GLUON", raising=False)
         host._launch_spec.cache_clear()
         conf._get_gluon_config_cached.cache_clear()
-        # Rows 0-15 go to expert 0 and rows 16-31 to expert 1, one M block each.
-        logits = torch.zeros((M, EXPERTS), dtype=torch.float16, device="cuda")
-        logits[: M // 2, 0] = 1
-        logits[M // 2 :, 1] = 1
-        route, gather, scatter = routing(logits, 1)
+        route, gather, scatter = _routes(M)
         torch.manual_seed(5)
-        x = torch.randn((M, K), dtype=torch.bfloat16, device="cuda")
+        # 16 rows give block_m 16, the only block_m where unpadded_N/K apply.
+        routes16 = _routes(16)
+        assert routes16[0].block_m == 16
         yield SimpleNamespace(
             route=route,
             gather=gather,
             scatter=scatter,
-            x={op: downcast_to_mxfp(x, q, axis=-1) for op, (_, q) in _OPS.items()},
+            x=_activations(M, K),
+            routes16=routes16,
+            x16=_activations(16, K_PAD),
         )
         host._launch_spec.cache_clear()
         conf._get_gluon_config_cached.cache_clear()
@@ -74,30 +93,40 @@ def launches(monkeypatch):
     return seen
 
 
-def _weights(op, experts, seed):
+def _weights(op, experts, seed, n=N, k=K):
     """Column-major MX weights (E, K, N) and their scales."""
     torch.manual_seed(seed)
-    w = torch.randn((experts, N, K), dtype=torch.bfloat16, device="cuda")
-    return downcast_to_mxfp(w.transpose(1, 2), _OPS[op][1], axis=1)
+    w = torch.randn((experts, n, k), dtype=torch.bfloat16, device="cuda")
+    return downcast_to_mxfp(w.transpose(1, 2), _OPS[op][2], axis=1)
 
 
-def _gemm2(op, case, w, ws):
-    fn = _OPS[op][0]
-    x, xs = case.x[op]
-    return fn(
+def _call(op, routes, x, xs, w, ws, **padding):
+    route, gather, scatter = routes
+    return _OPS[op][0](
         x,
         w,
         xs,
         ws,
-        routing_data=case.route,
-        gather_indx=case.gather,
-        scatter_indx=case.scatter,
+        routing_data=route,
+        gather_indx=gather,
+        scatter_indx=scatter,
+        **padding,
     )
+
+
+def _gemm2(op, case, w, ws):
+    routes = case.route, case.gather, case.scatter
+    return _call(op, routes, *case.x[op], w, ws)
+
+
+def _dense(t):
+    """A new K-contiguous copy of ``t``, with no cached data."""
+    return t.transpose(1, 2).contiguous().transpose(1, 2)
 
 
 def _fresh(op, case, w, ws):
     """The result for new contiguous copies, which have no cached data."""
-    return _gemm2(op, case, w.transpose(1, 2).contiguous().transpose(1, 2), ws.clone())
+    return _gemm2(op, case, _dense(w), ws.clone())
 
 
 @pytest.mark.parametrize("op", list(_OPS))
@@ -128,7 +157,10 @@ def test_in_place_weight_and_scale_updates(op, inference, case, launches):
         out = _gemm2(op, case, w, ws)
         assert not torch.equal(out, after_w)
         assert torch.equal(out, _fresh(op, case, w, ws))
-    assert launches and all(flags == (True, True) for flags in launches), launches
+    # An inference tensor has no version counter, so GEMM2 reads it directly.
+    copies = not inference
+    assert launches and all(f == (copies, copies) for f in launches), launches
+    assert hasattr(w, host._B_PRESHUFFLE_ATTR) == copies
 
 
 @pytest.mark.parametrize("op", list(_OPS))
@@ -220,3 +252,54 @@ def test_allow_b_via_lds_environment_skips_the_packed_copy(
     assert not launches[-1][0]
     assert not hasattr(plain, host._B_PRESHUFFLE_ATTR)
     assert torch.equal(out, default)
+
+
+@pytest.mark.parametrize("op", list(_OPS))
+def test_unpadded_n_keeps_the_stored_layout(op, case, launches):
+    x, xs = (t[:, : t.shape[1] * K // K_PAD] for t in case.x16[op])
+    w, ws = _weights(op, EXPERTS, seed=10, n=2 * N)
+    out = _call(op, case.routes16, x, xs, w, ws, unpadded_N=N)
+    assert launches[-1] == (False, False), "a padded tensor gets no copy"
+    full = _call(op, case.routes16, x, xs, w, ws)  # now with copies of all 2N columns
+    assert launches[-1] == (True, True)
+    again = _call(op, case.routes16, x, xs, w, ws, unpadded_N=N)
+    ref = _call(op, case.routes16, x, xs, _dense(w[..., :N]), _dense(ws[..., :N]))
+    assert torch.equal(out[:, :N], ref)
+    assert torch.equal(again[:, :N], ref)
+    assert torch.equal(full[:, :N], ref)
+
+
+@pytest.mark.parametrize("op", list(_OPS))
+def test_smaller_unpadded_k_after_a_full_k_call(op, case, launches):
+    x, xs = case.x16[op]
+    w, ws = _weights(op, EXPERTS, seed=11, k=K_PAD)
+    _call(op, case.routes16, x, xs, w, ws)  # the full K: makes the copies
+    assert launches[-1] == (True, True)
+    out = _call(op, case.routes16, x, xs, w, ws, unpadded_K=K)
+    assert launches[-1] == (False, False), "a padded tensor gets no copy"
+    kx, kw = x.shape[1] * K // K_PAD, w.shape[1] * K // K_PAD
+    ref = _call(
+        op,
+        case.routes16,
+        x[:, :kx].contiguous(),
+        xs[:, : K // 32].contiguous(),
+        _dense(w[:, :kw]),
+        _dense(ws[:, : K // 32]),
+    )
+    assert torch.equal(out, ref)
+
+
+def test_versionless_copy_is_kept_until_dropped():
+    with torch.inference_mode():
+        src = torch.zeros(4, device="cuda")
+    made = []
+
+    def make():
+        made.append(src + len(made))
+        return made[-1]
+
+    first = host._memoised_on(src, host._B_PRESHUFFLE_ATTR, make)
+    assert host._memoised_on(src, host._B_PRESHUFFLE_ATTR, make) is first
+    host.drop_weight_copies(src)
+    assert host._memoised_on(src, host._B_PRESHUFFLE_ATTR, make) is not first
+    assert len(made) == 2

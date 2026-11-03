@@ -902,7 +902,7 @@ def _default_launch_config(
     apply_swiglu,
     stream_expert_payload=False,
     multi_block=False,
-    graph_capture=False,
+    direct_b=False,
 ):
     """Share automatic stage-specific geometry with the capability check.
 
@@ -910,10 +910,9 @@ def _default_launch_config(
     ``_multi_block``); with ``small_grid`` it picks GEMM2's grid class, "small",
     "multi" or "any".
 
-    ``graph_capture``: the launch is captured in a CUDA graph. GEMM2 then keeps the
-    ladder, which reads the weights and scales directly. The family entries read
-    copies that the host makes and checks, and a graph replay does not run that host
-    code, so it would not see an update of the weights.
+    ``direct_b``: GEMM2 must read the weights and scales directly (see the host's
+    ``_gemm2_reads_b_directly``: graph capture, inference or padded tensors). It then
+    keeps the ladder; the family entries read copies that the host makes and checks.
     """
     small_grid = bool(small_grid)
     ladder, env_keys = _get_gluon_config_cached(
@@ -925,7 +924,7 @@ def _default_launch_config(
         small_grid,
         bool(stream_expert_payload),
     )
-    if not apply_swiglu and not graph_capture and (dq_a, dq_b) in _GEMM2_FAMILIES:
+    if not apply_swiglu and not direct_b and (dq_a, dq_b) in _GEMM2_FAMILIES:
         # Every override below needs apply_swiglu, so none applies to GEMM2.
         grid = "small" if small_grid else "multi" if multi_block else "any"
         ladder = _gemm2_launch_config(ladder, block_m, N, K, dq_a, dq_b, env_keys, grid)
