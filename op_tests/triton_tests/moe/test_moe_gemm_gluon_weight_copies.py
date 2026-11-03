@@ -303,6 +303,9 @@ def test_copy_made_on_one_stream_is_complete_on_another(
         return wait_event(stream, event)
 
     monkeypatch.setattr(torch.cuda.Stream, "wait_event", recording_wait)
+    # Compile first: a compile on the timed path outlasts the sleep below, and the
+    # copy is then complete before the second stream asks for it.
+    _gemm2(op, case, *_weights(op, EXPERTS, seed=99))
     w, ws = _weights(op, EXPERTS, seed=12)
     first, second = torch.cuda.Stream(), torch.cuda.Stream()
     for stream in (first, second):
