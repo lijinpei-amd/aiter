@@ -7,7 +7,8 @@ from aiter.ops.triton._triton_kernels.moe.reduce import (
     _reduce_grouped,
     _scatter_grouped,
 )
-from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
+from aiter.ops.triton.utils._triton.arch_info import get_arch, is_tdm_avail
+from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
 
 try:
     from aiter.ops.triton._gluon_kernels.gfx1250.moe.reduce import (
@@ -19,6 +20,25 @@ try:
 except (ImportError, ModuleNotFoundError):
     _reduce_grouped_gluon = None
     _reduce_grouped_gluon_num_warps = None
+
+
+#: ``_reduce_grouped`` launch of every reduction without a tuned entry.
+_REDUCE_TILE_DEFAULT = {"BLOCK_N": 512, "num_warps": 2, "X_CACHE_MODIFIER": ""}
+
+
+def _reduce_tile(grouped_combine: bool) -> dict:
+    """Column block, warps and X load hint of the ``_reduce_grouped`` launch.
+
+    The ``grouped_combine`` entry of the MOE-REDUCE family tunes the top-k combine of a
+    grouped GEMM (rows gathered by ``indx``, one split-K partial, no activation, no
+    residual, no validity mask). Every other reduction, and an arch without the
+    file, keeps :data:`_REDUCE_TILE_DEFAULT`.
+    """
+    tile = dict(_REDUCE_TILE_DEFAULT)
+    if grouped_combine:
+        table = get_moe_dispatch("MOE-REDUCE", get_arch(), "triton")
+        tile.update(table.get("grouped_combine", {}))
+    return tile
 
 
 @dataclass(frozen=True)
@@ -231,8 +251,15 @@ def reduce_grouped(
         )
         return out
 
-    # 1024 columns over 2 warps: 16-byte loads of bf16 rows, half the CTAs of 512.
-    BLOCK_N = 1024
+    tile = _reduce_tile(
+        indx is not None
+        and x.shape[0] == 1
+        and not apply_swiglu
+        and reduction_n == 1
+        and residual is None
+        and indx_valid is None
+    )
+    BLOCK_N = tile["BLOCK_N"]
     num_blocks = triton.cdiv(x.shape[-1], BLOCK_N)
 
     # Step 9: prep external residual buffer + strides for the kernel.
@@ -275,6 +302,7 @@ def reduce_grouped(
         stride_extres_m=res_stride_m,
         stride_extres_n=res_stride_n,
         HAS_EXT_RESIDUAL=has_ext_residual,
-        num_warps=2,
+        X_CACHE_MODIFIER=tile["X_CACHE_MODIFIER"],
+        num_warps=tile["num_warps"],
     )
     return out

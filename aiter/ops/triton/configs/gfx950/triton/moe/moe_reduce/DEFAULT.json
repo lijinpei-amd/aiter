@@ -1,0 +1,7 @@
+{
+    "grouped_combine": {
+        "BLOCK_N": 1024,
+        "num_warps": 2,
+        "X_CACHE_MODIFIER": ".cg"
+    }
+}

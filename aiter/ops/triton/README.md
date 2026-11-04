@@ -176,6 +176,7 @@ small launch grid takes `_small`. Other launches take `_multi` when the experts
 average two or more M blocks, and `_half` when they average at most half an M
 block. All other launches take `_any` alone. An optional
 `bm<block_m>_half_tile` entry tunes the half-height tile of a `_half` launch.
+The `MOE-REDUCE` family tunes the top-k combine of `reduce_grouped`.
 
 [`configs/AGENTS.md`](configs/AGENTS.md) has the layout, the file names, the
 loaders, the JSON format and the steps to add a config. To tune a GEMM, use
