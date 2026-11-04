@@ -96,7 +96,8 @@ bit-identical in 72/72 cells. Table:
 Remaining gap, largest first:
 
 - a8w4 dsv4-pro T=4096 (even routing) is 1.050x the tuned FlyDSL stage 2 on HIP 7 at
-  `db1ba831e` with the task's exact protocol (Gluon 1132.1 us, FlyDSL atomic 1078.1 us,
+  `db1ba831e` (kernel code unchanged since; `ca7d68ae6` only renames the reduce in
+  traces) with the task's exact protocol (Gluon 1132.1 us, FlyDSL atomic 1078.1 us,
   medians of 3 alternating rounds; per round 1.054, 1.046, 1.069). At `ee0de5558`
   (same kernels): 1.042 (Gluon 1133.8 us, FlyDSL 1088.4 us). Gluon has measured
   1132-1134 us in each session since `ad8958e72`; FlyDSL 1078-1088 us. At `ad8958e72`
@@ -123,11 +124,28 @@ Remaining gap, largest first:
   routings. Steady state (HIP 6, 2000 calls, 2 rounds): 1196 us vs 1041-1047 us for
   the current two launches, +150 mJ per call; 6/10 chunk-0 N tiles 1240/1167 us, 512
   reduce CTAs 1208 us. Cause: the reduce code runs at GEMM2's occupancy (512 VGPRs,
-  one CTA per CU), so each reducer holds a CU through latency-bound loads. The reduce
-  is at its bandwidth floor (`l6/reduce_floor.py`, HIP 6): 83.1 us for 352 MB in and
-  59 MB out (4.95 TB/s), torch's contiguous `sum` over the same bytes 92.6 us, a 704 MB
-  copy 147.3 us (4.8 TB/s); a footprint folded into 59 MB (MALL-resident) is only
-  4 us faster (`l6/reduce_footprint.py`). The
+  one CTA per CU), so each reducer holds a CU through latency-bound loads. Among the
+  kernels measured, the reduce is as fast as plain streaming (`l6/reduce_floor.py`,
+  HIP 6): 83.1 us for 352 MB in and 59 MB out (4.95 TB/s), torch's contiguous `sum`
+  over the same bytes 92.6 us, a 704 MB copy 147.3 us (4.8 TB/s); a footprint folded
+  into 59 MB (MALL-resident) is only 4 us faster (`l6/reduce_footprint.py`).
+  Fourteenth pass, diagnostics on HIP 6 with checked snapshots (`l6/diag14.sh`, record
+  `l6/diag14/`, HEAD ca7d68ae6; they do not decide criterion 1): in one protocol run
+  the GPU has no kernels for 146 ms before Gluon's first GEMM2 (Triton's JIT cache key
+  for the first Gluon launches), the warmup GEMM2 calls take 970-1228 us and the 20
+  timed ones average 1023.7 us (reduce 92.0 us). The same kernels give 1109-1127 us
+  plain and 1080-1086 us under cProfile (3 alternating pairs), so the protocol result
+  depends on host timing. A plain Triton read of 4.23 GB takes 791-878 us; GEMM2's
+  bytes (4.49 GB read, 352 MB written) at the measured rates take ~907 us, against
+  ~960 us steady state (rates of these kernels, not a proven limit). Standalone reduce
+  experiment (`diag14/reduce_layouts.out`): token-major rows with identity indices
+  77.8 us vs 82.5-83.3 us for today's gathered rows; the GEMM2 epilogue that would
+  write token-major rows is not built. Fifteenth pass, two CTAs per CU (not kept;
+  `l6/w2_probe.txt`, `l6/w2c_screen.txt`): at `WAVES_PER_EU` 2 both tiles must fit 256
+  registers; the 512-column half tile spills (650 VGPRs), and the one spill-free form
+  (128 x 128 tile in 2 passes, 64 x 256 half tile) is +10.5% at steady state (HIP 5,
+  1177 vs 1061-1066 us, +120 mJ): A is read for 28 N tiles per expert instead of 14.
+  The B payload loads already stream (`sc0 nt`) and A loads are cached. The
   bf16 store's row-segment length (128-512 B per instruction) makes no difference,
   nor does `global_store` in place of `buffer_store`. Twelfth pass (HIP 7 kernel trace,
   `l2/kt_fly_both_h7/`): FlyDSL's atomic kernel 1076.7 us, its row-storing kernel of the
