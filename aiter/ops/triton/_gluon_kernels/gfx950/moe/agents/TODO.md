@@ -371,12 +371,17 @@ Remaining:
   cells: the GEMM kernel is above 1.05x (a4w4 / a8w4 dsv4-pro T=1 1.27x / 1.23x, a4w4
   glm52-base T=4096 1.08x, a4w4 glm52-base and minimax-m3 T=1024 1.05x). 17 cells are
   within 0.01 of a class bound. No kernel cause is traced yet.
-- glm52-base (E 256, H 6144) has no `moe_sort_scales` instance
-  (`MXFP4_MOE_SUPPORTED_SHAPES` has H 6144 only for NE 257). Its 9 block_m 64 and 128
-  GEMM1 launches ask for sorted A scales but read the raw ones: the launched config has
-  `A_SCALE_SORTED_SHUFFLED=False` and the trace has no sort kernel. Two of the five
-  kernel cells above are a4w4 glm52-base (T=1024, T=4096). Follow-up: add an NE 256 / H
-  6144 instance, then re-time those cells.
+- glm52-base (E 256, H 6144) is not in the Python support table
+  `MXFP4_MOE_SUPPORTED_SHAPES` (`aiter/ops/moe_mxfp4_aux.py` lists H 6144 only for NE 257).
+  The host guard in `_sorted_shuffle_a_scales` checks that table, so the 9 block_m 64 and
+  128 GEMM1 launches of glm52-base ask for sorted A scales but read the raw ones: the
+  launched config has `A_SCALE_SORTED_SHUFFLED=False` and the trace has no sort kernel.
+  The generated aux module already has the sort instances for this shape
+  (`gen_instances.py` lists (256, 6144, 2048, 8); the linked `module_moe_mxfp4_aux.so` has
+  `sort_scales_kernel_impl` for BM 32, 64 and 128 at NE 256, H 6144). Two of the five
+  kernel cells above are a4w4 glm52-base (T=1024, T=4096). Follow-up: add the generated
+  shapes to the support table, check the dispatch, then re-time those cells. Do not add
+  a second C++ instance.
 - `run_perftest` sometimes misreads the kernels of one iteration and reports 2-4x the
   time without a warning (3 of 19 iterations kept). Before you trust an outlier, check
   how many iterations `get_trace_perf` kept.
