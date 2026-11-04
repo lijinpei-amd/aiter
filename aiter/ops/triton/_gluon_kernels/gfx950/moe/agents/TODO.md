@@ -101,7 +101,15 @@ Remaining gap, largest first:
   `compare_a8w4pro_20261104_l5.md`, with the 72-cell HIP 7 matrix of that commit).
   `ad8958e72` streams the reduce_grouped rows (`.cg`) and widens its column block to
   1024 (HIP 7: 0.986 even, 0.990 random; balanced order 0.979 / 0.988). At
-  `fded59f68` it was 1.058 (`compare_a8w4pro_20261104_l4.md`). An earlier
+  `fded59f68` it was 1.058 (`compare_a8w4pro_20261104_l4.md`). The reduce tile is
+  read from the MOE-REDUCE config family since `374b6bcad` (same kernel for the
+  measured cells). Tenth pass, steady-state screen (2000 back-to-back calls, HIP 6,
+  repeat spread ~0.2%; a screen only, not acceptance timing) of the 512-column tile:
+  SCHED_MODE 1-4, WAIT_COMMIT_SCHEME 1/2/4, K_UNROLL 6, DS_READ_A_*_IN_MFMA,
+  tiles_per_warp [2,4], B scales via LDS, SOFF_UNROLL and SCALE_FILL_MID are all
+  within 0.3% of the current tile; GROUP_M 2 and SLOT_N 512 are +1%; BLOCK_N 1024
+  spills 697 VGPRs. A single-process HIP 6 run first showed SCHED_MODE 1 at -2.8%; it
+  did not reproduce. An earlier
   table that screened FlyDSL's reduce candidate too gave 1.077. Seventh pass, not kept:
   a tile-contiguous B weight copy (bit-exact, no change) and other result/weight cache
   policies (GEMM2 slower, reduce unchanged). Gluon's GEMM2 kernel alone now takes about

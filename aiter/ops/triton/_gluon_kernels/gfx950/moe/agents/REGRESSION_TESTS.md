@@ -119,7 +119,11 @@ Notes:
   change renames, adds or removes a `KernelLayout` field, or adds a sched-dump case
   (`layout_fields.py` imports that case list, so T0 differs too). Check that the diff
   shows only that, then accept it with `tests/gate.sh baseline --fast` on the changed
-  tree.
+  tree. Last done at `374b6bcad` for the `HALF_M_TILE` config field (it changes each
+  config's serialization and mangle) and the `epilogue_bias_copies` layout field; T0
+  was unchanged. The previous `$OUT` references (recorded at `b38920e09`) are kept in
+  `$OUT/gate_ref_archive_b38920e09/`; `--fast` does not touch the T2b and T2d
+  references, which stay those of `b38920e09`.
 - A differing check prints its number of hunks, the full diff command, and the
   first 20 lines of `diff -U0 -F '^== '` (a few hunks), cut to 200 columns. Each
   hunk is labelled with the `== <config>` it belongs to.
