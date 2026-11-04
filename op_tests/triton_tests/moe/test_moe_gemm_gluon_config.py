@@ -729,7 +729,7 @@ def test_gemm2_families_hold_tuning_values_only(family):
     grid_keys = {
         f"bm{bm}_{grid}"
         for bm in conf._SUPPORTED_BLOCK_M
-        for grid in ("small", "multi", "half")
+        for grid in ("small", "multi", "half", "half_tile")
     }
     assert any_keys <= set(table) <= any_keys | grid_keys
     known = set(
@@ -739,11 +739,18 @@ def test_gemm2_families_hold_tuning_values_only(family):
     )
     for entry in table.values():
         assert entry and set(entry) <= known - {"BLOCK_M"}
-    # A grid entry lists only what it changes on top of the any entry.
+    # A grid entry lists only what it changes on top of the any entry. A half_tile
+    # entry goes on top of the block_m / 2 config, and only a _half launch uses it.
     for key, entry in table.items():
-        if not key.endswith("_any"):
+        if key.endswith("_half_tile"):
+            block_m = int(key[2:].split("_")[0])
+            assert f"bm{block_m}_half" in table, key
+            base = table[f"bm{block_m // 2}_any"]
+        elif not key.endswith("_any"):
             base = table[key.rsplit("_", 1)[0] + "_any"]
-            assert not {k for k, v in entry.items() if base.get(k) == v}, key
+        else:
+            continue
+        assert not {k for k, v in entry.items() if base.get(k) == v}, key
 
 
 @pytest.mark.parametrize("dq_a,dq_b", list(conf._GEMM2_FAMILIES))
@@ -845,21 +852,31 @@ def _gemm2_spec(block_m=128, act=None, half_block=True):
 
 
 def test_gemm2_half_m_tile_is_the_half_block_m_config():
-    # a8w4 block_m 128 runs an M block of at most 64 rows on its block_m 64 config.
+    # a8w4 block_m 128 runs an M block of at most 64 rows on its block_m 64 config,
+    # with the bm128_half_tile entry on top.
     spec = _gemm2_spec()
     *_, config, tuning, half = spec
     assert config["HALF_M_TILE"] and _plain(tuning.HALF_M_TILE)
-    assert len(spec[1]) == 5 and _plain(spec[1][4]) == _tuning_spec(
-        dict(
-            conf._default_launch_config(
-                64, 7168, 3072, DtypeQuant.MXFP8, DtypeQuant.MXFP4, False, False
-            ),
-            HALF_M_TILE=False,
-        )
+    tile = get_moe_dispatch("A8W4-GEMM2", "gfx950", "gluon")["bm128_half_tile"]
+    expected = dict(
+        conf._default_launch_config(
+            64, 7168, 3072, DtypeQuant.MXFP8, DtypeQuant.MXFP4, False, False
+        ),
+        HALF_M_TILE=False,
+        **{k: conf._hashable(v) for k, v in tile.items()},
     )
+    assert len(spec[1]) == 5 and _plain(spec[1][4]) == _tuning_spec(expected)
     assert _plain(half.BLOCK_M) == 64 and not _plain(half.HALF_M_TILE)
-    for key in ("BLOCK_N", "WAVES_PER_EU", "B_PRESHUFFLED", "B_SCALE_SHUFFLED"):
+    for key in ("WAVES_PER_EU", "B_PRESHUFFLED", "B_SCALE_SHUFFLED"):
         assert _plain(getattr(half, key)) == _plain(getattr(tuning, key)), key
+
+
+def test_gemm2_wider_half_m_tile_sets_the_n_grid():
+    # The half-height tile is twice as wide as the block_m tile, so the N grid is the
+    # half-height tile's, and the block_m tile covers its N block in two passes.
+    grid_n, *_, tuning, half = _gemm2_spec()
+    assert _plain(half.BLOCK_N) == 2 * _plain(tuning.BLOCK_N)
+    assert grid_n == 7168 // _plain(half.BLOCK_N)
 
 
 @pytest.mark.parametrize(
@@ -879,16 +896,28 @@ def test_gemm2_half_m_tile_only_where_the_entry_and_launch_ask(
 
 @pytest.mark.parametrize(
     "key,value",
-    [("BLOCK_N", 128), ("WAVES_PER_EU", 2), ("B_PRESHUFFLED", False)],
+    [("BLOCK_N", 384), ("WAVES_PER_EU", 2), ("B_PRESHUFFLED", False)],
 )
 def test_gemm2_half_m_tile_needs_the_launch_grid_and_operands(gemm2_tables, key, value):
-    # The half-height tile shares the launch's grid, waves and weight copies.
-    entry = gemm2_tables["A8W4-GEMM2"]["bm64_any"]
+    # The half-height tile shares the launch's waves and weight copies, and its N block
+    # is a whole number of the launch's.
+    entry = gemm2_tables["A8W4-GEMM2"]["bm128_half_tile"]
     entry[key] = value
     if key == "B_PRESHUFFLED":
         entry["ALLOW_B_VIA_LDS"] = True
     spec = _gemm2_spec()
     assert not spec[4]["HALF_M_TILE"] and spec[6] is None and len(spec[1]) == 4
+
+
+@pytest.mark.parametrize("env,expected", [(None, 6), ("2", 2)])
+def test_gemm2_half_m_tile_keeps_environment_keys(
+    gemm2_tables, monkeypatch, env, expected
+):
+    # The half_tile entry goes on top, but a key the environment sets keeps its value.
+    gemm2_tables["A8W4-GEMM2"]["bm128_half_tile"]["K_UNROLL"] = 6
+    if env is not None:
+        monkeypatch.setenv("AITER_TRITON_MOE_GLUON_K_UNROLL", env)
+    assert _plain(_gemm2_spec()[6].K_UNROLL) == expected
 
 
 def test_gemm2_half_m_tile_environment_override(monkeypatch):

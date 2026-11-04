@@ -829,18 +829,22 @@ def _gemm2_env_keys() -> tuple:
     )
 
 
+def _gemm2_entry(block_m, dq_a, dq_b, name) -> dict:
+    """The operands' GEMM2 family entry ``bm<block_m>_<name>``, empty when the family
+    has none. A copy, with JSON lists as the tuples the config uses."""
+    family = _GEMM2_FAMILIES[(dq_a, dq_b)]
+    table = get_moe_dispatch(family, get_arch(), "gluon")
+    return {k: _hashable(v) for k, v in table.get(f"bm{block_m}_{name}", {}).items()}
+
+
 def _gemm2_tuned(block_m, dq_a, dq_b, grid) -> dict:
     """The operands' GEMM2 family entry (empty when it has none for ``block_m``):
     ``bm<block_m>_any``, overlaid by ``bm<block_m>_<grid>`` ("small", "multi" or
-    "half") when the family has that entry. A copy, with JSON lists as the tuples the
-    config uses."""
-    family = _GEMM2_FAMILIES[(dq_a, dq_b)]
-    table = get_moe_dispatch(family, get_arch(), "gluon")
-    entry = {
-        **table.get(f"bm{block_m}_any", {}),
-        **table.get(f"bm{block_m}_{grid}", {}),
+    "half") when the family has that entry."""
+    return {
+        **_gemm2_entry(block_m, dq_a, dq_b, "any"),
+        **_gemm2_entry(block_m, dq_a, dq_b, grid),
     }
-    return {k: _hashable(v) for k, v in entry.items()}
 
 
 @cache
@@ -904,14 +908,25 @@ def _gemm2_launch_config(
 
 @cache
 def _gemm2_half_m_config(
-    cfg_items: tuple, block_m, N, K, dq_a, dq_b, small_grid, multi_block
+    cfg_items: tuple,
+    block_m,
+    N,
+    K,
+    dq_a,
+    dq_b,
+    small_grid,
+    multi_block,
+    env_keys: tuple = (),
 ):
     """The half-height tile of a GEMM2 launch whose config is ``cfg_items``, as sorted
     config items, or None when the launch has none.
 
-    The tile is the ``_default_launch_config`` of ``block_m / 2`` for the same launch.
-    It must use the launch's grid, warps, waves per EU and operand copies, so a config
-    that differs in one of them gives no half-height tile.
+    The tile is the ``_default_launch_config`` of ``block_m / 2`` for the same launch,
+    with the family's ``bm<block_m>_half_tile`` entry on top. ``env_keys`` (see
+    :func:`_gemm2_env_keys`) keep their value. The tile must use the launch's warps,
+    waves per EU and operand copies, and a ``BLOCK_N`` that is a whole multiple of the
+    launch's; else the launch has no half-height tile. A wider tile sets the N grid,
+    and the full tile then covers its N block in passes.
     """
     cfg = dict(cfg_items)
     if not cfg.get("HALF_M_TILE") or block_m // 2 not in _SUPPORTED_BLOCK_M:
@@ -929,15 +944,17 @@ def _gemm2_half_m_config(
         ),
         HALF_M_TILE=False,
     )
+    if (dq_a, dq_b) in _GEMM2_FAMILIES:
+        tile = _gemm2_entry(block_m, dq_a, dq_b, "half_tile")
+        half.update((k, v) for k, v in tile.items() if k not in env_keys)
     shared = (
-        "BLOCK_N",
         "warps_per_cta",
         "WAVES_PER_EU",
         "A_SCALE_SORTED_SHUFFLED",
         "B_SCALE_SHUFFLED",
         "B_PRESHUFFLED",
     )
-    if any(half[key] != cfg[key] for key in shared):
+    if half["BLOCK_N"] % cfg["BLOCK_N"] or any(half[key] != cfg[key] for key in shared):
         return None
     items = _cfg_key(half)
     return None if _launch_error(items, dq_a, dq_b, N, K) else items

@@ -66,6 +66,7 @@ from aiter.ops.triton.moe.moe_op_gemm_gluon_config import (
     _cval,
     _default_launch_config,
     _env_int,
+    _gemm2_env_keys,
     _gemm2_half_m_config,
     _hashable,
     _pipeline_error,
@@ -338,7 +339,15 @@ def _launch_spec(
     half_items = None
     if act is None and half_block:
         half_items = _gemm2_half_m_config(
-            _cfg_key(c), block_m, N, K, dq_a, dq_b, small_grid, multi_block
+            _cfg_key(c),
+            block_m,
+            N,
+            K,
+            dq_a,
+            dq_b,
+            small_grid,
+            multi_block,
+            _gemm2_env_keys(),
         )
     # The flag tells the kernel that it gets a half-height tile.
     c = dict(c, HALF_M_TILE=half_items is not None)
@@ -384,6 +393,8 @@ def _launch_spec(
         half_cfg_host = KernelTuningConfig(func_cfg_host, *half_spec)
         validate_buffer_counts(half_cfg_host)
         constexpr_args += (gl.constexpr(half_spec),)
+        # A wider half-height tile sets the N grid (see _gemm2_half_m_config).
+        grid_n = _cval(KernelLayout(half_cfg_host).grid_N(N))
     num_warps = c["warps_per_cta"][0] * c["warps_per_cta"][1]
     return (
         grid_n,

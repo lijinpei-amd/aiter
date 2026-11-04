@@ -177,7 +177,9 @@ def _moe_gemm_body(
 
     ``half_cfg`` and ``half_layout`` are the half-height tile's config and layout, or
     None. With them, an M block that holds at most ``half_cfg.BLOCK_M`` rows runs that
-    tile instead of the ``tuning_cfg`` one.
+    tile instead of the ``tuning_cfg`` one. The N grid is then the half-height tile's,
+    and the ``tuning_cfg`` tile covers its N block in ``half_cfg.BLOCK_N /
+    tuning_cfg.BLOCK_N`` passes.
     """
     gl.static_assert(tuning_cfg.HALF_M_TILE == (half_cfg is not None))
     pid = gl.program_id(0)
@@ -209,6 +211,7 @@ def _moe_gemm_body(
         # whole BLOCK_M blocks.
         gl.static_assert(not half_cfg.A_SCALE_SORTED_SHUFFLED)
         gl.static_assert(tuning_cfg.BLOCK_M == 2 * half_cfg.BLOCK_M)
+        gl.static_assert(half_cfg.BLOCK_N % tuning_cfg.BLOCK_N == 0)
         if M_e - block_id * tuning_cfg.BLOCK_M <= half_cfg.BLOCK_M:
             _moe_gemm_tile(
                 a,
@@ -232,27 +235,55 @@ def _moe_gemm_body(
                 NUM_K * tuning_cfg.BLOCK_K // half_cfg.BLOCK_K,
             )
             return
-    _moe_gemm_tile(
-        a,
-        b,
-        res,
-        rt,
-        bias_hbm_ptr,
-        stride_bias_e,
-        x_static_scale_hbm_ptr,
-        pid_m,
-        pid_n,
-        expt_id,
-        block_id,
-        M_e,
-        start_m,
-        func_cfg,
-        tuning_cfg,
-        layout,
-        N,
-        K,
-        NUM_K,
-    )
+        N_PASSES: gl.constexpr = half_cfg.BLOCK_N // tuning_cfg.BLOCK_N
+    else:
+        N_PASSES: gl.constexpr = 1
+    if require_constexpr(N_PASSES == 1):
+        _moe_gemm_tile(
+            a,
+            b,
+            res,
+            rt,
+            bias_hbm_ptr,
+            stride_bias_e,
+            x_static_scale_hbm_ptr,
+            pid_m,
+            pid_n,
+            expt_id,
+            block_id,
+            M_e,
+            start_m,
+            func_cfg,
+            tuning_cfg,
+            layout,
+            N,
+            K,
+            NUM_K,
+        )
+    else:
+        # A runtime loop keeps one copy of the tile's code.
+        for n_pass in range(N_PASSES):
+            _moe_gemm_tile(
+                a,
+                b,
+                res,
+                rt,
+                bias_hbm_ptr,
+                stride_bias_e,
+                x_static_scale_hbm_ptr,
+                pid_m,
+                pid_n * N_PASSES + n_pass,
+                expt_id,
+                block_id,
+                M_e,
+                start_m,
+                func_cfg,
+                tuning_cfg,
+                layout,
+                N,
+                K,
+                NUM_K,
+            )
 
 
 @gluon.jit

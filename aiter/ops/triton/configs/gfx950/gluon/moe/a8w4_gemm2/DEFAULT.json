@@ -78,6 +78,12 @@
         "TILE_SCHED": 0,
         "result_cache_modifier": ".cs"
     },
+    "bm128_half_tile": {
+        "BLOCK_N": 512,
+        "SLOT_N": 256,
+        "BLOCK_K": 128,
+        "VGPR_PREFETCH_K": 128
+    },
     "bm128_multi": {
         "result_cache_modifier": ".cs",
         "expert_cache_modifier": "",

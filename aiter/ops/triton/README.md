@@ -174,7 +174,8 @@ have a `bm<block_m>_any` entry for each `block_m`. An optional
 the keys that it changes, and the launch merges it over `bm<block_m>_any`. A
 small launch grid takes `_small`. Other launches take `_multi` when the experts
 average two or more M blocks, and `_half` when they average at most half an M
-block. All other launches take `_any` alone.
+block. All other launches take `_any` alone. An optional
+`bm<block_m>_half_tile` entry tunes the half-height tile of a `_half` launch.
 
 [`configs/AGENTS.md`](configs/AGENTS.md) has the layout, the file names, the
 loaders, the JSON format and the steps to add a config. To tune a GEMM, use

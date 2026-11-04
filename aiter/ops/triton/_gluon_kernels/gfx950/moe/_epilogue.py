@@ -122,18 +122,22 @@ def _stage_epilogue_inputs(
                 gamma_lds_ptr, gammas_hbm_ptr, g_offs, mask=g_offs < M_e, other=0.0
             )
         if require_constexpr(func_cfg.has_bias):
-            epi_b_offs = layout.n_split_offs(
-                pid_n,
-                gl.arange(
-                    0,
-                    BN,
-                    layout=layout.epilogue_bias_buffer_load_lds_layout,
-                ),
-                N,
-            )
-            gl.amd.cdna4.async_copy.buffer_load_to_shared(
-                bias_lds_ptr, bias_hbm_base, epi_b_offs
-            )
+            COPIES: gl.constexpr = layout.epilogue_bias_copies
+            CN: gl.constexpr = BN // COPIES
+            for c in gl.static_range(COPIES):
+                epi_b_offs = layout.n_split_offs(
+                    pid_n,
+                    c * CN
+                    + gl.arange(
+                        0,
+                        CN,
+                        layout=layout.epilogue_bias_buffer_load_lds_layout,
+                    ),
+                    N,
+                )
+                gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                    bias_lds_ptr.slice(c * CN, CN), bias_hbm_base, epi_b_offs
+                )
         # They are committed as the groups the schedule counts, which its drain
         # waits place at their exact FIFO position: after the last main step, before
         # the first drain step. They therefore lengthen the wait only for reads whose
