@@ -112,10 +112,11 @@ Remaining gap, largest first:
   tiles_per_warp [2,4], B scales via LDS, SOFF_UNROLL and SCALE_FILL_MID are all
   within 0.3% of the current tile; GROUP_M 2 and SLOT_N 512 are +1%; BLOCK_N 1024
   spills 697 VGPRs. A single-process HIP 6 run first showed SCHED_MODE 1 at -2.8%; it
-  did not reproduce. Eleventh pass: the in-kernel chunked reduce is not built; the
-  whole-wave 2-launch split (8+6 N tiles, `.wt`) shows that its chunk tile order and
-  store policy cost the GEMM2 +11 us, which an in-kernel version keeps, so it could
-  only save the launch gaps (separate launches: flat on HIP 7, equal energy). The
+  did not reproduce. Eleventh pass: measured for the two-launch split only (8+6 N
+  tiles, `.wt` stores, whole waves): its GEMM2 costs +11 us over the whole call (the
+  column-chunk tile order, the `.wt` stores and the second launch together), and the
+  split is flat on HIP 7 with equal energy per call. A persistent in-kernel chunked
+  reduce is not built; this measurement does not bound it. The
   bf16 store's row-segment length (128-512 B per instruction) makes no difference,
   nor does `global_store` in place of `buffer_store`. Twelfth pass (HIP 7 kernel trace,
   `l2/kt_fly_both_h7/`): FlyDSL's atomic kernel 1076.7 us, its row-storing kernel of the
