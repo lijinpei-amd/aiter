@@ -119,11 +119,18 @@ Notes:
   change renames, adds or removes a `KernelLayout` field, or adds a sched-dump case
   (`layout_fields.py` imports that case list, so T0 differs too). Check that the diff
   shows only that, then accept it with `tests/gate.sh baseline --fast` on the changed
-  tree. Last done at `374b6bcad` for the `HALF_M_TILE` config field (it changes each
-  config's serialization and mangle) and the `epilogue_bias_copies` layout field; T0
-  was unchanged. The previous `$OUT` references (recorded at `b38920e09`) are kept in
-  `$OUT/gate_ref_archive_b38920e09/`; `--fast` does not touch the T2b and T2d
-  references, which stay those of `b38920e09`.
+  tree. To check, keep the old reference and run `tests/layout_ref_diff.py OLD NEW
+  --drop-field <added field> --drop-cfg-item <added config field>`: it drops those
+  and the `#mangle_sha256` lines and prints every other difference by case. A tuning
+  value that a config change moved (not a field) shows up there and needs its own
+  paired measurement. Last done at `374b6bcad`: the `HALF_M_TILE` config field (it
+  changes each config's serialization and mangle) and the `epilogue_bias_copies`
+  layout field, plus one tuning value, `result_cache_modifier` `''` -> `'.cs'` in
+  `prod/g2-a8w4-t256-bm64-noact/raw` (the a8w4 `bm64_any` entry of `49081e874`,
+  paired in that commit); T0 was unchanged. The previous `$OUT` references (recorded
+  at `b38920e09`) are kept in `$OUT/gate_ref_archive_b38920e09/`; `--fast` does not
+  touch the T2b and T2d references, which stay those of `b38920e09`. T0b SAME after
+  that means equal to the re-recorded reference, not to `b38920e09`'s.
 - A differing check prints its number of hunks, the full diff command, and the
   first 20 lines of `diff -U0 -F '^== '` (a few hunks), cut to 200 columns. Each
   hunk is labelled with the `== <config>` it belongs to.
