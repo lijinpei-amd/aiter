@@ -541,6 +541,17 @@ def test_small_block_m_mxfp8_mxfp4_gemm1_register_b_is_narrow(overrides):
     )
 
 
+@pytest.mark.parametrize("block_m", [16, 32])
+def test_small_block_m_gemm1_families_read_b_from_registers(block_m):
+    # The A4W4-GEMM1 tiles at block_m 16/32 (T=8..1024 in the model matrix).
+    config = conf._default_launch_config(
+        block_m, 4096, 4096, DtypeQuant.MXFP4, DtypeQuant.MXFP4, False, True
+    )
+    assert not config["ALLOW_B_VIA_LDS"] and config["B_PRESHUFFLED"]
+    assert config["B_SCALE_SHUFFLED"] and config["BLOCK_K"] == 256
+    assert config["BLOCK_N"] == (128 if block_m == 16 else 256)
+
+
 @pytest.fixture
 def gemm1_tables(monkeypatch):
     """Editable copies of the GEMM1 families, served in place of the JSON files."""
