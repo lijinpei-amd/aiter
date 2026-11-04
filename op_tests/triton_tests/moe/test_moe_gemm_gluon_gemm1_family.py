@@ -21,6 +21,18 @@ from op_tests.triton_tests.moe.test_moe_gemm_gluon_config import (  # noqa: F401
     _clear_config_caches,
 )
 
+_A4W4 = (DtypeQuant.MXFP4, DtypeQuant.MXFP4)
+_A8W8 = (DtypeQuant.MXFP8, DtypeQuant.MXFP8)
+
+
+def _ladder_with_launch_keys(block_m, N, K, dq_a, dq_b, small_grid=False, *_):
+    """The config of a GEMM1 launch without a tile entry: the ladder and the family's
+    launch keys."""
+    return dict(
+        conf.get_gluon_config(block_m, N, K, dq_a, dq_b, small_grid),
+        **conf._gemm1_tuned(block_m, dq_a, dq_b),
+    )
+
 
 @pytest.mark.parametrize("N,K", [(4096, 4096), (6144, 7168)])
 @pytest.mark.parametrize("block_m", [16, 32])
@@ -65,8 +77,6 @@ def test_small_block_m_mxfp8_mxfp4_gemm1_reads_b_from_registers(block_m, N, K):
     [
         {"small_grid": True},
         {"apply_swiglu": False},
-        # MXFP8 weights at N 6144 / K 6144: A8W8-GEMM1 keeps the ladder there.
-        {"dq_b": DtypeQuant.MXFP8, "block_m": 16, "N": 6144, "K": 6144},
         {"N": 2880},
         {"N": 4096, "K": 7168},
         {"N": 4096, "K": 7168, "block_m": 16},
@@ -113,30 +123,25 @@ def test_small_block_m_gemm1_families_read_b_from_registers(dq_a, dq_b, block_m)
     assert config["BLOCK_N"] == (128 if block_m == 16 else 256)
 
 
-@pytest.mark.parametrize(
-    "dq_a,dq_b",
-    [
-        (DtypeQuant.MXFP4, DtypeQuant.MXFP4),
-        (DtypeQuant.MXFP8, DtypeQuant.MXFP4),
-        (DtypeQuant.MXFP8, DtypeQuant.MXFP8),
-    ],
-)
-def test_gemm1_small_grids_take_the_block_m_16_small_tile(dq_a, dq_b):
-    # T=1 (a small grid): the bm16_small tile, except at N 6144 / K 7168 (dsv4-pro),
-    # where the tile was 6-15% slower and the ladder stays.
-    tile = conf._default_launch_config(16, 4096, 4096, dq_a, dq_b, True, True)
+@pytest.mark.parametrize("dtypes", list(conf._GEMM1_FAMILIES))
+def test_gemm1_small_grids_take_the_block_m_16_small_tile(dtypes):
+    # T=1 (a small grid): the bm16_small tile.
+    tile = conf._default_launch_config(16, 4096, 4096, *dtypes, True, True)
     assert not tile["ALLOW_B_VIA_LDS"] and tile["B_PRESHUFFLED"]
     assert (tile["BLOCK_N"], tile["BLOCK_K"]) == (128, 256)
-    args = (16, 6144, 7168, dq_a, dq_b, True)
-    config = conf._default_launch_config(*args, True)
-    assert config == dict(
-        conf.get_gluon_config(*args), **conf._gemm1_tuned(16, *args[3:5])
-    )
 
 
-_A4W4 = (DtypeQuant.MXFP4, DtypeQuant.MXFP4)
-_A8W4 = (DtypeQuant.MXFP8, DtypeQuant.MXFP4)
-_A8W8 = (DtypeQuant.MXFP8, DtypeQuant.MXFP8)
+@pytest.mark.parametrize(
+    "args",
+    [
+        # dsv4-pro T=1: the small-grid tile was 6-15% slower.
+        *((16, 6144, 7168, *dtypes, True) for dtypes in conf._GEMM1_FAMILIES),
+        # a8w8 minimax-m3 T=8/32: T=32 was 2.5% slower with the block_m 16 tile.
+        (16, 6144, 6144, *_A8W8, False),
+    ],
+)
+def test_gemm1_shapes_that_keep_the_ladder(args):
+    assert conf._default_launch_config(*args, True) == _ladder_with_launch_keys(*args)
 
 
 @pytest.mark.parametrize(
@@ -144,7 +149,7 @@ _A8W8 = (DtypeQuant.MXFP8, DtypeQuant.MXFP8)
     [
         # block_m 64 (glm52-base and minimax-m3 T=1024): B in registers.
         (64, 4096, 6144, _A4W4, True),
-        (64, 6144, 6144, _A8W4, True),
+        (64, 6144, 6144, (DtypeQuant.MXFP8, DtypeQuant.MXFP4), True),
         (64, 4096, 6144, _A8W8, True),
         # block_m 128: a4w4 except dsv4-pro, a8w8 at glm52-base and minimax-m3.
         (128, 4096, 4096, _A4W4, True),
@@ -186,15 +191,6 @@ def test_a4w4_block_m_128_schedule_yields_to_the_environment(monkeypatch):
     assert config["DS_READ_A_PAYLOAD_IN_MFMA"]
 
 
-def test_a8w8_block_m_16_keeps_the_ladder_at_n_6144_k_6144():
-    # minimax-m3 T=32 was 2.5% slower with the A8W8-GEMM1 block_m 16 tile.
-    args = (16, 6144, 6144, DtypeQuant.MXFP8, DtypeQuant.MXFP8, False)
-    config = conf._default_launch_config(*args, True)
-    assert config == dict(
-        conf.get_gluon_config(*args), **conf._gemm1_tuned(16, *args[3:5])
-    )
-
-
 @pytest.fixture
 def gemm1_tables(monkeypatch):
     """Editable copies of the GEMM1 families, served in place of the JSON files."""
@@ -218,18 +214,17 @@ def test_gemm1_families_hold_tuning_values_only(family):
     # Tile entries bm<block_m>_any and _small, optionally for one N and K, and the
     # half-height tile's bm<block_m>_half and bm<block_m>_half_tile.
     assert table
+    block_m = "|".join(map(str, conf._SUPPORTED_BLOCK_M))
     names = re.compile(
-        r"bm(16|32|64|128)_(any|small|half|half_tile|n[0-9]+_k[0-9]+_(any|small))"
+        rf"bm({block_m})_(any|small|half|half_tile|n[0-9]+_k[0-9]+_(?:any|small))"
     )
-    for name in table:
-        assert names.fullmatch(name), name
-        assert name.split("_", 1)[0] + "_any" in table, name
     for name, entry in table.items():
-        # _half sets launch keys only.
-        if name.endswith("_half"):
+        match = names.fullmatch(name)
+        assert match and f"bm{match[1]}_any" in table, name
+        # _half sets launch keys only; the other launch keys come from _any.
+        if match[2] == "half":
             assert set(entry) <= set(conf._GEMM1_ENV), name
-        # Launch keys come from _any and _half only.
-        if name.endswith("_small") or re.search(r"_n[0-9]+_k", name):
+        elif match[2] not in ("any", "half_tile"):
             assert not set(entry) & set(conf._GEMM1_ENV), name
     known = set(
         conf.get_gluon_config_uncached(
@@ -259,14 +254,11 @@ def test_gemm1_entry_that_cannot_launch_keeps_the_ladder(gemm1_tables):
     # Register B on plain weights is rejected by the launch, so the ladder stays,
     # with the launch keys of the entry on top.
     gemm1_tables["A8W4-GEMM1"]["bm32_any"]["B_PRESHUFFLED"] = False
-    assert conf._default_launch_config(*_GEMM1_ARGS) == dict(
-        conf.get_gluon_config(*_GEMM1_ARGS[:5]),
-        **conf._gemm1_tuned(*_GEMM1_ARGS[:1], *_GEMM1_ARGS[3:5]),
+    assert conf._default_launch_config(*_GEMM1_ARGS) == _ladder_with_launch_keys(
+        *_GEMM1_ARGS
     )
 
 
-#: A launch with a half-height tile from its family's _half_tile entry: a8w8
-#: glm52-base T=1024 (block_m 64, a mean of 32 rows).
 #: A small-grid launch of the A8W4-GEMM1 family: dsv4-flash T=1 (block_m 16).
 _GEMM1_SMALL_ARGS = (16, 4096, 4096, DtypeQuant.MXFP8, DtypeQuant.MXFP4, True, True)
 
@@ -297,17 +289,13 @@ def test_gemm1_shape_entry_replaces_the_any_entry(gemm1_tables):
     # An empty shape entry keeps the ladder for that N and K only.
     _clear_config_caches()
     table["bm32_n4096_k4096_any"] = {}
-    ladder = dict(
-        conf.get_gluon_config(*_GEMM1_ARGS[:5]),
-        **conf._gemm1_tuned(*_GEMM1_ARGS[:1], *_GEMM1_ARGS[3:5]),
-    )
+    ladder = _ladder_with_launch_keys(*_GEMM1_ARGS)
     assert conf._default_launch_config(*_GEMM1_ARGS) == ladder
     other = (32, 6144, 7168) + _GEMM1_ARGS[3:]
     assert conf._default_launch_config(*other)["BLOCK_N"] == tuned["BLOCK_N"]
     # A shape entry lists the whole tile: it does not take bm32_any's keys.
     _clear_config_caches()
     table["bm32_n4096_k4096_any"] = dict(table["bm32_any"], GROUP_M=2)
-    del table["bm32_n4096_k4096_any"]["HALF_M_TILE"]
     assert conf._default_launch_config(*_GEMM1_ARGS) == dict(tuned, GROUP_M=2)
 
 
@@ -343,6 +331,8 @@ def test_gemm1_small_grid_entry_respects_environment_and_direct_b(
     assert (config["GROUP_M"], config["WAVES_PER_EU"]) == (2, 1)
 
 
+#: A launch with a half-height tile from its family's _half_tile entry: a8w8
+#: glm52-base T=1024 (block_m 64, a mean of 32 rows).
 _GEMM1_HALF_ARGS = (64, 4096, 6144, DtypeQuant.MXFP8, DtypeQuant.MXFP8, False, True)
 
 
