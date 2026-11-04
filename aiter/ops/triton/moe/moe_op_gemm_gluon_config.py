@@ -1165,13 +1165,9 @@ def _default_launch_config(
             B_PRESHUFFLED=True,
             ALLOW_B_VIA_LDS=False,
         )
-        # The A8W4-GEMM1 family's bm128_any sets HALF_M_TILE: when the experts
-        # average at most 64 rows (dsv4-pro T=4096: exactly 64, which
-        # routing_block_m raises to block_m 128), a block of at most 64 rows runs the
-        # block_m 64 tile (_gemm1_half_m_config). GEMM1 kernel at dsv4-pro T=4096,
-        # HIP 2: 2504 -> 1977 us (even routing), 2513 -> 2321 us (random routing),
-        # output bit-identical. Its bm128_half entry streams the result (.cs), which
-        # both tiles use: 1985 -> 1870 us (even), 2303 -> 2290 us (random).
+        # The A8W4-GEMM1 family asks for a half-height tile, which
+        # _gemm1_half_m_config gives only where it fits the launch, and sets the
+        # result policy of launches whose experts average at most 64 rows.
         c.update(_gemm1_tuned(block_m, dq_a, dq_b, half_block))
     if (
         apply_swiglu
