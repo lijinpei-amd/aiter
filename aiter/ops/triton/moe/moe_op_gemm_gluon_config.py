@@ -716,6 +716,9 @@ def get_gluon_config_uncached(
                 _env_int("AITER_TRITON_MOE_GLUON_SCALE_FILL_MID", 0)
             ),
             "UNROLL_EPILOGUE": True,
+            # GEMM1: run an M block that holds at most BLOCK_M / 2 rows on the
+            # block_m / 2 config (_gemm1_half_m_config).
+            "HALF_M_TILE": bool(_env_int("AITER_TRITON_MOE_GLUON_HALF_M_TILE", 0)),
             # Read the complete BLOCK_K payload stage into registers one pipeline step
             # before its MFMAs consume it. The pipeline requires this
             # whole-stage handoff; there is no disabled or partial K-prefetch mode.
@@ -817,6 +820,43 @@ _FAMILY_ENV = {
 }
 
 
+#: Ladder keys that a GEMM1 family entry can set, with the AITER_TRITON_MOE_GLUON_
+#: variables that set them in the ladder. When one of them is set, the ladder value
+#: (the environment's) wins over the entry.
+_GEMM1_ENV = {
+    "HALF_M_TILE": ("HALF_M_TILE",),
+    "result_cache_modifier": ("RESULT_CACHE_MODIFIER", "RESULT_MOD"),
+}
+
+
+@cache
+def _gemm1_family_entry(block_m, dq_a, dq_b, half_block) -> tuple:
+    """The operands' GEMM1 family entry as sorted items (empty when there is none):
+    ``bm<block_m>_any``, overlaid by ``bm<block_m>_half`` when ``half_block``. Its
+    keys must be in :data:`_GEMM1_ENV`."""
+    family = _GEMM1_FAMILIES.get((dq_a, dq_b))
+    if family is None:
+        return ()
+    table = get_moe_dispatch(family, get_arch(), "gluon")
+    entry = {
+        **table.get(f"bm{block_m}_any", {}),
+        **(table.get(f"bm{block_m}_half", {}) if half_block else {}),
+    }
+    unknown = set(entry) - set(_GEMM1_ENV)
+    assert not unknown, f"{family} bm{block_m}: keys {sorted(unknown)} not allowed"
+    return tuple(sorted((k, _hashable(v)) for k, v in entry.items()))
+
+
+def _gemm1_tuned(block_m, dq_a, dq_b, half_block=False) -> dict:
+    """The GEMM1 family entry without the keys that the environment sets."""
+    prefix = "AITER_TRITON_MOE_GLUON_"
+    return {
+        key: value
+        for key, value in _gemm1_family_entry(block_m, dq_a, dq_b, bool(half_block))
+        if not any(prefix + name in os.environ for name in _GEMM1_ENV[key])
+    }
+
+
 def _family_env_keys() -> tuple:
     """The :data:`_FAMILY_ENV` keys that the environment sets now, sorted."""
     prefix = "AITER_TRITON_MOE_GLUON_"
@@ -911,6 +951,7 @@ def _default_launch_config(
     stream_expert_payload=False,
     multi_block=False,
     direct_b=False,
+    half_block=False,
 ):
     """Share automatic stage-specific geometry with the capability check.
 
@@ -921,6 +962,9 @@ def _default_launch_config(
     ``direct_b``: the launch must read the weights and scales directly (see the host's
     ``_reads_b_directly``: graph capture, inference or padded tensors). It then keeps
     the ladder; the family entries read copies that the host makes and checks.
+
+    ``half_block``: the experts average at most half an M block (see the host's
+    ``_half_block``); GEMM1 then also takes its family's ``bm<block_m>_half`` entry.
     """
     small_grid = bool(small_grid)
     ladder, env_keys = _get_gluon_config_cached(
@@ -945,9 +989,12 @@ def _default_launch_config(
         and not small_grid
         and (dq_a, dq_b) in _GEMM1_FAMILIES
         and not (N == 4096 and K == 7168)
+        and block_m < 128
     ):
         # The GEMM1 entries were measured on large grids; the September shape keeps the
-        # block_m 32 override below (docs/perf_gemm1_a8w4_bm32.md).
+        # block_m 32 override below (docs/perf_gemm1_a8w4_bm32.md). The family's
+        # block_m 128 entries carry only the half-height tile keys (_GEMM1_ENV), which
+        # the block_m 128 override below applies (_gemm1_tuned).
         family = _GEMM1_FAMILIES[(dq_a, dq_b)]
         ladder = _family_launch_config(
             ladder, family, block_m, N, K, dq_a, dq_b, env_keys, "any"
@@ -1137,6 +1184,10 @@ def _default_launch_config(
             B_PRESHUFFLED=True,
             ALLOW_B_VIA_LDS=False,
         )
+        # The A8W4-GEMM1 family asks for a half-height tile, which
+        # _gemm1_half_m_config gives only where it fits the launch, and sets the
+        # result policy of launches whose experts average at most 64 rows.
+        c.update(_gemm1_tuned(block_m, dq_a, dq_b, half_block))
     if (
         apply_swiglu
         and dq_b == DtypeQuant.MXFP4
@@ -1278,6 +1329,51 @@ def _default_launch_config(
             ),
         )
     return c
+
+
+#: Keys whose value the half-height tile takes from its launch: the operand copies
+#: that the launch prepares (the GEMM1 kernel reads one copy of each for both tiles),
+#: and the cache policy of the result, which both tiles write.
+_HALF_M_LAUNCH_KEYS = (
+    "A_SCALE_SORTED_SHUFFLED",
+    "B_SCALE_SHUFFLED",
+    "B_PRESHUFFLED",
+    "result_cache_modifier",
+)
+
+
+@cache
+def _gemm1_half_m_config(cfg_items: tuple, block_m, N, K, dq_a, dq_b, small_grid):
+    """The half-height tile of a GEMM1 launch whose config is ``cfg_items``, as sorted
+    config items, or None when the launch has none.
+
+    The tile is the ``_default_launch_config`` of ``block_m / 2`` for the same launch,
+    and it takes the launch's operand copies and result policy
+    (:data:`_HALF_M_LAUNCH_KEYS`). It must use
+    the launch's grid, warps and waves per EU, so a config that differs in one of them
+    gives no half-height tile.
+    """
+    cfg = dict(cfg_items)
+    if not cfg.get("HALF_M_TILE") or block_m // 2 not in _SUPPORTED_BLOCK_M:
+        return None
+    half = dict(
+        _default_launch_config(block_m // 2, N, K, dq_a, dq_b, small_grid, True),
+        HALF_M_TILE=False,
+        **{key: cfg[key] for key in _HALF_M_LAUNCH_KEYS},
+    )
+    if any(half[k] != cfg[k] for k in ("BLOCK_N", "warps_per_cta", "WAVES_PER_EU")):
+        return None
+    # The copies must be ones the tile can read.
+    if half["A_SCALE_SORTED_SHUFFLED"] and (
+        not _scale_shuffle_supported(half, 0) or int(half["SLOT_M"]) % 32
+    ):
+        return None
+    if half["B_SCALE_SHUFFLED"] and not _b_scale_shuffle_fits(half):
+        return None
+    if not half["ALLOW_B_VIA_LDS"] and not half["B_PRESHUFFLED"]:
+        return None
+    items = _cfg_key(half)
+    return None if _launch_error(items, dq_a, dq_b, N, K) else items
 
 
 def _expected_m_tiles_per_expert(M: int, n_expts_tot: int, block_m: int) -> int:

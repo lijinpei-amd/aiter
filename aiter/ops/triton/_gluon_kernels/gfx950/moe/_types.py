@@ -385,6 +385,9 @@ class TuningSpec(NamedTuple):
     SCALE_SLOT_K: int = 0
     #: Statically expand the finite main-loop remainder after complete unrolled bodies.
     UNROLL_EPILOGUE: bool = True
+    #: An M block that holds at most BLOCK_M / 2 rows runs a second tile, BLOCK_M / 2
+    #: rows high, from its own config (the half-height tile, agents/CONCEPTS.md).
+    HALF_M_TILE: bool = False
 
 
 class ActivationSpec(NamedTuple):

@@ -568,16 +568,20 @@ _GEMM1_ARGS = (32, 4096, 4096, DtypeQuant.MXFP8, DtypeQuant.MXFP4, False, True)
 @pytest.mark.parametrize("family", sorted(conf._GEMM1_FAMILIES.values()))
 def test_gemm1_families_hold_tuning_values_only(family):
     table = get_moe_dispatch(family, "gfx950", "gluon")
-    # Only bm<block_m>_any entries: GEMM1 has no grid classes.
+    # bm<block_m>_any entries, plus bm<block_m>_half for the half-height tile: GEMM1
+    # has no other grid classes.
     assert table
-    assert set(table) <= {f"bm{bm}_any" for bm in conf._SUPPORTED_BLOCK_M}
+    assert set(table) <= {
+        f"bm{bm}_{cls}" for bm in conf._SUPPORTED_BLOCK_M for cls in ("any", "half")
+    }
     known = set(
         conf.get_gluon_config_uncached(
             32, 4096, 4096, DtypeQuant.MXFP8, DtypeQuant.MXFP4
         )
     )
+    assert any(table.values())
     for entry in table.values():
-        assert entry and set(entry) <= known - {"BLOCK_M"}
+        assert set(entry) <= known - {"BLOCK_M"}
         # Register B reads the preshuffled copy.
         assert entry.get("ALLOW_B_VIA_LDS", True) or entry.get("B_PRESHUFFLED")
 

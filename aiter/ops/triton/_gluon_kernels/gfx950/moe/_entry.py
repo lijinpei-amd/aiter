@@ -6,6 +6,8 @@
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import require_constexpr
+
 from ._config import KernelFuncConfig, KernelTuningConfig
 from ._lang import constexpr_fields
 from ._lang import unwrap_attr as _cv
@@ -36,9 +38,14 @@ def _moe_gemm_body(
     N: gl.constexpr,
     K: gl.constexpr,
     NUM_K,
+    half_cfg=None,
 ):
-    """Build the layout from ``tuning_cfg`` and run the body."""
+    """Build the layouts from ``tuning_cfg`` and ``half_cfg`` and run the body."""
     layout = KernelLayout(tuning_cfg)
+    if require_constexpr(half_cfg is not None):
+        half_layout = KernelLayout(half_cfg)
+    else:
+        half_layout: gl.constexpr = None
     _moe_gemm_body_with_layout(
         a,
         b,
@@ -55,6 +62,8 @@ def _moe_gemm_body(
         N,
         K,
         NUM_K,
+        half_cfg,
+        half_layout,
     )
 
 
@@ -140,10 +149,18 @@ def _moe_gluon_gemm1(
     CFG_TUNING: gl.constexpr,
     CFG_N: gl.constexpr,
     CFG_K: gl.constexpr,
+    CFG_TUNING_HALF: gl.constexpr = None,
 ):
-    """gemm1: gather + X @ W1 + bias + swiglu, optionally fused MXFP4 output quant."""
+    """gemm1: gather + X @ W1 + bias + swiglu, optionally fused MXFP4 output quant.
+
+    ``CFG_TUNING_HALF`` is the half-height tile's ``TuningSpec``, or None.
+    """
     func_cfg = KernelFuncConfig(*constexpr_fields(CFG_FUNC))
     tuning_cfg = KernelTuningConfig(func_cfg, *constexpr_fields(CFG_TUNING))
+    if require_constexpr(CFG_TUNING_HALF is not None):
+        half_cfg = KernelTuningConfig(func_cfg, *constexpr_fields(CFG_TUNING_HALF))
+    else:
+        half_cfg: gl.constexpr = None
     _moe_gemm_body(
         QuantTokenTensor(
             A_DTYPE_QUANT,
@@ -202,6 +219,7 @@ def _moe_gluon_gemm1(
         CFG_N,
         CFG_K,
         NUM_K,
+        half_cfg,
     )
 
 

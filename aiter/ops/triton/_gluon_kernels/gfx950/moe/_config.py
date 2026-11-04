@@ -241,6 +241,9 @@ class KernelTuningConfig:
     SCALE_SLOT_N: gl.constexpr
     SCALE_SLOT_K: gl.constexpr
     UNROLL_EPILOGUE: gl.constexpr
+    #: A short M block (at most BLOCK_M / 2 rows) runs a second, half-height tile
+    #: from its own config (agents/CONCEPTS.md); the launch passes that config.
+    HALF_M_TILE: gl.constexpr
 
     @gluon.constexpr_function
     def __init__(
@@ -293,6 +296,7 @@ class KernelTuningConfig:
         SCALE_SLOT_N=0,
         SCALE_SLOT_K=0,
         UNROLL_EPILOGUE=True,
+        HALF_M_TILE=False,
     ):
         self.func_cfg = func_cfg
         self.BLOCK_M = gl.constexpr(BLOCK_M)
@@ -343,6 +347,7 @@ class KernelTuningConfig:
         self.SCALE_SLOT_N = gl.constexpr(int(SCALE_SLOT_N))
         self.SCALE_SLOT_K = gl.constexpr(int(SCALE_SLOT_K))
         self.UNROLL_EPILOGUE = gl.constexpr(bool(UNROLL_EPILOGUE))
+        self.HALF_M_TILE = gl.constexpr(bool(HALF_M_TILE))
 
     @gluon.constexpr_function
     def num_buffers(self, operand, scale=False):

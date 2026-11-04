@@ -1323,7 +1323,7 @@ def test_absent_scale_ring_indices_ignore_invalid_unused_depths(scale_depths):
         None,
         None,
         tuple((key, conf._hashable(value)) for key, value in config.items()),
-    )[-1]
+    )[5]
     assert validate(tc, 512, 960)
     schedule = Schedule(tc, KernelLayout(tc), 960)
     assert maybe_unwrap(schedule.depth) == 2

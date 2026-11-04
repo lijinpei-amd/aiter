@@ -133,6 +133,66 @@ block_m 128 reads B scales from registers without a fault. Reproduce with
 `bench_out/gluon_moe_regression/gemm2/g1/sweep_g1.py` (variant `bscale_reg` in
 `v_screen4.json`), then check the B-scale register offsets for SLOT_N 64.
 
+## Close the GEMM1 gap to FlyDSL stage 1 at an exact mean of 64 rows
+
+Priority: high. Target: a8w4 dsv4-pro T=4096 GEMM1 (N 6144, K 7168, E 384, top-k 6),
+Gluon / FlyDSL best stage 1 <= 1.00 on HIP 2, even routing (`N_ACTIVE=max`).
+Diagnosis: `bench_out/gluon_moe_regression/gemm2/gemm1_a8w4_dsv4pro_t4096.md`.
+
+Done 2026-11-04: the gap was block_m. The mean is exactly 64 rows per expert, so
+`routing_block_m` gives block_m 128 and, with even routing, every M tile is half
+empty. FlyDSL's best kernels use a 64-row tile. A GEMM1 launch whose experts average
+at most half an M block now runs each M block of at most 64 rows on a half-height tile,
+the block_m 64 config (`HALF_M_TILE`, CONCEPTS.md); only the `A8W4-GEMM1` family's
+`bm128_any` entry asks for it. GEMM1 kernel on HIP 2: 2504 -> 1977 us (even
+routing), 2513 -> 2321 us (random routing); `gluon_perftest` in 4 paired rounds: 0.796
+(even), 0.925 (random).
+Output bit-identical in all 72 cells, both routings. Forcing block_m 64 in the routing
+was -24% (even) but +2% (random) for Gluon and +5.5% (random) for Triton.
+
+Done 2026-11-04: the family's `bm128_half` entry streams the result (`.cs`) of a
+half-height-tile launch; both tiles use it. GEMM1 kernel 1985 -> 1870 us (even), about
+-0.5% (random). Target cell, 4 paired rounds: 0.765 (even), 0.915 (random). Against
+FlyDSL's best bf16 stage 1, 5 alternating rounds on HIP 2: 0.992-1.001, median 0.998.
+
+Remaining margin, largest first:
+
+- The margin is inside the noise. FlyDSL's best bf16 time mostly reads 1997-2012 us,
+  but 2 of 15 readings on HIP 2 were 1937-1939 us; there Gluon is 1.03x.
+- The protocol call adds two kernels that FlyDSL's stage-1 time does not have: the
+  sorted A-scale pre-pass (`moe_sort_scales`, about 30 us; FlyDSL sorts in its quant
+  step) and a top-k `reduce_grouped` (39 us with the streamed result). The second is
+  an artifact of `bench_moe_gemm_gluon.py`: it passes `scatter_indx` to GEMM1 too, and
+  no model does that (see `bench_moe_gemm_a8w4_cudagraph.py`). The GEMM kernel alone is
+  6-9% faster than FlyDSL's (1870 vs 1983-2060 us, rocprofv3, same session).
+- One wave per SIMD. The block_m 128 tile needs 452 VGPRs, and the half-height tile in
+  the same kernel inherits that occupancy. Alone, the block_m 64 tile at two waves per
+  SIMD (B in registers, BLOCK_K 128, 192 VGPRs) is 3% faster. Tried and dropped: a
+  second launch for that tile (half-tile-only, then full-tile-only): -1.3% even, +27%
+  random (the full-tile-only launch is badly balanced, and an empty 9216-CTA launch
+  costs 19-28 us); the block_m 128 tile at two waves per SIMD (all six variants spill
+  316-576 B, 1.8-2.6x slower); 8-warp tiles (block_m 64 at 3354 us); raw A scales
+  (+60 us, more than the pre-pass); `.wt` instead of `.cs` (flat).
+- CTA start: about 2.1 us of each 57 us CTA has no copy in flight: the routing scalar
+  chain, then about 166 address instructions (A, B and scale offsets) after an 88-cycle
+  gather wait and before the first B copy. Issuing B copies before the A address math
+  can recover only part of that 3.7%; it changes the code of every kernel.
+- Cross-tile prefetch (a persistent CTA that issues the next tile's copies during the
+  drain and epilogue) would hide the CTA start and end at one wave per SIMD. It is a
+  new pipeline feature; not tried.
+
+Extend the half-height tile, each its own change: a4w4 dsv4-pro T=4096 (its block_m 64
+and 128 configs share BLOCK_N, warps and waves; with `AITER_TRITON_MOE_GLUON_HALF_M_TILE=1`
+the output is bit-identical in the test, and a HIP 6 screen of the kernel gave 2088 ->
+1880 us even and 2079 -> 1996 us random), and the block_m 64 launches at a mean of 32
+rows (glm52-base and minimax-m3 T=1024), which need a block_m 32 config with the same
+grid and warps. Merge with GEMM2's half-height tile (`../aiter-gemm2-a8w4`, 8e8fd5457):
+same field and kernel split; GEMM2 asserts raw A scales, GEMM1 addresses sorted A
+scales at `2 * pid_m`.
+
+Check: `gluon_perftest.py STAGE=1` paired against the base, both routings, and the
+output sha256 of all 72 cells (`gemm2/g1pro/out_hash2.py`).
+
 ## Refill an LDS scale with `R > 1` right after its `ds_read`: tried, no win
 
 Tried 2026-10-21, then dropped. An LDS component was copied `D * R` steps before its

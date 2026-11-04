@@ -220,8 +220,8 @@ there is no file. Do not change the returned dict.
 | `A8W4` | `triton` | `bm<block_m>_n<N>_k<K>` | `BLOCK_SIZE_N`, `BLOCK_SIZE_K`, `num_warps`, `num_stages`, `waves_per_eu`, `matrix_instr_nonkdim` |
 | `A8W4` | `gluon` | `bm<block_m>_n<N>_k<K>_<bucket>`, then `bm<block_m>_any` | `block_n`, `block_k`, `num_buffers`, `num_warps`, `persistent_iters` |
 | `A4W4` | `gluon` | `bm<block_m>_n<N>_k<K>_<bucket>`, then `bm<block_m>_any` | `block_n`, `block_k`, `num_buffers`, `num_warps` |
+| `A8W4-GEMM1` | `gluon` (gfx950) | `bm<block_m>_any`, optional `bm<block_m>_half` | block_m 16/32: the same keys as the `*-GEMM2` families; block_m 128: `HALF_M_TILE`, `result_cache_modifier` |
 | `A4W4-GEMM2`, `A8W4-GEMM2`, `A8W8-GEMM2` | `gluon` (gfx950) | `bm<block_m>_any`, optional `bm<block_m>_small` and `bm<block_m>_multi` | keys of the gfx950 Gluon MoE tuning config, e.g. `BLOCK_N`, `BLOCK_K`, `SLOT_M`, `SLOT_N`, `mfma_instr_shape`, `warps_per_cta`, `tiles_per_warp`, `NUM_LDS_BUFFER`, `K_UNROLL`, `VGPR_PREFETCH_K`, `WAVES_PER_EU`, `WAIT_COMMIT_SCHEME`, `SOFF_UNROLL`, `GROUP_M`, `B_SCALE_SHUFFLED`, `B_PRESHUFFLED`, `ALLOW_B_VIA_LDS` |
-| `A8W4-GEMM1` | `gluon` (gfx950) | `bm<block_m>_any` | the same keys as the `*-GEMM2` families |
 
 - `block_m` is the key. Do not put `BLOCK_SIZE_M` or `block_m` in an entry.
 - `<bucket>` comes from `m2bucket()`: `tiny` (M ≤ 8), `small` (M ≤ 32),
@@ -229,6 +229,26 @@ there is no file. Do not change the returned dict.
   (M > 512). Give each new Gluon shape all six buckets. A missing bucket
   falls back to `bm<block_m>_any`.
 - Each Gluon file has a `bm<block_m>_any` entry for each `block_m`.
+- The `A8W4-GEMM1` family tunes the gfx950 Gluon MoE GEMM1 (the gate/up
+  projection with SwiGLU) for MXFP8 activations and MXFP4 weights. It has two
+  kinds of entries:
+  - **block_m 16 and 32: full tiles.** They follow the `*-GEMM2` rules below, but
+    GEMM1 has no grid classes: only `bm<block_m>_any`. The launch merges them over
+    the ladder when the grid is not small, and not at N 4096 with K 7168, which has
+    a Python override. The Python overrides in `_default_launch_config` serve the
+    other block_m.
+  - **block_m 128: the half-height tile.** These entries list only keys of
+    `_GEMM1_ENV` (now `HALF_M_TILE` and `result_cache_modifier`), on top of the
+    tuned block_m 128 tile of `_default_launch_config`.
+    `"HALF_M_TILE": true` gives a launch a second tile, `block_m / 2` rows high,
+    when the experts average at most `block_m / 2` rows (`_half_block` in
+    `moe_op_gemm_gluon.py`: 2 · M ≤ block_m · E). An optional `bm<block_m>_half`
+    entry lists only the keys it changes on top of `bm<block_m>_any`; only such a
+    launch takes it. The Python code keeps the eligibility checks
+    (`_gemm1_half_m_config`): the second tile must have the launch's `BLOCK_N`,
+    warps and waves per EU, and it takes the launch's operand copies and result
+    cache policy; else the launch has one tile. An `AITER_TRITON_MOE_GLUON_*`
+    variable that sets a key wins over the entry.
 - The `*-GEMM2` families tune the gfx950 Gluon MoE GEMM2 (the down projection,
   no activation) for MX activations and weights. An entry lists only the keys
   it changes on top of the Python ladder of `moe_op_gemm_gluon_config.py`; a
@@ -247,13 +267,6 @@ there is no file. Do not change the returned dict.
   applies `bm<block_m>_multi` when the experts average two or more M blocks
   (`_multi_block` in `moe_op_gemm_gluon.py`: M ≥ 2 · block_m · E). A small grid
   never takes `_multi`.
-- The `A8W4-GEMM1` family tunes the gfx950 Gluon MoE GEMM1 (the gate/up
-  projection with SwiGLU) for MXFP8 activations and MXFP4 weights. Its entries
-  follow the `*-GEMM2` rules above, but GEMM1 has no grid classes: only
-  `bm<block_m>_any` entries. The launch applies them when the grid is not small,
-  and not at N 4096 with K 7168, which has a Python override. It has entries for
-  block_m 16 and 32; the Python overrides in `_default_launch_config` serve the
-  other block_m.
 
 ## Conv
 
