@@ -361,15 +361,22 @@ root file system, and when it is full the units fail with `Errno 28` or a bus er
 
 Remaining:
 
-- 33 GEMM1 cells are still above 1.05x FlyDSL's best BF16 stage 1 (final `e60515009`,
-  even routing). The kernel split and FlyDSL were timed in one lock, 3-8 runs per cell
-  (`bench_out/gluon_moe_regression/gemm2/gemm1_generalize.md`). 11 cells: the GEMM
-  kernel is within 1.02x and the other kernels of the call make the gap (the top-k
-  combine, and at block_m 64 or 128 the A-scale sort). 17 cells: the GEMM kernel is
-  1.02-1.05x (block_m 128 at T >= 4096, block_m 16 at T=8, a4w4 minimax-m3 T=1024). 5
-  cells: the GEMM kernel is above 1.05x (a4w4 / a8w4 dsv4-pro T=1 1.27x / 1.24x, a4w4
-  glm52-base T=4096 1.08x and T=1024 1.05x, a8w8 dsv4-flash T=1024 1.05x). No kernel
-  cause is traced yet.
+- 32 GEMM1 cells are still above 1.05x FlyDSL's best BF16 stage 1 (final `e60515009`,
+  even routing). The kernel split and FlyDSL were timed in one lock, 4-10 runs per
+  cell, each run checked against the full launch config, routing and device of the
+  final tree (`bench_out/gluon_moe_regression/gemm2/gemm1_generalize.md`). 11 cells: the
+  GEMM kernel is within 1.02x and the other kernels of the call make the gap (the top-k
+  combine, and at block_m 64 or 128 the A-scale sort). 16 cells: the GEMM kernel is
+  1.02-1.05x (block_m 128 at T >= 4096, block_m 16 at T=8, a8w8 dsv4-flash T=1024). 5
+  cells: the GEMM kernel is above 1.05x (a4w4 / a8w4 dsv4-pro T=1 1.27x / 1.23x, a4w4
+  glm52-base T=4096 1.08x, a4w4 glm52-base and minimax-m3 T=1024 1.05x). 17 cells are
+  within 0.01 of a class bound. No kernel cause is traced yet.
+- glm52-base (E 256, H 6144) has no `moe_sort_scales` instance
+  (`MXFP4_MOE_SUPPORTED_SHAPES` has H 6144 only for NE 257). Its 9 block_m 64 and 128
+  GEMM1 launches ask for sorted A scales but read the raw ones: the launched config has
+  `A_SCALE_SORTED_SHUFFLED=False` and the trace has no sort kernel. Two of the five
+  kernel cells above are a4w4 glm52-base (T=1024, T=4096). Follow-up: add an NE 256 / H
+  6144 instance, then re-time those cells.
 - `run_perftest` sometimes misreads the kernels of one iteration and reports 2-4x the
   time without a warning (3 of 19 iterations kept). Before you trust an outlier, check
   how many iterations `get_trace_perf` kept.
