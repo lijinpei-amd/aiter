@@ -12,8 +12,6 @@ the largest expert takes the half-height tile at ``block_id`` 1. The GEMM1 famil
 each dtype pair asks for the tile at each of them.
 """
 
-import os
-
 import pytest
 import torch
 
@@ -26,6 +24,10 @@ from aiter.ops.triton.moe.moe_op_gemm_a8w8 import moe_gemm_a8w8
 from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from op_tests.triton_tests.moe.moe_test_utils import (
+    clean_gluon_tuning_environment,
+    clear_gluon_config_caches,
+)
 from op_tests.triton_tests.utils.mxfp_ref import upcast_from_mxfp
 
 #: NE 33 and K 3584 have a C++ scale-sort instance, so the A scales are sorted in
@@ -48,28 +50,12 @@ _OPS = {
 }
 
 
-def _clear_config_caches():
-    for cached in (
-        host._launch_spec,
-        conf._get_gluon_config_cached,
-        conf._gemm1_family_entry,
-        conf._gemm1_half_m_config,
-        conf._family_launch_config,
-    ):
-        cached.cache_clear()
-
-
 @pytest.fixture
 def clean_env(monkeypatch):
     if get_arch() != "gfx950":
         pytest.skip("Gluon MoE kernels are gfx950 only.")
-    for name in os.environ:
-        if name.startswith("AITER_TRITON_MOE_GLUON_"):
-            monkeypatch.delenv(name)
     monkeypatch.delenv("AITER_TRITON_MOE_DISABLE_GLUON", raising=False)
-    _clear_config_caches()
-    yield monkeypatch
-    _clear_config_caches()
+    yield from clean_gluon_tuning_environment(monkeypatch)
 
 
 @pytest.fixture
@@ -167,7 +153,7 @@ def test_half_m_tile_rows_match_the_full_tile(op, block_m, cases, clean_env, lau
     assert [launch[:2] for launch in launches] == [(False, None)]
 
     clean_env.setenv("AITER_TRITON_MOE_GLUON_HALF_M_TILE", "1")
-    _clear_config_caches()
+    clear_gluon_config_caches()
     half = _gemm1(op, case)
     assert launches[1][:2] == (True, block_m // 2)
     # Both launches read the same A scales: at block_m 64 and 128, the sorted ones.
@@ -260,7 +246,7 @@ def test_environment_wins_over_the_gemm1_family(value, clean_env):
     clean_env.setenv("AITER_TRITON_MOE_GLUON_HALF_M_TILE", value)
     assert _gemm1_config("a8w4", 128)["HALF_M_TILE"] is (value == "1")
     clean_env.setenv("AITER_TRITON_MOE_GLUON_RESULT_CACHE_MODIFIER", "")
-    _clear_config_caches()
+    clear_gluon_config_caches()
     assert _gemm1_config("a8w4", 128, half_block=True)["result_cache_modifier"] == ""
 
 

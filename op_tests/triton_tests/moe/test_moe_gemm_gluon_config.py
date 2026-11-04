@@ -53,31 +53,15 @@ from op_tests.triton_tests.moe.gluon_buffer_audit import (
     _plain,
     _schedule,
 )
+from op_tests.triton_tests.moe.moe_test_utils import clean_gluon_tuning_environment
 from op_tests.triton_tests.moe.test_moe_gemm_gluon_buffered_schedule import (
     _assert_minimal_peel,
 )
 
 
-def _clear_config_caches():
-    for cached in (
-        host._launch_spec,
-        conf._get_gluon_config_cached,
-        conf._family_launch_config,
-        conf._gemm2_half_m_config,
-        conf._gemm1_family_entry,
-        conf._gemm1_half_m_config,
-    ):
-        cached.cache_clear()
-
-
 @pytest.fixture(autouse=True)
 def _clean_tuning_environment(monkeypatch):
-    for name in os.environ:
-        if name.startswith("AITER_TRITON_MOE_GLUON_"):
-            monkeypatch.delenv(name)
-    _clear_config_caches()
-    yield
-    _clear_config_caches()
+    yield from clean_gluon_tuning_environment(monkeypatch)
 
 
 @pytest.fixture

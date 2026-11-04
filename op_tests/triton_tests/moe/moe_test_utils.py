@@ -2,6 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Helpers shared by the MoE Triton tests."""
 
+import os
+
 import torch
 
 from aiter import logger
@@ -81,3 +83,32 @@ def assert_close(ref, tri, maxtol=None, rmstol=None, description="--", verbose=T
 
     assert max_err <= maxtol
     assert rms_err <= rmstol
+
+
+def clear_gluon_config_caches():
+    """Clear the cached Gluon MoE launch configs, so the next launch reads the tuning
+    environment and the config families again."""
+    # Imported here: the other MoE tests do not load the Gluon host.
+    from aiter.ops.triton.moe import moe_op_gemm_gluon as host
+    from aiter.ops.triton.moe import moe_op_gemm_gluon_config as conf
+
+    for cached in (
+        host._launch_spec,
+        conf._get_gluon_config_cached,
+        conf._family_launch_config,
+        conf._gemm2_half_m_config,
+        conf._gemm1_family_entry,
+        conf._gemm1_half_m_config,
+    ):
+        cached.cache_clear()
+
+
+def clean_gluon_tuning_environment(monkeypatch):
+    """Fixture body: remove the ``AITER_TRITON_MOE_GLUON_*`` variables and clear the
+    Gluon config caches before and after the test. Yields ``monkeypatch``."""
+    for name in os.environ:
+        if name.startswith("AITER_TRITON_MOE_GLUON_"):
+            monkeypatch.delenv(name)
+    clear_gluon_config_caches()
+    yield monkeypatch
+    clear_gluon_config_caches()

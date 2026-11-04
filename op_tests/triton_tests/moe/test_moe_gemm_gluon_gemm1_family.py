@@ -14,15 +14,18 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import validate
 from aiter.ops.triton.moe import moe_op_gemm_gluon as host
 from aiter.ops.triton.moe import moe_op_gemm_gluon_config as conf
 from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
-
-# The configuration tests' environment and cache reset, autouse here too.
-from op_tests.triton_tests.moe.test_moe_gemm_gluon_config import (  # noqa: F401
-    _clean_tuning_environment,
-    _clear_config_caches,
+from op_tests.triton_tests.moe.moe_test_utils import (
+    clean_gluon_tuning_environment,
+    clear_gluon_config_caches,
 )
 
 _A4W4 = (DtypeQuant.MXFP4, DtypeQuant.MXFP4)
 _A8W8 = (DtypeQuant.MXFP8, DtypeQuant.MXFP8)
+
+
+@pytest.fixture(autouse=True)
+def _clean_tuning_environment(monkeypatch):
+    yield from clean_gluon_tuning_environment(monkeypatch)
 
 
 def _ladder_with_launch_keys(block_m, N, K, dq_a, dq_b, small_grid=False, *_):
@@ -270,15 +273,15 @@ def test_gemm1_small_grid_entry_overlays_the_ladder(gemm1_tables):
     table.pop("bm16_small", None)
     assert conf._default_launch_config(*_GEMM1_SMALL_ARGS) == ladder
     # A _small entry is the whole tile on top of the ladder; _any does not apply.
-    _clear_config_caches()
+    clear_gluon_config_caches()
     table["bm16_small"] = {"GROUP_M": 2}
     assert conf._default_launch_config(*_GEMM1_SMALL_ARGS) == dict(ladder, GROUP_M=2)
     # An entry for the launch's N and K replaces the generic one.
-    _clear_config_caches()
+    clear_gluon_config_caches()
     table["bm16_n4096_k4096_small"] = {"GROUP_M": 1}
     assert conf._default_launch_config(*_GEMM1_SMALL_ARGS)["GROUP_M"] == 1
     # An empty one keeps the ladder for that shape.
-    _clear_config_caches()
+    clear_gluon_config_caches()
     table["bm16_n4096_k4096_small"] = {}
     assert conf._default_launch_config(*_GEMM1_SMALL_ARGS) == ladder
 
@@ -287,14 +290,14 @@ def test_gemm1_shape_entry_replaces_the_any_entry(gemm1_tables):
     tuned = conf._default_launch_config(*_GEMM1_ARGS)
     table = gemm1_tables["A8W4-GEMM1"]
     # An empty shape entry keeps the ladder for that N and K only.
-    _clear_config_caches()
+    clear_gluon_config_caches()
     table["bm32_n4096_k4096_any"] = {}
     ladder = _ladder_with_launch_keys(*_GEMM1_ARGS)
     assert conf._default_launch_config(*_GEMM1_ARGS) == ladder
     other = (32, 6144, 7168) + _GEMM1_ARGS[3:]
     assert conf._default_launch_config(*other)["BLOCK_N"] == tuned["BLOCK_N"]
     # A shape entry lists the whole tile: it does not take bm32_any's keys.
-    _clear_config_caches()
+    clear_gluon_config_caches()
     table["bm32_n4096_k4096_any"] = dict(table["bm32_any"], GROUP_M=2)
     assert conf._default_launch_config(*_GEMM1_ARGS) == dict(tuned, GROUP_M=2)
 
@@ -308,7 +311,7 @@ def test_gemm1_entry_changes_the_tile_of_a_python_override(gemm1_tables, block_m
     launch_keys = {k: v for k, v in entry.items() if k in conf._GEMM1_ENV}
     table[f"bm{block_m}_any"] = launch_keys
     python_tile = conf._default_launch_config(*args)
-    _clear_config_caches()
+    clear_gluon_config_caches()
     table[f"bm{block_m}_any"] = dict(launch_keys, GROUP_M=2)
     assert conf._default_launch_config(*args) == dict(python_tile, GROUP_M=2)
     # Not at the September shape, which keeps its Python tiles.
@@ -326,7 +329,7 @@ def test_gemm1_small_grid_entry_respects_environment_and_direct_b(
     assert direct == ladder
     # An AITER_TRITON_MOE_GLUON_* variable wins over the entry.
     monkeypatch.setenv("AITER_TRITON_MOE_GLUON_WAVES_PER_EU", "1")
-    _clear_config_caches()
+    clear_gluon_config_caches()
     config = conf._default_launch_config(*_GEMM1_SMALL_ARGS)
     assert (config["GROUP_M"], config["WAVES_PER_EU"]) == (2, 1)
 
@@ -345,11 +348,11 @@ def _gemm1_half_tile_config():
 def test_gemm1_half_tile_is_read_from_its_family(gemm1_tables):
     half = _gemm1_half_tile_config()
     assert half["BLOCK_M"] == 32 and half["BLOCK_N"] == 256
-    _clear_config_caches()
+    clear_gluon_config_caches()
     gemm1_tables["A8W8-GEMM1"]["bm64_half_tile"]["GROUP_M"] = 2
     assert _gemm1_half_tile_config() == dict(half, GROUP_M=2)
     # Without the entry, the block_m 32 config has another BLOCK_N: no half tile.
-    _clear_config_caches()
+    clear_gluon_config_caches()
     del gemm1_tables["A8W8-GEMM1"]["bm64_half_tile"]
     assert _gemm1_half_tile_config() is None
 
@@ -358,7 +361,7 @@ def test_gemm1_environment_override_wins_over_the_half_tile_entry(monkeypatch):
     half = _gemm1_half_tile_config()
     assert half["K_UNROLL"] == 6
     monkeypatch.setenv("AITER_TRITON_MOE_GLUON_K_UNROLL", "3")
-    _clear_config_caches()
+    clear_gluon_config_caches()
     assert _gemm1_half_tile_config()["K_UNROLL"] == 3
 
 
