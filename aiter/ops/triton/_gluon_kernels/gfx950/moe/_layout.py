@@ -262,6 +262,8 @@ class KernelLayout:
     output_block_n: gl.constexpr
     epilogue_threads: gl.constexpr
     epilogue_inputs_via_lds: gl.constexpr
+    #: Async copies that stage the bias in LDS: 2 at 2 values per thread (a copy moves
+    #: 32 or 128 bits per thread), else 1.
     epilogue_bias_copies: gl.constexpr
     epilogue_input_lds_layout: gl.constexpr
     epilogue_gamma_shape: gl.constexpr

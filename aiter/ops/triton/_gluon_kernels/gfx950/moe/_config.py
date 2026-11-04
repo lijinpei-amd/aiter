@@ -241,6 +241,8 @@ class KernelTuningConfig:
     SCALE_SLOT_N: gl.constexpr
     SCALE_SLOT_K: gl.constexpr
     UNROLL_EPILOGUE: gl.constexpr
+    #: GEMM2 only: the launch also has the half-height tile, ``BLOCK_M / 2`` rows high,
+    #: for M blocks of at most ``BLOCK_M / 2`` rows (CONCEPTS.md).
     HALF_M_TILE: gl.constexpr
 
     @gluon.constexpr_function
