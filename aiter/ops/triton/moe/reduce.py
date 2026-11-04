@@ -22,22 +22,27 @@ except (ImportError, ModuleNotFoundError):
     _reduce_grouped_gluon_num_warps = None
 
 
-#: ``_reduce_grouped`` launch of every reduction without a tuned entry.
-_REDUCE_TILE_DEFAULT = {"BLOCK_N": 512, "num_warps": 2, "X_CACHE_MODIFIER": ""}
+#: Keys of a MOE-REDUCE entry.
+_REDUCE_TILE_KEYS = frozenset(("BLOCK_N", "num_warps", "X_CACHE_MODIFIER"))
 
 
 def _reduce_tile(grouped_combine: bool) -> dict:
     """Column block, warps and X load hint of the ``_reduce_grouped`` launch.
 
-    The ``grouped_combine`` entry of the MOE-REDUCE family tunes the top-k combine of a
-    grouped GEMM (rows gathered by ``indx``, one split-K partial, no activation, no
-    residual, no validity mask). Every other reduction, and an arch without the
-    file, keeps :data:`_REDUCE_TILE_DEFAULT`.
+    Read from the MOE-REDUCE family: its ``grouped_combine`` entry, where the arch has
+    one, for the top-k combine of a grouped GEMM (rows gathered by ``indx``, one
+    split-K partial, no activation, no residual, no validity mask), else its
+    ``default`` entry. The returned dict is the loader's cached object: read only.
     """
-    tile = dict(_REDUCE_TILE_DEFAULT)
-    if grouped_combine:
-        table = get_moe_dispatch("MOE-REDUCE", get_arch(), "triton")
-        tile.update(table.get("grouped_combine", {}))
+    table = get_moe_dispatch("MOE-REDUCE", get_arch(), "triton")
+    key = (
+        "grouped_combine"
+        if grouped_combine and "grouped_combine" in table
+        else "default"
+    )
+    assert key in table, f"MOE-REDUCE has no '{key}' entry for {get_arch()}"
+    tile = table[key]
+    assert set(tile) == _REDUCE_TILE_KEYS, f"MOE-REDUCE '{key}' entry {tile}"
     return tile
 
 

@@ -119,7 +119,7 @@ def _reduce_grouped(
     stride_extres_m: tl.uint64,
     stride_extres_n,
     HAS_EXT_RESIDUAL: tl.constexpr,
-    X_CACHE_MODIFIER: tl.constexpr = "",
+    X_CACHE_MODIFIER: tl.constexpr,
 ):
     pid = tl.program_id(0)
     pid_t = pid // num_blocks

@@ -14,6 +14,26 @@ import torch
 from aiter.ops.triton.moe import reduce as reduce_mod
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
+
+#: The launch every reduction had before the MOE-REDUCE family.
+_DEFAULT_TILE = {"BLOCK_N": 512, "num_warps": 2, "X_CACHE_MODIFIER": ""}
+_ARCHS = (
+    "gfx942",
+    "gfx950",
+    "gfx1100",
+    "gfx1101",
+    "gfx1150",
+    "gfx1151",
+    "gfx1200",
+    "gfx1201",
+    "gfx1250",
+)
+
+
+def _table():
+    return get_moe_dispatch("MOE-REDUCE", get_arch(), "triton")
 
 
 def _ordered_sum(rows):
@@ -29,9 +49,7 @@ def _ordered_sum(rows):
 def test_reduce_grouped_topk_combine_is_the_ordered_sum(n, tuned, monkeypatch):
     groups, k = 256, 6
     if not tuned:
-        monkeypatch.setattr(
-            reduce_mod, "_reduce_tile", lambda _: dict(reduce_mod._REDUCE_TILE_DEFAULT)
-        )
+        monkeypatch.setattr(reduce_mod, "_reduce_tile", lambda _: _table()["default"])
     x = torch.randn((1, groups * k, n), dtype=torch.bfloat16, device="cuda")
     indx = torch.randperm(groups * k, device="cuda").to(torch.int32).view(groups, k)
     out = torch.empty((groups, n), dtype=torch.bfloat16, device="cuda")
@@ -50,10 +68,21 @@ def test_reduce_grouped_split_k_is_the_ordered_sum():
 
 
 def test_reduce_tile_tunes_only_the_topk_combine():
-    default = reduce_mod._REDUCE_TILE_DEFAULT
-    assert reduce_mod._reduce_tile(False) == default
-    tuned = reduce_mod._reduce_tile(True)
+    table = _table()
+    assert reduce_mod._reduce_tile(False) == table["default"] == _DEFAULT_TILE
+    grouped = reduce_mod._reduce_tile(True)
+    assert grouped == table.get("grouped_combine", table["default"])
     if get_arch() == "gfx950":
-        assert tuned == {"BLOCK_N": 1024, "num_warps": 2, "X_CACHE_MODIFIER": ".cg"}
-    else:
-        assert set(tuned) == set(default)
+        assert grouped == {"BLOCK_N": 1024, "num_warps": 2, "X_CACHE_MODIFIER": ".cg"}
+
+
+@pytest.mark.parametrize("arch", _ARCHS)
+def test_every_arch_publishes_the_default_reduce_tile(arch):
+    # The tile has no Python fallback, so each arch's file must hold the full entry.
+    cfg_dir = resolve_config_dir(
+        "moe", "MOE-REDUCE", backend="triton", arch=arch, cu_num=None
+    )
+    table = load_config_json(f"{cfg_dir}/DEFAULT.json")
+    assert table["default"] == _DEFAULT_TILE
+    for entry in table.values():
+        assert set(entry) == set(_DEFAULT_TILE)
