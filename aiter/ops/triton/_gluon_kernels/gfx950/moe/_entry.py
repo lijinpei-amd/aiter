@@ -6,8 +6,10 @@
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton._gluon_kernels.gfx950.moe._lang import require_constexpr
+
 from ._config import KernelFuncConfig, KernelTuningConfig
-from ._lang import constexpr_fields, require_constexpr
+from ._lang import constexpr_fields
 from ._lang import unwrap_attr as _cv
 from ._layout import KernelLayout
 from ._types import QuantExpertTensor, QuantTokenTensor, ResultTensor, RoutingMeta

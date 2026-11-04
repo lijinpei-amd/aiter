@@ -241,6 +241,8 @@ class KernelTuningConfig:
     SCALE_SLOT_N: gl.constexpr
     SCALE_SLOT_K: gl.constexpr
     UNROLL_EPILOGUE: gl.constexpr
+    #: A short M block (at most BLOCK_M / 2 rows) runs a second, half-height tile
+    #: from its own config (agents/CONCEPTS.md); the launch passes that config.
     HALF_M_TILE: gl.constexpr
 
     @gluon.constexpr_function
