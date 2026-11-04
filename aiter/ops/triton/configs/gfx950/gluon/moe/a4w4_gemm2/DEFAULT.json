@@ -70,6 +70,16 @@
         "SOFF_UNROLL": true,
         "ALLOW_B_SCALE_VIA_LDS": false
     },
+    "bm128_half": {
+        "HALF_M_TILE": true,
+        "GROUP_M": 1,
+        "result_cache_modifier": ".cs"
+    },
+    "bm128_half_tile": {
+        "BLOCK_N": 512,
+        "SLOT_N": 256,
+        "result_cache_modifier": ".cs"
+    },
     "bm128_multi": {
         "result_cache_modifier": ".cs",
         "expert_cache_modifier": "",

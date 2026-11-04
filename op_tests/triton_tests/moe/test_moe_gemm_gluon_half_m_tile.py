@@ -121,6 +121,7 @@ def test_half_m_tile_rows_match_the_full_tile(op, clean_env, half_tiles):
     torch.testing.assert_close(half.float(), triton.float(), atol=1e-1, rtol=2e-2)
 
 
-def test_a8w4_family_takes_the_half_m_tile(clean_env, half_tiles):
-    _gemm2("a8w4", _case("a8w4"))
+@pytest.mark.parametrize("op", list(_OPS))
+def test_family_takes_the_half_m_tile(op, clean_env, half_tiles):
+    _gemm2(op, _case(op))
     assert half_tiles == [64]
