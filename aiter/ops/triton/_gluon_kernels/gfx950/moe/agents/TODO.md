@@ -95,9 +95,15 @@ bit-identical in 72/72 cells. Table:
 
 Remaining gap, largest first:
 
-- a8w4 dsv4-pro T=4096 (even routing) is 1.077x the tuned FlyDSL stage 2 on HIP 7 at
-  `d65b654c8` (Gluon 1136.4 us, FlyDSL atomic 1055.6 us, medians of 3 alternating rounds;
-  per round 1.097, 1.092, 1.045). Sixth pass (`compare_a8w4pro_20261104_l3.md`): the GPU
+- a8w4 dsv4-pro T=4096 (even routing) is 1.058x the tuned FlyDSL stage 2 on HIP 7 at
+  `fded59f68` with the task's exact protocol (Gluon 1142.5 us, FlyDSL atomic 1079.6 us,
+  medians of 3 alternating rounds; per round 1.050, 1.059, 1.062;
+  `compare_a8w4pro_20261104_l4.md`, which also has the 72-cell HIP 7 matrix). An earlier
+  table that screened FlyDSL's reduce candidate too gave 1.077. Seventh pass, not kept:
+  a tile-contiguous B weight copy (bit-exact, no change) and other result/weight cache
+  policies (GEMM2 slower, reduce unchanged). Gluon's GEMM2 kernel alone now takes about
+  as long as FlyDSL's whole stage 2; the separate reduce (~100 us) is the difference.
+  Sixth pass (`compare_a8w4pro_20261104_l3.md`): the GPU
   runs at its 1000 W cap during these calls (GFX clock ~1.1 GHz of 2.2), so a call's time
   follows its energy, and removing stalls alone does not help: a persistent kernel that
   issues the next tile's prologue before the store is bit-exact and uses 4% fewer cycles
