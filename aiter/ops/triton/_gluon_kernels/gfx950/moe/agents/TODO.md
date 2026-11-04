@@ -110,7 +110,11 @@ Remaining gap, largest first:
   tiles_per_warp [2,4], B scales via LDS, SOFF_UNROLL and SCALE_FILL_MID are all
   within 0.3% of the current tile; GROUP_M 2 and SLOT_N 512 are +1%; BLOCK_N 1024
   spills 697 VGPRs. A single-process HIP 6 run first showed SCHED_MODE 1 at -2.8%; it
-  did not reproduce. An earlier
+  did not reproduce. Eleventh pass: the in-kernel chunked reduce is not built; the
+  whole-wave 2-launch split (8+6 N tiles, `.wt`) shows that its chunk tile order and
+  store policy cost the GEMM2 +11 us, which an in-kernel version keeps, so it could
+  only save the launch gaps (separate launches: flat on HIP 7, equal energy). The
+  bf16 store's row-segment length (128-512 B per instruction) makes no difference. An earlier
   table that screened FlyDSL's reduce candidate too gave 1.077. Seventh pass, not kept:
   a tile-contiguous B weight copy (bit-exact, no change) and other result/weight cache
   policies (GEMM2 slower, reduce unchanged). Gluon's GEMM2 kernel alone now takes about
