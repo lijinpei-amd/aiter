@@ -15,6 +15,7 @@ _reduce_grouped_repr = make_kernel_repr(
         "SWIGLU_ADD_RESIDUAL",
         "USE_TDM",
         "HAS_EXT_RESIDUAL",
+        "X_CACHE_MODIFIER",
     ],
 )
 
