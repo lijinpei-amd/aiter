@@ -93,7 +93,9 @@
         "WAVES_PER_EU": 2
     },
     "bm64_any": {
-        "HALF_M_TILE": true
+        "HALF_M_TILE": true,
+        "ALLOW_B_VIA_LDS": false,
+        "B_PRESHUFFLED": true
     },
     "bm64_half": {
         "result_cache_modifier": ".cs"
@@ -129,5 +131,8 @@
     },
     "bm128_half": {
         "result_cache_modifier": ".cs"
+    },
+    "bm128_half_tile": {
+        "ALLOW_B_VIA_LDS": true
     }
 }

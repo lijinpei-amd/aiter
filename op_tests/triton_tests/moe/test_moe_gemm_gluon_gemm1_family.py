@@ -67,7 +67,6 @@ def test_small_block_m_mxfp8_mxfp4_gemm1_reads_b_from_registers(block_m, N, K):
         {"apply_swiglu": False},
         # MXFP8 weights at N 6144 / K 6144: A8W8-GEMM1 keeps the ladder there.
         {"dq_b": DtypeQuant.MXFP8, "block_m": 16, "N": 6144, "K": 6144},
-        {"block_m": 64},
         {"N": 2880},
         {"N": 4096, "K": 7168},
         {"N": 4096, "K": 7168, "block_m": 16},
@@ -133,6 +132,38 @@ def test_gemm1_small_grids_take_the_block_m_16_small_tile(dq_a, dq_b):
     assert config == dict(
         conf.get_gluon_config(*args), **conf._gemm1_tuned(16, *args[3:5])
     )
+
+
+_A4W4 = (DtypeQuant.MXFP4, DtypeQuant.MXFP4)
+_A8W4 = (DtypeQuant.MXFP8, DtypeQuant.MXFP4)
+_A8W8 = (DtypeQuant.MXFP8, DtypeQuant.MXFP8)
+
+
+@pytest.mark.parametrize(
+    "block_m,N,K,dtypes,registers",
+    [
+        # block_m 64 (glm52-base and minimax-m3 T=1024): B in registers.
+        (64, 4096, 6144, _A4W4, True),
+        (64, 6144, 6144, _A8W4, True),
+        (64, 4096, 6144, _A8W8, True),
+        # block_m 128: a4w4 at glm52-base, a8w8 at glm52-base and minimax-m3.
+        (128, 4096, 6144, _A4W4, True),
+        (128, 6144, 6144, _A4W4, False),
+        (128, 6144, 6144, _A8W8, True),
+        (128, 4096, 4096, _A8W8, False),
+        (128, 6144, 7168, _A8W8, False),
+        (128, 512, 2560, _A8W8, False),
+    ],
+)
+def test_gemm1_large_block_m_b_from_registers(block_m, N, K, dtypes, registers):
+    config = conf._default_launch_config(block_m, N, K, *dtypes, False, True)
+    assert config["ALLOW_B_VIA_LDS"] is not registers
+    assert config["B_PRESHUFFLED"] is registers
+    # The half-height tile keeps B through LDS (reading the launch's copy).
+    half = conf._gemm1_half_m_config(
+        conf._cfg_key(dict(config, HALF_M_TILE=True)), block_m, N, K, *dtypes, False
+    )
+    assert half is not None and dict(half)["ALLOW_B_VIA_LDS"]
 
 
 def test_a8w8_block_m_16_keeps_the_ladder_at_n_6144_k_6144():
@@ -263,12 +294,14 @@ def test_gemm1_shape_entry_replaces_the_any_entry(gemm1_tables):
 @pytest.mark.parametrize("block_m", [64, 128])
 def test_gemm1_entry_changes_the_tile_of_a_python_override(gemm1_tables, block_m):
     # a4w4 block_m 64 and 128 take a Python tile; the entry lists keys on top of it.
-    args = (block_m, 4096, 6144, DtypeQuant.MXFP4, DtypeQuant.MXFP4, False, True)
+    args = (block_m, 2048, 3584, DtypeQuant.MXFP4, DtypeQuant.MXFP4, False, True)
+    table = gemm1_tables["A4W4-GEMM1"]
+    entry = table[f"bm{block_m}_any"]
+    launch_keys = {k: v for k, v in entry.items() if k in conf._GEMM1_ENV}
+    table[f"bm{block_m}_any"] = launch_keys
     python_tile = conf._default_launch_config(*args)
     _clear_config_caches()
-    table = gemm1_tables["A4W4-GEMM1"]
-    table.pop(f"bm{block_m}_n4096_k6144_any", None)
-    table[f"bm{block_m}_any"] = dict(table[f"bm{block_m}_any"], GROUP_M=2)
+    table[f"bm{block_m}_any"] = dict(launch_keys, GROUP_M=2)
     assert conf._default_launch_config(*args) == dict(python_tile, GROUP_M=2)
     # Not at the September shape, which keeps its Python tiles.
     september = (block_m, 4096, 7168) + args[3:]

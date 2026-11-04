@@ -310,6 +310,17 @@ median head / base, even (HIP 1) / random (HIP 0): T=8 and T=32 0.739-0.811 /
 0.747-0.815, dsv4-flash T=1024 0.731 / 0.730, dsv4-pro T=1024 0.816 / 0.823. Output
 bit-identical in all 72 cells.
 
+Done 2026-11-04 (round 1): B in registers on top of the Python block_m 64 and 128
+tiles, where 4 fresh-process pairs show a gain (median with / without, even / random):
+block_m 64 (glm52-base, minimax-m3 T=1024) for all three dtype pairs, a4w4 0.956 /
+0.974 and 0.948 / 0.971, a8w4 0.974 / 1.007 and 0.978 / 0.996, a8w8 0.981 / 0.986 and
+0.956 / 0.981; block_m 128 a4w4 glm52-base only (T=4096 1.008 / 0.955, T=16384 0.979 /
+0.978) and a8w8 glm52-base and minimax-m3 (0.977-0.996). Not taken: a4w4 block_m 128
+on dsv4-pro (T=4096 random 1.059), dsv4-flash and minimax-m3 (flat); a8w8 block_m 128
+on dsv4-flash (T=4096 even 1.029) and dsv4-pro (1.064 in a screen). The half-height
+tiles keep B through LDS (`bm128_half_tile`): with B in registers in both tiles the
+block_m 64 cells were 2-11% slower in a screen.
+
 Done 2026-11-04 (round 1): T=1 (a small grid) takes the block_m 16 tiles through the
 new `bm16_small` entries (all three families; a8w8 at the ladder's waves per EU), and
 keeps the ladder at N 6144 / K 7168 (`bm16_n6144_k7168_small` empty: dsv4-pro was
