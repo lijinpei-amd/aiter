@@ -95,9 +95,11 @@ bit-identical in 72/72 cells. Table:
 
 Remaining gap, largest first:
 
-- a8w4 dsv4-pro T=4096 (even routing) is 1.042x the tuned FlyDSL stage 2 on HIP 7 at
-  `ee0de5558` with the task's exact protocol (Gluon 1133.8 us, FlyDSL atomic 1088.4 us,
-  medians of 3 alternating rounds; per round 1.042, 1.039, 1.048). At `ad8958e72`
+- a8w4 dsv4-pro T=4096 (even routing) is 1.050x the tuned FlyDSL stage 2 on HIP 7 at
+  `db1ba831e` with the task's exact protocol (Gluon 1132.1 us, FlyDSL atomic 1078.1 us,
+  medians of 3 alternating rounds; per round 1.054, 1.046, 1.069). At `ee0de5558`
+  (same kernels): 1.042 (Gluon 1133.8 us, FlyDSL 1088.4 us). Gluon has measured
+  1132-1134 us in each session since `ad8958e72`; FlyDSL 1078-1088 us. At `ad8958e72`
   (same kernels): 1.051 (Gluon 1133.5 us, FlyDSL 1078.2 us;
   `compare_a8w4pro_20261104_l5.md`, with the 72-cell HIP 7 matrix of that commit).
   `ad8958e72` streams the reduce_grouped rows (`.cg`) and widens its column block to
@@ -114,7 +116,8 @@ Remaining gap, largest first:
   whole-wave 2-launch split (8+6 N tiles, `.wt`) shows that its chunk tile order and
   store policy cost the GEMM2 +11 us, which an in-kernel version keeps, so it could
   only save the launch gaps (separate launches: flat on HIP 7, equal energy). The
-  bf16 store's row-segment length (128-512 B per instruction) makes no difference. An earlier
+  bf16 store's row-segment length (128-512 B per instruction) makes no difference,
+  nor does `global_store` in place of `buffer_store`. An earlier
   table that screened FlyDSL's reduce candidate too gave 1.077. Seventh pass, not kept:
   a tile-contiguous B weight copy (bit-exact, no change) and other result/weight cache
   policies (GEMM2 slower, reduce unchanged). Gluon's GEMM2 kernel alone now takes about
