@@ -170,10 +170,13 @@ def _reduce_grouped(
                     vals = tl.reshape(x_desc.load([row, pid_n * BLOCK_N]), (BLOCK_N,))
                 else:
                     x_row_ptr = XPtrs + indxs[i] * stride_xm + b * stride_xb
+                    # Each row of X is read once, so the loads stream (.cg).
                     if EVEN_N:
-                        vals = tl.load(x_row_ptr)
+                        vals = tl.load(x_row_ptr, cache_modifier=".cg")
                     else:
-                        vals = tl.load(x_row_ptr, mask=x_n_mask, other=0.0)
+                        vals = tl.load(
+                            x_row_ptr, mask=x_n_mask, other=0.0, cache_modifier=".cg"
+                        )
                 vals = vals.to(tl.float32)
                 curr += vals
 

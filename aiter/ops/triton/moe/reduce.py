@@ -231,7 +231,8 @@ def reduce_grouped(
         )
         return out
 
-    BLOCK_N = 512
+    # 1024 columns over 2 warps: 16-byte loads of bf16 rows, half the CTAs of 512.
+    BLOCK_N = 1024
     num_blocks = triton.cdiv(x.shape[-1], BLOCK_N)
 
     # Step 9: prep external residual buffer + strides for the kernel.
