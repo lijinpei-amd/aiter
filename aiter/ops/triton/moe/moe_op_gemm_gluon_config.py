@@ -838,40 +838,33 @@ _GEMM1_ENV = {
 
 @cache
 def _gemm1_family_entry(block_m, dq_a, dq_b, half_block) -> tuple:
-    """The :data:`_GEMM1_ENV` keys of the operands' GEMM1 family entry as sorted items
-    (empty when there is none): ``bm<block_m>_any``, overlaid by ``bm<block_m>_half``
-    when ``half_block``. The block_m 128 tile and every ``_half`` entry hold only these
-    keys; the other keys of a ``_any`` entry are a tile (:func:`_family_tuned`)."""
+    """The :data:`_GEMM1_ENV` keys (the launch keys) of the operands' GEMM1 family
+    entry as sorted items (empty when there is none): ``bm<block_m>_any``, overlaid by
+    ``bm<block_m>_half`` when ``half_block``. A ``_half`` entry holds only these keys;
+    the other keys of a ``_any`` entry are a tile (:func:`_default_launch_config`)."""
     family = _GEMM1_FAMILIES.get((dq_a, dq_b))
     if family is None:
         return ()
     table = get_moe_dispatch(family, get_arch(), "gluon")
-    for name in (f"bm{block_m}_half",) + (
-        (f"bm{block_m}_any",) if block_m == 128 else ()
-    ):
-        unknown = set(table.get(name, {})) - set(_GEMM1_ENV)
-        assert not unknown, f"{family} {name}: keys {sorted(unknown)} not allowed"
-    entry = {
-        **table.get(f"bm{block_m}_any", {}),
-        **(table.get(f"bm{block_m}_half", {}) if half_block else {}),
-    }
-    return tuple(sorted((k, _hashable(v)) for k, v in entry.items() if k in _GEMM1_ENV))
+    half = table.get(f"bm{block_m}_half", {})
+    unknown = set(half) - set(_GEMM1_ENV)
+    assert not unknown, f"{family} bm{block_m}_half: keys {sorted(unknown)} not allowed"
+    entry = {**table.get(f"bm{block_m}_any", {}), **(half if half_block else {})}
+    return _cfg_key({k: v for k, v in entry.items() if k in _GEMM1_ENV})
 
 
-@cache
-def _gemm1_half_tile(block_m, dq_a, dq_b, env_keys: tuple) -> tuple:
-    """The operands' GEMM1 family entry ``bm<block_m>_half_tile`` as sorted items: the
-    keys of a block_m launch's half-height tile on top of the ``block_m / 2`` config,
-    without the ``env_keys`` (see :func:`_family_env_keys`)."""
+def _gemm1_half_tile(block_m, dq_a, dq_b) -> dict:
+    """The operands' GEMM1 family entry ``bm<block_m>_half_tile``: the keys of a block_m
+    launch's half-height tile on top of the ``block_m / 2`` config, without the keys
+    that the environment sets (see :func:`_family_env_keys`)."""
     family = _GEMM1_FAMILIES.get((dq_a, dq_b))
     if family is None:
-        return ()
+        return {}
     entry = get_moe_dispatch(family, get_arch(), "gluon").get(
         f"bm{block_m}_half_tile", {}
     )
-    return tuple(
-        sorted((k, _hashable(v)) for k, v in entry.items() if k not in env_keys)
-    )
+    env_keys = _family_env_keys()
+    return {k: _hashable(v) for k, v in entry.items() if k not in env_keys}
 
 
 def _gemm1_tuned(block_m, dq_a, dq_b, half_block=False) -> dict:
@@ -907,13 +900,10 @@ def _family_tuned(family, block_m, grid) -> dict:
     """The ``family`` entry for ``block_m`` (empty when it has none):
     ``bm<block_m>_any``, overlaid by ``bm<block_m>_<grid>`` ("small", "multi" or
     "half") when the family has that entry."""
-    entry = {
+    return {
         **_family_entry(family, block_m, "any"),
         **_family_entry(family, block_m, grid),
     }
-    # A GEMM1 family's launch keys apply on top of the whole tile (_gemm1_tuned).
-    gemm1 = family in _GEMM1_FAMILIES.values()
-    return {k: v for k, v in entry.items() if not (gemm1 and k in _GEMM1_ENV)}
 
 
 @cache
@@ -1088,12 +1078,13 @@ def _default_launch_config(
         and block_m < 128
     ):
         # The GEMM1 entries were measured on large grids; the September shape keeps the
-        # block_m 32 override below (docs/perf_gemm1_a8w4_bm32.md). The family's
-        # block_m 128 entries carry only the half-height tile keys (_GEMM1_ENV), which
-        # the block_m 128 override below applies (_gemm1_tuned).
+        # block_m 32 override below (docs/perf_gemm1_a8w4_bm32.md). The launch keys
+        # (_GEMM1_ENV) keep their ladder value here: _gemm1_tuned applies them on top of
+        # the final tile, at every block_m.
         family = _GEMM1_FAMILIES[(dq_a, dq_b)]
+        keep = env_keys + tuple(_GEMM1_ENV)
         ladder = _family_launch_config(
-            ladder, family, block_m, N, K, dq_a, dq_b, env_keys, "any"
+            ladder, family, block_m, N, K, dq_a, dq_b, keep, "any"
         )
     c = dict(ladder)
     if (
@@ -1457,12 +1448,11 @@ def _gemm1_half_m_config(
     cfg = dict(cfg_items)
     if not cfg.get("HALF_M_TILE") or block_m // 2 not in _SUPPORTED_BLOCK_M:
         return None
-    tile = () if direct_b else _gemm1_half_tile(block_m, dq_a, dq_b, _family_env_keys())
     half = {
         **_default_launch_config(
             block_m // 2, N, K, dq_a, dq_b, small_grid, True, direct_b=direct_b
         ),
-        **dict(tile),
+        **({} if direct_b else _gemm1_half_tile(block_m, dq_a, dq_b)),
         "HALF_M_TILE": False,
         **{
             key: cfg.get(key, TuningSpec._field_defaults.get(key))

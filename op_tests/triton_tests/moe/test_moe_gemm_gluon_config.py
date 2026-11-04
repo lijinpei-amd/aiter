@@ -58,25 +58,26 @@ from op_tests.triton_tests.moe.test_moe_gemm_gluon_buffered_schedule import (
 )
 
 
-@pytest.fixture(autouse=True)
-def _clean_tuning_environment(monkeypatch):
-    for name in os.environ:
-        if name.startswith("AITER_TRITON_MOE_GLUON_"):
-            monkeypatch.delenv(name)
-    caches = (
+def _clear_config_caches():
+    for cached in (
         host._launch_spec,
         conf._get_gluon_config_cached,
         conf._family_launch_config,
         conf._gemm2_half_m_config,
         conf._gemm1_family_entry,
-        conf._gemm1_half_tile,
         conf._gemm1_half_m_config,
-    )
-    for cached in caches:
+    ):
         cached.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _clean_tuning_environment(monkeypatch):
+    for name in os.environ:
+        if name.startswith("AITER_TRITON_MOE_GLUON_"):
+            monkeypatch.delenv(name)
+    _clear_config_caches()
     yield
-    for cached in caches:
-        cached.cache_clear()
+    _clear_config_caches()
 
 
 @pytest.fixture
@@ -587,7 +588,7 @@ def test_gemm1_families_hold_tuning_values_only(family):
         for cls in ("any", "half", "half_tile")
     }
     for name in table:
-        assert name.rsplit("_", 1)[0].removesuffix("_half") + "_any" in table, name
+        assert name.split("_", 1)[0] + "_any" in table, name
     # The launch keys: the block_m 128 tile is Python's, and _half sets launch keys.
     for name, entry in table.items():
         if name == "bm128_any" or name.endswith("_half"):
@@ -640,13 +641,11 @@ def _gemm1_half_tile_config():
 def test_gemm1_half_tile_is_read_from_its_family(gemm1_tables):
     half = _gemm1_half_tile_config()
     assert half["BLOCK_M"] == 32 and half["BLOCK_N"] == 256
-    for cached in (conf._gemm1_half_tile, conf._gemm1_half_m_config):
-        cached.cache_clear()
+    _clear_config_caches()
     gemm1_tables["A8W8-GEMM1"]["bm64_half_tile"]["GROUP_M"] = 2
     assert _gemm1_half_tile_config() == dict(half, GROUP_M=2)
     # Without the entry, the block_m 32 config has another BLOCK_N: no half tile.
-    for cached in (conf._gemm1_half_tile, conf._gemm1_half_m_config):
-        cached.cache_clear()
+    _clear_config_caches()
     del gemm1_tables["A8W8-GEMM1"]["bm64_half_tile"]
     assert _gemm1_half_tile_config() is None
 
@@ -655,13 +654,7 @@ def test_gemm1_environment_override_wins_over_the_half_tile_entry(monkeypatch):
     half = _gemm1_half_tile_config()
     assert half["K_UNROLL"] == 6
     monkeypatch.setenv("AITER_TRITON_MOE_GLUON_K_UNROLL", "3")
-    for cached in (
-        conf._get_gluon_config_cached,
-        conf._family_launch_config,
-        conf._gemm1_half_tile,
-        conf._gemm1_half_m_config,
-    ):
-        cached.cache_clear()
+    _clear_config_caches()
     assert _gemm1_half_tile_config()["K_UNROLL"] == 3
 
 
