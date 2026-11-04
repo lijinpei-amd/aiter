@@ -95,9 +95,10 @@ bit-identical in 72/72 cells. Table:
 
 Remaining gap, largest first:
 
-- a8w4 dsv4-pro T=4096 (even routing) is 1.051x the tuned FlyDSL stage 2 on HIP 7 at
-  `ad8958e72` with the task's exact protocol (Gluon 1133.5 us, FlyDSL atomic 1078.2 us,
-  medians of 3 alternating rounds; per round 1.064, 1.053, 1.043;
+- a8w4 dsv4-pro T=4096 (even routing) is 1.042x the tuned FlyDSL stage 2 on HIP 7 at
+  `ee0de5558` with the task's exact protocol (Gluon 1133.8 us, FlyDSL atomic 1088.4 us,
+  medians of 3 alternating rounds; per round 1.042, 1.039, 1.048). At `ad8958e72`
+  (same kernels): 1.051 (Gluon 1133.5 us, FlyDSL 1078.2 us;
   `compare_a8w4pro_20261104_l5.md`, with the 72-cell HIP 7 matrix of that commit).
   `ad8958e72` streams the reduce_grouped rows (`.cg`) and widens its column block to
   1024 (HIP 7: 0.986 even, 0.990 random; balanced order 0.979 / 0.988). At
