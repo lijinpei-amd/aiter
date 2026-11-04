@@ -246,16 +246,17 @@ Remaining gap, largest first:
   remaining candidate has a positive HIP 7 measurement. Data, probes and the per-variant
   tables:
   `bench_out/gluon_moe_regression/gemm2/compare_a8w4pro_20261104_l2.md`.
-- Prefill cells of the other families after the generalization (estimates from the
-  2026-11-04 reference and A/B; the same-lock table is in
-  `gemm2_prefill_generalize.md`): glm52-base T=1024 stays ~1.14-1.18x FlyDSL in all
-  three dtypes. Its GEMM2 kernel alone is ~1.09x FlyDSL's whole stage 2, while
-  minimax-m3 T=1024 (the same class and 32-row tile, K 3072 against 2048) is at parity:
-  with 8 BLOCK_K steps the prologue and the store weigh more, and at WAVES_PER_EU 1 (the
-  two tiles must share it) no second CTA hides them. dsv4-flash T=1024 (block_m 32, not
-  a half launch) is ~1.07-1.10x, its GEMM2 alone ~1.04x. Elsewhere the remaining gap is
-  the separate reduce (2-17% of the call): a4w4 minimax-m3 T=4096 ~1.13x, GEMM2 alone
-  1.02x.
+- Prefill cells after the generalization (same-lock table, HIP 3/7, 3 rounds, in
+  `gemm2_prefill_generalize.md`; Gluon/FlyDSL geomean over the prefill cells 1.120 ->
+  1.072 a4w4, 1.104 -> 1.067 a8w4, 1.065 -> 1.035 a8w8). dsv4-flash T=1024 (block_m 32,
+  24 rows per expert, not a half launch) is 1.07-1.19x, its GEMM2 kernel alone
+  1.04-1.13x: the block_m 32 tile is the Python ladder's (PER_OP commits, WAVES_PER_EU
+  0), never tuned for prefill; screen `bm32_any` knobs next. glm52-base T=1024 is
+  1.06-1.15x, GEMM2 alone 1.02-1.08x, while minimax-m3 T=1024 (the same 32-row tile,
+  K 3072 against 2048) is 1.02-1.03x alone: with 8 BLOCK_K steps the prologue and the
+  store weigh more, and at WAVES_PER_EU 1 (the two tiles must share it) no second CTA
+  hides them. At T=4096 and T=16384 every cell above 1.05x has its GEMM2 alone at
+  0.91-1.015x: the remaining gap is the separate reduce (8-19% of the call).
 - a8w4 dsv4-flash T=16384 is 1.095x FlyDSL, close to the 1.10 limit. The GEMM (~1245
   us) is faster than FlyDSL's whole stage 2 (1355 us, a tuned atomic kernel), but the
   separate deterministic reduce adds ~237 us at ~4.6 TB/s. No reduce launch shape, a
