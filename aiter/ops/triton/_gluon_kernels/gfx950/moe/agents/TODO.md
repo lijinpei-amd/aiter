@@ -84,10 +84,36 @@ HIP 7 (3 paired rounds) a8w4 dsv4-pro T=4096 is 1323 -> 1255 us (even) and 1464 
 bit-identical in 72/72 cells. Gluon / tuned FlyDSL at that cell is 1.16 on HIP 7.
 Table: `bench_out/gluon_moe_regression/gemm2/compare_a8w4pro_20261104_c2.md`.
 
+Done 2026-11-04 (round 8): the half-height tile of a `_half` launch takes the
+`bm<block_m>_half_tile` entry, and its `BLOCK_N` can be a whole multiple of the launch's;
+the 128-row tile then covers the wider N block in passes (`f8bebc5c7`). For a8w4 the
+tile is 512 columns wide, which halves its A reads and CTAs, and the `bm128_half` launch
+walks one M block at a time on each XCD (`d65b654c8`). On HIP 7 (3 paired rounds) a8w4
+dsv4-pro T=4096 is 1255 -> 1141 us (even) and 1403 -> 1388 us (random). Output
+bit-identical in 72/72 cells. Table:
+`bench_out/gluon_moe_regression/gemm2/compare_a8w4pro_20261104_l3.md`.
+
 Remaining gap, largest first:
 
-- a8w4 dsv4-pro T=4096 (even routing) is 1.15-1.16x the tuned FlyDSL stage 2 on HIP 7
-  (1249/1091 us and 1259/1082 us in two sessions of 3 alternating rounds). These are
+- a8w4 dsv4-pro T=4096 (even routing) is 1.077x the tuned FlyDSL stage 2 on HIP 7 at
+  `d65b654c8` (Gluon 1136.4 us, FlyDSL atomic 1055.6 us, medians of 3 alternating rounds;
+  per round 1.097, 1.092, 1.045). Sixth pass (`compare_a8w4pro_20261104_l3.md`): the GPU
+  runs at its 1000 W cap during these calls (GFX clock ~1.1 GHz of 2.2), so a call's time
+  follows its energy, and removing stalls alone does not help: a persistent kernel that
+  issues the next tile's prologue before the store is bit-exact and uses 4% fewer cycles
+  on a traced CU but is 2.5-4% slower. Both backends are timed inside a power transient
+  (a spike at calls 4-6, then ~30 calls to settle); Gluon's protocol window sits in the
+  spike. Diagnostics: no store at all -88 us, but a store into a MALL-resident 50 MB
+  window costs the same as the real store, so the store cost is not HBM traffic. Not
+  kept: 7 column chunks (the protocol gain is the GPU cooling between launches; steady
+  state +2.5%, random +8%), chunk orders and layouts in one launch, reduce launch shapes
+  (within 1%), deeper B rings, 8 warps. The separate reduce (~100 us) is the largest
+  part of the bit-exact design that FlyDSL's atomic epilogue does not pay. Next
+  experiment: read the amd-smi energy counter per call for the GEMM2 and the reduce
+  separately, then run the reduce of each column chunk inside the persistent GEMM2
+  (per-XCD tile counters exist in `l2/po3_persistent_overlap_prototype.patch`), gated by
+  a per-chunk done counter, so the chunk's intermediate is read back while it is in
+  MALL. The text below is the state before round 8. These are
   results of the variants tested so far, not a proven limit. In them, most of the gap
   sits in the deterministic epilogue: removing the intermediate store takes the GEMM2
   kernel from ~1096 to 956 us (HIP 2), and the separate reduce adds ~100 us. A
