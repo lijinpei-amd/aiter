@@ -67,8 +67,167 @@ launch. The register-B tiles hold one CTA per CU, so each CTA's tail runs expose
 Design, numbers and the final patch: `bench_out/gluon_moe_regression/gemm2/r3/
 T7_RESULT.md`, `r5/t7_combine_final.patch`.
 
+Done 2026-11-04 (round 6): a8w4 dsv4-pro T=4096 (a mean of exactly 64 rows per
+expert, so the routing gives block_m 128) runs every M block of at most 64 rows on a
+second, half-height tile, the block_m 64 config (`HALF_M_TILE`, CONCEPTS.md). Only
+launches whose experts average at most half an M block get the second path: in every
+block_m 128 launch it changed the schedule of the main loop and cost 1-5% where it never
+ran. On HIP 4 (3 paired rounds), GEMM2 + reduce 1530 -> 1311 us (even routing) and
+1529 -> 1421 us (random), output bit-identical. Table: `bench_out/gluon_moe_regression/
+gemm2/compare_a8w4pro_20261104_c1.md`.
+
+Done 2026-11-04 (round 7): a launch whose experts average at most half an M block takes
+the `bm<block_m>_half` entry. For a8w4 it runs the linear tile order (`TILE_SCHED` 0)
+and streams the result (`.cs`); the a8w4 block_m 64 tile also streams the result. On
+HIP 7 (3 paired rounds) a8w4 dsv4-pro T=4096 is 1323 -> 1255 us (even) and 1464 ->
+1407 us (random); a8w4 glm52-base and minimax-m3 T=1024 0.95-0.99. Output
+bit-identical in 72/72 cells. Gluon / tuned FlyDSL at that cell is 1.16 on HIP 7.
+Table: `bench_out/gluon_moe_regression/gemm2/compare_a8w4pro_20261104_c2.md`.
+
+Done 2026-11-04 (round 8): the half-height tile of a `_half` launch takes the
+`bm<block_m>_half_tile` entry, and its `BLOCK_N` can be a whole multiple of the launch's;
+the 128-row tile then covers the wider N block in passes (`f8bebc5c7`). For a8w4 the
+tile is 512 columns wide, which halves its A reads and CTAs, and the `bm128_half` launch
+walks one M block at a time on each XCD (`d65b654c8`). On HIP 7 (3 paired rounds) a8w4
+dsv4-pro T=4096 is 1255 -> 1141 us (even) and 1403 -> 1388 us (random). Output
+bit-identical in 72/72 cells. Table:
+`bench_out/gluon_moe_regression/gemm2/compare_a8w4pro_20261104_l3.md`.
+
 Remaining gap, largest first:
 
+- a8w4 dsv4-pro T=4096 (even routing) is 1.050x the tuned FlyDSL stage 2 on HIP 7 at
+  `db1ba831e` (kernel code unchanged since; `ca7d68ae6` only renames the reduce in
+  traces) with the task's exact protocol (Gluon 1132.1 us, FlyDSL atomic 1078.1 us,
+  medians of 3 alternating rounds; per round 1.054, 1.046, 1.069). At `ee0de5558`
+  (same kernels): 1.042 (Gluon 1133.8 us, FlyDSL 1088.4 us). Gluon has measured
+  1132-1134 us in each session since `ad8958e72`; FlyDSL 1078-1088 us. At `ad8958e72`
+  (same kernels): 1.051 (Gluon 1133.5 us, FlyDSL 1078.2 us;
+  `compare_a8w4pro_20261104_l5.md`, with the 72-cell HIP 7 matrix of that commit).
+  `ad8958e72` streams the reduce_grouped rows (`.cg`) and widens its column block to
+  1024 (HIP 7: 0.986 even, 0.990 random; balanced order 0.979 / 0.988). At
+  `fded59f68` it was 1.058 (`compare_a8w4pro_20261104_l4.md`). The reduce tile is
+  read from the MOE-REDUCE config family since `374b6bcad` (same kernel for the
+  measured cells). Tenth pass, steady-state screen (2000 back-to-back calls, HIP 6,
+  repeat spread ~0.2%; a screen only, not acceptance timing) of the 512-column tile:
+  SCHED_MODE 1-4, WAIT_COMMIT_SCHEME 1/2/4, K_UNROLL 6, DS_READ_A_*_IN_MFMA,
+  tiles_per_warp [2,4], B scales via LDS, SOFF_UNROLL and SCALE_FILL_MID are all
+  within 0.3% of the current tile; GROUP_M 2 and SLOT_N 512 are +1%; BLOCK_N 1024
+  spills 697 VGPRs. A single-process HIP 6 run first showed SCHED_MODE 1 at -2.8%; it
+  did not reproduce. Eleventh pass: measured for the two-launch split only (8+6 N
+  tiles, `.wt` stores, whole waves): its GEMM2 costs +11 us over the whole call (the
+  column-chunk tile order, the `.wt` stores and the second launch together), and the
+  split is flat on HIP 7 with equal energy per call. Thirteenth pass, in-kernel
+  chunked reduce (prototype, not kept): one launch with grid [chunk 0 tiles][chunk 1
+  tiles][256 reduce CTAs]; chunk 1's CTAs reduce chunk 0 after their tile, the last CTAs
+  reduce chunk 1, gated by per-chunk tile counters (`.wt` stores, `s_waitcnt vmcnt(0)`,
+  barrier, relaxed agent-scope atomic; `.cv` loads). Output equal to b38920e09 in both
+  routings. Steady state (HIP 6, 2000 calls, 2 rounds): 1196 us vs 1041-1047 us for
+  the current two launches, +150 mJ per call; 6/10 chunk-0 N tiles 1240/1167 us, 512
+  reduce CTAs 1208 us. Cause: the reduce code runs at GEMM2's occupancy (512 VGPRs,
+  one CTA per CU), so each reducer holds a CU through latency-bound loads. Among the
+  kernels measured, the reduce is as fast as plain streaming (`l6/reduce_floor.py`,
+  HIP 6): 83.1 us for 352 MB in and 59 MB out (4.95 TB/s), torch's contiguous `sum`
+  over the same bytes 92.6 us, a 704 MB copy 147.3 us (4.8 TB/s); a footprint folded
+  into 59 MB (MALL-resident) is only 4 us faster (`l6/reduce_footprint.py`).
+  Fourteenth pass, diagnostics on HIP 6 with checked snapshots (`l6/diag14.sh`, record
+  `l6/diag14/`, HEAD ca7d68ae6; they do not decide criterion 1): in one protocol run
+  the GPU has no kernels for 146 ms before Gluon's first GEMM2 (Triton's JIT cache key
+  for the first Gluon launches), the warmup GEMM2 calls take 970-1228 us and the 20
+  timed ones average 1023.7 us (reduce 92.0 us). The same kernels give 1109-1127 us
+  plain and 1080-1086 us under cProfile (3 alternating pairs), so the protocol result
+  depends on host timing. A plain Triton read of 4.23 GB takes 791-878 us; GEMM2's
+  bytes (4.49 GB read, 352 MB written) at the measured rates take ~907 us, against
+  ~960 us steady state (rates of these kernels, not a proven limit). Standalone reduce
+  experiment (`diag14/reduce_layouts.out`): token-major rows with identity indices
+  77.8 us vs 82.5-83.3 us for today's gathered rows; the GEMM2 epilogue that would
+  write token-major rows is not built. Fifteenth pass, two CTAs per CU (not kept;
+  `l6/w2_probe.txt`, `l6/w2c_screen.txt`): at `WAVES_PER_EU` 2 both tiles must fit 256
+  registers; the 512-column half tile spills (650 VGPRs), and the one spill-free form
+  (128 x 128 tile in 2 passes, 64 x 256 half tile) is +10.5% at steady state (HIP 5,
+  1177 vs 1061-1066 us, +120 mJ): A is read for 28 N tiles per expert instead of 14.
+  The B payload loads already stream (`sc0 nt`) and A loads are cached. The
+  bf16 store's row-segment length (128-512 B per instruction) makes no difference,
+  nor does `global_store` in place of `buffer_store`. Twelfth pass (HIP 7 kernel trace,
+  `l2/kt_fly_both_h7/`): FlyDSL's atomic kernel 1076.7 us, its row-storing kernel of the
+  same tile 1124.1 us plus `moe_reduction` 92.4 us. Gluon's row-storing GEMM2 is faster
+  than FlyDSL's; the gap is the deterministic combine (rows stored + reduce) against
+  FlyDSL's atomic one, which costs it 47 us less than storing rows and needs no reduce. An earlier
+  table that screened FlyDSL's reduce candidate too gave 1.077. Seventh pass, not kept:
+  a tile-contiguous B weight copy (bit-exact, no change) and other result/weight cache
+  policies (GEMM2 slower, reduce unchanged). Gluon's GEMM2 kernel alone now takes about
+  as long as FlyDSL's whole stage 2; the separate reduce (~100 us) is the difference.
+  Eighth pass: the deterministic chunked reduce (GEMM2 + reduce per column chunk, `.wt`
+  stores, the chunk read back from MALL) is bit-exact and cuts the reduce by 30%, but
+  paired on HIP 7 it is 0.995 (flat) and its energy per call equals the whole call's;
+  not kept. Energy per call at the cap: GEMM2 1031 mJ, reduce 105 mJ; the intermediate
+  store is ~9% of the call (not DRAM: a MALL-resident window costs the same), B HBM
+  traffic ~2.4%. Stores straight from the accumulator layout are 11% slower. The reduce
+  candidate (BLOCK_N 1024, 2 warps, `.cg` loads) was confirmed with balanced order on
+  HIP 7 and kept in `ad8958e72` (above). Sixth pass (`compare_a8w4pro_20261104_l3.md`): the GPU
+  runs at its 1000 W cap during these calls (GFX clock ~1.1 GHz of 2.2), so a call's time
+  follows its energy, and removing stalls alone does not help: a persistent kernel that
+  issues the next tile's prologue before the store is bit-exact and uses 4% fewer cycles
+  on a traced CU but is 2.5-4% slower. Both backends are timed inside a power transient
+  (a spike at calls 4-6, then ~30 calls to settle); Gluon's protocol window sits in the
+  spike. Diagnostics: no store at all -88 us, but a store into a MALL-resident 50 MB
+  window costs the same as the real store, so the store cost is not HBM traffic. Not
+  kept: 7 column chunks (the protocol gain is the GPU cooling between launches; steady
+  state +2.5%, random +8%), chunk orders and layouts in one launch, reduce launch shapes
+  (within 1%), deeper B rings, 8 warps. The separate reduce (~100 us) is the largest
+  part of the bit-exact design that FlyDSL's atomic epilogue does not pay. The energy
+  measurement and the separate-launch chunked reduce were done in the eighth pass (above).
+  The in-kernel chunked reduce was built and measured in the thirteenth pass (above):
+  +15% at steady state. The text below is the state before round 8. These are
+  results of the variants tested so far, not a proven limit. In them, most of the gap
+  sits in the deterministic epilogue: removing the intermediate store takes the GEMM2
+  kernel from ~1096 to 956 us (HIP 2), and the separate reduce adds ~100 us. A
+  memory-only probe of the same traffic (256 persistent programs, no MFMA, HIP 3) takes
+  811 us for B + A + B scales and ~995 us with the 352 MB bf16 store. FlyDSL instead adds
+  into the 59 MB output with atomics, which the bit-exact rule excludes. Measured and not
+  kept (screens on HIP 2/3, the HIP 7 ones marked): XCD-local tile order (-0.5%), a
+  persistent loop (HIP 7: -0.9% even, +1.4% random), 8 warps at 2 waves/SIMD (HIP 7:
+  +0.9% even, +4.1% random,
+  +3-6% on the a8w4 block_m 64 cells), streaming hints in `_reduce_grouped` (reduce
+  -11 us in the pipeline, GEMM2 +7 us; HIP 7: 1.002/0.992), a 2-way column split so
+  each intermediate half stays in MALL (reduce 2x36 us, net -0.8% with `.wt` stores),
+  and the pipeline knobs (SCHED_MODE, WAIT_COMMIT_SCHEME, DS_READ_IN_MFMA, K_UNROLL,
+  B_NUM_BUFFER, SCALE_SLOT_K, SOFF_UNROLL: all within +-1% or slower). Output sha256
+  equal to the base was checked for the persistent loop, the 8-warp, XCD-order,
+  SOFF_UNROLL and SCALE_SLOT_K configs and the column split; the reduce hints were
+  checked bit-exact standalone; the env knob sweep was timing only. Diagnostic only, not
+  a candidate: a tile-contiguous B copy read with a timing hack that loads the wrong
+  bytes (-1.6% on HIP 2), so it says nothing about a correct implementation. Third pass:
+  the round-5 last-producer in-kernel combine (bit-exact, on its own tree 6e9ee75f5)
+  measured 1.163x (even) and 1.193x (random) against the separate reduce at this cell
+  (HIP 3); a half-height tile at occupancy 3 spills 8-147 VGPRs in every tested layout
+  (occupancy 2 without spills: -2% with half tiles only, but the full tile does not fit);
+  8 warps with compiler warp pipelining spills; overlapping one column half's reduce with
+  the next half's GEMM2 on a second stream is slower than running them in sequence.
+  Diagnostic attribution (wrong-data hacks, HIP 3): B scales ~16 us, A rows ~31 us of the
+  GEMM2. Not built: the fixed-role ordered combine (slot 5 waits for slots 0-4); it keeps
+  the publication costs round 5 measured as dominant. Fourth pass: FlyDSL's own tuned
+  tile with its non-atomic `reduce` epilogue (rows stored, then `moe_reduction`) takes
+  1215.6 us against 1092.3 us atomic on HIP 7 (3 alternating rounds); Gluon (1244.9 us
+  in the same rounds) is 1.024x that deterministic FlyDSL path and 1.140x the atomic one.
+  Diagnostic only: fly_tune.py validates that path by cosine >= 0.999, not bit identity,
+  and it does not bound a bit-exact Gluon kernel; criterion 1 stays the atomic kernel.
+  Implemented and measured, not kept: a dynamic persistent GEMM2 for the half class (256
+  CTAs fetch tiles from a self-resetting device counter, no padded CTAs; bit-exact; HIP 3
+  GEMM2 -25 us even, HIP 7 paired 1.000 even / 1.007 random) and half-height tiles only
+  (bit-exact; slower: the doubled grid's empty CTAs cost ~60 us at one CTA per CU).
+  Diagnostics: twice the MFMA work adds 160-260 us (the MFMAs are mostly exposed at one
+  wave per SIMD); launching only the real tiles saves ~20 us on HIP 3. Fifth pass: the
+  one-A-fragment pipeline (DS-read each A slot in the last pane that multiplies it, in
+  its MFMA region) is bit-exact, cuts the half-height tile's AGPRs 73 -> 44 and brings an
+  occupancy-3 tile to 1-2 spilled VGPRs (`TRITON_HIP_AGPR_ALLOC=64`), but HIP 7 paired
+  3 rounds give 1.009 even / 1.011 random in the half class (not kept); the occupancy-3
+  tile was no faster on HIP 3 either. HIP 3 screens have not transferred to HIP 7 three
+  times (8 warps, dynamic persistent, one A fragment): screen on HIP 7 directly. The
+  2-way column split with `.wt` stores (each half's intermediate read back from MALL) is
+  bit-exact and flat on HIP 7: 1.000 even, 1.006 random (3 alternating rounds). No
+  remaining candidate has a positive HIP 7 measurement. Data, probes and the per-variant
+  tables:
+  `bench_out/gluon_moe_regression/gemm2/compare_a8w4pro_20261104_l2.md`.
 - a8w4 dsv4-flash T=16384 is 1.095x FlyDSL, close to the 1.10 limit. The GEMM (~1245
   us) is faster than FlyDSL's whole stage 2 (1355 us, a tuned atomic kernel), but the
   separate deterministic reduce adds ~237 us at ~4.6 TB/s. No reduce launch shape, a

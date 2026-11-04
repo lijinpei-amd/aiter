@@ -159,11 +159,14 @@ In MOE dispatch tables, flag:
 - Triton keys (`BLOCK_SIZE_N`, `num_stages`) in a Gluon file, or Gluon keys
   (`block_n`, `num_buffers`, `persistent_iters`) in a Triton file.
 - In a gfx950 Gluon GEMM2 family (`a4w4_gemm2`, `a8w4_gemm2`, `a8w8_gemm2`):
-  a key other than `bm<block_m>_any`, `bm<block_m>_small` and
-  `bm<block_m>_multi`; a `_small` or `_multi` entry without the `_any` entry
-  of its `block_m`; a `_small` or `_multi` entry that repeats a key of `_any`
-  with the same value; a merged entry with `"ALLOW_B_VIA_LDS": false` and
-  without `"B_PRESHUFFLED": true`.
+  a key other than `bm<block_m>_any`, `bm<block_m>_small`,
+  `bm<block_m>_multi`, `bm<block_m>_half` and `bm<block_m>_half_tile`; a
+  `_small`, `_multi` or `_half` entry without the `_any` entry of its
+  `block_m`; a `_small`, `_multi` or `_half` entry that repeats a key of `_any`
+  with the same value; a `_half_tile` entry without the `_half` entry of its
+  `block_m`, or that repeats a key of `bm<block_m / 2>_any` with the same value;
+  a merged entry with `"ALLOW_B_VIA_LDS": false` and without
+  `"B_PRESHUFFLED": true`.
 - In a gfx950 Gluon GEMM1 family (`a8w4_gemm1`): a key other than
   `bm<block_m>_any` and `bm<block_m>_half`; a `_half` entry without the `_any`
   entry of its `block_m`; a merged entry with `"ALLOW_B_VIA_LDS": false` and
@@ -171,9 +174,14 @@ In MOE dispatch tables, flag:
   `HALF_M_TILE` and `result_cache_modifier` (the block_m 128 entries only ask
   for the half-height tile and its result policy).
 
-Do not flag a GEMM2 `_small` or `_multi` entry that has only a few keys. The
-launch merges it over `bm<block_m>_any`: `_small` for a small launch grid,
-else `_multi` when the experts average two or more M blocks.
+Do not flag a GEMM2 `_small`, `_multi` or `_half` entry that has only a few
+keys. The launch merges at most one of them over `bm<block_m>_any`, in this
+order: `_small` for a small launch grid, else `_multi` when the experts
+average two or more M blocks, else `_half` when they average at most half an
+M block. `"HALF_M_TILE": true` gives a launch its half-height tile only in a
+`_half` launch; that tile uses the `bm<block_m / 2>` entries and
+`bm<block_m>_half_tile` on top. Its `BLOCK_N` can be a whole multiple of the
+launch's.
 
 ## Configs: Python code
 

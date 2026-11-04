@@ -15,6 +15,7 @@ _reduce_grouped_repr = make_kernel_repr(
         "SWIGLU_ADD_RESIDUAL",
         "USE_TDM",
         "HAS_EXT_RESIDUAL",
+        "X_CACHE_MODIFIER",
     ],
 )
 
@@ -119,6 +120,7 @@ def _reduce_grouped(
     stride_extres_m: tl.uint64,
     stride_extres_n,
     HAS_EXT_RESIDUAL: tl.constexpr,
+    X_CACHE_MODIFIER: tl.constexpr,
 ):
     pid = tl.program_id(0)
     pid_t = pid // num_blocks
@@ -171,9 +173,14 @@ def _reduce_grouped(
                 else:
                     x_row_ptr = XPtrs + indxs[i] * stride_xm + b * stride_xb
                     if EVEN_N:
-                        vals = tl.load(x_row_ptr)
+                        vals = tl.load(x_row_ptr, cache_modifier=X_CACHE_MODIFIER)
                     else:
-                        vals = tl.load(x_row_ptr, mask=x_n_mask, other=0.0)
+                        vals = tl.load(
+                            x_row_ptr,
+                            mask=x_n_mask,
+                            other=0.0,
+                            cache_modifier=X_CACHE_MODIFIER,
+                        )
                 vals = vals.to(tl.float32)
                 curr += vals
 

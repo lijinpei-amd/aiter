@@ -262,6 +262,9 @@ class KernelLayout:
     output_block_n: gl.constexpr
     epilogue_threads: gl.constexpr
     epilogue_inputs_via_lds: gl.constexpr
+    #: Async copies that stage the bias in LDS: 2 at 2 values per thread (a copy moves
+    #: 32 or 128 bits per thread), else 1.
+    epilogue_bias_copies: gl.constexpr
     epilogue_input_lds_layout: gl.constexpr
     epilogue_gamma_shape: gl.constexpr
     epilogue_gamma_buffer_load_lds_layout: gl.constexpr
@@ -637,8 +640,10 @@ class KernelLayout:
         epilogue_inputs_via_lds = (
             epilogue_threads >= BM
             and BN % epilogue_threads == 0
-            and epilogue_bias_per_thread in (1, 4)
+            and epilogue_bias_per_thread in (1, 2, 4)
         )
+        # A copy moves 32 or 128 bits per thread, so 2 bias values per thread take 2.
+        epilogue_bias_copies = 2 if epilogue_bias_per_thread == 2 else 1
         epilogue_input_lds_layout = gl.SwizzledSharedLayout(
             vec=1, per_phase=1, max_phase=1, order=[0]
         )
@@ -651,7 +656,10 @@ class KernelLayout:
                 [1], [WARP_SIZE], [num_warps], [0]
             )
             epilogue_bias_buffer_load_lds_layout = gl.BlockedLayout(
-                [epilogue_bias_per_thread], [WARP_SIZE], [num_warps], [0]
+                [epilogue_bias_per_thread // epilogue_bias_copies],
+                [WARP_SIZE],
+                [num_warps],
+                [0],
             )
         gu_split = fc.weight_gu_hbm_layout.value == WeightGuHbmLayout.SPLIT
         quant_staging_rows = BM if gu_split else SLOT_M
@@ -718,6 +726,7 @@ class KernelLayout:
         self.output_block_n = gl.constexpr(output_block_n)
         self.epilogue_threads = gl.constexpr(epilogue_threads)
         self.epilogue_inputs_via_lds = gl.constexpr(epilogue_inputs_via_lds)
+        self.epilogue_bias_copies = gl.constexpr(epilogue_bias_copies)
         self.epilogue_input_lds_layout = gl.constexpr(epilogue_input_lds_layout)
         self.epilogue_gamma_shape = gl.constexpr(epilogue_gamma_shape)
         self.epilogue_gamma_buffer_load_lds_layout = gl.constexpr(

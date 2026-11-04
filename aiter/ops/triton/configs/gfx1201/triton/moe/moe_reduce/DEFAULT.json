@@ -1,0 +1,7 @@
+{
+    "default": {
+        "BLOCK_N": 512,
+        "num_warps": 2,
+        "X_CACHE_MODIFIER": ""
+    }
+}

@@ -221,9 +221,17 @@ there is no file. Do not change the returned dict.
 | `A8W4` | `gluon` | `bm<block_m>_n<N>_k<K>_<bucket>`, then `bm<block_m>_any` | `block_n`, `block_k`, `num_buffers`, `num_warps`, `persistent_iters` |
 | `A4W4` | `gluon` | `bm<block_m>_n<N>_k<K>_<bucket>`, then `bm<block_m>_any` | `block_n`, `block_k`, `num_buffers`, `num_warps` |
 | `A8W4-GEMM1` | `gluon` (gfx950) | `bm<block_m>_any`, optional `bm<block_m>_half` | block_m 16/32: the same keys as the `*-GEMM2` families; block_m 128: `HALF_M_TILE`, `result_cache_modifier` |
-| `A4W4-GEMM2`, `A8W4-GEMM2`, `A8W8-GEMM2` | `gluon` (gfx950) | `bm<block_m>_any`, optional `bm<block_m>_small` and `bm<block_m>_multi` | keys of the gfx950 Gluon MoE tuning config, e.g. `BLOCK_N`, `BLOCK_K`, `SLOT_M`, `SLOT_N`, `mfma_instr_shape`, `warps_per_cta`, `tiles_per_warp`, `NUM_LDS_BUFFER`, `K_UNROLL`, `VGPR_PREFETCH_K`, `WAVES_PER_EU`, `WAIT_COMMIT_SCHEME`, `SOFF_UNROLL`, `GROUP_M`, `B_SCALE_SHUFFLED`, `B_PRESHUFFLED`, `ALLOW_B_VIA_LDS` |
+| `A4W4-GEMM2`, `A8W4-GEMM2`, `A8W8-GEMM2` | `gluon` (gfx950) | `bm<block_m>_any`, optional `bm<block_m>_small`, `bm<block_m>_multi`, `bm<block_m>_half` and `bm<block_m>_half_tile` | keys of the gfx950 Gluon MoE tuning config, e.g. `BLOCK_N`, `BLOCK_K`, `SLOT_M`, `SLOT_N`, `mfma_instr_shape`, `warps_per_cta`, `tiles_per_warp`, `NUM_LDS_BUFFER`, `K_UNROLL`, `VGPR_PREFETCH_K`, `WAVES_PER_EU`, `WAIT_COMMIT_SCHEME`, `SOFF_UNROLL`, `GROUP_M`, `TILE_SCHED`, `HALF_M_TILE`, `result_cache_modifier`, `B_SCALE_SHUFFLED`, `B_PRESHUFFLED`, `ALLOW_B_VIA_LDS` |
+| `MOE-REDUCE` | `triton` | `default`, optional `grouped_combine` | `BLOCK_N`, `num_warps`, `X_CACHE_MODIFIER` |
 
-- `block_m` is the key. Do not put `BLOCK_SIZE_M` or `block_m` in an entry.
+- `block_m` is the key of the GEMM families. Do not put `BLOCK_SIZE_M` or
+  `block_m` in an entry.
+- `MOE-REDUCE` sets the `_reduce_grouped` launch of `reduce_grouped`
+  (`moe/reduce.py::_reduce_tile`). Every arch's file has a `default` entry, and
+  every entry has all three keys; there is no Python fallback. An optional
+  `grouped_combine` entry (gfx950 only, measured) replaces it for the top-k
+  combine of a grouped GEMM: rows gathered by `indx`, one split-K partial, no
+  activation, no residual and no validity mask.
 - `<bucket>` comes from `m2bucket()`: `tiny` (M ≤ 8), `small` (M ≤ 32),
   `medium` (M ≤ 128), `medium2` (M ≤ 256), `large` (M ≤ 512) and `xlarge`
   (M > 512). Give each new Gluon shape all six buckets. A missing bucket
@@ -260,13 +268,28 @@ there is no file. Do not change the returned dict.
   An `AITER_TRITON_MOE_GLUON_*` variable that sets a ladder key wins over the
   entry (`_FAMILY_ENV`). For example, `AITER_TRITON_MOE_GLUON_ALLOW_B_VIA_LDS=1`
   reads B from LDS and makes no preshuffled copy.
-  A `bm<block_m>_small` or `bm<block_m>_multi` entry lists only the keys it
-  changes on top of `bm<block_m>_any`. The launch applies `bm<block_m>_small`
-  when the launch grid is small (`small_grid` in `moe_op_gemm_gluon_config.py`:
-  fewer than 512 CTAs at 128-column N tiles, in practice one token). Else it
-  applies `bm<block_m>_multi` when the experts average two or more M blocks
-  (`_multi_block` in `moe_op_gemm_gluon.py`: M ≥ 2 · block_m · E). A small grid
-  never takes `_multi`.
+  A `bm<block_m>_small`, `bm<block_m>_multi` or `bm<block_m>_half` entry lists
+  only the keys it changes on top of `bm<block_m>_any`. The launch applies
+  `bm<block_m>_small` when the launch grid is small (`small_grid` in
+  `moe_op_gemm_gluon_config.py`: fewer than 512 CTAs at 128-column N tiles, in
+  practice one token). Else it applies `bm<block_m>_multi` when the experts
+  average two or more M blocks (`_multi_block` in `moe_op_gemm_gluon.py`:
+  M ≥ 2 · block_m · E), and `bm<block_m>_half` when they average at most half
+  an M block (`_half_block`: 2 · M ≤ block_m · E). This is where the routing
+  raised `block_m` for an exact mean, and nearly every expert has one M block.
+  An entry with `"HALF_M_TILE": true` gives a `_half` launch a second tile,
+  `block_m / 2` rows high. A CTA whose M block holds at most `block_m / 2` rows
+  runs that tile, with the config the launch gets at `block_m / 2` (the
+  `bm<block_m / 2>` entries) and the optional `bm<block_m>_half_tile` entry on
+  top. That entry lists only the keys it changes on top of `bm<block_m / 2>_any`.
+  Other launches keep one tile, also when
+  `AITER_TRITON_MOE_GLUON_HALF_M_TILE=1`: a second code path changes the code
+  of the first. The two tiles must have the same `warps_per_cta`,
+  `WAVES_PER_EU` and operand layouts (`B_PRESHUFFLED`, `B_SCALE_SHUFFLED`,
+  `A_SCALE_SORTED_SHUFFLED`), and the `BLOCK_N` of the half-height tile must be
+  a whole multiple of the launch's; else the launch has only the `block_m` tile
+  (`_gemm2_half_m_config` in `moe_op_gemm_gluon_config.py`). A wider half-height
+  tile sets the N grid, and the `block_m` tile covers its N block in passes.
 
 ## Conv
 

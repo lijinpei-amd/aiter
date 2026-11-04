@@ -277,10 +277,18 @@ def _moe_gluon_gemm2(
     CFG_TUNING: gl.constexpr,
     CFG_N: gl.constexpr,
     CFG_K: gl.constexpr,
+    CFG_TUNING_HALF: gl.constexpr = None,
 ):
-    """gemm2: X @ W2 + bias, multiplied by the router combine weight (gammas)."""
+    """gemm2: X @ W2 + bias, multiplied by the router combine weight (gammas).
+
+    ``CFG_TUNING_HALF`` is the half-height tile's ``TuningSpec``, or None.
+    """
     func_cfg = KernelFuncConfig(*constexpr_fields(CFG_FUNC))
     tuning_cfg = KernelTuningConfig(func_cfg, *constexpr_fields(CFG_TUNING))
+    if require_constexpr(CFG_TUNING_HALF is not None):
+        half_cfg = KernelTuningConfig(func_cfg, *constexpr_fields(CFG_TUNING_HALF))
+    else:
+        half_cfg: gl.constexpr = None
     _moe_gemm_body(
         QuantTokenTensor(
             A_DTYPE_QUANT,
@@ -339,4 +347,5 @@ def _moe_gluon_gemm2(
         CFG_N,
         CFG_K,
         NUM_K,
+        half_cfg,
     )

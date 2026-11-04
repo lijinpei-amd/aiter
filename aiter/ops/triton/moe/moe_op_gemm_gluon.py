@@ -67,6 +67,8 @@ from aiter.ops.triton.moe.moe_op_gemm_gluon_config import (
     _default_launch_config,
     _env_int,
     _gemm1_half_m_config,
+    _family_env_keys,
+    _gemm2_half_m_config,
     _hashable,
     _pipeline_error,
     _probe_lds_bytes,
@@ -336,9 +338,21 @@ def _launch_spec(
         f"config BLOCK_M {c['BLOCK_M']} must match routing block_m {block_m}"
     )
     half_items = None
-    if act is not None and half_block:
+    if half_block and act is not None:
         half_items = _gemm1_half_m_config(
             _cfg_key(c), block_m, N, K, dq_a, dq_b, small_grid
+        )
+    elif half_block:
+        half_items = _gemm2_half_m_config(
+            _cfg_key(c),
+            block_m,
+            N,
+            K,
+            dq_a,
+            dq_b,
+            small_grid,
+            multi_block,
+            _family_env_keys(),
         )
     # The flag tells the kernel that it gets a half-height tile.
     c = dict(c, HALF_M_TILE=half_items is not None)
@@ -384,6 +398,9 @@ def _launch_spec(
         half_cfg_host = KernelTuningConfig(func_cfg_host, *half_spec)
         validate_buffer_counts(half_cfg_host)
         constexpr_args += (gl.constexpr(half_spec),)
+        # A wider half-height tile sets the N grid (GEMM2, see _gemm2_half_m_config;
+        # GEMM1's has the same BLOCK_N).
+        grid_n = _cval(KernelLayout(half_cfg_host).grid_N(N))
     num_warps = c["warps_per_cta"][0] * c["warps_per_cta"][1]
     return (
         grid_n,

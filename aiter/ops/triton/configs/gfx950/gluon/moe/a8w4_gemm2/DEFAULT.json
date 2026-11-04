@@ -38,7 +38,11 @@
         "GROUP_M": 8,
         "B_SCALE_SHUFFLED": true,
         "B_PRESHUFFLED": true,
-        "ALLOW_B_VIA_LDS": false
+        "ALLOW_B_VIA_LDS": false,
+        "result_cache_modifier": ".cs"
+    },
+    "bm64_half": {
+        "TILE_SCHED": 0
     },
     "bm128_any": {
         "BLOCK_N": 256,
@@ -68,6 +72,17 @@
         "B_PRESHUFFLED": true,
         "ALLOW_B_VIA_LDS": false,
         "ALLOW_B_SCALE_VIA_LDS": false
+    },
+    "bm128_half": {
+        "HALF_M_TILE": true,
+        "GROUP_M": 1,
+        "result_cache_modifier": ".cs"
+    },
+    "bm128_half_tile": {
+        "BLOCK_N": 512,
+        "SLOT_N": 256,
+        "BLOCK_K": 128,
+        "VGPR_PREFETCH_K": 128
     },
     "bm128_multi": {
         "result_cache_modifier": ".cs",

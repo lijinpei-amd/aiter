@@ -170,10 +170,14 @@ def _get_config(M: int, N: int, K: int):
 MOE tables use `bm<block_m>` keys and are read with `get_moe_dispatch()`. The
 gfx950 Gluon MoE GEMM2 families (`configs/gfx950/gluon/moe/{a4w4,a8w4,a8w8}_gemm2/`)
 have a `bm<block_m>_any` entry for each `block_m`. An optional
-`bm<block_m>_small` or `bm<block_m>_multi` entry lists only the keys that it
-changes, and the launch merges it over `bm<block_m>_any`. A small launch grid
-takes `_small`. Other launches take `_multi` when the experts average two or
-more M blocks. All other launches take `_any` alone. The GEMM1 family
+`bm<block_m>_small`, `bm<block_m>_multi` or `bm<block_m>_half` entry lists only
+the keys that it changes, and the launch merges it over `bm<block_m>_any`. A
+small launch grid takes `_small`. Other launches take `_multi` when the experts
+average two or more M blocks, and `_half` when they average at most half an M
+block. All other launches take `_any` alone. An optional
+`bm<block_m>_half_tile` entry tunes the half-height tile of a `_half` launch.
+The `MOE-REDUCE` family tunes the top-k combine of `reduce_grouped`.
+The GEMM1 family
 `configs/gfx950/gluon/moe/a8w4_gemm1/` has full-tile `bm<block_m>_any` entries for
 block_m 16 and 32, and block_m 128 entries that only ask for the half-height tile
 (`bm128_any`) and set its result policy (`bm128_half`, taken when the experts

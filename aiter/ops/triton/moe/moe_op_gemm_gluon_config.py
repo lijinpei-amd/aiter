@@ -716,8 +716,9 @@ def get_gluon_config_uncached(
                 _env_int("AITER_TRITON_MOE_GLUON_SCALE_FILL_MID", 0)
             ),
             "UNROLL_EPILOGUE": True,
-            # GEMM1: run an M block that holds at most BLOCK_M / 2 rows on the
-            # block_m / 2 config (_gemm1_half_m_config).
+            # Run an M block that holds at most BLOCK_M / 2 rows on a half-height tile:
+            # GEMM1 the block_m / 2 config (_gemm1_half_m_config), GEMM2 the family's
+            # bm<BLOCK_M / 2> config (_gemm2_half_m_config).
             "HALF_M_TILE": bool(_env_int("AITER_TRITON_MOE_GLUON_HALF_M_TILE", 0)),
             # Read the complete BLOCK_K payload stage into registers one pipeline step
             # before its MFMAs consume it. The pipeline requires this
@@ -793,8 +794,10 @@ _FAMILY_ENV = {
             "ALLOW_B_SCALE_VIA_LDS",
             "ALLOW_B_VIA_LDS",
             "GROUP_M",
+            "HALF_M_TILE",
             "K_UNROLL",
             "SOFF_UNROLL",
+            "TILE_SCHED",
             "VGPR_PREFETCH_K",
             "WAIT_COMMIT_SCHEME",
             "WAVES_PER_EU",
@@ -869,16 +872,21 @@ def _family_env_keys() -> tuple:
     )
 
 
+def _family_entry(family, block_m, name) -> dict:
+    """The ``family`` entry ``bm<block_m>_<name>``, empty when the family has none. A
+    copy, with JSON lists as the tuples the config uses."""
+    table = get_moe_dispatch(family, get_arch(), "gluon")
+    return {k: _hashable(v) for k, v in table.get(f"bm{block_m}_{name}", {}).items()}
+
+
 def _family_tuned(family, block_m, grid) -> dict:
     """The ``family`` entry for ``block_m`` (empty when it has none):
-    ``bm<block_m>_any``, overlaid by ``bm<block_m>_<grid>`` ("small" or "multi") when
-    the family has that entry. A copy, with JSON lists as the tuples the config uses."""
-    table = get_moe_dispatch(family, get_arch(), "gluon")
-    entry = {
-        **table.get(f"bm{block_m}_any", {}),
-        **table.get(f"bm{block_m}_{grid}", {}),
+    ``bm<block_m>_any``, overlaid by ``bm<block_m>_<grid>`` ("small", "multi" or
+    "half") when the family has that entry."""
+    return {
+        **_family_entry(family, block_m, "any"),
+        **_family_entry(family, block_m, grid),
     }
-    return {k: _hashable(v) for k, v in entry.items()}
 
 
 @cache
@@ -940,6 +948,60 @@ def _family_launch_config(
     return key
 
 
+@cache
+def _gemm2_half_m_config(
+    cfg_items: tuple,
+    block_m,
+    N,
+    K,
+    dq_a,
+    dq_b,
+    small_grid,
+    multi_block,
+    env_keys: tuple = (),
+):
+    """The half-height tile of a GEMM2 launch whose config is ``cfg_items``, as sorted
+    config items, or None when the launch has none.
+
+    The tile is the ``_default_launch_config`` of ``block_m / 2`` for the same launch,
+    with the family's ``bm<block_m>_half_tile`` entry on top. ``env_keys`` (see
+    :func:`_family_env_keys`) keep their value. The tile must use the launch's warps,
+    waves per EU and operand copies, and a ``BLOCK_N`` that is a whole multiple of the
+    launch's; else the launch has no half-height tile. A wider tile sets the N grid,
+    and the full tile then covers its N block in passes.
+    """
+    cfg = dict(cfg_items)
+    if not cfg.get("HALF_M_TILE") or block_m // 2 not in _SUPPORTED_BLOCK_M:
+        return None
+    half = dict(
+        _default_launch_config(
+            block_m // 2,
+            N,
+            K,
+            dq_a,
+            dq_b,
+            small_grid,
+            False,
+            multi_block=multi_block,
+        ),
+        HALF_M_TILE=False,
+    )
+    if (dq_a, dq_b) in _GEMM2_FAMILIES:
+        tile = _family_entry(_GEMM2_FAMILIES[(dq_a, dq_b)], block_m, "half_tile")
+        half.update((k, v) for k, v in tile.items() if k not in env_keys)
+    shared = (
+        "warps_per_cta",
+        "WAVES_PER_EU",
+        "A_SCALE_SORTED_SHUFFLED",
+        "B_SCALE_SHUFFLED",
+        "B_PRESHUFFLED",
+    )
+    if half["BLOCK_N"] % cfg["BLOCK_N"] or any(half[key] != cfg[key] for key in shared):
+        return None
+    items = _cfg_key(half)
+    return None if _launch_error(items, dq_a, dq_b, N, K) else items
+
+
 def _default_launch_config(
     block_m,
     N,
@@ -956,15 +1018,14 @@ def _default_launch_config(
     """Share automatic stage-specific geometry with the capability check.
 
     ``multi_block``: the experts average at least two M blocks (see the host's
-    ``_multi_block``); with ``small_grid`` it picks GEMM2's grid class, "small",
-    "multi" or "any".
+    ``_multi_block``). ``half_block``: they average at most half an M block (the
+    host's ``_half_block``); GEMM1 then also takes its family's ``bm<block_m>_half``
+    entry. With ``small_grid`` they pick GEMM2's grid class, "small", "multi", "half"
+    or "any", in this order.
 
     ``direct_b``: the launch must read the weights and scales directly (see the host's
     ``_reads_b_directly``: graph capture, inference or padded tensors). It then keeps
     the ladder; the family entries read copies that the host makes and checks.
-
-    ``half_block``: the experts average at most half an M block (see the host's
-    ``_half_block``); GEMM1 then also takes its family's ``bm<block_m>_half`` entry.
     """
     small_grid = bool(small_grid)
     ladder, env_keys = _get_gluon_config_cached(
@@ -978,7 +1039,12 @@ def _default_launch_config(
     )
     if not apply_swiglu and not direct_b and (dq_a, dq_b) in _GEMM2_FAMILIES:
         # Every override below needs apply_swiglu, so none applies to GEMM2.
-        grid = "small" if small_grid else "multi" if multi_block else "any"
+        if small_grid:
+            grid = "small"
+        elif multi_block:
+            grid = "multi"
+        else:
+            grid = "half" if half_block else "any"
         family = _GEMM2_FAMILIES[(dq_a, dq_b)]
         ladder = _family_launch_config(
             ladder, family, block_m, N, K, dq_a, dq_b, env_keys, grid
