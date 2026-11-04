@@ -115,8 +115,19 @@ Remaining gap, largest first:
   did not reproduce. Eleventh pass: measured for the two-launch split only (8+6 N
   tiles, `.wt` stores, whole waves): its GEMM2 costs +11 us over the whole call (the
   column-chunk tile order, the `.wt` stores and the second launch together), and the
-  split is flat on HIP 7 with equal energy per call. A persistent in-kernel chunked
-  reduce is not built; this measurement does not bound it. The
+  split is flat on HIP 7 with equal energy per call. Thirteenth pass, in-kernel
+  chunked reduce (prototype, not kept): one launch with grid [chunk 0 tiles][chunk 1
+  tiles][256 reduce CTAs]; chunk 1's CTAs reduce chunk 0 after their tile, the last CTAs
+  reduce chunk 1, gated by per-chunk tile counters (`.wt` stores, `s_waitcnt vmcnt(0)`,
+  barrier, relaxed agent-scope atomic; `.cv` loads). Output equal to b38920e09 in both
+  routings. Steady state (HIP 6, 2000 calls, 2 rounds): 1196 us vs 1041-1047 us for
+  the current two launches, +150 mJ per call; 6/10 chunk-0 N tiles 1240/1167 us, 512
+  reduce CTAs 1208 us. Cause: the reduce code runs at GEMM2's occupancy (512 VGPRs,
+  one CTA per CU), so each reducer holds a CU through latency-bound loads. The reduce
+  is at its bandwidth floor (`l6/reduce_floor.py`, HIP 6): 83.1 us for 352 MB in and
+  59 MB out (4.95 TB/s), torch's contiguous `sum` over the same bytes 92.6 us, a 704 MB
+  copy 147.3 us (4.8 TB/s); a footprint folded into 59 MB (MALL-resident) is only
+  4 us faster (`l6/reduce_footprint.py`). The
   bf16 store's row-segment length (128-512 B per instruction) makes no difference,
   nor does `global_store` in place of `buffer_store`. Twelfth pass (HIP 7 kernel trace,
   `l2/kt_fly_both_h7/`): FlyDSL's atomic kernel 1076.7 us, its row-storing kernel of the
@@ -147,9 +158,8 @@ Remaining gap, largest first:
   (within 1%), deeper B rings, 8 warps. The separate reduce (~100 us) is the largest
   part of the bit-exact design that FlyDSL's atomic epilogue does not pay. The energy
   measurement and the separate-launch chunked reduce were done in the eighth pass (above).
-  An in-kernel chunked reduce (the reduce of each column chunk inside the persistent
-  GEMM2, gated by a per-chunk done counter) is not built; the separate-launch result
-  does not bound it. The text below is the state before round 8. These are
+  The in-kernel chunked reduce was built and measured in the thirteenth pass (above):
+  +15% at steady state. The text below is the state before round 8. These are
   results of the variants tested so far, not a proven limit. In them, most of the gap
   sits in the deterministic epilogue: removing the intermediate store takes the GEMM2
   kernel from ~1096 to 956 us (HIP 2), and the separate reduce adds ~100 us. A
