@@ -352,6 +352,13 @@ fresh-process pairs: 0.954 (even, HIP 1), 0.939 (random, HIP 0); dsv4-pro T=1024
 level. The block_m 64 half tile now lists its waves per EU, B path and B-scale policy,
 which it took from the block_m 32 config.
 
+Checked 2026-11-05 at `e60515009` (all GEMM1 family changes above) against
+`5faf66be5`: the September cold harness (`cold_bench.sh`, 20 cells, base and head in
+one lock on HIP 1) has every Gluon cell within 1% (-0.28% to +0.83%). GEMM1 and GEMM2
+output sha256 are identical in all 72 cells under even and random routing. Set `TMPDIR`
+to a directory on `/raid` for the suite and the cold harness: `/tmp` is on the shared
+root file system, and when it is full the units fail with `Errno 28` or a bus error.
+
 Remaining:
 
 - The benchmark (`bench_moe_gemm_gluon.py::_run_one`) passes `scatter_indx` to
