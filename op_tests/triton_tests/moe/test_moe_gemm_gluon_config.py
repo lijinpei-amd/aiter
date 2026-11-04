@@ -617,10 +617,12 @@ def test_gemm1_without_an_entry_keeps_the_ladder(gemm1_tables):
 
 
 def test_gemm1_entry_that_cannot_launch_keeps_the_ladder(gemm1_tables):
-    # Register B on plain weights is rejected by the launch, so the ladder stays.
+    # Register B on plain weights is rejected by the launch, so the ladder stays,
+    # with the launch keys of the entry on top.
     gemm1_tables["A8W4-GEMM1"]["bm32_any"]["B_PRESHUFFLED"] = False
-    assert conf._default_launch_config(*_GEMM1_ARGS) == conf.get_gluon_config(
-        *_GEMM1_ARGS[:5]
+    assert conf._default_launch_config(*_GEMM1_ARGS) == dict(
+        conf.get_gluon_config(*_GEMM1_ARGS[:5]),
+        **conf._gemm1_tuned(*_GEMM1_ARGS[:1], *_GEMM1_ARGS[3:5]),
     )
 
 

@@ -50,7 +50,20 @@
         "B_SCALE_SHUFFLED": true,
         "B_PRESHUFFLED": true,
         "ALLOW_B_VIA_LDS": false,
-        "expert_scale_cache_modifier": ""
+        "expert_scale_cache_modifier": "",
+        "HALF_M_TILE": true
+    },
+    "bm32_half": {
+        "result_cache_modifier": ".cs"
+    },
+    "bm32_half_tile": {
+        "BLOCK_N": 256,
+        "SLOT_N": 128,
+        "tiles_per_warp": [
+            1,
+            2
+        ],
+        "WAVES_PER_EU": 2
     },
     "bm64_any": {
         "HALF_M_TILE": true

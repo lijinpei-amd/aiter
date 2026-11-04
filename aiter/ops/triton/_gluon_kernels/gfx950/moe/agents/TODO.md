@@ -410,6 +410,12 @@ fresh-process pairs, median head / base, even (HIP 1) / random (HIP 5): a4w4
 glm52-base 0.934 / 0.956, minimax-m3 0.987 / 0.962; a8w4 0.840 / 0.939, 0.889 /
 0.949; a8w8 0.832 / 0.877, 0.861 / 0.845. Output bit-identical in all 72 cells.
 
+Done 2026-11-04: the block_m 32 launches at a mean of 16 rows (dsv4-pro T=1024) take
+the tile too, a block_m 16 tile with the launch's BLOCK_N 256 and waves per EU
+(`bm32_any`, `bm32_half` `.cs`, `bm32_half_tile`). 4 fresh-process pairs against the
+launch without it, even (HIP 5) / random (HIP 6): a4w4 0.989 / 1.003, a8w4 0.987 /
+0.986, a8w8 0.972 / 0.993. The block_m 16 launches cannot have one (no block_m 8).
+
 Remaining: merge with GEMM2's half-height tile (`../aiter-gemm2-a8w4`, 8e8fd5457):
 same field and kernel split; GEMM2 asserts raw A scales, GEMM1 addresses sorted A
 scales at `2 * pid_m`.

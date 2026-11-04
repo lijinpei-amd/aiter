@@ -5,11 +5,11 @@
 
 With ``HALF_M_TILE``, an M block that holds at most ``BLOCK_M / 2`` rows runs a
 second tile, ``BLOCK_M / 2`` rows high. Its rows must be bit-identical to the rows
-that the full tile computes. The routings here give block_m 128 (a mean of exactly
-64 rows, experts with 0, 1, 64, 65, 126 and 150 rows) and block_m 64 (a mean of
-exactly 32 rows, experts with 0, 1, 32, 33, 62 and 75 rows), so both tiles run in one
-launch, and the second block of the largest expert takes the half-height tile at
-``block_id`` 1. The GEMM1 family of each dtype pair asks for the tile at both block_m.
+that the full tile computes. The routings here give block_m 128, 64 and 32 (a mean of
+exactly block_m / 2 rows; experts with 0, 1, block_m / 2, block_m / 2 + 1, block_m - 2
+and more than block_m rows), so both tiles run in one launch, and the second block of
+the largest expert takes the half-height tile at ``block_id`` 1. The GEMM1 family of
+each dtype pair asks for the tile at each of them.
 """
 
 import os
@@ -37,6 +37,7 @@ N, K, EXPERTS = 2048, 3584, 33
 ROWS = {
     128: (0, 1, 64, 65, 126, 150) + (64,) * 5 + (63,) * 22,
     64: (0, 1, 32, 33, 62, 75) + (32,) * 16 + (31,) * 11,
+    32: (0, 1, 16, 17, 30, 40) + (16,) * 19 + (15,) * 8,
 }
 _FP8, _FP4 = torch.float8_e4m3fn, torch.uint8
 #: op -> (public wrapper, activation storage, weight storage)
@@ -167,8 +168,9 @@ def test_half_m_tile_rows_match_the_full_tile(op, block_m, cases, clean_env, lau
     _clear_config_caches()
     half = _gemm1(op, case)
     assert launches[1][:2] == (True, block_m // 2)
-    # Both launches read the same A scales; for MX activations, the sorted ones.
-    assert launches[0][2] == launches[1][2] == ScaleSwizzle.SORTED_SHUFFLED
+    # Both launches read the same A scales: at block_m 64 and 128, the sorted ones.
+    assert launches[0][2] == launches[1][2]
+    assert (launches[0][2] == ScaleSwizzle.SORTED_SHUFFLED) == (block_m >= 64)
     assert torch.equal(half, full)
 
     ref = _reference(op, case)
@@ -220,17 +222,17 @@ def _a8w4_gemm1_config(block_m, half_block=False):
     return _gemm1_config("a8w4", block_m, half_block)
 
 
-@pytest.mark.parametrize("block_m", [64, 128])
+@pytest.mark.parametrize("block_m", [32, 64, 128])
 @pytest.mark.parametrize("op", sorted(_OPS))
 def test_gemm1_family_sets_the_half_m_tile(op, block_m, clean_env):
-    # Each GEMM1 family asks for the tile at block_m 64 and 128, and streams the
+    # Each GEMM1 family asks for the tile at block_m 32, 64 and 128, and streams the
     # result of a launch whose experts average at most half an M block.
     family = conf._GEMM1_FAMILIES[_DTYPES[op]]
     entry = conf.get_moe_dispatch(family, conf.get_arch(), "gluon")
     assert entry[f"bm{block_m}_any"]["HALF_M_TILE"] is True
     assert entry[f"bm{block_m}_half"] == {"result_cache_modifier": ".cs"}
-    # The block_m 16/32 entries are full tiles and do not ask for the half tile.
-    assert not any("HALF_M_TILE" in entry[f"bm{bm}_any"] for bm in (16, 32))
+    # There is no block_m 8 tile.
+    assert "HALF_M_TILE" not in entry["bm16_any"]
     assert _gemm1_config(op, block_m)["HALF_M_TILE"] is True
     assert _gemm1_config(op, block_m)["result_cache_modifier"] == ""
     launch = _gemm1_config(op, block_m, half_block=True)
