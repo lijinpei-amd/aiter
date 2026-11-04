@@ -108,9 +108,13 @@ Remaining gap, largest first:
   paired on HIP 7 it is 0.995 (flat) and its energy per call equals the whole call's;
   not kept. Energy per call at the cap: GEMM2 1031 mJ, reduce 105 mJ; the intermediate
   store is ~9% of the call (not DRAM: a MALL-resident window costs the same), B HBM
-  traffic ~2.4%. Stores straight from the accumulator layout are 11% slower. Open small
-  candidate: reduce BLOCK_N 1024, 2 warps, `.cg` loads (-1.2% whole call, HIP 6 steady
-  state; pair it on HIP 7). Sixth pass (`compare_a8w4pro_20261104_l3.md`): the GPU
+  traffic ~2.4%. Stores straight from the accumulator layout are 11% slower. Small
+  candidate, inconclusive: reduce BLOCK_N 1024, 2 warps, `.cg` loads (-1.2% whole call,
+  HIP 6 steady state). HIP 7 pairings (`l2/redh7_{max,rand}.csv`, `l2/redh7b.csv`, the
+  reduce env-gated in `wt_rd`): even 0.975, 0.986, 0.980 and then 0.997, 1.004, 0.990
+  (6 rounds, median 0.985); random 0.994, 0.981, 0.994. Remaining confirmation: the
+  production form in both run orders on HIP 7, both routings, plus the Triton cells
+  (the reduce is shared with the Triton path). Sixth pass (`compare_a8w4pro_20261104_l3.md`): the GPU
   runs at its 1000 W cap during these calls (GFX clock ~1.1 GHz of 2.2), so a call's time
   follows its energy, and removing stalls alone does not help: a persistent kernel that
   issues the next tile's prologue before the store is bit-exact and uses 4% fewer cycles
@@ -121,12 +125,11 @@ Remaining gap, largest first:
   kept: 7 column chunks (the protocol gain is the GPU cooling between launches; steady
   state +2.5%, random +8%), chunk orders and layouts in one launch, reduce launch shapes
   (within 1%), deeper B rings, 8 warps. The separate reduce (~100 us) is the largest
-  part of the bit-exact design that FlyDSL's atomic epilogue does not pay. Next
-  experiment: read the amd-smi energy counter per call for the GEMM2 and the reduce
-  separately, then run the reduce of each column chunk inside the persistent GEMM2
-  (per-XCD tile counters exist in `l2/po3_persistent_overlap_prototype.patch`), gated by
-  a per-chunk done counter, so the chunk's intermediate is read back while it is in
-  MALL. The text below is the state before round 8. These are
+  part of the bit-exact design that FlyDSL's atomic epilogue does not pay. The energy
+  measurement and the separate-launch chunked reduce were done in the eighth pass (above).
+  An in-kernel chunked reduce (the reduce of each column chunk inside the persistent
+  GEMM2, gated by a per-chunk done counter) is not built; the separate-launch result
+  does not bound it. The text below is the state before round 8. These are
   results of the variants tested so far, not a proven limit. In them, most of the gap
   sits in the deterministic epilogue: removing the intermediate store takes the GEMM2
   kernel from ~1096 to 956 us (HIP 2), and the separate reduce adds ~100 us. A
