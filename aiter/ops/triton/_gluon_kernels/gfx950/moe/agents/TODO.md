@@ -93,6 +93,24 @@ dsv4-pro T=4096 is 1255 -> 1141 us (even) and 1403 -> 1388 us (random). Output
 bit-identical in 72/72 cells. Table:
 `bench_out/gluon_moe_regression/gemm2/compare_a8w4pro_20261104_l3.md`.
 
+Done 2026-11-04 (prefill generalization of rounds 6-8): the half-block recipe runs in
+every family. a4w4 and a8w8 `bm128_half` (dsv4-pro T=4096) take the 512-column
+half-height tile in XCD order, one M block at a time, with `.cs` stores (a8w8: BLOCK_K
+128 in that tile). The `bm64_half` class (glm52-base and minimax-m3 T=1024, a mean of
+exactly 32 rows) gets a 32-row half-height tile (`bm64_half_tile`, WAVES_PER_EU 1), the
+linear tile order and `.cs` stores; the tile is 512 columns wide for a8w4 only. Every
+block_m 32 launch (T=1024 of dsv4-flash and dsv4-pro) streams its result in the linear
+order, and a8w8 streams the result of every block_m 128 launch. HIP 7 / HIP 1, 3 paired
+rounds against 946f4a07f, new/old even / random: a4w4 dsv4-pro T4096 0.796 / 0.916,
+a8w8 0.847 / 0.934; the bm64 half cells 0.83-0.93 / 0.89-0.95; block_m 32 cells
+0.97-1.00 / 0.97-0.99; a8w8 T4096 any 0.975-0.998 / 0.930-0.976. Output bit-identical.
+Not kept, measured: a 16-row half-height tile at `bm32_half` (0.990-0.999); `.cs` on
+a4w4 and a8w4 `bm128_any` (1.00-1.05); a 512-column 32-row tile for a4w4 (slower under
+random routing) and a8w8 (spills 29-35 VGPRs); the XCD order at block_m 64 (slower
+under random routing); per-shape `reduce_grouped` tiles (512/2048 columns, 1/4 warps,
+no load hint: within 1.5% of the current tile at every prefill shape, no hint +12% at
+T=16384). Table: `bench_out/gluon_moe_regression/gemm2/gemm2_prefill_generalize.md`.
+
 Remaining gap, largest first:
 
 - a8w4 dsv4-pro T=4096 (even routing) is 1.050x the tuned FlyDSL stage 2 on HIP 7 at
@@ -228,6 +246,16 @@ Remaining gap, largest first:
   remaining candidate has a positive HIP 7 measurement. Data, probes and the per-variant
   tables:
   `bench_out/gluon_moe_regression/gemm2/compare_a8w4pro_20261104_l2.md`.
+- Prefill cells of the other families after the generalization (estimates from the
+  2026-11-04 reference and A/B; the same-lock table is in
+  `gemm2_prefill_generalize.md`): glm52-base T=1024 stays ~1.14-1.18x FlyDSL in all
+  three dtypes. Its GEMM2 kernel alone is ~1.09x FlyDSL's whole stage 2, while
+  minimax-m3 T=1024 (the same class and 32-row tile, K 3072 against 2048) is at parity:
+  with 8 BLOCK_K steps the prologue and the store weigh more, and at WAVES_PER_EU 1 (the
+  two tiles must share it) no second CTA hides them. dsv4-flash T=1024 (block_m 32, not
+  a half launch) is ~1.07-1.10x, its GEMM2 alone ~1.04x. Elsewhere the remaining gap is
+  the separate reduce (2-17% of the call): a4w4 minimax-m3 T=4096 ~1.13x, GEMM2 alone
+  1.02x.
 - a8w4 dsv4-flash T=16384 is 1.095x FlyDSL, close to the 1.10 limit. The GEMM (~1245
   us) is faster than FlyDSL's whole stage 2 (1355 us, a tuned atomic kernel), but the
   separate deterministic reduce adds ~237 us at ~4.6 TB/s. No reduce launch shape, a
