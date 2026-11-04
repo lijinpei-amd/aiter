@@ -117,7 +117,11 @@ Remaining gap, largest first:
   store policy cost the GEMM2 +11 us, which an in-kernel version keeps, so it could
   only save the launch gaps (separate launches: flat on HIP 7, equal energy). The
   bf16 store's row-segment length (128-512 B per instruction) makes no difference,
-  nor does `global_store` in place of `buffer_store`. An earlier
+  nor does `global_store` in place of `buffer_store`. Twelfth pass (HIP 7 kernel trace,
+  `l2/kt_fly_both_h7/`): FlyDSL's atomic kernel 1076.7 us, its row-storing kernel of the
+  same tile 1124.1 us plus `moe_reduction` 92.4 us. Gluon's row-storing GEMM2 is faster
+  than FlyDSL's; the gap is the deterministic combine (rows stored + reduce) against
+  FlyDSL's atomic one, which costs it 47 us less than storing rows and needs no reduce. An earlier
   table that screened FlyDSL's reduce candidate too gave 1.077. Seventh pass, not kept:
   a tile-contiguous B weight copy (bit-exact, no change) and other result/weight cache
   policies (GEMM2 slower, reduce unchanged). Gluon's GEMM2 kernel alone now takes about
