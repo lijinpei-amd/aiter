@@ -75,7 +75,7 @@
     },
     "bm128_half": {
         "HALF_M_TILE": true,
-        "TILE_SCHED": 0,
+        "GROUP_M": 1,
         "result_cache_modifier": ".cs"
     },
     "bm128_half_tile": {
