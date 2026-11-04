@@ -65,8 +65,8 @@ def test_small_block_m_mxfp8_mxfp4_gemm1_reads_b_from_registers(block_m, N, K):
     [
         {"small_grid": True},
         {"apply_swiglu": False},
-        # MXFP8 weights: no A8W8-GEMM1 tile at block_m 16.
-        {"dq_b": DtypeQuant.MXFP8, "block_m": 16},
+        # MXFP8 weights at N 6144 / K 6144: A8W8-GEMM1 keeps the ladder there.
+        {"dq_b": DtypeQuant.MXFP8, "block_m": 16, "N": 6144, "K": 6144},
         {"block_m": 64},
         {"N": 2880},
         {"N": 4096, "K": 7168},
@@ -102,6 +102,7 @@ def test_small_block_m_mxfp8_mxfp4_gemm1_register_b_is_narrow(overrides):
     [
         (DtypeQuant.MXFP4, DtypeQuant.MXFP4, 16),
         (DtypeQuant.MXFP4, DtypeQuant.MXFP4, 32),
+        (DtypeQuant.MXFP8, DtypeQuant.MXFP8, 16),
         (DtypeQuant.MXFP8, DtypeQuant.MXFP8, 32),
     ],
 )
@@ -111,6 +112,15 @@ def test_small_block_m_gemm1_families_read_b_from_registers(dq_a, dq_b, block_m)
     assert not config["ALLOW_B_VIA_LDS"] and config["B_PRESHUFFLED"]
     assert config["B_SCALE_SHUFFLED"] and config["BLOCK_K"] == 256
     assert config["BLOCK_N"] == (128 if block_m == 16 else 256)
+
+
+def test_a8w8_block_m_16_keeps_the_ladder_at_n_6144_k_6144():
+    # minimax-m3 T=32 was 2.5% slower with the A8W8-GEMM1 block_m 16 tile.
+    args = (16, 6144, 6144, DtypeQuant.MXFP8, DtypeQuant.MXFP8, False)
+    config = conf._default_launch_config(*args, True)
+    assert config == dict(
+        conf.get_gluon_config(*args), **conf._gemm1_tuned(16, *args[3:5])
+    )
 
 
 @pytest.fixture

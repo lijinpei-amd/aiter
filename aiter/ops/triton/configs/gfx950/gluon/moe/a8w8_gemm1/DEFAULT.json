@@ -1,5 +1,31 @@
 {
-    "bm16_any": {},
+    "bm16_any": {
+        "BLOCK_N": 128,
+        "BLOCK_K": 256,
+        "SLOT_M": 16,
+        "SLOT_N": 64,
+        "mfma_instr_shape": [
+            16,
+            16,
+            128
+        ],
+        "warps_per_cta": [
+            1,
+            4
+        ],
+        "tiles_per_warp": [
+            1,
+            1
+        ],
+        "NUM_LDS_BUFFER": 3,
+        "K_UNROLL": 3,
+        "VGPR_PREFETCH_K": 256,
+        "B_SCALE_SHUFFLED": true,
+        "B_PRESHUFFLED": true,
+        "ALLOW_B_VIA_LDS": false,
+        "WAVES_PER_EU": 1
+    },
+    "bm16_n6144_k6144_any": {},
     "bm32_any": {
         "BLOCK_N": 256,
         "BLOCK_K": 256,
@@ -54,7 +80,8 @@
         "B_SCALE_SHUFFLED": true,
         "B_PRESHUFFLED": true,
         "ALLOW_B_VIA_LDS": false,
-        "WAVES_PER_EU": 1
+        "WAVES_PER_EU": 1,
+        "expert_scale_cache_modifier": ""
     },
     "bm64_any": {
         "BLOCK_N": 256,

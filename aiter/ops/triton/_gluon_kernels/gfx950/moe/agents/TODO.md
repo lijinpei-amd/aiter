@@ -310,6 +310,12 @@ median head / base, even (HIP 1) / random (HIP 0): T=8 and T=32 0.739-0.811 /
 0.747-0.815, dsv4-flash T=1024 0.731 / 0.730, dsv4-pro T=1024 0.816 / 0.823. Output
 bit-identical in all 72 cells.
 
+Done 2026-11-04 (round 1): `A8W8-GEMM1` `bm16_any`, the a8w4 block_m 16 tile at one
+wave per SIMD, with `bm16_n6144_k6144_any` empty (minimax-m3 keeps the ladder). 4
+fresh-process pairs, median candidate / base, even (HIP 3) / random (HIP 6): T=8
+dsv4-flash 0.971 / 0.941, dsv4-pro 0.993 / 0.962, glm52-base 0.971 / 0.992; T=32
+dsv4-flash 0.968 / 0.942, dsv4-pro 1.012 / 1.002, glm52-base 1.013 / 0.975.
+
 Done 2026-11-04: `A8W8-GEMM1` `bm32_any`, the a8w4 block_m 32 tile at one wave per
 SIMD (at two waves per SIMD it is 8-15% slower than the ladder). dsv4-flash T=1024, 4
 fresh-process pairs: 0.954 (even, HIP 1), 0.939 (random, HIP 0); dsv4-pro T=1024 is
@@ -327,9 +333,8 @@ Remaining:
   T=1024 1.009, glm52-base T=32 1.020, dsv4-flash T=32 1.028, minimax-m3 T=8 1.040,
   dsv4-flash T=8 1.071. FlyDSL wins with tile_m 16 at dsv4-pro T=1024 (16 rows per
   expert; the router gives block_m 32) and with a K split across waves at T=8.
-- a8w8 at block_m 16 takes the ladder: the A8W4-GEMM1 tile and its variants (one
-  wave per SIMD, BLOCK_N 256) were 0.95-1.02 of it in an 8-cell screen, with no
-  variant faster in every cell.
+- a8w8 minimax-m3 (N 6144, K 6144) at block_m 16 takes the ladder: with the
+  A8W8-GEMM1 tile T=32 was 2.5% slower (even routing, 4/4 pairs), T=8 2% faster.
 - The older GEMM1 overrides in `_default_launch_config` (block_m 64 and 128, the
   September-shape tiles) still hold tuning values in Python. Move them into GEMM1
   families as `A8W4-GEMM1` does; check that the effective configs do not change.
