@@ -168,11 +168,15 @@ In MOE dispatch tables, flag:
   a merged entry with `"ALLOW_B_VIA_LDS": false` and without
   `"B_PRESHUFFLED": true`.
 - In a gfx950 Gluon GEMM1 family (`a4w4_gemm1`, `a8w4_gemm1`, `a8w8_gemm1`): a
-  key other than `bm<block_m>_any`, `bm<block_m>_half` and `bm<block_m>_half_tile`;
-  a `_half` or `_half_tile` entry without the `_any` entry of its `block_m`; a
-  merged entry with `"ALLOW_B_VIA_LDS": false` and without `"B_PRESHUFFLED": true`;
-  a `bm128_any` or `_half` key other than `HALF_M_TILE` and `result_cache_modifier`
-  (the launch keys: they ask for the half-height tile and set its result policy).
+  key other than `bm<block_m>_any`, `bm<block_m>_small`,
+  `bm<block_m>_n<N>_k<K>_any`, `bm<block_m>_n<N>_k<K>_small`, `bm<block_m>_half`
+  and `bm<block_m>_half_tile`; such an entry without the `_any` entry of its
+  `block_m`; an entry with `"ALLOW_B_VIA_LDS": false` and without
+  `"B_PRESHUFFLED": true`; a `bm128_any` or `_half` key other than `HALF_M_TILE`
+  and `result_cache_modifier` (the launch keys: they ask for the half-height tile
+  and set its result policy); a launch key in a `_small` or `_n<N>_k<K>_` entry.
+  Do not flag a GEMM1 `_small` or shape entry that repeats keys of `_any`: unlike
+  GEMM2, it lists the whole tile on top of the ladder.
 
 Do not flag a GEMM2 `_small`, `_multi` or `_half` entry that has only a few
 keys. The launch merges at most one of them over `bm<block_m>_any`, in this

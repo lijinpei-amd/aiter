@@ -4,6 +4,8 @@
 """CPU checks for the gfx950 Gluon MoE GEMM1 config families (``*-GEMM1``): the
 block_m 16/32 tiles, the launch keys and the half-height tile entries."""
 
+import re
+
 import pytest
 
 from aiter.ops.triton._gluon_kernels.gfx950.moe._layout import KernelLayout
@@ -131,20 +133,22 @@ _GEMM1_ARGS = (32, 4096, 4096, DtypeQuant.MXFP8, DtypeQuant.MXFP4, False, True)
 @pytest.mark.parametrize("family", sorted(conf._GEMM1_FAMILIES.values()))
 def test_gemm1_families_hold_tuning_values_only(family):
     table = get_moe_dispatch(family, "gfx950", "gluon")
-    # bm<block_m>_any entries, plus bm<block_m>_half and bm<block_m>_half_tile for the
-    # half-height tile: GEMM1 has no other grid classes.
+    # Tile entries bm<block_m>_any and _small, optionally for one N and K, and the
+    # half-height tile's bm<block_m>_half and bm<block_m>_half_tile.
     assert table
-    assert set(table) <= {
-        f"bm{bm}_{cls}"
-        for bm in conf._SUPPORTED_BLOCK_M
-        for cls in ("any", "half", "half_tile")
-    }
+    names = re.compile(
+        r"bm(16|32|64|128)_(any|small|half|half_tile|n[0-9]+_k[0-9]+_(any|small))"
+    )
     for name in table:
+        assert names.fullmatch(name), name
         assert name.split("_", 1)[0] + "_any" in table, name
-    # The launch keys: the block_m 128 tile is Python's, and _half sets launch keys.
     for name, entry in table.items():
+        # The block_m 128 tile is Python's, and _half sets launch keys.
         if name == "bm128_any" or name.endswith("_half"):
             assert set(entry) <= set(conf._GEMM1_ENV), name
+        # Launch keys come from _any and _half only.
+        if name.endswith("_small") or re.search(r"_n[0-9]+_k", name):
+            assert not set(entry) & set(conf._GEMM1_ENV), name
     known = set(
         conf.get_gluon_config_uncached(
             32, 4096, 4096, DtypeQuant.MXFP8, DtypeQuant.MXFP4
@@ -181,6 +185,65 @@ def test_gemm1_entry_that_cannot_launch_keeps_the_ladder(gemm1_tables):
 
 #: A launch with a half-height tile from its family's _half_tile entry: a8w8
 #: glm52-base T=1024 (block_m 64, a mean of 32 rows).
+#: A small-grid launch of the A8W4-GEMM1 family: dsv4-flash T=1 (block_m 16).
+_GEMM1_SMALL_ARGS = (16, 4096, 4096, DtypeQuant.MXFP8, DtypeQuant.MXFP4, True, True)
+
+
+def test_gemm1_small_grid_entry_overlays_the_ladder(gemm1_tables):
+    ladder = conf.get_gluon_config(*_GEMM1_SMALL_ARGS[:6])
+    table = gemm1_tables["A8W4-GEMM1"]
+    # Without a _small entry a small grid keeps the ladder, whatever _any holds.
+    table.pop("bm16_small", None)
+    assert conf._default_launch_config(*_GEMM1_SMALL_ARGS) == ladder
+    # A _small entry is the whole tile on top of the ladder; _any does not apply.
+    _clear_config_caches()
+    table["bm16_small"] = {"GROUP_M": 2}
+    assert conf._default_launch_config(*_GEMM1_SMALL_ARGS) == dict(ladder, GROUP_M=2)
+    # An entry for the launch's N and K replaces the generic one.
+    _clear_config_caches()
+    table["bm16_n4096_k4096_small"] = {"GROUP_M": 1}
+    assert conf._default_launch_config(*_GEMM1_SMALL_ARGS)["GROUP_M"] == 1
+    # An empty one keeps the ladder for that shape.
+    _clear_config_caches()
+    table["bm16_n4096_k4096_small"] = {}
+    assert conf._default_launch_config(*_GEMM1_SMALL_ARGS) == ladder
+
+
+def test_gemm1_shape_entry_replaces_the_any_entry(gemm1_tables):
+    tuned = conf._default_launch_config(*_GEMM1_ARGS)
+    table = gemm1_tables["A8W4-GEMM1"]
+    # An empty shape entry keeps the ladder for that N and K only.
+    _clear_config_caches()
+    table["bm32_n4096_k4096_any"] = {}
+    ladder = dict(
+        conf.get_gluon_config(*_GEMM1_ARGS[:5]),
+        **conf._gemm1_tuned(*_GEMM1_ARGS[:1], *_GEMM1_ARGS[3:5]),
+    )
+    assert conf._default_launch_config(*_GEMM1_ARGS) == ladder
+    other = (32, 6144, 7168) + _GEMM1_ARGS[3:]
+    assert conf._default_launch_config(*other)["BLOCK_N"] == tuned["BLOCK_N"]
+    # A shape entry lists the whole tile: it does not take bm32_any's keys.
+    _clear_config_caches()
+    table["bm32_n4096_k4096_any"] = dict(table["bm32_any"], GROUP_M=2)
+    del table["bm32_n4096_k4096_any"]["HALF_M_TILE"]
+    assert conf._default_launch_config(*_GEMM1_ARGS) == dict(tuned, GROUP_M=2)
+
+
+def test_gemm1_small_grid_entry_respects_environment_and_direct_b(
+    gemm1_tables, monkeypatch
+):
+    ladder = conf.get_gluon_config(*_GEMM1_SMALL_ARGS[:6])
+    gemm1_tables["A8W4-GEMM1"]["bm16_small"] = {"GROUP_M": 2, "WAVES_PER_EU": 2}
+    # A launch that reads the weights directly keeps the ladder.
+    direct = conf._default_launch_config(*_GEMM1_SMALL_ARGS, direct_b=True)
+    assert direct == ladder
+    # An AITER_TRITON_MOE_GLUON_* variable wins over the entry.
+    monkeypatch.setenv("AITER_TRITON_MOE_GLUON_WAVES_PER_EU", "1")
+    _clear_config_caches()
+    config = conf._default_launch_config(*_GEMM1_SMALL_ARGS)
+    assert (config["GROUP_M"], config["WAVES_PER_EU"]) == (2, 1)
+
+
 _GEMM1_HALF_ARGS = (64, 4096, 6144, DtypeQuant.MXFP8, DtypeQuant.MXFP8, False, True)
 
 

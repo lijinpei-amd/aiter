@@ -93,7 +93,7 @@ def test_other_launches_keep_the_existing_tuning_ladder(overrides):
         return
     if overrides == {"block_m": 64}:
         # The A8W8-GEMM1 family sets the block_m 64 tile (the block_m 128 geometry).
-        entry = conf._family_tuned("A8W8-GEMM1", 64, "any")
+        entry = conf._family_tuned("A8W8-GEMM1", ("bm64_any",))
         tile = {k: v for k, v in entry.items() if k not in conf._GEMM1_ENV}
         assert tile and {name: cfg[name] for name in tile} == tile
         return

@@ -646,7 +646,8 @@ def test_gemm2_small_block_m_reads_preshuffled_b(dq_a, dq_b, block_m, small_grid
     )
     ladder = conf.get_gluon_config(block_m, 7168, 3072, dq_a, dq_b, small_grid)
     tuned = conf._family_tuned(
-        conf._GEMM2_FAMILIES[(dq_a, dq_b)], block_m, "small" if small_grid else "any"
+        conf._GEMM2_FAMILIES[(dq_a, dq_b)],
+        conf._gemm2_tile_names(block_m, "small" if small_grid else "any"),
     )
     changed = {name for name in config if config[name] != ladder[name]}
     # Only the family entry changes the ladder: GEMM2 does not take GEMM1's `.cg` hint
@@ -770,7 +771,9 @@ def test_gemm2_multi_block_streams_the_result_and_caches_the_weights(dq_a, dq_b)
     scale = "" if dq_b == DtypeQuant.MXFP4 else ".cg"
     assert [multi[k] for k in modifiers] == [".cs", "", scale]
     # Other launches keep the bm128_any entry's result policy (a8w8 streams it too).
-    any_entry = conf._family_tuned(conf._GEMM2_FAMILIES[(dq_a, dq_b)], 128, "any")
+    any_entry = conf._family_tuned(
+        conf._GEMM2_FAMILIES[(dq_a, dq_b)], conf._gemm2_tile_names(128, "any")
+    )
     assert plain["result_cache_modifier"] == any_entry.get("result_cache_modifier", "")
     assert plain["expert_cache_modifier"]
     changed = {k for k in multi if multi[k] != plain[k]}
@@ -780,9 +783,10 @@ def test_gemm2_multi_block_streams_the_result_and_caches_the_weights(dq_a, dq_b)
 def test_gemm2_grid_entry_overlays_the_any_entry(gemm2_tables):
     # A grid entry lists only the keys it changes on top of bm<block_m>_any.
     gemm2_tables["A4W4-GEMM2"]["bm64_multi"] = {"GROUP_M": 2}
-    any_entry = conf._family_tuned("A4W4-GEMM2", 64, "any")
+    any_entry = conf._family_tuned("A4W4-GEMM2", conf._gemm2_tile_names(64, "any"))
     assert any_entry["GROUP_M"] != 2
-    assert conf._family_tuned("A4W4-GEMM2", 64, "multi") == dict(any_entry, GROUP_M=2)
+    multi = conf._family_tuned("A4W4-GEMM2", conf._gemm2_tile_names(64, "multi"))
+    assert multi == dict(any_entry, GROUP_M=2)
 
 
 @pytest.mark.parametrize(

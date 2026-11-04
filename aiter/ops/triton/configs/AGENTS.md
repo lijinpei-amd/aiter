@@ -220,7 +220,7 @@ there is no file. Do not change the returned dict.
 | `A8W4` | `triton` | `bm<block_m>_n<N>_k<K>` | `BLOCK_SIZE_N`, `BLOCK_SIZE_K`, `num_warps`, `num_stages`, `waves_per_eu`, `matrix_instr_nonkdim` |
 | `A8W4` | `gluon` | `bm<block_m>_n<N>_k<K>_<bucket>`, then `bm<block_m>_any` | `block_n`, `block_k`, `num_buffers`, `num_warps`, `persistent_iters` |
 | `A4W4` | `gluon` | `bm<block_m>_n<N>_k<K>_<bucket>`, then `bm<block_m>_any` | `block_n`, `block_k`, `num_buffers`, `num_warps` |
-| `A4W4-GEMM1`, `A8W4-GEMM1`, `A8W8-GEMM1` | `gluon` (gfx950) | `bm<block_m>_any`, optional `bm<block_m>_half` and `bm<block_m>_half_tile` | tile keys: the same keys as the `*-GEMM2` families; launch keys: `HALF_M_TILE`, `result_cache_modifier` |
+| `A4W4-GEMM1`, `A8W4-GEMM1`, `A8W8-GEMM1` | `gluon` (gfx950) | `bm<block_m>_any`; optional `bm<block_m>_small`, `bm<block_m>_n<N>_k<K>_any`, `bm<block_m>_n<N>_k<K>_small`, `bm<block_m>_half` and `bm<block_m>_half_tile` | tile keys: the same keys as the `*-GEMM2` families; launch keys: `HALF_M_TILE`, `result_cache_modifier` |
 | `A4W4-GEMM2`, `A8W4-GEMM2`, `A8W8-GEMM2` | `gluon` (gfx950) | `bm<block_m>_any`, optional `bm<block_m>_small`, `bm<block_m>_multi`, `bm<block_m>_half` and `bm<block_m>_half_tile` | keys of the gfx950 Gluon MoE tuning config, e.g. `BLOCK_N`, `BLOCK_K`, `SLOT_M`, `SLOT_N`, `mfma_instr_shape`, `warps_per_cta`, `tiles_per_warp`, `NUM_LDS_BUFFER`, `K_UNROLL`, `VGPR_PREFETCH_K`, `WAVES_PER_EU`, `WAIT_COMMIT_SCHEME`, `SOFF_UNROLL`, `GROUP_M`, `TILE_SCHED`, `HALF_M_TILE`, `result_cache_modifier`, `B_SCALE_SHUFFLED`, `B_PRESHUFFLED`, `ALLOW_B_VIA_LDS` |
 | `MOE-REDUCE` | `triton` | `default`, optional `grouped_combine` | `BLOCK_N`, `num_warps`, `X_CACHE_MODIFIER` |
 
@@ -238,21 +238,29 @@ there is no file. Do not change the returned dict.
   falls back to `bm<block_m>_any`.
 - Each Gluon file has a `bm<block_m>_any` entry for each `block_m`.
 - The `*-GEMM1` families tune the gfx950 Gluon MoE GEMM1 (the gate/up
-  projection with SwiGLU) for MX activations and weights. GEMM1 has no grid
-  classes. An entry has two kinds of keys:
-  - **Tile keys.** In a `bm<block_m>_any` entry they follow the `*-GEMM2` rules
-    below. The launch merges them over the ladder when the grid is not small, and
-    not at N 4096 with K 7168, which has a Python override. The Python overrides in
-    `_default_launch_config` set the tile at block_m 128, and at block_m 64 for
-    MXFP4 weights; there the entries hold no tile keys (`bm128_any` holds only
-    launch keys).
+  projection with SwiGLU) for MX activations and weights. An entry has two kinds
+  of keys:
+  - **Tile keys.** They follow the `*-GEMM2` rules below. A launch takes one tile
+    entry (`_gemm1_tile_names`): on a small grid (`small_grid`, see below)
+    `bm<block_m>_small`, else `bm<block_m>_any`; an entry
+    `bm<block_m>_n<N>_k<K>_small` or `bm<block_m>_n<N>_k<K>_any` replaces it for
+    that N and K. Unlike GEMM2, the small-grid entry is not merged over `_any`:
+    each entry lists the whole tile on top of the ladder, and a missing or empty
+    entry keeps the ladder. Use a shape entry only for a shape whose measured
+    result differs from the rest. The launch merges the entry over the ladder,
+    not at N 4096 with K 7168, which has a Python override. The Python overrides
+    in `_default_launch_config` set the tile at block_m 128, and at block_m 64
+    for MXFP4 weights; there the entries hold no tile keys (`bm128_any` holds
+    only launch keys).
   - **Launch keys**, the keys of `_GEMM1_ENV` (now `HALF_M_TILE` and
     `result_cache_modifier`). They apply on top of the tile of the launch, at
     every block_m. `"HALF_M_TILE": true` gives a launch a second tile,
     `block_m / 2` rows high, when the experts average at most `block_m / 2` rows
     (`_half_block` in `moe_op_gemm_gluon.py`: 2 · M ≤ block_m · E). An optional
     `bm<block_m>_half` entry lists only the launch keys it changes on top of
-    `bm<block_m>_any`; only such a launch takes it.
+    `bm<block_m>_any`; only such a launch takes it. Launch keys come from
+    `bm<block_m>_any` and `bm<block_m>_half` only, not from the other tile
+    entries.
   - An optional `bm<block_m>_half_tile` entry lists the tile keys of the
     half-height tile of a block_m launch, on top of the `block_m / 2` config. The
     Python code keeps the eligibility checks (`_gemm1_half_m_config`): the second

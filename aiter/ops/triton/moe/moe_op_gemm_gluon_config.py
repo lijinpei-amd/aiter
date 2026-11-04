@@ -896,14 +896,31 @@ def _family_entry(family, block_m, name) -> dict:
     return {k: _hashable(v) for k, v in table.get(f"bm{block_m}_{name}", {}).items()}
 
 
-def _family_tuned(family, block_m, grid) -> dict:
-    """The ``family`` entry for ``block_m`` (empty when it has none):
-    ``bm<block_m>_any``, overlaid by ``bm<block_m>_<grid>`` ("small", "multi" or
-    "half") when the family has that entry."""
-    return {
-        **_family_entry(family, block_m, "any"),
-        **_family_entry(family, block_m, grid),
-    }
+def _family_tuned(family, names: tuple) -> dict:
+    """The entries ``names`` of ``family`` merged in order (a missing one is empty). A
+    copy, with JSON lists as the tuples the config uses."""
+    table = get_moe_dispatch(family, get_arch(), "gluon")
+    entry = {}
+    for name in names:
+        entry.update(table.get(name, {}))
+    return {k: _hashable(v) for k, v in entry.items()}
+
+
+def _gemm2_tile_names(block_m, grid) -> tuple:
+    """A GEMM2 family's entries for a launch of grid class ``grid`` ("small", "multi",
+    "half" or "any"): ``bm<block_m>_any``, overlaid by ``bm<block_m>_<grid>``."""
+    return (f"bm{block_m}_any", f"bm{block_m}_{grid}")
+
+
+def _gemm1_tile_names(family, block_m, N, K, small_grid) -> tuple:
+    """A GEMM1 family's tile entry for a launch of grid class ``cls`` ("small" on a small
+    grid, else "any"): ``bm<block_m>_n<N>_k<K>_<cls>`` when the family has one, else
+    ``bm<block_m>_<cls>``. The entry overlays the ladder (a small-grid entry does not
+    take ``bm<block_m>_any``); a missing or empty one keeps the ladder."""
+    cls = "small" if small_grid else "any"
+    shape = f"bm{block_m}_n{N}_k{K}_{cls}"
+    table = get_moe_dispatch(family, get_arch(), "gluon")
+    return (shape if shape in table else f"bm{block_m}_{cls}",)
 
 
 @cache
@@ -928,17 +945,17 @@ def _launch_error(cfg_items: tuple, dq_a, dq_b, N, K):
 
 @cache
 def _family_launch_config(
-    ladder_items: tuple, family, block_m, N, K, dq_a, dq_b, env_keys: tuple, grid: str
+    ladder_items: tuple, family, names: tuple, N, K, dq_a, dq_b, env_keys: tuple
 ) -> tuple:
-    """The ladder with the tuned entry of ``family`` on top, as sorted config items.
-    ``env_keys`` are the ladder keys that the environment set (see
-    :func:`_family_env_keys`); they keep their ladder value. ``grid`` is the launch's
-    grid class (see :func:`_default_launch_config`).
+    """The ladder with the entries ``names`` of ``family`` on top (see
+    :func:`_family_tuned`), as sorted config items. ``env_keys`` are the ladder keys
+    that keep their ladder value: the ones the environment set (see
+    :func:`_family_env_keys`), and for GEMM1 the launch keys.
 
     The entry applies only where the launch can run the result as is; elsewhere the
     ladder stays. Memoised because ``gluon_supported`` asks for it on every launch.
     """
-    tuned = _family_tuned(family, block_m, grid)
+    tuned = _family_tuned(family, names)
     ladder = dict(ladder_items)
     new = dict(ladder, **tuned)
     new.update((key, ladder[key]) for key in env_keys)
@@ -1066,26 +1083,25 @@ def _default_launch_config(
         else:
             grid = "half" if half_block else "any"
         family = _GEMM2_FAMILIES[(dq_a, dq_b)]
+        names = _gemm2_tile_names(block_m, grid)
         ladder = _family_launch_config(
-            ladder, family, block_m, N, K, dq_a, dq_b, env_keys, grid
+            ladder, family, names, N, K, dq_a, dq_b, env_keys
         )
     if (
         apply_swiglu
         and not direct_b
-        and not small_grid
         and (dq_a, dq_b) in _GEMM1_FAMILIES
         and not (N == 4096 and K == 7168)
         and block_m < 128
     ):
-        # The GEMM1 entries were measured on large grids; the September shape keeps the
-        # block_m 32 override below (docs/perf_gemm1_a8w4_bm32.md). The launch keys
-        # (_GEMM1_ENV) keep their ladder value here: _gemm1_tuned applies them on top of
-        # the final tile, at every block_m.
+        # The September shape keeps the block_m 32 override below
+        # (docs/perf_gemm1_a8w4_bm32.md). The launch keys (_GEMM1_ENV) keep their
+        # ladder value here: _gemm1_tuned applies them on top of the final tile, at
+        # every block_m.
         family = _GEMM1_FAMILIES[(dq_a, dq_b)]
+        names = _gemm1_tile_names(family, block_m, N, K, small_grid)
         keep = env_keys + tuple(_GEMM1_ENV)
-        ladder = _family_launch_config(
-            ladder, family, block_m, N, K, dq_a, dq_b, keep, "any"
-        )
+        ladder = _family_launch_config(ladder, family, names, N, K, dq_a, dq_b, keep)
     c = dict(ladder)
     if (
         not small_grid
