@@ -310,6 +310,14 @@ median head / base, even (HIP 1) / random (HIP 0): T=8 and T=32 0.739-0.811 /
 0.747-0.815, dsv4-flash T=1024 0.731 / 0.730, dsv4-pro T=1024 0.816 / 0.823. Output
 bit-identical in all 72 cells.
 
+Done 2026-11-04 (round 1): T=1 (a small grid) takes the block_m 16 tiles through the
+new `bm16_small` entries (all three families; a8w8 at the ladder's waves per EU), and
+keeps the ladder at N 6144 / K 7168 (`bm16_n6144_k7168_small` empty: dsv4-pro was
+1.06-1.15x with the tile). 8 fresh-process pairs, median candidate / base, even (HIP
+5) / random (HIP 6): a4w4 dsv4-flash 0.957 / 0.855, glm52-base 0.939 / 0.889,
+minimax-m3 0.913 / 0.876; a8w4 1.004 / 0.950, 0.949 / 0.951, 0.940 / 0.915; a8w8
+0.911 / 0.888, 0.980 / 0.967, 0.927 / 0.907.
+
 Done 2026-11-04 (round 1): `A8W8-GEMM1` `bm16_any`, the a8w4 block_m 16 tile at one
 wave per SIMD, with `bm16_n6144_k6144_any` empty (minimax-m3 keeps the ladder). 4
 fresh-process pairs, median candidate / base, even (HIP 3) / random (HIP 6): T=8

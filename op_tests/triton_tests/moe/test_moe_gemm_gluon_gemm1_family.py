@@ -114,6 +114,27 @@ def test_small_block_m_gemm1_families_read_b_from_registers(dq_a, dq_b, block_m)
     assert config["BLOCK_N"] == (128 if block_m == 16 else 256)
 
 
+@pytest.mark.parametrize(
+    "dq_a,dq_b",
+    [
+        (DtypeQuant.MXFP4, DtypeQuant.MXFP4),
+        (DtypeQuant.MXFP8, DtypeQuant.MXFP4),
+        (DtypeQuant.MXFP8, DtypeQuant.MXFP8),
+    ],
+)
+def test_gemm1_small_grids_take_the_block_m_16_small_tile(dq_a, dq_b):
+    # T=1 (a small grid): the bm16_small tile, except at N 6144 / K 7168 (dsv4-pro),
+    # where the tile was 6-15% slower and the ladder stays.
+    tile = conf._default_launch_config(16, 4096, 4096, dq_a, dq_b, True, True)
+    assert not tile["ALLOW_B_VIA_LDS"] and tile["B_PRESHUFFLED"]
+    assert (tile["BLOCK_N"], tile["BLOCK_K"]) == (128, 256)
+    args = (16, 6144, 7168, dq_a, dq_b, True)
+    config = conf._default_launch_config(*args, True)
+    assert config == dict(
+        conf.get_gluon_config(*args), **conf._gemm1_tuned(16, *args[3:5])
+    )
+
+
 def test_a8w8_block_m_16_keeps_the_ladder_at_n_6144_k_6144():
     # minimax-m3 T=32 was 2.5% slower with the A8W8-GEMM1 block_m 16 tile.
     args = (16, 6144, 6144, DtypeQuant.MXFP8, DtypeQuant.MXFP8, False)

@@ -25,6 +25,33 @@
         "ALLOW_B_VIA_LDS": false,
         "expert_scale_cache_modifier": ""
     },
+    "bm16_small": {
+        "BLOCK_N": 128,
+        "BLOCK_K": 256,
+        "SLOT_M": 16,
+        "SLOT_N": 64,
+        "mfma_instr_shape": [
+            16,
+            16,
+            128
+        ],
+        "warps_per_cta": [
+            1,
+            4
+        ],
+        "tiles_per_warp": [
+            1,
+            1
+        ],
+        "NUM_LDS_BUFFER": 3,
+        "K_UNROLL": 3,
+        "VGPR_PREFETCH_K": 256,
+        "B_SCALE_SHUFFLED": true,
+        "B_PRESHUFFLED": true,
+        "ALLOW_B_VIA_LDS": false,
+        "expert_scale_cache_modifier": ""
+    },
+    "bm16_n6144_k7168_small": {},
     "bm32_any": {
         "BLOCK_N": 256,
         "BLOCK_K": 256,
