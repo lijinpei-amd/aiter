@@ -103,7 +103,14 @@ Remaining gap, largest first:
   a tile-contiguous B weight copy (bit-exact, no change) and other result/weight cache
   policies (GEMM2 slower, reduce unchanged). Gluon's GEMM2 kernel alone now takes about
   as long as FlyDSL's whole stage 2; the separate reduce (~100 us) is the difference.
-  Sixth pass (`compare_a8w4pro_20261104_l3.md`): the GPU
+  Eighth pass: the deterministic chunked reduce (GEMM2 + reduce per column chunk, `.wt`
+  stores, the chunk read back from MALL) is bit-exact and cuts the reduce by 30%, but
+  paired on HIP 7 it is 0.995 (flat) and its energy per call equals the whole call's;
+  not kept. Energy per call at the cap: GEMM2 1031 mJ, reduce 105 mJ; the intermediate
+  store is ~9% of the call (not DRAM: a MALL-resident window costs the same), B HBM
+  traffic ~2.4%. Stores straight from the accumulator layout are 11% slower. Open small
+  candidate: reduce BLOCK_N 1024, 2 warps, `.cg` loads (-1.2% whole call, HIP 6 steady
+  state; pair it on HIP 7). Sixth pass (`compare_a8w4pro_20261104_l3.md`): the GPU
   runs at its 1000 W cap during these calls (GFX clock ~1.1 GHz of 2.2), so a call's time
   follows its energy, and removing stalls alone does not help: a persistent kernel that
   issues the next tile's prologue before the store is bit-exact and uses 4% fewer cycles
