@@ -800,6 +800,7 @@ _FAMILY_ENV = {
             "GROUP_M",
             "HALF_M_TILE",
             "K_UNROLL",
+            "SCHED_MODE",
             "SOFF_UNROLL",
             "TILE_SCHED",
             "VGPR_PREFETCH_K",

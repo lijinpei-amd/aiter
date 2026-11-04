@@ -127,12 +127,13 @@
         "expert_scale_cache_modifier": ".cg"
     },
     "bm128_any": {
-        "HALF_M_TILE": true
-    },
-    "bm128_n4096_k6144_any": {
+        "HALF_M_TILE": true,
+        "SCHED_MODE": 4,
+        "DS_READ_A_PAYLOAD_IN_MFMA": true,
         "ALLOW_B_VIA_LDS": false,
         "B_PRESHUFFLED": true
     },
+    "bm128_n6144_k7168_any": {},
     "bm128_half": {
         "result_cache_modifier": ".cs"
     },

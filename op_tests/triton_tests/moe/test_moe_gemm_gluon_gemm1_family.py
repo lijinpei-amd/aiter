@@ -146,9 +146,11 @@ _A8W8 = (DtypeQuant.MXFP8, DtypeQuant.MXFP8)
         (64, 4096, 6144, _A4W4, True),
         (64, 6144, 6144, _A8W4, True),
         (64, 4096, 6144, _A8W8, True),
-        # block_m 128: a4w4 at glm52-base, a8w8 at glm52-base and minimax-m3.
+        # block_m 128: a4w4 except dsv4-pro, a8w8 at glm52-base and minimax-m3.
+        (128, 4096, 4096, _A4W4, True),
         (128, 4096, 6144, _A4W4, True),
-        (128, 6144, 6144, _A4W4, False),
+        (128, 6144, 6144, _A4W4, True),
+        (128, 6144, 7168, _A4W4, False),
         (128, 6144, 6144, _A8W8, True),
         (128, 4096, 4096, _A8W8, False),
         (128, 6144, 7168, _A8W8, False),
@@ -164,6 +166,24 @@ def test_gemm1_large_block_m_b_from_registers(block_m, N, K, dtypes, registers):
         conf._cfg_key(dict(config, HALF_M_TILE=True)), block_m, N, K, *dtypes, False
     )
     assert half is not None and dict(half)["ALLOW_B_VIA_LDS"]
+
+
+@pytest.mark.parametrize(
+    "N,K,scheduled", [(4096, 4096, True), (6144, 6144, True), (6144, 7168, False)]
+)
+def test_a4w4_block_m_128_interleaves_mfmas_with_the_a_reads(N, K, scheduled):
+    # The A8W4 block_m 128 schedule; dsv4-pro (N 6144, K 7168) keeps the Python tile.
+    args = (128, N, K, *_A4W4, False, True)
+    config = conf._default_launch_config(*args)
+    assert (config["SCHED_MODE"] == conf.SchedMode.MFMA_8) is scheduled
+    assert config["DS_READ_A_PAYLOAD_IN_MFMA"] is scheduled
+
+
+def test_a4w4_block_m_128_schedule_yields_to_the_environment(monkeypatch):
+    monkeypatch.setenv("AITER_TRITON_MOE_GLUON_SCHED_MODE", "0")
+    config = conf._default_launch_config(128, 4096, 4096, *_A4W4, False, True)
+    assert config["SCHED_MODE"] == conf.SchedMode.NONE
+    assert config["DS_READ_A_PAYLOAD_IN_MFMA"]
 
 
 def test_a8w8_block_m_16_keeps_the_ladder_at_n_6144_k_6144():

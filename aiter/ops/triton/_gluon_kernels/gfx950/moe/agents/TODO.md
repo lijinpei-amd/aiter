@@ -321,6 +321,17 @@ on dsv4-flash (T=4096 even 1.029) and dsv4-pro (1.064 in a screen). The half-hei
 tiles keep B through LDS (`bm128_half_tile`): with B in registers in both tiles the
 block_m 64 cells were 2-11% slower in a screen.
 
+Done 2026-11-04 (round 1): a4w4 block_m 128 takes the a8w4 block_m 128 schedule
+(`SCHED_MODE` MFMA_8, A's LDS reads in the MFMA region) with B in registers
+(`A4W4-GEMM1` `bm128_any`); dsv4-pro (N 6144, K 7168) keeps the Python tile
+(`bm128_n6144_k7168_any` empty). 4 fresh-process pairs against the round-1 tile,
+even (HIP 5) / random (HIP 2): T=4096 dsv4-flash 0.998 / 0.999, glm52-base 0.996 /
+0.980, minimax-m3 0.990 / 1.002; T=16384 0.978 / 0.977, 0.944 / 0.959, 0.949 /
+0.961. dsv4-pro was 1.051 at T=4096 even (its half-height tile launch) and 0.968 at
+T=16384; the schedule alone was 0.988-1.004 there. Not found at a8w8 block_m 128: the
+schedule 0.99-1.00, with B in registers 1.00-1.03, BLOCK_K 256 1.01-1.05 (screen).
+BLOCK_N 128 at a4w4 block_m 128 was 1.05-1.27x (screen).
+
 Done 2026-11-04 (round 1): T=1 (a small grid) takes the block_m 16 tiles through the
 new `bm16_small` entries (all three families; a8w8 at the ladder's waves per EU), and
 keeps the ladder at N 6144 / K 7168 (`bm16_n6144_k7168_small` empty: dsv4-pro was
