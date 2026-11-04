@@ -608,8 +608,8 @@ def test_gemm1_entry_that_cannot_launch_keeps_the_ladder(gemm1_tables):
 
 
 #: A launch with a half-height tile from its family's _half_tile entry: a8w8
-#: dsv4-pro T=4096 (block_m 128, a mean of 64 rows).
-_GEMM1_HALF_ARGS = (128, 6144, 7168, DtypeQuant.MXFP8, DtypeQuant.MXFP8, False, True)
+#: glm52-base T=1024 (block_m 64, a mean of 32 rows).
+_GEMM1_HALF_ARGS = (64, 4096, 6144, DtypeQuant.MXFP8, DtypeQuant.MXFP8, False, True)
 
 
 def _gemm1_half_tile_config():
@@ -620,15 +620,15 @@ def _gemm1_half_tile_config():
 
 def test_gemm1_half_tile_is_read_from_its_family(gemm1_tables):
     half = _gemm1_half_tile_config()
-    assert half["BLOCK_M"] == 64 and half["BLOCK_N"] == 256
+    assert half["BLOCK_M"] == 32 and half["BLOCK_N"] == 256
     for cached in (conf._gemm1_half_tile, conf._gemm1_half_m_config):
         cached.cache_clear()
-    gemm1_tables["A8W8-GEMM1"]["bm128_half_tile"]["GROUP_M"] = 2
+    gemm1_tables["A8W8-GEMM1"]["bm64_half_tile"]["GROUP_M"] = 2
     assert _gemm1_half_tile_config() == dict(half, GROUP_M=2)
-    # Without the entry, the block_m 64 config has another BLOCK_N: no half tile.
+    # Without the entry, the block_m 32 config has another BLOCK_N: no half tile.
     for cached in (conf._gemm1_half_tile, conf._gemm1_half_m_config):
         cached.cache_clear()
-    del gemm1_tables["A8W8-GEMM1"]["bm128_half_tile"]
+    del gemm1_tables["A8W8-GEMM1"]["bm64_half_tile"]
     assert _gemm1_half_tile_config() is None
 
 

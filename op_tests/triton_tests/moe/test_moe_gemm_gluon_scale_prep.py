@@ -91,6 +91,11 @@ def test_other_launches_keep_the_existing_tuning_ladder(overrides):
         # test_gemm2_large_block_m_tile), not the ladder and not GEMM1's tile.
         assert (cfg["GROUP_M"], cfg["A_SCALE_SORTED_SHUFFLED"]) == (8, False)
         return
+    if overrides == {"block_m": 64}:
+        # The A8W8-GEMM1 family sets the block_m 64 tile (the block_m 128 geometry).
+        tile = conf._family_tuned("A8W8-GEMM1", 64, "any")
+        assert tile and {name: cfg[name] for name in tile} == tile
+        return
     expected = dict(conf.get_gluon_config(
         overrides.get("block_m", 128), overrides.get("N", 512),
         overrides.get("K", 2560), overrides.get("dq_a", DtypeQuant.MXFP8),

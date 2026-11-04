@@ -387,10 +387,19 @@ family launch keys now apply at every block_m and dtype pair. dsv4-pro T=4096, 4
 fresh-process pairs (`gluon_perftest.py`): a4w4 0.908 (even, HIP 1) and 0.935 (random,
 HIP 5); a8w8 0.894 and 0.938. Output bit-identical in all 72 cells, both routings.
 
-Remaining: the block_m 64 launches at a mean of 32 rows (glm52-base and minimax-m3
-T=1024), which need a block_m 32 config with the same grid and warps. Merge with
-GEMM2's half-height tile (`../aiter-gemm2-a8w4`, 8e8fd5457): same field and kernel
-split; GEMM2 asserts raw A scales, GEMM1 addresses sorted A scales at `2 * pid_m`.
+Done 2026-11-04: the block_m 64 launches at a mean of 32 rows (glm52-base and
+minimax-m3 T=1024) take the tile for all three dtype pairs (`bm64_any`, `bm64_half`
+`.cs`, `bm64_half_tile`: the block_m 64 tile at 32 rows, B through LDS). a8w8 block_m 64
+first takes the block_m 128 geometry (`A8W8-GEMM1` `bm64_any`: BLOCK_N 256, BLOCK_K 128,
+16x16x128, 1x4 warps, sorted A and shuffled B scales; alone -8%), which a half-height
+tile can share; its block_m 128 launches then need no `bm128_half_tile`. 4
+fresh-process pairs, median head / base, even (HIP 1) / random (HIP 5): a4w4
+glm52-base 0.934 / 0.956, minimax-m3 0.987 / 0.962; a8w4 0.840 / 0.939, 0.889 /
+0.949; a8w8 0.832 / 0.877, 0.861 / 0.845. Output bit-identical in all 72 cells.
+
+Remaining: merge with GEMM2's half-height tile (`../aiter-gemm2-a8w4`, 8e8fd5457):
+same field and kernel split; GEMM2 asserts raw A scales, GEMM1 addresses sorted A
+scales at `2 * pid_m`.
 
 Check: `gluon_perftest.py STAGE=1` paired against the base, both routings, and the
 output sha256 of all 72 cells (`gemm2/g1pro/out_hash2.py`).

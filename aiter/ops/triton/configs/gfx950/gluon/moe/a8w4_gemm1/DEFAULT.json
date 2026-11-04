@@ -52,7 +52,38 @@
         "ALLOW_B_VIA_LDS": false,
         "expert_scale_cache_modifier": ""
     },
-    "bm64_any": {},
+    "bm64_any": {
+        "HALF_M_TILE": true
+    },
+    "bm64_half": {
+        "result_cache_modifier": ".cs"
+    },
+    "bm64_half_tile": {
+        "BLOCK_N": 256,
+        "BLOCK_K": 256,
+        "SLOT_M": 32,
+        "SLOT_N": 128,
+        "mfma_instr_shape": [
+            16,
+            16,
+            128
+        ],
+        "warps_per_cta": [
+            1,
+            4
+        ],
+        "tiles_per_warp": [
+            2,
+            2
+        ],
+        "NUM_LDS_BUFFER": 3,
+        "K_UNROLL": 3,
+        "VGPR_PREFETCH_K": 256,
+        "WAVES_PER_EU": 1,
+        "WAIT_COMMIT_SCHEME": 3,
+        "ALLOW_B_VIA_LDS": true,
+        "expert_scale_cache_modifier": ".cg"
+    },
     "bm128_any": {
         "HALF_M_TILE": true
     },

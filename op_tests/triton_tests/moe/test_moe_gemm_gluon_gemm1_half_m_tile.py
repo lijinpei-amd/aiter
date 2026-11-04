@@ -5,10 +5,11 @@
 
 With ``HALF_M_TILE``, an M block that holds at most ``BLOCK_M / 2`` rows runs a
 second tile, ``BLOCK_M / 2`` rows high. Its rows must be bit-identical to the rows
-that the full tile computes. The routing here gives block_m 128 (a mean of exactly
-64 rows, experts with 0, 1, 64, 65, 126 and 150 rows), so both tiles run in one
+that the full tile computes. The routings here give block_m 128 (a mean of exactly
+64 rows, experts with 0, 1, 64, 65, 126 and 150 rows) and block_m 64 (a mean of
+exactly 32 rows, experts with 0, 1, 32, 33, 62 and 75 rows), so both tiles run in one
 launch, and the second block of the largest expert takes the half-height tile at
-``block_id`` 1. The GEMM1 family of each dtype pair asks for the tile.
+``block_id`` 1. The GEMM1 family of each dtype pair asks for the tile at both block_m.
 """
 
 import os
@@ -28,11 +29,15 @@ from aiter.ops.triton.utils._triton.arch_info import get_arch
 from op_tests.triton_tests.utils.mxfp_ref import upcast_from_mxfp
 
 #: NE 33 and K 3584 have a C++ scale-sort instance, so the A scales are sorted in
-#: block_m blocks and the half-height tile reads them at 2 * pid_m.
-N, K, EXPERTS = 512, 3584, 33
+#: block_m blocks and the half-height tile reads them at 2 * pid_m. N 2048 makes the
+#: grid large enough for the family's block_m 64 tile (a small grid keeps the ladder).
+N, K, EXPERTS = 2048, 3584, 33
 #: block_m -> rows of each expert: a mean of exactly block_m / 2, so the routing gives
 #: that block_m.
-ROWS = {128: (0, 1, 64, 65, 126, 150) + (64,) * 5 + (63,) * 22}
+ROWS = {
+    128: (0, 1, 64, 65, 126, 150) + (64,) * 5 + (63,) * 22,
+    64: (0, 1, 32, 33, 62, 75) + (32,) * 16 + (31,) * 11,
+}
 _FP8, _FP4 = torch.float8_e4m3fn, torch.uint8
 #: op -> (public wrapper, activation storage, weight storage)
 _OPS = {
@@ -182,10 +187,10 @@ def test_every_dtype_takes_the_half_m_tile_by_default(
 def test_a_half_tile_that_does_not_fit_keeps_one_tile(
     cases, clean_env, launches, monkeypatch
 ):
-    # Without its bm128_half_tile entry, the a8w8 block_m 64 config has another
+    # Without its family's block_m 64 tile, the a8w8 block_m 64 config has another
     # BLOCK_N and warp split, so no half-height tile fits the block_m 128 launch.
     table = dict(conf.get_moe_dispatch("A8W8-GEMM1", conf.get_arch(), "gluon"))
-    del table["bm128_half_tile"]
+    table["bm64_any"] = {}
     original = conf.get_moe_dispatch
     monkeypatch.setattr(
         conf,
@@ -215,10 +220,10 @@ def _a8w4_gemm1_config(block_m, half_block=False):
     return _gemm1_config("a8w4", block_m, half_block)
 
 
-@pytest.mark.parametrize("block_m", [128])
+@pytest.mark.parametrize("block_m", [64, 128])
 @pytest.mark.parametrize("op", sorted(_OPS))
 def test_gemm1_family_sets_the_half_m_tile(op, block_m, clean_env):
-    # Each GEMM1 family asks for the tile at block_m 128, and streams the
+    # Each GEMM1 family asks for the tile at block_m 64 and 128, and streams the
     # result of a launch whose experts average at most half an M block.
     family = conf._GEMM1_FAMILIES[_DTYPES[op]]
     entry = conf.get_moe_dispatch(family, conf.get_arch(), "gluon")
