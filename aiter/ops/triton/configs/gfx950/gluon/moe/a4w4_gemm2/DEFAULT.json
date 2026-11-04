@@ -40,6 +40,15 @@
         "B_PRESHUFFLED": true,
         "ALLOW_B_VIA_LDS": false
     },
+    "bm64_half": {
+        "HALF_M_TILE": true,
+        "TILE_SCHED": 0,
+        "result_cache_modifier": ".cs"
+    },
+    "bm64_half_tile": {
+        "WAVES_PER_EU": 1,
+        "result_cache_modifier": ".cs"
+    },
     "bm128_any": {
         "BLOCK_N": 256,
         "BLOCK_K": 256,

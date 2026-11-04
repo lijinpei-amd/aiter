@@ -42,7 +42,14 @@
         "result_cache_modifier": ".cs"
     },
     "bm64_half": {
-        "TILE_SCHED": 0
+        "TILE_SCHED": 0,
+        "HALF_M_TILE": true
+    },
+    "bm64_half_tile": {
+        "WAVES_PER_EU": 1,
+        "BLOCK_N": 512,
+        "SLOT_N": 256,
+        "result_cache_modifier": ".cs"
     },
     "bm128_any": {
         "BLOCK_N": 256,

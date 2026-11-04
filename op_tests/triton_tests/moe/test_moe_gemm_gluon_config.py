@@ -882,7 +882,6 @@ def test_gemm2_wider_half_m_tile_sets_the_n_grid():
 @pytest.mark.parametrize(
     "block_m,act,half_block",
     [
-        (64, None, True),  # the a8w4 block_m 64 entry has no half-height tile
         (128, ActivationSpec(int(ActKind.SILU), 1.0, None, False), True),  # GEMM1
         (128, None, False),  # the experts average more than half an M block
     ],
@@ -891,6 +890,13 @@ def test_gemm2_half_m_tile_only_where_the_entry_and_launch_ask(
     block_m, act, half_block
 ):
     spec = _gemm2_spec(block_m, act, half_block)
+    assert not spec[4].get("HALF_M_TILE") and spec[6] is None and len(spec[1]) == 4
+
+
+def test_gemm2_half_m_tile_needs_the_entry(gemm2_tables):
+    # A _half launch whose entry does not set HALF_M_TILE keeps one tile.
+    del gemm2_tables["A8W4-GEMM2"]["bm64_half"]["HALF_M_TILE"]
+    spec = _gemm2_spec(64)
     assert not spec[4].get("HALF_M_TILE") and spec[6] is None and len(spec[1]) == 4
 
 
