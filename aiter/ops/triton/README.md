@@ -180,8 +180,8 @@ The `MOE-REDUCE` family tunes the top-k combine of `reduce_grouped`.
 The GEMM1 families
 (`configs/gfx950/gluon/moe/{a4w4,a8w4,a8w8}_gemm1/`) have tile entries
 (`bm<block_m>_any`, `bm<block_m>_small` for a small grid, and
-`bm<block_m>_n<N>_k<K>_any` / `_small` for one N and K) where the Python code sets
-no tile. Each lists the whole tile on top of the ladder. An entry can also ask for
+`bm<block_m>_n<N>_k<K>_any` / `_small` for one N and K). Each lists its keys on top
+of the ladder, or of the tile a Python override sets. An entry can also ask for
 the half-height tile (`HALF_M_TILE`) and set its result policy (`bm<block_m>_half`,
 taken when the experts average at most half an M block). A
 `bm<block_m>_half_tile` entry sets the half-height tile's own keys.

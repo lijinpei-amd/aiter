@@ -947,10 +947,11 @@ def _launch_error(cfg_items: tuple, dq_a, dq_b, N, K):
 def _family_launch_config(
     ladder_items: tuple, family, names: tuple, N, K, dq_a, dq_b, env_keys: tuple
 ) -> tuple:
-    """The ladder with the entries ``names`` of ``family`` on top (see
-    :func:`_family_tuned`), as sorted config items. ``env_keys`` are the ladder keys
-    that keep their ladder value: the ones the environment set (see
-    :func:`_family_env_keys`), and for GEMM1 the launch keys.
+    """The config ``ladder_items`` (the ladder, or for GEMM1 the tile of a Python
+    override) with the entries ``names`` of ``family`` on top (see
+    :func:`_family_tuned`), as sorted config items. ``env_keys`` keep their value from
+    ``ladder_items``: the keys the environment set (see :func:`_family_env_keys`), and
+    for GEMM1 the launch keys.
 
     The entry applies only where the launch can run the result as is; elsewhere the
     ladder stays. Memoised because ``gluon_supported`` asks for it on every launch.
@@ -1087,21 +1088,6 @@ def _default_launch_config(
         ladder = _family_launch_config(
             ladder, family, names, N, K, dq_a, dq_b, env_keys
         )
-    if (
-        apply_swiglu
-        and not direct_b
-        and (dq_a, dq_b) in _GEMM1_FAMILIES
-        and not (N == 4096 and K == 7168)
-        and block_m < 128
-    ):
-        # The September shape keeps the block_m 32 override below
-        # (docs/perf_gemm1_a8w4_bm32.md). The launch keys (_GEMM1_ENV) keep their
-        # ladder value here: _gemm1_tuned applies them on top of the final tile, at
-        # every block_m.
-        family = _GEMM1_FAMILIES[(dq_a, dq_b)]
-        names = _gemm1_tile_names(family, block_m, N, K, small_grid)
-        keep = env_keys + tuple(_GEMM1_ENV)
-        ladder = _family_launch_config(ladder, family, names, N, K, dq_a, dq_b, keep)
     c = dict(ladder)
     if (
         not small_grid
@@ -1381,6 +1367,22 @@ def _default_launch_config(
             NUM_LDS_BUFFER=3,
             K_UNROLL=3,
             VGPR_PREFETCH_K=128,
+        )
+    if (
+        apply_swiglu
+        and not direct_b
+        and (dq_a, dq_b) in _GEMM1_FAMILIES
+        and not (N == 4096 and K == 7168)
+    ):
+        # The GEMM1 family's tile entry goes on top of the tile above: the ladder, or a
+        # Python override (block_m 128, block_m 64 for MXFP4 weights). The September
+        # shape keeps its overrides (docs/perf_gemm1_a8w4_bm32.md). The launch keys
+        # (_GEMM1_ENV) keep their value here: _gemm1_tuned sets them below.
+        family = _GEMM1_FAMILIES[(dq_a, dq_b)]
+        names = _gemm1_tile_names(family, block_m, N, K, small_grid)
+        keep = env_keys + tuple(_GEMM1_ENV)
+        c = dict(
+            _family_launch_config(_cfg_key(c), family, names, N, K, dq_a, dq_b, keep)
         )
     if apply_swiglu:
         # The GEMM1 family can ask for a half-height tile, which _gemm1_half_m_config

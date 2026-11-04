@@ -172,11 +172,12 @@ In MOE dispatch tables, flag:
   `bm<block_m>_n<N>_k<K>_any`, `bm<block_m>_n<N>_k<K>_small`, `bm<block_m>_half`
   and `bm<block_m>_half_tile`; such an entry without the `_any` entry of its
   `block_m`; an entry with `"ALLOW_B_VIA_LDS": false` and without
-  `"B_PRESHUFFLED": true`; a `bm128_any` or `_half` key other than `HALF_M_TILE`
-  and `result_cache_modifier` (the launch keys: they ask for the half-height tile
-  and set its result policy); a launch key in a `_small` or `_n<N>_k<K>_` entry.
+  `"B_PRESHUFFLED": true`; a `_half` key other than `HALF_M_TILE` and
+  `result_cache_modifier` (the launch keys: they ask for the half-height tile and
+  set its result policy); a launch key in a `_small` or `_n<N>_k<K>_` entry.
   Do not flag a GEMM1 `_small` or shape entry that repeats keys of `_any`: unlike
-  GEMM2, it lists the whole tile on top of the ladder.
+  GEMM2, it is not merged over `_any`. Do not flag a GEMM1 block_m 64 or 128 entry
+  with only a few tile keys: it changes the tile of a Python override.
 
 Do not flag a GEMM2 `_small`, `_multi` or `_half` entry that has only a few
 keys. The launch merges at most one of them over `bm<block_m>_any`, in this

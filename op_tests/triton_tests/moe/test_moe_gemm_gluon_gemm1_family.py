@@ -174,8 +174,8 @@ def test_gemm1_families_hold_tuning_values_only(family):
         assert names.fullmatch(name), name
         assert name.split("_", 1)[0] + "_any" in table, name
     for name, entry in table.items():
-        # The block_m 128 tile is Python's, and _half sets launch keys.
-        if name == "bm128_any" or name.endswith("_half"):
+        # _half sets launch keys only.
+        if name.endswith("_half"):
             assert set(entry) <= set(conf._GEMM1_ENV), name
         # Launch keys come from _any and _half only.
         if name.endswith("_small") or re.search(r"_n[0-9]+_k", name):
@@ -258,6 +258,21 @@ def test_gemm1_shape_entry_replaces_the_any_entry(gemm1_tables):
     table["bm32_n4096_k4096_any"] = dict(table["bm32_any"], GROUP_M=2)
     del table["bm32_n4096_k4096_any"]["HALF_M_TILE"]
     assert conf._default_launch_config(*_GEMM1_ARGS) == dict(tuned, GROUP_M=2)
+
+
+@pytest.mark.parametrize("block_m", [64, 128])
+def test_gemm1_entry_changes_the_tile_of_a_python_override(gemm1_tables, block_m):
+    # a4w4 block_m 64 and 128 take a Python tile; the entry lists keys on top of it.
+    args = (block_m, 4096, 6144, DtypeQuant.MXFP4, DtypeQuant.MXFP4, False, True)
+    python_tile = conf._default_launch_config(*args)
+    _clear_config_caches()
+    table = gemm1_tables["A4W4-GEMM1"]
+    table.pop(f"bm{block_m}_n4096_k6144_any", None)
+    table[f"bm{block_m}_any"] = dict(table[f"bm{block_m}_any"], GROUP_M=2)
+    assert conf._default_launch_config(*args) == dict(python_tile, GROUP_M=2)
+    # Not at the September shape, which keeps its Python tiles.
+    september = (block_m, 4096, 7168) + args[3:]
+    assert conf._default_launch_config(*september)["GROUP_M"] != 2
 
 
 def test_gemm1_small_grid_entry_respects_environment_and_direct_b(

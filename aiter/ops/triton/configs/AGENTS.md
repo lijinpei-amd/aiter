@@ -245,13 +245,14 @@ there is no file. Do not change the returned dict.
     `bm<block_m>_small`, else `bm<block_m>_any`; an entry
     `bm<block_m>_n<N>_k<K>_small` or `bm<block_m>_n<N>_k<K>_any` replaces it for
     that N and K. Unlike GEMM2, the small-grid entry is not merged over `_any`:
-    each entry lists the whole tile on top of the ladder, and a missing or empty
-    entry keeps the ladder. Use a shape entry only for a shape whose measured
-    result differs from the rest. The launch merges the entry over the ladder,
-    not at N 4096 with K 7168, which has a Python override. The Python overrides
-    in `_default_launch_config` set the tile at block_m 128, and at block_m 64
-    for MXFP4 weights; there the entries hold no tile keys (`bm128_any` holds
-    only launch keys).
+    each entry lists its keys on top of the launch's base tile, and a missing or
+    empty entry keeps that tile. Use a shape entry only for a shape whose measured
+    result differs from the rest. The base tile is the ladder, or where a Python
+    override of `_default_launch_config` sets the tile (block_m 128, and block_m
+    64 for MXFP4 weights) that tile: there an entry lists only the keys it changes
+    on top of it, for example B in registers. A launch that reads the weights
+    directly (`_reads_b_directly`) and the September shape (N 4096 with K 7168)
+    take no tile entry.
   - **Launch keys**, the keys of `_GEMM1_ENV` (now `HALF_M_TILE` and
     `result_cache_modifier`). They apply on top of the tile of the launch, at
     every block_m. `"HALF_M_TILE": true` gives a launch a second tile,
