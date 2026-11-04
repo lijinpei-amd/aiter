@@ -95,10 +95,13 @@ bit-identical in 72/72 cells. Table:
 
 Remaining gap, largest first:
 
-- a8w4 dsv4-pro T=4096 (even routing) is 1.058x the tuned FlyDSL stage 2 on HIP 7 at
-  `fded59f68` with the task's exact protocol (Gluon 1142.5 us, FlyDSL atomic 1079.6 us,
-  medians of 3 alternating rounds; per round 1.050, 1.059, 1.062;
-  `compare_a8w4pro_20261104_l4.md`, which also has the 72-cell HIP 7 matrix). An earlier
+- a8w4 dsv4-pro T=4096 (even routing) is 1.051x the tuned FlyDSL stage 2 on HIP 7 at
+  `ad8958e72` with the task's exact protocol (Gluon 1133.5 us, FlyDSL atomic 1078.2 us,
+  medians of 3 alternating rounds; per round 1.064, 1.053, 1.043;
+  `compare_a8w4pro_20261104_l5.md`, with the 72-cell HIP 7 matrix of that commit).
+  `ad8958e72` streams the reduce_grouped rows (`.cg`) and widens its column block to
+  1024 (HIP 7: 0.986 even, 0.990 random; balanced order 0.979 / 0.988). At
+  `fded59f68` it was 1.058 (`compare_a8w4pro_20261104_l4.md`). An earlier
   table that screened FlyDSL's reduce candidate too gave 1.077. Seventh pass, not kept:
   a tile-contiguous B weight copy (bit-exact, no change) and other result/weight cache
   policies (GEMM2 slower, reduce unchanged). Gluon's GEMM2 kernel alone now takes about
@@ -108,13 +111,9 @@ Remaining gap, largest first:
   paired on HIP 7 it is 0.995 (flat) and its energy per call equals the whole call's;
   not kept. Energy per call at the cap: GEMM2 1031 mJ, reduce 105 mJ; the intermediate
   store is ~9% of the call (not DRAM: a MALL-resident window costs the same), B HBM
-  traffic ~2.4%. Stores straight from the accumulator layout are 11% slower. Small
-  candidate, inconclusive: reduce BLOCK_N 1024, 2 warps, `.cg` loads (-1.2% whole call,
-  HIP 6 steady state). HIP 7 pairings (`l2/redh7_{max,rand}.csv`, `l2/redh7b.csv`, the
-  reduce env-gated in `wt_rd`): even 0.975, 0.986, 0.980 and then 0.997, 1.004, 0.990
-  (6 rounds, median 0.985); random 0.994, 0.981, 0.994. Remaining confirmation: the
-  production form in both run orders on HIP 7, both routings, plus the Triton cells
-  (the reduce is shared with the Triton path). Sixth pass (`compare_a8w4pro_20261104_l3.md`): the GPU
+  traffic ~2.4%. Stores straight from the accumulator layout are 11% slower. The reduce
+  candidate (BLOCK_N 1024, 2 warps, `.cg` loads) was confirmed with balanced order on
+  HIP 7 and kept in `ad8958e72` (above). Sixth pass (`compare_a8w4pro_20261104_l3.md`): the GPU
   runs at its 1000 W cap during these calls (GFX clock ~1.1 GHz of 2.2), so a call's time
   follows its energy, and removing stalls alone does not help: a persistent kernel that
   issues the next tile's prologue before the store is bit-exact and uses 4% fewer cycles
