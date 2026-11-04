@@ -107,9 +107,13 @@ a8w8 0.847 / 0.934; the bm64 half cells 0.83-0.93 / 0.89-0.95; block_m 32 cells
 Not kept, measured: a 16-row half-height tile at `bm32_half` (0.990-0.999); `.cs` on
 a4w4 and a8w4 `bm128_any` (1.00-1.05); a 512-column 32-row tile for a4w4 (slower under
 random routing) and a8w8 (spills 29-35 VGPRs); the XCD order at block_m 64 (slower
-under random routing); per-shape `reduce_grouped` tiles (512/2048 columns, 1/4 warps,
-no load hint: within 1.5% of the current tile at every prefill shape, no hint +12% at
-T=16384). Table: `bench_out/gluon_moe_regression/gemm2/gemm2_prefill_generalize.md`.
+under random routing); per-shape `reduce_grouped` tiles (512 or 2048 columns, 1 or 4
+warps, no load hint; a8w4 at every prefill shape, a4w4 and a8w8 at T=4096/16384). No
+variant made both the reduce kernel and the whole call at least 2% faster in both
+routings. The two shapes whose whole call read 2-4% faster had an unchanged or slower
+reduce, and alone in 4 fresh-process pairs they are 0.992-1.012. No load hint makes the
+reduce up to 1.38x slower (a8w4 glm52-base T=4096). Table:
+`bench_out/gluon_moe_regression/gemm2/gemm2_prefill_generalize.md`.
 
 Remaining gap, largest first:
 
@@ -246,17 +250,21 @@ Remaining gap, largest first:
   remaining candidate has a positive HIP 7 measurement. Data, probes and the per-variant
   tables:
   `bench_out/gluon_moe_regression/gemm2/compare_a8w4pro_20261104_l2.md`.
-- Prefill cells after the generalization (same-lock table, HIP 3/7, 3 rounds, in
-  `gemm2_prefill_generalize.md`; Gluon/FlyDSL geomean over the prefill cells 1.120 ->
-  1.072 a4w4, 1.104 -> 1.067 a8w4, 1.065 -> 1.035 a8w8). dsv4-flash T=1024 (block_m 32,
-  24 rows per expert, not a half launch) is 1.07-1.19x, its GEMM2 kernel alone
-  1.04-1.13x: the block_m 32 tile is the Python ladder's (PER_OP commits, WAVES_PER_EU
-  0), never tuned for prefill; screen `bm32_any` knobs next. glm52-base T=1024 is
-  1.06-1.15x, GEMM2 alone 1.02-1.08x, while minimax-m3 T=1024 (the same 32-row tile,
-  K 3072 against 2048) is 1.02-1.03x alone: with 8 BLOCK_K steps the prologue and the
-  store weigh more, and at WAVES_PER_EU 1 (the two tiles must share it) no second CTA
-  hides them. At T=4096 and T=16384 every cell above 1.05x has its GEMM2 alone at
-  0.91-1.015x: the remaining gap is the separate reduce (8-19% of the call).
+- Prefill cells after the generalization: the same-lock table (HIP 3 / HIP 7, 3 rounds)
+  is in `gemm2_prefill_generalize.md`. Gluon/FlyDSL geomean over the prefill cells, base
+  -> final: 1.120 -> 1.072 a4w4, 1.104 -> 1.067 a8w4, 1.065 -> 1.035 a8w8. For the 18
+  cells still above 1.05x, one lock (HIP 1, 2 rounds) timed the GEMM2 kernel, the
+  reduce and FlyDSL's stage 2:
+  - At T=4096 and T=16384, the GEMM2 kernel alone is 0.89-1.005x FlyDSL, and the call
+    is 1.01-1.12x. The rest is the separate bit-exact reduce (7-18% of the call).
+  - At T=1024, the kernel alone is 0.94-1.11x. The largest gaps are a8w8 dsv4-flash
+    1.11, a8w8 glm52-base 1.09, and a4w4 dsv4-flash and minimax-m3 1.06; the reduce
+    adds 3-7%.
+  - Untested hypothesis for dsv4-flash T=1024 (block_m 32, not a half launch): it runs
+    the Python ladder's block_m 32 tile, which was never tuned for prefill; screen
+    `bm32_any` knobs.
+  - The short-K explanation for glm52-base T=1024 does not hold. In the same lock,
+    minimax-m3 T=1024 (K 3072) trails at least as much in a4w4 / a8w4.
 - a8w4 dsv4-flash T=16384 is 1.095x FlyDSL, close to the 1.10 limit. The GEMM (~1245
   us) is faster than FlyDSL's whole stage 2 (1355 us, a tuned atomic kernel), but the
   separate deterministic reduce adds ~237 us at ~4.6 TB/s. No reduce launch shape, a
