@@ -771,7 +771,9 @@ def test_gemm2_multi_block_streams_the_result_and_caches_the_weights(dq_a, dq_b)
     )
     scale = "" if dq_b == DtypeQuant.MXFP4 else ".cg"
     assert [multi[k] for k in modifiers] == [".cs", "", scale]
-    assert plain["result_cache_modifier"] == "" and plain["expert_cache_modifier"]
+    # a8w8 streams the result of its other block_m 128 launches too.
+    streamed = ".cs" if dq_b == DtypeQuant.MXFP8 else ""
+    assert plain["result_cache_modifier"] == streamed and plain["expert_cache_modifier"]
     changed = {k for k in multi if multi[k] != plain[k]}
     assert changed <= set(modifiers)
 
