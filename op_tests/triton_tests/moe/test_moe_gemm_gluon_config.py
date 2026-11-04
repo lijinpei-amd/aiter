@@ -645,10 +645,13 @@ def test_gemm2_small_block_m_reads_preshuffled_b(dq_a, dq_b, block_m, small_grid
     ladder = conf.get_gluon_config(block_m, 7168, 3072, dq_a, dq_b, small_grid)
     changed = {name for name in config if config[name] != ladder[name]}
     # Only the B layout changes, plus a 128-column N tile on a small grid (T=1) where
-    # the family has a bm16_small entry: GEMM2 does not take GEMM1's `.cg` hint for
-    # shuffled MXFP8 scales.
+    # the family has a bm16_small entry, and at block_m 32 the streamed result in the
+    # linear tile order: GEMM2 does not take GEMM1's `.cg` hint for shuffled MXFP8
+    # scales.
     narrow = small_grid and dq_b == DtypeQuant.MXFP4
     expected = {"B_SCALE_SHUFFLED", "B_PRESHUFFLED", "ALLOW_B_VIA_LDS"}
+    if block_m == 32:
+        expected |= {"result_cache_modifier", "TILE_SCHED"}
     assert changed == expected | ({"BLOCK_N"} if narrow else set())
     assert config["B_PRESHUFFLED"] and not config["ALLOW_B_VIA_LDS"]
     if narrow:

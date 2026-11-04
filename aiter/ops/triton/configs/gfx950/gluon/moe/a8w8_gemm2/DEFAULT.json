@@ -7,7 +7,9 @@
     "bm32_any": {
         "B_SCALE_SHUFFLED": true,
         "B_PRESHUFFLED": true,
-        "ALLOW_B_VIA_LDS": false
+        "ALLOW_B_VIA_LDS": false,
+        "result_cache_modifier": ".cs",
+        "TILE_SCHED": 0
     },
     "bm64_any": {
         "BLOCK_N": 256,
@@ -44,8 +46,7 @@
     },
     "bm64_half_tile": {
         "WAVES_PER_EU": 1,
-        "BLOCK_N": 256,
-        "result_cache_modifier": ".cs"
+        "BLOCK_N": 256
     },
     "bm128_any": {
         "BLOCK_N": 256,
