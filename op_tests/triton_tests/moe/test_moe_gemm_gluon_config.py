@@ -643,19 +643,13 @@ def test_gemm2_small_block_m_reads_preshuffled_b(dq_a, dq_b, block_m, small_grid
         block_m, 7168, 3072, dq_a, dq_b, small_grid, False
     )
     ladder = conf.get_gluon_config(block_m, 7168, 3072, dq_a, dq_b, small_grid)
+    tuned = conf._gemm2_tuned(block_m, dq_a, dq_b, "small" if small_grid else "any")
     changed = {name for name in config if config[name] != ladder[name]}
-    # Only the B layout changes, plus a 128-column N tile on a small grid (T=1) where
-    # the family has a bm16_small entry, and at block_m 32 the streamed result in the
-    # linear tile order: GEMM2 does not take GEMM1's `.cg` hint for shuffled MXFP8
-    # scales.
-    narrow = small_grid and dq_b == DtypeQuant.MXFP4
-    expected = {"B_SCALE_SHUFFLED", "B_PRESHUFFLED", "ALLOW_B_VIA_LDS"}
-    if block_m == 32:
-        expected |= {"result_cache_modifier", "TILE_SCHED"}
-    assert changed == expected | ({"BLOCK_N"} if narrow else set())
+    # Only the family entry changes the ladder: GEMM2 does not take GEMM1's `.cg` hint
+    # for shuffled MXFP8 scales.
+    assert changed == {key for key, value in tuned.items() if ladder[key] != value}
+    assert all(config[key] == value for key, value in tuned.items())
     assert config["B_PRESHUFFLED"] and not config["ALLOW_B_VIA_LDS"]
-    if narrow:
-        assert config["BLOCK_N"] == 128
 
 
 @pytest.mark.parametrize(
@@ -771,9 +765,10 @@ def test_gemm2_multi_block_streams_the_result_and_caches_the_weights(dq_a, dq_b)
     )
     scale = "" if dq_b == DtypeQuant.MXFP4 else ".cg"
     assert [multi[k] for k in modifiers] == [".cs", "", scale]
-    # a8w8 streams the result of its other block_m 128 launches too.
-    streamed = ".cs" if dq_b == DtypeQuant.MXFP8 else ""
-    assert plain["result_cache_modifier"] == streamed and plain["expert_cache_modifier"]
+    # Other launches keep the bm128_any entry's result policy (a8w8 streams it too).
+    any_entry = conf._gemm2_tuned(128, dq_a, dq_b, "any")
+    assert plain["result_cache_modifier"] == any_entry.get("result_cache_modifier", "")
+    assert plain["expert_cache_modifier"]
     changed = {k for k in multi if multi[k] != plain[k]}
     assert changed <= set(modifiers)
 
@@ -836,6 +831,11 @@ def test_gemm2_register_b_entry_needs_preshuffled_weights(gemm2_tables):
     )
 
 
+def _assert_one_tile(spec):
+    """The launch of ``spec`` (``_launch_spec``'s result) has no half-height tile."""
+    assert not spec[4].get("HALF_M_TILE") and spec[6] is None and len(spec[1]) == 4
+
+
 def _gemm2_spec(block_m=128, act=None, half_block=True):
     """``_launch_spec`` of an a8w4 launch with gather and gammas."""
     return host._launch_spec(
@@ -885,24 +885,20 @@ def test_gemm2_wider_half_m_tile_sets_the_n_grid():
 
 
 @pytest.mark.parametrize(
-    "block_m,act,half_block",
+    "act,half_block",
     [
-        (128, ActivationSpec(int(ActKind.SILU), 1.0, None, False), True),  # GEMM1
-        (128, None, False),  # the experts average more than half an M block
+        (ActivationSpec(int(ActKind.SILU), 1.0, None, False), True),  # GEMM1
+        (None, False),  # the experts average more than half an M block
     ],
 )
-def test_gemm2_half_m_tile_only_where_the_entry_and_launch_ask(
-    block_m, act, half_block
-):
-    spec = _gemm2_spec(block_m, act, half_block)
-    assert not spec[4].get("HALF_M_TILE") and spec[6] is None and len(spec[1]) == 4
+def test_gemm2_half_m_tile_only_where_the_launch_asks(act, half_block):
+    _assert_one_tile(_gemm2_spec(128, act, half_block))
 
 
 def test_gemm2_half_m_tile_needs_the_entry(gemm2_tables):
     # A _half launch whose entry does not set HALF_M_TILE keeps one tile.
     del gemm2_tables["A8W4-GEMM2"]["bm64_half"]["HALF_M_TILE"]
-    spec = _gemm2_spec(64)
-    assert not spec[4].get("HALF_M_TILE") and spec[6] is None and len(spec[1]) == 4
+    _assert_one_tile(_gemm2_spec(64))
 
 
 @pytest.mark.parametrize(
@@ -916,8 +912,7 @@ def test_gemm2_half_m_tile_needs_the_launch_grid_and_operands(gemm2_tables, key,
     entry[key] = value
     if key == "B_PRESHUFFLED":
         entry["ALLOW_B_VIA_LDS"] = True
-    spec = _gemm2_spec()
-    assert not spec[4]["HALF_M_TILE"] and spec[6] is None and len(spec[1]) == 4
+    _assert_one_tile(_gemm2_spec())
 
 
 @pytest.mark.parametrize("env,expected", [(None, 6), ("2", 2)])
