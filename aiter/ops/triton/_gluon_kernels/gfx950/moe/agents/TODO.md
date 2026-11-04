@@ -379,14 +379,18 @@ Remaining margin, largest first:
   drain and epilogue) would hide the CTA start and end at one wave per SIMD. It is a
   new pipeline feature; not tried.
 
-Extend the half-height tile, each its own change: a4w4 dsv4-pro T=4096 (its block_m 64
-and 128 configs share BLOCK_N, warps and waves; with `AITER_TRITON_MOE_GLUON_HALF_M_TILE=1`
-the output is bit-identical in the test, and a HIP 6 screen of the kernel gave 2088 ->
-1880 us even and 2079 -> 1996 us random), and the block_m 64 launches at a mean of 32
-rows (glm52-base and minimax-m3 T=1024), which need a block_m 32 config with the same
-grid and warps. Merge with GEMM2's half-height tile (`../aiter-gemm2-a8w4`, 8e8fd5457):
-same field and kernel split; GEMM2 asserts raw A scales, GEMM1 addresses sorted A
-scales at `2 * pid_m`.
+Done 2026-11-04: a4w4 and a8w8 at block_m 128 take the tile too, from the new
+`A4W4-GEMM1` and `A8W8-GEMM1` families (`bm128_any`, `bm128_half` `.cs`). The a8w8
+block_m 64 config has another BLOCK_N and warp split, so its family also sets the
+half-height tile's own keys (`bm128_half_tile`: the block_m 128 tile at 64 rows). The
+family launch keys now apply at every block_m and dtype pair. dsv4-pro T=4096, 4
+fresh-process pairs (`gluon_perftest.py`): a4w4 0.908 (even, HIP 1) and 0.935 (random,
+HIP 5); a8w8 0.894 and 0.938. Output bit-identical in all 72 cells, both routings.
+
+Remaining: the block_m 64 launches at a mean of 32 rows (glm52-base and minimax-m3
+T=1024), which need a block_m 32 config with the same grid and warps. Merge with
+GEMM2's half-height tile (`../aiter-gemm2-a8w4`, 8e8fd5457): same field and kernel
+split; GEMM2 asserts raw A scales, GEMM1 addresses sorted A scales at `2 * pid_m`.
 
 Check: `gluon_perftest.py STAGE=1` paired against the base, both routings, and the
 output sha256 of all 72 cells (`gemm2/g1pro/out_hash2.py`).

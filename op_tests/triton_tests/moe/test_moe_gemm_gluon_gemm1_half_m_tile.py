@@ -6,10 +6,9 @@
 With ``HALF_M_TILE``, an M block that holds at most ``BLOCK_M / 2`` rows runs a
 second tile, ``BLOCK_M / 2`` rows high. Its rows must be bit-identical to the rows
 that the full tile computes. The routing here gives block_m 128 (a mean of exactly
-64 rows) and experts with 0, 1, 64, 65, 126 and 150 rows, so both tiles run in one
-launch, and the second block of the 150-row expert (22 rows) takes the half-height
-tile at ``block_id`` 1. a4w4 takes the tile only through the environment; a8w8
-has none.
+64 rows, experts with 0, 1, 64, 65, 126 and 150 rows), so both tiles run in one
+launch, and the second block of the largest expert takes the half-height tile at
+``block_id`` 1. The GEMM1 family of each dtype pair asks for the tile.
 """
 
 import os
@@ -29,10 +28,11 @@ from aiter.ops.triton.utils._triton.arch_info import get_arch
 from op_tests.triton_tests.utils.mxfp_ref import upcast_from_mxfp
 
 #: NE 33 and K 3584 have a C++ scale-sort instance, so the A scales are sorted in
-#: block_m 128 blocks and the half-height tile reads them at 2 * pid_m.
+#: block_m blocks and the half-height tile reads them at 2 * pid_m.
 N, K, EXPERTS = 512, 3584, 33
-#: Rows of each expert: a mean of exactly 64, so the routing gives block_m 128.
-ROWS = (0, 1, 64, 65, 126, 150) + (64,) * 5 + (63,) * 22
+#: block_m -> rows of each expert: a mean of exactly block_m / 2, so the routing gives
+#: that block_m.
+ROWS = {128: (0, 1, 64, 65, 126, 150) + (64,) * 5 + (63,) * 22}
 _FP8, _FP4 = torch.float8_e4m3fn, torch.uint8
 #: op -> (public wrapper, activation storage, weight storage)
 _OPS = {
@@ -47,7 +47,9 @@ def _clear_config_caches():
         host._launch_spec,
         conf._get_gluon_config_cached,
         conf._gemm1_family_entry,
+        conf._gemm1_half_tile,
         conf._gemm1_half_m_config,
+        conf._family_launch_config,
     ):
         cached.cache_clear()
 
@@ -90,28 +92,29 @@ def launches(monkeypatch):
 
 @pytest.fixture(scope="module")
 def cases():
-    """op -> routing with block_m 128 and ROWS rows per expert, and MX operands."""
+    """(op, block_m) -> routing with ROWS[block_m] rows per expert, and MX operands."""
     if get_arch() != "gfx950":
         pytest.skip("Gluon MoE kernels are gfx950 only.")
-    expert = torch.repeat_interleave(
-        torch.arange(EXPERTS, device="cuda"), torch.tensor(ROWS, device="cuda")
-    )
-    logits = torch.full(
-        (sum(ROWS), EXPERTS), float("-inf"), dtype=torch.float16, device="cuda"
-    )
-    logits[torch.arange(sum(ROWS), device="cuda"), expert] = 1
-    route, gather, _ = routing(logits, 1)
-    route.gate_scal = None
-    assert route.block_m == 128
     out = {}
-    for op, (_, x_dtype, w_dtype) in _OPS.items():
-        torch.manual_seed(7)
-        x = torch.randn((sum(ROWS), K), dtype=torch.bfloat16, device="cuda")
-        w = torch.randn((EXPERTS, N, K), dtype=torch.bfloat16, device="cuda") / 16
-        bias = torch.randn((EXPERTS, N), dtype=torch.float32, device="cuda")
-        x, xs = downcast_to_mxfp(x, x_dtype, axis=-1)
-        w, ws = downcast_to_mxfp(w.transpose(1, 2), w_dtype, axis=1)
-        out[op] = (x, w, xs, ws, bias, route, gather)
+    for block_m, rows in ROWS.items():
+        expert = torch.repeat_interleave(
+            torch.arange(EXPERTS, device="cuda"), torch.tensor(rows, device="cuda")
+        )
+        logits = torch.full(
+            (sum(rows), EXPERTS), float("-inf"), dtype=torch.float16, device="cuda"
+        )
+        logits[torch.arange(sum(rows), device="cuda"), expert] = 1
+        route, gather, _ = routing(logits, 1)
+        route.gate_scal = None
+        assert route.block_m == block_m
+        for op, (_, x_dtype, w_dtype) in _OPS.items():
+            torch.manual_seed(7)
+            x = torch.randn((sum(rows), K), dtype=torch.bfloat16, device="cuda")
+            w = torch.randn((EXPERTS, N, K), dtype=torch.bfloat16, device="cuda") / 16
+            bias = torch.randn((EXPERTS, N), dtype=torch.float32, device="cuda")
+            x, xs = downcast_to_mxfp(x, x_dtype, axis=-1)
+            w, ws = downcast_to_mxfp(w.transpose(1, 2), w_dtype, axis=1)
+            out[op, block_m] = (x, w, xs, ws, bias, route, gather)
     return out
 
 
@@ -147,87 +150,111 @@ def _reference(op, case):
     )
 
 
-@pytest.mark.parametrize("op", ["a8w4", "a4w4"])
-def test_half_m_tile_rows_match_the_full_tile(op, cases, clean_env, launches):
+@pytest.mark.parametrize("block_m", sorted(ROWS))
+@pytest.mark.parametrize("op", sorted(_OPS))
+def test_half_m_tile_rows_match_the_full_tile(op, block_m, cases, clean_env, launches):
+    case = cases[op, block_m]
     clean_env.setenv("AITER_TRITON_MOE_GLUON_HALF_M_TILE", "0")
-    full = _gemm1(op, cases[op])
+    full = _gemm1(op, case)
     assert [launch[:2] for launch in launches] == [(False, None)]
 
     clean_env.setenv("AITER_TRITON_MOE_GLUON_HALF_M_TILE", "1")
     _clear_config_caches()
-    half = _gemm1(op, cases[op])
-    assert launches[1][:2] == (True, 64)
+    half = _gemm1(op, case)
+    assert launches[1][:2] == (True, block_m // 2)
     # Both launches read the same A scales; for MX activations, the sorted ones.
     assert launches[0][2] == launches[1][2] == ScaleSwizzle.SORTED_SHUFFLED
     assert torch.equal(half, full)
 
-    ref = _reference(op, cases[op])
+    ref = _reference(op, case)
     torch.testing.assert_close(half.float(), ref, atol=0.25, rtol=0.05)
 
 
-def test_a8w4_takes_the_half_m_tile_by_default(cases, clean_env, launches):
-    _gemm1("a8w4", cases["a8w4"])
-    assert [launch[:2] for launch in launches] == [(True, 64)]
+@pytest.mark.parametrize("block_m", sorted(ROWS))
+@pytest.mark.parametrize("op", sorted(_OPS))
+def test_every_dtype_takes_the_half_m_tile_by_default(
+    op, block_m, cases, clean_env, launches
+):
+    _gemm1(op, cases[op, block_m])
+    assert [launch[:2] for launch in launches] == [(True, block_m // 2)]
 
 
-def test_a8w8_keeps_one_tile(cases, clean_env, launches):
-    # Its block_m 64 config has another BLOCK_N and warp split, so no half-height
-    # tile fits the block_m 128 launch.
-    clean_env.setenv("AITER_TRITON_MOE_GLUON_HALF_M_TILE", "1")
-    out = _gemm1("a8w8", cases["a8w8"])
+def test_a_half_tile_that_does_not_fit_keeps_one_tile(
+    cases, clean_env, launches, monkeypatch
+):
+    # Without its bm128_half_tile entry, the a8w8 block_m 64 config has another
+    # BLOCK_N and warp split, so no half-height tile fits the block_m 128 launch.
+    table = dict(conf.get_moe_dispatch("A8W8-GEMM1", conf.get_arch(), "gluon"))
+    del table["bm128_half_tile"]
+    original = conf.get_moe_dispatch
+    monkeypatch.setattr(
+        conf,
+        "get_moe_dispatch",
+        lambda name, *a: table if name == "A8W8-GEMM1" else original(name, *a),
+    )
+    out = _gemm1("a8w8", cases["a8w8", 128])
     assert [launch[:2] for launch in launches] == [(False, None)]
-    ref = _reference("a8w8", cases["a8w8"])
+    ref = _reference("a8w8", cases["a8w8", 128])
     torch.testing.assert_close(out.float(), ref, atol=0.25, rtol=0.05)
 
 
-def _a8w4_gemm1_config(block_m, half_block=False):
+_DTYPES = {
+    "a4w4": (DtypeQuant.MXFP4, DtypeQuant.MXFP4),
+    "a8w4": (DtypeQuant.MXFP8, DtypeQuant.MXFP4),
+    "a8w8": (DtypeQuant.MXFP8, DtypeQuant.MXFP8),
+}
+
+
+def _gemm1_config(op, block_m, half_block=False):
     return conf._default_launch_config(
-        block_m,
-        N,
-        K,
-        DtypeQuant.MXFP8,
-        DtypeQuant.MXFP4,
-        False,
-        True,
-        half_block=half_block,
+        block_m, N, K, *_DTYPES[op], False, True, half_block=half_block
     )
 
 
-def test_a8w4_gemm1_family_sets_the_half_m_tile(clean_env):
-    # The A8W4-GEMM1 family asks for the tile at block_m 128 only, and streams the
+def _a8w4_gemm1_config(block_m, half_block=False):
+    return _gemm1_config("a8w4", block_m, half_block)
+
+
+@pytest.mark.parametrize("block_m", [128])
+@pytest.mark.parametrize("op", sorted(_OPS))
+def test_gemm1_family_sets_the_half_m_tile(op, block_m, clean_env):
+    # Each GEMM1 family asks for the tile at block_m 128, and streams the
     # result of a launch whose experts average at most half an M block.
-    entry = conf.get_moe_dispatch("A8W4-GEMM1", conf.get_arch(), "gluon")
-    # The block_m 16/32 entries are full tiles and never ask for the half tile.
-    assert {k: v for k, v in entry.items() if v and k.startswith("bm128")} == {
-        "bm128_any": {"HALF_M_TILE": True},
-        "bm128_half": {"result_cache_modifier": ".cs"},
-    }
-    assert not any(
-        "HALF_M_TILE" in v for k, v in entry.items() if not k.startswith("bm128")
-    )
-    assert _a8w4_gemm1_config(128)["HALF_M_TILE"] is True
-    assert _a8w4_gemm1_config(128)["result_cache_modifier"] == ""
-    launch = _a8w4_gemm1_config(128, half_block=True)
+    family = conf._GEMM1_FAMILIES[_DTYPES[op]]
+    entry = conf.get_moe_dispatch(family, conf.get_arch(), "gluon")
+    assert entry[f"bm{block_m}_any"]["HALF_M_TILE"] is True
+    assert entry[f"bm{block_m}_half"] == {"result_cache_modifier": ".cs"}
+    # The block_m 16/32 entries are full tiles and do not ask for the half tile.
+    assert not any("HALF_M_TILE" in entry[f"bm{bm}_any"] for bm in (16, 32))
+    assert _gemm1_config(op, block_m)["HALF_M_TILE"] is True
+    assert _gemm1_config(op, block_m)["result_cache_modifier"] == ""
+    launch = _gemm1_config(op, block_m, half_block=True)
     assert launch["result_cache_modifier"] == ".cs"
     half = dict(
         conf._gemm1_half_m_config(
-            conf._cfg_key(launch),
-            128,
-            N,
-            K,
-            DtypeQuant.MXFP8,
-            DtypeQuant.MXFP4,
-            False,
+            conf._cfg_key(launch), block_m, N, K, *_DTYPES[op], False
         )
     )
-    assert half["BLOCK_M"] == 64 and half["result_cache_modifier"] == ".cs"
-    assert _a8w4_gemm1_config(64, half_block=True)["result_cache_modifier"] == ""
-    assert _a8w4_gemm1_config(64)["HALF_M_TILE"] is False
+    assert half["BLOCK_M"] == block_m // 2 and not half["HALF_M_TILE"]
+    for key in ("BLOCK_N", "warps_per_cta", "WAVES_PER_EU") + conf._HALF_M_LAUNCH_KEYS:
+        # The launch config may lack a newer launch key; the half tile takes its default.
+        default = conf.TuningSpec._field_defaults.get(key)
+        assert half[key] == launch.get(key, default), key
     # Not for GEMM2.
-    gemm2 = conf._default_launch_config(
-        128, N, K, DtypeQuant.MXFP8, DtypeQuant.MXFP4, False, False
-    )
+    gemm2 = conf._default_launch_config(block_m, N, K, *_DTYPES[op], False, False)
     assert not gemm2["HALF_M_TILE"]
+
+
+def test_a_launch_that_reads_the_weights_directly_takes_no_half_tile_entry(clean_env):
+    # A direct_b launch reads no host copies, so the half tile is the plain block_m / 2
+    # config: for a8w8 its BLOCK_N and warps differ, so the launch has one tile.
+    launch = conf._default_launch_config(
+        128, N, K, *_DTYPES["a8w8"], False, True, direct_b=True, half_block=True
+    )
+    items = conf._cfg_key(launch)
+    args = (items, 128, N, K, *_DTYPES["a8w8"], False)
+    assert conf._gemm1_half_m_config(*args) is not None
+    assert conf._gemm1_half_m_config(*args, direct_b=True) is None
 
 
 @pytest.mark.parametrize("value", ["0", "1"])

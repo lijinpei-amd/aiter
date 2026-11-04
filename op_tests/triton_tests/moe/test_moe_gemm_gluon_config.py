@@ -68,6 +68,9 @@ def _clean_tuning_environment(monkeypatch):
         conf._get_gluon_config_cached,
         conf._family_launch_config,
         conf._gemm2_half_m_config,
+        conf._gemm1_family_entry,
+        conf._gemm1_half_tile,
+        conf._gemm1_half_m_config,
     )
     for cached in caches:
         cached.cache_clear()
@@ -558,12 +561,20 @@ _GEMM1_ARGS = (32, 4096, 4096, DtypeQuant.MXFP8, DtypeQuant.MXFP4, False, True)
 @pytest.mark.parametrize("family", sorted(conf._GEMM1_FAMILIES.values()))
 def test_gemm1_families_hold_tuning_values_only(family):
     table = get_moe_dispatch(family, "gfx950", "gluon")
-    # bm<block_m>_any entries, plus bm<block_m>_half for the half-height tile: GEMM1
-    # has no other grid classes.
+    # bm<block_m>_any entries, plus bm<block_m>_half and bm<block_m>_half_tile for the
+    # half-height tile: GEMM1 has no other grid classes.
     assert table
     assert set(table) <= {
-        f"bm{bm}_{cls}" for bm in conf._SUPPORTED_BLOCK_M for cls in ("any", "half")
+        f"bm{bm}_{cls}"
+        for bm in conf._SUPPORTED_BLOCK_M
+        for cls in ("any", "half", "half_tile")
     }
+    for name in table:
+        assert name.rsplit("_", 1)[0].removesuffix("_half") + "_any" in table, name
+    # The launch keys: the block_m 128 tile is Python's, and _half sets launch keys.
+    for name, entry in table.items():
+        if name == "bm128_any" or name.endswith("_half"):
+            assert set(entry) <= set(conf._GEMM1_ENV), name
     known = set(
         conf.get_gluon_config_uncached(
             32, 4096, 4096, DtypeQuant.MXFP8, DtypeQuant.MXFP4
@@ -594,6 +605,45 @@ def test_gemm1_entry_that_cannot_launch_keeps_the_ladder(gemm1_tables):
     assert conf._default_launch_config(*_GEMM1_ARGS) == conf.get_gluon_config(
         *_GEMM1_ARGS[:5]
     )
+
+
+#: A launch with a half-height tile from its family's _half_tile entry: a8w8
+#: dsv4-pro T=4096 (block_m 128, a mean of 64 rows).
+_GEMM1_HALF_ARGS = (128, 6144, 7168, DtypeQuant.MXFP8, DtypeQuant.MXFP8, False, True)
+
+
+def _gemm1_half_tile_config():
+    launch = conf._default_launch_config(*_GEMM1_HALF_ARGS, half_block=True)
+    items = conf._gemm1_half_m_config(conf._cfg_key(launch), *_GEMM1_HALF_ARGS[:6])
+    return None if items is None else dict(items)
+
+
+def test_gemm1_half_tile_is_read_from_its_family(gemm1_tables):
+    half = _gemm1_half_tile_config()
+    assert half["BLOCK_M"] == 64 and half["BLOCK_N"] == 256
+    for cached in (conf._gemm1_half_tile, conf._gemm1_half_m_config):
+        cached.cache_clear()
+    gemm1_tables["A8W8-GEMM1"]["bm128_half_tile"]["GROUP_M"] = 2
+    assert _gemm1_half_tile_config() == dict(half, GROUP_M=2)
+    # Without the entry, the block_m 64 config has another BLOCK_N: no half tile.
+    for cached in (conf._gemm1_half_tile, conf._gemm1_half_m_config):
+        cached.cache_clear()
+    del gemm1_tables["A8W8-GEMM1"]["bm128_half_tile"]
+    assert _gemm1_half_tile_config() is None
+
+
+def test_gemm1_environment_override_wins_over_the_half_tile_entry(monkeypatch):
+    half = _gemm1_half_tile_config()
+    assert half["K_UNROLL"] == 6
+    monkeypatch.setenv("AITER_TRITON_MOE_GLUON_K_UNROLL", "3")
+    for cached in (
+        conf._get_gluon_config_cached,
+        conf._family_launch_config,
+        conf._gemm1_half_tile,
+        conf._gemm1_half_m_config,
+    ):
+        cached.cache_clear()
+    assert _gemm1_half_tile_config()["K_UNROLL"] == 3
 
 
 def test_gemm1_environment_override_wins_over_the_family_entry(monkeypatch):
@@ -644,7 +694,16 @@ def test_large_t_mxfp8_mxfp4_gemm1_interleaves_mfma_with_memory(
         {"small_grid": True},
     ],
 )
-def test_t256_mxfp8_gemm1_geometry_override_is_narrow(overrides):
+def test_t256_mxfp8_gemm1_geometry_override_is_narrow(overrides, monkeypatch):
+    # Without the GEMM1 families, which tune the neighbouring launches on purpose.
+    original = conf.get_moe_dispatch
+    monkeypatch.setattr(
+        conf,
+        "get_moe_dispatch",
+        lambda name, *a: (
+            {} if name in conf._GEMM1_FAMILIES.values() else original(name, *a)
+        ),
+    )
     args = {
         "block_m": 64,
         "N": 4096,

@@ -775,7 +775,11 @@ def get_gluon_config_uncached(
 
 #: Tuned GEMM1 (gate/up projection with SwiGLU) families,
 #: ``configs/gfx950/gluon/moe/<family>/``.
-_GEMM1_FAMILIES = {(DtypeQuant.MXFP8, DtypeQuant.MXFP4): "A8W4-GEMM1"}
+_GEMM1_FAMILIES = {
+    (DtypeQuant.MXFP4, DtypeQuant.MXFP4): "A4W4-GEMM1",
+    (DtypeQuant.MXFP8, DtypeQuant.MXFP4): "A8W4-GEMM1",
+    (DtypeQuant.MXFP8, DtypeQuant.MXFP8): "A8W8-GEMM1",
+}
 
 #: Tuned GEMM2 (no activation) families, ``configs/gfx950/gluon/moe/<family>/``.
 _GEMM2_FAMILIES = {
@@ -834,20 +838,40 @@ _GEMM1_ENV = {
 
 @cache
 def _gemm1_family_entry(block_m, dq_a, dq_b, half_block) -> tuple:
-    """The operands' GEMM1 family entry as sorted items (empty when there is none):
-    ``bm<block_m>_any``, overlaid by ``bm<block_m>_half`` when ``half_block``. Its
-    keys must be in :data:`_GEMM1_ENV`."""
+    """The :data:`_GEMM1_ENV` keys of the operands' GEMM1 family entry as sorted items
+    (empty when there is none): ``bm<block_m>_any``, overlaid by ``bm<block_m>_half``
+    when ``half_block``. The block_m 128 tile and every ``_half`` entry hold only these
+    keys; the other keys of a ``_any`` entry are a tile (:func:`_family_tuned`)."""
     family = _GEMM1_FAMILIES.get((dq_a, dq_b))
     if family is None:
         return ()
     table = get_moe_dispatch(family, get_arch(), "gluon")
+    for name in (f"bm{block_m}_half",) + (
+        (f"bm{block_m}_any",) if block_m == 128 else ()
+    ):
+        unknown = set(table.get(name, {})) - set(_GEMM1_ENV)
+        assert not unknown, f"{family} {name}: keys {sorted(unknown)} not allowed"
     entry = {
         **table.get(f"bm{block_m}_any", {}),
         **(table.get(f"bm{block_m}_half", {}) if half_block else {}),
     }
-    unknown = set(entry) - set(_GEMM1_ENV)
-    assert not unknown, f"{family} bm{block_m}: keys {sorted(unknown)} not allowed"
-    return tuple(sorted((k, _hashable(v)) for k, v in entry.items()))
+    return tuple(sorted((k, _hashable(v)) for k, v in entry.items() if k in _GEMM1_ENV))
+
+
+@cache
+def _gemm1_half_tile(block_m, dq_a, dq_b, env_keys: tuple) -> tuple:
+    """The operands' GEMM1 family entry ``bm<block_m>_half_tile`` as sorted items: the
+    keys of a block_m launch's half-height tile on top of the ``block_m / 2`` config,
+    without the ``env_keys`` (see :func:`_family_env_keys`)."""
+    family = _GEMM1_FAMILIES.get((dq_a, dq_b))
+    if family is None:
+        return ()
+    entry = get_moe_dispatch(family, get_arch(), "gluon").get(
+        f"bm{block_m}_half_tile", {}
+    )
+    return tuple(
+        sorted((k, _hashable(v)) for k, v in entry.items() if k not in env_keys)
+    )
 
 
 def _gemm1_tuned(block_m, dq_a, dq_b, half_block=False) -> dict:
@@ -883,10 +907,13 @@ def _family_tuned(family, block_m, grid) -> dict:
     """The ``family`` entry for ``block_m`` (empty when it has none):
     ``bm<block_m>_any``, overlaid by ``bm<block_m>_<grid>`` ("small", "multi" or
     "half") when the family has that entry."""
-    return {
+    entry = {
         **_family_entry(family, block_m, "any"),
         **_family_entry(family, block_m, grid),
     }
+    # A GEMM1 family's launch keys apply on top of the whole tile (_gemm1_tuned).
+    gemm1 = family in _GEMM1_FAMILIES.values()
+    return {k: v for k, v in entry.items() if not (gemm1 and k in _GEMM1_ENV)}
 
 
 @cache
@@ -1253,10 +1280,6 @@ def _default_launch_config(
             B_PRESHUFFLED=True,
             ALLOW_B_VIA_LDS=False,
         )
-        # The A8W4-GEMM1 family asks for a half-height tile, which
-        # _gemm1_half_m_config gives only where it fits the launch, and sets the
-        # result policy of launches whose experts average at most 64 rows.
-        c.update(_gemm1_tuned(block_m, dq_a, dq_b, half_block))
     if (
         apply_swiglu
         and dq_b == DtypeQuant.MXFP4
@@ -1352,6 +1375,11 @@ def _default_launch_config(
             K_UNROLL=3,
             VGPR_PREFETCH_K=128,
         )
+    if apply_swiglu:
+        # The GEMM1 family can ask for a half-height tile, which _gemm1_half_m_config
+        # gives only where it fits the launch, and set the result policy of launches
+        # whose experts average at most half an M block.
+        c.update(_gemm1_tuned(block_m, dq_a, dq_b, half_block))
     if dq_b == DtypeQuant.MXFP8 and (
         # Not for GEMM2: its shuffled scales at block_m 32 are 1.3-2.5% slower with
         # the hint, and block_m 16 is flat.
@@ -1413,24 +1441,34 @@ _HALF_M_LAUNCH_KEYS = (
 
 
 @cache
-def _gemm1_half_m_config(cfg_items: tuple, block_m, N, K, dq_a, dq_b, small_grid):
+def _gemm1_half_m_config(
+    cfg_items: tuple, block_m, N, K, dq_a, dq_b, small_grid, direct_b=False
+):
     """The half-height tile of a GEMM1 launch whose config is ``cfg_items``, as sorted
     config items, or None when the launch has none.
 
     The tile is the ``_default_launch_config`` of ``block_m / 2`` for the same launch,
-    and it takes the launch's operand copies and result policy
-    (:data:`_HALF_M_LAUNCH_KEYS`). It must use
-    the launch's grid, warps and waves per EU, so a config that differs in one of them
-    gives no half-height tile.
+    with the family's ``bm<block_m>_half_tile`` entry on top (not when the launch reads
+    the weights directly, ``direct_b``), and it takes the launch's operand copies and
+    result policy (:data:`_HALF_M_LAUNCH_KEYS`). It must use the launch's grid, warps
+    and waves per EU, so a config that differs in one of them gives no half-height
+    tile.
     """
     cfg = dict(cfg_items)
     if not cfg.get("HALF_M_TILE") or block_m // 2 not in _SUPPORTED_BLOCK_M:
         return None
-    half = dict(
-        _default_launch_config(block_m // 2, N, K, dq_a, dq_b, small_grid, True),
-        HALF_M_TILE=False,
-        **{key: cfg.get(key, TuningSpec._field_defaults.get(key)) for key in _HALF_M_LAUNCH_KEYS},
-    )
+    tile = () if direct_b else _gemm1_half_tile(block_m, dq_a, dq_b, _family_env_keys())
+    half = {
+        **_default_launch_config(
+            block_m // 2, N, K, dq_a, dq_b, small_grid, True, direct_b=direct_b
+        ),
+        **dict(tile),
+        "HALF_M_TILE": False,
+        **{
+            key: cfg.get(key, TuningSpec._field_defaults.get(key))
+            for key in _HALF_M_LAUNCH_KEYS
+        },
+    }
     if any(half[k] != cfg[k] for k in ("BLOCK_N", "warps_per_cta", "WAVES_PER_EU")):
         return None
     # The copies must be ones the tile can read.

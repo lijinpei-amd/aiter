@@ -167,12 +167,12 @@ In MOE dispatch tables, flag:
   `block_m`, or that repeats a key of `bm<block_m / 2>_any` with the same value;
   a merged entry with `"ALLOW_B_VIA_LDS": false` and without
   `"B_PRESHUFFLED": true`.
-- In a gfx950 Gluon GEMM1 family (`a8w4_gemm1`): a key other than
-  `bm<block_m>_any` and `bm<block_m>_half`; a `_half` entry without the `_any`
-  entry of its `block_m`; a merged entry with `"ALLOW_B_VIA_LDS": false` and
-  without `"B_PRESHUFFLED": true`; a `bm128_any` or `_half` key other than
-  `HALF_M_TILE` and `result_cache_modifier` (the block_m 128 entries only ask
-  for the half-height tile and its result policy).
+- In a gfx950 Gluon GEMM1 family (`a4w4_gemm1`, `a8w4_gemm1`, `a8w8_gemm1`): a
+  key other than `bm<block_m>_any`, `bm<block_m>_half` and `bm<block_m>_half_tile`;
+  a `_half` or `_half_tile` entry without the `_any` entry of its `block_m`; a
+  merged entry with `"ALLOW_B_VIA_LDS": false` and without `"B_PRESHUFFLED": true`;
+  a `bm128_any` or `_half` key other than `HALF_M_TILE` and `result_cache_modifier`
+  (the launch keys: they ask for the half-height tile and set its result policy).
 
 Do not flag a GEMM2 `_small`, `_multi` or `_half` entry that has only a few
 keys. The launch merges at most one of them over `bm<block_m>_any`, in this

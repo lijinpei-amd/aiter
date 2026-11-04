@@ -177,11 +177,12 @@ average two or more M blocks, and `_half` when they average at most half an M
 block. All other launches take `_any` alone. An optional
 `bm<block_m>_half_tile` entry tunes the half-height tile of a `_half` launch.
 The `MOE-REDUCE` family tunes the top-k combine of `reduce_grouped`.
-The GEMM1 family
-`configs/gfx950/gluon/moe/a8w4_gemm1/` has full-tile `bm<block_m>_any` entries for
-block_m 16 and 32, and block_m 128 entries that only ask for the half-height tile
-(`bm128_any`) and set its result policy (`bm128_half`, taken when the experts
-average at most half an M block).
+The GEMM1 families
+(`configs/gfx950/gluon/moe/{a4w4,a8w4,a8w8}_gemm1/`) have tile entries
+(`bm<block_m>_any`) where the Python code sets no tile. An entry can also ask for
+the half-height tile (`HALF_M_TILE`) and set its result policy (`bm<block_m>_half`,
+taken when the experts average at most half an M block). A
+`bm<block_m>_half_tile` entry sets the half-height tile's own keys.
 
 [`configs/AGENTS.md`](configs/AGENTS.md) has the layout, the file names, the
 loaders, the JSON format and the steps to add a config. To tune a GEMM, use

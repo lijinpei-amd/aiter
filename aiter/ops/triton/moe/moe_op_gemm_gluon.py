@@ -340,7 +340,7 @@ def _launch_spec(
     half_items = None
     if half_block and act is not None:
         half_items = _gemm1_half_m_config(
-            _cfg_key(c), block_m, N, K, dq_a, dq_b, small_grid
+            _cfg_key(c), block_m, N, K, dq_a, dq_b, small_grid, direct_b
         )
     elif half_block:
         half_items = _gemm2_half_m_config(

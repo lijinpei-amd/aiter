@@ -1,0 +1,11 @@
+{
+    "bm16_any": {},
+    "bm32_any": {},
+    "bm64_any": {},
+    "bm128_any": {
+        "HALF_M_TILE": true
+    },
+    "bm128_half": {
+        "result_cache_modifier": ".cs"
+    }
+}
