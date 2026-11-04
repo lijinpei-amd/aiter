@@ -108,11 +108,13 @@ Not kept, measured: a 16-row half-height tile at `bm32_half` (0.990-0.999); `.cs
 a4w4 and a8w4 `bm128_any` (1.00-1.05); a 512-column 32-row tile for a4w4 (slower under
 random routing) and a8w8 (spills 29-35 VGPRs); the XCD order at block_m 64 (slower
 under random routing); per-shape `reduce_grouped` tiles (512 or 2048 columns, 1 or 4
-warps, no load hint; a8w4 at every prefill shape, a4w4 and a8w8 at T=4096/16384). No
-variant made both the reduce kernel and the whole call at least 2% faster in both
-routings. The two shapes whose whole call read 2-4% faster had an unchanged or slower
-reduce, and alone in 4 fresh-process pairs they are 0.992-1.012. No load hint makes the
-reduce up to 1.38x slower (a8w4 glm52-base T=4096). Table:
+warps, no load hint; a8w4 at every prefill shape, a4w4 and a8w8 at T=4096/16384). In the
+screens, 15 variant / shape pairs, all at T=4096, read a whole call at least 2% faster
+in one routing and at most 2% slower in the other. Re-timed alone in 4 fresh-process
+pairs per routing, their medians are 0.985-1.022, apart from one borderline 0.980. 8 more
+pairs put that one at 1.010 / 1.016, and an A/A control of the same cell spans
+0.951-1.035 per pair. No load hint makes the reduce up to 1.38x slower (a8w4 glm52-base
+T=4096). Table:
 `bench_out/gluon_moe_regression/gemm2/gemm2_prefill_generalize.md`.
 
 Remaining gap, largest first:
