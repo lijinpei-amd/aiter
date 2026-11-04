@@ -510,7 +510,8 @@ def test_small_block_m_mxfp8_mxfp4_gemm1_reads_b_from_registers(block_m, N, K):
     [
         {"small_grid": True},
         {"apply_swiglu": False},
-        {"dq_b": DtypeQuant.MXFP8},
+        # MXFP8 weights: no A8W8-GEMM1 tile at block_m 16.
+        {"dq_b": DtypeQuant.MXFP8, "block_m": 16},
         {"block_m": 64},
         {"N": 2880},
         {"N": 4096, "K": 7168},
@@ -541,12 +542,17 @@ def test_small_block_m_mxfp8_mxfp4_gemm1_register_b_is_narrow(overrides):
     )
 
 
-@pytest.mark.parametrize("block_m", [16, 32])
-def test_small_block_m_gemm1_families_read_b_from_registers(block_m):
-    # The A4W4-GEMM1 tiles at block_m 16/32 (T=8..1024 in the model matrix).
-    config = conf._default_launch_config(
-        block_m, 4096, 4096, DtypeQuant.MXFP4, DtypeQuant.MXFP4, False, True
-    )
+@pytest.mark.parametrize(
+    "dq_a,dq_b,block_m",
+    [
+        (DtypeQuant.MXFP4, DtypeQuant.MXFP4, 16),
+        (DtypeQuant.MXFP4, DtypeQuant.MXFP4, 32),
+        (DtypeQuant.MXFP8, DtypeQuant.MXFP8, 32),
+    ],
+)
+def test_small_block_m_gemm1_families_read_b_from_registers(dq_a, dq_b, block_m):
+    # The A4W4-GEMM1 and A8W8-GEMM1 tiles at block_m 16/32 (dsv4-flash T=8..1024).
+    config = conf._default_launch_config(block_m, 4096, 4096, dq_a, dq_b, False, True)
     assert not config["ALLOW_B_VIA_LDS"] and config["B_PRESHUFFLED"]
     assert config["B_SCALE_SHUFFLED"] and config["BLOCK_K"] == 256
     assert config["BLOCK_N"] == (128 if block_m == 16 else 256)
