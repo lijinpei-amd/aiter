@@ -1472,7 +1472,10 @@ def moe_gemm1_a8w4_mxfp8_out(
     ``scale_layout="sorted_shuffled"`` writes the scales the way gemm2 reads them with
     A_SCALE_SORTED_SHUFFLED instead (moe_sort_scales.cuh): rows at their padded routing
     position in ``routing_data.block_m`` blocks, one 256 B run per 32-row stripe and
-    K256. The buffer is ``(n_blocks * block_m, N/64)`` bytes, zero where no row lands.
+    K256. The buffer is ``(n_blocks * block_m, N/64)`` bytes and only the bytes of routed
+    rows are written: the rest (padding rows, unused blocks) is left uninitialised. GEMM2
+    reads a padding row's scales only for an output row it masks, and an MFMA row's
+    scale touches that row alone, so nothing reads them into a result.
 
     Raises if the shape is outside the Gluon path.
     """
@@ -1487,7 +1490,7 @@ def moe_gemm1_a8w4_mxfp8_out(
         assert out_n % 256 == 0, "sorted-shuffled scales pack K256 groups"
         block_m = int(routing_data.block_m)
         rows = routing_data.n_blocks(M, block_m) * block_m
-        y_scales = torch.zeros(
+        y_scales = torch.empty(
             (rows, out_n // MX_GROUP_SIZE), dtype=torch.uint8, device=x.device
         )
     else:

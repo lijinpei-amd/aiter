@@ -60,7 +60,7 @@ def _split(w, w_scale, bias):
 def _shuffle_reference(raw, rdata):
     """Host form of moe_sort_scales.cuh's layout: raw (sorted, unpadded) scale rows
     moved to their padded routing position, then one 256 B run per 32-row stripe and
-    K256."""
+    K256. Returns (bytes, mask of the bytes a routed row owns)."""
     bm = int(rdata.block_m)
     ed = rdata.expt_data
     offs_raw = ed.token_offs_raw.long()
@@ -75,7 +75,13 @@ def _shuffle_reference(raw, rdata):
         (rdata.n_blocks(m, bm) * bm, cols), dtype=torch.uint8, device=raw.device
     )
     dense[pad[e] * bm + (rows - offs_raw[e])] = raw
-    return dense.view(-1, 2, 16, cols // 8, 2, 4).permute(0, 3, 5, 2, 4, 1).reshape(-1)
+    live = torch.zeros_like(dense, dtype=torch.bool)
+    live[pad[e] * bm + (rows - offs_raw[e])] = True
+
+    def shuffle(t):
+        return t.view(-1, 2, 16, cols // 8, 2, 4).permute(0, 3, 5, 2, 4, 1).reshape(-1)
+
+    return shuffle(dense), shuffle(live)
 
 
 def _fused(args, act, **kw):
@@ -145,7 +151,11 @@ def test_gemm1_sorted_shuffled_scales(m, n, k, n_expts_tot, n_expts_act, device=
     y_raw, s_raw = _fused(args, act, gate_up_split=True)
     y_shf, s_shf = _fused(args, act, gate_up_split=True, scale_layout="sorted_shuffled")
     assert torch.equal(y_shf.view(torch.uint8), y_raw.view(torch.uint8))
-    assert torch.equal(s_shf.reshape(-1), _shuffle_reference(s_raw, rdata))
+    ref, live = _shuffle_reference(s_raw, rdata)
+    got = s_shf.reshape(-1)
+    assert got.numel() == ref.numel()
+    # Only routed rows' bytes are written; the rest of the buffer is uninitialised.
+    assert torch.equal(got[live], ref[live])
 
 
 @pytest.mark.parametrize("m, n, k, n_expts_tot, n_expts_act", SHAPES)
