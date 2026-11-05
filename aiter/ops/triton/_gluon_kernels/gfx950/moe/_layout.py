@@ -20,7 +20,7 @@ from ._packed_scale import (
     packed_scale_lds_view_layout,
     packed_scale_sel,
 )
-from ._types import Component, WeightGuHbmLayout
+from ._types import Component, DtypeQuant, WeightGuHbmLayout
 
 __all__ = ["KernelLayout"]
 
@@ -670,7 +670,9 @@ class KernelLayout:
             )
         gu_split = fc.weight_gu_hbm_layout.value == WeightGuHbmLayout.SPLIT
         quant_staging_rows = BM if gu_split else SLOT_M
-        quant_staging_rotates = fc.output_quant.value is not None and not gu_split
+        quant_staging_rotates = (
+            fc.output_quant.value == DtypeQuant.MXFP4 and not gu_split
+        )
         quant_staging_layout = gl.SwizzledSharedLayout(
             vec=1, per_phase=1, max_phase=1, order=[1, 0]
         )

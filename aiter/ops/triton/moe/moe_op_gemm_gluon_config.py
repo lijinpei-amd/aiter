@@ -1402,6 +1402,7 @@ def _default_launch_config(
 #: and the cache policy of the result, which both tiles write.
 _HALF_M_LAUNCH_KEYS = (
     "A_SCALE_SORTED_SHUFFLED",
+    "OUT_SCALE_SORTED_SHUFFLED",
     "B_SCALE_SHUFFLED",
     "B_PRESHUFFLED",
     "result_cache_modifier",
@@ -1425,7 +1426,7 @@ def _gemm1_half_m_config(cfg_items: tuple, block_m, N, K, dq_a, dq_b, small_grid
     half = dict(
         _default_launch_config(block_m // 2, N, K, dq_a, dq_b, small_grid, True),
         HALF_M_TILE=False,
-        **{key: cfg[key] for key in _HALF_M_LAUNCH_KEYS},
+        **{key: cfg.get(key, TuningSpec._field_defaults.get(key)) for key in _HALF_M_LAUNCH_KEYS},
     )
     if any(half[k] != cfg[k] for k in ("BLOCK_N", "warps_per_cta", "WAVES_PER_EU")):
         return None

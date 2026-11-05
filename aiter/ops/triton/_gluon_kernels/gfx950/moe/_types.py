@@ -388,6 +388,11 @@ class TuningSpec(NamedTuple):
     #: An M block that holds at most BLOCK_M / 2 rows runs a second tile, BLOCK_M / 2
     #: rows high, from its own config (the half-height tile, agents/CONCEPTS.md).
     HALF_M_TILE: bool = False
+    #: Fused MX output quant: write the output's E8M0 scales in the sorted-shuffled
+    #: layout gemm2 reads with A_SCALE_SORTED_SHUFFLED (moe_sort_scales.cuh: one 256 B
+    #: run per 32-row stripe and K256, rows at their padded routing position) instead
+    #: of the raw (M, N/32) tensor. The payload stays in sorted, unpadded rows.
+    OUT_SCALE_SORTED_SHUFFLED: bool = False
 
 
 class ActivationSpec(NamedTuple):

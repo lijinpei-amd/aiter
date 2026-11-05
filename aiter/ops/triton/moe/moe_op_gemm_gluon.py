@@ -190,7 +190,7 @@ def gluon_supported(
         return False, "a per-tensor weight scale is not implemented on the Gluon path"
     if x_static_scale is not None and dq_a != DtypeQuant.FP8_E4M3:
         return False, "a static activation scale only applies to unscaled fp8 operands"
-    if out_quant not in (None, DtypeQuant.MXFP4):
+    if out_quant not in (None, DtypeQuant.MXFP4, DtypeQuant.MXFP8):
         return False, f"output_quant {out_quant} is not implemented"
     if swizzle_mx_scale is not None:
         # CDNA4_SCALE keeps the direct-to-LDS write coalesced but needs the descriptor
@@ -909,8 +909,12 @@ def moe_gemm_gluon(
     config: dict | None = None,
     gate_up_split: bool | None = None,
     epilogue: EpilogueMode | int | None = None,
+    out_scale_sorted_shuffled: bool = False,
 ):
     """Launch the Gluon grouped GEMM into ``y`` (shape ``(1, M, N // ARN)``).
+
+    ``out_scale_sorted_shuffled``: with a fused MX output quant, write ``y_scales`` in
+    the sorted-shuffled layout gemm2 reads (OUT_SCALE_SORTED_SHUFFLED).
 
     Operand dtypes are inferred from the tensors -- ``uint8`` + scales is MXFP4, fp8 +
     scales is MXFP8, fp8 alone is FP8_E4M3 (unit scales, still on the scaled pipe),
@@ -976,7 +980,12 @@ def moe_gemm_gluon(
         )
     else:
         act = None
-    out_quant = int(DtypeQuant.MXFP4) if y_scales is not None else None
+    if y_scales is None:
+        out_quant = None
+    elif y.dtype == torch.float8_e4m3fn:
+        out_quant = int(DtypeQuant.MXFP8)
+    else:
+        out_quant = int(DtypeQuant.MXFP4)
 
     # Every argument but the config tuple is fixed for this launch, so bind them once.
     # Three of the shuffle branches below rebuild the spec against an amended config,
@@ -1045,6 +1054,13 @@ def moe_gemm_gluon(
         _cfg = dict(
             _cfg, A_SCALE_SORTED_SHUFFLED=a_shuffled, B_SCALE_SHUFFLED=b_shuffled
         )
+        grid_n, constexpr_args, num_warps, waves_per_eu, _cfg, _tc, _half_tc = _spec(
+            _cfg_key(_cfg)
+        )
+
+    if out_scale_sorted_shuffled and not _cfg.get("OUT_SCALE_SORTED_SHUFFLED", False):
+        assert y_scales is not None
+        _cfg = dict(_cfg, OUT_SCALE_SORTED_SHUFFLED=True)
         grid_n, constexpr_args, num_warps, waves_per_eu, _cfg, _tc, _half_tc = _spec(
             _cfg_key(_cfg)
         )
@@ -1383,3 +1399,96 @@ def moe_gemm1_a4w4_mxfp4_out(
     )
     return y[0], y_scales
 
+
+def moe_gemm1_a8w4_mxfp8_out(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    x_scales: torch.Tensor,
+    w_scales: torch.Tensor,
+    bias: torch.Tensor | None,
+    routing_data,
+    gather_indx: torch.Tensor | None,
+    gammas: torch.Tensor | None = None,
+    *,
+    alpha: float = 1.0,
+    limit: float | None = None,
+    swiglu_add_residual: bool = False,
+    config: dict | None = None,
+    gate_up_split: bool | None = None,
+    epilogue: EpilogueMode | int | None = None,
+    scale_layout: str = "raw",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """gemm1 with the activation **and** an MXFP8 output quant fused into the epilogue:
+    the a8w4 counterpart of :func:`moe_gemm1_a4w4_mxfp4_out`. Returns
+    ``(y_fp8, y_scales)``: e4m3 ``(M, N/2)`` and uint8 E8M0 ``(M, N/64)`` (one scale per
+    32 emitted columns, the power-of-2 amax scheme of ``dynamic_mxfp8_quant``), rows in
+    the sorted routing order, i.e. gemm2's operand A for an a8w4 layer.
+
+    ``scale_layout="sorted_shuffled"`` writes the scales the way gemm2 reads them with
+    A_SCALE_SORTED_SHUFFLED instead (moe_sort_scales.cuh): rows at their padded routing
+    position in ``routing_data.block_m`` blocks, one 256 B run per 32-row stripe and
+    K256. The buffer is ``(n_blocks * block_m, N/64)`` bytes, zero where no row lands.
+
+    Raises if the shape is outside the Gluon path.
+    """
+    assert scale_layout in ("raw", "sorted_shuffled"), scale_layout
+    M = x.shape[0] if gather_indx is None else gather_indx.shape[0]
+    N = w.shape[-1]
+    K = x.shape[-1]
+    out_n = N // 2
+    y = torch.empty((1, M, out_n), dtype=torch.float8_e4m3fn, device=x.device)
+    shuffled = scale_layout == "sorted_shuffled"
+    if shuffled:
+        assert out_n % 256 == 0, "sorted-shuffled scales pack K256 groups"
+        block_m = int(routing_data.block_m)
+        rows = routing_data.n_blocks(M, block_m) * block_m
+        y_scales = torch.zeros(
+            (rows, out_n // MX_GROUP_SIZE), dtype=torch.uint8, device=x.device
+        )
+    else:
+        y_scales = torch.empty(
+            (M, out_n // MX_GROUP_SIZE), dtype=torch.uint8, device=x.device
+        )
+    ok, why = gluon_supported(
+        x=x,
+        w=w,
+        x_scales=x_scales,
+        w_scales=w_scales,
+        y=y,
+        bias=bias,
+        routing_data=routing_data,
+        swizzle_mx_scale=None,
+        split_k=1,
+        x_static_scale=None,
+        quant_static_scale=None,
+        out_quant=DtypeQuant.MXFP8,
+        N=N,
+        K=K,
+        apply_swiglu=True,
+    )
+    if not ok:
+        raise NotImplementedError(f"fused MXFP8 gemm1 not available: {why}")
+    moe_gemm_gluon(
+        y,
+        x,
+        w,
+        x_scales,
+        w_scales,
+        bias,
+        gammas,
+        routing_data,
+        gather_indx,
+        None,
+        N,
+        K,
+        True,
+        alpha,
+        limit,
+        swiglu_add_residual,
+        y_scales=y_scales,
+        config=config,
+        gate_up_split=gate_up_split,
+        epilogue=epilogue,
+        out_scale_sorted_shuffled=shuffled,
+    )
+    return y[0], y_scales

@@ -18,10 +18,11 @@ from aiter.ops.triton.utils.common_utils import strip_annotate
 from ._lang import MX_GROUP_CE as MX_GROUP
 from ._lang import optional as _opt
 from ._lang import require_constexpr
-from ._quant import mxfp4_quant_gluon
+from ._quant import mxfp4_quant_gluon, mxfp8_quant_gluon
 from ._types import DtypeQuant, Pane, WeightGuHbmLayout
 
 _DQ_MXFP4: gl.constexpr = gl.constexpr(int(DtypeQuant.MXFP4))
+_DQ_MXFP8: gl.constexpr = gl.constexpr(int(DtypeQuant.MXFP8))
 _WEIGHT_GU_SPLIT: gl.constexpr = gl.constexpr(int(WeightGuHbmLayout.SPLIT))
 
 
@@ -344,6 +345,8 @@ def _epilogue_one_tile(
     lin=None,
     STAGE_ROW: gl.constexpr = 0,
     GATE_PRE: gl.constexpr = False,
+    pid_m=None,
+    OUT_SCALE_CK1: gl.constexpr = 0,
 ):
     """bias -> activation -> gammas -> output_quant -> store, for ONE pane.
 
@@ -462,6 +465,61 @@ def _epilogue_one_tile(
             mask=(rows < M_e)[:, None],
             cache=tuning_cfg.result_cache_modifier,
         )
+    elif require_constexpr(func_cfg.output_quant == _DQ_MXFP8):
+        # Fused MXFP8 output quant (e4m3 payload, one E8M0 scale per 32 emitted
+        # columns), straight off the fp32 accumulator: the power-of-2 amax scale of
+        # dynamic_mxfp8_quant, then the hardware scaled e4m3 pack (see mxfp8_quant_gluon). One byte per value,
+        # so the payload needs no packing and no LDS bounce: the store layout already
+        # gives each lane 16 contiguous bytes. Same caveat as MXFP4: quantizing the
+        # fp32 accumulator is not bit-identical to quantizing a bf16 round trip.
+        gl.static_assert(OUT_SLOT_N % MX_GROUP == 0)
+        LANE8: gl.constexpr = layout.quant_amax_lane_elems(SLOT_M, OUT_SLOT_N)
+        x_fp8, bs = mxfp8_quant_gluon(out, OUT_SLOT_N, SLOT_M, MX_GROUP, LANE8)
+        PL8: gl.constexpr = layout.result_store_layout(SLOT_M, OUT_SLOT_N, 8)
+        pv = gl.convert_layout(x_fp8, PL8, assert_trivial=False)
+        pm = BM * block_id + mi * SLOT_M + gl.arange(0, SLOT_M, layout=gl.SliceLayout(1, PL8))
+        pn = gl.arange(0, OUT_SLOT_N, layout=gl.SliceLayout(0, PL8))
+        gl.amd.cdna4.buffer_store(
+            pv,
+            y_hbm_ptr,
+            pm[:, None] * y_stride_m + (out_n0 + pn)[None, :] * y_stride_n,
+            mask=(pm < M_e)[:, None],
+            cache=tuning_cfg.result_cache_modifier,
+        )
+        S8_COLS: gl.constexpr = OUT_SLOT_N // MX_GROUP
+        SL8: gl.constexpr = layout.result_store_layout(SLOT_M, S8_COLS, 8)
+        sv = gl.convert_layout(bs, SL8, assert_trivial=False)
+        sl8 = mi * SLOT_M + gl.arange(0, SLOT_M, layout=gl.SliceLayout(1, SL8))
+        sm8 = BM * block_id + sl8
+        sn8 = gl.arange(0, S8_COLS, layout=gl.SliceLayout(0, SL8))
+        if require_constexpr(tuning_cfg.OUT_SCALE_SORTED_SHUFFLED):
+            # moe_sort_scales.cuh's layout, in the launch's padded block space: row P
+            # (pid_m * BLOCK_M + local row) and scale column c land at byte
+            # ((s, ku, k_lane, n_lane), ikxdl * 2 + im_a) with s = P // 32,
+            # im_a = P % 32 // 16, n_lane = P % 16, ku = c // 8, ikxdl = c % 8 // 4,
+            # k_lane = c % 4 -- one 256 B run per 32-row stripe and K256.
+            gl.static_assert(OUT_SCALE_CK1 > 0)
+            prow = pid_m * BM + sl8
+            col = out_n0 // MX_GROUP + sn8
+            stripe = (prow // 32)[:, None]
+            im_a = ((prow % 32) // 16)[:, None]
+            n_lane = (prow % 16)[:, None]
+            ku = (col // 8)[None, :]
+            ikxdl = ((col % 8) // 4)[None, :]
+            k_lane = (col % 4)[None, :]
+            offs = (
+                (((stripe * OUT_SCALE_CK1 + ku) * 4 + k_lane) * 16 + n_lane) * 4
+                + ikxdl * 2
+                + im_a
+            )
+            gl.amd.cdna4.buffer_store(sv, ys_hbm_ptr, offs, mask=(sm8 < M_e)[:, None])
+        else:
+            gl.amd.cdna4.buffer_store(
+                sv,
+                ys_hbm_ptr,
+                sm8[:, None] * ys_stride_m + (out_n0 // MX_GROUP + sn8)[None, :] * ys_stride_n,
+                mask=(sm8 < M_e)[:, None],
+            )
     else:
         # Fused MXFP4 output quant, straight off the fp32 accumulator.
         #
@@ -611,6 +669,7 @@ def _epilogue_store(
     tuning_cfg,
     layout,
     GATE_PRE: gl.constexpr = False,
+    pid_m=None,
 ):
     """bias -> activation -> gammas -> output_quant -> store, per pane.
 
@@ -622,6 +681,8 @@ def _epilogue_store(
     """
     SLOT_M: gl.constexpr = tuning_cfg.SLOT_M
     OUT_SLOT_N: gl.constexpr = layout.output_n_slot
+    # Sorted-shuffled output scales: K256 packs per 32-row stripe of the output.
+    CK1: gl.constexpr = N // func_cfg.activation_reduction_n() // 256
 
     NN: gl.constexpr = layout.num_n_slots
     NM: gl.constexpr = layout.num_m_slots
@@ -655,7 +716,7 @@ def _epilogue_store(
     # dead pipeline buffers) and buys NM-1 barrier pairs and one wide store instead of
     # NM narrow ones.
     QROWS: gl.constexpr = layout.quant_staging_rows
-    if require_constexpr(func_cfg.output_quant is not None):
+    if require_constexpr(func_cfg.output_quant == _DQ_MXFP4):
         qp_lds_ptr = gl.allocate_shared_memory(
             gl.uint8, layout.quant_payload_storage_shape(QROWS, OUT_SLOT_N), layout=QSH
         )
@@ -712,8 +773,10 @@ def _epilogue_store(
                 lin=acc[Pane(mi, 1).linear_index(NM)],
                 STAGE_ROW=mi * SLOT_M,
                 GATE_PRE=GATE_PRE,
+                pid_m=pid_m,
+                OUT_SCALE_CK1=CK1,
             )
-        if require_constexpr(func_cfg.output_quant is not None):
+        if require_constexpr(func_cfg.output_quant == _DQ_MXFP4):
             _epi_block_flush(
                 qp_lds_ptr, qs_lds_ptr,
                 y_hbm_ptr, y_stride_m, y_stride_n,
@@ -788,4 +851,6 @@ def _epilogue_store(
                     layout,
                     qp_lds_ptr,
                     qs_lds_ptr,
+                    pid_m=pid_m,
+                    OUT_SCALE_CK1=CK1,
                 )

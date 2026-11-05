@@ -459,7 +459,11 @@ def _moe_gemm_tile(
         acc = regs.acc
 
     y_hbm_ptr = res.ptr + start_m.to(gl.int64) * res.stride_m
-    if require_constexpr(func_cfg.output_quant is not None):
+    if require_constexpr(tuning_cfg.OUT_SCALE_SORTED_SHUFFLED):
+        # Sorted-shuffled output scales are addressed by the padded block pid_m, not
+        # by the expert's raw row offset.
+        ys_hbm_ptr = res.scale_ptr
+    elif require_constexpr(func_cfg.output_quant is not None):
         ys_hbm_ptr = res.scale_ptr + start_m.to(gl.int64) * res.scale_stride_m
     else:
         ys_hbm_ptr: gl.constexpr = None
@@ -484,4 +488,5 @@ def _moe_gemm_tile(
         tuning_cfg,
         layout,
         GATE_PRE=FUSE,
+        pid_m=pid_m,
     )

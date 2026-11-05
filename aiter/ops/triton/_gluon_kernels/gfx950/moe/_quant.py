@@ -19,6 +19,9 @@ from triton.experimental.gluon import language as gl
 __all__ = ["mxfp4_quant_gluon"]
 
 
+from aiter.ops.triton._gluon_kernels.common.utils import mx_e8m0_scale
+
+
 @gluon.jit
 def mxfp4_quant_gluon(
     x,
@@ -146,3 +149,68 @@ def mxfp4_quant_gluon(
             (packed & 0xFF).to(tl.uint8).reshape(BLOCK_SIZE_M, BLOCK_SIZE_N // 2),
             bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS),
         )
+
+
+@gluon.jit
+def mxfp8_quant_gluon(
+    x,
+    BLOCK_SIZE_N: gl.constexpr,
+    BLOCK_SIZE_M: gl.constexpr,
+    MX_BLOCK: gl.constexpr,
+    LANE_ELEMS: gl.constexpr = 0,
+):
+    """fp32 ``[M, N]`` -> (e4m3 ``[M, N]``, E8M0 ``[M, N/32]``).
+
+    The scale is dynamic_mxfp8_quant's (``mx_e8m0_scale(amax, 8)``): amax rounded up to
+    a power of two when its top two mantissa bits are set, minus the e4m3 exponent
+    range 8, biased by 127. On the exponent field that is ``max(E, 8) - 8`` for the
+    rounded amax's biased exponent E, the same integer form mxfp4_quant_gluon uses
+    with 2 in place of 8.
+
+    With ``LANE_ELEMS`` (elements of one MX group a lane owns, see
+    ``KernelLayout.quant_amax_lane_elems``) it follows mxfp4_quant_gluon's single
+    reshape lineage: in-lane fp32 amax, cross-lane integer max, and the hardware pack
+    ``v_cvt_scalef32_pk_fp8_f32``, which takes the E8M0 scale as an operand and
+    converts two f32 to e4m3 at once. Otherwise: a scale multiply and ``.to(fp8)``.
+    """
+    NB: gl.constexpr = BLOCK_SIZE_N // MX_BLOCK
+    if LANE_ELEMS > 1 and MX_BLOCK % LANE_ELEMS == 0:
+        OUTER: gl.constexpr = MX_BLOCK // LANE_ELEMS
+        x5 = x.reshape(BLOCK_SIZE_M, NB, OUTER, LANE_ELEMS // 2, 2)
+        a5 = tl.abs(x5)
+        part = tl.max(a5, axis=-1, keep_dims=True)
+        part = tl.max(part, axis=3, keep_dims=True)
+        amax = tl.max(part.to(tl.int32, bitcast=True), axis=2, keep_dims=True)
+        e_biased = ((amax + 0x200000) >> 23) & 0xFF
+        e_biased = tl.maximum(e_biased, 8)
+        bs_e8m0 = (e_biased - 8).to(tl.uint8)
+        # The instruction takes the dequant scale 2**(bs - 127), i.e. bs in the
+        # exponent field, and divides by it.
+        hw_scale = ((e_biased - 8) << 23).to(tl.float32, bitcast=True)
+        hw5 = gl.full(x5.shape, 1.0, tl.float32, layout=x5.type.layout) * hw_scale
+        evens, odds = tl.split(x5)
+        scale_e, _scale_o = tl.split(hw5)
+        old_vdst = gl.full(evens.shape, 0, tl.int32, layout=evens.type.layout)
+        packed = tl.inline_asm_elementwise(
+            "v_cvt_scalef32_pk_fp8_f32 $0, $2, $3, $4",
+            "=v,0,v,v,v",
+            [old_vdst, evens, odds, scale_e],
+            dtype=tl.int32,
+            is_pure=True,
+            pack=1,
+        )
+        lo = (packed & 0xFF).to(tl.uint8)
+        hi = ((packed >> 8) & 0xFF).to(tl.uint8)
+        q = tl.join(lo, hi).reshape(BLOCK_SIZE_M, BLOCK_SIZE_N)
+        return (
+            q.to(tl.float8e4nv, bitcast=True),
+            bs_e8m0.reshape(BLOCK_SIZE_M, NB),
+        )
+    else:
+        x3 = x.reshape(BLOCK_SIZE_M, NB, MX_BLOCK)
+        amax = tl.max(tl.abs(x3), axis=-1, keep_dims=True)
+        bs_e8m0 = mx_e8m0_scale(amax, 8)
+        # 2**-(bs - 127) as an fp32 bit pattern: exponent field 254 - bs.
+        quant_scale = ((254 - bs_e8m0.to(tl.int32)) << 23).to(tl.float32, bitcast=True)
+        q = (x3 * quant_scale).to(tl.float8e4nv)
+        return q.reshape(BLOCK_SIZE_M, BLOCK_SIZE_N), bs_e8m0.reshape(BLOCK_SIZE_M, NB)
