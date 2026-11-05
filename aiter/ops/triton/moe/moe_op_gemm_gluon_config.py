@@ -828,9 +828,9 @@ _FAMILY_ENV = {
 }
 
 
-#: Ladder keys that a GEMM1 family entry can set, with the AITER_TRITON_MOE_GLUON_
-#: variables that set them in the ladder. When one of them is set, the ladder value
-#: (the environment's) wins over the entry.
+#: The launch keys of a GEMM1 family entry (see :func:`_gemm1_family_entry`), with the
+#: AITER_TRITON_MOE_GLUON_ variables that set them in the ladder. When one of them is
+#: set, the ladder value (the environment's) wins over the entry.
 _GEMM1_ENV = {
     "HALF_M_TILE": ("HALF_M_TILE",),
     "result_cache_modifier": ("RESULT_CACHE_MODIFIER", "RESULT_MOD"),
@@ -867,7 +867,8 @@ def _gemm1_half_tile(block_m, dq_a, dq_b) -> dict:
 
 
 def _gemm1_tuned(block_m, dq_a, dq_b, half_block=False) -> dict:
-    """The GEMM1 family entry without the keys that the environment sets."""
+    """The launch keys of the GEMM1 family entry (:func:`_gemm1_family_entry`) without
+    the keys that the environment sets."""
     prefix = "AITER_TRITON_MOE_GLUON_"
     return {
         key: value
@@ -1057,8 +1058,8 @@ def _default_launch_config(
     or "any", in this order.
 
     ``direct_b``: the launch must read the weights and scales directly (see the host's
-    ``_reads_b_directly``: graph capture, inference or padded tensors). It then keeps
-    the ladder; the family entries read copies that the host makes and checks.
+    ``_reads_b_directly``: graph capture, inference or padded tensors). It then takes
+    no family tile entry; those read copies that the host makes and checks.
     """
     small_grid = bool(small_grid)
     ladder, env_keys = _get_gluon_config_cached(

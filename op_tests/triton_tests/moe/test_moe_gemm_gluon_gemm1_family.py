@@ -2,7 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """CPU checks for the gfx950 Gluon MoE GEMM1 config families (``*-GEMM1``): the
-block_m 16/32 tiles, the launch keys and the half-height tile entries."""
+tile entries, the launch keys and the half-height tile entries."""
 
 import re
 
