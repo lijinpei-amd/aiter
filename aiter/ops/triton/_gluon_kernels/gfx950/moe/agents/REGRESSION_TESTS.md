@@ -130,7 +130,14 @@ Notes:
   paired in that commit); T0 was unchanged. The previous `$OUT` references (recorded
   at `b38920e09`) are kept in `$OUT/gate_ref_archive_b38920e09/`; `--fast` does not
   touch the T2b and T2d references, which stay those of `b38920e09`. T0b SAME after
-  that means equal to the re-recorded reference, not to `b38920e09`'s.
+  that means equal to the re-recorded reference, not to `b38920e09`'s. Re-recorded
+  again at `a993fb920` for tuning values only, each paired in its commit:
+  `result_cache_modifier` `''` -> `'.cs'` and `TILE_SCHED` 2 -> 0 in the three
+  `prod/g2-*-t128-bm32-noact/raw` cases (`f4a05f5ff`), and `result_cache_modifier`
+  `''` -> `'.cs'` in `prod/g2-a8w8-t1024-bm128-noact/raw`,
+  `prod/g2-a8w8-t4096-bm128-noact/raw` and `prod/scale_prep-mxfp8-noact`
+  (`a993fb920`); T0 was unchanged. The references it replaced are in
+  `$OUT/gate_ref_archive_946f4a07f/`.
 - A differing check prints its number of hunks, the full diff command, and the
   first 20 lines of `diff -U0 -F '^== '` (a few hunks), cut to 200 columns. Each
   hunk is labelled with the `== <config>` it belongs to.

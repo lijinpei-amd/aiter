@@ -431,7 +431,7 @@ def test_emitted_groups_and_waits_retire_required_copies(
     # independent FIFO oracles that model every pipeline region rather than a
     # nominal steady-state step: `_Machine` in
     # test_moe_gemm_gluon_buffered_schedule.py, which drives the real emitter, and
-    # `_audit_buffer_schedule` in test_moe_gemm_gluon_config.py. This test's job is
+    # `_audit_buffer_schedule` in gluon_buffer_audit.py. This test's job is
     # the ownership/grouping half of the contract, above.
 
 

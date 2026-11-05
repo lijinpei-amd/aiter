@@ -10,7 +10,9 @@
     "bm32_any": {
         "B_SCALE_SHUFFLED": true,
         "B_PRESHUFFLED": true,
-        "ALLOW_B_VIA_LDS": false
+        "ALLOW_B_VIA_LDS": false,
+        "result_cache_modifier": ".cs",
+        "TILE_SCHED": 0
     },
     "bm64_any": {
         "BLOCK_N": 256,
@@ -39,6 +41,14 @@
         "B_SCALE_SHUFFLED": true,
         "B_PRESHUFFLED": true,
         "ALLOW_B_VIA_LDS": false
+    },
+    "bm64_half": {
+        "HALF_M_TILE": true,
+        "TILE_SCHED": 0,
+        "result_cache_modifier": ".cs"
+    },
+    "bm64_half_tile": {
+        "WAVES_PER_EU": 1
     },
     "bm128_any": {
         "BLOCK_N": 256,
@@ -69,6 +79,16 @@
         "ALLOW_B_VIA_LDS": false,
         "SOFF_UNROLL": true,
         "ALLOW_B_SCALE_VIA_LDS": false
+    },
+    "bm128_half": {
+        "HALF_M_TILE": true,
+        "GROUP_M": 1,
+        "result_cache_modifier": ".cs"
+    },
+    "bm128_half_tile": {
+        "BLOCK_N": 512,
+        "SLOT_N": 256,
+        "result_cache_modifier": ".cs"
     },
     "bm128_multi": {
         "result_cache_modifier": ".cs",
