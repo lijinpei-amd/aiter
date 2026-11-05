@@ -93,6 +93,30 @@ dsv4-pro T=4096 is 1255 -> 1141 us (even) and 1403 -> 1388 us (random). Output
 bit-identical in 72/72 cells. Table:
 `bench_out/gluon_moe_regression/gemm2/compare_a8w4pro_20261104_l3.md`.
 
+Done 2026-11-04 (prefill generalization of rounds 6-8): the half-block recipe runs in
+every family. a4w4 and a8w8 `bm128_half` (dsv4-pro T=4096) take the 512-column
+half-height tile in XCD order, one M block at a time, with `.cs` stores (a8w8: BLOCK_K
+128 in that tile). The `bm64_half` class (glm52-base and minimax-m3 T=1024, a mean of
+exactly 32 rows) gets a 32-row half-height tile (`bm64_half_tile`, WAVES_PER_EU 1), the
+linear tile order and `.cs` stores; the tile is 512 columns wide for a8w4 only. Every
+block_m 32 launch (T=1024 of dsv4-flash and dsv4-pro) streams its result in the linear
+order, and a8w8 streams the result of every block_m 128 launch. HIP 7 / HIP 1, 3 paired
+rounds against 946f4a07f, new/old even / random: a4w4 dsv4-pro T4096 0.796 / 0.916,
+a8w8 0.847 / 0.934; the bm64 half cells 0.83-0.93 / 0.89-0.95; block_m 32 cells
+0.97-1.00 / 0.97-0.99; a8w8 T4096 any 0.975-0.998 / 0.930-0.976. Output bit-identical.
+Not kept, measured: a 16-row half-height tile at `bm32_half` (0.990-0.999); `.cs` on
+a4w4 and a8w4 `bm128_any` (1.00-1.05); a 512-column 32-row tile for a4w4 (slower under
+random routing) and a8w8 (spills 29-35 VGPRs); the XCD order at block_m 64 (slower
+under random routing); per-shape `reduce_grouped` tiles (512 or 2048 columns, 1 or 4
+warps, no load hint; a8w4 at every prefill shape, a4w4 and a8w8 at T=4096/16384). In the
+screens, 15 variant / shape pairs, all at T=4096, read a whole call at least 2% faster
+in one routing and at most 2% slower in the other. Re-timed alone in 4 fresh-process
+pairs per routing, their medians are 0.985-1.022, apart from one borderline 0.980. 8 more
+pairs put that one at 1.010 / 1.016, and an A/A control of the same cell spans
+0.951-1.035 per pair. No load hint makes the reduce up to 1.38x slower (a8w4 glm52-base
+T=4096). Table:
+`bench_out/gluon_moe_regression/gemm2/gemm2_prefill_generalize.md`.
+
 Remaining gap, largest first:
 
 - a8w4 dsv4-pro T=4096 (even routing) is 1.050x the tuned FlyDSL stage 2 on HIP 7 at
@@ -228,6 +252,21 @@ Remaining gap, largest first:
   remaining candidate has a positive HIP 7 measurement. Data, probes and the per-variant
   tables:
   `bench_out/gluon_moe_regression/gemm2/compare_a8w4pro_20261104_l2.md`.
+- Prefill cells after the generalization: the same-lock table (HIP 3 / HIP 7, 3 rounds)
+  is in `gemm2_prefill_generalize.md`. Gluon/FlyDSL geomean over the prefill cells, base
+  -> final: 1.120 -> 1.072 a4w4, 1.104 -> 1.067 a8w4, 1.065 -> 1.035 a8w8. For the 18
+  cells still above 1.05x, one lock (HIP 1, 2 rounds) timed the GEMM2 kernel, the
+  reduce and FlyDSL's stage 2:
+  - At T=4096 and T=16384, the GEMM2 kernel alone is 0.89-1.005x FlyDSL, and the call
+    is 1.01-1.12x. The rest is the separate bit-exact reduce (7-18% of the call).
+  - At T=1024, the kernel alone is 0.94-1.11x. The largest gaps are a8w8 dsv4-flash
+    1.11, a8w8 glm52-base 1.09, and a4w4 dsv4-flash and minimax-m3 1.06; the reduce
+    adds 3-7%.
+  - Untested hypothesis for dsv4-flash T=1024 (block_m 32, not a half launch): it runs
+    the Python ladder's block_m 32 tile, which was never tuned for prefill; screen
+    `bm32_any` knobs.
+  - The short-K explanation for glm52-base T=1024 does not hold. In the same lock,
+    minimax-m3 T=1024 (K 3072) trails at least as much in a4w4 / a8w4.
 - a8w4 dsv4-flash T=16384 is 1.095x FlyDSL, close to the 1.10 limit. The GEMM (~1245
   us) is faster than FlyDSL's whole stage 2 (1355 us, a tuned atomic kernel), but the
   separate deterministic reduce adds ~237 us at ~4.6 TB/s. No reduce launch shape, a
