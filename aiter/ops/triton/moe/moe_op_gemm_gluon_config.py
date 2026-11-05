@@ -989,6 +989,9 @@ def _gemm2_half_m_config(
     if (dq_a, dq_b) in _GEMM2_FAMILIES:
         tile = _family_entry(_GEMM2_FAMILIES[(dq_a, dq_b)], block_m, "half_tile")
         half.update((k, v) for k, v in tile.items() if k not in env_keys)
+    # The half tile reads the launch's A-scale buffer, so it takes its layout: the
+    # sorted-shuffled buffer is addressed in the launch's block space (2 * pid_m).
+    half["A_SCALE_SORTED_SHUFFLED"] = bool(cfg.get("A_SCALE_SORTED_SHUFFLED", False))
     shared = (
         "warps_per_cta",
         "WAVES_PER_EU",

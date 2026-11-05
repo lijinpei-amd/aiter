@@ -379,6 +379,10 @@ def moe_gemm_a8w4(
     # expert parallelism, where the other slots belong to another rank and are
     # never written, so the reduce must not sum them.
     gate_valid=None,
+    # x_scales is already in the sorted-shuffled layout gemm2 reads (from
+    # moe_gemm1_a8w4_mxfp8_out(..., scale_layout="sorted_shuffled")): sorted rows,
+    # gather_indx=None. Only the gfx950 Gluon kernel reads that layout.
+    x_scales_sorted_shuffled=False,
     # Destination for the grouped reduction's result, instead of a freshly
     # allocated buffer. May be a slice of a taller tensor -- the reduce writes
     # through `out`'s strides -- which lets a caller whose consumer wants more
@@ -598,6 +602,7 @@ def moe_gemm_a8w4(
             x_static_scale=x_static_scale,
             quant_static_scale=quant_static_scale,
             swizzle_mx_scale=swizzle_mx_scale,
+            x_scales_sorted_shuffled=x_scales_sorted_shuffled,
         )
     ):
         group_indx = (
@@ -623,6 +628,11 @@ def moe_gemm_a8w4(
             ),
         )
 
+    if x_scales_sorted_shuffled:
+        raise ValueError(
+            "x_scales_sorted_shuffled needs the gfx950 Gluon kernel, which declined "
+            "this call; the Triton kernel reads raw (M, K/32) scales only"
+        )
     expt_data = routing_data.expt_data
     expt_hist = None if expt_data is None else expt_data.hist
     expt_hist_sum = None if expt_data is None else expt_data.token_offs_pad[-1]

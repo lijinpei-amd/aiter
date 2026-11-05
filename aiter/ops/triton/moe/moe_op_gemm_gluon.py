@@ -497,8 +497,16 @@ def _sorted_shuffle_a_scales(x_scales, routing_data, gather_indx, K, cfg):
     Returns ``None`` when the config is not one the shuffle was written against, so the
     caller falls back to the raw K-contiguous path.
     """
-    if x_scales is None or gather_indx is None:
+    if x_scales is None:
         return None
+    sorted_rows = gather_indx is None
+    if sorted_rows:
+        # GEMM2 reads its rows already sorted (GEMM1's output order): the identity
+        # gather, in the routed-row encoding the map divides by n_expts_act.
+        gather_indx = (
+            torch.arange(x_scales.shape[0], device=x_scales.device, dtype=torch.int32)
+            * routing_data.n_expts_act
+        )
     block_m = int(cfg["BLOCK_M"])
     # Mirrors KernelLayout.payload_a_sorted_shuffled_ok: the permutation is carried by
     # the LDS tile's layout. A shuffled scale load covers an integer number of BLOCK_K
@@ -529,9 +537,11 @@ def _sorted_shuffle_a_scales(x_scales, routing_data, gather_indx, K, cfg):
     # {32, 64, 128}. The module is torch-free, so a missing instance aborts the process
     # instead of raising: check the shape table first and fall back to raw scales.
     n_expts_tot = int(expt_data.hist.numel())
-    if block_m not in (32, 64, 128) or not any(
+    has_instance = any(
         ne == n_expts_tot and h == K for ne, h, _e, _topk in MXFP4_MOE_SUPPORTED_SHAPES
-    ):
+    )
+    # Sorted rows (GEMM2) have a torch fallback below for shapes with no C++ instance.
+    if block_m not in (32, 64, 128) or not (has_instance or sorted_rows):
         _LOGGER.info(
             "sorted-shuffled A scales unavailable, using raw scales: no aux instance "
             f"for BM={block_m} NE={n_expts_tot} H={K}"
@@ -550,6 +560,19 @@ def _sorted_shuffle_a_scales(x_scales, routing_data, gather_indx, K, cfg):
     out = torch.empty(
         n_blocks * c_m1 * c_k1 * 4 * 16 * 4, dtype=torch.uint8, device=dev
     )
+    if not has_instance:
+        # Same layout as moe_sort_scales.cuh: per 32-row stripe s, byte
+        # ((s, ku, k_lane, n_lane), ikxdl * 2 + im_a) holds the scale of row
+        # s * 32 + im_a * 16 + n_lane, column ku * 8 + ikxdl * 4 + k_lane.
+        n_tok = int(x_scales.shape[0])
+        rows = torch.where(sorted_token_ids < n_tok, sorted_token_ids, 0).long()
+        out.copy_(
+            x_scales.view(torch.uint8)[rows]
+            .view(max_sorted // 32, 2, 16, c_k1, 2, 4)
+            .permute(0, 3, 5, 2, 4, 1)
+            .reshape(-1)
+        )
+        return out
     mxfp4_moe_sort_scales(
         x_scales,
         sorted_token_ids,
@@ -910,11 +933,14 @@ def moe_gemm_gluon(
     gate_up_split: bool | None = None,
     epilogue: EpilogueMode | int | None = None,
     out_scale_sorted_shuffled: bool = False,
+    x_scales_sorted_shuffled: bool = False,
 ):
     """Launch the Gluon grouped GEMM into ``y`` (shape ``(1, M, N // ARN)``).
 
     ``out_scale_sorted_shuffled``: with a fused MX output quant, write ``y_scales`` in
     the sorted-shuffled layout gemm2 reads (OUT_SCALE_SORTED_SHUFFLED).
+    ``x_scales_sorted_shuffled``: ``x_scales`` is already in that layout (sorted rows,
+    gather_indx=None); it is read as is.
 
     Operand dtypes are inferred from the tensors -- ``uint8`` + scales is MXFP4, fp8 +
     scales is MXFP8, fp8 alone is FP8_E4M3 (unit scales, still on the scaled pipe),
@@ -1023,10 +1049,27 @@ def moe_gemm_gluon(
     a_scales, a_swizzle = x_scales, ScaleSwizzle.NONE
     a_scale_stride_m = 0 if x_scales is None else x_scales.stride(0)
     a_scale_stride_k = 0 if x_scales is None else x_scales.stride(1)
-    if (
+    if x_scales_sorted_shuffled:
+        # The caller hands over the buffer already in the sorted-shuffled layout (e.g.
+        # moe_gemm1_a8w4_mxfp8_out(scale_layout="sorted_shuffled")), in the routing's
+        # block_m blocks; nothing to prepare, and no raw form to fall back to.
+        if (
+            gather_indx is not None
+            or not _scale_shuffle_supported(_cfg, 0)
+            or int(_cfg["BLOCK_M"]) % 32
+            or int(_cfg["SLOT_M"]) % 32
+            or K % 256
+        ):
+            raise ValueError(
+                "x_scales_sorted_shuffled needs sorted rows (gather_indx=None), K % 256 "
+                "== 0 and a config whose A scale tile takes the sorted-shuffled layout"
+            )
+        a_scales, a_swizzle = x_scales.reshape(-1), ScaleSwizzle.SORTED_SHUFFLED
+        a_scale_stride_m, a_scale_stride_k = 0, 32
+    elif (
         _cfg.get("A_SCALE_SORTED_SHUFFLED", False)
         or _env_int("AITER_TRITON_MOE_GLUON_SORTED_SCALES", 0)
-    ) and apply_swiglu:
+    ) and (apply_swiglu or gather_indx is None):
         shuffled = _sorted_shuffle_a_scales(
             x_scales, routing_data, gather_indx, K, _cfg
         )
@@ -1262,6 +1305,7 @@ def try_gluon_grouped_gemm(
     quant_static_scale=None,
     swizzle_mx_scale=None,
     w_static_scale=None,
+    x_scales_sorted_shuffled=False,
 ) -> bool:
     """The one hook every ``moe_gemm_*`` wrapper calls.
 
@@ -1309,6 +1353,7 @@ def try_gluon_grouped_gemm(
         limit,
         swiglu_add_residual,
         x_static_scale=x_static_scale,
+        x_scales_sorted_shuffled=x_scales_sorted_shuffled,
     )
     return True
 
