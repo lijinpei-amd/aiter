@@ -11,7 +11,7 @@ from aiter.ops.triton.utils.common_utils import strip_annotate
 
 from ._config import KernelFuncConfig, KernelTuningConfig
 from ._lang import optional as _opt
-from ._lang import require_constexpr
+from ._lang import HAS_BUFFER_LOAD_CONTIGUITY, require_constexpr
 from ._layout import KernelLayout
 from ._types import A_PAYLOAD, A_SCALE, B_PAYLOAD, B_SCALE, Component
 
@@ -39,9 +39,42 @@ def _buffer_load_to_lds(
     costs no VGPRs and no per-lane arithmetic. See ``SOFF_UNROLL`` in ``_config.py``:
     it lets one base pointer serve every step of an unrolled body.
     """
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        lds_ptr, hbm_ptr, hbm_offs, cache_modifier=cache, soffset=SOFF
-    )
+    # A zero offset is left out: plain upstream Triton takes no ``soffset`` here.
+    if require_constexpr(SOFF == 0):
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            lds_ptr, hbm_ptr, hbm_offs, cache_modifier=cache
+        )
+    else:
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            lds_ptr, hbm_ptr, hbm_offs, cache_modifier=cache, soffset=SOFF
+        )
+
+
+@gluon.jit
+def _buffer_load(ptr, offsets, cache: gl.constexpr, SOFF: gl.constexpr, CONTIG: gl.constexpr = 1):
+    """``cdna4.buffer_load``, passing ``soffset`` and ``contiguity`` only when they matter.
+
+    Plain upstream Triton's ``buffer_load`` takes neither keyword, and a zero offset and a
+    contiguity of 1 are the defaults anyway. Without contiguity support a contiguous
+    register scale is loaded one element at a time.
+    """
+    if require_constexpr(CONTIG > 1 and HAS_BUFFER_LOAD_CONTIGUITY):
+        if require_constexpr(SOFF == 0):
+            value = gl.amd.cdna4.buffer_load(
+                ptr=ptr, offsets=offsets, cache=cache, contiguity=CONTIG
+            )
+        else:
+            value = gl.amd.cdna4.buffer_load(
+                ptr=ptr, offsets=offsets, cache=cache, contiguity=CONTIG, soffset=SOFF
+            )
+    else:
+        if require_constexpr(SOFF == 0):
+            value = gl.amd.cdna4.buffer_load(ptr=ptr, offsets=offsets, cache=cache)
+        else:
+            value = gl.amd.cdna4.buffer_load(
+                ptr=ptr, offsets=offsets, cache=cache, soffset=SOFF
+            )
+    return value
 
 
 @gluon.jit
@@ -219,9 +252,7 @@ class LDSManager:
                 SOFF,
             )
         else:
-            payload = gl.amd.cdna4.buffer_load(
-                ptr=hbm_ptr, offsets=hbm_offs, cache=cache, soffset=SOFF
-            )
+            payload = _buffer_load(hbm_ptr, hbm_offs, cache, SOFF)
             return (payload,)
 
     @gluon.jit
@@ -269,28 +300,17 @@ class LDSManager:
             gl.static_assert(layout.component_in_reg(Component(operand, True)))
             if require_constexpr(cfg.preshuffled(operand, True)):
                 if require_constexpr(layout.scale_packed_ok(operand)):
-                    scale = gl.amd.cdna4.buffer_load(
-                        ptr=hbm_ptr.to(gl.pointer_type(gl.int32)),
-                        offsets=hbm_offs // 4,
-                        cache=cache,
-                        soffset=SOFF,
+                    scale = _buffer_load(
+                        hbm_ptr.to(gl.pointer_type(gl.int32)), hbm_offs // 4, cache, SOFF
                     )
                 else:
                     scale = gl.convert_layout(
-                        gl.amd.cdna4.buffer_load(
-                            ptr=hbm_ptr,
-                            offsets=hbm_offs,
-                            cache=cache,
-                            contiguity=4,
-                            soffset=SOFF,
-                        ),
+                        _buffer_load(hbm_ptr, hbm_offs, cache, SOFF, 4),
                         layout.scale_slot_fragment_layout(operand),
                     )
                 fragments = _scale_fragments(scale, layout, operand)
             else:
-                scale = gl.amd.cdna4.buffer_load(
-                    ptr=hbm_ptr, offsets=hbm_offs, cache=cache, soffset=SOFF
-                )
+                scale = _buffer_load(hbm_ptr, hbm_offs, cache, SOFF)
                 fragments = (scale,)
             return fragments
 

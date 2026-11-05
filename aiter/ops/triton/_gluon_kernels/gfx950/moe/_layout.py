@@ -6,7 +6,13 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.language.core import _aggregate as aggregate
 
-from ._lang import MX_GROUP, WARP_SIZE, require_constexpr, strip_annotate
+from ._lang import (
+    HAS_MFMA_SCALED_PACKED,
+    MX_GROUP,
+    WARP_SIZE,
+    require_constexpr,
+    strip_annotate,
+)
 from ._packed_scale import (
     packed_scale_dot_layout,
     packed_scale_dot_shape,
@@ -567,7 +573,8 @@ class KernelLayout:
             frag = payload_fragment_layout[idx]
             sel = (None, None)
             if (
-                scale_preshuffled[idx]
+                HAS_MFMA_SCALED_PACKED.value
+                and scale_preshuffled[idx]
                 and slot_nonk[idx] % 32 == 0
                 and packed_scale_layout(frag, scale_slot_nonk[idx], scale_slot_k[idx])
                 is not None
