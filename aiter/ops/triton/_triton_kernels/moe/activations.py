@@ -53,17 +53,9 @@ def gate_up_split_perm(n: int):
 
 @triton.jit(repr=_clip_repr)
 def clip(x, limit, clip_lower: tl.constexpr):
-    # Keep the upper clamp scalar to avoid the register-pressure regression from
-    # https://github.com/llvm/llvm-project/commit/86aaf7b55ef5bfe4f96c8d58ce6addfe5e85967b
-    # because AMDGPU later scalarizes the packed minimum during lowering.
-    res = tl.inline_asm_elementwise(
-        "v_min_f32 $0, $1, $2",
-        "=v,v,v",
-        [x, limit],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
+    # Do not use inline asm here. LLVM adds no MFMA wait states before an inline asm,
+    # so it can read an accumulator before the MFMA writes it.
+    res = tl.minimum(x, limit)
     if clip_lower:
         res = tl.maximum(-limit, res)
     return res
