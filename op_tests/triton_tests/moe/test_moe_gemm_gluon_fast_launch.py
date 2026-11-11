@@ -4,14 +4,17 @@
 """The fast launch of the gfx950 Gluon MoE GEMM gives the slow path's results.
 
 The fast launch replays a compiled kernel when the launch matches a recorded one. Two
-calls with the same launch spec but other tensor dtypes need other compiled kernels,
-so the replay must not take the first call's kernel for the second call.
+calls with the same launch spec can need other compiled kernels: other tensor dtypes,
+another topk, or a Triton knob that changes the compiled kernel. The replay must not
+take the first call's kernel for the second call. Each test calls each case twice, so
+it also proves that the second call takes the fast path and gives the same bits.
 """
 
 import os
 
 import pytest
 import torch
+from triton import knobs
 
 from aiter.ops.triton.moe import moe_op_gemm_gluon as host
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import moe_gemm_a4w4
@@ -33,6 +36,26 @@ def clean_env(monkeypatch):
     host._FAST_LAUNCH_CACHE.clear()
     yield monkeypatch
     host._FAST_LAUNCH_CACHE.clear()
+
+
+@pytest.fixture
+def fast_launches(monkeypatch):
+    """One entry for each Gluon launch: the kernel that the fast path replayed, or
+    None when the launch took the slow path."""
+    launches = []
+    original = host._fast_launch
+
+    def spy(*args):
+        compiled = original(*args)
+        launches.append(compiled)
+        return compiled
+
+    monkeypatch.setattr(host, "_fast_launch", spy)
+    return launches
+
+
+def _hits(launches):
+    return [compiled is not None for compiled in launches]
 
 
 def _case():
@@ -62,20 +85,23 @@ def _gemm(case, out_dtype):
     [(torch.float32, torch.bfloat16), (torch.bfloat16, torch.float32)],
     ids=["fp32_then_bf16", "bf16_then_fp32"],
 )
-def test_fast_launch_keeps_each_output_dtype(dtypes, clean_env):
+def test_fast_launch_keeps_each_output_dtype(dtypes, clean_env, fast_launches):
     case = _case()
     clean_env.setenv("AITER_TRITON_MOE_GLUON_FAST_LAUNCH", "0")
     expected = {dtype: _gemm(case, dtype) for dtype in dtypes}
     assert not host._FAST_LAUNCH_CACHE
+    fast_launches.clear()
 
     clean_env.setenv("AITER_TRITON_MOE_GLUON_FAST_LAUNCH", "1")
     for dtype in dtypes:
-        actual = _gemm(case, dtype)
-        assert actual.dtype == dtype
-        assert torch.equal(
-            actual, expected[dtype]
-        ), f"{dtype} output after a {dtypes[0]} launch differs from the slow path"
-    assert host._FAST_LAUNCH_CACHE, "the Gluon kernel did not run"
+        for call in ("first", "second"):
+            actual = _gemm(case, dtype)
+            assert actual.dtype == dtype
+            assert torch.equal(
+                actual, expected[dtype]
+            ), f"{call} {dtype} launch after {dtypes[0]} differs from the slow path"
+    # The first launch of a dtype records it, and the second replays it.
+    assert _hits(fast_launches) == [False, True, False, True]
 
 
 TOPK_TOKENS, TOPK_EXPERTS = 10, 8
@@ -111,7 +137,7 @@ def _topk_gemm(case, topk):
 @pytest.mark.parametrize(
     "topks", [(4, 5), (5, 4)], ids=["topk4_then_5", "topk5_then_4"]
 )
-def test_fast_launch_keeps_each_topk(topks, clean_env):
+def test_fast_launch_keeps_each_topk(topks, clean_env, fast_launches):
     """topk is a kernel constexpr that the memoised launch spec does not take.
 
     With 10 tokens over 8 experts, topk 4 and 5 give the same grid and launch spec,
@@ -123,12 +149,49 @@ def test_fast_launch_keeps_each_topk(topks, clean_env):
     clean_env.setenv("AITER_TRITON_MOE_GLUON_FAST_LAUNCH", "0")
     expected = {topk: _topk_gemm(case, topk) for topk in topks}
     assert not host._FAST_LAUNCH_CACHE
+    fast_launches.clear()
 
     clean_env.setenv("AITER_TRITON_MOE_GLUON_FAST_LAUNCH", "1")
     for topk in topks:
-        assert torch.equal(
-            _topk_gemm(case, topk), expected[topk]
-        ), f"topk {topk} after a topk {topks[0]} launch differs from the slow path"
-    # One entry: both launches reached the same fast-launch key, which is the
+        for call in ("first", "second"):
+            assert torch.equal(
+                _topk_gemm(case, topk), expected[topk]
+            ), f"{call} topk {topk} launch after topk {topks[0]} differs from slow path"
+    assert _hits(fast_launches) == [False, True, False, True]
+    # One entry: both topks reached the same fast-launch key, which is the
     # collision this test needs. Two entries would mean it no longer tests anything.
     assert len(host._FAST_LAUNCH_CACHE) == 1
+
+
+@pytest.mark.parametrize("knob_first", [False, True], ids=["plain_first", "knob_first"])
+@pytest.mark.parametrize(
+    "owner, name, value, plain",
+    [
+        # Any mode is a compile option. The AMD backend runs no pass for this one, so
+        # the kernel compiles; fpsan fails in TritonInstrumentFpSanitizer on it.
+        (knobs.compilation, "instrumentation_mode", "aiter-test", ""),
+        (knobs.runtime, "debug", True, False),
+    ],
+    ids=["instrumentation_mode", "debug"],
+)
+def test_fast_launch_keeps_the_compile_knobs(
+    owner, name, value, plain, knob_first, clean_env, fast_launches
+):
+    """JITFunction.run passes these knobs to the compiler, so a kernel compiled with
+    one of them on is not the plain kernel.
+
+    The fast path neither replays nor records a launch with one of them on. So only
+    the plain launch replays, and it replays the plain kernel.
+    """
+    case = _case()
+    clean_env.setenv("AITER_TRITON_MOE_GLUON_FAST_LAUNCH", "1")
+    for setting in (value, plain) if knob_first else (plain, value):
+        clean_env.setattr(owner, name, setting)
+        _gemm(case, torch.bfloat16)
+        _gemm(case, torch.bfloat16)
+    plain_hits, knob_hits = [False, True], [False, False]
+    assert _hits(fast_launches) == (
+        knob_hits + plain_hits if knob_first else plain_hits + knob_hits
+    )
+    replayed = [compiled for compiled in fast_launches if compiled is not None]
+    assert getattr(replayed[0].metadata, name) == plain

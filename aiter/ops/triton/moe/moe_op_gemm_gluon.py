@@ -29,6 +29,7 @@ import weakref
 from functools import cache
 
 import torch
+from triton import knobs
 from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton._gluon_kernels.gfx950.moe._config import (
@@ -838,6 +839,21 @@ def _spec_key(vals, out):
     return out
 
 
+def _plain_compile() -> bool:
+    """True when no Triton knob that changes the compiled kernel is on.
+
+    ``JITFunction.run`` passes these knobs to the compiler, so a kernel compiled with
+    one of them on is not the kernel of a plain launch. The fast path neither replays
+    nor records such a launch. ``fpsan_homomorphic_casts`` acts only in the ``fpsan``
+    instrumentation mode, so the mode test covers it.
+    """
+    return not (
+        knobs.runtime.debug
+        or knobs.compilation.instrumentation_mode
+        or knobs.runtime.add_stages_inspection_hook is not None
+    )
+
+
 def _fast_launch_key(kernel, grid_x, num_warps, waves_per_eu, constexpr_args, device):
     """The ``_FAST_LAUNCH_CACHE`` key of a launch.
 
@@ -860,17 +876,16 @@ def _fast_launch(kernel, grid_x, args, num_warps, waves_per_eu, constexpr_args):
     """
     if not _env_int("AITER_TRITON_MOE_GLUON_FAST_LAUNCH", 1):
         return None
-    from triton import knobs
 
-    # Profiling hooks and Triton's debug mode both act inside the slow path; if either
-    # is live, take it so their behaviour is not silently dropped. An installed-but-empty
-    # HookChain is truthy, so emptiness has to be tested through .calls -- the launch
-    # hooks are non-None by default and a bare truth test never takes the fast path.
+    # Profiling hooks act inside the slow path; if one is live, take it so its
+    # behaviour is not silently dropped. An installed-but-empty HookChain is truthy, so
+    # emptiness has to be tested through .calls -- the launch hooks are non-None by
+    # default and a bare truth test never takes the fast path.
     if not _hooks_empty(knobs.runtime.launch_enter_hook):
         return None
     if not _hooks_empty(knobs.runtime.launch_exit_hook):
         return None
-    if knobs.runtime.debug:
+    if not _plain_compile():
         return None
 
     device = torch.cuda.current_device()
@@ -900,6 +915,9 @@ def _fast_launch_memoise(
 ):
     """Record a completed slow-path launch so the next identical one can skip it."""
     if compiled is None or not _env_int("AITER_TRITON_MOE_GLUON_FAST_LAUNCH", 1):
+        return
+    # A kernel compiled with a debug or instrumentation knob on must not replay later.
+    if not _plain_compile():
         return
     key = _fast_launch_key(
         kernel,
