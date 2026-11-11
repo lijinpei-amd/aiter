@@ -815,8 +815,9 @@ def _spec_key(vals, out):
     """Append the parts of ``vals`` that can change a launch's specialization.
 
     Triton re-derives a full specialization on every launch -- ~16 us of the ~41 us
-    launch here -- but between two launches of one *already compiled* kernel only two
-    things can move: the 16-byte alignment of each pointer (which it bakes in as
+    launch here -- but between two launches of one *already compiled* kernel only
+    three things can move: the element type of each pointer (an output can be bf16 or
+    fp32 under the same launch spec), its 16-byte alignment (which it bakes in as
     ``tt.divisibility``) and the runtime scalars. Constexprs cannot move, because they
     are pinned by the identity of the memoised ``constexpr_args`` in the cache key.
 
@@ -824,6 +825,7 @@ def _spec_key(vals, out):
     """
     for v in vals:
         if isinstance(v, torch.Tensor):
+            out.append(v.dtype)
             out.append(v.data_ptr() % 16 == 0)
         elif isinstance(v, tuple):
             _spec_key(v, out)
