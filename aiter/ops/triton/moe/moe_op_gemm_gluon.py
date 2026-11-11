@@ -29,6 +29,7 @@ import weakref
 from functools import cache
 
 import torch
+from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton._gluon_kernels.gfx950.moe._config import (
     KernelFuncConfig,
@@ -315,8 +316,6 @@ def _launch_spec(
     The host aggregates and launch constants depend only on compile-time values,
     so they are computed once per distinct configuration.
     """
-    from triton.experimental.gluon import language as gl
-
     c = (
         _canonical_slot_keys(dict(config_items))
         if config_items
@@ -815,23 +814,36 @@ def _spec_key(vals, out):
     """Append the parts of ``vals`` that can change a launch's specialization.
 
     Triton re-derives a full specialization on every launch -- ~16 us of the ~41 us
-    launch here -- but between two launches of one *already compiled* kernel only
-    three things can move: the element type of each pointer (an output can be bf16 or
-    fp32 under the same launch spec), its 16-byte alignment (which it bakes in as
-    ``tt.divisibility``) and the runtime scalars. Constexprs cannot move, because they
-    are pinned by the identity of the memoised ``constexpr_args`` in the cache key.
+    launch here. Between two launches with the same cache key, only these can change:
+    the element type of each pointer (an output can be bf16 or fp32 under one launch
+    spec), its 16-byte alignment (Triton bakes it in as ``tt.divisibility``), the
+    runtime scalars, and the constexpr fields that ``_launch_spec`` does not take
+    (``topk`` and ``n_expts_act``). The ``constexpr_args`` values are the objects of
+    the stored spec, so each costs one identity test.
 
-    Recurses into the aggregates, whose fields are ordinary launch arguments.
+    Recurses into the aggregates, whose fields are ordinary launch arguments. The int
+    test comes before the constexpr test: the other order costs ~0.5 us more per
+    launch, because each of the ~19 int arguments does one more ``isinstance``.
     """
     for v in vals:
         if isinstance(v, torch.Tensor):
             out.append(v.dtype)
             out.append(v.data_ptr() % 16 == 0)
-        elif isinstance(v, tuple):
-            _spec_key(v, out)
         elif isinstance(v, int):  # bool is an int; both are fine as key material
             out.append(v)
+        elif isinstance(v, gl.constexpr):
+            out.append(v.value)
+        elif isinstance(v, tuple):
+            _spec_key(v, out)
     return out
+
+
+def _fast_launch_key(kernel, grid_x, num_warps, waves_per_eu, constexpr_args, device):
+    """The ``_FAST_LAUNCH_CACHE`` key of a launch.
+
+    Triton compiles and loads a kernel for each device, so the device is in the key.
+    """
+    return (id(kernel), id(constexpr_args), num_warps, waves_per_eu, grid_x, device)
 
 
 def _fast_launch(kernel, grid_x, args, num_warps, waves_per_eu, constexpr_args):
@@ -861,7 +873,10 @@ def _fast_launch(kernel, grid_x, args, num_warps, waves_per_eu, constexpr_args):
     if knobs.runtime.debug:
         return None
 
-    key = (id(kernel), id(constexpr_args), num_warps, waves_per_eu, grid_x)
+    device = torch.cuda.current_device()
+    key = _fast_launch_key(
+        kernel, grid_x, num_warps, waves_per_eu, constexpr_args, device
+    )
     entry = _FAST_LAUNCH_CACHE.get(key)
     if entry is None:
         return None
@@ -869,7 +884,7 @@ def _fast_launch(kernel, grid_x, args, num_warps, waves_per_eu, constexpr_args):
     if _spec_key(args, []) != spec:
         return None
 
-    stream = _current_raw_stream(torch.cuda.current_device())
+    stream = _current_raw_stream(device)
     if cpp is not None:
         # Generated launcher: METH_FASTCALL, straight-line unpack, THPVariable_Unpack
         # instead of a data_ptr() method call per tensor. Same top-level arguments.
@@ -886,7 +901,14 @@ def _fast_launch_memoise(
     """Record a completed slow-path launch so the next identical one can skip it."""
     if compiled is None or not _env_int("AITER_TRITON_MOE_GLUON_FAST_LAUNCH", 1):
         return
-    key = (id(kernel), id(constexpr_args), num_warps, waves_per_eu, grid_x)
+    key = _fast_launch_key(
+        kernel,
+        grid_x,
+        num_warps,
+        waves_per_eu,
+        constexpr_args,
+        torch.cuda.current_device(),
+    )
     cpp = None
     if _env_int("AITER_TRITON_MOE_GLUON_CPP_LAUNCH", 0):
         # Off by default: the first build of a given signature costs ~12 s of ninja.

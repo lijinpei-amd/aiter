@@ -76,3 +76,59 @@ def test_fast_launch_keeps_each_output_dtype(dtypes, clean_env):
             actual, expected[dtype]
         ), f"{dtype} output after a {dtypes[0]} launch differs from the slow path"
     assert host._FAST_LAUNCH_CACHE, "the Gluon kernel did not run"
+
+
+TOPK_TOKENS, TOPK_EXPERTS = 10, 8
+
+
+def _topk_case():
+    """MXFP4 operands and routing logits for TOPK_TOKENS tokens over TOPK_EXPERTS."""
+    torch.manual_seed(13)
+    logits = torch.randn(
+        (TOPK_TOKENS, TOPK_EXPERTS), dtype=torch.float16, device="cuda"
+    )
+    x = torch.randn((TOPK_TOKENS, K), dtype=torch.bfloat16, device="cuda")
+    w = torch.randn((TOPK_EXPERTS, N, K), dtype=torch.bfloat16, device="cuda")
+    x, xs = downcast_to_mxfp(x, torch.uint8, axis=-1)
+    w, ws = downcast_to_mxfp(w.transpose(1, 2), torch.uint8, axis=1)
+    return logits, x, w, xs, ws
+
+
+def _topk_gemm(case, topk):
+    logits, x, w, xs, ws = case
+    route, gather, _ = routing(logits, topk)
+    return moe_gemm_a4w4(
+        x,
+        w,
+        xs,
+        ws,
+        routing_data=route,
+        gather_indx=gather,
+        out_dtype=torch.bfloat16,
+    )
+
+
+@pytest.mark.parametrize(
+    "topks", [(4, 5), (5, 4)], ids=["topk4_then_5", "topk5_then_4"]
+)
+def test_fast_launch_keeps_each_topk(topks, clean_env):
+    """topk is a kernel constexpr that the memoised launch spec does not take.
+
+    With 10 tokens over 8 experts, topk 4 and 5 give the same grid and launch spec,
+    so the two launches share one fast-launch entry and only the spec key can tell
+    them apart. A replay of the other topk's kernel divides the gather index by the
+    wrong topk and reads the wrong token rows.
+    """
+    case = _topk_case()
+    clean_env.setenv("AITER_TRITON_MOE_GLUON_FAST_LAUNCH", "0")
+    expected = {topk: _topk_gemm(case, topk) for topk in topks}
+    assert not host._FAST_LAUNCH_CACHE
+
+    clean_env.setenv("AITER_TRITON_MOE_GLUON_FAST_LAUNCH", "1")
+    for topk in topks:
+        assert torch.equal(
+            _topk_gemm(case, topk), expected[topk]
+        ), f"topk {topk} after a topk {topks[0]} launch differs from the slow path"
+    # One entry: both launches reached the same fast-launch key, which is the
+    # collision this test needs. Two entries would mean it no longer tests anything.
+    assert len(host._FAST_LAUNCH_CACHE) == 1
