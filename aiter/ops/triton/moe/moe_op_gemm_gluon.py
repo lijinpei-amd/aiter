@@ -151,6 +151,47 @@ def _half_block(routing_data, M) -> bool:
     return 2 * M <= routing_data.block_m * routing_data.n_expts_tot
 
 
+_SWIZZLE_NAMES = (None, "CDNA4_SCALE")
+
+
+def _cdna4_scale_error(w_scales: torch.Tensor, N: int, K: int) -> str | None:
+    """Return why ``w_scales`` is not a readable CDNA4_SCALE tile, or None if it is.
+
+    The tile is the view that ``shuffle_scale_moe(arch="gfx950")`` returns: shape
+    ``(E, K, N // 32)``, and its last two dims transposed are contiguous.
+    """
+    allowed = [torch.uint8]
+    if hasattr(torch, "float8_e8m0fnu"):
+        allowed.append(torch.float8_e8m0fnu)
+    if w_scales.dtype not in allowed:
+        return f"CDNA4_SCALE needs uint8 or e8m0 scales, got dtype {w_scales.dtype}"
+    if w_scales.dim() != 3:
+        return f"CDNA4_SCALE needs 3 dims (E, K, N/32), got {w_scales.dim()}"
+    if N % 32 != 0:
+        return f"CDNA4_SCALE needs N % 32 == 0, got N={N}"
+    if K % 256 != 0:
+        return f"CDNA4_SCALE needs K % 256 == 0, got K={K}"
+    if w_scales.shape[1:] != (K, N // 32):
+        return (
+            f"CDNA4_SCALE needs shape (E, {K}, {N // 32}), "
+            f"got shape {tuple(w_scales.shape)}"
+        )
+    if not w_scales.transpose(-1, -2).is_contiguous():
+        return "CDNA4_SCALE needs a view whose last two dims transposed are contiguous"
+    return None
+
+
+def _swizzle_error(swizzle_mx_scale, w_scales, N: int, K: int) -> str | None:
+    """Return why the ``swizzle_mx_scale`` request cannot run, or None."""
+    if swizzle_mx_scale not in _SWIZZLE_NAMES:
+        return f"scale swizzle {swizzle_mx_scale} is not supported"
+    if swizzle_mx_scale is None:
+        return None
+    if w_scales is None:
+        return "CDNA4_SCALE needs weight scales"
+    return _cdna4_scale_error(w_scales, N, K)
+
+
 def gluon_supported(
     *,
     x: torch.Tensor,
@@ -194,10 +235,9 @@ def gluon_supported(
         return False, "a static activation scale only applies to unscaled fp8 operands"
     if out_quant not in (None, DtypeQuant.MXFP4, DtypeQuant.MXFP8):
         return False, f"output_quant {out_quant} is not implemented"
-    if swizzle_mx_scale is not None:
-        # CDNA4_SCALE keeps the direct-to-LDS write coalesced but needs the descriptor
-        # reshape/permute of the preshuffled tile; not implemented yet.
-        return False, f"scale swizzle {swizzle_mx_scale} is not implemented"
+    scale_error = _swizzle_error(swizzle_mx_scale, w_scales, N, K)
+    if scale_error is not None:
+        return False, scale_error
     if routing_data is None or routing_data.expt_data is None:
         return False, "Gluon path needs the Family-A routing metadata"
     if x.stride(-1) != 1:
@@ -976,6 +1016,7 @@ def moe_gemm_gluon(
     epilogue: EpilogueMode | int | None = None,
     out_scale_sorted_shuffled: bool = False,
     x_scales_sorted_shuffled: bool = False,
+    swizzle_mx_scale: str | None = None,
 ):
     """Launch the Gluon grouped GEMM into ``y`` (shape ``(1, M, N // ARN)``).
 
@@ -1000,6 +1041,10 @@ def moe_gemm_gluon(
     ``BLOCK_K / 32``, at least that wide, and divide total K / 32. Unshuffled scales
     ignore these settings.
 
+    ``swizzle_mx_scale`` is ``None`` (raw ``w_scales``) or ``"CDNA4_SCALE"`` (the tile
+    that ``shuffle_scale_moe(arch="gfx950")`` returns). An unreadable tile raises
+    ``ValueError``.
+
     ``y_scales`` non-None selects the fused MXFP4 output quant: ``y`` then holds the
     E2M1 payload (``N // ARN // 2`` uint8 columns) and ``y_scales`` the E8M0 exponents,
     bit-identical to what the standalone ``mxfp4_quant`` launch produces.
@@ -1017,6 +1062,9 @@ def moe_gemm_gluon(
     Returns the compiled kernel handle so callers (the ISA-assertion test) can inspect
     ``.asm``; the result itself is written into ``y`` / ``y_scales``.
     """
+    scale_error = _swizzle_error(swizzle_mx_scale, w_scales, N, K)
+    if scale_error is not None:
+        raise ValueError(scale_error)
     if gate_up_split is None:
         gate_up_split = bool(_env_int("AITER_TRITON_MOE_GLUON_GU_SPLIT", 0))
     gate_up_split = bool(gate_up_split) and apply_swiglu
@@ -1396,6 +1444,7 @@ def try_gluon_grouped_gemm(
         swiglu_add_residual,
         x_static_scale=x_static_scale,
         x_scales_sorted_shuffled=x_scales_sorted_shuffled,
+        swizzle_mx_scale=swizzle_mx_scale,
     )
     return True
 
@@ -1416,6 +1465,7 @@ def moe_gemm1_a4w4_mxfp4_out(
     config: dict | None = None,
     gate_up_split: bool | None = None,
     epilogue: EpilogueMode | int | None = None,
+    swizzle_mx_scale: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """gemm1 with the activation **and** the MXFP4 output quant fused into the epilogue.
 
@@ -1450,7 +1500,7 @@ def moe_gemm1_a4w4_mxfp4_out(
         y=y,
         bias=bias,
         routing_data=routing_data,
-        swizzle_mx_scale=None,
+        swizzle_mx_scale=swizzle_mx_scale,
         split_k=1,
         x_static_scale=None,
         quant_static_scale=None,
@@ -1483,6 +1533,7 @@ def moe_gemm1_a4w4_mxfp4_out(
         config=config,
         gate_up_split=gate_up_split,
         epilogue=epilogue,
+        swizzle_mx_scale=swizzle_mx_scale,
     )
     return y[0], y_scales
 
@@ -1504,6 +1555,7 @@ def moe_gemm1_a8w4_mxfp8_out(
     gate_up_split: bool | None = None,
     epilogue: EpilogueMode | int | None = None,
     scale_layout: str = "raw",
+    swizzle_mx_scale: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """gemm1 with the activation **and** an MXFP8 output quant fused into the epilogue:
     the a8w4 counterpart of :func:`moe_gemm1_a4w4_mxfp4_out`. Returns
@@ -1547,7 +1599,7 @@ def moe_gemm1_a8w4_mxfp8_out(
         y=y,
         bias=bias,
         routing_data=routing_data,
-        swizzle_mx_scale=None,
+        swizzle_mx_scale=swizzle_mx_scale,
         split_k=1,
         x_static_scale=None,
         quant_static_scale=None,
@@ -1580,5 +1632,6 @@ def moe_gemm1_a8w4_mxfp8_out(
         gate_up_split=gate_up_split,
         epilogue=epilogue,
         out_scale_sorted_shuffled=shuffled,
+        swizzle_mx_scale=swizzle_mx_scale,
     )
     return y[0], y_scales
