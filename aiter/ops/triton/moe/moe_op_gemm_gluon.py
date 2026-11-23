@@ -211,9 +211,16 @@ def gluon_supported(
     w_static_scale=None,
     apply_swiglu: bool = False,
     gate_up_split: bool = False,
+    gather_indx: torch.Tensor | None = None,
+    x_scales_sorted_shuffled: bool = False,
 ) -> tuple[bool, str]:
     """The capability predicate. Returns ``(ok, reason)``; ``reason`` is logged when
-    the call falls back to the Triton kernel."""
+    the call falls back to the Triton kernel.
+
+    ``gather_indx`` and ``x_scales_sorted_shuffled`` have the meaning they have in
+    :func:`moe_gemm_gluon`. They tell if the launch can sort the A scales, which
+    ``CDNA4_SCALE`` weight scales need at ``BLOCK_K`` 128.
+    """
     if os.environ.get("AITER_TRITON_MOE_DISABLE_GLUON", "0") != "0":
         return False, "disabled by AITER_TRITON_MOE_DISABLE_GLUON"
     if get_arch() != "gfx950":
@@ -272,9 +279,21 @@ def gluon_supported(
             apply_swiglu,
         ),
         _multi_block(routing_data, y.shape[1]),
-        _reads_b_directly(w, w_scales, N, K, dq_b),
+        _reads_b_directly(w, N, K, dq_b),
         _half_block(routing_data, y.shape[1]),
     )
+    # The launch reads the weight scales in the layout of the input.
+    b_cdna4 = swizzle_mx_scale == "CDNA4_SCALE"
+    cfg = dict(cfg, B_SCALE_SHUFFLED=b_cdna4)
+    if b_cdna4:
+        a_shuffled = x_scales_sorted_shuffled or (
+            _a_sort_requested(cfg, apply_swiglu, gather_indx)
+            and _a_sort_fits(x_scales, K, cfg)
+            and _a_sort_runs(routing_data, int(cfg["BLOCK_M"]), K, gather_indx is None)
+        )
+        config_error = _cdna4_config_error(cfg, a_shuffled)
+        if config_error is not None:
+            return False, config_error
     if N % cfg["BLOCK_N"] != 0:
         return False, f"N {N} % BLOCK_N {cfg['BLOCK_N']} != 0"
     if K % cfg["BLOCK_K"] != 0:
@@ -525,6 +544,65 @@ def _sorted_token_id_map(expt_data, gather_indx, n_expts_act, block_m, n_blocks,
     return built
 
 
+def _a_sort_requested(cfg, apply_swiglu, gather_indx) -> bool:
+    """True when ``moe_gemm_gluon`` tries to sort and shuffle raw A scales."""
+    requested = cfg.get("A_SCALE_SORTED_SHUFFLED", False) or _env_int(
+        "AITER_TRITON_MOE_GLUON_SORTED_SCALES", 0
+    )
+    return bool(requested) and (apply_swiglu or gather_indx is None)
+
+
+def _a_sort_fits(x_scales, K, cfg) -> bool:
+    """True when the config and the raw A scales allow the sorted-shuffled layout."""
+    if x_scales is None:
+        return False
+    # Mirrors KernelLayout.payload_a_sorted_shuffled_ok: the permutation is carried by
+    # the LDS tile's layout. A shuffled scale load covers an integer number of BLOCK_K
+    # payload steps; K128 therefore retains each packed K256 group for two steps.
+    return (
+        _scale_shuffle_supported(cfg, 0)
+        and x_scales.ndim == 2
+        and x_scales.shape[1] == K // MX_GROUP_SIZE
+        and x_scales.is_contiguous()
+        and int(cfg["BLOCK_M"]) % 32 == 0
+        # The buffer is one 256 B run per 32-row stripe, so a slot that is a
+        # whole number of stripes is a contiguous slice of it; the kernel indexes the
+        # slice with a stripe offset. It does not have to be the whole block.
+        and int(cfg["SLOT_M"]) % 32 == 0
+        and K % 256 == 0
+    )
+
+
+def _a_sort_has_instance(routing_data, K) -> bool:
+    """True when the C++ A-scale sort has an instance for this shape."""
+    from aiter.ops.moe_mxfp4_aux import MXFP4_MOE_SUPPORTED_SHAPES
+
+    # The C++ side is a codegen'd template keyed on (BM, NE, D_HIDDEN), BM in
+    # {32, 64, 128}. The module is torch-free, so a missing instance aborts the process
+    # instead of raising: check the shape table first and fall back to raw scales.
+    n_expts_tot = int(routing_data.expt_data.hist.numel())
+    return any(
+        ne == n_expts_tot and h == K for ne, h, _e, _topk in MXFP4_MOE_SUPPORTED_SHAPES
+    )
+
+
+def _a_sort_runs(routing_data, block_m, K, sorted_rows) -> bool:
+    """True when the A-scale sort can run for this shape."""
+    # Sorted rows (GEMM2) have a torch fallback for shapes with no C++ instance.
+    return block_m in (32, 64, 128) and (
+        sorted_rows or _a_sort_has_instance(routing_data, K)
+    )
+
+
+def _cdna4_config_error(cfg, a_shuffled) -> str | None:
+    """Return why ``cfg`` cannot read ``CDNA4_SCALE`` weight scales, or None."""
+    if not _b_scale_shuffle_fits(cfg):
+        return "this config cannot read CDNA4_SCALE weight scales"
+    if int(cfg["BLOCK_K"]) == 128 and not a_shuffled:
+        return "CDNA4_SCALE weight scales at BLOCK_K 128 need sorted-shuffled A scales"
+    return None
+
+
 def _sorted_shuffle_a_scales(x_scales, routing_data, gather_indx, K, cfg):
     """Run the C++ pre-pass that sorts + fragment-permutes the token scales.
 
@@ -548,40 +626,17 @@ def _sorted_shuffle_a_scales(x_scales, routing_data, gather_indx, K, cfg):
             * routing_data.n_expts_act
         )
     block_m = int(cfg["BLOCK_M"])
-    # Mirrors KernelLayout.payload_a_sorted_shuffled_ok: the permutation is carried by
-    # the LDS tile's layout. A shuffled scale load covers an integer number of BLOCK_K
-    # payload steps; K128 therefore retains each packed K256 group for two steps.
-    if (
-        not _scale_shuffle_supported(cfg, 0)
-        or x_scales.ndim != 2
-        or x_scales.shape[1] != K // MX_GROUP_SIZE
-        or not x_scales.is_contiguous()
-        or block_m % 32 != 0
-        # The buffer is one 256 B run per 32-row stripe, so a slot that is a
-        # whole number of stripes is a contiguous slice of it; the kernel indexes the
-        # slice with a stripe offset. It does not have to be the whole block.
-        or int(cfg["SLOT_M"]) % 32 != 0
-        or K % 256 != 0
-    ):
+    if not _a_sort_fits(x_scales, K, cfg):
         return None
 
-    from aiter.ops.moe_mxfp4_aux import (
-        MXFP4_MOE_SUPPORTED_SHAPES,
-        mxfp4_moe_sort_scales,
-    )
+    from aiter.ops.moe_mxfp4_aux import mxfp4_moe_sort_scales
 
     dev = x_scales.device
     expt_data = routing_data.expt_data
     n_expts_act = routing_data.n_expts_act
-    # The C++ side is a codegen'd template keyed on (BM, NE, D_HIDDEN), BM in
-    # {32, 64, 128}. The module is torch-free, so a missing instance aborts the process
-    # instead of raising: check the shape table first and fall back to raw scales.
     n_expts_tot = int(expt_data.hist.numel())
-    has_instance = any(
-        ne == n_expts_tot and h == K for ne, h, _e, _topk in MXFP4_MOE_SUPPORTED_SHAPES
-    )
-    # Sorted rows (GEMM2) have a torch fallback below for shapes with no C++ instance.
-    if block_m not in (32, 64, 128) or not (has_instance or sorted_rows):
+    has_instance = _a_sort_has_instance(routing_data, K)
+    if not _a_sort_runs(routing_data, block_m, K, sorted_rows):
         _LOGGER.info(
             "sorted-shuffled A scales unavailable, using raw scales: no aux instance "
             f"for BM={block_m} NE={n_expts_tot} H={K}"
@@ -630,7 +685,6 @@ def _sorted_shuffle_a_scales(x_scales, routing_data, gather_indx, K, cfg):
 #: Kinds of copy made from a caller tensor. The weights are static, so in production
 #: the shuffle belongs in the checkpoint-load path; caching keeps the benchmark honest
 #: (paid once, not per call) without changing every caller.
-_B_SCALE_SHUFFLE_COPY = "cdna4_scale_shuffled"
 _B_PRESHUFFLE_COPY = "b_preshuffled"
 
 
@@ -712,19 +766,18 @@ def _cached_copy(src, kind, make, *dims):
 def drop_weight_copies(*tensors):
     """Drop the reordered copies that the Gluon MoE GEMM keeps for weight tensors.
 
-    The GEMM keeps a preshuffled copy of ``w`` and of ``w_scales``, and makes a new
-    copy after a PyTorch in-place update. Call this function with the tensors after a
-    write that PyTorch does not count: for example the replay of a CUDA graph that
-    writes the weights, a write through ``.data``, or an in-place write to an inference
-    tensor. ``None`` entries are skipped.
+    The GEMM keeps a preshuffled copy of ``w``, and makes a new copy after a PyTorch
+    in-place update. Call this function with the tensors after a write that PyTorch
+    does not count: for example the replay of a CUDA graph that writes the weights, a
+    write through ``.data``, or an in-place write to an inference tensor. ``None``
+    entries are skipped.
     """
     for t in tensors:
         if t is None:
             continue
-        for kind in (_B_PRESHUFFLE_COPY, _B_SCALE_SHUFFLE_COPY):
-            entry = _WEIGHT_COPIES.get((id(t), kind))
-            if entry is not None and entry.src() is t:
-                entry.finalizer()  # removes the entry
+        entry = _WEIGHT_COPIES.get((id(t), _B_PRESHUFFLE_COPY))
+        if entry is not None and entry.src() is t:
+            entry.finalizer()  # removes the entry
 
 
 def _k_pack(dq) -> int:
@@ -778,44 +831,9 @@ def _preshuffled_b(w, cfg, N, K, dq_b):
     )
 
 
-def _shuffled_b_scales(w_scales, cfg, N, K):
-    """CDNA4_SCALE-preshuffled weight scales, or None if the config cannot read them.
-
-    Reuses utils/shuffle.py::shuffle_scale_moe, whose gfx950 permute
-    (preshuffle_factor 32, scale_kwidth 8) lands each element in exactly the slot
-    ``get_mfma_scale_layout`` assigns for a 16x16x128 operand -- verified base for base
-    against the layout, same as the A-side shuffle. Padded scales (logical N or K
-    below the stored extent) get no copy.
-    """
-    if w_scales is None:
-        return None
-    if (
-        not _b_scale_shuffle_fits(cfg)
-        or w_scales.shape[-1] % 32 != 0
-        or w_scales.shape[-2] % 8 != 0
-        or w_scales.shape[-1] != N
-        or w_scales.shape[-2] * MX_GROUP_SIZE != K
-    ):
-        return None
-    from aiter.ops.triton.utils.shuffle import _shuffle_scale_tile_gfx950
-
-    # The tile permute itself, not shuffle_scale_moe: that transposes the result
-    # back to (E, K*, N/32) for the Triton kernels, and materialising that view
-    # would undo the very byte order the shuffle exists to produce. What the kernel
-    # reads is the pre-transpose (E, N/32, K) tile, which is already contiguous.
-    # The N rows keep their input order, including separate gate/up halves.
-    return _cached_copy(
-        w_scales,
-        _B_SCALE_SHUFFLE_COPY,
-        lambda: _shuffle_scale_tile_gfx950(w_scales.transpose(-1, -2), 32, 8),
-        N,
-        K,
-    )
-
-
-def _reads_b_directly(w, w_scales, N, K, dq_b) -> bool:
-    """True when the launch must read ``w`` and ``w_scales`` directly, through its
-    ladder, instead of the copies that the family entries read.
+def _reads_b_directly(w, N, K, dq_b) -> bool:
+    """True when the launch must read ``w`` directly, through its ladder, instead of
+    the copy that the family entries read.
 
     A copy is not valid while a CUDA graph is captured (a replay runs no host check),
     for an inference tensor (no version counter shows its writes) or for a padded
@@ -825,12 +843,7 @@ def _reads_b_directly(w, w_scales, N, K, dq_b) -> bool:
         return True
     pack = _k_pack(dq_b)
     *_, k_stored, n_stored = w.shape
-    if n_stored != N or k_stored * pack != K:
-        return True
-    if w_scales is None:
-        return False
-    *_, k_groups, n_scales = w_scales.shape
-    return w_scales.is_inference() or n_scales != N or k_groups * MX_GROUP_SIZE != K
+    return n_stored != N or k_stored * pack != K
 
 
 #: Compiled kernel + launch constants, keyed by everything that can change the
@@ -1042,8 +1055,11 @@ def moe_gemm_gluon(
     ignore these settings.
 
     ``swizzle_mx_scale`` is ``None`` (raw ``w_scales``) or ``"CDNA4_SCALE"`` (the tile
-    that ``shuffle_scale_moe(arch="gfx950")`` returns). An unreadable tile raises
-    ``ValueError``.
+    that ``shuffle_scale_moe(arch="gfx950")`` returns). The kernel reads ``w_scales``
+    in this layout and makes no copy. An unreadable tile raises ``ValueError``. A
+    config that cannot read the tile also raises ``ValueError``: at ``BLOCK_K`` 128 the
+    A scales must be sorted-shuffled too. An explicit ``config`` must set
+    ``B_SCALE_SHUFFLED`` to match ``swizzle_mx_scale``.
 
     ``y_scales`` non-None selects the fused MXFP4 output quant: ``y`` then holds the
     E2M1 payload (``N // ARN // 2`` uint8 columns) and ``y_scales`` the E8M0 exponents,
@@ -1065,6 +1081,12 @@ def moe_gemm_gluon(
     scale_error = _swizzle_error(swizzle_mx_scale, w_scales, N, K)
     if scale_error is not None:
         raise ValueError(scale_error)
+    b_cdna4 = swizzle_mx_scale == "CDNA4_SCALE"
+    if config and bool(config.get("B_SCALE_SHUFFLED", False)) != b_cdna4:
+        raise ValueError(
+            f"config B_SCALE_SHUFFLED={config.get('B_SCALE_SHUFFLED', False)} does not "
+            f"match swizzle_mx_scale={swizzle_mx_scale}"
+        )
     if gate_up_split is None:
         gate_up_split = bool(_env_int("AITER_TRITON_MOE_GLUON_GU_SPLIT", 0))
     gate_up_split = bool(gate_up_split) and apply_swiglu
@@ -1085,7 +1107,7 @@ def moe_gemm_gluon(
     small_grid = _small_grid(routing_data, y.shape[1], N)
     multi_block = _multi_block(routing_data, y.shape[1])
     half_block = _half_block(routing_data, y.shape[1])
-    direct_b = _reads_b_directly(w, w_scales, N, K, dq_b)
+    direct_b = _reads_b_directly(w, N, K, dq_b)
 
     if apply_swiglu:
         act = ActivationSpec(
@@ -1156,10 +1178,7 @@ def moe_gemm_gluon(
             )
         a_scales, a_swizzle = x_scales.reshape(-1), ScaleSwizzle.SORTED_SHUFFLED
         a_scale_stride_m, a_scale_stride_k = 0, 32
-    elif (
-        _cfg.get("A_SCALE_SORTED_SHUFFLED", False)
-        or _env_int("AITER_TRITON_MOE_GLUON_SORTED_SCALES", 0)
-    ) and (apply_swiglu or gather_indx is None):
+    elif _a_sort_requested(_cfg, apply_swiglu, gather_indx):
         shuffled = _sorted_shuffle_a_scales(
             x_scales, routing_data, gather_indx, K, _cfg
         )
@@ -1170,16 +1189,17 @@ def moe_gemm_gluon(
             # load wider than BLOCK_K is retained for its scale-K/BLOCK_K payload steps.
             a_scale_stride_m, a_scale_stride_k = 0, 32
     a_shuffled = a_swizzle == ScaleSwizzle.SORTED_SHUFFLED
+    # The input sets the B-scale layout. The kernel reads the tile as given.
     b_scales, b_swizzle = w_scales, ScaleSwizzle.NONE
     b_scale_stride_k = 0 if w_scales is None else w_scales.stride(1)
-    if _cfg.get("B_SCALE_SHUFFLED", False) or _env_int(
-        "AITER_TRITON_MOE_GLUON_SHUFFLED_W_SCALES", 0
-    ):
-        shuf_w = _shuffled_b_scales(w_scales, _cfg, N, K)
-        if shuf_w is not None:
-            b_scales, b_swizzle = shuf_w, ScaleSwizzle.CDNA4_SCALE
-            b_scale_stride_k = 32
-    b_shuffled = b_swizzle == ScaleSwizzle.CDNA4_SCALE
+    if b_cdna4:
+        config_error = _cdna4_config_error(_cfg, a_shuffled)
+        if config_error is not None:
+            raise ValueError(config_error)
+        # The (E, N/32, K) view is the contiguous tile. Eight scales span 256 bytes.
+        b_scales, b_swizzle = w_scales.transpose(-1, -2), ScaleSwizzle.CDNA4_SCALE
+        b_scale_stride_k = 32
+    b_shuffled = b_cdna4
     if (
         bool(_cfg.get("A_SCALE_SORTED_SHUFFLED", False)) != a_shuffled
         or bool(_cfg.get("B_SCALE_SHUFFLED", False)) != b_shuffled
@@ -1421,6 +1441,8 @@ def try_gluon_grouped_gemm(
         K=K,
         w_static_scale=w_static_scale,
         apply_swiglu=apply_swiglu,
+        gather_indx=gather_indx,
+        x_scales_sorted_shuffled=x_scales_sorted_shuffled,
     )
     if not ok:
         _LOGGER.debug(f"{op_name}: falling back to the Triton kernel: {why}")

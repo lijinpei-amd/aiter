@@ -961,7 +961,7 @@ def _family_launch_config(
         new["B_PRESHUFFLED"] = not new["ALLOW_B_VIA_LDS"]
     # The entries were measured with N and K multiples of 256 only, and an entry that
     # keeps the base BLOCK_K at BLOCK_K 256 only. Those N and K also satisfy
-    # _preshuffled_b and _shuffled_b_scales.
+    # _preshuffled_b and the CDNA4_SCALE weight-scale tile.
     if (
         not tuned
         or N % 256
@@ -1057,9 +1057,9 @@ def _default_launch_config(
     entry. With ``small_grid`` they pick GEMM2's grid class, "small", "multi", "half"
     or "any", in this order.
 
-    ``direct_b``: the launch must read the weights and scales directly (see the host's
-    ``_reads_b_directly``: graph capture, inference or padded tensors). It then takes
-    no family tile entry; those read copies that the host makes and checks.
+    ``direct_b``: the launch must read the weights directly (see the host's
+    ``_reads_b_directly``: graph capture, inference or padded weights). It then takes
+    no family tile entry; those read the weight copy that the host makes and checks.
     """
     small_grid = bool(small_grid)
     ladder, env_keys = _get_gluon_config_cached(
@@ -1409,9 +1409,9 @@ def _default_launch_config(
         # T=16/64 were the unshuffled ones; their block_m 32 tile now shuffles too,
         # and with the hint gains (see that override).
         #
-        # Those overrides only shuffle when N and K are multiples of 256, where
-        # _shuffled_b_scales always succeeds, so the launch never drops the shuffle
-        # and keeps the hint.
+        # Those overrides only shuffle when N and K are multiples of 256. The launch
+        # reads the weight scales in the layout of the input. With raw scales it
+        # clears the shuffle and keeps the hint.
         #
         # BLOCK_K 128 through LDS: an unshuffled scale row is 4 bytes, and its LDS
         # copy has every warp fetch the same rows (all but one warp's writes are
@@ -1547,7 +1547,7 @@ def _scale_shuffle_supported(cfg, operand):
 
 
 def _b_scale_shuffle_fits(cfg):
-    """The config half of what ``_shuffled_b_scales`` needs to shuffle B scales."""
+    """True when ``cfg`` can read ``CDNA4_SCALE`` weight scales."""
     # Stripe-based like the A shuffle: one 256 B run per 32 columns, so a slot that
     # is a whole number of stripes is a contiguous slice of the tile.
     return _scale_shuffle_supported(cfg, 1) and int(cfg["SLOT_N"]) % 32 == 0
