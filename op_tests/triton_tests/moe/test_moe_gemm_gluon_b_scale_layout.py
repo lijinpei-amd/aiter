@@ -560,3 +560,116 @@ def test_validate_layout_rejects_b_scale_k_above_k256():
         _validate_b_shuffled(
             **_NARROW_B, BLOCK_K=512, VGPR_PREFETCH_K=512, NUM_LDS_BUFFER=2
         )
+
+
+def _k512_entry():
+    # A block_m 32 tile small enough to fit the LDS at BLOCK_K 512.
+    cfg = dict(
+        host._launch_spec(
+            32,
+            _N,
+            _K,
+            DtypeQuant.MXFP8,
+            DtypeQuant.MXFP8,
+            False,
+            False,
+            False,
+            True,
+            False,
+            ActivationSpec(int(ActKind.SILU), 1.0, None, False),
+            None,
+            None,
+        )[4],
+        BLOCK_K=512,
+        VGPR_PREFETCH_K=512,
+        BLOCK_N=64,
+        SLOT_N=64,
+        tiles_per_warp=(2, 1),
+        NUM_LDS_BUFFER=2,
+        K_UNROLL=1,
+        A_SCALE_SORTED_SHUFFLED=False,
+        B_SCALE_SHUFFLED=False,
+    )
+    return cfg
+
+
+def _k512_inputs():
+    case = _mx8_inputs()
+    case.routing_data.block_m = 32
+    return case
+
+
+def _tuning(args):
+    return conf._cval(args["CFG_TUNING"])
+
+
+def test_default_k512_with_cdna4_input_runs_at_k256(monkeypatch):
+    case = _k512_inputs()
+    tile = _mx8_tile()
+    entry = _k512_entry()
+    monkeypatch.setattr(host, "_default_launch_config", lambda *_: dict(entry))
+    args = _capture(case, tile, "CDNA4_SCALE", None, monkeypatch)
+    assert _tuning(args).BLOCK_K == 256
+    _assert_b_scales(args, tile, cdna4=True)
+
+
+def test_default_k512_with_raw_input_keeps_k512(monkeypatch):
+    case = _k512_inputs()
+    entry = _k512_entry()
+    monkeypatch.setattr(host, "_default_launch_config", lambda *_: dict(entry))
+    args = _capture(case, case.ws, None, None, monkeypatch)
+    assert _tuning(args).BLOCK_K == 512
+    _assert_b_scales(args, case.ws, cdna4=False)
+
+
+def test_explicit_k512_config_with_cdna4_input_raises(monkeypatch):
+    case = _k512_inputs()
+    _no_launch(monkeypatch)
+    cfg = dict(_k512_entry(), B_SCALE_SHUFFLED=True)
+    with pytest.raises(ValueError, match="cannot read"):
+        _capture(case, _mx8_tile(), "CDNA4_SCALE", cfg, monkeypatch)
+
+
+@pytest.mark.parametrize("k256_runs", [True, False])
+def test_gluon_supported_agrees_with_the_k256_launch(k256_runs, monkeypatch):
+    case = _k512_inputs()
+    real = host._pipeline_error
+
+    def pipeline_error(cfg_items, *rest):
+        if not k256_runs and dict(cfg_items)["BLOCK_K"] == 256:
+            return "no pipeline"
+        return real(cfg_items, *rest)
+
+    monkeypatch.setattr(host, "_pipeline_error", pipeline_error)
+    ok, why = _mx8_supported(case, _mx8_tile(), monkeypatch, _k512_entry())
+    assert ok is k256_runs, why
+    if not k256_runs:
+        assert "cannot read" in why
+        _no_launch(monkeypatch)
+        with pytest.raises(ValueError, match="cannot read"):
+            _capture(case, _mx8_tile(), "CDNA4_SCALE", None, monkeypatch)
+
+
+def test_b_scale_k256_changes_only_an_oversized_block_k():
+    entry = _k512_entry()
+    k256 = conf._b_scale_k256(entry)
+    assert k256 == dict(entry, BLOCK_K=256, VGPR_PREFETCH_K=256)
+    assert conf._b_scale_k256(k256) is None
+    assert conf._b_scale_k256(dict(entry, SLOT_N=16)) is None
+
+
+def test_gemm1_half_tile_reads_cdna4_at_k256(monkeypatch):
+    half = _k512_entry()
+    monkeypatch.setattr(conf, "_default_launch_config", lambda *_, **__: dict(half))
+    monkeypatch.setattr(conf, "_gemm1_half_tile", lambda *_: {})
+    conf._gemm1_half_m_config.cache_clear()
+    launch = dict(
+        conf._b_scale_k256(half), BLOCK_M=64, HALF_M_TILE=True, B_SCALE_SHUFFLED=True
+    )
+    items = conf._gemm1_half_m_config(
+        conf._cfg_key(launch), 64, _N, _K, DtypeQuant.MXFP8, DtypeQuant.MXFP8, False
+    )
+    conf._gemm1_half_m_config.cache_clear()
+    assert items is not None
+    assert dict(items)["BLOCK_K"] == 256
+    assert dict(items)["B_SCALE_SHUFFLED"] is True

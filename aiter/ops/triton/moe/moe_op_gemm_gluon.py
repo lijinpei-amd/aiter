@@ -62,6 +62,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import (
 from aiter.ops.triton.moe.moe_op_gemm_gluon_config import (
     _SUPPORTED_BLOCK_M,
     MX_GROUP_SIZE,
+    _b_scale_k256,
     _b_scale_shuffle_fits,
     _canonical_slot_keys,
     _cfg_key,
@@ -72,6 +73,7 @@ from aiter.ops.triton.moe.moe_op_gemm_gluon_config import (
     _family_env_keys,
     _gemm2_half_m_config,
     _hashable,
+    _launch_error,
     _pipeline_error,
     _probe_lds_bytes,
     _scale_shuffle_supported,
@@ -285,6 +287,8 @@ def gluon_supported(
     # The launch reads the weight scales in the layout of the input.
     b_cdna4 = swizzle_mx_scale == "CDNA4_SCALE"
     cfg = dict(cfg, B_SCALE_SHUFFLED=b_cdna4)
+    if b_cdna4:
+        cfg = _cdna4_default_config(cfg, dq_a, dq_b, N, K)
     if x_scales_sorted_shuffled and int(cfg["BLOCK_K"]) == 128 and not b_cdna4:
         return False, (
             "x_scales_sorted_shuffled at BLOCK_K 128 needs CDNA4_SCALE weight scales"
@@ -374,16 +378,19 @@ def _launch_spec(
     multi_block=False,
     direct_b=False,
     half_block=False,
+    b_cdna4=False,
 ):
     """Host-side constexpr work, memoised.
 
     The host aggregates and launch constants depend only on compile-time values,
-    so they are computed once per distinct configuration.
+    so they are computed once per distinct configuration. ``b_cdna4``: the weight
+    scales are ``CDNA4_SCALE``; the default config then reads them if it can (see
+    :func:`_cdna4_default_config`).
     """
-    c = (
-        _canonical_slot_keys(dict(config_items))
-        if config_items
-        else _default_launch_config(
+    if config_items:
+        c = _canonical_slot_keys(dict(config_items))
+    else:
+        c = _default_launch_config(
             block_m,
             N,
             K,
@@ -396,7 +403,8 @@ def _launch_spec(
             direct_b,
             half_block,
         )
-    )
+        if b_cdna4:
+            c = _cdna4_default_config(c, dq_a, dq_b, N, K)
     assert c["BLOCK_M"] == block_m, (
         f"config BLOCK_M {c['BLOCK_M']} must match routing block_m {block_m}"
     )
@@ -605,6 +613,28 @@ def _cdna4_config_error(cfg, a_shuffled) -> str | None:
     if int(cfg["BLOCK_K"]) == 128 and not a_shuffled:
         return "CDNA4_SCALE weight scales at BLOCK_K 128 need sorted-shuffled A scales"
     return None
+
+
+def _cdna4_default_config(cfg, dq_a, dq_b, N, K):
+    """Return the default config ``cfg`` for ``CDNA4_SCALE`` weight scales.
+
+    When only a ``BLOCK_K`` above 256 stops ``cfg`` from reading the tile, return
+    ``cfg`` at ``BLOCK_K`` 256 if that config passes the launch checks. Else return
+    ``cfg``. ``gluon_supported`` and the launch both use this function, so they
+    make the same decision.
+    """
+    k256 = _b_scale_k256(cfg)
+    if k256 is None:
+        return cfg
+    k256["B_SCALE_SHUFFLED"] = True
+    if (
+        K % k256["BLOCK_K"]
+        or _cdna4_config_error(k256, False) is not None
+        or _pipeline_error(_cfg_key(k256), dq_a, dq_b, K) is not None
+        or _launch_error(_cfg_key(k256), dq_a, dq_b, N, K) is not None
+    ):
+        return cfg
+    return k256
 
 
 def _sorted_shuffle_a_scales(x_scales, routing_data, gather_indx, K, cfg):
@@ -1061,7 +1091,8 @@ def moe_gemm_gluon(
     ``swizzle_mx_scale`` is ``None`` (raw ``w_scales``) or ``"CDNA4_SCALE"`` (the tile
     that ``shuffle_scale_moe(arch="gfx950")`` returns). The kernel reads ``w_scales``
     in this layout and makes no copy. An unreadable tile raises ``ValueError``. A
-    config that cannot read the tile also raises ``ValueError``. At ``BLOCK_K`` 128 the
+    default config at a ``BLOCK_K`` above 256 runs at ``BLOCK_K`` 256 when it can. A
+    config that cannot read the tile raises ``ValueError``. At ``BLOCK_K`` 128 the
     A and B scales are both shuffled or both raw: with ``CDNA4_SCALE`` the A scales
     must be sorted-shuffled, and with raw ``w_scales`` the A scales are read raw
     (``x_scales_sorted_shuffled`` then raises ``ValueError``). An explicit ``config``
@@ -1156,6 +1187,7 @@ def moe_gemm_gluon(
             multi_block,
             direct_b,
             half_block,
+            b_cdna4,
         )
 
     grid_n, constexpr_args, num_warps, waves_per_eu, _cfg, _tc, _half_tc = _spec(

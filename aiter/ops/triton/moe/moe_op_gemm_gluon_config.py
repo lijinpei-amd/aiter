@@ -1023,6 +1023,9 @@ def _gemm2_half_m_config(
     # The half tile reads the launch's A-scale buffer, so it takes its layout: the
     # sorted-shuffled buffer is addressed in the launch's block space (2 * pid_m).
     half["A_SCALE_SORTED_SHUFFLED"] = bool(cfg.get("A_SCALE_SORTED_SHUFFLED", False))
+    if half["B_SCALE_SHUFFLED"] and not _b_scale_shuffle_fits(half):
+        # The half tile also reads CDNA4_SCALE weight scales at BLOCK_K 256.
+        half = _b_scale_k256(half) or half
     shared = (
         "warps_per_cta",
         "WAVES_PER_EU",
@@ -1482,7 +1485,10 @@ def _gemm1_half_m_config(
     ):
         return None
     if half["B_SCALE_SHUFFLED"] and not _b_scale_shuffle_fits(half):
-        return None
+        # The half tile also reads CDNA4_SCALE weight scales at BLOCK_K 256.
+        half = _b_scale_k256(half)
+        if half is None:
+            return None
     if not half["ALLOW_B_VIA_LDS"] and not half["B_PRESHUFFLED"]:
         return None
     items = _cfg_key(half)
@@ -1556,6 +1562,16 @@ def _b_scale_shuffle_fits(cfg):
         and int(cfg["BLOCK_K"]) in (128, 256)
         and int(cfg["SLOT_N"]) % 32 == 0
     )
+
+
+def _b_scale_k256(cfg):
+    """Return ``cfg`` at ``BLOCK_K`` 256 when only a ``BLOCK_K`` above 256 stops it
+    from reading ``CDNA4_SCALE`` weight scales, else None. ``VGPR_PREFETCH_K`` must
+    equal ``BLOCK_K``, so it changes too."""
+    if int(cfg["BLOCK_K"]) <= 256 or _b_scale_shuffle_fits(cfg):
+        return None
+    k256 = dict(cfg, BLOCK_K=256, VGPR_PREFETCH_K=256)
+    return k256 if _b_scale_shuffle_fits(k256) else None
 
 
 _TUNING_KEYS = TuningSpec._fields
