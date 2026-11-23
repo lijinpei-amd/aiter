@@ -443,8 +443,18 @@ def test_k128_register_scale_phase(register_case):
         (512, 16, (True, False)),
         (256, 16, (True, True)),
         (256, 32, (False, True)),
+        (512, 16, (True, True)),
+        (512, 32, (False, True)),
     ],
-    ids=["raw-k256", "a-scale512", "a-scale512-k512", "both-scale512", "b-scale1024"],
+    ids=[
+        "raw-k256",
+        "a-scale512",
+        "a-scale512-k512",
+        "both-scale512",
+        "b-scale1024",
+        "both-scale512-k512",
+        "b-scale1024-k512",
+    ],
 )
 def test_scale_and_payload_k_load_units_are_independent(
     register_case, block_k, scale_k, shuffled

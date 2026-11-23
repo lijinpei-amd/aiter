@@ -62,7 +62,6 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import (
 from aiter.ops.triton.moe.moe_op_gemm_gluon_config import (
     _SUPPORTED_BLOCK_M,
     MX_GROUP_SIZE,
-    _b_scale_k256,
     _b_scale_shuffle_fits,
     _canonical_slot_keys,
     _cfg_key,
@@ -73,7 +72,6 @@ from aiter.ops.triton.moe.moe_op_gemm_gluon_config import (
     _family_env_keys,
     _gemm2_half_m_config,
     _hashable,
-    _launch_error,
     _pipeline_error,
     _probe_lds_bytes,
     _scale_shuffle_supported,
@@ -287,7 +285,6 @@ def gluon_supported(
     # The launch reads the weight scales in the layout of the input.
     cfg = dict(cfg, B_SCALE_SHUFFLED=b_cdna4)
     if b_cdna4:
-        cfg = _cdna4_default_config(cfg, dq_a, dq_b, N, K)
         config_error = _cdna4_config_error(cfg)
         if config_error is not None:
             return False, config_error
@@ -373,8 +370,8 @@ def _launch_spec(
 
     The host aggregates and launch constants depend only on compile-time values,
     so they are computed once per distinct configuration. ``b_cdna4``: the weight
-    scales are ``CDNA4_SCALE``; the default config then reads them if it can (see
-    :func:`_cdna4_default_config`).
+    scales are ``CDNA4_SCALE``; the default config then comes from a ladder that
+    can read them (see :func:`_default_launch_config`).
     """
     if config_items:
         c = _canonical_slot_keys(dict(config_items))
@@ -393,8 +390,6 @@ def _launch_spec(
             half_block,
             b_cdna4,
         )
-        if b_cdna4:
-            c = _cdna4_default_config(c, dq_a, dq_b, N, K)
     assert c["BLOCK_M"] == block_m, (
         f"config BLOCK_M {c['BLOCK_M']} must match routing block_m {block_m}"
     )
@@ -601,27 +596,6 @@ def _cdna4_config_error(cfg) -> str | None:
     if not _b_scale_shuffle_fits(cfg):
         return "this config cannot read CDNA4_SCALE weight scales"
     return None
-
-
-def _cdna4_default_config(cfg, dq_a, dq_b, N, K):
-    """Return the default config ``cfg`` for ``CDNA4_SCALE`` weight scales.
-
-    When only a ``BLOCK_K`` above 256 stops ``cfg`` from reading the tile, return
-    ``cfg`` at ``BLOCK_K`` 256 if that config passes the launch checks. Else return
-    ``cfg``. ``gluon_supported`` and the launch both use this function, so they
-    make the same decision.
-    """
-    k256 = _b_scale_k256(cfg)
-    if k256 is None:
-        return cfg
-    k256["B_SCALE_SHUFFLED"] = True
-    if (
-        K % k256["BLOCK_K"]
-        or _pipeline_error(_cfg_key(k256), dq_a, dq_b, K) is not None
-        or _launch_error(_cfg_key(k256), dq_a, dq_b, N, K) is not None
-    ):
-        return cfg
-    return k256
 
 
 def _sorted_shuffle_a_scales(x_scales, routing_data, gather_indx, K, cfg):
@@ -1078,12 +1052,10 @@ def moe_gemm_gluon(
     ``swizzle_mx_scale`` is ``None`` (raw ``w_scales``) or ``"CDNA4_SCALE"`` (the tile
     that ``shuffle_scale_moe(arch="gfx950")`` returns). The kernel reads ``w_scales``
     in this layout and makes no copy. An unreadable tile raises ``ValueError``. A
-    default config at a ``BLOCK_K`` above 256 runs at ``BLOCK_K`` 256 when it can. A
     config that cannot read the tile raises ``ValueError``. Each scale operand is
     read in its own layout. A shuffled operand needs a config that can read it (at
     ``BLOCK_K`` 128, ``tiles_per_warp`` of at least 2 on that operand). An explicit
-    ``config`` must set ``B_SCALE_SHUFFLED`` to match ``swizzle_mx_scale``. With ``CDNA4_SCALE``
-    input, the half tile of an explicit config can run at ``BLOCK_K`` 256.
+    ``config`` must set ``B_SCALE_SHUFFLED`` to match ``swizzle_mx_scale``.
 
     ``y_scales`` non-None selects the fused MXFP4 output quant: ``y`` then holds the
     E2M1 payload (``N // ARN // 2`` uint8 columns) and ``y_scales`` the E8M0 exponents,

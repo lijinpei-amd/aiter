@@ -1032,9 +1032,6 @@ def _gemm2_half_m_config(
     # The half tile reads the launch's A-scale buffer, so it takes its layout: the
     # sorted-shuffled buffer is addressed in the launch's block space (2 * pid_m).
     half["A_SCALE_SORTED_SHUFFLED"] = bool(cfg.get("A_SCALE_SORTED_SHUFFLED", False))
-    if half["B_SCALE_SHUFFLED"] and not _b_scale_shuffle_fits(half):
-        # The half tile also reads CDNA4_SCALE weight scales at BLOCK_K 256.
-        half = _b_scale_k256(half) or half
     shared = (
         "warps_per_cta",
         "WAVES_PER_EU",
@@ -1508,10 +1505,7 @@ def _gemm1_half_m_config(
     ):
         return None
     if half["B_SCALE_SHUFFLED"] and not _b_scale_shuffle_fits(half):
-        # The half tile also reads CDNA4_SCALE weight scales at BLOCK_K 256.
-        half = _b_scale_k256(half)
-        if half is None:
-            return None
+        return None
     if not half["ALLOW_B_VIA_LDS"] and not half["B_PRESHUFFLED"]:
         return None
     items = _cfg_key(half)
@@ -1579,24 +1573,7 @@ def _b_scale_shuffle_fits(cfg):
     """True when ``cfg`` can read ``CDNA4_SCALE`` weight scales."""
     # Stripe-based like the A shuffle: one 256 B run per 32 columns, so a slot that
     # is a whole number of stripes is a contiguous slice of the tile.
-    # The kernel validates one K128 or K256 scale run per stage.
-    return (
-        _scale_shuffle_supported(cfg, 1)
-        and int(cfg["BLOCK_K"]) in (128, 256)
-        and int(cfg["SLOT_N"]) % 32 == 0
-    )
-
-
-def _b_scale_k256(cfg):
-    """Return ``cfg`` at ``BLOCK_K`` 256 if that reads ``CDNA4_SCALE``, else None.
-
-    Only a ``BLOCK_K`` above 256 can stop a config from reading the tile.
-    ``VGPR_PREFETCH_K`` must equal ``BLOCK_K``, so it changes too.
-    """
-    if int(cfg["BLOCK_K"]) <= 256 or _b_scale_shuffle_fits(cfg):
-        return None
-    k256 = dict(cfg, BLOCK_K=256, VGPR_PREFETCH_K=256)
-    return k256 if _b_scale_shuffle_fits(k256) else None
+    return _scale_shuffle_supported(cfg, 1) and int(cfg["SLOT_N"]) % 32 == 0
 
 
 _TUNING_KEYS = TuningSpec._fields

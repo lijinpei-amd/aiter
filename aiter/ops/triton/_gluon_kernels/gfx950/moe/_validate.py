@@ -170,7 +170,7 @@ def validate_layout(tc, layout, N, K):
                 "K must contain complete SCALE_SLOT_K tiles"
             )
 
-    # -- shuffled B scale tile: one K128 or K256 run per 32 non-K rows --
+    # -- shuffled B scale tile: whole 32-row stripes --
     if tc.preshuffled(1, True):
         nonk = layout.scale_slot_nonk(1)
         assert nonk > 0 and nonk % 32 == 0, (
@@ -179,10 +179,6 @@ def validate_layout(tc, layout, N, K):
         )
         assert instr[2] == 128, (
             f"B_SCALE_SHUFFLED needs MFMA K 128 for the B scale slot (got {instr[2]})"
-        )
-        assert BK in (128, 256), (
-            f"B_SCALE_SHUFFLED needs BLOCK_K 128 or 256 for the B scale slot "
-            f"(got {BK})"
         )
         # K128 needs both 16-row halves of a 32-row stripe in one wave
         # (tiles_per_warp N >= 2).
