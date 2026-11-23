@@ -505,3 +505,58 @@ def test_k128_caller_shuffled_a_with_raw_b_is_refused(monkeypatch):
         x_scales_sorted_shuffled=True,
     )
     assert not ok and "BLOCK_K 128" in why
+
+
+_NARROW_B = {
+    "BLOCK_M": 64,
+    "SLOT_M": 32,
+    "BLOCK_N": 64,
+    "SLOT_N": 64,
+    "warps_per_cta": (1, 4),
+    "tiles_per_warp": (2, 1),
+}
+
+
+def _validate_b_shuffled(**overrides):
+    from aiter.ops.triton._gluon_kernels.gfx950.moe._validate import validate
+    from op_tests.triton_tests.moe.test_moe_gemm_gluon_scale_layout import _config
+
+    tc = _config(fused=False, B_SCALE_SHUFFLED=True, **overrides)
+    return validate(tc, 4096, 7168)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {
+            "BLOCK_N": 16,
+            "SLOT_N": 16,
+            "warps_per_cta": (2, 1),
+            "tiles_per_warp": (2, 1),
+        },
+        {"SCALE_SLOT_N": 48},
+    ],
+)
+def test_validate_layout_rejects_short_b_scale_slot(overrides):
+    # The layout build already refuses these, with its own message.
+    with pytest.raises(AssertionError, match="SLOT_N"):
+        _validate_b_shuffled(**overrides)
+
+
+def test_validate_layout_accepts_k128_and_k256_b_scale_tiles():
+    assert _validate_b_shuffled(
+        **{**_NARROW_B, "warps_per_cta": (1, 2), "tiles_per_warp": (2, 2)}
+    )
+    assert _validate_b_shuffled(**_NARROW_B, BLOCK_K=256, VGPR_PREFETCH_K=256)
+
+
+def test_validate_layout_rejects_k128_b_scale_without_paired_tiles():
+    with pytest.raises(AssertionError, match="B scale slot"):
+        _validate_b_shuffled(**_NARROW_B)
+
+
+def test_validate_layout_rejects_b_scale_k_above_k256():
+    with pytest.raises(AssertionError, match="B scale slot"):
+        _validate_b_shuffled(
+            **_NARROW_B, BLOCK_K=512, VGPR_PREFETCH_K=512, NUM_LDS_BUFFER=2
+        )

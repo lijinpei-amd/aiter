@@ -171,6 +171,9 @@ truncate rows, and `BLOCK_K > 256` can underallocate or copy only part of a stag
 extent divisible by 32 and only the explicitly implemented K128/K256 cases, including
 the existing packed-K128 pairing rules.
 
+**Status:** fixed. `validate_layout` checks the B scale slot: a positive multiple of
+32 rows, MFMA K 128, BLOCK_K 128 or 256, and `tiles_per_warp` N of 2 or more at K128.
+
 ### M4. Safety validation is disabled by optimized Python
 
 **Reachability:** an optimized Python process plus an invalid custom/environmental
