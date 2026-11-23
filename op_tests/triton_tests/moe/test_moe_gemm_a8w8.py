@@ -264,8 +264,13 @@ def test_op(
     act_dtype_str,
     weight_dtype_str,
     hbm_swizzling,
+    monkeypatch,
     device="cuda",
 ):
+    if hbm_swizzling and get_arch() == "gfx950":
+        # These cases check the Triton CDNA4_SCALE kernel. The Gluon path has its own
+        # test.
+        monkeypatch.setenv("AITER_TRITON_MOE_DISABLE_GLUON", "1")
     _run_case(
         m,
         n,
@@ -283,6 +288,48 @@ def test_op(
         hbm_swizzling,
         device=device,
     )
+
+
+def _count_gluon_launches(monkeypatch):
+    """Count the calls of ``moe_gemm_gluon`` that the wrapper makes."""
+    from aiter.ops.triton.moe import moe_op_gemm_gluon
+
+    calls = []
+    real = moe_op_gemm_gluon.moe_gemm_gluon
+
+    def counting(*args, **kwargs):
+        calls.append(kwargs.get("swizzle_mx_scale"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(moe_op_gemm_gluon, "moe_gemm_gluon", counting)
+    return calls
+
+
+@pytest.mark.parametrize("do_gather, do_scatter", [(True, False), (False, True)])
+def test_cdna4_scale_gluon_path(do_gather, do_scatter, monkeypatch):
+    """CDNA4_SCALE weight scales run on the Gluon kernel."""
+    if get_arch() != "gfx950":
+        pytest.skip("Gluon MoE kernels are gfx950 only.")
+    monkeypatch.delenv("AITER_TRITON_MOE_DISABLE_GLUON", raising=False)
+    calls = _count_gluon_launches(monkeypatch)
+    _run_case(
+        1024,
+        3072,
+        3072,
+        do_gather,
+        do_scatter,
+        False,
+        do_gather,
+        False,
+        False,
+        128,
+        4,
+        "mxfloat8_e4m3fn",
+        "mxfloat8_e4m3fn",
+        True,
+    )
+    assert calls, "the call did not reach moe_gemm_gluon"
+    assert set(calls) == {"CDNA4_SCALE"}
 
 
 def _run_case(

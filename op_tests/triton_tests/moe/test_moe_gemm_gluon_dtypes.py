@@ -33,6 +33,7 @@ from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 from op_tests.triton_tests.utils.mxfp_ref import upcast_from_mxfp
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 from op_tests.triton_tests.moe.test_moe_gemm_a4w4 import assert_close
 
 # (id, x dtype tag, w dtype tag)
@@ -42,6 +43,25 @@ _PAIRS = [
     ("mxfp8xmxfp8", "mxfp8", "mxfp8"),
     ("mxfp8xmxfp4", "mxfp8", "mxfp4"),
 ]
+
+
+@pytest.fixture
+def _no_soffset_unroll(monkeypatch):
+    """Drop SOFF_UNROLL from tuned entries when the Triton build lacks ``soffset``."""
+    import inspect
+
+    from aiter.ops.triton.moe import moe_op_gemm_gluon as host
+
+    from triton.experimental.gluon.language.amd import cdna4
+
+    if "soffset" in inspect.signature(cdna4.buffer_load).parameters:
+        return
+    real = host._default_launch_config
+
+    def without_soffset(*args, **kwargs):
+        return dict(real(*args, **kwargs), SOFF_UNROLL=False)
+
+    monkeypatch.setattr(host, "_default_launch_config", without_soffset)
 
 
 def _quantize(t: torch.Tensor, tag: str, axis: int):
@@ -59,68 +79,99 @@ def _quantize(t: torch.Tensor, tag: str, axis: int):
     "x_tag, w_tag", [(x, w) for _, x, w in _PAIRS], ids=[i for i, _, _ in _PAIRS]
 )
 @pytest.mark.parametrize("m, n, k", [(1024, 2048, 2048), (16, 4096, 4096)])
-def test_operand_dtype_pairs(x_tag, w_tag, m, n, k, device="cuda"):
+@pytest.mark.parametrize("stage", ["gemm1_gather_swiglu", "gemm2_scatter"])
+def test_operand_dtype_pairs(
+    x_tag, w_tag, m, n, k, stage, _no_soffset_unroll, device="cuda"
+):
+    """Raw and ``CDNA4_SCALE`` weight scales give the reference result and equal bits."""
     if get_arch() != "gfx950":
         pytest.skip("Gluon MoE kernels are gfx950 only.")
+    gemm1 = stage.startswith("gemm1")
     n_expts_tot, n_expts_act = 64, 4
     torch.manual_seed(0)
     logits = torch.randn((m, n_expts_tot), dtype=torch.float16, device=device)
-    rdata, gindx, _ = routing(logits, n_expts_act)
+    rdata, gindx, sindx = routing(logits, n_expts_act)
     rdata.gate_scal = None
+    M = gindx.shape[0]
 
-    x = torch.randn((m, k), device=device, dtype=torch.bfloat16)
+    x = torch.randn((m if gemm1 else M, k), device=device, dtype=torch.bfloat16)
     # (E, K, N) with stride(-2) == 1, the layout contract every path asserts
     w = torch.randn((n_expts_tot, n, k), device=device, dtype=torch.bfloat16).transpose(
         1, 2
     )
     bias = torch.randn((n_expts_tot, n), device=device, dtype=torch.float32)
-    gammas = torch.rand((gindx.shape[0],), device=device, dtype=torch.float32)
+    gammas = torch.rand((M,), device=device, dtype=torch.float32)
 
     x_q, x_s, x_ref = _quantize(x, x_tag, axis=-1)
     w_q, w_s, w_ref = _quantize(w, w_tag, axis=1)
     assert w_q.stride(-2) == 1
 
-    M = gindx.shape[0]
-    y = torch.zeros((1, M, n), device=device, dtype=torch.bfloat16)
-    ok, why = gluon_supported(
-        x=x_q,
-        w=w_q,
-        x_scales=x_s,
-        w_scales=w_s,
-        y=y,
-        bias=bias,
-        routing_data=rdata,
-        swizzle_mx_scale=None,
-        split_k=1,
-        x_static_scale=None,
-        quant_static_scale=None,
-        out_quant=None,
-        N=n,
-        K=k,
-    )
-    if not ok:
-        pytest.skip(f"not on the Gluon path: {why}")
+    gather_indx = gindx if gemm1 else None
+    scatter_indx = None if gemm1 else sindx
+    n_out = n // 2 if gemm1 else n
+    layouts = {"raw": (w_s, None)}
+    if w_s is not None and n % 32 == 0 and k % 256 == 0:
+        layouts["cdna4"] = (shuffle_scale_moe(w_s, arch="gfx950"), "CDNA4_SCALE")
 
-    moe_gemm_gluon(
-        y,
-        x_q,
-        w_q,
-        x_s,
-        w_s,
+    ref = moe_gemm_torch(
+        x_ref,
+        w_ref,
         bias,
-        gammas,
         rdata,
-        gindx,
-        None,
-        n,
-        k,
-        False,
-        1.0,
-        None,
-        False,
+        gather_indx,
+        scatter_indx,
+        gammas,
+        apply_swiglu=gemm1,
     )
-    ref = moe_gemm_torch(x_ref, w_ref, bias, rdata, gindx, None, gammas)
-    assert_close(ref, y[0], description=f"{x_tag}x{w_tag}")
+    outs = {}
+    for name, (w_scales, swizzle) in layouts.items():
+        y = torch.zeros((1, M, n_out), device=device, dtype=torch.bfloat16)
+        ok, why = gluon_supported(
+            x=x_q,
+            w=w_q,
+            x_scales=x_s,
+            w_scales=w_scales,
+            y=y,
+            bias=bias,
+            routing_data=rdata,
+            swizzle_mx_scale=swizzle,
+            split_k=1,
+            x_static_scale=None,
+            quant_static_scale=None,
+            out_quant=None,
+            N=n,
+            K=k,
+            gather_indx=gather_indx,
+            apply_swiglu=gemm1,
+        )
+        if not ok:
+            if name == "raw":
+                pytest.skip(f"not on the Gluon path: {why}")
+            pytest.skip(f"{name} scales not on the Gluon path: {why}")
+        moe_gemm_gluon(
+            y,
+            x_q,
+            w_q,
+            x_s,
+            w_scales,
+            bias,
+            gammas,
+            rdata,
+            gather_indx,
+            scatter_indx,
+            n,
+            k,
+            gemm1,
+            1.0,
+            1.0 if gemm1 else None,
+            gemm1,
+            swizzle_mx_scale=swizzle,
+        )
+        got = y[0] if gemm1 else y[0][sindx.long().view(-1, n_expts_act)].float().sum(1)
+        assert_close(ref, got, description=f"{x_tag}x{w_tag} {name}")
+        outs[name] = y
+    if "cdna4" in outs:
+        torch.testing.assert_close(outs["raw"], outs["cdna4"], rtol=0, atol=0)
 
 
 def test_dtype_inference():
