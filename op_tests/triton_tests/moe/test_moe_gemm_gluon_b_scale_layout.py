@@ -473,13 +473,71 @@ def test_shuffle_scale_moe_byte_order():
     torch.testing.assert_close(raw, original)
 
 
-def test_cdna4_scales_do_not_set_direct_b():
+def _gemm2_inputs():
     case = _mx8_inputs()
-    with torch.inference_mode():
-        raw = torch.zeros(_E, _K // 32, _N, dtype=torch.uint8)
-        tile = shuffle_scale_moe(raw, arch="gfx950")
-    assert tile.is_inference()
-    assert not host._reads_b_directly(case.w, _N, _K, DtypeQuant.MXFP8)
+    case.gather = None
+    case.y = torch.empty(1, 8, _N, dtype=torch.bfloat16)
+    return case
+
+
+def _gemm2_capture(case, ws, swizzle, monkeypatch):
+    captured = {}
+
+    def launch(kernel, grid, args, *metadata):
+        captured.update(zip(kernel.arg_names, args))
+        return object()
+
+    monkeypatch.setattr(host, "_fast_launch", launch)
+    host.moe_gemm_gluon(
+        case.y,
+        case.x,
+        case.w,
+        case.xs,
+        ws,
+        None,
+        None,
+        case.routing_data,
+        None,
+        None,
+        case.n,
+        case.k,
+        False,
+        1.0,
+        None,
+        False,
+        swizzle_mx_scale=swizzle,
+    )
+    return captured
+
+
+@pytest.mark.parametrize("cdna4", [False, True], ids=["raw-input", "cdna4-input"])
+def test_captured_gemm2_ladder_reads_cdna4_scales(cdna4, monkeypatch):
+    # Under graph capture the launch reads the weights directly, through the ladder.
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(host, "get_arch", lambda: "gfx950")
+    case = _gemm2_inputs()
+    assert host._reads_b_directly(case.w, _N, _K, DtypeQuant.MXFP8)
+    ws, swizzle = (_mx8_tile(), "CDNA4_SCALE") if cdna4 else (case.ws, None)
+    ok, why = host.gluon_supported(
+        x=case.x,
+        w=case.w,
+        x_scales=case.xs,
+        w_scales=ws,
+        y=case.y,
+        bias=None,
+        routing_data=case.routing_data,
+        swizzle_mx_scale=swizzle,
+        split_k=1,
+        x_static_scale=None,
+        quant_static_scale=None,
+        out_quant=None,
+        N=case.n,
+        K=case.k,
+    )
+    assert ok, why
+    args = _gemm2_capture(case, ws, swizzle, monkeypatch)
+    assert _tuning(args).mfma_instr_shape == ((16, 16, 128) if cdna4 else (32, 32, 64))
+    _assert_b_scales(args, ws, cdna4=cdna4)
 
 
 def test_scale_copy_and_env_override_are_gone(monkeypatch):

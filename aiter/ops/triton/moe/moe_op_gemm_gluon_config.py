@@ -349,6 +349,7 @@ def _get_gluon_config_cached(
     dq_b,
     small_grid: bool,
     stream_expert_payload: bool,
+    b_scale_cdna4: bool = False,
 ) -> tuple:
     """The ladder as sorted items, and the :data:`_FAMILY_ENV` keys that the
     environment set when it was built. Both read the environment once per entry."""
@@ -360,6 +361,7 @@ def _get_gluon_config_cached(
         dq_b,
         small_grid,
         stream_expert_payload,
+        b_scale_cdna4,
     )
     return tuple(sorted(ladder.items())), _family_env_keys()
 
@@ -396,6 +398,7 @@ def get_gluon_config_uncached(
     dq_b,
     small_grid: bool = False,
     stream_expert_payload: bool = False,
+    b_scale_cdna4: bool = False,
 ) -> dict:
     """Explicit Python ladder keyed on shape, dtypes and launch-reuse regime.
 
@@ -424,6 +427,9 @@ def get_gluon_config_uncached(
     numbers are tuned for MXFP4, and an MXFP8 or bf16 operand is two or four times
     wider per element, so the same ``(BLOCK_N, BLOCK_K)`` would overflow the 160 KiB
     cap outright.
+
+    ``b_scale_cdna4``: the weight scales are ``CDNA4_SCALE``. A scaled B then uses
+    the 16x16x128 MFMA at every ``block_m``, because only that MFMA reads the tile.
     """
     if block_m == 16:
         # BLOCK_K=512 is not a depth choice, it is forced: the A-scale tile is
@@ -448,6 +454,8 @@ def get_gluon_config_uncached(
     else:  # 128
         block_n, block_k, num_warps, nb = 256, 256, 8, 3
         nonk = 32
+    if b_scale_cdna4 and dq_b in _SCALED:
+        nonk = 16
     nb = _env_int("AITER_TRITON_MOE_GLUON_NB", nb)
     instr = _mfma_instr(dq_a, dq_b, nonk)
     ds_read_flags = _ds_read_flags_from_env()
@@ -1014,6 +1022,7 @@ def _gemm2_half_m_config(
             small_grid,
             False,
             multi_block=multi_block,
+            b_cdna4=bool(cfg.get("B_SCALE_SHUFFLED", False)),
         ),
         HALF_M_TILE=False,
     )
@@ -1051,6 +1060,7 @@ def _default_launch_config(
     multi_block=False,
     direct_b=False,
     half_block=False,
+    b_cdna4=False,
 ):
     """Share automatic stage-specific geometry with the capability check.
 
@@ -1063,6 +1073,10 @@ def _default_launch_config(
     ``direct_b``: the launch must read the weights directly (see the host's
     ``_reads_b_directly``: graph capture, inference or padded weights). It then takes
     no family tile entry; those read the weight copy that the host makes and checks.
+
+    ``b_cdna4``: the weight scales are ``CDNA4_SCALE``. The ladder then uses an MFMA
+    that reads them (see :func:`get_gluon_config_uncached`). Family entries do not
+    change.
     """
     small_grid = bool(small_grid)
     ladder, env_keys = _get_gluon_config_cached(
@@ -1073,6 +1087,7 @@ def _default_launch_config(
         dq_b,
         small_grid,
         bool(stream_expert_payload),
+        bool(b_cdna4),
     )
     if not apply_swiglu and not direct_b and (dq_a, dq_b) in _GEMM2_FAMILIES:
         # Every override below needs apply_swiglu, so none applies to GEMM2.
@@ -1468,7 +1483,15 @@ def _gemm1_half_m_config(
         return None
     half = {
         **_default_launch_config(
-            block_m // 2, N, K, dq_a, dq_b, small_grid, True, direct_b=direct_b
+            block_m // 2,
+            N,
+            K,
+            dq_a,
+            dq_b,
+            small_grid,
+            True,
+            direct_b=direct_b,
+            b_cdna4=bool(cfg.get("B_SCALE_SHUFFLED", False)),
         ),
         **({} if direct_b else _gemm1_half_tile(block_m, dq_a, dq_b)),
         "HALF_M_TILE": False,

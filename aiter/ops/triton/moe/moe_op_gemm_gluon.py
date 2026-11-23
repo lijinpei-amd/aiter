@@ -262,6 +262,7 @@ def gluon_supported(
     if block_m not in _SUPPORTED_BLOCK_M:
         return False, f"block_m {block_m} outside {_SUPPORTED_BLOCK_M}"
 
+    b_cdna4 = swizzle_mx_scale == "CDNA4_SCALE"
     cfg = _default_launch_config(
         block_m,
         N,
@@ -281,9 +282,9 @@ def gluon_supported(
         _multi_block(routing_data, y.shape[1]),
         _reads_b_directly(w, N, K, dq_b),
         _half_block(routing_data, y.shape[1]),
+        b_cdna4,
     )
     # The launch reads the weight scales in the layout of the input.
-    b_cdna4 = swizzle_mx_scale == "CDNA4_SCALE"
     cfg = dict(cfg, B_SCALE_SHUFFLED=b_cdna4)
     if b_cdna4:
         cfg = _cdna4_default_config(cfg, dq_a, dq_b, N, K)
@@ -390,6 +391,7 @@ def _launch_spec(
             multi_block,
             direct_b,
             half_block,
+            b_cdna4,
         )
         if b_cdna4:
             c = _cdna4_default_config(c, dq_a, dq_b, N, K)
