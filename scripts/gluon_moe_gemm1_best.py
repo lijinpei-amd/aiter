@@ -42,7 +42,7 @@ TEST_FILE = "op_tests/triton_tests/moe/test_moe_gemm_a4w4.py"
 
 #: The tuned flag set. Everything here is a deviation from the default that was measured
 #: to matter; the ones worth calling out:
-#:   SHUFFLED_W_SCALES -- the CDNA4_SCALE weight-scale preshuffle.
+#:   CDNA4_SCALE -- the weight scales are handed over preshuffled (see run_workload).
 #:   WAIT_COMMIT_SCHEME -- the copy-commit and wait granularity for the live step.
 #: The two occupancy knobs live in PER_WARPS below rather than here, because they are
 #: only safe at 8 waves; see the comment there.
@@ -55,7 +55,6 @@ BEST = {
     "AITER_TRITON_MOE_GLUON_SLOT_N": "128",
     "AITER_TRITON_MOE_GLUON_SCALE_SLOT_M": "128",
     "AITER_TRITON_MOE_GLUON_SORTED_SCALES": "1",
-    "AITER_TRITON_MOE_GLUON_SHUFFLED_W_SCALES": "1",
     "AITER_TRITON_MOE_GLUON_SCALE_FILL_MID": "1",
     # WarpPipeline: 0 none, 1 the TritonAMDGPUWarpPipeline pass.
     "AITER_TRITON_MOE_GLUON_WARP_PIPELINE": "0",
@@ -203,6 +202,10 @@ def run_workload(tokens, reps, warmup):
         if bias is not None:
             bias = bias[..., perm].contiguous()
 
+    # The tuned arm reads the CDNA4_SCALE tile. Build it once, outside the timed loop.
+    from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
+
+    ws = shuffle_scale_moe(ws, arch="gfx950")
     y = torch.empty((1, gindx.shape[0], n // 2), dtype=torch.bfloat16, device="cuda")
 
     def call():
@@ -223,6 +226,7 @@ def run_workload(tokens, reps, warmup):
             recipe.swiglu.alpha,
             recipe.swiglu.limit,
             False,
+            swizzle_mx_scale="CDNA4_SCALE",
         )
 
     # Long, and deliberately so. The kernel needs ~30 dispatches to reach steady state:

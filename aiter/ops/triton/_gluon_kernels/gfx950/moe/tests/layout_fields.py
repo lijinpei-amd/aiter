@@ -403,8 +403,9 @@ def _n_blocks(n_rows, block_m):
 def _effective_cfg(cfg, dq_a, dq_b, N, K, swiglu):
     """The shuffle/preshuffle flags moe_gemm_gluon actually launches with.
 
-    Mirrors the pure preconditions of _sorted_shuffle_a_scales, _shuffled_b_scales and
-    _preshuffled_b (gemm1 gathers, so the A-scale pre-pass is reachable there).
+    Mirrors the pure preconditions of _sorted_shuffle_a_scales and _preshuffled_b
+    (gemm1 gathers, so the A-scale pre-pass is reachable there). The B-scale flag
+    stays only where the caller can hand over a CDNA4_SCALE tile.
     """
     c = dict(cfg)
     scaled = (DQ.MXFP4, DQ.MXFP8)

@@ -28,6 +28,7 @@ def build():
     import torch
 
     from aiter.ops.triton.moe.moe_op_gemm_gluon import moe_gemm_gluon
+    from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
     from op_tests.op_benchmarks.triton.bench_moe_gemm_gluon import (
         _OPS,
         _build,
@@ -43,6 +44,8 @@ def build():
         T, n, k, sh.n_expts_tot, sh.n_expts_act, "cuda", xd, wd, n_active=E
     )
     M = gindx.shape[0]
+    # The tuned arm reads the CDNA4_SCALE tile; build it once, outside the timed call.
+    ws = shuffle_scale_moe(ws, arch="gfx950")
 
     def call(y):
         moe_gemm_gluon(
@@ -62,6 +65,7 @@ def build():
             recipe.swiglu.alpha,
             recipe.swiglu.limit,
             False,
+            swizzle_mx_scale="CDNA4_SCALE",
         )
         return y
 

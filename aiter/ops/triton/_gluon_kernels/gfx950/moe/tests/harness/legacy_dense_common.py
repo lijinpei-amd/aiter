@@ -96,12 +96,30 @@ def make_inputs(precision):
     }
 
 
+def weight_scale_input(data, config):
+    """Return the B scales and ``swizzle_mx_scale`` that match ``config``.
+
+    A config with ``B_SCALE_SHUFFLED`` gets the CDNA4_SCALE tile, built once per
+    input set and kept in ``data``. Any other config gets the raw scales.
+    """
+    if data["ws"] is None:
+        return None, None
+    raw = data["ws"].transpose(-1, -2)
+    if not config.get("B_SCALE_SHUFFLED", False):
+        return raw, None
+    if "ws_cdna4" not in data:
+        from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
+
+        data["ws_cdna4"] = shuffle_scale_moe(raw, arch="gfx950")
+    return data["ws_cdna4"], "CDNA4_SCALE"
+
+
 def build_gluon(data, config):
     from aiter.ops.triton.moe import moe_op_gemm_gluon as host
 
     y = torch.empty((1, T * TOPK, N // 2), device="cuda", dtype=torch.bfloat16)
     w = data["w"].transpose(-1, -2)
-    ws = None if data["ws"] is None else data["ws"].transpose(-1, -2)
+    ws, swizzle = weight_scale_input(data, config)
 
     def call():
         return host.moe_gemm_gluon(
@@ -123,6 +141,7 @@ def build_gluon(data, config):
             False,
             config=config,
             gate_up_split=True,
+            swizzle_mx_scale=swizzle,
         )
 
     kernel = call()

@@ -94,7 +94,7 @@ def build_gluon(data, tuning, artifact_dir):
         else None
     )
     w = data["w"].transpose(-1, -2)
-    ws = None if data["ws"] is None else data["ws"].transpose(-1, -2)
+    ws, swizzle = bc.weight_scale_input(data, tuning)
     captured = []
     original = host._fast_launch
 
@@ -124,6 +124,7 @@ def build_gluon(data, tuning, artifact_dir):
             y_scales=ys,
             config=tuning,
             gate_up_split=True,
+            swizzle_mx_scale=swizzle,
         )
     finally:
         host._fast_launch = original

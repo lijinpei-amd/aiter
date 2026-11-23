@@ -34,6 +34,7 @@ def _load(name: str, path: Path):
 
 _A4 = _load("_dtype_tokens_legacy_a4_common", ROOT / "legacy_a4_common.py")
 _DENSE = _load("_dtype_tokens_legacy_dense_common", ROOT / "legacy_dense_common.py")
+weight_scale_input = _DENSE.weight_scale_input
 
 
 def configure(k: int = 7168, block_m: int = 128, tokens: int = 16):

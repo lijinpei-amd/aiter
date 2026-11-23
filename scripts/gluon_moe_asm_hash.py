@@ -61,14 +61,20 @@ y = torch.empty((1, bc.T * bc.TOPK, bc.N // (4 if quantized else 2)),
 ys = (torch.empty((bc.T * bc.TOPK, bc.N // 64), device="cuda", dtype=torch.uint8)
       if quantized else None)
 w = data["w"].transpose(-1, -2)
-ws = None if data["ws"] is None else data["ws"].transpose(-1, -2)
+ws, swizzle = None, None
+if data["ws"] is not None:
+    ws = data["ws"].transpose(-1, -2)
+    if tuning.get("B_SCALE_SHUFFLED", False):
+        # The config reads the CDNA4_SCALE tile, so the caller hands it over.
+        from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
+        ws, swizzle = shuffle_scale_moe(ws, arch="gfx950"), "CDNA4_SCALE"
 original = host._fast_launch
 host._fast_launch = lambda *a: None          # compile, never launch
 try:
     host.moe_gemm_gluon(
         y, data["x"], w, data["xs"], ws, None, None, data["route"], data["gather"],
         None, bc.N, bc.K, True, 1.0, None, False, y_scales=ys, config=tuning,
-        gate_up_split=True)
+        gate_up_split=True, swizzle_mx_scale=swizzle)
 finally:
     host._fast_launch = original
 hits = glob.glob(os.environ["TRITON_CACHE_DIR"] + "/**/_moe_gluon_gemm1.amdgcn",
