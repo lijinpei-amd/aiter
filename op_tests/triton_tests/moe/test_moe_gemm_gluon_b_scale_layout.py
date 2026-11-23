@@ -441,3 +441,67 @@ def test_scale_copy_and_env_override_are_gone(monkeypatch):
     monkeypatch.setenv("AITER_TRITON_MOE_GLUON_SHUFFLED_W_SCALES", "1")
     args = _capture(case, case.ws, None, _mx8_config(256, False, False), monkeypatch)
     _assert_b_scales(args, case.ws, cdna4=False)
+
+
+@pytest.mark.parametrize("cdna4", [False, True])
+def test_k128_scales_are_both_shuffled_or_both_raw(cdna4, monkeypatch):
+    case = _mx8_inputs()
+    ws = _mx8_tile() if cdna4 else case.ws
+    packed_a = _a_sorter(True, monkeypatch)
+    cfg = _mx8_config(128, True, cdna4)
+    args = _capture(case, ws, "CDNA4_SCALE" if cdna4 else None, cfg, monkeypatch)
+    _assert_b_scales(args, ws, cdna4=cdna4)
+    tuning = conf._cval(args["CFG_TUNING"])
+    assert tuning.A_SCALE_SORTED_SHUFFLED is cdna4
+    a_swizzle = ScaleSwizzle.SORTED_SHUFFLED if cdna4 else ScaleSwizzle.NONE
+    assert conf._cval(args["A_SCALE_SWIZZLE"]) == a_swizzle
+    assert args["a_scale_ptr"] is (packed_a if cdna4 else case.xs)
+
+
+def test_k128_caller_shuffled_a_with_raw_b_is_refused(monkeypatch):
+    case = _mx8_inputs()
+    case.gather = None
+    _no_launch(monkeypatch)
+    with pytest.raises(ValueError, match="BLOCK_K 128"):
+        host.moe_gemm_gluon(
+            case.y,
+            case.x,
+            case.w,
+            case.xs,
+            case.ws,
+            None,
+            None,
+            case.routing_data,
+            None,
+            None,
+            case.n,
+            case.k,
+            True,
+            1.0,
+            None,
+            False,
+            config=_mx8_config(128, True, False),
+            x_scales_sorted_shuffled=True,
+        )
+    monkeypatch.setattr(host, "get_arch", lambda: "gfx950")
+    entry = _mx8_config(128, True, False)
+    monkeypatch.setattr(host, "_default_launch_config", lambda *_: dict(entry))
+    ok, why = host.gluon_supported(
+        x=case.x,
+        w=case.w,
+        x_scales=case.xs,
+        w_scales=case.ws,
+        y=case.y,
+        bias=None,
+        routing_data=case.routing_data,
+        swizzle_mx_scale=None,
+        split_k=1,
+        x_static_scale=None,
+        quant_static_scale=None,
+        out_quant=None,
+        N=case.n,
+        K=case.k,
+        apply_swiglu=True,
+        x_scales_sorted_shuffled=True,
+    )
+    assert not ok and "BLOCK_K 128" in why

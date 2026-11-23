@@ -285,6 +285,10 @@ def gluon_supported(
     # The launch reads the weight scales in the layout of the input.
     b_cdna4 = swizzle_mx_scale == "CDNA4_SCALE"
     cfg = dict(cfg, B_SCALE_SHUFFLED=b_cdna4)
+    if x_scales_sorted_shuffled and int(cfg["BLOCK_K"]) == 128 and not b_cdna4:
+        return False, (
+            "x_scales_sorted_shuffled at BLOCK_K 128 needs CDNA4_SCALE weight scales"
+        )
     if b_cdna4:
         a_shuffled = x_scales_sorted_shuffled or (
             _a_sort_requested(cfg, apply_swiglu, gather_indx)
@@ -1057,9 +1061,11 @@ def moe_gemm_gluon(
     ``swizzle_mx_scale`` is ``None`` (raw ``w_scales``) or ``"CDNA4_SCALE"`` (the tile
     that ``shuffle_scale_moe(arch="gfx950")`` returns). The kernel reads ``w_scales``
     in this layout and makes no copy. An unreadable tile raises ``ValueError``. A
-    config that cannot read the tile also raises ``ValueError``: at ``BLOCK_K`` 128 the
-    A scales must be sorted-shuffled too. An explicit ``config`` must set
-    ``B_SCALE_SHUFFLED`` to match ``swizzle_mx_scale``.
+    config that cannot read the tile also raises ``ValueError``. At ``BLOCK_K`` 128 the
+    A and B scales are both shuffled or both raw: with ``CDNA4_SCALE`` the A scales
+    must be sorted-shuffled, and with raw ``w_scales`` the A scales are read raw
+    (``x_scales_sorted_shuffled`` then raises ``ValueError``). An explicit ``config``
+    must set ``B_SCALE_SHUFFLED`` to match ``swizzle_mx_scale``.
 
     ``y_scales`` non-None selects the fused MXFP4 output quant: ``y`` then holds the
     E2M1 payload (``N // ARN // 2`` uint8 columns) and ``y_scales`` the E8M0 exponents,
@@ -1161,6 +1167,12 @@ def moe_gemm_gluon(
     a_scales, a_swizzle = x_scales, ScaleSwizzle.NONE
     a_scale_stride_m = 0 if x_scales is None else x_scales.stride(0)
     a_scale_stride_k = 0 if x_scales is None else x_scales.stride(1)
+    # At BLOCK_K 128 the A and B scales are both shuffled or both raw.
+    k128_raw_b = int(_cfg["BLOCK_K"]) == 128 and not b_cdna4
+    if x_scales_sorted_shuffled and k128_raw_b:
+        raise ValueError(
+            "x_scales_sorted_shuffled at BLOCK_K 128 needs CDNA4_SCALE weight scales"
+        )
     if x_scales_sorted_shuffled:
         # The caller hands over the buffer already in the sorted-shuffled layout (e.g.
         # moe_gemm1_a8w4_mxfp8_out(scale_layout="sorted_shuffled")), in the routing's
@@ -1178,7 +1190,7 @@ def moe_gemm_gluon(
             )
         a_scales, a_swizzle = x_scales.reshape(-1), ScaleSwizzle.SORTED_SHUFFLED
         a_scale_stride_m, a_scale_stride_k = 0, 32
-    elif _a_sort_requested(_cfg, apply_swiglu, gather_indx):
+    elif not k128_raw_b and _a_sort_requested(_cfg, apply_swiglu, gather_indx):
         shuffled = _sorted_shuffle_a_scales(
             x_scales, routing_data, gather_indx, K, _cfg
         )
