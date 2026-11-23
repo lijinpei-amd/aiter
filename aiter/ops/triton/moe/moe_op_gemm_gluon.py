@@ -222,6 +222,10 @@ def gluon_supported(
     ``gather_indx`` and ``x_scales_sorted_shuffled`` have the meaning they have in
     :func:`moe_gemm_gluon`. They tell if the launch can sort the A scales, which
     ``CDNA4_SCALE`` weight scales need at ``BLOCK_K`` 128.
+
+    ``swizzle_mx_scale`` is ``None`` (raw ``w_scales``) or ``"CDNA4_SCALE"`` (the
+    output of ``shuffle_scale_moe(arch="gfx950")``). The latter needs ``N % 32 == 0``
+    and ``K % 256 == 0``. A tile that no config can read gives ``(False, reason)``.
     """
     if os.environ.get("AITER_TRITON_MOE_DISABLE_GLUON", "0") != "0":
         return False, "disabled by AITER_TRITON_MOE_DISABLE_GLUON"
@@ -1096,7 +1100,8 @@ def moe_gemm_gluon(
     A and B scales are both shuffled or both raw: with ``CDNA4_SCALE`` the A scales
     must be sorted-shuffled, and with raw ``w_scales`` the A scales are read raw
     (``x_scales_sorted_shuffled`` then raises ``ValueError``). An explicit ``config``
-    must set ``B_SCALE_SHUFFLED`` to match ``swizzle_mx_scale``.
+    must set ``B_SCALE_SHUFFLED`` to match ``swizzle_mx_scale``. With ``CDNA4_SCALE``
+    input, the half tile of an explicit config can run at ``BLOCK_K`` 256.
 
     ``y_scales`` non-None selects the fused MXFP4 output quant: ``y`` then holds the
     E2M1 payload (``N // ARN // 2`` uint8 columns) and ``y_scales`` the E8M0 exponents,
@@ -1467,6 +1472,9 @@ def try_gluon_grouped_gemm(
     fall through to its own Triton kernel. Capability-gated and never asserted: an
     unsupported combination is a fallback, not a failure, so no existing caller silently
     changes behaviour.
+
+    ``swizzle_mx_scale`` has the meaning it has in :func:`moe_gemm_gluon`. A
+    ``CDNA4_SCALE`` tile that the Gluon kernel cannot read is a fallback to Triton.
     """
     ok, why = gluon_supported(
         x=x,
@@ -1545,6 +1553,8 @@ def moe_gemm1_a4w4_mxfp4_out(
     gate occupies ``[0, N/2)`` and up ``[N/2, N)`` along N; see
     :func:`gate_up_split_perm`. The returned payload and scales are bit-identical to
     the interleaved form, so the two are a drop-in A/B.
+
+    ``swizzle_mx_scale`` has the meaning it has in :func:`moe_gemm_gluon`.
 
     Raises if the shape is outside the Gluon path; there is no silent fallback here
     because the caller is asking for the fused format specifically.
@@ -1636,6 +1646,8 @@ def moe_gemm1_a8w4_mxfp8_out(
     rows are written: the rest (padding rows, unused blocks) is left uninitialised. GEMM2
     reads a padding row's scales only for an output row it masks, and an MFMA row's
     scale touches that row alone, so nothing reads them into a result.
+
+    ``swizzle_mx_scale`` has the meaning it has in :func:`moe_gemm_gluon`.
 
     Raises if the shape is outside the Gluon path.
     """

@@ -38,7 +38,9 @@ Memory layout contract (the wrapper hard-asserts it), with ``pack`` = 2 for MXFP
 
 * activations  ``(M, K/pack)`` row-major, ``stride(-1) == 1``
 * weights      ``(E, K/pack, N)`` with ``stride(-2) == 1``  (K contiguous)
-* scales       ``(E, K/32, N)`` strided view, K contiguous, strides carried explicitly
+* scales       ``(E, K/32, N)`` strided view, K contiguous, strides carried explicitly,
+               or the ``CDNA4_SCALE`` tile ``(E, K, N/32)`` that the caller made with
+               ``shuffle_scale_moe``. The host never copies the weight scales.
 * stage 1: ``N = 2*I``, ``K = H``; stage 2: ``N = H``, ``K = I``
 * stage 1 gate/up arrive pre-fused, in one of two packings along N, selected by
   ``KernelFuncConfig.weight_gu_hbm_layout``:

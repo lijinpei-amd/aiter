@@ -62,6 +62,7 @@ def build():
         w, ws = keep_layout(w), keep_layout(ws)
 
     # The tuned arm reads the CDNA4_SCALE tile; build it once, outside the timed call.
+    # The default config for these shapes reads shuffled weight scales.
     ws = shuffle_scale_moe(ws, arch="gfx950")
 
     def call():

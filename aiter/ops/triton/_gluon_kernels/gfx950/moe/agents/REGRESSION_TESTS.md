@@ -57,6 +57,10 @@ When to run them during a refactor, cheapest first:
   physical GPU 5. The cold bench takes the physical (amd-smi) index and maps it to
   HIP itself. Check `amd-smi process` before using a GPU, and never put a side job on
   the GPU a benchmark is using.
+- **Weight-scale layout.** The input sets the layout. The harness passes
+  `swizzle_mx_scale="CDNA4_SCALE"` (made with `shuffle_scale_moe`) for each case whose
+  config has `B_SCALE_SHUFFLED`. Times of raw input on such a config are reported, not
+  gated: the kernel reads the raw scales, which is slower.
 - **Environment.** Defaults are set in `tests/_env.sh`. Override `PY`, `ROCM_PATH`,
   `TRITON_HIP_DS_AGPR_LLC` (the patched llc), `HARNESS` or `OUT` from the
   environment. The `PY` and llc defaults assume `venv/01/` and `llvm-project/` next

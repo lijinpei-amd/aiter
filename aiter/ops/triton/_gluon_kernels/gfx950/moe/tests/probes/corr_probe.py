@@ -45,6 +45,7 @@ def build():
     )
     M = gindx.shape[0]
     # The tuned arm reads the CDNA4_SCALE tile; build it once, outside the timed call.
+    # The default config for these shapes reads shuffled weight scales.
     ws = shuffle_scale_moe(ws, arch="gfx950")
 
     def call(y):

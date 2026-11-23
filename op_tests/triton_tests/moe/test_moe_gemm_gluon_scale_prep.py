@@ -387,8 +387,7 @@ def test_legacy_sorted_scales_switch_still_prepares_raw_a_scales(
     cfg = dict(_config(block_k), A_SCALE_SORTED_SHUFFLED=False,
                B_SCALE_SHUFFLED=cdna4)
     monkeypatch.setenv("AITER_TRITON_MOE_GLUON_SORTED_SCALES", "1")
-    # This switch no longer prepares B scales: the B layout is the input's.
-    monkeypatch.setenv("AITER_TRITON_MOE_GLUON_SHUFFLED_W_SCALES", "1")
+    # This switch does not prepare B scales: the B layout is the input's.
     packed_a = torch.empty(2 * 128 * case.k // 32, dtype=torch.uint8)
     monkeypatch.setattr(host, "_sorted_shuffle_a_scales", lambda *_: packed_a)
     args = _capture_launch(case, cfg, True, monkeypatch, cdna4=cdna4)

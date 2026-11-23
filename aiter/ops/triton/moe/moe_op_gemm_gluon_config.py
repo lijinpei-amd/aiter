@@ -1565,9 +1565,11 @@ def _b_scale_shuffle_fits(cfg):
 
 
 def _b_scale_k256(cfg):
-    """Return ``cfg`` at ``BLOCK_K`` 256 when only a ``BLOCK_K`` above 256 stops it
-    from reading ``CDNA4_SCALE`` weight scales, else None. ``VGPR_PREFETCH_K`` must
-    equal ``BLOCK_K``, so it changes too."""
+    """Return ``cfg`` at ``BLOCK_K`` 256 if that reads ``CDNA4_SCALE``, else None.
+
+    Only a ``BLOCK_K`` above 256 can stop a config from reading the tile.
+    ``VGPR_PREFETCH_K`` must equal ``BLOCK_K``, so it changes too.
+    """
     if int(cfg["BLOCK_K"]) <= 256 or _b_scale_shuffle_fits(cfg):
         return None
     k256 = dict(cfg, BLOCK_K=256, VGPR_PREFETCH_K=256)

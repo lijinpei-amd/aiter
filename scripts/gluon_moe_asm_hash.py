@@ -66,6 +66,7 @@ if data["ws"] is not None:
     ws = data["ws"].transpose(-1, -2)
     if tuning.get("B_SCALE_SHUFFLED", False):
         # The config reads the CDNA4_SCALE tile, so the caller hands it over.
+        # Same as tests/harness/legacy_dense_common.py::weight_scale_input.
         from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
         ws, swizzle = shuffle_scale_moe(ws, arch="gfx950"), "CDNA4_SCALE"
 original = host._fast_launch

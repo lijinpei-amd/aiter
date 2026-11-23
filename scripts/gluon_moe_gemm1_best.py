@@ -203,6 +203,7 @@ def run_workload(tokens, reps, warmup):
             bias = bias[..., perm].contiguous()
 
     # The tuned arm reads the CDNA4_SCALE tile. Build it once, outside the timed loop.
+    # The default config for these shapes reads shuffled weight scales.
     from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 
     ws = shuffle_scale_moe(ws, arch="gfx950")

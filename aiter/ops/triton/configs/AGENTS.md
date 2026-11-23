@@ -303,6 +303,10 @@ there is no file. Do not change the returned dict.
   a whole multiple of the launch's; else the launch has only the `block_m` tile
   (`_gemm2_half_m_config` in `moe_op_gemm_gluon_config.py`). A wider half-height
   tile sets the N grid, and the `block_m` tile covers its N block in passes.
+- `B_SCALE_SHUFFLED` records the weight-scale layout that the entry was tuned
+  for. The input sets the real layout (`swizzle_mx_scale`). The host sets the
+  flag from the input in a tuned or default config. An explicit `config=` must
+  match the input, else the host raises `ValueError`.
 
 ## Conv
 
