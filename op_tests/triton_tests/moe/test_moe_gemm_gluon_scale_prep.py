@@ -182,28 +182,6 @@ def test_k128_packing_requires_both_non_k_tiles_in_the_wave(operand):
     assert conf._scale_shuffle_supported(cfg, 1 - operand)
 
 
-def test_b_preshuffle_preserves_n_order_and_reuses_the_k256_format():
-    experts, n, k = 2, 128, 512
-    raw = (torch.arange(experts * n * (k // 32), dtype=torch.int64) % 251).to(
-        torch.uint8
-    ).reshape(experts, n, k // 32).transpose(1, 2)
-    original = raw.clone()
-    packed = host._shuffled_b_scales(raw, _config(), n, k)
-    assert packed.shape == (experts, n // 32, k)
-    flat = packed.reshape(experts, -1)
-    # Independent byte address: the two low bits select non-K+16 and K+4.
-    # Rows span both gate/up halves, whose original N ordering must be retained.
-    for e in range(experts):
-        for row in range(n):
-            for group in range(k // 32):
-                offset = ((row // 32) * k + (group // 8) * 256
-                          + (group % 4) * 64 + (row % 16) * 4
-                          + ((group % 8) // 4) * 2 + (row % 32) // 16)
-                assert flat[e, offset] == raw[e, group, row]
-    torch.testing.assert_close(raw, original)
-    assert host._shuffled_b_scales(raw, _config(256), n, k) is packed
-
-
 def _inputs(k=2560):
     m, n, experts, topk = 4, 512, 2, 2
     expt_data = SimpleNamespace(
@@ -222,12 +200,13 @@ def _inputs(k=2560):
         w=torch.empty(experts, n, k, dtype=torch.float8_e4m3fn).transpose(1, 2),
         xs=torch.empty(m, k // 32, dtype=torch.uint8),
         ws=torch.empty(experts, n, k // 32, dtype=torch.uint8).transpose(1, 2),
+        ws_cdna4=torch.empty(experts, n // 32, k, dtype=torch.uint8).transpose(1, 2),
         y=torch.empty(1, m * topk, n // 2),
         gather=torch.arange(m * topk, dtype=torch.int32),
     )
 
 
-def _capture_launch(case, config, split, monkeypatch):
+def _capture_launch(case, config, split, monkeypatch, cdna4=False):
     captured = {}
     sentinel = object()
 
@@ -237,9 +216,10 @@ def _capture_launch(case, config, split, monkeypatch):
 
     monkeypatch.setattr(host, "_fast_launch", launch)
     result = host.moe_gemm_gluon(
-        case.y, case.x, case.w, case.xs, case.ws, None, None,
-        case.routing_data, case.gather, None, case.n, case.k,
+        case.y, case.x, case.w, case.xs, case.ws_cdna4 if cdna4 else case.ws,
+        None, None, case.routing_data, case.gather, None, case.n, case.k,
         True, 1.0, None, False, config=config, gate_up_split=split,
+        swizzle_mx_scale="CDNA4_SCALE" if cdna4 else None,
     )
     assert result is sentinel
     assert captured["a_ptr"] is case.x and captured["b_ptr"] is case.w
@@ -256,13 +236,12 @@ def test_block_m_mismatch_is_rejected_before_preparation(
 ):
     case = _inputs()
     case.routing_data.block_m = routing_block_m
-    cfg = dict(_config(), BLOCK_M=config_block_m)
+    cfg = dict(_config(), BLOCK_M=config_block_m, B_SCALE_SHUFFLED=False)
 
     def unexpected_work(*_):
         pytest.fail("incompatible routing must be rejected before preparation")
 
     monkeypatch.setattr(host, "_sorted_shuffle_a_scales", unexpected_work)
-    monkeypatch.setattr(host, "_shuffled_b_scales", unexpected_work)
     monkeypatch.setattr(host, "_fast_launch", unexpected_work)
     with pytest.raises(AssertionError, match="BLOCK_M.*must match routing block_m"):
         host.moe_gemm_gluon(
@@ -275,13 +254,12 @@ def test_block_m_mismatch_is_rejected_before_preparation(
 @pytest.mark.parametrize("k", [0, 256, 640, 768])
 def test_short_strips_are_rejected_before_launch(k, monkeypatch):
     case = _inputs(k=k)
-    cfg = _config()
+    cfg = dict(_config(), B_SCALE_SHUFFLED=False)
 
     def unexpected_launch(*_):
         pytest.fail("an invalid pipeline must be rejected before launch")
 
     monkeypatch.setattr(host, "_sorted_shuffle_a_scales", lambda *_: None)
-    monkeypatch.setattr(host, "_shuffled_b_scales", lambda *_: None)
     monkeypatch.setattr(host, "_fast_launch", unexpected_launch)
     with pytest.raises(
         AssertionError, match="NUM_K.*PIPELINE_DEPTH.*PEELED.*UNROLL"
@@ -293,13 +271,11 @@ def test_short_strips_are_rejected_before_launch(k, monkeypatch):
         )
 
 
-@pytest.mark.parametrize("requested,available", [(True, False), (False, True)])
-def test_minimum_uses_resolved_scale_storage_after_preparation(
-    requested, available, monkeypatch
-):
+@pytest.mark.parametrize("cdna4", [False, True], ids=["raw-input", "cdna4-input"])
+def test_minimum_uses_resolved_scale_storage_after_preparation(cdna4, monkeypatch):
     case = _inputs(k=768)
     cfg = dict(_config(), K_UNROLL=1, A_SCALE_NUM_BUFFER=4, B_SCALE_NUM_BUFFER=4,
-               A_SCALE_SORTED_SHUFFLED=requested, B_SCALE_SHUFFLED=requested)
+               A_SCALE_SORTED_SHUFFLED=False, B_SCALE_SHUFFLED=cdna4)
     raw_tc = conf._probe_tuning_config(
         dict(cfg, A_SCALE_SORTED_SHUFFLED=False, B_SCALE_SHUFFLED=False),
         DtypeQuant.MXFP8, DtypeQuant.MXFP8,
@@ -320,15 +296,13 @@ def test_minimum_uses_resolved_scale_storage_after_preparation(
         + maybe_unwrap(packed.unroll)
         == 6
     )
+    # At BLOCK_K 128 the CDNA4_SCALE input gives packed A and B scales. Raw input
+    # gives raw A and B scales, whatever the A sort switch asks for.
     monkeypatch.setenv("AITER_TRITON_MOE_GLUON_SORTED_SCALES", "1")
-    monkeypatch.setenv("AITER_TRITON_MOE_GLUON_SHUFFLED_W_SCALES", "1")
     packed_a = torch.empty(2 * 128 * case.k // 32, dtype=torch.uint8)
-    packed_b = torch.empty(2, case.n // 32, case.k, dtype=torch.uint8)
-    monkeypatch.setattr(host, "_sorted_shuffle_a_scales",
-                        lambda *_: packed_a if available else None)
-    monkeypatch.setattr(host, "_shuffled_b_scales", lambda *_: packed_b)
-    if available:
-        args = _capture_launch(case, cfg, True, monkeypatch)
+    monkeypatch.setattr(host, "_sorted_shuffle_a_scales", lambda *_: packed_a)
+    if cdna4:
+        args = _capture_launch(case, cfg, True, monkeypatch, cdna4=True)
         assert args["NUM_K"] == 6
         assert conf._cval(args["CFG_TUNING"]).A_SCALE_SORTED_SHUFFLED
     else:
@@ -353,66 +327,76 @@ def test_capability_rejects_strips_below_selected_pipeline_minimum(k, monkeypatc
 
 @pytest.mark.parametrize("block_k", [128, 256])
 @pytest.mark.parametrize("split", [False, True])
+@pytest.mark.parametrize("cdna4", [False, True], ids=["raw-input", "cdna4-input"])
 @pytest.mark.parametrize("requested,available", [
-    ((True, True), (True, True)), ((True, True), (False, True)),
-    ((True, True), (True, False)), ((True, True), (False, False)),
-    ((True, False), (True, True)), ((False, True), (True, True)),
-    ((False, False), (True, True)),
+    (True, True), (True, False), (False, True),
 ])
-def test_raw_scale_inputs_are_prepared_or_restored_atomically(
-    block_k, split, requested, available, monkeypatch
+def test_b_scale_layout_follows_the_input_and_a_sort_is_prepared_or_restored(
+    block_k, split, cdna4, requested, available, monkeypatch
 ):
     case = _inputs()
-    cfg = dict(_config(block_k), A_SCALE_SORTED_SHUFFLED=requested[0],
-               B_SCALE_SHUFFLED=requested[1])
+    cfg = dict(_config(block_k), A_SCALE_SORTED_SHUFFLED=requested,
+               B_SCALE_SHUFFLED=cdna4)
     prepared_a = torch.empty(2 * 128 * case.k // 32, dtype=torch.uint8)
-    prepared_b = torch.empty(2, case.n // 32, case.k, dtype=torch.uint8)
     seen = []
 
     def prepare_a(raw, *_):
         assert raw is case.xs
         seen.append(0)
-        return prepared_a if available[0] else None
-
-    def prepare_b(raw, *_):
-        assert raw is case.ws
-        seen.append(1)
-        return prepared_b if available[1] else None
+        return prepared_a if available else None
 
     monkeypatch.setattr(host, "_sorted_shuffle_a_scales", prepare_a)
-    monkeypatch.setattr(host, "_shuffled_b_scales", prepare_b)
-    args = _capture_launch(case, cfg, split, monkeypatch)
-    assert seen == [idx for idx in (0, 1) if requested[idx]]
-    effective = tuple(want and have for want, have in zip(requested, available))
-    if block_k == 128 and not all(effective):
-        effective = (False, False)
+    if cdna4 and block_k == 128 and not (requested and available):
+        # K128 CDNA4_SCALE weight scales need sorted-shuffled A scales.
+        with pytest.raises(ValueError, match="sorted-shuffled A"):
+            _capture_launch(case, cfg, split, monkeypatch, cdna4=True)
+        return
+    args = _capture_launch(case, cfg, split, monkeypatch, cdna4=cdna4)
+    # At K128 raw B scales keep the A scales raw too: the A sort is not asked.
+    sorts_a = requested and not (block_k == 128 and not cdna4)
+    assert seen == ([0] if sorts_a else [])
+    a_shuffled = sorts_a and available
     tuning = conf._cval(args["CFG_TUNING"])
-    assert (tuning.A_SCALE_SORTED_SHUFFLED, tuning.B_SCALE_SHUFFLED) == effective
-    assert args["a_scale_ptr"] is (prepared_a if effective[0] else case.xs)
-    assert args["b_scale_ptr"] is (prepared_b if effective[1] else case.ws)
-    assert args["a_scale_stride_m"] == (0 if effective[0] else case.xs.stride(0))
-    assert args["A_SCALE_STRIDE_K"] == (32 if effective[0] else case.xs.stride(1))
-    assert args["B_SCALE_STRIDE_K"] == (32 if effective[1] else case.ws.stride(1))
+    assert (tuning.A_SCALE_SORTED_SHUFFLED, tuning.B_SCALE_SHUFFLED) == (
+        a_shuffled, cdna4
+    )
+    assert args["a_scale_ptr"] is (prepared_a if a_shuffled else case.xs)
+    if cdna4:
+        # The kernel reads the caller's tile as given, as an (E, N/32, K) view.
+        assert args["b_scale_ptr"].data_ptr() == case.ws_cdna4.data_ptr()
+    else:
+        assert args["b_scale_ptr"] is case.ws
+    assert args["a_scale_stride_m"] == (0 if a_shuffled else case.xs.stride(0))
+    assert args["A_SCALE_STRIDE_K"] == (32 if a_shuffled else case.xs.stride(1))
+    assert args["B_SCALE_STRIDE_K"] == (32 if cdna4 else case.ws.stride(1))
     assert conf._cval(args["A_SCALE_SWIZZLE"]) == (
-        ScaleSwizzle.SORTED_SHUFFLED if effective[0] else ScaleSwizzle.NONE
+        ScaleSwizzle.SORTED_SHUFFLED if a_shuffled else ScaleSwizzle.NONE
     )
     assert conf._cval(args["B_SCALE_SWIZZLE"]) == (
-        ScaleSwizzle.CDNA4_SCALE if effective[1] else ScaleSwizzle.NONE
+        ScaleSwizzle.CDNA4_SCALE if cdna4 else ScaleSwizzle.NONE
     )
 
 
-@pytest.mark.parametrize("block_k", [128, 256])
-def test_legacy_environment_switches_still_prepare_raw_scales(block_k, monkeypatch):
+@pytest.mark.parametrize(
+    "block_k,cdna4", [(128, True), (256, False), (256, True)]
+)
+def test_legacy_sorted_scales_switch_still_prepares_raw_a_scales(
+    block_k, cdna4, monkeypatch
+):
     case = _inputs()
-    cfg = dict(_config(block_k), A_SCALE_SORTED_SHUFFLED=False, B_SCALE_SHUFFLED=False)
+    cfg = dict(_config(block_k), A_SCALE_SORTED_SHUFFLED=False,
+               B_SCALE_SHUFFLED=cdna4)
     monkeypatch.setenv("AITER_TRITON_MOE_GLUON_SORTED_SCALES", "1")
+    # This switch no longer prepares B scales: the B layout is the input's.
     monkeypatch.setenv("AITER_TRITON_MOE_GLUON_SHUFFLED_W_SCALES", "1")
     packed_a = torch.empty(2 * 128 * case.k // 32, dtype=torch.uint8)
-    packed_b = torch.empty(2, case.n // 32, case.k, dtype=torch.uint8)
     monkeypatch.setattr(host, "_sorted_shuffle_a_scales", lambda *_: packed_a)
-    monkeypatch.setattr(host, "_shuffled_b_scales", lambda *_: packed_b)
-    args = _capture_launch(case, cfg, True, monkeypatch)
-    assert args["a_scale_ptr"] is packed_a and args["b_scale_ptr"] is packed_b
+    args = _capture_launch(case, cfg, True, monkeypatch, cdna4=cdna4)
+    assert args["a_scale_ptr"] is packed_a
+    if cdna4:
+        assert args["b_scale_ptr"].data_ptr() == case.ws_cdna4.data_ptr()
+    else:
+        assert args["b_scale_ptr"] is case.ws
 
 
 @pytest.mark.parametrize("block_k", [128, 256])

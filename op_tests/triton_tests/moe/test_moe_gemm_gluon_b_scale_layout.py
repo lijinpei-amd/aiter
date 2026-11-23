@@ -425,6 +425,36 @@ def test_try_gluon_falls_back_on_k128_cdna4_without_shuffled_a(monkeypatch):
     )
 
 
+def test_shuffle_scale_moe_byte_order():
+    """The CDNA4_SCALE tile keeps the N order and puts K+4 and non-K+16 in the low bits."""
+    experts, n, k = 2, 128, 512
+    raw = (
+        (torch.arange(experts * n * (k // 32), dtype=torch.int64) % 251)
+        .to(torch.uint8)
+        .reshape(experts, n, k // 32)
+        .transpose(1, 2)
+    )
+    original = raw.clone()
+    tile = shuffle_scale_moe(raw, arch="gfx950")
+    assert tile.shape == (experts, k, n // 32)
+    assert tile.transpose(-1, -2).is_contiguous()
+    flat = tile.transpose(-1, -2).reshape(experts, -1)
+    # Rows span both gate/up halves, whose original N ordering must be retained.
+    for e in range(experts):
+        for row in range(n):
+            for group in range(k // 32):
+                offset = (
+                    (row // 32) * k
+                    + (group // 8) * 256
+                    + (group % 4) * 64
+                    + (row % 16) * 4
+                    + ((group % 8) // 4) * 2
+                    + (row % 32) // 16
+                )
+                assert flat[e, offset] == raw[e, group, row]
+    torch.testing.assert_close(raw, original)
+
+
 def test_cdna4_scales_do_not_set_direct_b():
     case = _mx8_inputs()
     with torch.inference_mode():

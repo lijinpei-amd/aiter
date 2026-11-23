@@ -21,6 +21,7 @@ from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 from op_tests.triton_tests.utils.mxfp_ref import upcast_from_mxfp
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 from op_tests.triton_tests.moe.test_moe_gemm_a4w4 import assert_close
 
 
@@ -65,6 +66,7 @@ def case():
         w, ws = downcast_to_mxfp(w.transpose(1, 2), torch.float8_e4m3fn, axis=1)
         x_ref = upcast_from_mxfp(x, xs, torch.bfloat16, axis=-1).float()
         w_ref = upcast_from_mxfp(w, ws, torch.bfloat16, axis=1).float()
+        ws_cdna4 = shuffle_scale_moe(ws, arch="gfx950")
         raw = moe_gemm_torch(x_ref, w_ref, None, route, gather)
         gate, linear = raw.chunk(2, dim=-1)
         expected = {
@@ -95,6 +97,7 @@ def case():
             w=w,
             xs=xs,
             ws=ws,
+            ws_cdna4=ws_cdna4,
             route=route,
             gather=gather,
             expected=expected,
@@ -118,12 +121,19 @@ def _check(case, monkeypatch, *, config=None, split=True, packed=True, public=Fa
         assert tuning.K_UNROLL == (config or case.config)["K_UNROLL"]
         assert named["a_ptr"] is case.x and named["b_ptr"] is case.w
         assert (named["a_scale_ptr"] is case.xs) == (not shuffled[0])
-        assert (named["b_scale_ptr"] is case.ws) == (not shuffled[1])
+        if shuffled[1]:
+            # The kernel reads the caller's CDNA4_SCALE tile as given.
+            assert named["b_scale_ptr"].data_ptr() == case.ws_cdna4.data_ptr()
+        else:
+            assert named["b_scale_ptr"] is case.ws
         seen.append(True)
         return original(kernel, grid, args, *metadata)
 
     monkeypatch.setattr(host, "_fast_launch", capture)
     monkeypatch.setenv("AITER_TRITON_MOE_GLUON_GU_SPLIT", str(int(split)))
+    b_shuffled = packed[1] if isinstance(packed, tuple) else packed
+    w_scales = case.ws_cdna4 if b_shuffled else case.ws
+    swizzle = "CDNA4_SCALE" if b_shuffled else None
     first = None
     for _ in range(8):
         output.fill_(float("nan"))
@@ -135,7 +145,8 @@ def _check(case, monkeypatch, *, config=None, split=True, packed=True, public=Fa
                 x=case.x,
                 w=case.w,
                 x_scales=case.xs,
-                w_scales=case.ws,
+                w_scales=w_scales,
+                swizzle_mx_scale=swizzle,
                 bias=None,
                 gammas=None,
                 routing_data=case.route,
@@ -156,7 +167,7 @@ def _check(case, monkeypatch, *, config=None, split=True, packed=True, public=Fa
                 case.x,
                 case.w,
                 case.xs,
-                case.ws,
+                w_scales,
                 None,
                 None,
                 case.route,
@@ -170,6 +181,7 @@ def _check(case, monkeypatch, *, config=None, split=True, packed=True, public=Fa
                 False,
                 config=config,
                 gate_up_split=split,
+                swizzle_mx_scale=swizzle,
             )
         assert torch.isfinite(output).all()
         if first is None:
@@ -204,15 +216,9 @@ def test_public_mxfp8_gemm1_prepares_default_packed_scales(case, split, monkeypa
     _check(case, monkeypatch, split=split, public=True)
 
 
-@pytest.mark.parametrize("unavailable", ["a", "b"])
-def test_public_mxfp8_gemm1_restores_only_unavailable_raw_scale(
-    case, unavailable, monkeypatch
-):
-    helper = "_sorted_shuffle_a_scales" if unavailable == "a" else "_shuffled_b_scales"
-    monkeypatch.setattr(host, helper, lambda *_: None)
-    _check(
-        case, monkeypatch, packed=(unavailable != "a", unavailable != "b"), public=True
-    )
+def test_public_mxfp8_gemm1_reads_raw_scales_raw(case, monkeypatch):
+    """Raw input is read raw on both sides: no scale is sorted or shuffled."""
+    _check(case, monkeypatch, packed=False, public=True)
 
 
 @pytest.mark.parametrize("scheme", list(WaitCommitScheme), ids=lambda mode: mode.name)
@@ -222,11 +228,9 @@ def test_public_mxfp8_gemm1_restores_only_unavailable_raw_scale(
         ((128, 256, 8), (True, True), False, (3, 3, 3, 3), True, False),
         ((128, 256, 16), (True, True), False, (2, 3, 2, 3), False, True),
         ((128, 256, 32), (True, True), True, (2, 2, 2, 2), True, True),
-        ((128, 256, 16), (True, False), False, (3, 2, 3, 2), True, True),
-        ((128, 256, 16), (False, True), True, (3, 2, 2, 3), False, False),
         ((1, 1, 1), (False, False), False, (3, 3, 3, 3), True, False),
     ],
-    ids=["mn", "mnk", "register-k1024", "a-only", "b-only", "raw-ignores"],
+    ids=["mn", "mnk", "register-k1024", "raw-ignores"],
 )
 def test_independent_scale_slots(
     case, monkeypatch, scheme, scale_shape, shuffled, registers, depths, split, soff

@@ -3,8 +3,9 @@
 
 """The gfx950 Gluon MoE GEMM2 reads the weights that the caller passes now.
 
-The launch keeps a preshuffled copy of the B payload and of the B scales for the
-weight tensors. A strided weight view and an in-place weight or scale update must
+The launch keeps a preshuffled copy of the B payload for the weight tensors. It
+reads the B scales as the caller gives them (raw here) and makes no copy of them.
+A strided weight view and an in-place weight or scale update must
 give the same result as fresh contiguous tensors with the same values. This also
 applies to the replay of a CUDA graph, which does not run the host code that checks
 the copies, to a copy used from another stream, and to padded weights (unpadded_N,
@@ -62,8 +63,8 @@ def _clear_config_caches():
 
 
 def _assert_launches(launches, copies):
-    """Every launch read the preshuffled B and the shuffled B scales, or neither."""
-    assert launches and all(f == (copies, copies) for f in launches), launches
+    """Every launch read the preshuffled B or none did, and the raw B scales as given."""
+    assert launches and all(f == (copies, False) for f in launches), launches
 
 
 @pytest.fixture(scope="module")
@@ -270,7 +271,7 @@ def test_unpadded_n_keeps_the_stored_layout(op, case, launches):
     out = _call(op, case.routes16, x, xs, w, ws, unpadded_N=N)
     assert launches[-1] == (False, False), "a padded tensor gets no copy"
     full = _call(op, case.routes16, x, xs, w, ws)  # now with copies of all 2N columns
-    assert launches[-1] == (True, True)
+    assert launches[-1] == (True, False)
     again = _call(op, case.routes16, x, xs, w, ws, unpadded_N=N)
     ref = _call(op, case.routes16, x, xs, _dense(w[..., :N]), _dense(ws[..., :N]))
     assert torch.equal(out[:, :N], ref)
@@ -283,7 +284,7 @@ def test_smaller_unpadded_k_after_a_full_k_call(op, case, launches):
     x, xs = case.x16[op]
     w, ws = _weights(op, EXPERTS, seed=11, k=K_PAD)
     _call(op, case.routes16, x, xs, w, ws)  # the full K: makes the copies
-    assert launches[-1] == (True, True)
+    assert launches[-1] == (True, False)
     out = _call(op, case.routes16, x, xs, w, ws, unpadded_K=K)
     assert launches[-1] == (False, False), "a padded tensor gets no copy"
     kx, kw = x.shape[1] * K // K_PAD, w.shape[1] * K // K_PAD
@@ -378,14 +379,14 @@ def test_dropped_copy_stays_allocated_for_a_consumer_stream(
         torch.cuda._sleep(1 << 27)  # the GEMM below runs after the drop
         out = _gemm2(op, case, w, ws)
     host.drop_weight_copies(w, ws)
-    # Blocks of the copies' sizes, written on this stream: freed memory goes here.
+    # A block of the copy's size, written on this stream: freed memory goes here.
     reuse = [
         torch.full(
             (t.numel() * t.element_size(),), 0x7F, dtype=torch.uint8, device="cuda"
         )
-        for t in (w, ws)
+        for t in (w,)
     ]
-    assert recorded.count(consumer.cuda_stream) == 2, "one record per copy"
+    assert recorded.count(consumer.cuda_stream) == 1, "one record per copy"
     torch.cuda.synchronize()
     del reuse
     _assert_launches(launches, True)
@@ -399,7 +400,7 @@ def test_weights_with_copies_save_and_copy(op, case, launches):
     module = torch.nn.Module()
     module.weight = weight
     _gemm2(op, case, weight, ws)
-    assert launches[-1] == (True, True)
+    assert launches[-1] == (True, False)
     for obj in (weight, ws, module, {"w": weight, "ws": ws}):
         torch.save(obj, io.BytesIO())
     buffer = io.BytesIO()

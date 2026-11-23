@@ -25,6 +25,7 @@ from aiter.ops.triton.moe.moe_op_gemm_a4w4 import moe_gemm_torch
 from aiter.ops.triton.moe.moe_op_gemm_gluon import moe_gemm_gluon
 from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 from op_tests.triton_tests.moe.test_moe_gemm_gluon_dtypes import _quantize
 from op_tests.triton_tests.moe.test_moe_gemm_gluon_read_placement import _config
 
@@ -100,13 +101,23 @@ def _build_register_case(dtype, m=513, n=512, k=None, experts=33, topk=8):
     )
 
 
+def _weight_scales(case, config):
+    """The B scales and ``swizzle_mx_scale`` that match ``B_SCALE_SHUFFLED``."""
+    if not config.get("B_SCALE_SHUFFLED", False):
+        return case.ws, None
+    if getattr(case, "ws_cdna4", None) is None:
+        case.ws_cdna4 = shuffle_scale_moe(case.ws, arch="gfx950")
+    return case.ws_cdna4, "CDNA4_SCALE"
+
+
 def _launch_register_case(case, config, *, swiglu=True, split=True, y_scales=None):
+    w_scales, swizzle = _weight_scales(case, config)
     return moe_gemm_gluon(
         case.output,
         case.x,
         case.w,
         case.xs,
-        case.ws,
+        w_scales,
         None,
         None,
         case.route,
@@ -121,6 +132,7 @@ def _launch_register_case(case, config, *, swiglu=True, split=True, y_scales=Non
         config=config,
         gate_up_split=split,
         y_scales=y_scales,
+        swizzle_mx_scale=swizzle,
     )
 
 
@@ -428,10 +440,11 @@ def test_k128_register_scale_phase(register_case):
     [
         (256, 8, (False, False)),
         (256, 16, (True, False)),
-        (512, 16, (True, True)),
-        (512, 32, (False, True)),
+        (512, 16, (True, False)),
+        (256, 16, (True, True)),
+        (256, 32, (False, True)),
     ],
-    ids=["raw-k256", "a-scale512", "both-scale512", "b-scale1024"],
+    ids=["raw-k256", "a-scale512", "a-scale512-k512", "both-scale512", "b-scale1024"],
 )
 def test_scale_and_payload_k_load_units_are_independent(
     register_case, block_k, scale_k, shuffled
@@ -494,6 +507,9 @@ def test_register_pipeline_without_fused_tail(register_case, swiglu):
         A_SCALE_NUM_BUFFER=4,
         B_SCALE_NUM_BUFFER=2,
     )
+    if not swiglu and case.dtype == "mxfp8":
+        # GEMM2 does not sort the A scales, and K128 scales are both shuffled or both raw.
+        config.update(A_SCALE_SORTED_SHUFFLED=False, B_SCALE_SHUFFLED=False)
     first = None
     for repeat in range(8):
         case.output.fill_(float("nan"))
@@ -704,6 +720,7 @@ def test_unequal_buffers_overlap_epilogue_inputs(register_case, split, epilogue)
         B_SCALE_NUM_BUFFER=2,
     )
     torch.manual_seed(95)
+    w_scales, swizzle = _weight_scales(case, config)
     experts = case.route.expt_hist.numel()
     bias = torch.randn((experts, case.n), device="cuda") * 0.3
     gammas = torch.rand(case.gather.numel(), device="cuda") + 0.25
@@ -726,7 +743,7 @@ def test_unequal_buffers_overlap_epilogue_inputs(register_case, split, epilogue)
             case.x,
             case.w,
             case.xs,
-            case.ws,
+            w_scales,
             bias,
             gammas,
             case.route,
@@ -741,6 +758,7 @@ def test_unequal_buffers_overlap_epilogue_inputs(register_case, split, epilogue)
             config=config,
             gate_up_split=split,
             epilogue=epilogue,
+            swizzle_mx_scale=swizzle,
         )
         if first is None:
             torch.testing.assert_close(
