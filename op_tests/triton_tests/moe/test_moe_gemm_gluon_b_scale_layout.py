@@ -325,18 +325,27 @@ def test_default_entry_with_cdna4_input_reads_the_tile(monkeypatch):
 
 
 @pytest.mark.parametrize("a_available", [False, True])
-def test_k128_cdna4_needs_shuffled_a(a_available, monkeypatch):
+def test_k128_cdna4_runs_with_raw_or_sorted_a(a_available, monkeypatch):
     case = _mx8_inputs()
     tile = _mx8_tile()
-    _a_sorter(a_available, monkeypatch)
-    cfg = _mx8_config(128, True, True)
-    if not a_available:
-        _no_launch(monkeypatch)
-        with pytest.raises(ValueError, match="BLOCK_K 128"):
-            _capture(case, tile, "CDNA4_SCALE", cfg, monkeypatch)
-        return
-    args = _capture(case, tile, "CDNA4_SCALE", cfg, monkeypatch)
+    packed_a = _a_sorter(a_available, monkeypatch)
+    args = _capture(
+        case, tile, "CDNA4_SCALE", _mx8_config(128, True, True), monkeypatch
+    )
     _assert_b_scales(args, tile, cdna4=True)
+    assert _tuning(args).A_SCALE_SORTED_SHUFFLED is a_available
+    assert args["a_scale_ptr"] is (packed_a if a_available else case.xs)
+
+
+def test_k128_cdna4_without_paired_b_tiles_is_refused(monkeypatch):
+    case = _mx8_inputs()
+    cfg = dict(_mx8_config(128, False, True), tiles_per_warp=(2, 1))
+    assert host._cdna4_config_error(cfg) is not None
+    _no_launch(monkeypatch)
+    with pytest.raises(ValueError, match="cannot read"):
+        _capture(case, _mx8_tile(), "CDNA4_SCALE", cfg, monkeypatch)
+    ok, why = _mx8_supported(case, _mx8_tile(), monkeypatch, cfg)
+    assert not ok and "cannot read" in why
 
 
 def test_config_that_cannot_read_cdna4_is_refused(monkeypatch):
@@ -368,7 +377,6 @@ def _mx8_supported(case, ws, monkeypatch, cfg):
         N=case.n,
         K=case.k,
         apply_swiglu=True,
-        gather_indx=case.gather,
     )
 
 
@@ -381,7 +389,7 @@ def test_gluon_supported_refuses_cdna4_that_the_config_cannot_read(monkeypatch):
     assert not ok and "cannot read" in why
 
 
-def test_gluon_supported_refuses_k128_cdna4_without_shuffled_a(monkeypatch):
+def test_gluon_supported_accepts_k128_cdna4_without_shuffled_a(monkeypatch):
     from aiter.ops import moe_mxfp4_aux
 
     # No aux instance for this shape: the launch cannot sort the A scales.
@@ -390,25 +398,32 @@ def test_gluon_supported_refuses_k128_cdna4_without_shuffled_a(monkeypatch):
     ok, why = _mx8_supported(
         case, _mx8_tile(), monkeypatch, _mx8_config(128, True, True)
     )
-    assert not ok and "BLOCK_K 128" in why
+    assert ok, why
 
 
-def test_try_gluon_falls_back_on_k128_cdna4_without_shuffled_a(monkeypatch):
+def test_try_gluon_runs_k128_cdna4_without_shuffled_a(monkeypatch):
     from aiter.ops import moe_mxfp4_aux
 
     monkeypatch.setattr(moe_mxfp4_aux, "MXFP4_MOE_SUPPORTED_SHAPES", set())
-    _no_launch(monkeypatch)
+    captured = {}
+
+    def launch(kernel, grid, args, *metadata):
+        captured.update(zip(kernel.arg_names, args))
+        return object()
+
+    monkeypatch.setattr(host, "_fast_launch", launch)
     case = _mx8_inputs()
+    tile = _mx8_tile()
     monkeypatch.setattr(host, "get_arch", lambda: "gfx950")
     entry = _mx8_config(128, True, True)
     monkeypatch.setattr(host, "_default_launch_config", lambda *_: dict(entry))
-    assert not host.try_gluon_grouped_gemm(
+    assert host.try_gluon_grouped_gemm(
         op_name="test",
         y=case.y,
         x=case.x,
         w=case.w,
         x_scales=case.xs,
-        w_scales=_mx8_tile(),
+        w_scales=tile,
         bias=None,
         gammas=None,
         routing_data=case.routing_data,
@@ -423,6 +438,9 @@ def test_try_gluon_falls_back_on_k128_cdna4_without_shuffled_a(monkeypatch):
         split_k=1,
         swizzle_mx_scale="CDNA4_SCALE",
     )
+    _assert_b_scales(captured, tile, cdna4=True)
+    assert _tuning(captured).A_SCALE_SORTED_SHUFFLED is False
+    assert captured["a_scale_ptr"] is case.xs
 
 
 def test_shuffle_scale_moe_byte_order():
@@ -473,46 +491,54 @@ def test_scale_copy_and_env_override_are_gone(monkeypatch):
     _assert_b_scales(args, case.ws, cdna4=False)
 
 
-@pytest.mark.parametrize("cdna4", [False, True])
-def test_k128_scales_are_both_shuffled_or_both_raw(cdna4, monkeypatch):
+@pytest.mark.parametrize("cdna4", [False, True], ids=["raw-b", "cdna4-b"])
+@pytest.mark.parametrize("a_available", [False, True], ids=["raw-a", "sorted-a"])
+def test_k128_scale_layouts_are_independent(a_available, cdna4, monkeypatch):
     case = _mx8_inputs()
     ws = _mx8_tile() if cdna4 else case.ws
-    packed_a = _a_sorter(True, monkeypatch)
+    packed_a = _a_sorter(a_available, monkeypatch)
     cfg = _mx8_config(128, True, cdna4)
     args = _capture(case, ws, "CDNA4_SCALE" if cdna4 else None, cfg, monkeypatch)
     _assert_b_scales(args, ws, cdna4=cdna4)
     tuning = conf._cval(args["CFG_TUNING"])
-    assert tuning.A_SCALE_SORTED_SHUFFLED is cdna4
-    a_swizzle = ScaleSwizzle.SORTED_SHUFFLED if cdna4 else ScaleSwizzle.NONE
+    assert tuning.A_SCALE_SORTED_SHUFFLED is a_available
+    a_swizzle = ScaleSwizzle.SORTED_SHUFFLED if a_available else ScaleSwizzle.NONE
     assert conf._cval(args["A_SCALE_SWIZZLE"]) == a_swizzle
-    assert args["a_scale_ptr"] is (packed_a if cdna4 else case.xs)
+    assert args["a_scale_ptr"] is (packed_a if a_available else case.xs)
 
 
-def test_k128_caller_shuffled_a_with_raw_b_is_refused(monkeypatch):
+def test_k128_caller_shuffled_a_with_raw_b_runs(monkeypatch):
     case = _mx8_inputs()
     case.gather = None
-    _no_launch(monkeypatch)
-    with pytest.raises(ValueError, match="BLOCK_K 128"):
-        host.moe_gemm_gluon(
-            case.y,
-            case.x,
-            case.w,
-            case.xs,
-            case.ws,
-            None,
-            None,
-            case.routing_data,
-            None,
-            None,
-            case.n,
-            case.k,
-            True,
-            1.0,
-            None,
-            False,
-            config=_mx8_config(128, True, False),
-            x_scales_sorted_shuffled=True,
-        )
+    captured = {}
+
+    def launch(kernel, grid, args, *metadata):
+        captured.update(zip(kernel.arg_names, args))
+        return object()
+
+    monkeypatch.setattr(host, "_fast_launch", launch)
+    host.moe_gemm_gluon(
+        case.y,
+        case.x,
+        case.w,
+        case.xs,
+        case.ws,
+        None,
+        None,
+        case.routing_data,
+        None,
+        None,
+        case.n,
+        case.k,
+        True,
+        1.0,
+        None,
+        False,
+        config=_mx8_config(128, True, False),
+        x_scales_sorted_shuffled=True,
+    )
+    assert conf._cval(captured["A_SCALE_SWIZZLE"]) == ScaleSwizzle.SORTED_SHUFFLED
+    _assert_b_scales(captured, case.ws, cdna4=False)
     monkeypatch.setattr(host, "get_arch", lambda: "gfx950")
     entry = _mx8_config(128, True, False)
     monkeypatch.setattr(host, "_default_launch_config", lambda *_: dict(entry))
@@ -532,9 +558,8 @@ def test_k128_caller_shuffled_a_with_raw_b_is_refused(monkeypatch):
         N=case.n,
         K=case.k,
         apply_swiglu=True,
-        x_scales_sorted_shuffled=True,
     )
-    assert not ok and "BLOCK_K 128" in why
+    assert ok, why
 
 
 _NARROW_B = {

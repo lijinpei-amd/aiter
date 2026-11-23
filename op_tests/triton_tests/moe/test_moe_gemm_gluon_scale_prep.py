@@ -296,8 +296,9 @@ def test_minimum_uses_resolved_scale_storage_after_preparation(cdna4, monkeypatc
         + maybe_unwrap(packed.unroll)
         == 6
     )
-    # At BLOCK_K 128 the CDNA4_SCALE input gives packed A and B scales. Raw input
-    # gives raw A and B scales, whatever the A sort switch asks for.
+    # The A sort switch packs the A scales. CDNA4_SCALE input also packs the B
+    # scales. Raw input keeps the B scales raw, so their four buffers still need
+    # UNROLL 4.
     monkeypatch.setenv("AITER_TRITON_MOE_GLUON_SORTED_SCALES", "1")
     packed_a = torch.empty(2 * 128 * case.k // 32, dtype=torch.uint8)
     monkeypatch.setattr(host, "_sorted_shuffle_a_scales", lambda *_: packed_a)
@@ -346,16 +347,11 @@ def test_b_scale_layout_follows_the_input_and_a_sort_is_prepared_or_restored(
         return prepared_a if available else None
 
     monkeypatch.setattr(host, "_sorted_shuffle_a_scales", prepare_a)
-    if cdna4 and block_k == 128 and not (requested and available):
-        # K128 CDNA4_SCALE weight scales need sorted-shuffled A scales.
-        with pytest.raises(ValueError, match="sorted-shuffled A"):
-            _capture_launch(case, cfg, split, monkeypatch, cdna4=True)
-        return
     args = _capture_launch(case, cfg, split, monkeypatch, cdna4=cdna4)
-    # At K128 raw B scales keep the A scales raw too: the A sort is not asked.
-    sorts_a = requested and not (block_k == 128 and not cdna4)
-    assert seen == ([0] if sorts_a else [])
-    a_shuffled = sorts_a and available
+    # Each scale operand follows its own layout: the B input does not change the
+    # A sort.
+    assert seen == ([0] if requested else [])
+    a_shuffled = requested and available
     tuning = conf._cval(args["CFG_TUNING"])
     assert (tuning.A_SCALE_SORTED_SHUFFLED, tuning.B_SCALE_SHUFFLED) == (
         a_shuffled, cdna4

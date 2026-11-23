@@ -184,7 +184,8 @@ def validate_layout(tc, layout, N, K):
             f"B_SCALE_SHUFFLED needs BLOCK_K 128 or 256 for the B scale slot "
             f"(got {BK})"
         )
-        # K128 keeps the paired-byte read: both non-K bytes belong to one wave.
+        # K128 needs both 16-row halves of a 32-row stripe in one wave
+        # (tiles_per_warp N >= 2).
         assert BK != 128 or tiles[1] >= 2, (
             "B_SCALE_SHUFFLED with BLOCK_K 128 needs tiles_per_warp N >= 2 for "
             f"the B scale slot (got {tiles[1]})"

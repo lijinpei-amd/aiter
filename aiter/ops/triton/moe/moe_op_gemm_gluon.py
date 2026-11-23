@@ -213,15 +213,9 @@ def gluon_supported(
     w_static_scale=None,
     apply_swiglu: bool = False,
     gate_up_split: bool = False,
-    gather_indx: torch.Tensor | None = None,
-    x_scales_sorted_shuffled: bool = False,
 ) -> tuple[bool, str]:
     """The capability predicate. Returns ``(ok, reason)``; ``reason`` is logged when
     the call falls back to the Triton kernel.
-
-    ``gather_indx`` and ``x_scales_sorted_shuffled`` have the meaning they have in
-    :func:`moe_gemm_gluon`. They tell if the launch can sort the A scales, which
-    ``CDNA4_SCALE`` weight scales need at ``BLOCK_K`` 128.
 
     ``swizzle_mx_scale`` is ``None`` (raw ``w_scales``) or ``"CDNA4_SCALE"`` (the
     output of ``shuffle_scale_moe(arch="gfx950")``). The latter needs ``N % 32 == 0``
@@ -293,17 +287,7 @@ def gluon_supported(
     cfg = dict(cfg, B_SCALE_SHUFFLED=b_cdna4)
     if b_cdna4:
         cfg = _cdna4_default_config(cfg, dq_a, dq_b, N, K)
-    if x_scales_sorted_shuffled and int(cfg["BLOCK_K"]) == 128 and not b_cdna4:
-        return False, (
-            "x_scales_sorted_shuffled at BLOCK_K 128 needs CDNA4_SCALE weight scales"
-        )
-    if b_cdna4:
-        a_shuffled = x_scales_sorted_shuffled or (
-            _a_sort_requested(cfg, apply_swiglu, gather_indx)
-            and _a_sort_fits(x_scales, K, cfg)
-            and _a_sort_runs(routing_data, int(cfg["BLOCK_M"]), K, gather_indx is None)
-        )
-        config_error = _cdna4_config_error(cfg, a_shuffled)
+        config_error = _cdna4_config_error(cfg)
         if config_error is not None:
             return False, config_error
     if N % cfg["BLOCK_N"] != 0:
@@ -610,12 +594,10 @@ def _a_sort_runs(routing_data, block_m, K, sorted_rows) -> bool:
     )
 
 
-def _cdna4_config_error(cfg, a_shuffled) -> str | None:
+def _cdna4_config_error(cfg) -> str | None:
     """Return why ``cfg`` cannot read ``CDNA4_SCALE`` weight scales, or None."""
     if not _b_scale_shuffle_fits(cfg):
         return "this config cannot read CDNA4_SCALE weight scales"
-    if int(cfg["BLOCK_K"]) == 128 and not a_shuffled:
-        return "CDNA4_SCALE weight scales at BLOCK_K 128 need sorted-shuffled A scales"
     return None
 
 
@@ -633,7 +615,6 @@ def _cdna4_default_config(cfg, dq_a, dq_b, N, K):
     k256["B_SCALE_SHUFFLED"] = True
     if (
         K % k256["BLOCK_K"]
-        or _cdna4_config_error(k256, False) is not None
         or _pipeline_error(_cfg_key(k256), dq_a, dq_b, K) is not None
         or _launch_error(_cfg_key(k256), dq_a, dq_b, N, K) is not None
     ):
@@ -1096,11 +1077,10 @@ def moe_gemm_gluon(
     that ``shuffle_scale_moe(arch="gfx950")`` returns). The kernel reads ``w_scales``
     in this layout and makes no copy. An unreadable tile raises ``ValueError``. A
     default config at a ``BLOCK_K`` above 256 runs at ``BLOCK_K`` 256 when it can. A
-    config that cannot read the tile raises ``ValueError``. At ``BLOCK_K`` 128 the
-    A and B scales are both shuffled or both raw: with ``CDNA4_SCALE`` the A scales
-    must be sorted-shuffled, and with raw ``w_scales`` the A scales are read raw
-    (``x_scales_sorted_shuffled`` then raises ``ValueError``). An explicit ``config``
-    must set ``B_SCALE_SHUFFLED`` to match ``swizzle_mx_scale``. With ``CDNA4_SCALE``
+    config that cannot read the tile raises ``ValueError``. Each scale operand is
+    read in its own layout. A shuffled operand needs a config that can read it (at
+    ``BLOCK_K`` 128, ``tiles_per_warp`` of at least 2 on that operand). An explicit
+    ``config`` must set ``B_SCALE_SHUFFLED`` to match ``swizzle_mx_scale``. With ``CDNA4_SCALE``
     input, the half tile of an explicit config can run at ``BLOCK_K`` 256.
 
     ``y_scales`` non-None selects the fused MXFP4 output quant: ``y`` then holds the
@@ -1204,12 +1184,6 @@ def moe_gemm_gluon(
     a_scales, a_swizzle = x_scales, ScaleSwizzle.NONE
     a_scale_stride_m = 0 if x_scales is None else x_scales.stride(0)
     a_scale_stride_k = 0 if x_scales is None else x_scales.stride(1)
-    # At BLOCK_K 128 the A and B scales are both shuffled or both raw.
-    k128_raw_b = int(_cfg["BLOCK_K"]) == 128 and not b_cdna4
-    if x_scales_sorted_shuffled and k128_raw_b:
-        raise ValueError(
-            "x_scales_sorted_shuffled at BLOCK_K 128 needs CDNA4_SCALE weight scales"
-        )
     if x_scales_sorted_shuffled:
         # The caller hands over the buffer already in the sorted-shuffled layout (e.g.
         # moe_gemm1_a8w4_mxfp8_out(scale_layout="sorted_shuffled")), in the routing's
@@ -1227,7 +1201,7 @@ def moe_gemm_gluon(
             )
         a_scales, a_swizzle = x_scales.reshape(-1), ScaleSwizzle.SORTED_SHUFFLED
         a_scale_stride_m, a_scale_stride_k = 0, 32
-    elif not k128_raw_b and _a_sort_requested(_cfg, apply_swiglu, gather_indx):
+    elif _a_sort_requested(_cfg, apply_swiglu, gather_indx):
         shuffled = _sorted_shuffle_a_scales(
             x_scales, routing_data, gather_indx, K, _cfg
         )
@@ -1242,7 +1216,7 @@ def moe_gemm_gluon(
     b_scales, b_swizzle = w_scales, ScaleSwizzle.NONE
     b_scale_stride_k = 0 if w_scales is None else w_scales.stride(1)
     if b_cdna4:
-        config_error = _cdna4_config_error(_cfg, a_shuffled)
+        config_error = _cdna4_config_error(_cfg)
         if config_error is not None:
             raise ValueError(config_error)
         # The (E, N/32, K) view is the contiguous tile. Eight scales span 256 bytes.
@@ -1493,8 +1467,6 @@ def try_gluon_grouped_gemm(
         K=K,
         w_static_scale=w_static_scale,
         apply_swiglu=apply_swiglu,
-        gather_indx=gather_indx,
-        x_scales_sorted_shuffled=x_scales_sorted_shuffled,
     )
     if not ok:
         _LOGGER.debug(f"{op_name}: falling back to the Triton kernel: {why}")

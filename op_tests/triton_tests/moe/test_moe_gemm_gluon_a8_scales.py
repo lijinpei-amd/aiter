@@ -216,9 +216,16 @@ def test_public_mxfp8_gemm1_prepares_default_packed_scales(case, split, monkeypa
     _check(case, monkeypatch, split=split, public=True)
 
 
-def test_public_mxfp8_gemm1_reads_raw_scales_raw(case, monkeypatch):
-    """Raw input is read raw on both sides: no scale is sorted or shuffled."""
-    _check(case, monkeypatch, packed=False, public=True)
+@pytest.mark.parametrize("unavailable", ["a", "b"])
+def test_public_mxfp8_gemm1_reads_each_scale_in_its_own_layout(
+    case, unavailable, monkeypatch
+):
+    """Raw A scales (no sort) or raw B scales (raw input) leave the other side packed."""
+    if unavailable == "a":
+        monkeypatch.setattr(host, "_sorted_shuffle_a_scales", lambda *_: None)
+    _check(
+        case, monkeypatch, packed=(unavailable != "a", unavailable != "b"), public=True
+    )
 
 
 @pytest.mark.parametrize("scheme", list(WaitCommitScheme), ids=lambda mode: mode.name)
@@ -228,9 +235,11 @@ def test_public_mxfp8_gemm1_reads_raw_scales_raw(case, monkeypatch):
         ((128, 256, 8), (True, True), False, (3, 3, 3, 3), True, False),
         ((128, 256, 16), (True, True), False, (2, 3, 2, 3), False, True),
         ((128, 256, 32), (True, True), True, (2, 2, 2, 2), True, True),
+        ((128, 256, 16), (True, False), False, (3, 2, 3, 2), True, True),
+        ((128, 256, 16), (False, True), True, (3, 2, 2, 3), False, False),
         ((1, 1, 1), (False, False), False, (3, 3, 3, 3), True, False),
     ],
-    ids=["mn", "mnk", "register-k1024", "raw-ignores"],
+    ids=["mn", "mnk", "register-k1024", "a-only", "b-only", "raw-ignores"],
 )
 def test_independent_scale_slots(
     case, monkeypatch, scheme, scale_shape, shuffled, registers, depths, split, soff

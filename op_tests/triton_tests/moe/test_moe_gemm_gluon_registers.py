@@ -508,8 +508,8 @@ def test_register_pipeline_without_fused_tail(register_case, swiglu):
         B_SCALE_NUM_BUFFER=2,
     )
     if not swiglu and case.dtype == "mxfp8":
-        # GEMM2 does not sort the A scales, and K128 scales are both shuffled or both raw.
-        config.update(A_SCALE_SORTED_SHUFFLED=False, B_SCALE_SHUFFLED=False)
+        # GEMM2 does not sort the A scales. The B scales are read shuffled.
+        config.update(A_SCALE_SORTED_SHUFFLED=False)
     first = None
     for repeat in range(8):
         case.output.fill_(float("nan"))

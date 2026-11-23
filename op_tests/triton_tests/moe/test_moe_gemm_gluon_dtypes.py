@@ -141,7 +141,6 @@ def test_operand_dtype_pairs(
             out_quant=None,
             N=n,
             K=k,
-            gather_indx=gather_indx,
             apply_swiglu=gemm1,
         )
         if not ok:
