@@ -72,6 +72,7 @@ from aiter.ops.triton.moe.moe_op_gemm_gluon_config import (
     _family_env_keys,
     _gemm2_half_m_config,
     _hashable,
+    _launch_error,
     _pipeline_error,
     _probe_lds_bytes,
     _scale_shuffle_supported,
@@ -283,6 +284,7 @@ def gluon_supported(
         b_cdna4,
     )
     # The launch reads the weight scales in the layout of the input.
+    flag_changed = bool(cfg.get("B_SCALE_SHUFFLED", False)) != b_cdna4
     cfg = dict(cfg, B_SCALE_SHUFFLED=b_cdna4)
     if b_cdna4:
         config_error = _cdna4_config_error(cfg)
@@ -300,6 +302,11 @@ def gluon_supported(
     )
     if pipeline_error is not None:
         return False, pipeline_error
+    if flag_changed:
+        # The tuned entry was checked with its own B-scale layout, not this one.
+        launch_error = _launch_error(_cfg_key(cfg), dq_a, dq_b, N, K)
+        if launch_error is not None:
+            return False, launch_error
     # Fill ownership no longer requires both axes split: a single-pane step copies both
     # operands, since the schedule maps each component's slots to panes rather
     # than handing each pane one copy. validate_pipeline() asserts the mapping

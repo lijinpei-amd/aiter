@@ -1032,6 +1032,8 @@ def _gemm2_half_m_config(
     # The half tile reads the launch's A-scale buffer, so it takes its layout: the
     # sorted-shuffled buffer is addressed in the launch's block space (2 * pid_m).
     half["A_SCALE_SORTED_SHUFFLED"] = bool(cfg.get("A_SCALE_SORTED_SHUFFLED", False))
+    # The half tile reads the launch's weight scales, so it takes their layout too.
+    half["B_SCALE_SHUFFLED"] = bool(cfg.get("B_SCALE_SHUFFLED", False))
     shared = (
         "warps_per_cta",
         "WAVES_PER_EU",

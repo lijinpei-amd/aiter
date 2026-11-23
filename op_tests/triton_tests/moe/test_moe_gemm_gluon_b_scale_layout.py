@@ -750,3 +750,46 @@ def test_gemm1_half_tile_reads_cdna4_at_k512(monkeypatch):
     assert items is not None
     assert dict(items)["BLOCK_K"] == 512
     assert dict(items)["B_SCALE_SHUFFLED"] is True
+
+
+@pytest.mark.parametrize("tuned_flag", [True, False])
+def test_gluon_supported_checks_the_launch_with_the_input_layout(
+    tuned_flag, monkeypatch
+):
+    # A raw-only launch error must refuse raw input only on an entry tuned shuffled.
+    case = _mx8_inputs()
+    real = host._launch_error
+
+    def launch_error(cfg_items, *rest):
+        if not dict(cfg_items)["B_SCALE_SHUFFLED"]:
+            return "no raw launch"
+        return real(cfg_items, *rest)
+
+    monkeypatch.setattr(host, "_launch_error", launch_error)
+    monkeypatch.setattr(host, "get_arch", lambda: "gfx950")
+    entry = _mx8_config(256, False, tuned_flag)
+    monkeypatch.setattr(host, "_default_launch_config", lambda *_: dict(entry))
+    ok, why = _supported(case, case.ws, None)
+    if tuned_flag:
+        assert not ok and why == "no raw launch"
+    else:
+        assert ok, why
+
+
+def test_gemm2_half_tile_takes_the_launch_b_layout(monkeypatch):
+    dq = DtypeQuant.MXFP8
+    half = dict(
+        conf._default_launch_config(64, _N, _K, dq, dq, False, False),
+        B_SCALE_SHUFFLED=True,
+    )
+    monkeypatch.setattr(conf, "_default_launch_config", lambda *_, **__: dict(half))
+    monkeypatch.setattr(conf, "_family_entry", lambda *_: {})
+    conf._gemm2_half_m_config.cache_clear()
+    # Raw input: the launch reads raw weight scales, so the half tile must too.
+    launch = dict(half, BLOCK_M=128, HALF_M_TILE=True, B_SCALE_SHUFFLED=False)
+    items = conf._gemm2_half_m_config(
+        conf._cfg_key(launch), 128, _N, _K, dq, dq, False, False
+    )
+    conf._gemm2_half_m_config.cache_clear()
+    assert items is not None
+    assert dict(items)["B_SCALE_SHUFFLED"] is False
