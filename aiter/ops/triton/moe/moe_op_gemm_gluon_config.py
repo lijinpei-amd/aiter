@@ -1550,7 +1550,12 @@ def _b_scale_shuffle_fits(cfg):
     """True when ``cfg`` can read ``CDNA4_SCALE`` weight scales."""
     # Stripe-based like the A shuffle: one 256 B run per 32 columns, so a slot that
     # is a whole number of stripes is a contiguous slice of the tile.
-    return _scale_shuffle_supported(cfg, 1) and int(cfg["SLOT_N"]) % 32 == 0
+    # The kernel validates one K128 or K256 scale run per stage.
+    return (
+        _scale_shuffle_supported(cfg, 1)
+        and int(cfg["BLOCK_K"]) in (128, 256)
+        and int(cfg["SLOT_N"]) % 32 == 0
+    )
 
 
 _TUNING_KEYS = TuningSpec._fields
