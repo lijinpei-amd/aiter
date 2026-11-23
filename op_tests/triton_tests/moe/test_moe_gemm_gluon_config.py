@@ -427,8 +427,9 @@ def test_t256_mxfp8_gemm1_uses_validated_streaming_geometry():
     "dq_b,ctas_per_cu", [(DtypeQuant.MXFP8, 2), (DtypeQuant.MXFP4, 3)]
 )
 def test_small_t_mxfp8_gemm1_fits_several_ctas_per_cu(dq_b, ctas_per_cu):
+    # The entry is tuned for CDNA4_SCALE input, which also selects the scale hint.
     config = conf._default_launch_config(
-        32, 4096, 7168, DtypeQuant.MXFP8, dq_b, False, True
+        32, 4096, 7168, DtypeQuant.MXFP8, dq_b, False, True, b_cdna4=True
     )
     expected = {
         "BLOCK_M": 32,
@@ -1058,11 +1059,20 @@ def test_streaming_expert_payload_respects_explicit_config(explicit):
 def test_mxfp8_weight_scale_hint_cases(
     dq_b, block_m, K, stream, block_k, shuffled, expected
 ):
+    # The hint follows the input layout: shuffled entries get CDNA4_SCALE input.
     config = conf._default_launch_config(
-        block_m, 4096, K, DtypeQuant.MXFP8, dq_b, False, True, stream
+        block_m, 4096, K, DtypeQuant.MXFP8, dq_b, False, True, stream, b_cdna4=shuffled
     )
     assert (config["BLOCK_K"], config["B_SCALE_SHUFFLED"]) == (block_k, shuffled)
     assert config["expert_scale_cache_modifier"] == expected
+
+
+def test_mxfp8_weight_scale_hint_skips_raw_input_on_a_shuffled_entry():
+    config = conf._default_launch_config(
+        64, 4096, 7168, DtypeQuant.MXFP8, DtypeQuant.MXFP8, False, True, True
+    )
+    assert (config["BLOCK_K"], config["B_SCALE_SHUFFLED"]) == (256, True)
+    assert config["expert_scale_cache_modifier"] == ""
 
 
 @pytest.mark.parametrize(

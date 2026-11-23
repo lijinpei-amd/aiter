@@ -168,11 +168,14 @@ sanitize the flag and shape.
 truncate rows, and `BLOCK_K > 256` can underallocate or copy only part of a stage.
 
 **Suggested fix:** validate B shuffled scales in `validate_layout`: positive non-K
-extent divisible by 32 and only the explicitly implemented K128/K256 cases, including
-the existing packed-K128 pairing rules.
+extent divisible by 32 and only the explicitly implemented K128/K256 cases. (No A/B
+pairing rule exists since d2dbacc1c: each scale operand is read in its own layout.)
 
 **Status:** fixed. `validate_layout` checks the B scale slot: a positive multiple of
-32 rows, MFMA K 128, BLOCK_K 128 or 256, and `tiles_per_warp` N of 2 or more at K128.
+32 rows, MFMA K 128, and `tiles_per_warp` N of 2 or more at K128. It has no BLOCK_K
+limit. Shuffled B scales at BLOCK_K 512 (scale K 16 and 32) give the same bits as
+the default register config on gfx950
+(`test_scale_and_payload_k_load_units_are_independent`, `*-k512` ids).
 
 ### M4. Safety validation is disabled by optimized Python
 

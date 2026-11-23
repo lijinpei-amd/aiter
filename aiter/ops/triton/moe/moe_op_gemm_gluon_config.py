@@ -1406,7 +1406,7 @@ def _default_launch_config(
     if dq_b == DtypeQuant.MXFP8 and (
         # Not for GEMM2: its shuffled scales at block_m 32 are 1.3-2.5% slower with
         # the hint, and block_m 16 is flat.
-        (c["B_SCALE_SHUFFLED"] and apply_swiglu)
+        (b_cdna4 and apply_swiglu)
         or (
             c["BLOCK_K"] == 128
             # Every override above needs apply_swiglu, so without it c is the ladder.
@@ -1426,9 +1426,8 @@ def _default_launch_config(
         # T=16/64 were the unshuffled ones; their block_m 32 tile now shuffles too,
         # and with the hint gains (see that override).
         #
-        # Those overrides only shuffle when N and K are multiples of 256. The launch
-        # reads the weight scales in the layout of the input. With raw scales it
-        # clears the shuffle and keeps the hint.
+        # The hint follows the layout of the input, not the tuned flag: the launch
+        # reads CDNA4_SCALE input shuffled and raw input raw.
         #
         # BLOCK_K 128 through LDS: an unshuffled scale row is 4 bytes, and its LDS
         # copy has every warp fetch the same rows (all but one warp's writes are
